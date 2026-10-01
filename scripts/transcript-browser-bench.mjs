@@ -48,7 +48,7 @@ import { createServer } from "node:http";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
-import { selectInputs, growthChunks, qualifyGrowth } from "./transcript-browser-inputs.mjs";
+import { selectInputs, growthChunks, qualifyGrowth, qualifyBandwidth } from "./transcript-browser-inputs.mjs";
 
 const B1_MS = 300;
 const LONG_TASK_MS = 50;
@@ -115,10 +115,16 @@ const followRows = [];
 const growthRows = [];
 const over = [];
 try {
-  if (PHASES.has("open")) for (const name of fixtures) rows.push(await measure(name));
+  if (PHASES.has("open")) for (const name of fixtures) {
+    console.error(`B1–B3 opening ${name}`);
+    rows.push(await measure(name));
+  }
   if (PHASES.has("follow")) {
     if (b4Fixtures.length === 0) over.push("B4: none of B4_FIXTURES was written, so nothing was measured");
-    for (const name of b4Fixtures) followRows.push(await follow(name));
+    for (const name of b4Fixtures) {
+      console.error(`B4 follow ${name}`);
+      followRows.push(await follow(name));
+    }
   }
   if (PHASES.has("growth")) {
     for (const name of GROW_FIXTURES) {
@@ -126,6 +132,9 @@ try {
       else for (const scenario of ["live edge", "parked on a new turn"]) growthRows.push(await growth(name, scenario));
     }
   }
+} catch (error) {
+  // Keep completed phases visible even if a later phase cannot be measured.
+  over.push(`measurement incomplete: ${error.message}`);
 } finally {
   await browser.close();
   server.close();
@@ -152,7 +161,7 @@ async function measure(name) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
   const errors = [];
-  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("pageerror", (e) => { errors.push(e.message); console.error(`${name}: ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/harness/transcript.html?fixture=${name}`);
   await page.waitForFunction(() => document.body.dataset.harness === "ready", null, { timeout: 30_000 });
   const cdp = await context.newCDPSession(page);
@@ -241,7 +250,7 @@ async function measure(name) {
   const heapScrolled = await heap(cdp);
   await context.close();
 
-  const messages = JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")).messages.length;
+  const messages = JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")).page.messages.length;
   const b1 = open.element;
   const maxLong = (xs) => (xs.length === 0 ? 0 : Math.max(...xs));
   const p95 = pct(scroll.frames, 95);
@@ -302,7 +311,7 @@ async function follow(name) {
   await context.addInitScript(commitHook);
   const page = await context.newPage();
   const errors = [];
-  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("pageerror", (e) => { errors.push(e.message); console.error(`${name}: ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/harness/transcript.html?fixture=${name}&mode=follow`);
   await page.waitForFunction(() => document.body.dataset.harness === "ready", null, { timeout: 30_000 });
   const cdp = await context.newCDPSession(page);
@@ -490,7 +499,7 @@ async function growth(name, scenario) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
   const errors = [];
-  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("pageerror", (e) => { errors.push(e.message); console.error(`${name}: ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/harness/transcript.html?fixture=${name}&mode=follow`);
   await page.waitForFunction(() => document.body.dataset.harness === "ready", null, { timeout: 30_000 });
   const cdp = await context.newCDPSession(page);
@@ -672,6 +681,8 @@ function b5Table() {
     const raw = readFileSync(join(dir, f));
     const n = JSON.parse(raw).page.messages.length;
     const worst = raw.length / REAL_RATIO_WORST;
+    try { qualifyBandwidth(raw.length, REAL_RATIO_WORST, B5_BYTES); }
+    catch (e) { over.push(`${f}: B5 ${e.message} (estimate, not measured wire bytes)`); }
     console.log(
       `| ${f.replace(/\.json$/, "")} | ${n} | ${kb(raw.length)} | ${kb(raw.length / REAL_RATIO_MEDIAN)} | ${kb(worst)} | ${worst <= B5_BYTES ? "within (estimate)" : "OVER (estimate)"} |`,
     );

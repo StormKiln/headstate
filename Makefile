@@ -157,11 +157,11 @@ bench-transcript:
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
 
 # The viewer in a browser (#1480, the harness #1487 designed): writes each
-# fixture's production window, builds the harness page (vite.harness.config.ts,
+# fixture's three production windows, builds the harness page (vite.harness.config.ts,
 # into dist-harness), and opens every page in Playwright's Chromium to
 # take B1 (open to first paint), B2 (long tasks while scrolling) and B3
 # (heap); then B4 (idle live-follow cost, nudges, eviction; about three
-# minutes a page in real time) and a B5 estimate (page bytes over the
+# minutes per end fixture in real time) and a B5 estimate (page bytes over the
 # real-text compression ratio). HARNESS_PHASES=open,follow,growth,b5 picks parts.
 # Not in `test` or CI, for bench-transcript's reason: its figures
 # describe the machine. Needs the browser once:
@@ -573,3 +573,12 @@ check-contrast:
 	yarn vitest run src/components/transcript/palette.test.ts src/lib/labels.test.ts
 	yarn vite build -c vite.harness.config.ts
 	node scripts/check-contrast-rendered.mjs
+
+# Developer-only own-PID WKWebView proxies, explicitly not native acceptance.
+# Requires the browser harness build and preserved production windows first.
+# Both output directories are explicit so no evidence/fixture is discarded.
+.PHONY: bench-transcript-native
+bench-transcript-native:
+	@test -n "$(BENCH_TRANSCRIPT_OUT)" -a -n "$(BENCH_NATIVE_OUT)" || (echo "Set BENCH_TRANSCRIPT_OUT and a fresh BENCH_NATIVE_OUT"; exit 2)
+	python3 scripts/transcript-native-bench.test.py
+	python3 scripts/transcript-native-bench.py "$(BENCH_TRANSCRIPT_OUT)" --out "$(BENCH_NATIVE_OUT)"

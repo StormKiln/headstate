@@ -93,17 +93,20 @@ async function main() {
   const raw = await (await fetch(`/fixtures/${fixture}.json`)).text();
   const base = JSON.parse(raw) as TranscriptWindow;
 
-  const file = new SyntheticTranscript(base);
-  let consumed = file.size;
+  // Static opening/scrolling measures any production position unchanged.
+  // Only follow mode invents later growth; it still requires a real end window.
+  const file = follow ? new SyntheticTranscript(base) : null;
+  let consumed = file?.size ?? base.page.file_bytes;
   const probe: HarnessProbe = {
     reads: [],
     refused: [],
-    size: file.size,
+    size: consumed,
     queued: 0,
     appended: 0,
     initialMessages: base.page.messages.length,
     chunkMessages(turns) { return chunk(0, turns, Infinity).messages.length; },
     grow(n, turns = false, take = Infinity) {
+      if (!file) throw new Error("harness: growth requires an end-window follow fixture");
       for (let i = 0; i < n; i++) {
         const g = ++generation;
         const page = chunk(g, turns, take);
@@ -144,6 +147,10 @@ async function main() {
         throw new Error(`harness: no answer for ${cmd}`);
       }
       const a = args as { anchor: { kind: string; offset?: number; behind_digest?: string }; direction: string };
+      if (!file) {
+        if (a.anchor.kind === "end") return JSON.parse(raw) as TranscriptWindow;
+        throw new Error("harness: static position fixture has no adjacent pages");
+      }
       let w: TranscriptWindow;
       if (a.anchor.kind === "end") {
         w = file.end();
