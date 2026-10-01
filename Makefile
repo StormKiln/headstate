@@ -154,17 +154,18 @@ bench-transcript:
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
 
 # The viewer in a browser (#1480, the harness #1487 designed): writes each
-# fixture's message page, builds the harness page (vite.harness.config.ts,
+# fixture's production window, builds the harness page (vite.harness.config.ts,
 # into dist-harness), and opens every page in Playwright's Chromium to
 # take B1 (open to first paint), B2 (long tasks while scrolling) and B3
 # (heap); then B4 (idle live-follow cost, nudges, eviction; about three
 # minutes a page in real time) and a B5 estimate (page bytes over the
-# real-text compression ratio). HARNESS_PHASES=open|follow|b5 picks parts.
+# real-text compression ratio). HARNESS_PHASES=open,follow,growth,b5 picks parts.
 # Not in `test` or CI, for bench-transcript's reason: its figures
 # describe the machine. Needs the browser once:
 # `yarn playwright install chromium` (or HARNESS_CHANNEL=chrome to use an
 # installed Chrome).
 bench-transcript-browser:
+	node --test scripts/transcript-browser-inputs.test.mjs
 	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
 	( cd src-tauri && HEADSTATE_TRANSCRIPT_PAYLOADS_OUT="$$out" \
 		cargo test --release --lib read_bench::transcript_message_payloads -- --ignored --nocapture ) \

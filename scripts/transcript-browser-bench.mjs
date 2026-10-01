@@ -4,7 +4,7 @@
 // harness"); `make bench-transcript-browser` runs this.
 //
 // Serves the harness build (`dist-harness`, from vite.harness.config.ts)
-// and the fixture pages the Rust side wrote (`<fixture>.messages-*.json`),
+// and the fixture pages the Rust side wrote (`<fixture>.window-end.json`),
 // opens each fixture in Playwright's Chromium and takes:
 //
 // - B1, open to first paint of the newest message: from a
@@ -48,6 +48,7 @@ import { createServer } from "node:http";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
+import { selectInputs, growthChunks, qualifyGrowth } from "./transcript-browser-inputs.mjs";
 
 const B1_MS = 300;
 const LONG_TASK_MS = 50;
@@ -64,16 +65,7 @@ const IDLE_MS = 45_000;
 const HIDDEN_MS = 20_000;
 /// A nudge for new bytes must be read faster than any idle delay.
 const NUDGE_MS = 1_000;
-/// Growth pages for the eviction runs, one fixture page's messages each:
-/// enough to pass the follower's `MAX_RESIDENT` (2,000) about 1.6 times.
-const GROW_CHUNKS = 30;
 const MAX_RESIDENT = 2_000;
-const B4_DEFAULT = ["messages-1k.messages-tail", "tool-heavy-70mb.messages-whole"];
-/// Exercise ordinary pages and a deliberate 400-message catch-up stress
-/// case. GROW_FIXTURE selects a single fixture for focused comparisons.
-const GROW_FIXTURES = process.env.GROW_FIXTURE
-  ? [process.env.GROW_FIXTURE]
-  : ["messages-1k.messages-tail", "tool-heavy-70mb.messages-whole"];
 
 // B5. #1478 (PR #1497): 20 real local transcript pages compressed 2.11x
 // to 4.43x, median ~2.8x. The generated fixtures compress ~7x, which
@@ -81,8 +73,6 @@ const GROW_FIXTURES = process.env.GROW_FIXTURE
 const REAL_RATIO_MEDIAN = 2.8;
 const REAL_RATIO_WORST = 2.11;
 const B5_BYTES = 150 * 1000;
-
-const PHASES = new Set((process.env.HARNESS_PHASES || "open,follow,growth,b5").split(","));
 
 const dir = process.argv[2];
 if (!dir) {
@@ -96,18 +86,7 @@ try {
   console.error(`no harness build at ${DIST}: run \`yarn vite build -c vite.harness.config.ts\``);
   process.exit(2);
 }
-const fixtures = readdirSync(dir)
-  .filter((f) => /\.messages-(tail|whole)\.json$/.test(f))
-  .sort()
-  .map((f) => f.replace(/\.json$/, ""));
-const b4Fixtures = (process.env.B4_FIXTURES ? process.env.B4_FIXTURES.split(",") : B4_DEFAULT).filter((f) =>
-  fixtures.includes(f),
-);
-if (fixtures.length === 0) {
-  // Not a pass: nothing was measured.
-  console.error(`no *.messages-*.json pages in ${dir}: nothing was measured`);
-  process.exit(2);
-}
+const { phases: PHASES, fixtures, b4Fixtures, growthFixtures: GROW_FIXTURES, b5: b5Pages } = selectInputs(readdirSync(dir), process.env);
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
 const server = createServer((req, res) => {
@@ -459,6 +438,7 @@ async function follow(name) {
   const at = Object.fromEntries(phases.map((p) => [p.label, p]));
   const check = (bad, what) => bad && over.push(`${name}: ${what}`);
   check(errors.length > 0, `page errors: ${errors.join("; ")}`);
+  check(refused.length > 0, `refused commands: ${refused.join("; ")}`);
   for (const p of phases) {
     const worst = p.longTasks.length === 0 ? 0 : Math.max(...p.longTasks);
     check(worst > LONG_TASK_MS, `B4 ${p.label}: a ${worst.toFixed(0)} ms long task with nothing new`);
@@ -493,7 +473,7 @@ async function heldChunks(cdp) {
   return held;
 }
 
-/// Grow the transcript `GROW_CHUNKS` pages past the first, one page per
+/// Grow enough actual page messages past the resident bound, one page per
 /// nudge, and see what the follow lets go. Two readers:
 ///
 /// - `live edge`: the reader pressed "jump to latest" and is following;
@@ -529,6 +509,8 @@ async function growth(name, scenario) {
     await page.waitForTimeout(1_000);
   }
   await page.evaluate(() => { window.__longTasks = []; });
+  const initial = await page.evaluate(() => window.__harness.initialMessages);
+  const chunkCount = growthChunks(await page.evaluate(t => window.__harness.chunkMessages(t), newTurns));
   const perChunk = [];
   const heaps = [];
   let rowsMax = 0;
@@ -540,7 +522,7 @@ async function growth(name, scenario) {
       const s = document.querySelector('[data-testid="transcript-read-status"]');
       return s?.dataset.state === "paused" && s.textContent.includes("Jump to the latest");
     });
-  for (let i = 1; i <= GROW_CHUNKS; i++) {
+  for (let i = 1; i <= chunkCount; i++) {
     const s = await page.evaluate((t) => {
       window.__harness.grow(1, t);
       return window.__harness.size;
@@ -595,17 +577,21 @@ async function growth(name, scenario) {
     }
   }
   const longTasks = await page.evaluate(() => window.__longTasks);
+  const refused = await page.evaluate(() => window.__harness.refused);
   await context.close();
 
   const chunkSize = perChunk[0];
+  try { qualifyGrowth(initial, perChunk.at(-1), perChunk.length, held, detachedAfter !== null); }
+  catch (e) { over.push(`${name}, ${scenario}: ${e.message}`); }
   const bound = Math.ceil(MAX_RESIDENT / chunkSize) + 1;
   const check = (bad, what) => bad && over.push(`${name}, ${scenario}: ${what}`);
   check(errors.length > 0, `page errors: ${errors.join("; ")}`);
+  check(refused.length > 0, `refused commands: ${refused.join("; ")}`);
   const top = Math.max(...heaps.map((h) => h.heap));
   check(top > HEAP_MB * 1024 * 1024, `B3 while growing: heap ${mb(top)} > ${HEAP_MB} MB`);
   check(
     held.size > bound,
-    `eviction: ${held.size} of ${GROW_CHUNKS} appended pages (${chunkSize} messages each) are still held; the ${MAX_RESIDENT}-message bound allows ${bound}`,
+    `eviction: ${held.size} of ${perChunk.length} appended pages (${chunkSize} messages each) are still held; the ${MAX_RESIDENT}-message bound allows ${bound}`,
   );
   // A reader following at the bottom keeps following: the far end is
   // the oldest page, never the newest.
@@ -614,26 +600,26 @@ async function growth(name, scenario) {
     `the follow detached after page ${detachedAfter} while the reader followed the live edge`,
   );
   check(rejoined === false, `"Jump to the latest" did not follow again after the follow detached`);
-  return { name, scenario, chunkSize, heaps, held, bound, rowsMax, longTasks, detachedAfter, rejoined };
+  return { name, scenario, chunkCount, chunks: perChunk.length, chunkSize, heaps, held, bound, rowsMax, longTasks, detachedAfter, rejoined };
 }
 
 function growthTables() {
   for (const g of growthRows) {
     const lt = g.longTasks;
     console.log(
-      `\n#### Growth past the ${MAX_RESIDENT}-message bound: ${g.name}, reader ${g.scenario} (${GROW_CHUNKS} pages of ${g.chunkSize} messages, one per nudge)\n`,
+      `\n#### Growth past the ${MAX_RESIDENT}-message bound: ${g.name}, reader ${g.scenario} (${g.chunkCount} pages of ${g.chunkSize} messages, one per nudge)\n`,
     );
     console.log("| messages appended after the first page | heap after GC | rows mounted | reader's distance from the bottom |");
     console.log("|---:|---:|---:|---:|");
     for (const h of g.heaps) console.log(`| ${h.appended} | ${mb(h.heap)} | ${h.mounted} | ${Math.round(h.bottomGap)} px |`);
     const ids = [...g.held].sort((a, b) => a - b);
     console.log(
-      `\nappended pages whose messages are still in the heap: ${g.held.size} of ${GROW_CHUNKS}${ids.length ? ` (pages ${ids.join(", ")})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
+      `\nappended pages whose messages are still in the heap: ${g.held.size} of ${g.chunks}${ids.length ? ` (pages ${ids.join(", ")})` : ""}; the bound allows ${g.bound}. Long tasks while growing: ${lt.length}${lt.length ? ` (max ${Math.max(...lt).toFixed(0)} ms)` : ""}; most rows mounted: ${g.rowsMax}.`,
     );
     console.log(
       g.detachedAfter === null
-        ? `The follow stayed at the live edge for all ${GROW_CHUNKS} pages.`
-        : `The follow detached after page ${g.detachedAfter} of ${GROW_CHUNKS} (growth stopped there); "Jump to the latest" ${g.rejoined ? "followed again" : "did NOT follow again"}.`,
+        ? `The follow stayed at the live edge for all ${g.chunkCount} pages.`
+        : `The follow detached after page ${g.detachedAfter} of ${g.chunkCount} (growth stopped there); "Jump to the latest" ${g.rejoined ? "followed again" : "did NOT follow again"}.`,
     );
   }
 }
@@ -676,13 +662,7 @@ function kb(x) {
 }
 
 function b5Table() {
-  const pages = readdirSync(dir)
-    .filter((f) => /\.window-(end|middle|start)\.json$/.test(f))
-    .sort();
-  if (pages.length === 0) {
-    console.log("\nB5: no *.window-*.json pages were written, so B5 was not estimated");
-    return;
-  }
+  const pages = b5Pages;
   console.log(
     `\n### B5, phone page bytes: an ESTIMATE from real-page ratios (${REAL_RATIO_MEDIAN}x median, ${REAL_RATIO_WORST}x worst; #1478), not a device measurement\n`,
   );

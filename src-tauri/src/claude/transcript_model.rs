@@ -709,6 +709,7 @@ impl Line {
 /// Split on the raw bytes BEFORE decoding, so an offset is a file offset
 /// even where a record holds invalid UTF-8 (decoded lossily, record by
 /// record).
+#[cfg(test)]
 pub(crate) fn lines_of(bytes: &[u8], base: u64) -> Vec<Line> {
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -1726,51 +1727,6 @@ fn short_hash(line: &str) -> String {
 // ---------------------------------------------------------------------
 // Reading files
 // ---------------------------------------------------------------------
-
-/// The tail of `path` as messages, bounded like `preview::tail`: a
-/// [`preview::TAIL_BYTES`] window, at most [`MAX_MESSAGES`], each block
-/// clipped with its clip stated.
-///
-/// # Errors
-///
-/// Only when the file cannot be opened, sized, sought or read. A window
-/// with no messages is an answer, and its counts say why.
-pub fn tail(path: &Path) -> Result<TranscriptPage, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
-    let file_bytes = file
-        .metadata()
-        .map_err(|e| format!("{}: could not read its size: {e}", path.display()))?
-        .len();
-    let start = file_bytes.saturating_sub(preview::TAIL_BYTES);
-    file.seek(SeekFrom::Start(start))
-        .map_err(|e| format!("{}: could not seek in it: {e}", path.display()))?;
-    let limit = file_bytes - start;
-    let mut buf = Vec::with_capacity(limit as usize);
-    let mut bounded = std::io::Read::take(&mut file, limit);
-    bounded
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
-    let bytes_read = limit - bounded.limit();
-
-    let (skip, window) = if start > 0 {
-        // Landed mid-record: drop to the first newline, `preview::tail`'s
-        // rule and for its reason.
-        let skip = buf
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(buf.len(), |nl| nl + 1);
-        (skip, WindowStart::MidFile)
-    } else {
-        (0, WindowStart::FileStart)
-    };
-    let lines = lines_of(&buf[skip..], start + skip as u64);
-    let mut page = capped(build(&lines, Seed::at(window), Some(path)));
-    page.bytes_read = bytes_read;
-    page.file_bytes = file_bytes;
-    page.truncated |= start > 0;
-    Ok(page)
-}
 
 /// One block's full text, found by the record's uuid (#1475).
 ///
@@ -3046,8 +3002,16 @@ mod tests {
             ),
         ];
         // CRLF, so the fetch's line handling is exercised on Windows endings.
-        let (_tmp, p) = tmp_file("full", &body(&recs).replace('\n', "\r\n"));
-        let page = tail(&p).unwrap();
+        let (_tmp, p) = tmp_file("full", &format!("{}\n", body(&recs)).replace('\n', "\r\n"));
+        let page = super::super::transcript_page::read_page(
+            &p,
+            &super::super::transcript_page::PageAnchor::End,
+            super::super::transcript_page::PageDirection::Before,
+            None,
+            super::super::transcript_page::IndexUse::None,
+        )
+        .unwrap()
+        .page;
         let TranscriptBlock::ToolCall {
             result: Some(out), ..
         } = &page.messages[0].blocks[0]
@@ -3087,28 +3051,6 @@ mod tests {
         );
     }
 
-    /// A tail that starts mid-file drops the partial first line, says it
-    /// is truncated, and keys leading uuid-less records as unanchored.
-    #[test]
-    fn a_mid_file_tail_is_truncated() {
-        let pad = user(
-            "u0",
-            serde_json::json!("z".repeat(preview::TAIL_BYTES as usize)),
-        );
-        let recs = [
-            pad,
-            serde_json::json!({"type": "permission-mode", "permissionMode": "auto"}),
-            user("u1", serde_json::json!("hi")),
-        ];
-        let (_tmp, p) = tmp_file("mid", &body(&recs));
-        let page = tail(&p).unwrap();
-        assert!(page.truncated);
-        assert!(page.bytes_read <= preview::TAIL_BYTES);
-        assert_eq!(page.messages.len(), 2, "{:#?}", page.messages);
-        assert_eq!(page.messages[0].id_source, IdSource::Unanchored);
-        assert_eq!(page.messages[1].id, "u1");
-    }
-
     /// Every message and tool output carries its record's file offset,
     /// and the offset is where that record's bytes really start -- in a
     /// file with a multi-byte character and a CRLF ending before it.
@@ -3121,7 +3063,15 @@ mod tests {
             result("r1", "t1")
         );
         let (_tmp, p) = tmp_file("offsets", &text);
-        let page = tail(&p).unwrap();
+        let page = super::super::transcript_page::read_page(
+            &p,
+            &super::super::transcript_page::PageAnchor::End,
+            super::super::transcript_page::PageDirection::Before,
+            None,
+            super::super::transcript_page::IndexUse::None,
+        )
+        .unwrap()
+        .page;
         let bytes = std::fs::read(&p).unwrap();
         let starts =
             |at: u64| bytes[at as usize] == b'{' && (at == 0 || bytes[at as usize - 1] == b'\n');
@@ -3163,8 +3113,16 @@ mod tests {
                 serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": long}]),
             ),
         ];
-        let (_tmp, p) = tmp_file("hint", &body(&recs));
-        let page = tail(&p).unwrap();
+        let (_tmp, p) = tmp_file("hint", &format!("{}\n", body(&recs)));
+        let page = super::super::transcript_page::read_page(
+            &p,
+            &super::super::transcript_page::PageAnchor::End,
+            super::super::transcript_page::PageDirection::Before,
+            None,
+            super::super::transcript_page::IndexUse::None,
+        )
+        .unwrap()
+        .page;
         let TranscriptBlock::ToolCall {
             result: Some(out), ..
         } = &page.messages[1].blocks[0]

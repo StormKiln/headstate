@@ -62,6 +62,8 @@ interface HarnessProbe {
   queued: number;
   /// Messages appended so far.
   appended: number;
+  initialMessages: number;
+  chunkMessages(newTurns: boolean): number;
   /// Queue `n` chunks of growth, one fixture page's messages each. By
   /// default each chunk continues the turn in progress -- its prompts
   /// are left out, as in one long agentic turn -- so a reader at the live
@@ -89,7 +91,7 @@ async function main() {
   if (!fixture) throw new Error("harness: ?fixture=<name> is required");
   const follow = params.get("mode") === "follow";
   const raw = await (await fetch(`/fixtures/${fixture}.json`)).text();
-  const base = JSON.parse(raw) as TranscriptPage;
+  const base = JSON.parse(raw) as TranscriptWindow;
 
   const file = new SyntheticTranscript(base);
   let consumed = file.size;
@@ -99,6 +101,8 @@ async function main() {
     size: file.size,
     queued: 0,
     appended: 0,
+    initialMessages: base.page.messages.length,
+    chunkMessages(turns) { return chunk(0, turns, Infinity).messages.length; },
     grow(n, turns = false, take = Infinity) {
       for (let i = 0; i < n; i++) {
         const g = ++generation;
@@ -117,7 +121,7 @@ async function main() {
   // One chunk of growth: the fixture's messages under ids no earlier
   // chunk used, costing the bytes of the JSON they came from.
   const chunk = (g: number, newTurns: boolean, keep: number): TranscriptPage => {
-    const page = JSON.parse(raw.replace(IDS, (id) => `${id}-g${g}`)) as TranscriptPage;
+    const page = (JSON.parse(raw.replace(IDS, (id) => `${id}-g${g}`)) as TranscriptWindow).page;
     // Continuing the turn in progress: no opener, and every message's
     // turn is the one the merge carries in from the page before.
     const messages = (
@@ -139,7 +143,7 @@ async function main() {
         probe.refused.push(cmd);
         throw new Error(`harness: no answer for ${cmd}`);
       }
-      const a = args as { anchor: { kind: string; offset?: number }; direction: string };
+      const a = args as { anchor: { kind: string; offset?: number; behind_digest?: string }; direction: string };
       let w: TranscriptWindow;
       if (a.anchor.kind === "end") {
         w = file.end();
@@ -147,7 +151,7 @@ async function main() {
         probe.queued = 0;
       } else if (a.direction === "after") {
         const from = a.anchor.offset ?? consumed;
-        w = file.after(from);
+        w = file.after(from, a.anchor.behind_digest);
         if (w.end.offset > consumed) {
           consumed = w.end.offset;
           probe.queued = Math.max(0, probe.queued - 1);

@@ -264,19 +264,21 @@ browser.
 
 How it is built:
 
-- **Payloads.** `read_bench::transcript_message_payloads` (ignored; a no-op
-  without `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT`) writes, per fixture, the
-  `TranscriptPage` exactly as `transcript_model::tail` reads it
-  (`<fixture>.messages-tail.json`) and the whole file parsed as one page
-  (`<fixture>.messages-whole.json`). The read model caps a page at its newest
-  400 messages (`MAX_MESSAGES`), so "whole" is the fullest page a read can hand
-  the viewer today. It also writes the pages the viewer actually reads
-  (`<fixture>.window-{end,middle,start}.json`): the `TranscriptWindow` of
-  `claude_transcript_page` backwards from the end, backwards from the middle
-  and forwards from byte 0, as JSON exactly as it crosses to the webview and
-  the phone. B5 is estimated from these. The fixtures themselves are
-  generated into the test's own temporary directory, which is dropped; only
-  the payloads are written to the output directory.
+- **Payloads (8.2).** `read_bench::transcript_message_payloads` writes
+  `<fixture>.window-{end,middle,start}.json` using the production
+  `transcript_page::read_page` with `IndexUse::None`. B1–B4 open only the
+  end window, capped at 200 messages. The initial IPC response retains its
+  actual cursors/digests, seam, positions, clipping and read/scanned counters;
+  I/O bytes are never interpreted as its cursor span. Parsing that window
+  inside the mock IPC answer remains included in B1. Middle/start windows
+  feed B5 estimates. Cached-index startup, command authorization, native IPC
+  and remote masking are not measured by this mock browser path.
+  Synthetic source files live in the writer's temporary directory; only
+  payloads go to the requested output directory. Existing saved payloads
+  are not deleted. Legacy tail/whole filenames are ignored by selection.
+  The old 400-message full-parser stress inputs are no longer generated or
+  benchmarked; the historical tables below retain their original workloads
+  and cannot be compared directly with the current 200-message pages.
 - **Target.** `vite.harness.config.ts` builds the app's own Vite config
   against `harness/transcript.html` into `dist-harness/`; the app bundle never
   includes it. The page (`src/harness/transcriptBench.tsx`) mounts
@@ -758,3 +760,34 @@ Reproduce without regenerating any saved benchmark fixtures:
 ```sh
 CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib synthetic_watch_tick_measurement -- --ignored --nocapture
 ```
+
+
+## 8.2 production-window harness migration (#1541)
+
+`transcript_model::tail` has been removed after migrating its full-text,
+offset and hint tests to the production page reader. `preview::tail` remains
+the separate supported stop-proposal reader. Production page tests retain
+UUID-less anchoring, oversized-record, partial-trailing-record and tiling
+coverage; the obsolete tail-only unanchored behavior is not emulated.
+
+Current B4 defaults are `messages-1k.window-end` and
+`tool-heavy-70mb.window-end`. `B4_FIXTURES` and `GROW_FIXTURE` select those
+names without `.json`; missing requested/default fixtures and empty or
+unknown selected phases fail before measurement. B5-only selection can use
+just middle/start windows, but cannot silently pass with no payloads.
+
+Growth retains replay recipes rather than generated message objects. Its
+subsequent cursors/positions remain explicitly synthetic; only the initial
+window is a real production payload. The planned growth count is at least
+30 chunks and enough to append 3,200 actual messages after filtering prompts
+for the continuing-turn case. Empty growth fails. Each run must show that
+initial plus appended messages exceeds 2,000 and the expected page was
+released: oldest for a live-edge reader, rejected newest for a parked reader
+that detaches. Existing heap/page-count bounds, rejoin, visibility, nudges,
+Element Timing and scroll checks remain. No fixed 30-chunk assumption can
+turn a below-cap run into an eviction success.
+
+This migration records no replacement timings. Release Task 10 will run the
+final browser measurements after export/accessibility changes. Historical
+400-message stress results, B5 compression estimates, and actual-device
+limitations remain qualified as originally measured.
