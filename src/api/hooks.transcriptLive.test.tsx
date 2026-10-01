@@ -56,12 +56,11 @@ function book(path: string, pages: number): RemoteTranscriptWindow[] {
 
 const books = vi.hoisted(() => new Map<string, unknown[]>());
 const pageRead = vi.hoisted(() =>
-  vi.fn(
-    async (
-      path: string,
-      anchor: { kind: string; offset?: number },
-      direction: string,
-    ): Promise<unknown> => {
+  vi.fn<(
+    path: string, anchor: { kind: string; offset?: number }, direction: string,
+    limit?: number | null, reveal?: boolean,
+  ) => Promise<unknown>>(
+    async (path, anchor, direction) => {
       const b = books.get(path) as RemoteTranscriptWindow[];
       if (anchor.kind === "end") return b.at(-1);
       if (direction === "before") return b.find((w) => w.end.offset === anchor.offset);
@@ -71,6 +70,8 @@ const pageRead = vi.hoisted(() =>
     },
   ),
 );
+const defaultPageRead = pageRead.getMockImplementation()!;
+
 vi.mock("./tauri", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   claudeTranscriptPage: pageRead,
@@ -97,6 +98,7 @@ beforeEach(() => {
   });
   books.clear();
   pageRead.mockClear();
+  pageRead.mockImplementation(defaultPageRead);
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -156,5 +158,44 @@ describe("useClaudeTranscriptLive", () => {
     expect(result.current.messages!.length).toBeLessThanOrEqual(600);
     expect(result.current.messages!.at(-1)!.id).toBe(last);
     expect(result.current.hasOlder).toBe(true);
+  });
+});
+
+describe("saved-position fallback lifecycle", () => {
+  it.each(["path", "reveal", "disabled", "unmount"])("stops the old owner's pending fallback on %s", async (change) => {
+    const old = book("/a.jsonl", 60);
+    const fresh = book("/b.jsonl", 1)[0];
+    let oldReads = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    pageRead.mockImplementation(async (path, anchor, direction, _limit, reveal) => {
+      if (path !== "/a.jsonl" || reveal) return fresh;
+      oldReads++;
+      if (anchor.kind === "end") return old.at(-1);
+      if (direction === "after") return { ...old.at(-1)!, rewritten: true };
+      const w = old.find((p) => p.end.offset === anchor.offset)!;
+      if (oldReads === 3) await pending;
+      return w;
+    });
+    const { result, rerender, unmount } = renderHook(
+      ({ path, reveal, enabled }) => useClaudeTranscriptLive(path, {
+        liveness: { state: "dead", why: "fixture" }, reveal, enabled,
+        openAt: "missing", openAtCursor: { offset: 900, behind_digest: "stale" },
+      }),
+      { initialProps: { path: "/a.jsonl", reveal: false, enabled: true } },
+    );
+    await settle();
+    expect(oldReads).toBe(3);
+    const oldCursor = result.current.cursorFor;
+    if (change === "unmount") unmount();
+    else rerender({ path: change === "path" ? "/b.jsonl" : "/a.jsonl", reveal: change === "reveal", enabled: change !== "disabled" });
+    await settle();
+    release();
+    await settle();
+    expect(oldReads).toBe(3);
+    expect(oldCursor("/a.jsonl#11600")).toBeNull();
+    if (change === "disabled") expect(result.current.navigationNotice).toMatch(/cancelled/i);
+    else if (change !== "unmount") expect(result.current.messages?.[0].id).toMatch(/^\/b\.jsonl#/);
+    unmount();
   });
 });

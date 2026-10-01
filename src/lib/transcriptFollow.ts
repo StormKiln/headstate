@@ -268,6 +268,8 @@ export class TranscriptFollower {
   private readonly now: () => number;
   private openAt: string | null;
   private readonly openAtCursor: PageCursor | null;
+  private navigationGeneration = 0;
+  private activeNavigation: number | null = null;
 
   constructor(
     private readonly fetchPage: FetchPage,
@@ -299,10 +301,11 @@ export class TranscriptFollower {
     this.kick();
   }
 
-  /// Stop reading. A read in flight still lands -- what it retrieved is
-  /// an answer -- but nothing further is scheduled.
+  /// Stop reading. An ordinary single read may land, but a saved-position
+  /// search loses ownership immediately and discards its outstanding answer.
   stop(): void {
     this.running = false;
+    this.cancelNavigation();
     this.clearTimer();
     this.publish();
   }
@@ -319,6 +322,7 @@ export class TranscriptFollower {
   setVisible(visible: boolean): void {
     if (visible === this.visible) return;
     this.visible = visible;
+    if (!visible) this.cancelNavigation();
     this.kick();
   }
 
@@ -347,6 +351,7 @@ export class TranscriptFollower {
 
   /// The viewer reached the oldest message held.
   loadOlder(): Promise<void> {
+    this.cancelNavigation();
     return this.enqueue(() => this.older());
   }
 
@@ -355,12 +360,14 @@ export class TranscriptFollower {
   /// reads the next page forward.
   loadNewer(): Promise<void> {
     if (this.attached) return Promise.resolve();
+    this.cancelNavigation();
     return this.enqueue(() => this.newer());
   }
 
   /// "Jump to latest" from a run that no longer reaches the live edge:
   /// open on the newest page again.
   jumpToLatest(): Promise<void> {
+    this.cancelNavigation();
     if (this.attached) return Promise.resolve();
     return this.enqueue(async () => {
       const w = await this.read({ kind: "end" }, "before");
@@ -392,35 +399,48 @@ export class TranscriptFollower {
   /// direction, and "jump to latest" re-attaches. A cursor the file no
   /// longer matches comes back `rewritten`, which is a replacement from
   /// the end as any other.
-  seek(id: string, at: PageCursor | null): Promise<boolean> {
-    return this.enqueue(() => this.seekHeld(id, at))
-      .then(() => this.pages.length > 0 && pageOf(this.pages, id) >= 0);
+  /// `null` means cancelled, not a successful landing or a missing message.
+  seek(id: string, at: PageCursor | null): Promise<boolean | null> {
+    const generation = this.cancelNavigation();
+    this.activeNavigation = generation;
+    return this.enqueue(() => this.seekHeld(id, at, generation))
+      .then(() => this.navigationCurrent(generation)
+        ? this.pages.length > 0 && pageOf(this.pages, id) >= 0
+        : null);
   }
 
   /// Shared by opening and explicit navigation. Never enqueue from inside
   /// the queue: opening would wait for itself to finish.
-  private async seekHeld(id: string, at: PageCursor | null): Promise<void> {
+  private async seekHeld(id: string, at: PageCursor | null, generation: number): Promise<void> {
+    if (!this.navigationCurrent(generation)) return;
+    // One budget shared by a nearby search and any rewritten-cursor fallback.
+    // Ten 200-message production pages cover the normal resident history.
+    const budget = { remaining: SEEK_PAGES };
     this.snap = { ...this.snap, navigationNotice: null };
     if (this.pages.length === 0 || pageOf(this.pages, id) >= 0) {
+      this.activeNavigation = null;
       this.publish();
       return;
     }
     const first = this.pages[0];
     const near = at === null ||
       (at.offset < first.start.offset && first.start.offset - at.offset <= SEEK_NEAR_BYTES);
-    if (near) await this.reachBack(id);
+    if (near) await this.reachBack(id, generation, budget);
+    if (!this.navigationCurrent(generation)) return;
     let stale = false;
     if (pageOf(this.pages, id) < 0 && at !== null) {
-      const w = await this.read(cursor(at), "after");
+      const w = await this.read(cursor(at), "after", generation);
       if (w !== null) {
         stale = w.rewritten;
         this.pages = [w];
         this.attached = w.at_end;
         this.viewport = null;
         this.bump();
-        if (stale) await this.reachBack(id);
+        if (stale) await this.reachBack(id, generation, budget);
       }
     }
+    if (!this.navigationCurrent(generation)) return;
+    this.activeNavigation = null;
     const found = pageOf(this.pages, id) >= 0;
     const navigationNotice = stale
       ? this.snap.error !== null
@@ -442,6 +462,7 @@ export class TranscriptFollower {
   /// held. Stopping at `SEEK_PAGES` is not the end: the next call goes
   /// on from there, so the button that asked still works.
   loadOlderUntil(wanted: (m: TranscriptMessage) => boolean): Promise<boolean> {
+    this.cancelNavigation();
     const held = () => this.pages.some((p) => p.page.messages.some(wanted));
     return this.enqueue(async () => {
       if (this.pages.length === 0 || held()) return;
@@ -471,6 +492,7 @@ export class TranscriptFollower {
 
   /// Read now, whatever the cadence says: pull to refresh, "Try again".
   refresh(): Promise<void> {
+    this.cancelNavigation();
     this.clearTimer();
     return this.enqueue(() => this.tick());
   }
@@ -485,6 +507,25 @@ export class TranscriptFollower {
   }
 
   // ---- internals ----
+
+  private navigationCurrent(generation: number): boolean {
+    return generation === this.navigationGeneration && this.running && this.visible;
+  }
+
+  /// Invalidate before enqueueing a newer action. It then waits for at most
+  /// the outstanding RPC, never the rest of an abandoned backward scan.
+  private cancelNavigation(): number {
+    this.navigationGeneration++;
+    if (this.activeNavigation !== null) {
+      this.activeNavigation = null;
+      this.snap = {
+        ...this.snap,
+        navigationNotice: "Saved-position search was cancelled. Use Turns or Find to locate the saved message.",
+      };
+      this.publish();
+    }
+    return this.navigationGeneration;
+  }
 
   private enqueue(op: () => Promise<void>): Promise<void> {
     this.busy++;
@@ -552,13 +593,17 @@ export class TranscriptFollower {
   private async read(
     anchor: TranscriptPageAnchor,
     direction: TranscriptPageDirection,
+    navigation?: number,
   ): Promise<RemoteTranscriptWindow | null> {
+    if (navigation !== undefined && !this.navigationCurrent(navigation)) return null;
     try {
       const w = await this.fetchPage(anchor, direction);
+      if (navigation !== undefined && !this.navigationCurrent(navigation)) return null;
       this.snap = { ...this.snap, error: null, lastReadAt: this.now(), fileBytes: w.page.file_bytes };
       if (w.masking !== undefined) this.lastMasking = w.masking;
       return w;
     } catch (e) {
+      if (navigation !== undefined && !this.navigationCurrent(navigation)) return null;
       this.snap = { ...this.snap, error: e };
       this.backOff();
       return null;
@@ -612,8 +657,15 @@ export class TranscriptFollower {
 
   /// The first page: the newest, and then back to `openAt` if asked.
   private async open(): Promise<void> {
-    const w = await this.read({ kind: "end" }, "before");
+    const target = this.openAt;
+    const generation = this.navigationGeneration;
+    this.openAt = null;
+    if (target !== null) this.activeNavigation = generation;
+    const w = await this.read({ kind: "end" }, "before", target === null ? undefined : generation);
+    if (target !== null && !this.navigationCurrent(generation)) return;
     if (w === null) {
+      this.openAt = target;
+      this.activeNavigation = null;
       this.publish();
       return;
     }
@@ -621,9 +673,10 @@ export class TranscriptFollower {
     this.pages = [w];
     this.attached = true;
     if (this.live === "running") this.lastGrowthAt = this.now();
-    const target = this.openAt;
-    this.openAt = null;
-    if (target !== null) await this.seekHeld(target, this.openAtCursor);
+    if (target !== null) {
+      await this.seekHeld(target, this.openAtCursor, generation);
+      if (!this.navigationCurrent(generation)) return;
+    }
     this.publish();
   }
 
@@ -640,15 +693,18 @@ export class TranscriptFollower {
   /// Prepend older pages until `id` is held, the start is reached, or
   /// the bound would bind. Does not publish: the caller publishes once,
   /// so no intermediate list is ever seen.
-  private async reachBack(id: string): Promise<void> {
-    // Even bookkeeping-only pages must consume the finite search budget.
-    for (
-      let reads = 0;
-      reads < this.max && pageOf(this.pages, id) < 0 && !this.pages[0].at_start && count(this.pages) < this.max;
-      reads++
+  private async reachBack(
+    id: string,
+    generation = this.navigationGeneration,
+    budget = { remaining: SEEK_PAGES },
+  ): Promise<void> {
+    while (
+      this.navigationCurrent(generation) && budget.remaining > 0 &&
+      pageOf(this.pages, id) < 0 && !this.pages[0].at_start && count(this.pages) < this.max
     ) {
+      budget.remaining--;
       const first = this.pages[0];
-      const w = await this.read(cursor(first.start), "before");
+      const w = await this.read(cursor(first.start), "before", generation);
       if (
         w === null || w.rewritten || w.end.offset !== first.start.offset ||
         w.start.offset >= first.start.offset || count(this.pages) + w.page.messages.length > this.max

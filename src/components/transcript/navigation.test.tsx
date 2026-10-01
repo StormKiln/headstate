@@ -5,7 +5,7 @@
 /// Generic fixtures only.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   FindHit,
@@ -15,7 +15,8 @@ import type {
   TranscriptPageAnchor,
   TranscriptPageDirection,
 } from "../../types/transcript";
-import { DEAD } from "./fixtures";
+import { useJumps } from "./useNavigation";
+import { DEAD, liveOf } from "./fixtures";
 import { installScrollShim, type ScrollShim } from "./scrollShim";
 
 const REC = 100;
@@ -395,3 +396,33 @@ for (const [host, Host] of [["desktop", DesktopTranscript], ["phone", PhoneTrans
     });
   });
 }
+
+it("a cancelled jump cannot clear the newer jump's pending landing", async () => {
+  let cancelFirst!: (value: boolean | null) => void;
+  const first = new Promise<boolean | null>((resolve) => { cancelFirst = resolve; });
+  const live = liveOf(undefined, undefined, {
+    seek: (id) => id === "p1" ? first : Promise.resolve(true),
+  });
+  const scrollTo = vi.fn(() => true);
+  const handle = { current: { scrollTo, scrollToLatest() {}, firstVisible: () => null } };
+  const { result, rerender } = renderHook(
+    ({ messages }) => useJumps({ live, messages, shown: messages, handle }),
+    { initialProps: { messages: [] as TranscriptMessage[] } },
+  );
+  act(() => result.current.jumpTo("p1", null));
+  act(() => result.current.jumpTo("p2", null));
+  await act(async () => { cancelFirst(null); });
+  rerender({ messages: [message(2)] });
+  expect(scrollTo).toHaveBeenCalledWith("p2");
+  expect(result.current.note).toBeNull();
+});
+
+it("a jump to a held row still supersedes the follower's pending search", () => {
+  const seek = vi.fn(() => Promise.resolve(true));
+  const live = liveOf(undefined, undefined, { seek });
+  const handle = { current: { scrollTo: () => true, scrollToLatest() {}, firstVisible: () => null } };
+  const messages = [message(2)];
+  const { result } = renderHook(() => useJumps({ live, messages, shown: messages, handle }));
+  act(() => result.current.jumpTo("p2", null));
+  expect(seek).toHaveBeenCalledWith("p2", null);
+});

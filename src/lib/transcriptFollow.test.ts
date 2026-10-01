@@ -283,20 +283,79 @@ describe("saved page cursors (#1530)", () => {
     expect(f.getSnapshot().error).toBeNull();
   });
 
-  it("bounds fallback reads even across pages containing only bookkeeping", async () => {
+  it("bounds bookkeeping-only fallback independently of the production resident limit", async () => {
     const file = new FakeFile(10_000);
     let reads = 0;
     const f = new TranscriptFollower(async (anchor, direction) => {
-      if (++reads > 20) throw new Error("test sentinel: unbounded fallback");
+      if (++reads > 30) throw new Error("test sentinel: excessive fallback");
       const w = await file.page(anchor, direction);
       return anchor.kind === "cursor" && direction === "before"
         ? { ...w, page: { ...w.page, messages: [] } } : w;
-    }, { maxResident: 12, openAt: "missing", openAtCursor: { offset: 900, behind_digest: "old" } });
+    }, { openAt: "missing", openAtCursor: { offset: 900, behind_digest: "old" } });
     f.setLive("not-running");
     f.start();
     await settle();
-    expect(reads).toBeLessThanOrEqual(14);
+    expect(reads).toBeLessThanOrEqual(12); // tail, saved cursor, at most ten backward pages
     expect(f.getSnapshot().error).toBeNull();
+    expect(f.getSnapshot().navigationNotice).toMatch(/could not be found.*history loaded/i);
+  });
+
+  it("retains legacy reach across the usual 200-message pages", async () => {
+    const file = new FakeFile(10_000, 200);
+    const f = follower(file, { openAt: "r8100" });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(ids(f.getSnapshot())).toContain("r8100");
+    expect(file.calls.length).toBe(10);
+  });
+
+  it.each(["stop", "hide", "stop-start"])("cancels a pending stale fallback on %s without late publication", async (change) => {
+    const file = new FakeFile(10_000);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const f = new TranscriptFollower(async (anchor, direction) => {
+      const w = await file.page(anchor, direction);
+      if (file.calls.length === 3) await pending;
+      return w;
+    }, { openAt: "missing", openAtCursor: { offset: 900, behind_digest: "old" } });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    expect(file.calls.length).toBe(3);
+    if (change === "hide") f.setVisible(false);
+    else f.stop();
+    if (change === "stop-start") f.start();
+    const cancelled = f.getSnapshot();
+    expect(cancelled.navigationNotice).toMatch(/cancelled/i);
+    release();
+    await settle();
+    expect(file.calls.length).toBe(3);
+    expect(f.getSnapshot()).toEqual(cancelled);
+    expect(ids(f.getSnapshot())).toEqual(["r9997", "r9998", "r9999"]);
+  });
+
+  it("superseding navigation waits only for the outstanding read, not the abandoned scan", async () => {
+    const file = new FakeFile(10_000);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const f = new TranscriptFollower(async (anchor, direction) => {
+      const w = await file.page(anchor, direction);
+      if (file.calls.length === 3) await pending;
+      return w;
+    });
+    f.setLive("not-running");
+    f.start();
+    await settle();
+    const abandoned = f.seek("missing", { offset: 900, behind_digest: "old" });
+    await settle();
+    const wanted = f.seek("r10", { offset: 900, behind_digest: "g0@900" });
+    release();
+    await expect(abandoned).resolves.toBeNull();
+    await expect(wanted).resolves.toBe(true);
+    expect(file.calls.length).toBe(4);
+    expect(ids(f.getSnapshot())).toEqual(["r9", "r10", "r11"]);
+    expect(f.getSnapshot().navigationNotice).toBeNull();
   });
 
   it.each([true, false])("discloses stale saved cursors even when fallback finds the message: %s", async (found) => {

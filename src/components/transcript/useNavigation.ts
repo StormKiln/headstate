@@ -168,6 +168,7 @@ export function useJumps({
   handle: RefObject<TranscriptViewerHandle | null>;
 }): Jumps {
   const [pending, setPending] = useState<Pending | null>(null);
+  const jumpRequest = useRef(0);
   const [note, setNote] = useState<string | null>(null);
   // Scrolling is the viewer's, through its handle: done in an effect
   // after the render that decided it. `seq` makes a second jump to the
@@ -219,15 +220,20 @@ export function useJumps({
 
   const jumpTo = useCallback(
     (id: string, at: PageCursor | null) => {
+      const request = ++jumpRequest.current;
       const l = resolveId(id);
       if (l !== null) {
+        setPending(null);
+        // Even a held target supersedes an outstanding saved-position scan.
+        void live.seek(id, at);
         land(l);
         return;
       }
       setPending({ kind: "id", id });
       void live.seek(id, at).then((held) => {
-        if (held) return;
+        if (request !== jumpRequest.current || held) return;
         setPending(null);
+        if (held === null) return; // cancellation is reported by the follower, never as "not found"
         setNote(
           at === null
             ? "That message is further back than can be loaded at once. Use Turns to go there."
@@ -240,9 +246,12 @@ export function useJumps({
 
   const step = useCallback(
     (dir: -1 | 1) => {
+      jumpRequest.current++;
+      setPending(null);
       const from = handle.current?.firstVisible() ?? null;
       const target = adjacentOpener(shown, from, dir);
       if (target !== null) {
+        void live.seek(target.id, null);
         land({ anchor: target.id, note: null });
         return;
       }
