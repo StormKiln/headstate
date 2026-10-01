@@ -95,13 +95,14 @@ export function TranscriptHeader({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <LivenessLine tone={live.tone} label={live.label} />
         <WaitingLine tone={waiting.tone} label={waiting.label} title={waiting.title} />
+        {waiting.summary ? <span data-testid="permission-summary" className="min-w-0 basis-full whitespace-pre-wrap break-all text-xs"><MaskedText text={waiting.summary} /></span> : null}
       </div>
       {/* Mounted with the header, so the session STARTING to wait is
           announced (#1489): a region that arrives with its text is often
           not read. Polite, and only the present tense -- "waited earlier"
           is history, not news. */}
       <span role="status" className="sr-only">
-        {waiting.tone === "now" ? waiting.label : ""}
+        {waiting.tone === "now" ? <MaskedText text={waiting.label} /> : ""}
       </span>
       {live.detail ? (
         <p className="text-[11px] text-[#8b949e]" data-testid="transcript-header-liveness-why">
@@ -142,7 +143,7 @@ export function TranscriptHeader({
           shown.
         </p>
       ) : s.opening_prompt ? (
-        <p className="truncate text-[11px] text-[#8b949e]" title={s.opening_prompt}>
+        <p className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-[11px] text-[#8b949e]" data-testid="transcript-header-asked">
           Asked: <MaskedText text={s.opening_prompt} />
         </p>
       ) : null}
@@ -215,18 +216,18 @@ function WaitingLine({
   if (tone === "now") {
     return (
       <span
-        className="flex items-center gap-1 rounded bg-[#322e22] px-1.5 py-0.5 font-semibold text-[#d29922]"
+        className="flex min-w-0 items-center gap-1 whitespace-pre-wrap break-all rounded bg-[#322e22] px-1.5 py-0.5 font-semibold text-[#d29922]"
         title={title ?? undefined}
         data-tone={tone}
       >
         <Circle className="h-2.5 w-2.5 fill-current" aria-hidden="true" />
-        {label}
+        <MaskedText text={label} />
       </span>
     );
   }
   return (
-    <span className="text-[#8b949e]" title={title ?? undefined} data-tone={tone}>
-      {label}
+    <span className="min-w-0 whitespace-pre-wrap break-all text-[#8b949e]" title={title ?? undefined} data-tone={tone}>
+      <MaskedText text={label} />
     </span>
   );
 }

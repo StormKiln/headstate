@@ -229,6 +229,20 @@ describe("the desktop transcript", () => {
     expect(within(panels[0]).getByText(/Write the parser/)).toBeTruthy();
   });
 
+  it("exposes a partial checklist when only a TaskList result is loaded", () => {
+    state.pages[MAIN] = page([msg("result", "t", {kind:"tool_results"}, [{kind:"tool_result", ...output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"1",subject:"Snapshot task",status:"pending"}],omitted:0,truncated:false}}})}])]);
+    render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
+    expect(within(screen.getAllByRole("region",{name:"Tasks"})[0]).getByText("Snapshot task")).toBeTruthy();
+    expect(screen.getAllByText(/at least 0 of at least 1 task/).length).toBeGreaterThan(0);
+  });
+
+  it("keeps wholly omitted snapshot details reachable as incomplete", () => {
+    state.pages[MAIN] = page([msg("result", "t", {kind:"tool_results"}, [{kind:"tool_result", ...output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[],omitted:2,truncated:false}}})}])]);
+    render(<DesktopTranscript path={MAIN} liveness={DEAD} />);
+    expect(screen.getAllByRole("region",{name:"Tasks"}).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Recorded task details are incomplete.").length).toBeGreaterThan(0);
+  });
+
   it("shows no task panel for a session with no tasks", () => {
     state.pages[MAIN] = page([msg("a1", "a1", { kind: "assistant" }, [text("x")])]);
     render(<DesktopTranscript path={MAIN} liveness={DEAD} />);

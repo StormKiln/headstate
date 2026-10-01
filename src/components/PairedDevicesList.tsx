@@ -159,7 +159,7 @@ export function PairedDevicesList() {
                   setConfirming(d);
                 }}
                 aria-label={`Revoke ${d.name}`}
-                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10"
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10"
               >
                 Revoke
               </button>

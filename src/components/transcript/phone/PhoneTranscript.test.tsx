@@ -6,6 +6,7 @@ import type {
   RemoteTranscriptWindow,
   TranscriptMessage,
 } from "../../../types/transcript";
+import { readMarker } from "../sinceYouLeft";
 import { DEAD, output } from "../fixtures";
 import { installScrollShim, type ScrollShim } from "../scrollShim";
 
@@ -60,6 +61,7 @@ vi.mock("@/api/tauri", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   claudeTranscriptBlockText: vi.fn(),
   claudeTranscriptPage: pageRead,
+  saveMarkdown: saveExport,
 }));
 
 /// What the host hands pending reconciliation (#1491), per render.
@@ -95,6 +97,7 @@ function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
   };
 }
 
+const saveExport = vi.hoisted(() => vi.fn().mockResolvedValue("presented"));
 const { PhoneTranscript } = await import("./PhoneTranscript");
 
 function msg(id: string, over: Partial<TranscriptMessage> = {}): TranscriptMessage {
@@ -139,6 +142,7 @@ beforeEach(() => {
   state.revealed = {};
   state.waiting = [];
   state.book = null;
+  localStorage.clear();
   pageRead.mockClear();
 });
 afterEach(() => {
@@ -155,6 +159,47 @@ async function show(masked: Answer, revealed: Answer = {}) {
 }
 
 describe("masked secrets and Reveal (#1488)", () => {
+  it("blocks clipboard and sharing while revealed, then shares the visible masked owner", async () => {
+    saveExport.mockClear();
+    const row = (text: string) => msg("export", {blocks:[{kind:"text",index:0,text,clip:null}]});
+    await show({data:page([row("key ⟦hidden:token⟧")],MASKED)}, {data:page([row("synthetic-raw-export-secret")],{...MASKED,hidden:0,revealed:true})});
+    fireEvent.click(screen.getByRole("button",{name:"Reveal"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Options"}));
+    await shim.flush();
+    expect(screen.getByText("Hide revealed text to export a masked transcript")).toBeTruthy();
+    for (const button of within(screen.getByTestId("export-controls")).getAllByRole("button")) expect(button).toHaveProperty("disabled",true);
+    expect(saveExport).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByRole("dialog"), {key:"Escape"});
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Hide it again"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:"Options"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/Share.*markdown/}));
+    await shim.flush();
+    expect(saveExport).toHaveBeenCalledTimes(1);
+    expect(saveExport.mock.calls[0][0]).toContain("⟦hidden:token⟧");
+    expect(saveExport.mock.calls[0][0]).not.toContain("synthetic-raw-export-secret");
+  });
+  it("saves the active revealed page cursor and switches back to the masked owner", async () => {
+    const row = msg("same", { offset: 50 });
+    await show({ data: page([row], MASKED) });
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 0, behind_digest: "" });
+    const w = windowOf(page([row], { ...MASKED, hidden: 0, revealed: true }));
+    pageRead.mockImplementationOnce(async (_path, _anchor, _direction, _limit, reveal) => {
+      expect(reveal).toBe(true);
+      return { ...w, start: { offset: 20, behind_digest: "revealed-page" }, at_start: false };
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reveal" }));
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 20, behind_digest: "revealed-page" });
+    fireEvent.click(screen.getByRole("button", { name: "Hide it again" }));
+    await shim.flush();
+    expect(readMarker("/p.jsonl")?.cursor).toEqual({ offset: 0, behind_digest: "" });
+  });
+
   it("says how many were hidden and offers Reveal when the desktop allows it", async () => {
     await show(
       { data: page([msg("a", { blocks: [{ kind: "text", index: 0, text: "key ⟦hidden:token⟧", clip: null }] })], MASKED) },
@@ -348,6 +393,27 @@ describe("the task list (#1504)", () => {
     await shim.flush();
     const sheet = screen.getByRole("dialog");
     expect(within(sheet).getByText("Write the parser")).toBeTruthy();
+  });
+
+  it("opens a snapshot-only checklist and discards revealed titles after hiding", async () => {
+    const row = (subject: string) => msg("result", {kind:{kind:"tool_results"}, blocks:[{kind:"tool_result", ...output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"1",subject,status:"pending"}],omitted:0,truncated:false}}})}]});
+    await show({data:page([row("[hidden]")],MASKED)}, {data:page([row("synthetic revealed title")],{...MASKED,hidden:0,revealed:true})});
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(within(screen.getByRole("dialog")).getByText("[hidden]")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", {name:"Close"}));
+    fireEvent.click(screen.getByRole("button",{name:"Reveal"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(within(screen.getByRole("dialog")).getByText("synthetic revealed title")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", {name:"Close"}));
+    fireEvent.click(screen.getByRole("button",{name:"Hide it again"}));
+    await shim.flush();
+    fireEvent.click(screen.getByRole("button",{name:/^Tasks/}));
+    await shim.flush();
+    expect(screen.queryByText("synthetic revealed title")).toBeNull();
+    expect(within(screen.getByRole("dialog")).getByText("[hidden]")).toBeTruthy();
   });
 
   it("offers no Tasks button when the session has no tasks", async () => {

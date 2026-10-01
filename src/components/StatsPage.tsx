@@ -493,12 +493,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                   being done about it. A reader told only what is missing,
                   and told it unchanged for ten minutes, concludes the page
                   is broken (#1103). */}
-              {activity ? <span className="ml-1 opacity-80">{activity}</span> : null}
+              {activity ? <span className="ml-1">{activity}</span> : null}
               {/* A failure, styled as one (#1570): the amber around it says
                   "partial", and a collection that will not happen is not
                   a shade of partial. */}
               {notCollecting ? (
-                <span className="ml-1 text-[#f85149]">{notCollecting}</span>
+                <span className="ml-1 text-[#ff7b72]">{notCollecting}</span>
               ) : null}
             </div>
           ) : null}

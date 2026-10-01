@@ -112,3 +112,16 @@ describe("turnMarkdown", () => {
     expect(md.startsWith("_This turn began before the part of the transcript that was read._")).toBe(true);
   });
 });
+
+
+it("exports background tool arguments and preserves unknown waiting mode", () => {
+  const md = messageMarkdown(msg("a",null,{kind:"assistant"},[
+    call("TaskStop",{tool:"task_stop",task_id:"bg1"},null),
+    call("TaskOutput",{tool:"task_output",task_id:"bg1",block:false,timeout:0},output({text:"recorded output"})),
+    call("TaskOutput",{tool:"task_output",task_id:null,block:null,timeout:null},null),
+  ]));
+  expect(md).toContain("Stop requested · bg1");
+  expect(md).toContain("without waiting · timeout 0 ms");
+  expect(md).toContain("wait mode not recorded");
+  expect(md).toContain("recorded output");
+});

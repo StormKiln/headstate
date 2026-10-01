@@ -33,6 +33,13 @@
 //! **if a change here would make this do more than read stdin and append
 //! one line, it belongs in #913 instead.**
 //!
+//! Optional permission context (#1533) adds bounded in-memory masking only
+//! for a Notification carrying an actual tool name. Generic events, including
+//! SessionEnd, never initialize the masker. The whole accepted candidate is
+//! masked before clipping, and optional fields must fit the serialized budget.
+//! Fresh-process debug record-building cost was 21.1 ms (regex cold init); this
+//! excludes startup/IO and does not replace the old release end-to-end timing.
+//!
 //! # Why the pid is the parent, and is not searched for
 //!
 //! The documented hook payload carries `session_id`, `transcript_path`,
@@ -338,6 +345,9 @@ pub struct Record {
     /// given a per-event name, because the field means the same thing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Same-payload permission context, already masked; never raw tool_input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_summary: Option<String>,
     /// `PostToolUseFailure`'s `error_message`.
     ///
     /// The one field here that is NOT bounded by a small vocabulary: it is
@@ -582,7 +592,11 @@ fn str_field(payload: &serde_json::Value, key: &str) -> Option<String> {
 /// really sent an empty name, and guessing is wrong because both `source`
 /// and `reason` can be absent.
 pub fn record_from(payload: &serde_json::Value, ppid: u32, now: &str) -> Record {
-    Record {
+    let notification = payload
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        == Some("Notification");
+    let mut record = Record {
         v: RECORD_VERSION,
         event: str_field(payload, "hook_event_name").unwrap_or_else(|| "unknown".to_owned()),
         session_id: str_field(payload, "session_id"),
@@ -597,10 +611,16 @@ pub fn record_from(payload: &serde_json::Value, ppid: u32, now: &str) -> Record 
         // which is exactly the coupling #1061 exists to avoid, since each
         // of #1060's six sub-issues would then have to edit this match.
         //
-        // It also keeps the hook O(1): this is eight `get` calls on an
-        // already-parsed `Value`, with no disk touched.
+        // Generic events still do simple field extraction, with no disk
+        // touched. Notification tool context is the bounded masked exception
+        // below; raw inputs never become record fields.
         error_type: str_field(payload, "error_type"),
-        tool_name: str_field(payload, "tool_name"),
+        tool_name: if notification {
+            None
+        } else {
+            str_field(payload, "tool_name")
+        },
+        permission_summary: None,
         error_message: capped_str_field(payload, "error_message"),
         denial_reason: capped_str_field(payload, "denial_reason"),
         tool_use_id: str_field(payload, "tool_use_id"),
@@ -608,7 +628,52 @@ pub fn record_from(payload: &serde_json::Value, ppid: u32, now: &str) -> Record 
         agent_id: str_field(payload, "agent_id"),
         agent_type: str_field(payload, "agent_type"),
         notification_type: str_field(payload, "notification_type"),
+    };
+    if notification && record.notification_type.as_deref() == Some("permission_prompt") {
+        if let Some(name) = payload.get("tool_name").and_then(serde_json::Value::as_str) {
+            record.tool_name = permission_text(name, 80);
+            if record.tool_name.is_some() {
+                let key = match name.trim() {
+                    "Bash" => Some("command"),
+                    "Read" | "Write" | "Edit" | "MultiEdit" => Some("file_path"),
+                    _ => None,
+                };
+                record.permission_summary = key
+                    .and_then(|key| payload.get("tool_input")?.get(key)?.as_str())
+                    .and_then(|text| permission_text(text, TEXT_FIELD_CAP));
+            }
+        }
+        // Budget the serialized JSON INCLUDING escaping and the newline.
+        // Preserve an oversized pre-existing base record; never enlarge it
+        // with optional context. No global stdin/base-field bound is claimed.
+        if serde_json::to_vec(&record).map_or(true, |v| v.len() + 1 > 512) {
+            record.permission_summary = None;
+        }
+        if serde_json::to_vec(&record).map_or(true, |v| v.len() + 1 > 512) {
+            record.tool_name = None;
+        }
     }
+    record
+}
+
+/// Mask the WHOLE accepted candidate before normalization/clipping. Reject
+/// oversized candidates instead of cutting a credential out of recognition.
+/// This bounds optional-context preprocessing, not hook stdin parsing.
+pub(super) fn permission_text(text: &str, cap: usize) -> Option<String> {
+    if text.len() > 64 * 1024 || text.trim().is_empty() {
+        return None;
+    }
+    let (masked, _) = crate::remote::privacy::mask_text(text);
+    let mut clean = masked.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.len() > cap {
+        let mut end = cap - "…".len();
+        while !clean.is_char_boundary(end) {
+            end -= 1;
+        }
+        clean.truncate(end);
+        clean.push('…');
+    }
+    Some(clean)
 }
 
 /// Where the handoff file lives, given a home directory.
@@ -1097,7 +1162,7 @@ mod tests {
             ),
             (
                 "Notification",
-                serde_json::json!({ "notification_type": "idle_prompt" }),
+                serde_json::json!({ "notification_type": "permission_prompt", "tool_name": "Bash", "tool_input": {"command": "echo fixture ".repeat(100)} }),
             ),
         ];
 
@@ -1395,5 +1460,175 @@ mod tests {
             (0..APPENDERS).collect::<Vec<_>>(),
             "every append must land exactly once"
         );
+    }
+    fn permission_payload(tool: serde_json::Value, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"hook_event_name":"Notification", "session_id":"generic-session", "notification_type":"permission_prompt", "tool_name":tool, "tool_input":input})
+    }
+
+    #[test]
+    fn permission_context_masks_before_clipping_and_never_dumps_inputs() {
+        // A Google key becomes recognizable only after its entire 39 bytes.
+        // Clipping the raw string at 160 first would leak its leading bytes.
+        let secret = format!("AIza{}", "a".repeat(35));
+        let command = format!("{} {}", "x".repeat(140), secret);
+        let r = record_from(
+            &permission_payload(
+                serde_json::json!("Bash"),
+                serde_json::json!({"command":command,"content":"MUST-NOT-STORE"}),
+            ),
+            1,
+            TS,
+        );
+        let summary = r.permission_summary.unwrap();
+        assert!(!summary.contains("AIza"));
+        assert!(summary.len() <= TEXT_FIELD_CAP);
+        for tool in ["Read", "Write", "Edit", "MultiEdit"] {
+            let r = record_from(
+                &permission_payload(
+                    serde_json::json!(tool),
+                    serde_json::json!({"file_path":"/fixture/file", "content":"MUST-NOT-STORE"}),
+                ),
+                1,
+                TS,
+            );
+            assert_eq!(r.permission_summary.as_deref(), Some("/fixture/file"));
+            assert!(!serde_json::to_string(&r)
+                .unwrap()
+                .contains("MUST-NOT-STORE"));
+        }
+        let named_secret = record_from(
+            &permission_payload(
+                serde_json::json!("PASSWORD=syntheticCredential123456"),
+                serde_json::json!({}),
+            ),
+            1,
+            TS,
+        );
+        assert!(!named_secret
+            .tool_name
+            .unwrap()
+            .contains("syntheticCredential123456"));
+        let unknown = record_from(
+            &permission_payload(
+                serde_json::json!("Other"),
+                serde_json::json!({"command":"MUST-NOT-STORE"}),
+            ),
+            1,
+            TS,
+        );
+        assert_eq!(unknown.tool_name.as_deref(), Some("Other"));
+        assert!(unknown.permission_summary.is_none());
+        for tool in [
+            serde_json::Value::Null,
+            serde_json::json!(123),
+            serde_json::json!("   "),
+            serde_json::json!("x".repeat(65537)),
+        ] {
+            let r = record_from(
+                &permission_payload(tool, serde_json::json!({"command":"fixture"})),
+                1,
+                TS,
+            );
+            assert!(r.tool_name.is_none() && r.permission_summary.is_none());
+        }
+        for command in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("x".repeat(65537)),
+        ] {
+            let r = record_from(
+                &permission_payload(
+                    serde_json::json!("Bash"),
+                    serde_json::json!({"command":command}),
+                ),
+                1,
+                TS,
+            );
+            assert!(r.permission_summary.is_none());
+        }
+        for event in [
+            "PermissionRequest",
+            "PermissionDenied",
+            "PostToolUseFailure",
+        ] {
+            let mut p = permission_payload(
+                serde_json::json!("Bash"),
+                serde_json::json!({"command":"MUST-NOT-STORE"}),
+            );
+            p["hook_event_name"] = serde_json::json!(event);
+            assert!(record_from(&p, 1, TS).permission_summary.is_none());
+        }
+        let mut idle = permission_payload(
+            serde_json::json!("Bash"),
+            serde_json::json!({"command":"fixture"}),
+        );
+        idle["notification_type"] = serde_json::json!("idle_prompt");
+        let r = record_from(&idle, 1, TS);
+        assert!(r.tool_name.is_none() && r.permission_summary.is_none());
+    }
+
+    #[test]
+    fn permission_record_budget_accounts_for_escaping_multibyte_and_base_overflow() {
+        for text in [
+            "界".repeat(1000),
+            "\\\"".repeat(1000),
+            "\u{0001}".repeat(1000),
+        ] {
+            let mut payload = permission_payload(
+                serde_json::json!("Bash"),
+                serde_json::json!({"command":text}),
+            );
+            payload["cwd"] = serde_json::json!("/fixture/".repeat(15));
+            let r = record_from(&payload, u32::MAX, TS);
+            assert!(serde_json::to_vec(&r).unwrap().len() < 512);
+            assert_eq!(r.event, "Notification");
+            if let Some(summary) = r.permission_summary {
+                assert!(summary.len() <= TEXT_FIELD_CAP);
+            }
+        }
+        let mut payload = permission_payload(
+            serde_json::json!("界".repeat(100)),
+            serde_json::json!({"command":"fixture"}),
+        );
+        payload["cwd"] = serde_json::json!("/fixture/".repeat(100));
+        let r = record_from(&payload, 1, TS);
+        assert!(r.tool_name.is_none() && r.permission_summary.is_none());
+        assert_eq!(r.session_id.as_deref(), Some("generic-session"));
+        assert_eq!(r.event, "Notification");
+    }
+
+    #[test]
+    #[ignore = "fresh-process synthetic hook latency measurement"]
+    fn permission_masker_latency_measurement() {
+        let payload = permission_payload(
+            serde_json::json!("Bash"),
+            serde_json::json!({"command":"API_KEY=syntheticCredential123456 echo fixture"}),
+        );
+        let started = std::time::Instant::now();
+        let record = record_from(&payload, 1, TS);
+        assert!(record.permission_summary.is_some());
+        println!(
+            "cold permission record (includes regex initialization): {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        for size in [64, 65536] {
+            let payload = permission_payload(
+                serde_json::json!("Bash"),
+                serde_json::json!({"command":"a".repeat(size)}),
+            );
+            let mut samples = Vec::new();
+            for i in 0..110 {
+                let start = std::time::Instant::now();
+                std::hint::black_box(record_from(&payload, 1, TS));
+                if i >= 10 {
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "warm permission record input_bytes={size}: n=100 median_ms={:.3} p95_ms={:.3}",
+                samples[50], samples[95]
+            );
+        }
     }
 }

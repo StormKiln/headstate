@@ -396,7 +396,7 @@ export function PrDetailView({
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
             approvedByViewer || reviewing !== null
-              ? "border border-[#30363d] text-[#8b949e] opacity-50"
+              ? "border border-[#30363d] text-[#8b949e] disabled:opacity-50"
               : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
         >
@@ -808,7 +808,7 @@ export function PrDetailView({
             // that then sat beside it -- two actions that change nothing
             // -- so the control that destroyed a shared ref was the one
             // thing in the row with no visual warning at all.
-            className="flex w-fit items-center gap-1.5 rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#f85149] hover:bg-[#f85149]/10"
+            className="flex w-fit items-center gap-1.5 rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#ff7b72] hover:bg-[#f85149]/10"
           >
             <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
             {/* The ellipsis says a question comes first, as on

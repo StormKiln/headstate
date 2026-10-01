@@ -1632,6 +1632,9 @@ export type ClaudeWaiting =
       kind: string;
       /// When the notification was recorded, as an ISO timestamp.
       at: string;
+      /// Optional same-notification masked permission context; older peers omit it.
+      tool?: string | null;
+      summary?: string | null;
     }
   /// It asked for input at `at`, and we cannot say whether it still
   /// needs it. Never rendered in the present tense.
@@ -1639,6 +1642,9 @@ export type ClaudeWaiting =
       state: "last-seen";
       kind: string;
       at: string;
+      /// Optional same-notification masked permission context; older peers omit it.
+      tool?: string | null;
+      summary?: string | null;
       /// Why the present tense could not be claimed -- the liveness
       /// reason, carried through so the indicator's `title` says which of
       /// "the process is gone" and "we could not tell" applies. Without
@@ -2466,6 +2472,8 @@ export type ClaudeToolArgs =
     }
   | { tool: "task_get"; task_id: string | null }
   | { tool: "task_list" }
+  | { tool: "task_stop"; task_id: string | null }
+  | { tool: "task_output"; task_id: string | null; block: boolean | null; timeout: number | null }
   /// A tool whose shape this build does not know: its argument keys, so
   /// the reader can see Headstate is behind rather than that the call
   /// was empty.
@@ -2983,10 +2991,11 @@ export type BranchDeleteFrame =
 /// caller's own token echoed back; a frame whose `run` is not yours is
 /// another run's, and its index means nothing against your list.
 export interface WorktreeRemovalFrame {
-  run: number | null;
+  /// Older desktops emitted counts only. Missing correlation must never remove a row.
+  run?: number | null;
   done: number;
   total: number;
-  removed: boolean;
+  removed?: boolean;
 }
 
 /// One moment of the machine's health, mirroring the Rust

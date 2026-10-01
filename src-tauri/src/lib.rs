@@ -19,6 +19,7 @@ pub mod identity;
 /// here so `cargo test` compiles it.
 #[cfg(test)]
 mod invariants;
+mod markdown_export;
 mod notification_navigation;
 pub mod packages;
 pub mod panic_hook;
@@ -262,6 +263,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -290,6 +292,7 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            commands::save_markdown,
             notification_navigation::take_notification_pr,
             commands::diag_log,
             commands::background_panicked,
@@ -385,6 +388,7 @@ pub fn run() {
             commands::claude_session_usage,
             commands::claude_transcript_block_text,
             commands::claude_transcript_page,
+            commands::claude_transcript_watch,
             commands::claude_transcript_find,
             commands::claude_poll_live,
             commands::claude_overview,
@@ -555,6 +559,8 @@ pub fn run() {
             // to signal even when nothing is listening for it.
             let waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::Waker(waker.clone()));
+            let backfill_waker = Arc::new(tokio::sync::Notify::new());
+            app.manage(poll::BackfillWaker(backfill_waker.clone()));
             app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
@@ -1077,7 +1083,7 @@ pub fn run() {
                 // would both spend the margin and make the protection
                 // self-referential. `spawn_backfill`'s own docs carry the
                 // argument in full.
-                poll::spawn_backfill(handle.clone(), client.clone());
+                poll::spawn_backfill(handle.clone(), client.clone(), backfill_waker);
                 poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 

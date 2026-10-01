@@ -285,12 +285,20 @@ pub enum Waiting {
         kind: String,
         /// When the notification was recorded.
         at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     /// It asked for input at this time, and we cannot say whether it
     /// still needs it.
     LastSeen {
         kind: String,
         at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
         /// Why the present tense could not be claimed -- the liveness
         /// reason, carried through so the row's tooltip says which of
         /// "the process is gone" and "we could not tell" applies.
@@ -340,6 +348,14 @@ pub enum NotWaiting {
 /// not raise the waiting indicator. Unknown values render as themselves.
 pub const PROMPTS: &[&str] = &["idle_prompt", "permission_prompt"];
 
+#[derive(Debug, Clone)]
+struct Notification {
+    kind: String,
+    at: String,
+    tool: Option<String>,
+    summary: Option<String>,
+}
+
 /// One session's rows out of `claude_hook_event`, already grouped.
 ///
 /// Read once for the whole list rather than per row: the list has ~1,500
@@ -354,7 +370,7 @@ pub struct Events {
     /// `SubagentStart` types, in file order.
     agent_types: Vec<Option<String>>,
     /// The newest `Notification`'s type and time, if any.
-    newest_notification: Option<(String, String)>,
+    newest_notification: Option<Notification>,
     /// The newest timestamp of ANY row for this session, whatever the
     /// event -- the expiry clock for [`waiting`].
     newest_at: Option<String>,
@@ -447,7 +463,13 @@ impl Events {
     ///    sentences but the same entitlement, which is none. Neither may
     ///    claim the present tense.
     pub fn waiting(&self, liveness: &Liveness) -> Waiting {
-        let Some((kind, at)) = self.newest_notification.as_ref() else {
+        let Some(Notification {
+            kind,
+            at,
+            tool,
+            summary,
+        }) = self.newest_notification.as_ref()
+        else {
             return Waiting::No {
                 why: NotWaiting::NeverObserved,
             };
@@ -471,10 +493,14 @@ impl Events {
             Liveness::Running { .. } => Waiting::Now {
                 kind: kind.clone(),
                 at: at.clone(),
+                tool: tool.clone(),
+                summary: summary.clone(),
             },
             Liveness::Dead { why } | Liveness::Unknown { why } => Waiting::LastSeen {
                 kind: kind.clone(),
                 at: at.clone(),
+                tool: tool.clone(),
+                summary: summary.clone(),
                 why: why.clone(),
             },
         }
@@ -509,9 +535,9 @@ fn sorted_counts(counts: HashMap<&str, usize>) -> Vec<(String, usize)> {
 /// one pass with no per-session sort.
 pub fn events_by_session(conn: &Connection) -> Result<HashMap<String, Events>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, event, at, trigger_kind, agent_type, notification_type
+        "SELECT session_id, event, at, trigger_kind, agent_type, notification_type, tool_name, permission_summary
          FROM claude_hook_event
-         ORDER BY at ASC",
+         ORDER BY at ASC, rowid ASC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -521,12 +547,14 @@ pub fn events_by_session(conn: &Connection) -> Result<HashMap<String, Events>, r
             r.get::<_, Option<String>>(3)?,
             r.get::<_, Option<String>>(4)?,
             r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
         ))
     })?;
 
     let mut out: HashMap<String, Events> = HashMap::new();
     for row in rows {
-        let (sid, event, at, trigger, agent_type, notification) = row?;
+        let (sid, event, at, trigger, agent_type, notification, tool, summary) = row?;
         let e = out.entry(sid).or_default();
         match event.as_str() {
             "PreCompact" => e.compact_triggers.push(trigger),
@@ -535,7 +563,13 @@ pub fn events_by_session(conn: &Connection) -> Result<HashMap<String, Events>, r
                 if let Some(kind) = notification {
                     // Ascending order means a later row is newer, so the
                     // last one to arrive wins.
-                    e.newest_notification = Some((kind, at.clone()));
+                    let permission = kind == "permission_prompt";
+                    e.newest_notification = Some(Notification {
+                        kind,
+                        at: at.clone(),
+                        tool: if permission { tool } else { None },
+                        summary: if permission { summary } else { None },
+                    });
                 }
             }
             // An event this app does not recognise still advances the

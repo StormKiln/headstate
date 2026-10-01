@@ -18,7 +18,7 @@ import {
   searchSummary,
   type CallState,
 } from "./summary";
-import { taskCallRefused, taskIdOfCall, taskStatusWords, type TaskListState } from "./tasks";
+import { backgroundTaskSummary, taskCallRefused, taskIdOfCall, taskStatusWords, type TaskListState } from "./tasks";
 import type { LoadFullText, OpenSubagent, ToolCallBlock, ToolVariant } from "./types";
 
 /// One tool call, rendered the way Claude Code shows it (#1483).
@@ -142,6 +142,14 @@ function render(args: ClaudeToolArgs, ctx: Ctx): View {
     case "task_get":
     case "task_list":
       return taskCall(args, ctx);
+    case "task_stop":
+    case "task_output":
+      return {
+        title: args.tool === "task_stop" ? "TaskStop" : "TaskOutput",
+        summary: backgroundTaskSummary(args),
+        status: ctx.result?.is_error === true ? <Chip tone="error">error</Chip> : null,
+        body: <ResultFold ctx={ctx} label="Result" title="Background task" />,
+      };
     case "other":
     case "none":
       return other(args, ctx);

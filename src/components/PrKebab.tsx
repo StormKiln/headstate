@@ -192,7 +192,7 @@ export function PrKebab({
                     }}
                     className={`flex w-full items-center rounded px-2 py-1.5 text-left text-sm ${
                       why
-                        ? "text-[#8b949e] opacity-50"
+                        ? "text-[#8b949e] disabled:opacity-50"
                         : "text-[#e6edf3] hover:bg-[#21262d]"
                     }`}
                   >

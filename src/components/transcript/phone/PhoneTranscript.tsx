@@ -93,6 +93,7 @@ const renderPhonePending = (p: PendingMessage) => <PhonePendingMessage pending={
 /// touch that starts in the transcript stops here, after this view's
 /// own gesture has seen it.
 export function PhoneTranscript({
+  watchActivity = false,
   path,
   liveness,
   label = "Transcript",
@@ -100,12 +101,13 @@ export function PhoneTranscript({
   waiting,
   openAt = "latest",
 }: {
+  watchActivity?: boolean;
   path: string;
   liveness: Liveness;
   label?: string;
   /// The session `path` is the main transcript of, so the desktop's
   /// activity nudge for it reads at once (#1477). Omitted for a
-  /// subagent's transcript, which is not nudged.
+  /// subagent's transcript, which uses an expiring opaque activity watch.
   sessionId?: string | null;
   /// For the "while you were away" card (#1484). Absent: not said.
   waiting?: ClaudeWaiting;
@@ -113,6 +115,7 @@ export function PhoneTranscript({
   /// marker -- a notification's tap (#1486, #1484).
   openAt?: "latest" | "marker";
 }) {
+  const [subagent, setSubagent] = useState<TranscriptSubagent | null>(null);
   const marker = useOpenedMarker(path);
   const openAtId = openAt === "marker" ? (marker?.id ?? null) : null;
   const [reveal, setReveal] = useState(false);
@@ -121,7 +124,9 @@ export function PhoneTranscript({
     reveal: true,
     enabled: reveal,
     sessionId,
+    watchActivity: watchActivity && subagent === null,
     openAt: openAtId,
+    openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,
   });
   // Refused or failed before it read anything: the masked text stays.
   const revealFailed =
@@ -132,7 +137,9 @@ export function PhoneTranscript({
     liveness,
     enabled: !reveal || revealFailed,
     sessionId,
+    watchActivity: watchActivity && subagent === null,
     openAt: openAtId,
+    openAtCursor: openAt === "marker" ? (marker?.cursor ?? null) : null,
   });
   const showingRevealed = reveal && revealed.messages !== undefined;
   const active = showingRevealed ? revealed : masked;
@@ -141,7 +148,6 @@ export function PhoneTranscript({
 
   const scale = useTextScale();
   const [tasksOpen, setTasksOpen] = useState(false);
-  const [subagent, setSubagent] = useState<TranscriptSubagent | null>(null);
 
   const messages = useMemo(() => held ?? [], [held]);
   const truncated = active.hasOlder;
@@ -206,6 +212,7 @@ export function PhoneTranscript({
   const since = useSinceYouLeft({
     path,
     marker,
+    cursorFor: active.cursorFor,
     messages,
     shown,
     hasOlder: active.hasOlder,
@@ -248,7 +255,7 @@ export function PhoneTranscript({
     marker === null
       ? undefined
       : since.beforeHeld
-        ? () => jumps.jumpTo(marker.id, null)
+        ? () => jumps.jumpTo(marker.id, marker.cursor ?? null)
         : dividerAt !== null
           ? () => void handle.current?.scrollTo(dividerAt)
           : undefined;
@@ -382,7 +389,7 @@ export function PhoneTranscript({
                 : `The hidden text could not be revealed: ${commandError(revealed.error).message}`}
             </span>
           ) : null}
-          {checklist.tasks.length > 0 ? (
+          {checklist.tasks.length > 0 || checklist.snapshotIncomplete ? (
             <button
               type="button"
               aria-haspopup="dialog"
@@ -470,6 +477,7 @@ export function PhoneTranscript({
               <div className="flex flex-col gap-4">
                 <ShowControls show={show} hidden={hidden} />
                 <ExportControls
+                  revealed={showingRevealed}
                   messages={messages}
                   hasOlder={active.hasOlder}
                   atLiveEdge={active.atLiveEdge}
@@ -499,6 +507,7 @@ export function PhoneTranscript({
           <div className="flex min-h-0 flex-1 flex-col px-4 pb-4">
             {subagent?.transcript_path ? (
               <PhoneTranscript
+                watchActivity
                 path={subagent.transcript_path}
                 liveness={subagentLiveness(liveness, subagent)}
                 label="Subagent transcript"

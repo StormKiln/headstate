@@ -47,6 +47,31 @@ afterEach(() => {
 });
 
 describe("the marker", () => {
+  it("enriches a same-position legacy marker with its real page cursor without moving backward", () => {
+    const row = reply("a1", 500, "u1");
+    advanceMarker(PATH, row);
+    expect(advanceMarker(PATH, row, { offset: 300, behind_digest: "page-digest" })).toBe(true);
+    expect(readMarker(PATH)).toEqual({ id: "a1", offset: 500, cursor: { offset: 300, behind_digest: "page-digest" } });
+    expect(advanceMarker(PATH, reply("older", 400, "u1"), { offset: 0, behind_digest: "" })).toBe(false);
+    expect(advanceMarker(PATH, row)).toBe(false);
+    expect(readMarker(PATH)?.cursor?.offset).toBe(300);
+  });
+
+  it.each([
+    { offset: -1, behind_digest: "d" }, { offset: 1.5, behind_digest: "d" },
+    { offset: Number.MAX_SAFE_INTEGER + 1, behind_digest: "d" },
+    { offset: 100, behind_digest: "" }, { offset: 100, behind_digest: "d".repeat(129) },
+    { offset: 600, behind_digest: "d" },
+  ])("drops malformed cursor metadata without dropping the legacy marker: %j", (cursor) => {
+    localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "a1", offset: 500, cursor }));
+    expect(readMarker(PATH)).toEqual({ id: "a1", offset: 500 });
+  });
+
+  it("retains the real empty digest at the beginning of a file", () => {
+    advanceMarker(PATH, reply("a1", 500, "u1"), { offset: 0, behind_digest: "" });
+    expect(readMarker(PATH)?.cursor).toEqual({ offset: 0, behind_digest: "" });
+  });
+
   it("persists and restores per transcript", () => {
     expect(readMarker(PATH)).toBeNull();
     expect(advanceMarker(PATH, reply("a1", 500, "u1"))).toBe(true);

@@ -644,7 +644,7 @@ export function HealthConditions({
   if (failed) {
     return (
       <div
-        className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-3 py-2 text-xs text-[#f85149]"
+        className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-3 py-2 text-xs text-[#ff7b72]"
         role="status"
       >
         {/* VERBATIM (#946). "This is not a clean result — the rules did
@@ -1359,7 +1359,7 @@ export function SystemHealthPage() {
                             so it is named rather than left to be
                             guessed from the mount point. */}
                         {d.is_root ? (
-                          <span className="ml-2 rounded bg-[#30363d] px-1.5 py-0.5 text-xs text-[#8b949e]">
+                          <span className="ml-2 rounded bg-[#30363d] px-1.5 py-0.5 text-xs text-[#b1bac4]">
                             system
                           </span>
                         ) : null}
@@ -2467,7 +2467,7 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
                     <span className="truncate text-sm text-[#e6edf3]">
                       {d.mount}
                       {d.is_root ? (
-                        <span className="ml-2 rounded bg-[#30363d] px-1.5 py-0.5 text-xs text-[#8b949e]">
+                        <span className="ml-2 rounded bg-[#30363d] px-1.5 py-0.5 text-xs text-[#b1bac4]">
                           system
                         </span>
                       ) : null}

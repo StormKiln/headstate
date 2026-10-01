@@ -66,7 +66,7 @@ export function BackgroundHealthNotice({
     >
       {bad.map((t) => (
         <div key={t.task} className="text-xs">
-          <p className="font-semibold text-[#f85149]">
+          <p className="font-semibold text-[#ff7b72]">
             {label(t.task)} has failed {t.consecutive_failures} time
             {t.consecutive_failures === 1 ? "" : "s"} in a row.
           </p>

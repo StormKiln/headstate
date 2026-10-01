@@ -1,0 +1,40 @@
+[
+  {
+    "type": "assistant",
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01KZAHww7ErTxmSNQGpJUSHt",
+          "name": "TaskStop",
+          "input": {
+            "task_id": "b8mm8ub7r"
+          },
+          "caller": {
+            "type": "direct"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_01KZAHww7ErTxmSNQGpJUSHt",
+          "type": "tool_result",
+          "content": "{\"message\":\"Successfully stopped task: b8mm8ub7r (sleep 120)\",\"task_id\":\"b8mm8ub7r\",\"task_type\":\"local_bash\",\"command\":\"sleep 120\"}"
+        }
+      ]
+    },
+    "toolUseResult": {
+      "message": "Successfully stopped task: b8mm8ub7r (sleep 120)",
+      "task_id": "b8mm8ub7r",
+      "task_type": "local_bash",
+      "command": "sleep 120"
+    }
+  }
+]

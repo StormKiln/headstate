@@ -5,7 +5,7 @@
 /// Generic fixtures only.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   FindHit,
@@ -15,7 +15,8 @@ import type {
   TranscriptPageAnchor,
   TranscriptPageDirection,
 } from "../../types/transcript";
-import { DEAD } from "./fixtures";
+import { useJumps } from "./useNavigation";
+import { DEAD, liveOf } from "./fixtures";
 import { installScrollShim, type ScrollShim } from "./scrollShim";
 
 const REC = 100;
@@ -54,10 +55,11 @@ const pageRead = vi.hoisted(() =>
       direction: TranscriptPageDirection,
     ): Promise<RemoteTranscriptWindow> => {
       const n = file.n;
-      const at =
+      const rewritten = anchor.kind === "cursor" && anchor.behind_digest !== `d${anchor.offset}`;
+      const at = rewritten ? n :
         anchor.kind === "start" ? 0 : anchor.kind === "end" ? n : anchor.offset / 100;
       const [from, to] =
-        direction === "before" ? [Math.max(0, at - 5), at] : [at, Math.min(n, at + 5)];
+        (rewritten || direction === "before") ? [Math.max(0, at - 5), at] : [at, Math.min(n, at + 5)];
       const messages = [];
       for (let i = from; i < to; i++) messages.push(message(i));
       return {
@@ -74,7 +76,7 @@ const pageRead = vi.hoisted(() =>
         end: cursorAt(to),
         at_start: from === 0,
         at_end: to === n,
-        rewritten: false,
+        rewritten,
         position: { first: null, last: null, total: null, exact: false, basis: "bytes" },
         seam: { first_model: null, last_model: null },
         bytes_scanned: 0,
@@ -103,6 +105,8 @@ vi.mock("../../api/tauri", async (importOriginal) => ({
 }));
 
 const { DesktopTranscript } = await import("./DesktopTranscript");
+const { PhoneTranscript } = await import("./phone/PhoneTranscript");
+const { readMarker } = await import("./sinceYouLeft");
 const { useFilters } = await import("../../store/filters");
 
 const PATH = "/tmp/projects/p/session.jsonl";
@@ -341,4 +345,84 @@ describe("the keyboard (#1489)", () => {
     // The panel is still open: one Escape closes one thing.
     expect(screen.getByRole("complementary")).toBeTruthy();
   });
+});
+
+for (const [host, Host] of [["desktop", DesktopTranscript], ["phone", PhoneTranscript]] as const) {
+  describe(`${host} saved cursor wiring`, () => {
+    async function mount(openAt: "latest" | "marker") {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(<QueryClientProvider client={qc}><Host path={PATH} liveness={DEAD} openAt={openAt} /></QueryClientProvider>);
+      await shim.flush();
+      await shim.flush();
+    }
+    it.each(["marker", "latest"] as const)("reaches a far marker using its page cursor from %s", async (openAt) => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "p10", offset: 1000, cursor: cursorAt(9) }));
+      await mount(openAt);
+      if (openAt === "latest") {
+        fireEvent.click(screen.getByRole("button", { name: /load back to where you left off/i }));
+        await shim.flush();
+        await shim.flush();
+      }
+      expect(mounted("p10") || mounted("p11")).toBe(true);
+      expect(pageRead.mock.calls.some((c) => c[1].kind === "cursor" && c[1].offset === 900 && c[2] === "after")).toBe(true);
+      expect(pageRead.mock.calls.length).toBeLessThanOrEqual(5);
+    });
+    it.each(["marker", "latest"] as const)("keeps a successful stale-cursor fallback notice after landing from %s", async (openAt) => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "p9970", offset: 997000, cursor: { offset: 900, behind_digest: "stale" } }));
+      await mount(openAt);
+      if (openAt === "latest") {
+        fireEvent.click(screen.getByRole("button", { name: /load back to where you left off/i }));
+        await shim.flush();
+        await shim.flush();
+      }
+      expect(mounted("p9970") || mounted("p9971")).toBe(true);
+      expect(screen.getByTestId("jump-note-announce").textContent).toMatch(/changed.*found the saved message/i);
+      expect(screen.getAllByText(/changed; found the saved message/i).some((el) => el.tagName === "P")).toBe(true);
+    });
+    it("shows an honest bounded failure when the rewritten file no longer contains the marker", async () => {
+      file.n = 10_000;
+      localStorage.setItem(`headstate.transcript.read:${PATH}`, JSON.stringify({ id: "gone", offset: 1000, cursor: { offset: 900, behind_digest: "stale" } }));
+      await mount("marker");
+      expect(mounted("gone")).toBe(false);
+      expect(screen.getByTestId("jump-note-announce").textContent).toMatch(/changed.*could not be found.*Turns or Find/i);
+      expect(pageRead.mock.calls.length).toBeLessThanOrEqual(405);
+    });
+    it("persists the real containing page start from the mounted viewer", async () => {
+      await mount("latest");
+      expect(readMarker(PATH)).toMatchObject({ cursor: cursorAt(55) });
+      expect(readMarker(PATH)!.offset).toBeGreaterThan(5500);
+    });
+  });
+}
+
+it("a cancelled jump cannot clear the newer jump's pending landing", async () => {
+  let cancelFirst!: (value: boolean | null) => void;
+  const first = new Promise<boolean | null>((resolve) => { cancelFirst = resolve; });
+  const live = liveOf(undefined, undefined, {
+    seek: (id) => id === "p1" ? first : Promise.resolve(true),
+  });
+  const scrollTo = vi.fn(() => true);
+  const handle = { current: { scrollTo, scrollToLatest() {}, firstVisible: () => null } };
+  const { result, rerender } = renderHook(
+    ({ messages }) => useJumps({ live, messages, shown: messages, handle }),
+    { initialProps: { messages: [] as TranscriptMessage[] } },
+  );
+  act(() => result.current.jumpTo("p1", null));
+  act(() => result.current.jumpTo("p2", null));
+  await act(async () => { cancelFirst(null); });
+  rerender({ messages: [message(2)] });
+  expect(scrollTo).toHaveBeenCalledWith("p2");
+  expect(result.current.note).toBeNull();
+});
+
+it("a jump to a held row still supersedes the follower's pending search", () => {
+  const seek = vi.fn(() => Promise.resolve(true));
+  const live = liveOf(undefined, undefined, { seek });
+  const handle = { current: { scrollTo: () => true, scrollToLatest() {}, firstVisible: () => null } };
+  const messages = [message(2)];
+  const { result } = renderHook(() => useJumps({ live, messages, shown: messages, handle }));
+  act(() => result.current.jumpTo("p2", null));
+  expect(seek).toHaveBeenCalledWith("p2", null);
 });

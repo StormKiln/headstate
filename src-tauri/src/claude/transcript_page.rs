@@ -1,11 +1,9 @@
 //! Paged reads of a transcript: a bounded page before or after a cursor
 //! (#1220, epic #1473).
 //!
-//! `transcript_model::tail` answers "show me the newest 256 KB". The
-//! viewer also has to answer "what happened earlier" in a 70 MB file,
-//! and #1487's harness measured the only way to get there today --
-//! `follow` from offset 0 -- reading all 70.1 MiB into one buffer. This
-//! module is the read that replaces it.
+//! The viewer uses this reader for both newest and earlier pages. It
+//! replaced legacy whole-file follow and fixed-byte tail reads, which
+//! could not support bounded navigation through large transcripts.
 //!
 //! # The promises
 //!

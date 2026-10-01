@@ -199,10 +199,30 @@ pub fn slice_detail_query(
     first_index: usize,
     first: u32,
 ) -> String {
+    slice_detail_page_query(q, slices, first_index, first, None)
+}
+
+/// A single background page per day; cursors survive in local storage.
+pub fn slice_detail_page_query(
+    q: &StatsQuery,
+    slices: &[Slice],
+    first_index: usize,
+    first: u32,
+    after: Option<&[Option<String>]>,
+) -> String {
     let mut doc = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
     for (i, s) in slices.iter().enumerate() {
         let alias = slice_alias(first_index + i);
-        let search = q.search_query(&s.from, &s.to);
+        let mut search = q.search_query(&s.from, &s.to);
+        let mut continuation = String::new();
+        let mut page_info = "";
+        if let Some(cursors) = after {
+            search.push_str(" sort:created-asc");
+            if let Some(Some(cursor)) = cursors.get(i) {
+                continuation = format!(", after: {}", graphql_string(cursor));
+            }
+            page_info = "pageInfo { hasNextPage endCursor }";
+        }
         doc.push_str(&format!(
             // The alias's own closing brace is INDENTED and kept off a
             // line of its own. A bare "}" on its own line is
@@ -211,8 +231,8 @@ pub fn slice_detail_query(
             // and that check is worth keeping sharp, because an extra or
             // missing top-level brace is a whole-document syntax error
             // that no mapper test would catch.
-            "  {alias}: search(query: {}, type: ISSUE, first: {first}) {{\n\
-             \x20   issueCount\n\
+            "  {alias}: search(query: {}, type: ISSUE, first: {first}{continuation}) {{\n\
+             \x20   issueCount {page_info}\n\
              \x20   nodes {{ ... on PullRequest {{ number title url repository {{ nameWithOwner }} author {{ login }} createdAt mergedAt additions deletions changedFiles reviews {{ totalCount }} }} }} }}\n",
             graphql_string(&search)
         ));
@@ -625,6 +645,47 @@ mod tests {
             "only {found} field reads found in from_alias_map -- the scan is broken, \
              not the document"
         );
+    }
+
+    /// Background pagination needs the count and cursor beside the nodes they
+    /// qualify; every PR field below is consumed by the board/backfill readers.
+    #[test]
+    fn slice_detail_page_query_preserves_reader_shape_and_cursor_scope() {
+        let query = StatsQuery::new(
+            Some(Subject::Login("octocat".into())),
+            Scope::Org("acme".into()),
+            Measure::Merged,
+        );
+        let cursor = "next\"\\\n\r\t";
+        let after = [Some(cursor.to_owned()), None];
+        let doc = slice_detail_page_query(&query, &slices(2), 7, 50, Some(&after));
+        assert!(doc.contains("rateLimit { cost remaining resetAt }"));
+        let first = doc.split_once("s7: search").unwrap().1;
+        let (first, second) = first.split_once("s8: search").unwrap();
+        assert!(first.contains(&format!(
+            ", after: {}",
+            serde_json::to_string(cursor).unwrap()
+        )));
+        assert!(!second.contains("after:"));
+        for alias in [first, second] {
+            assert!(alias.contains("sort:created-asc"));
+            assert!(alias.contains("type: ISSUE, first: 50"));
+            let selection = alias.split_once(") {").unwrap().1;
+            let normalized = selection.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.starts_with(
+                    "issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest {"
+                ),
+                "count and pageInfo must qualify this alias's nodes: {normalized}"
+            );
+            assert!(normalized.contains("nodes { ... on PullRequest { number title url repository { nameWithOwner } author { login } createdAt mergedAt additions deletions changedFiles reviews { totalCount } } }"), "missing or misplaced board/backfill field: {normalized}");
+        }
+        // Foreground reads retain their unpaged shape; no continuation leaks
+        // from one background alias into another or into the foreground path.
+        let foreground = slice_detail_page_query(&query, &slices(1), 7, 50, None);
+        assert!(!foreground.contains("after:"));
+        assert!(!foreground.contains("pageInfo"));
+        assert!(!foreground.contains("sort:created-asc"));
     }
 
     /// The series document carries what its mapper reads, which is one

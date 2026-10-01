@@ -134,6 +134,8 @@ pub const EVENT_NAMES: &[&str] = &[
     // that the file changed. A lost nudge costs latency, never what is
     // shown -- the follow keeps its own poll.
     "claude-session-activity",
+    // Opaque watch ID, byte size, sequence only; shares the main activity event cap.
+    "claude-transcript-activity",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

@@ -30,11 +30,11 @@ const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
 const BUMP_TONE: Record<Bump, string> = {
   patch: "bg-[#238636]/15 text-[#3fb950]",
   minor: "bg-[#d29922]/15 text-[#d29922]",
-  major: "bg-[#f85149]/15 text-[#f85149]",
+  major: "bg-[#f85149]/15 text-[#ff7b72]",
   // Deliberately NOT a severity colour. It is an absence of information
   // rather than a size of change, and red or green would assert
   // something the comparison could not determine.
-  unknown: "bg-[#30363d] text-[#8b949e]",
+  unknown: "bg-[#30363d] text-[#b1bac4]",
 };
 
 const FILTERS: { id: UpdateFilter; label: string; hint: string }[] = [
@@ -192,7 +192,7 @@ export function PackagesPage() {
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Filter by name…"
           aria-label="Filter packages by name"
-          className="w-40 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 text-xs text-[#e6edf3] placeholder:text-[#6e7681]"
+          className="w-40 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 text-xs text-[#e6edf3] placeholder:text-[#8b949e]"
         />
 
         <HelpButton topic="package-updates" />
@@ -269,7 +269,7 @@ export function PackagesPage() {
                   }),
               );
             }}
-            className="flex items-center gap-1 rounded border border-[#8957e5]/40 px-2 py-1 text-xs text-[#a371f7] hover:bg-[#8957e5]/10 disabled:opacity-50"
+            className="flex items-center gap-1 rounded border border-[#8957e5]/40 px-2 py-1 text-xs text-[#bc8cff] hover:bg-[#8957e5]/10 disabled:opacity-50"
           >
             Claudify
           </button>

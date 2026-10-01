@@ -225,7 +225,7 @@ export function unavailableReason(repo: string, checkout: CheckoutState): string
 /// The Claudify styling from the Worktrees row -- purple, with the
 /// sparkles -- at the size of the buttons beside it here.
 export const CLAUDIFY_CLASS =
-  "flex w-fit items-center gap-1.5 rounded border border-[#8957e5]/40 px-3 py-1.5 text-sm text-[#a371f7] hover:bg-[#8957e5]/10 disabled:opacity-50";
+  "flex w-fit items-center gap-1.5 rounded border border-[#8957e5]/40 px-3 py-1.5 text-sm text-[#bc8cff] hover:bg-[#8957e5]/10 disabled:opacity-50";
 export const PLAIN_CLASS =
   "flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]";
 

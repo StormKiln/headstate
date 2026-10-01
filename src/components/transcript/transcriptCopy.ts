@@ -1,3 +1,4 @@
+import { backgroundTaskSummary } from "./tasks";
 /// A transcript message, or a whole turn, as markdown for the clipboard
 /// (#1480). The copy path is 7.6's (#1399): built on click, handed to
 /// `copyText`, and a toast either way -- see `CopyMarkdown` in
@@ -77,6 +78,9 @@ function callLine(name: string, args: ClaudeToolArgs): string {
       return args.task_id !== null ? `${name}(#${args.task_id})` : name;
     case "task_list":
       return name;
+    case "task_stop":
+    case "task_output":
+      return `${name}(${backgroundTaskSummary(args)})`;
     case "other":
       return args.keys.length > 0 ? `${name}(${args.keys.join(", ")})` : name;
     case "none":

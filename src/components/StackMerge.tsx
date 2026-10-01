@@ -123,7 +123,7 @@ export function StackMerge({
         title={unavailable ?? `${label}: ${numberList(lands)}`}
         className={`rounded px-3 py-1.5 text-sm ${
           unavailable
-            ? "border border-[#30363d] text-[#8b949e] opacity-50"
+            ? "border border-[#30363d] text-[#8b949e] disabled:opacity-50"
             : "bg-[#238636] font-medium text-white hover:bg-[#1a7f37]"
         }`}
       >

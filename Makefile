@@ -1,5 +1,5 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
-	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
+	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android check-native-ios check-native-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
 	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
 	check-shell-scroll shadcn-add
@@ -29,12 +29,9 @@ mobile-frontend:
 lint-mobile:
 	cd src-mobile && cargo fmt --check
 	cd src-mobile && cargo clippy --workspace --all-targets -- -D warnings
-	# No Kotlin is compiled anywhere -- not by this target, not in CI, which
-	# generates the Android Studio project and never runs Gradle. Tauri
-	# dispatches on the LITERAL @Command method name, so a name that does not
-	# match what Rust invokes fails on a device and nowhere else (#698).
-	# Not prefixed with `cd src-mobile`: each recipe line is its own shell,
-	# so this one starts at the repo root like the rest.
+	# Native compilation has separate platform gates; literal bridge names
+	# still need this check because native compilation cannot compare Rust strings.
+	python3 scripts/check-plugin-commands.test.py
 	python3 scripts/check-plugin-commands.py
 
 test-mobile:
@@ -53,6 +50,13 @@ check-mobile-ios:
 check-mobile-android:
 	rustup target add aarch64-linux-android
 	cd src-mobile && cargo check --target aarch64-linux-android
+
+# Actual plugin packages, isolated from generated app projects and source caches.
+check-native-android:
+	python3 scripts/check-native.py android
+
+check-native-ios:
+	python3 scripts/check-native.py ios
 
 deny-mobile:
 	cd src-mobile && cargo deny check
@@ -131,7 +135,7 @@ test-rust:
 	cd crates/headstate-stepup && cargo test
 	cd src-tauri && cargo test
 
-test-ui:
+test-ui: check-wire-contract
 	yarn vitest run
 
 # ---- Transcript performance (#1487) --------------------------------------
@@ -154,17 +158,18 @@ bench-transcript:
 	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
 
 # The viewer in a browser (#1480, the harness #1487 designed): writes each
-# fixture's message page, builds the harness page (vite.harness.config.ts,
+# fixture's three production windows, builds the harness page (vite.harness.config.ts,
 # into dist-harness), and opens every page in Playwright's Chromium to
 # take B1 (open to first paint), B2 (long tasks while scrolling) and B3
 # (heap); then B4 (idle live-follow cost, nudges, eviction; about three
-# minutes a page in real time) and a B5 estimate (page bytes over the
-# real-text compression ratio). HARNESS_PHASES=open|follow|b5 picks parts.
+# minutes per end fixture in real time) and a B5 estimate (page bytes over the
+# real-text compression ratio). HARNESS_PHASES=open,follow,growth,b5 picks parts.
 # Not in `test` or CI, for bench-transcript's reason: its figures
 # describe the machine. Needs the browser once:
 # `yarn playwright install chromium` (or HARNESS_CHANNEL=chrome to use an
 # installed Chrome).
 bench-transcript-browser:
+	node --test scripts/transcript-browser-inputs.test.mjs
 	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
 	( cd src-tauri && HEADSTATE_TRANSCRIPT_PAYLOADS_OUT="$$out" \
 		cargo test --release --lib read_bench::transcript_message_payloads -- --ignored --nocapture ) \
@@ -392,6 +397,7 @@ lint-deps:
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
+	python3 scripts/check-native.test.py
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
 	# actionlint, and it does NOT replace the script above it. That was
@@ -487,7 +493,7 @@ lint-rust:
 	cd src-tauri && cargo fmt --check
 	cd src-tauri && cargo clippy --all-targets -- -D warnings
 
-lint-ui:
+lint-ui: check-wire-contract
 	yarn tsc -b --force
 	yarn eslint .
 	yarn knip
@@ -549,3 +555,31 @@ icons:
 	rm -f src-tauri/icons/StoreLogo.png
 	rm -f src-tauri/icons/Square*.png src-tauri/icons/64x64.png
 	python3 scripts/make-icons.py --restore-icns-if-unchanged
+
+# Independently shipped phones must not consume unchecked desktop shapes (#711).
+.PHONY: wire-contract check-wire-contract
+wire-contract:
+	node scripts/wire-contract.mjs
+
+check-wire-contract:
+	node --test scripts/wire-contract.test.mjs
+	node scripts/wire-contract.mjs --check
+
+# Source-discovered contrast contracts plus real compiled component states.
+# Needs `yarn playwright install chromium` once; CI installs the pinned browser.
+.PHONY: check-contrast
+check-contrast:
+	node --test scripts/contrast-source.test.mjs
+	node scripts/check-contrast-source.mjs
+	yarn vitest run src/components/transcript/palette.test.ts src/lib/labels.test.ts
+	yarn vite build -c vite.harness.config.ts
+	node scripts/check-contrast-rendered.mjs
+
+# Developer-only own-PID WKWebView proxies, explicitly not native acceptance.
+# Requires the browser harness build and preserved production windows first.
+# Both output directories are explicit so no evidence/fixture is discarded.
+.PHONY: bench-transcript-native
+bench-transcript-native:
+	@test -n "$(BENCH_TRANSCRIPT_OUT)" -a -n "$(BENCH_NATIVE_OUT)" || (echo "Set BENCH_TRANSCRIPT_OUT and a fresh BENCH_NATIVE_OUT"; exit 2)
+	python3 scripts/transcript-native-bench.test.py
+	python3 scripts/transcript-native-bench.py "$(BENCH_TRANSCRIPT_OUT)" --out "$(BENCH_NATIVE_OUT)"

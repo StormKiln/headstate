@@ -97,12 +97,12 @@ function displayState(
 }
 
 const TONE: Record<VenvState, string> = {
-  orphaned: "bg-[#f85149]/15 text-[#f85149]",
+  orphaned: "bg-[#f85149]/15 text-[#ff7b72]",
   stale: "bg-[#d29922]/15 text-[#d29922]",
   live: "bg-[#238636]/15 text-[#3fb950]",
   // Grey, deliberately: the danger tones say "act on this", and the
   // whole point of `unknown` is that this run cannot tell you to.
-  unknown: "bg-[#8b949e]/15 text-[#8b949e]",
+  unknown: "bg-[#8b949e]/15 text-[#b1bac4]",
 };
 
 /// Poetry virtualenvs, on the Artifacts page.
@@ -315,7 +315,7 @@ export function VenvSection() {
               setChecked(new Set(orphans.map((r) => r.v.path)));
               setConfirming(true);
             }}
-            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             Remove all {orphans.length} orphaned
             {/* The size only when it IS the size (#956). A destructive
@@ -330,7 +330,7 @@ export function VenvSection() {
             type="button"
             disabled={busy}
             onClick={() => setConfirming(true)}
-            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             {/* Same rule (#956): `selectedBytes` is a `?? 0` sum over a
                 map a failed chunk left holes in. */}

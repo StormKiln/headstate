@@ -269,7 +269,7 @@ fn row(r: &ListRow, registry: &Registry, failures: &HashMap<String, Failure>) ->
         None
     };
     let waiting = match &r.waiting {
-        Waiting::Now { kind, at } => Some(DigestWaiting {
+        Waiting::Now { kind, at, .. } => Some(DigestWaiting {
             kind: kind.clone(),
             since: at.clone(),
         }),
@@ -411,6 +411,8 @@ mod tests {
     fn digest_carries_no_transcript_text() {
         let mut r = list_row("s1", running("idle"), "2026-09-26T11:58:00Z");
         r.waiting = Waiting::Now {
+            tool: Some("permission-tool-sentinel".into()),
+            summary: Some("permission-argument-sentinel".into()),
             kind: "permission_prompt".into(),
             at: "2026-09-26T11:59:30Z".into(),
         };
@@ -425,6 +427,8 @@ mod tests {
         let json = serde_json::to_value(&d).unwrap();
         let text = json.to_string();
         for leaked in [
+            "permission-tool-sentinel",
+            "permission-argument-sentinel",
             "widget loader",
             "sk-live",
             "rotate the key",
@@ -552,11 +556,15 @@ mod tests {
     fn waiting_is_only_the_present_tense() {
         let mut now_waiting = list_row("s1", running("idle"), "2026-09-26T11:58:00Z");
         now_waiting.waiting = Waiting::Now {
+            tool: None,
+            summary: None,
             kind: "idle_prompt".into(),
             at: "2026-09-26T11:59:30Z".into(),
         };
         let mut last_seen = list_row("s2", ListLiveness::Dead { why: 0 }, "2026-09-26T11:58:00Z");
         last_seen.waiting = Waiting::LastSeen {
+            tool: None,
+            summary: None,
             kind: "idle_prompt".into(),
             at: "2026-09-26T11:00:00Z".into(),
             why: "gone".into(),

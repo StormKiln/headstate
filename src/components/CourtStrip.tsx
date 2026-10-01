@@ -63,7 +63,7 @@ export function CourtStrip({
       <button
         type="button"
         onClick={() => onSelect("mine")}
-        className="text-sm font-semibold text-[#f85149] hover:underline"
+        className="text-sm font-semibold text-[#ff7b72] hover:underline"
       >
         {mine.length} needs you
       </button>

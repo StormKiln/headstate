@@ -106,6 +106,8 @@ export function liveOf(
     fileBytes: read?.file_bytes ?? null,
     masking: undefined,
     replacements: 0,
+    navigationNotice: null,
+    cursorFor: () => null,
     position:
       read === undefined
         ? null
@@ -183,6 +185,8 @@ export function everyToolCall(): ToolCallBlock[] {
     ["TaskUpdate", { tool: "task_update", task_id: "3", status: "completed", subject: null, active_form: null, fields: ["status"], truncated: false }, output({ text: "ok", task: { task_id: "3", success: true, status_from: "in_progress", status_to: "completed" } })],
     ["TaskGet", { tool: "task_get", task_id: "3" }, output({ text: "Task 3" })],
     ["TaskList", { tool: "task_list" }, output({ text: "1 task" })],
+    ["TaskStop", { tool: "task_stop", task_id: "bg1" }, null],
+    ["TaskOutput", { tool: "task_output", task_id: "bg1", block: false, timeout: 0 }, output({ text: "Recorded output" })],
     ["Mystery", { tool: "other", keys: ["alpha", "beta"] }, output({ text: "done" })],
     ["Unrecorded", { tool: "none" }, null],
   ];

@@ -99,7 +99,7 @@ export function PairedDesktopPanel() {
             code on that desktop.
           </p>
           {unpair.isError ? (
-            <p role="alert" className="text-xs text-[#f85149]">
+            <p role="alert" className="text-xs text-[#ff7b72]">
               {unpair.error instanceof Error ? unpair.error.message : String(unpair.error)}
             </p>
           ) : null}

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Transport } from "./transport";
+import { assertRemoteReply, isRemoteEvent, remoteEventError } from "./wireContract";
 
 /// The mobile transport: the companion app's webview talking to its own
 /// Rust process (`src-mobile`), which forwards every command to the
@@ -41,6 +42,7 @@ import type { Transport } from "./transport";
 /// page's return to the foreground asks again: iOS ends the stream when
 /// the app suspends, and re-subscribing is how the phone catches up.
 const CLIENT_COMMANDS = new Set([
+  "save_markdown",
   "pair_from_qr",
   "unpair",
   "connection_state",
@@ -92,15 +94,35 @@ function ensureSubscribed(): void {
   }
 }
 
+// Bounded by the fixed remote event registry. Repeated malformed frames do
+// not flood logs, and no payload/argument/record key is ever logged.
+const warnedEvents = new Set<string>();
+
 export const remote: Transport = {
   call: <T>(name: string, args?: Record<string, unknown>) =>
     CLIENT_COMMANDS.has(name)
       ? args === undefined
         ? invoke<T>(name)
         : invoke<T>(name, args)
-      : invoke<T>("remote_call", { command: name, args: args ?? {} }),
-  listen: (event, cb) => {
+      : invoke<unknown>("remote_call", { command: name, args: args ?? {} }).then((value) => {
+          assertRemoteReply(name, value);
+          return value as T;
+        }),
+  listen: <T>(event: string, cb: (e: { payload: T }) => void) => {
     ensureSubscribed();
-    return listen(event, cb);
+    if (!isRemoteEvent(event)) return listen(event, cb);
+    // Keep this synchronous so listener-install throws and unlisten retain
+    // their existing semantics. Only delivery is guarded.
+    return listen(event, (frame: { payload: T }) => {
+      const failure = remoteEventError(event, frame.payload);
+      if (failure) {
+        if (!warnedEvents.has(event)) {
+          warnedEvents.add(event);
+          console.warn(failure);
+        }
+        return;
+      }
+      cb(frame);
+    });
   },
 };

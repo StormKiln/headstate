@@ -324,7 +324,7 @@ function PasteForm({
 function PairingFailureNotice({ failure }: { failure: PairingFailure }) {
   return (
     <div role="alert" className="space-y-1 rounded border border-[#f85149]/30 bg-[#f85149]/10 p-3">
-      <p className="text-sm font-medium text-[#f85149]">{failure.title}</p>
+      <p className="text-sm font-medium text-[#ff7b72]">{failure.title}</p>
       <p className="text-sm text-[#e6edf3]">{failure.detail}</p>
       {/* Collapsed by default: when the advice above is right, this is
           noise. When it is wrong -- "check both devices are on the same
@@ -337,8 +337,8 @@ function PairingFailureNotice({ failure }: { failure: PairingFailure }) {
           issue, and an IPv6 address does not wrap on a phone. */}
       {failure.technical !== "" && failure.technical !== failure.detail ? (
         <details className="pt-1">
-          <summary className="cursor-pointer text-xs text-[#8b949e]">Show details</summary>
-          <p className="mt-1 select-all break-all font-mono text-xs text-[#8b949e]">
+          <summary className="cursor-pointer text-xs text-[#b1bac4]">Show details</summary>
+          <p className="mt-1 select-all break-all font-mono text-xs text-[#b1bac4]">
             {failure.technical}
           </p>
         </details>

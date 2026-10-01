@@ -1460,6 +1460,10 @@ fn truncation_payload(fetched: u64, total: u64) -> u64 {
     }
 }
 
+/// A dedicated demand signal: stats clicks must not consume the poll loop's
+/// own wake-up permit.
+pub struct BackfillWaker(pub Arc<Notify>);
+
 /// Spawn the PR Stats backfill worker (#1092, #1093).
 ///
 /// # Why this is a SIBLING of [`spawn`] and not part of its tick
@@ -1487,16 +1491,18 @@ fn truncation_payload(fetched: u64, total: u64) -> u64 {
 /// Nothing is written before the fetch, which is what makes a crash
 /// mid-tick leave no stuck row: there is no `pending` state to be stuck
 /// in.
-pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
+pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Notify>) {
     tauri::async_runtime::spawn(async move {
-        // The first tick waits a full interval rather than firing at
-        // launch. Startup is the busiest moment the app has -- the poll
+        // The first tick waits a full interval unless a Stats click nudges
+        // it. Startup is the busiest moment the app has -- the poll
         // loop's first tick, the window's first render and whatever the
         // user clicks are all competing -- and a backfill is the one
         // consumer that can always wait.
+        let mut last_started: Option<tokio::time::Instant> = None;
         loop {
-            tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL).await;
-            let tick = backfill_tick(&app, &client).await;
+            wait_backfill_tick(&waker, last_started).await;
+            last_started = Some(tokio::time::Instant::now());
+            let tick = backfill_tick(crate::commands::db_path(&app), &client).await;
             match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
@@ -1551,6 +1557,18 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>) {
     });
 }
 
+/// Coalesced demand can wake an idle worker, but cannot spend faster than
+/// the established cadence. The caller awaits each tick before waiting again.
+async fn wait_backfill_tick(waker: &Notify, last_started: Option<tokio::time::Instant>) {
+    tokio::select! {
+        _ = tokio::time::sleep(crate::github::stats::backfill::BACKFILL_INTERVAL) => {},
+        _ = waker.notified() => {},
+    }
+    if let Some(last) = last_started {
+        tokio::time::sleep_until(last + crate::github::stats::backfill::BACKFILL_INTERVAL).await;
+    }
+}
+
 /// A tick's outcome, plus the scope window it applies to.
 ///
 /// The window travels back to the LOOP so the loop can emit exactly one
@@ -1591,7 +1609,7 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 ///
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
-async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
+async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Tick {
     use crate::github::stats::backfill::{self as bf, TickOutcome};
 
     // The gate, BEFORE any request. `None` means skip -- deliberately the
@@ -1620,15 +1638,20 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
         .into();
     }
 
-    let db = crate::commands::db_path(app);
     let now = chrono::Utc::now();
+    let budget = bf::tick_budget();
+    let viewer = match client.stats_viewer_metered(&budget).await {
+        Ok(viewer) => viewer,
+        Err(_) => return TickOutcome::Failed("could not verify the stats account".into()).into(),
+    };
 
     // Which scope, and what it still owes -- off the runtime, because this
     // is SQLite (`persist_and_emit` states the rule).
     let picked = {
         let db = db.clone();
+        let viewer = viewer.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<Option<_>, String> {
-            let conn = open_db(&db).map_err(|e| e.to_string())?;
+            let mut conn = open_db(&db).map_err(|e| e.to_string())?;
             let Some(scope) =
                 crate::store::pr_backfill_scope::next_to_work(&conn).map_err(|e| e.to_string())?
             else {
@@ -1640,7 +1663,16 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
             let uncovered =
                 crate::store::pr_slice::uncovered_days(&conn, &scope.scope_key, &from, &to)
                     .map_err(|e| e.to_string())?;
-            Ok(Some((scope, from, to, uncovered)))
+            let pages = crate::store::pr_backfill_page::select(
+                &mut conn,
+                &viewer,
+                &scope.scope_key,
+                &uncovered,
+                bf::GROUP_SLICES,
+            )?;
+            let coverage = crate::store::pr_slice::coverage(&conn, &scope.scope_key, &from, &to)
+                .map_err(|e| e.to_string())?;
+            Ok(Some((scope, from, to, uncovered, pages, coverage.partial)))
         })
         .await
     };
@@ -1650,7 +1682,8 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
         Ok(Err(e)) => return TickOutcome::Failed(e).into(),
         Err(e) => return TickOutcome::Failed(e.to_string()).into(),
     };
-    let (scope, from, to, uncovered) = picked;
+    let (scope, from, to, uncovered, pages, partial) = picked;
+    let covered_before = bf::days_between(&from, &to).saturating_sub(uncovered.len());
     // Everything past this point knows its scope, so every exit can report
     // one.
     let here = |outcome| Tick {
@@ -1667,7 +1700,11 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
         // worked, so the rotation moves on rather than re-deciding this
         // same scope every minute.
         mark_worked(&db, &scope.scope_key, now).await;
-        return here(TickOutcome::Complete);
+        return here(if partial {
+            TickOutcome::Failed("some days exceed the search retrieval limit".into())
+        } else {
+            TickOutcome::Complete
+        });
     }
 
     // A measure whose days could never settle is not walked at all --
@@ -1675,7 +1712,9 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
     // rotation, and left alone otherwise.
     if !bf::walkable(&scope.measure) {
         mark_worked(&db, &scope.scope_key, now).await;
-        return here(TickOutcome::Complete);
+        return here(TickOutcome::Failed(
+            "this measure cannot be backfilled".into(),
+        ));
     }
     let Some(q) = bf::query_for(&scope.scope_kind, &scope.scope_value, &scope.measure) else {
         // A row this build cannot interpret. Marked worked so it cannot
@@ -1687,99 +1726,54 @@ async fn backfill_tick(app: &AppHandle, client: &Arc<GitHubClient>) -> Tick {
         )));
     };
 
-    let group: Vec<String> = uncovered.iter().take(bf::GROUP_SLICES).cloned().collect();
+    let group: Vec<String> = pages.iter().map(|p| p.day.clone()).collect();
     let slices = bf::day_slices(&group);
-    let budget = bf::tick_budget();
-
-    // One document for the whole group, MEASURED at 1 point.
-    let fetched = crate::github::stats::fetch::load_detail_chunked(
-        client,
-        &q,
-        &slices,
-        &budget,
-        bf::GROUP_SLICES,
-    )
-    .await;
+    let after: Vec<Option<String>> = pages.iter().map(|p| p.after.clone()).collect();
+    let fetched =
+        crate::github::stats::fetch::load_backfill_pages(client, &q, &slices, &after, &budget)
+            .await;
     let map = match fetched {
-        Ok(v) => v,
-        Err(e) => {
-            // The days stay uncovered, so the next tick retries them.
-            // Nothing was written, so there is no row to get stuck.
+        Ok(value) => value,
+        Err(_) => {
             mark_worked(&db, &scope.scope_key, now).await;
-            return here(TickOutcome::Failed(e.to_string()));
+            return here(TickOutcome::Failed(
+                "could not retrieve the next background page".into(),
+            ));
         }
     };
-
-    // Map the response the SAME way a foreground board does -- one mapper,
-    // so a backfilled row and a clicked one cannot differ.
-    let prs = crate::github::stats::Board::retrieved_prs(&map, &slices);
-    let refused = map["__refused"].as_u64().unwrap_or(0);
-    let counts: Vec<u64> = slices
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            map[crate::github::stats::query::slice_alias(i)]["issueCount"]
-                .as_u64()
-                .unwrap_or(0)
-        })
-        .collect();
-
-    let scope_key = scope.scope_key.clone();
     let written = {
         let db = db.clone();
-        let slices = slices.clone();
-        let key = scope_key.clone();
-        tauri::async_runtime::spawn_blocking(move || -> Result<(usize, usize), String> {
+        let key = scope.scope_key.clone();
+        let from = from.clone();
+        let to = to.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
             let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-            let mut days = 0;
-            let mut rows = 0;
-            for (i, slice) in slices.iter().enumerate() {
-                // Rows belonging to THIS slice only. A day's rows and the
-                // claim about that day land together, so a partially
-                // written group leaves whole days rather than partial ones.
-                let mine: Vec<_> = prs
-                    .iter()
-                    .filter(|p| p.merged_at == slice.from)
-                    .cloned()
-                    .collect();
-                let count = counts.get(i).copied().unwrap_or(0);
-                // Refusals are attributed to the whole document rather
-                // than to one alias -- `Outcome::refused_fields` records
-                // that the sliced path cannot attribute them -- so a
-                // refusal marks every slice in the group as refused. That
-                // is the conservative direction: the days are re-asked.
-                let row = crate::github::stats::backfill::classify(
-                    slice,
-                    count,
-                    mine.len() as u64,
-                    refused,
-                );
-                if row.state.settled() {
-                    days += 1;
-                }
-                rows += crate::store::pr_slice::record_with_rows(&mut conn, &key, &row, &mine, now)
-                    .map_err(|e| e.to_string())?;
-            }
+            let (rows, valid) = crate::store::pr_backfill_page::commit(
+                &mut conn, &viewer, &key, &pages, &map, now,
+            )?;
+            let coverage = crate::store::pr_slice::coverage(&conn, &key, &from, &to)
+                .map_err(|e| e.to_string())?;
+            let remaining = crate::store::pr_slice::uncovered_days(&conn, &key, &from, &to)
+                .map_err(|e| e.to_string())?;
             let _ = crate::store::pr_history::prune(&conn);
-            Ok((days, rows))
+            Ok((rows, valid, coverage, remaining.is_empty()))
         })
         .await
     };
-    mark_worked(&db, &scope_key, now).await;
-    let (days, rows) = match written {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return here(TickOutcome::Failed(e)),
-        Err(e) => return here(TickOutcome::Failed(e.to_string())),
-    };
-
-    // Whether there is still work left in the horizon. A tick that
-    // advanced and emptied the horizon has CONVERGED, and saying
-    // "Working" about it would leave the page promising a next batch that
-    // will never come.
-    if uncovered.len() > group.len() {
-        here(TickOutcome::Advanced { days, prs: rows })
-    } else {
-        here(TickOutcome::Complete)
+    mark_worked(&db, &scope.scope_key, now).await;
+    match written {
+        Ok(Ok((_, true, coverage, true))) if !coverage.partial => here(TickOutcome::Complete),
+        Ok(Ok((rows, true, coverage, false))) => here(TickOutcome::Advanced {
+            days: coverage.days_covered().saturating_sub(covered_before),
+            prs: rows,
+        }),
+        Ok(Ok(_)) => here(TickOutcome::Failed(
+            "background coverage is still partial or the page was inconsistent".into(),
+        )),
+        Ok(Err(e)) => here(TickOutcome::Failed(e)),
+        Err(_) => here(TickOutcome::Failed(
+            "background page storage task failed".into(),
+        )),
     }
 }
 
@@ -1861,6 +1855,217 @@ async fn emit_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backfill_dense_day_resumes_until_all_120_rows_are_stored() {
+        use crate::github::stats::{backfill as bf, budget};
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = wiremock::MockServer::start().await;
+            let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string();
+            let reply_day = day.clone();
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap();
+                    if !doc.contains("search(") {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"}}}));
+                    }
+                    let offset = if doc.contains("after: \"100\"") {100} else if doc.contains("after: \"50\"") {50} else {0};
+                    let end = (offset + 50).min(120);
+                    let nodes: Vec<_> = (offset..end).map(|n| serde_json::json!({
+                        "number":n+1,"title":"fixture","url":"https://example.com/pr",
+                        "repository":{"nameWithOwner":"fixture/repo"},"author":{"login":"fixture-author"},
+                        "createdAt":format!("{reply_day}T00:00:00Z"),"mergedAt":format!("{reply_day}T01:00:00Z"),
+                        "additions":1,"deletions":0,"changedFiles":1,"reviews":{"totalCount":0}
+                    })).collect();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"s0":{
+                        "issueCount":120,"nodes":nodes,"pageInfo":{"hasNextPage":end<120,"endCursor":end.to_string()}
+                    }}}))
+                }).mount(&server).await;
+            let new_client = || {
+                std::sync::Arc::new(crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(server.uri())
+                        .unwrap()
+                        .personal_token("fixture-token".to_string())
+                        .build()
+                        .unwrap(),
+                ))
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("dense.db");
+            let conn = crate::store::open_db(&db).unwrap();
+            crate::store::settings::set(
+                &conn,
+                crate::store::settings::keys::STATS_VIEWER,
+                &"fixture-viewer",
+            )
+            .unwrap();
+            let key = "merged|*|org:fixture";
+            crate::store::pr_backfill_scope::note_seen(
+                &conn,
+                &crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: key.into(),
+                    scope_kind: "org".into(),
+                    scope_value: "fixture".into(),
+                    measure: "merged".into(),
+                    horizon_days: 1,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let mut client = new_client();
+            client.fetch_viewer().await.unwrap();
+            let before = server.received_requests().await.unwrap().len();
+            for (pass, expected) in [50, 100, 120].into_iter().enumerate() {
+                let tick = super::backfill_tick(db.clone(), &client).await;
+                assert_eq!(
+                    crate::store::pr_history::count(&conn, key, &day, &day).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    matches!(tick.outcome, bf::TickOutcome::Complete),
+                    pass == 2,
+                    "{:?}",
+                    tick.outcome
+                );
+                if pass == 0 {
+                    // A fresh client/process must resume the durable cursor.
+                    client = new_client();
+                    client.fetch_viewer().await.unwrap();
+                }
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), before + 4);
+            let before = server.received_requests().await.unwrap().len();
+            assert!(matches!(
+                super::backfill_tick(db, &client).await.outcome,
+                bf::TickOutcome::Complete
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backfill_nudge_wakes_idle_worker_but_preserves_tick_floor() {
+        let waker = std::sync::Arc::new(tokio::sync::Notify::new());
+        waker.notify_one();
+        let start = tokio::time::Instant::now();
+        super::wait_backfill_tick(&waker, None).await;
+        assert_eq!(tokio::time::Instant::now(), start);
+        let second_waker = waker.clone();
+        let second = tokio::spawn(async move {
+            super::wait_backfill_tick(&second_waker, Some(start)).await;
+        });
+        for _ in 0..100 {
+            waker.notify_one();
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(!second.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        second.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            crate::github::stats::backfill::BACKFILL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn backfill_large_fixture_converges_and_stops_requesting_covered_days() {
+        use crate::github::stats::{backfill as bf, budget};
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap();
+                    let mut data = serde_json::Map::new();
+                    data.insert("viewer".into(),serde_json::json!({"login":"fixture-viewer"}));
+                    for i in 0..bf::GROUP_SLICES {
+                        let Some((_, tail)) = doc.split_once(&format!("s{i}: search(")) else { continue; };
+                        let day = &tail.split_once("merged:").unwrap().1[..10];
+                        let base: u64 = day.replace('-', "").parse().unwrap();
+                        let nodes: Vec<_> = (0..50).map(|n| serde_json::json!({
+                            "number": base * 100 + n, "title":"fixture", "url":"https://example.com/pr",
+                            "repository":{"nameWithOwner":"fixture/repo"}, "author":{"login":"fixture-author"},
+                            "createdAt":format!("{day}T00:00:00Z"), "mergedAt":format!("{day}T01:00:00Z"),
+                            "additions":10,"deletions":2,"changedFiles":1,"reviews":{"totalCount":1}
+                        })).collect();
+                        data.insert(format!("s{i}"), serde_json::json!({"issueCount":50,"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":"end"}}));
+                    }
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":data}))
+                }).mount(&server).await;
+            let client = std::sync::Arc::new(crate::github::client::GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(server.uri())
+                    .unwrap()
+                    .personal_token("fixture-token".to_string())
+                    .build()
+                    .unwrap(),
+            ));
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("backfill.db");
+            let conn = crate::store::open_db(&db).unwrap();
+            crate::store::settings::set(
+                &conn,
+                crate::store::settings::keys::STATS_VIEWER,
+                &"fixture-viewer",
+            )
+            .unwrap();
+            let key = bf::query_for("org", "fixture", "merged")
+                .unwrap()
+                .cache_key("fixture-viewer");
+            crate::store::pr_backfill_scope::note_seen(
+                &conn,
+                &crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: key.clone(),
+                    scope_kind: "org".into(),
+                    scope_value: "fixture".into(),
+                    measure: "merged".into(),
+                    horizon_days: 30,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let (from, to) = bf::horizon_window(chrono::Utc::now(), 30).unwrap();
+            let ticks = 30usize.div_ceil(bf::GROUP_SLICES);
+            for pass in 1..=ticks {
+                let tick = super::backfill_tick(db.clone(), &client).await;
+                assert!(
+                    !matches!(tick.outcome, bf::TickOutcome::Failed(_)),
+                    "{:?}",
+                    tick.outcome
+                );
+                if let bf::TickOutcome::Advanced { days, .. } = tick.outcome {
+                    assert_eq!(
+                        days, 5,
+                        "progress counts newly settled days, not the accumulated horizon"
+                    );
+                }
+                let coverage = crate::store::pr_slice::coverage(&conn, &key, &from, &to).unwrap();
+                assert_eq!(coverage.days_covered(), (pass * bf::GROUP_SLICES).min(30));
+            }
+            assert_eq!(
+                crate::store::pr_history::count(&conn, &key, &from, &to).unwrap(),
+                1500
+            );
+            let issued = server.received_requests().await.unwrap().len();
+            assert_eq!(issued, ticks + 1);
+            assert!(matches!(
+                super::backfill_tick(db, &client).await.outcome,
+                bf::TickOutcome::Complete
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), issued);
+        });
+    }
+
     /// The worst case in the six-day log: 8 fetched of 29 open (#745).
     #[test]
     fn a_short_list_reports_githubs_own_count() {
@@ -3333,3 +3538,7 @@ mod tests {
         assert_eq!(merged[1].merge, MergeState::Checking); // different repo, untouched
     }
 }
+
+#[cfg(test)]
+#[path = "poll_backfill_tests.rs"]
+mod backfill_tests;

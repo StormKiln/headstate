@@ -62,6 +62,7 @@ pub enum Class {
 /// Command name to class. The order is the spec's; keep it that way so a
 /// diff against the design document is a line-by-line comparison.
 pub const SURFACE: &[(&str, Class)] = &[
+    ("save_markdown", Class::Local),
     // read: no side effects on GitHub or disk.
     // Read: the phone asking whether the DESKTOP's background work died
     // is a question about state, not an action on the machine. The
@@ -585,6 +586,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // last consumer, and the paged viewer reads only these two.
     ("claude_transcript_block_text", Class::Read),
     ("claude_transcript_page", Class::Read),
+    // Ephemeral bounded metadata interest; same transcript admission, no durable write.
+    ("claude_transcript_watch", Class::Read),
     // Find messages anywhere in that transcript: the turn outline, or
     // the messages whose text holds a query (#1484). `Read` on the same
     // grounds, and bounded inside the command however large the file:
@@ -1323,6 +1326,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("offset")?,
         )
         .await),
+        "claude_transcript_watch" => {
+            res(commands::claude_transcript_watch(app.clone(), a.get("path")?).await)
+        }
         "claude_transcript_page" => res(commands::claude_transcript_page(
             a.get("path")?,
             a.get("anchor")?,

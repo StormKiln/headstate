@@ -236,7 +236,7 @@ export function ClaudeIntegrationsPanel({
           settled against -- and someone who turned the view off months ago
           still has a legitimate reason to remove the hook. A panel that
           cannot uninstall while disabled is a dead end. */}
-      <p className={`text-xs ${enabled ? "text-[#8b949e]" : "text-[#6e7681]"}`}>
+      <p className="text-xs text-[#8b949e]">
         Lists the sessions on this machine, which of them are still running, and the
         command to resume one that is not.
         {enabled ? null : " Hidden while this is off."}

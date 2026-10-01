@@ -58,13 +58,15 @@ set -euo pipefail
 # is still correct in two places that must not be rewritten: the macOS and iOS
 # bundle identifiers (`com.pktstorm.headstate`), which are an APPLE identity
 # rather than a GitHub one and cannot change without a new App Store record.
-ALLOWED='octocat|StormKiln|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
+# Native compile gates name the public JDK, Swift bridge and Gradle license dependencies.
+ALLOWED='adoptium|Brendonovich|JetBrains|octocat|StormKiln|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.
 # DSA and KEM cover the NIST post-quantum parameter sets (ML-DSA-65,
 # ML-KEM-768), which share the PREFIX-NUMBER shape.
-ALLOWED_TICKET_PREFIX='RUSTSEC|CVE|GHSA|DSA|KEM'
+# SHA-256 is the standard digest used for private export-cache reuse.
+ALLOWED_TICKET_PREFIX='RUSTSEC|CVE|GHSA|DSA|KEM|SHA'
 
 # Mail domains that cannot carry a private address by construction.
 # GitHub's no-reply domain exists so a commit is attributed without

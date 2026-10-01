@@ -18,7 +18,7 @@ const ACTION_TONE: Record<string, string> = {
   proposed: "bg-[#1f6feb]/15 text-[#58a6ff]",
   skipped: "bg-[#d29922]/15 text-[#d29922]",
   refused: "bg-[#d29922]/15 text-[#d29922]",
-  removed: "bg-[#f85149]/15 text-[#f85149]",
+  removed: "bg-[#f85149]/15 text-[#ff7b72]",
 };
 
 /// The cleanup ledger, and a button to run a pass now.
@@ -148,7 +148,7 @@ export function CleanupLog() {
             >
               <span
                 className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${
-                  ACTION_TONE[e.action] ?? "bg-[#30363d] text-[#8b949e]"
+                  ACTION_TONE[e.action] ?? "bg-[#30363d] text-[#b1bac4]"
                 }`}
               >
                 {e.action}

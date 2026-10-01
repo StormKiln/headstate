@@ -239,7 +239,7 @@ export function UpdateWizard({
                           are told apart. Without it the list showed the
                           same name twice with different versions and no
                           way to attribute either to a file. */}
-                      <span className="block truncate text-[10px] text-[#6e7681]">
+                      <span className="block truncate text-[10px] text-[#8b949e]">
                         {p.manifest}
                       </span>
                     </span>

@@ -2,6 +2,14 @@
 //! calls these commands and listens for the `prs-updated` event that
 //! [`crate::poll`] emits in the background.
 
+#[tauri::command]
+pub async fn save_markdown(
+    window: tauri::WebviewWindow,
+    markdown: String,
+) -> Result<String, String> {
+    crate::markdown_export::save_markdown(window, markdown).await
+}
+
 use crate::github::client::{ClientError, GitHubClient};
 use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
@@ -4962,60 +4970,30 @@ fn parse_scope_request(
     })
 }
 
-/// Note the current `@me` identity, dropping another user's cached rows.
-///
-/// A thin wrapper over `store::stats::note_viewer` so the three stats
-/// commands share one call site's error handling rather than each
-/// swallowing the `Result` its own way.
-///
-/// Failure is logged and swallowed for the reason every other cache
-/// interaction here is: the answer the command returns is correct
-/// regardless, and turning a tidy-up into a command failure would make an
-/// optimisation a liability. The cost of the failure is that a departed
-/// user's rows stay until the next successful call -- they are never
-/// SERVED, because keys resolve `@me` to a login (`Subject::cache_key`).
-fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
-    match crate::store::stats::note_viewer(conn, viewer) {
-        Ok(0) => {}
-        Ok(n) => {
-            log::info!("the stats cache dropped {n} rows for a previous identity");
-            // The accumulated pull requests go with it (#1004). They are
-            // keyed on `StatsQuery::cache_key` with `@me` already resolved,
-            // so a departed identity's rows can never be SERVED to the new
-            // one -- but leaving them would keep another user's corpus on
-            // disk indefinitely, and the event that clears one cache is
-            // exactly the event that should clear the layer beneath it.
-            match crate::store::pr_history::clear(conn) {
-                Ok(0) => {}
-                Ok(m) => log::info!("dropped {m} accumulated pull requests for that identity"),
-                Err(e) => log::warn!("could not clear accumulated pull requests: {e}"),
-            }
-            // The LEDGER goes with the rows (#1092), and this is the half
-            // it would be easiest to forget. Clearing `pr_history` alone
-            // leaves `pr_slice` claiming ranges are retrieved whose pull
-            // requests are gone -- and because the worker skips a range the
-            // ledger calls settled, those days would never be re-fetched.
-            // A ledger that lies is worse than no ledger, so the guard
-            // `the_identity_change_clears_every_backfill_table` checks
-            // this rather than a comment asking someone to remember.
-            match crate::store::pr_slice::clear(conn) {
-                Ok(0) => {}
-                Ok(m) => log::info!("dropped {m} slice ledger rows for that identity"),
-                Err(e) => log::warn!("could not clear the slice ledger: {e}"),
-            }
-            // And the scopes the worker walks, whose keys were resolved
-            // against a login that is no longer signed in.
-            match crate::store::pr_backfill_scope::clear(conn) {
-                Ok(0) => {}
-                Ok(m) => log::info!("dropped {m} backfill scopes for that identity"),
-                Err(e) => log::warn!("could not clear the backfill scopes: {e}"),
-            }
-            // And the frames remembered for those scopes (#1570), which
-            // would otherwise seed the next page with the old coverage.
-            forget_backfill_frames();
-        }
-        Err(e) => log::warn!("could not record the stats viewer: {e}"),
+/// Check the verified account before reading shared stats storage. Identity,
+/// cache, history, ledger and registrations change atomically. Failure stops
+/// the read: a board's all-authors key does not itself isolate accounts.
+fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let previous: Option<String> =
+        crate::store::settings::get(&tx, crate::store::settings::keys::STATS_VIEWER)
+            .map_err(|e| e.to_string())?;
+    let changed = previous.as_deref() != Some(viewer);
+    if changed {
+        // Clear even when the whole-window cache is empty: a store-first
+        // board may have history and coverage without any cache row.
+        crate::store::stats::clear(&tx).map_err(|e| e.to_string())?;
+        crate::store::pr_history::clear(&tx).map_err(|e| e.to_string())?;
+        crate::store::pr_slice::clear(&tx).map_err(|e| e.to_string())?;
+        crate::store::pr_backfill_scope::clear(&tx).map_err(|e| e.to_string())?;
+        crate::store::pr_backfill_page::clear(&tx).map_err(|e| e.to_string())?;
     }
+    crate::store::stats::note_viewer(&tx, viewer).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    if changed {
+        forget_backfill_frames();
+    }
+    Ok(())
 }
 
 /// Note the viewer and read the cached row, off the async runtime (#1090).
@@ -5050,7 +5028,7 @@ async fn stats_cache_read(
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         // Before any read: if the token now belongs to someone else, the
         // rows in this table are the previous user's (#840).
-        note_stats_viewer(&conn, &viewer);
+        note_stats_viewer(&conn, &viewer)?;
         Ok(crate::store::stats::get(&conn, &key, &from, &to, now)
             .ok()
             .flatten()
@@ -5177,8 +5155,7 @@ async fn note_scope_seen(
             e.to_string()
         })?;
         crate::diag!(
-            "[diag] backfill scope registered key={} kind={} horizon={}",
-            registration.scope_key,
+            "[diag] backfill scope registered kind={} horizon={}",
             registration.scope_kind,
             registration.horizon_days
         );
@@ -5286,9 +5263,30 @@ pub async fn stats_board(
     measure: String,
     days: i64,
 ) -> Result<StatsBoard, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    stats_board_for_client(
+        &client,
+        db_path(&app),
+        &app.state::<crate::poll::BackfillWaker>().0,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await
+}
+
+async fn stats_board_for_client(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    waker: &tokio::sync::Notify,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoard, String> {
     use crate::github::stats::{Budget, Measure};
 
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let measure = match measure.as_str() {
         "merged" => Measure::Merged,
         "opened" => Measure::Opened,
@@ -5314,14 +5312,11 @@ pub async fn stats_board(
     // budgeted for it (`// +1 for fetch_viewer.`), so the projection knew
     // about a request the accounting did not.
     let budget = Budget::new();
-    // Resolved so the UI can split the board into Mine and Others. One
-    // cheap request whose answer never changes for a session, and the same
-    // call `stats_count` makes for its cache key -- the viewer's login is
-    // genuinely needed here rather than avoidable, because `@me` is a
-    // qualifier GitHub resolves and not a login the UI can compare a row
-    // against.
+    // Reuse this immutable client's verified identity (normally resolved
+    // at startup). A new client must verify its own token once; subsequent
+    // covered clicks issue no provider requests, including viewer lookups.
     let viewer = client
-        .fetch_viewer_metered(&budget)
+        .stats_viewer_metered(&budget)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -5352,7 +5347,6 @@ pub async fn stats_board(
     let q = crate::github::stats::StatsQuery::new(None, req.scope.clone(), measure);
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
-    let db = db_path(&app);
     // REGISTERED BEFORE A CACHED BOARD CAN RETURN, not after the fetch
     // (#1109).
     //
@@ -5399,6 +5393,24 @@ pub async fn stats_board(
         note_scope_seen(db.clone(), registration, now).await,
         &q.cache_key(&viewer),
     );
+    if matches!(backfill, BackfillRegistration::Registered(_)) {
+        waker.notify_one();
+    }
+    if let Some(board) = stored_stats_board(
+        db.clone(),
+        q.cache_key(&viewer),
+        req.window.from.clone(),
+        req.window.to.clone(),
+    )
+    .await?
+    {
+        return Ok(StatsBoard {
+            scope_key: q.cache_key(&viewer),
+            viewer,
+            board,
+            backfill,
+        });
+    }
     if let Some(payload) = hit {
         if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload) {
             crate::diag!(
@@ -5458,7 +5470,7 @@ pub async fn stats_board(
     // partial answer.
     let scope_key = q.cache_key(&viewer);
     let out = crate::github::stats::board::load_board_accumulating(
-        &client, &req.scope, measure, window, &budget,
+        client, &req.scope, measure, window, &budget,
     )
     .await
     .map_err(|e| e.to_string());
@@ -5547,6 +5559,43 @@ pub async fn stats_board(
         }
     }
     out
+}
+
+/// Read the ledger and its evidence in one SQLite snapshot. A missing day
+/// never becomes a measured zero, and a stale whole-window cache cannot hide
+/// progress made by the worker since the preceding click.
+async fn stored_stats_board(
+    db: std::path::PathBuf,
+    scope_key: String,
+    from: String,
+    to: String,
+) -> Result<Option<crate::github::stats::Board>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let coverage = crate::store::pr_slice::coverage(&tx, &scope_key, &from, &to)
+            .map_err(|e| e.to_string())?;
+        if coverage.days_covered() == 0 {
+            return Ok(None);
+        }
+        let stored = crate::store::pr_history::load(&tx, &scope_key, &from, &to)
+            .map_err(|e| e.to_string())?;
+        let mut empty = crate::github::stats::Board::from_alias_map(
+            &serde_json::json!({}),
+            &[],
+            0,
+            crate::github::stats::Budget::new().snapshot(),
+        );
+        empty.total = None;
+        Ok(Some(crate::github::stats::Board::from_stored(
+            &stored,
+            &empty,
+            &coverage,
+            crate::github::stats::backfill::days_between(&from, &to),
+        )))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Write a load's pull requests down and re-assemble the board from
@@ -7233,7 +7282,10 @@ fn claude_transcript_path(path: &str) -> Result<std::path::PathBuf, String> {
 /// for the settings installer, and for the same reason: a guard tested
 /// against the real home directory is a guard tested on one machine's
 /// accidents.
-fn transcript_path_in(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn transcript_path_in(
+    root: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
     // The ROOT is canonicalized too: on macOS `/Users/...` resolves
     // through `/System/Volumes/Data`, so comparing a resolved path
     // against an unresolved root fails on every real machine.
@@ -7352,6 +7404,22 @@ pub async fn claude_transcript_block_text(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Renew a bounded, expiring metadata observation for an explicitly viewed
+/// transcript. Read-class: no durable write, same path and privacy admission
+/// as a page read. Errors never include the requested path.
+#[tauri::command]
+pub async fn claude_transcript_watch(
+    app: AppHandle,
+    path: String,
+) -> Result<crate::claude::activity::WatchLease, String> {
+    if !read_ui_prefs(&app).claude_integrations_enabled {
+        return Err("Transcript watch refused: integration disabled".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::claude::activity::register(&path))
+        .await
+        .map_err(|_| "Transcript activity watch unavailable".to_string())?
 }
 
 /// One bounded page of a transcript, before or after a cursor (#1220).
@@ -8160,6 +8228,225 @@ mod tests {
     /// ones that read one back. Keys keep the others apart; a clear is the
     /// one operation a key cannot scope.
     static FRAMES_CLEAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn stats_identity_clear_failure_rolls_back_and_refuses_the_read() {
+        let _frames = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        super::note_stats_viewer(&conn, "fixture-before").unwrap();
+        crate::store::pr_slice::put(
+            &conn,
+            "fixture-scope",
+            &crate::store::pr_slice::SliceRow {
+                from: "2026-09-01".into(),
+                to: "2026-09-01".into(),
+                state: crate::store::pr_slice::SliceState::Complete,
+                issue_count: 0,
+                retrieved: 0,
+                refused_fields: 0,
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_identity_clear BEFORE DELETE ON pr_slice BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        assert!(super::note_stats_viewer(&conn, "fixture-after").is_err());
+        assert_eq!(
+            crate::store::settings::get::<String>(
+                &conn,
+                crate::store::settings::keys::STATS_VIEWER
+            )
+            .unwrap()
+            .as_deref(),
+            Some("fixture-before")
+        );
+        assert_eq!(crate::store::pr_slice::total_rows(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn stats_store_first_cold_load_then_covered_click_issues_zero_requests() {
+        use crate::github::stats::budget;
+        let _frames = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|_: &wiremock::Request| {
+                    let mut data = serde_json::json!({"viewer":{"login":"fixture-viewer"}});
+                    for i in 0..20 {
+                        data[format!("s{i}")] = serde_json::json!({"issueCount":0,"nodes":[]});
+                    }
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":data}))
+                })
+                .mount(&server)
+                .await;
+            let client = crate::github::client::GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(server.uri())
+                    .unwrap()
+                    .personal_token("fixture-token".to_string())
+                    .build()
+                    .unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("stats.db");
+            let waker = tokio::sync::Notify::new();
+            let load = || {
+                super::stats_board_for_client(
+                    &client,
+                    db.clone(),
+                    &waker,
+                    "org".into(),
+                    Some("fixture-org".into()),
+                    "merged".into(),
+                    7,
+                )
+            };
+            let first = load().await.unwrap();
+            let issued = server.received_requests().await.unwrap().len();
+            assert!(
+                issued > 1,
+                "zero coverage must fetch beyond the viewer lookup"
+            );
+            assert_eq!(first.board.days_covered, 7);
+            assert!(first.board.complete);
+            tokio::time::timeout(std::time::Duration::from_millis(100), waker.notified())
+                .await
+                .unwrap();
+            let conn = super::open_db(&db).unwrap();
+            assert_eq!(
+                crate::store::pr_backfill_scope::next_to_work(&conn)
+                    .unwrap()
+                    .unwrap()
+                    .scope_key,
+                first.scope_key
+            );
+            // Sparse foreground slices span several days and intentionally
+            // do not overlap the worker's daily ledger. The cached fallback
+            // still prevents a second foreground load until coverage arrives.
+            load().await.unwrap();
+            assert_eq!(server.received_requests().await.unwrap().len(), issued);
+            for day in crate::github::stats::backfill::horizon_days(chrono::Utc::now(), 7) {
+                crate::store::pr_slice::put(
+                    &conn,
+                    &first.scope_key,
+                    &crate::store::pr_slice::SliceRow {
+                        from: day.clone(),
+                        to: day,
+                        state: crate::store::pr_slice::SliceState::Complete,
+                        issue_count: 0,
+                        retrieved: 0,
+                        refused_fields: 0,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            }
+            // A corrupt/stale whole-window cache cannot defeat the ledger.
+            conn.execute("UPDATE stats_cache SET payload = 'unreadable'", [])
+                .unwrap();
+            let second = load().await.unwrap();
+            assert_eq!(server.received_requests().await.unwrap().len(), issued);
+            assert_eq!(second.board.spend.requests, 0);
+            assert!(second.board.complete);
+            tokio::time::timeout(std::time::Duration::from_millis(100), waker.notified())
+                .await
+                .unwrap();
+            // Coverage for a different measure or scope must never be reused.
+            assert!(super::stored_stats_board(
+                db.clone(),
+                "opened|*|org:fixture-org".into(),
+                "2026-01-01".into(),
+                "2026-12-31".into()
+            )
+            .await
+            .unwrap()
+            .is_none());
+            // Removing every cache row must NOT prevent account isolation.
+            conn.execute("INSERT INTO pr_backfill_page(viewer,scope_key,day,payload,attempted) VALUES ('fixture-viewer','fixture','2026-09-01','{}',1)",[]).unwrap();
+            crate::store::stats::clear(&conn).unwrap();
+            super::note_stats_viewer(&conn, "different-viewer").unwrap();
+            let pending: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pr_backfill_page", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pending, 0);
+            assert_eq!(crate::store::pr_slice::total_rows(&conn).unwrap(), 0);
+            assert!(crate::store::pr_backfill_scope::next_to_work(&conn)
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn stats_store_first_keeps_uncovered_days_unknown_and_partial_days_partial() {
+        use crate::store::pr_slice::{self, SliceRow, SliceState};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stats.db");
+        let mut conn = super::open_db(&db).unwrap();
+        let key = "merged|*|org:fixture-partial";
+        let prs: Vec<_> = (0..1000)
+            .map(|n| crate::store::pr_history::StoredPr {
+                repo: "fixture/repo".into(),
+                number: n,
+                merged_at: "2026-09-01".into(),
+                title: "fixture".into(),
+                url: "https://example.com/pr".into(),
+                author: format!("fixture-author-{}", n % 100),
+                cycle_time_hours: 1.0,
+                size: 12,
+                additions: 10,
+                deletions: 2,
+                changed_files: 1,
+                reviews_received: 1,
+            })
+            .collect();
+        pr_slice::record_with_rows(
+            &mut conn,
+            key,
+            &SliceRow {
+                from: "2026-09-01".into(),
+                to: "2026-09-01".into(),
+                state: SliceState::Irreducible,
+                issue_count: 2000,
+                retrieved: 1000,
+                refused_fields: 0,
+            },
+            &prs,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let board = super::stored_stats_board(
+            db.clone(),
+            key.into(),
+            "2026-09-01".into(),
+            "2026-09-07".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(board.accumulated, 1000);
+        assert_eq!(board.rows.len(), 100);
+        assert_eq!(board.rows.iter().map(|r| r.prs).sum::<u64>(), 1000);
+        assert_eq!(board.days_covered, 1);
+        assert_eq!(board.days_total, 7);
+        assert_eq!(
+            board.total,
+            Some(2000),
+            "the ledger preserves the measured range while missing days remain uncovered"
+        );
+        assert!(!board.complete);
+        let whole_day =
+            super::stored_stats_board(db, key.into(), "2026-09-01".into(), "2026-09-01".into())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(whole_day.total, Some(2000));
+        assert!(!whole_day.complete);
+    }
 
     /// A frame for a scope key no other test uses. The remembered frames
     /// are process-wide, so each test owns its key rather than sharing one.

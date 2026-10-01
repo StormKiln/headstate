@@ -1,3 +1,4 @@
+import snapshotBoundaries from "./taskSnapshotBoundaries.json";
 /// #1504: the task checklist folded across messages. Generic fixtures cut
 /// to the measured record shapes -- no real task text.
 
@@ -19,7 +20,7 @@ afterEach(cleanup);
 
 let seq = 0;
 
-function message(blocks: ToolCallBlock[], over: Partial<TranscriptMessage> = {}): TranscriptMessage {
+function message(blocks: TranscriptMessage["blocks"], over: Partial<TranscriptMessage> = {}): TranscriptMessage {
   seq += 1;
   return {
     id: `m${seq}`,
@@ -242,7 +243,7 @@ describe("TaskChecklist panel", () => {
       "☐pending: #3 Test it",
     ]);
     expect(
-      within(panel).getByText("Tasks created before the earliest message shown are not listed."),
+      within(panel).getByText("Task history outside the messages shown may be missing."),
     ).toBeTruthy();
   });
 
@@ -307,4 +308,74 @@ describe("task calls in the transcript", () => {
     expect(labels).toEqual(["TaskList", "TaskGet: #1"]);
     expect(screen.queryByText(/Arguments:/)).toBeNull();
   });
+});
+
+
+describe("recorded task snapshots", () => {
+  const snapshot = (offset: number, status = "pending") => output({ offset, message_id: `r${offset}`, tool_use_id: `t${offset}`, task: {
+    ...taskResult({}), snapshots: { items: [{ task_id: "1", subject: "Recorded title", status }], omitted: 0, truncated: false },
+  } } as Partial<TranscriptToolOutput>);
+  it("uses a standalone snapshot as a partial checklist without a loaded call", () => {
+    const c = deriveTaskChecklist([message([{ kind: "tool_result", ...snapshot(100) }])], { truncated: false });
+    expect(c.tasks).toMatchObject([{ id: "1", subject: "Recorded title", status: "pending", created: false }]);
+    expect(c.partial).toBe(true);
+  });
+  it("orders observations by result position, not paired call position", () => {
+    const listed = call("TaskList", { tool: "task_list" }, snapshot(300));
+    const changed = update("1", "completed", output({ offset: 200 }));
+    const c = deriveTaskChecklist([message([listed], { offset: 10 }), message([changed], { offset: 20 })], { truncated: true });
+    expect(c.tasks[0].status).toBe("pending");
+  });
+  it("keeps a later update after an older snapshot and deduplicates standalone copies", () => {
+    const r = snapshot(100);
+    const c = deriveTaskChecklist([message([call("TaskList", { tool: "task_list" }, r), update("1", "completed", output({ offset: 300 }))]), message([{kind:"tool_result", ...r}])], { truncated: false });
+    expect(c.tasks).toHaveLength(1);
+    expect(c.tasks[0].status).toBe("completed");
+  });
+  it("does not erase known tasks on an empty list, apply refused snapshots, or mix sidechains", () => {
+    const refusedResult = snapshot(200);
+    refusedResult.task!.success = false;
+    const empty = snapshot(300); empty.task!.snapshots!.items = [];
+    const c = deriveTaskChecklist([message([create("Original", "1")]), message([{kind:"tool_result", ...refusedResult}]), message([{kind:"tool_result", ...empty}]), message([{kind:"tool_result", ...snapshot(400)}], { is_sidechain: true })], {truncated:false});
+    expect(c.tasks).toHaveLength(1);
+    expect(c.tasks[0].subject).toBe("Original");
+  });
+  it("keeps unknown and deleted snapshots honest and never treats background calls as checklist changes", () => {
+    const r = snapshot(100, "deleted");
+    const c = deriveTaskChecklist([message([{kind:"tool_result", ...r}])], {truncated:false});
+    expect(taskSummary(c)).toBeNull();
+    expect(deriveTaskChecklist([message([{kind:"tool_result", ...snapshot(200, "future")}])], {truncated:false}).tasks[0].status).toBe("future");
+    expect(deriveTaskChecklist([message([call("TaskStop", {tool:"task_stop",task_id:"1"}, snapshot(300))])], {truncated:false}).tasks).toEqual([]);
+  });
+  it("does not roll back a known status using a snapshot with unknown position", () => {
+    const r = snapshot(100); r.offset = null;
+    const c = deriveTaskChecklist([message([update("1", "completed", output({offset:200}))]),message([{kind:"tool_result",...r}])],{truncated:true});
+    expect(c.tasks[0]).toMatchObject({subject:"Recorded title",status:"completed"});
+  });
+  it("renders a background request without claiming the task stopped", () => {
+    render(<ToolCall call={call("TaskStop", { tool:"task_stop", task_id:"bg1" }, null)} variant="terminal" liveness={DEAD} />);
+    expect(screen.getByText("Stop requested · bg1")).toBeTruthy();
+    expect(screen.queryByText("Stopped")).toBeNull();
+  });
+
+});
+
+
+it("exposes omitted snapshot details without turning an unmeasured status into pending", () => {
+  const r = output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"1",subject:"Partial",status:null}],omitted:3,truncated:true}}});
+  const c = deriveTaskChecklist([message([{kind:"tool_result",...r}])], {truncated:false});
+  expect(c.tasks[0].status).toBeNull();
+  render(<TaskChecklist checklist={c} variant="terminal" />);
+  expect(screen.getByText("Some recorded task details were omitted or clipped.")).toBeTruthy();
+  expect(screen.getByText("status not recorded:")).toBeTruthy();
+});
+
+// Rust's parser test verifies these boundary statuses against actual parsed records.
+it.each(snapshotBoundaries)("does not promote incomplete $source ($remaining characters left)", ({ status, truncated }) => {
+  const r = output({task:{task_id:null,success:null,status_from:null,status_to:null,snapshots:{items:[{task_id:"4",subject:null,status}],omitted:0,truncated}}});
+  const state = deriveTaskChecklist([message([{kind:"tool_result",...r}])],{truncated:false});
+  expect(state.tasks[0].status).toBe(status);
+  expect(taskSummary(state)).toMatchObject({done:0,total:1});
+  expect(state.tasks).toHaveLength(1);
+  expect(state.snapshotIncomplete).toBe(truncated);
 });

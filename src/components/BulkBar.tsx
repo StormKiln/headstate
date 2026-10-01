@@ -253,7 +253,7 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
               {selected.map((pr) => {
                 const why = pending ? skip(pr, pending) : null;
                 return (
-                  <li key={prKey(pr)} className={`py-0.5 ${why ? "opacity-60" : ""}`}>
+                  <li key={prKey(pr)} className="py-0.5">
                     {pr.repo}#{pr.number} — {pr.title}
                     {why ? <span className="ml-1 text-[#d29922]">({why})</span> : null}
                   </li>

@@ -13,7 +13,9 @@
 /// was not reused: it indexes each session's first 8 MB as one row and
 /// answers with sessions, not messages.
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { saveMarkdown } from "../../api/tauri";
+import { IS_MOBILE_BUILD } from "../../lib/target";
 import { toast } from "sonner";
 import { useClaudeTranscriptFind } from "../../api/hooks";
 import { copyText } from "../../lib/clipboard";
@@ -339,12 +341,32 @@ export function ExportControls({
   messages,
   hasOlder,
   atLiveEdge,
+  revealed = false,
 }: {
+  revealed?: boolean;
   messages: readonly TranscriptMessage[];
   hasOlder: boolean;
   atLiveEdge: boolean;
 }) {
   const turns = useMemo(() => loadedTurns(messages), [messages]);
+  const saving = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const nativeExport = async (markdown: string) => {
+    if (revealed || saving.current) return;
+    saving.current = true;
+    setBusy(true);
+    try {
+      const outcome = await saveMarkdown(markdown);
+      if (outcome === "saved") toast.success("Saved the markdown file");
+      // Share-sheet completion/presentation is not proof a destination saved it.
+    } catch (error) {
+      toast.error("Could not export the markdown", { description: errorMessage(error) });
+    } finally {
+      saving.current = false;
+      setBusy(false);
+    }
+  };
+  const nativeLabel = IS_MOBILE_BUILD ? "Share" : "Save";
   const [from, setFrom] = useState(0);
   const [to, setTo] = useState<number | null>(null);
   const last = turns.length - 1;
@@ -356,8 +378,13 @@ export function ExportControls({
   };
   return (
     <div className="flex flex-col gap-2 text-xs" style={{ color: palette.text }} data-testid="export-controls">
+      {revealed ? <p>Hide revealed text to export a masked transcript</p> : null}
+      <button type="button" disabled={revealed || busy} className="tap-target self-start rounded border px-2 py-0.5" style={{borderColor: palette.border}} onClick={() => void nativeExport(messagesMarkdown(messages, {earlierUnloaded: hasOlder, laterUnloaded: !atLiveEdge}))}>
+        {nativeLabel} {hasOlder || !atLiveEdge ? "the loaded part" : "the session"} as markdown…
+      </button>
       <button
         type="button"
+        disabled={revealed || busy}
         className="tap-target self-start rounded border px-2 py-0.5"
         style={{ borderColor: palette.border }}
         onClick={() =>
@@ -403,6 +430,7 @@ export function ExportControls({
           </label>
           <button
             type="button"
+            disabled={revealed || busy}
             className="tap-target rounded border px-2 py-0.5"
             style={{ borderColor: palette.border }}
             onClick={() =>
@@ -416,6 +444,9 @@ export function ExportControls({
             }
           >
             Copy these turns
+          </button>
+          <button type="button" disabled={revealed || busy} className="tap-target rounded border px-2 py-0.5" style={{borderColor: palette.border}} onClick={() => void nativeExport(messagesMarkdown(turns.slice(start, end + 1).flatMap(t => t.messages), {earlierUnloaded: false, laterUnloaded: end === last && !atLiveEdge}))}>
+            {nativeLabel} these turns as markdown…
           </button>
         </div>
       ) : null}

@@ -37,7 +37,7 @@ export function TaskChecklist({
       </h2>
       {checklist.tasks.length === 0 ? (
         <p className="mt-1" style={{ color: palette.muted }}>
-          No tasks in the messages shown.
+          {checklist.snapshotIncomplete ? "Recorded task details are incomplete." : "No tasks in the messages shown."}
         </p>
       ) : (
         <ul className={terminal ? "mt-1 space-y-0.5" : "mt-2 space-y-1.5"} aria-label="Task list">
@@ -46,9 +46,14 @@ export function TaskChecklist({
           ))}
         </ul>
       )}
+      {checklist.snapshotIncomplete ? (
+        <p className="mt-1 text-[11px]" style={{ color: palette.muted }}>
+          Some recorded task details were omitted or clipped.
+        </p>
+      ) : null}
       {checklist.truncated ? (
         <p className="mt-1 text-[11px]" style={{ color: palette.muted }}>
-          Tasks created before the earliest message shown are not listed.
+          Task history outside the messages shown may be missing.
         </p>
       ) : null}
     </section>

@@ -573,19 +573,11 @@ fn transcript_find_timings() {
     );
 }
 
-/// The message pages the browser harness renders (#1480, #1487): each
-/// fixture's `TranscriptPage` exactly as `transcript_model::tail` reads it
-/// (`<name>.messages-tail.json`), and the whole file parsed
-/// as one page (`<name>.messages-whole.json`), which the read model caps
-/// at its newest [`super::transcript_model::MAX_MESSAGES`] -- the fullest
-/// page a read can hand the viewer today.
-///
-/// It also writes the pages the live viewer actually reads
-/// (`<name>.window-{end,middle,start}.json`): the `TranscriptWindow` of
-/// `claude_transcript_page` backwards from the end (what the viewer
-/// opens on), backwards from the middle, and forwards from byte 0, as
-/// JSON exactly as it crosses to the webview and the phone. The harness
-/// sizes budget B5 from them.
+/// Production page windows for the browser harness: `.window-end.json`
+/// is its open/follow input; middle/start windows support B5 estimates.
+/// These call the production reader without cached position-index work.
+/// Legacy 400-message whole-parser stress payloads are no longer generated;
+/// their historical results are not comparable to these capped pages.
 ///
 /// Writes, measures nothing, so it is not in the timings above. Run by
 /// `make bench-transcript-browser` with
@@ -607,27 +599,6 @@ fn transcript_message_payloads() {
     let temp = tempfile::tempdir().unwrap();
     for fixture in fixtures::ALL {
         let w: Written = fixtures::write(fixture, temp.path()).unwrap();
-        let tail = super::transcript_model::tail(&w.path).unwrap();
-        let body = std::fs::read_to_string(&w.path).unwrap();
-        let whole = super::transcript_model::parse(
-            &body,
-            super::transcript_model::WindowStart::FileStart,
-            Some(&w.path),
-        );
-        for (slug, page) in [("tail", &tail), ("whole", &whole)] {
-            let json = serde_json::to_vec(page).unwrap();
-            println!(
-                "{} {slug}: {} messages, {}",
-                fixture.name,
-                page.messages.len(),
-                human(json.len() as u64)
-            );
-            std::fs::write(
-                dir.join(format!("{}.messages-{slug}.json", fixture.name)),
-                json,
-            )
-            .unwrap();
-        }
         let m = marks(&w.path, w.bytes);
         for (slug, read) in [
             ("end", Read::PageAtEnd),
@@ -648,6 +619,42 @@ fn transcript_message_payloads() {
             .unwrap();
         }
     }
+}
+
+#[test]
+fn browser_payload_preserves_production_window_and_page_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("browser-payload.jsonl");
+    let body: String = (0..300)
+        .map(|i| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"user", "uuid":format!("u{i}"), "message":{"content":"hello"}
+                })
+            )
+        })
+        .collect();
+    std::fs::write(&path, &body).unwrap();
+    let m = marks(&path, body.len() as u64);
+    let payload = take(Read::PageAtEnd, &path, &m).payload;
+    let actual: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let direct = transcript_page::read_page(
+        &path,
+        &PageAnchor::End,
+        PageDirection::Before,
+        None,
+        IndexUse::None,
+    )
+    .unwrap();
+    assert_eq!(actual, serde_json::to_value(&direct).unwrap());
+    assert_eq!(actual["page"]["messages"].as_array().unwrap().len(), 200);
+    assert_eq!(actual["end"]["offset"], body.len() as u64);
+    assert!(actual["start"]["offset"].as_u64().unwrap() > 0);
+    assert!(actual["end"]["behind_digest"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(actual["at_end"], true);
 }
 
 fn human(bytes: u64) -> String {

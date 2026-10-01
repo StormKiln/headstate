@@ -263,8 +263,8 @@ function ImageRow({
         }
         className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
           img.in_use !== false || removing
-            ? "border-[#30363d] text-[#8b949e] opacity-50"
-            : "border-[#f85149]/40 text-[#f85149] hover:bg-[#f85149]/10"
+            ? "border-[#30363d] text-[#8b949e] disabled:opacity-50"
+            : "border-[#f85149]/40 text-[#ff7b72] hover:bg-[#f85149]/10"
         }`}
       >
         {removing ? "Removing…" : "Remove"}
@@ -564,7 +564,7 @@ export function DockerPage() {
               setIncludeWider(false);
               setBulkOpen(true);
             }}
-            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             Remove {stale.length} stale image{stale.length === 1 ? "" : "s"}
           </button>
@@ -642,7 +642,7 @@ export function DockerPage() {
               <button
                 type="button"
                 onClick={() => setPendingVolume(v)}
-                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-[#f85149] hover:bg-[#f85149]/10"
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-[#ff7b72] hover:bg-[#f85149]/10"
               >
                 Remove
               </button>

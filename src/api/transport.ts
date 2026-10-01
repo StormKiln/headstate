@@ -31,13 +31,14 @@ export interface Transport {
   listen<T>(event: string, cb: (e: { payload: T }) => void): Promise<UnlistenFn>;
 }
 
-function select(target: string): Transport {
-  if (target === "desktop") return local;
-  if (target === "mobile") return remote;
+// Keep the selection directly on Vite's build constant. Hiding it in a
+// function retained the entire remote schema graph in desktop bundles (#711),
+// even though that path never validates desktop IPC.
+const target = import.meta.env.VITE_TARGET;
+if (target !== "desktop" && target !== "mobile") {
   throw new Error(`unknown VITE_TARGET "${target}": expected "desktop" or "mobile"`);
 }
-
-const transport = select(import.meta.env.VITE_TARGET);
+const transport = target === "desktop" ? local : remote;
 
 // Plain pass-throughs, NOT `async`: `listen` throws synchronously
 // outside a Tauri runtime, and `useUpdateRunOutcome` relies on catching

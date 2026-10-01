@@ -161,7 +161,7 @@ export function ReportDialog({
           <ExternalLink
             href={url}
             onClick={onClose}
-            className="tap-target rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#2ea043]"
+            className="tap-target rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
           >
             Open on GitHub
           </ExternalLink>

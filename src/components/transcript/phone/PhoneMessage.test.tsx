@@ -406,3 +406,9 @@ describe("a message being sent (#1491)", () => {
     expect(status.textContent).toMatch(expected);
   });
 });
+
+
+it("renders a background output request on the phone without claiming completion", () => {
+  show(msg({kind:"assistant"}, [call("TaskOutput", {tool:"task_output",task_id:"bg1",block:true,timeout:1000},null)]));
+  expect(screen.getByText(/Output requested · bg1 · wait for completion · timeout 1000 ms/)).toBeTruthy();
+});

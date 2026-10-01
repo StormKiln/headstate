@@ -60,7 +60,7 @@ export function mergeWindows(windows: readonly TranscriptWindow[]): TranscriptMe
         // their own records. Stand them back up rather than lose them.
         for (const o of absorbedResults(m)) {
           if (seen.has(o.message_id)) continue;
-          out.push(standing(o, turn));
+          out.push(standing(o, turn, m.is_sidechain));
           seen.add(o.message_id);
         }
         continue;
@@ -101,6 +101,7 @@ function pairByToolUseId(messages: TranscriptMessage[]): TranscriptMessage[] {
       if (b.kind !== "tool_result" || b.tool_use_id === null) return;
       const at = calls.get(b.tool_use_id);
       if (at === undefined) return;
+      if (m.is_sidechain !== messages[at[0]].is_sidechain) return;
       const call = messages[at[0]].blocks[at[1]];
       const key = `${at[0]}:${at[1]}`;
       if (call.kind !== "tool_call" || call.result !== null || claimed.has(key)) return;
@@ -140,7 +141,7 @@ function absorbedResults(m: TranscriptMessage): TranscriptToolOutput[] {
 /// A result whose record's own message was folded away, standing again.
 /// Only the fields the output carries are known; the rest are absent,
 /// not zero.
-function standing(o: TranscriptToolOutput, turn: string | null): TranscriptMessage {
+function standing(o: TranscriptToolOutput, turn: string | null, sidechain: boolean): TranscriptMessage {
   return {
     id: o.message_id,
     id_source: "uuid",
@@ -152,7 +153,7 @@ function standing(o: TranscriptToolOutput, turn: string | null): TranscriptMessa
     usage: null,
     duration_ms: null,
     is_meta: false,
-    is_sidechain: false,
+    is_sidechain: sidechain,
     blocks: [{ kind: "tool_result", ...o }],
     offset: o.offset,
     // The record's own, which the output carries (#1476).

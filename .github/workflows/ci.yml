@@ -230,6 +230,8 @@ jobs:
         run: |
           (cd crates/headstate-stepup && cargo fmt --check)
           (cd src-tauri && cargo fmt --check)
+      - name: Remote wire contract
+        run: make check-wire-contract
       - name: Typecheck
         run: yarn tsc -b --force
       - name: ESLint
@@ -295,9 +297,15 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Frontend diagnostic wrapper self-test
         run: python3 scripts/test-frontend-ci.test.py
+      - name: Remote wire contract
+        run: make check-wire-contract
       - name: Frontend tests
         shell: bash
         run: bash scripts/test-frontend-ci.sh
+      - name: Production contrast and representative rendered states
+        run: |
+          yarn playwright install chromium
+          make check-contrast
       - name: Frontend diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -931,13 +939,23 @@ jobs:
         if: needs.mobile-changes.outputs.run == 'true'
         run: rustup target add aarch64-linux-android
 
-      # `make lint-mobile` also runs scripts/check-plugin-commands.py, which
-      # is the only thing in CI that looks at the Kotlin at all: this job
-      # generates the Android Studio project but never runs Gradle, so no
-      # .kt file is ever compiled. Tauri's PluginHandle dispatches on the
-      # literal @Command method name with no case conversion, so a Kotlin
-      # name that disagrees with what Rust invokes is a runtime failure on a
-      # device and nothing at build time -- nearly shipped in #696 (#698).
+      # Native compilation and string-dispatch agreement are independent gates.
+      - name: Pinned native Android compiler
+        if: needs.mobile-changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/headstate-temurin.tar.gz"
+          curl --fail --location --retry 3 'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz' -o "$archive"
+          echo "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/headstate-java"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/headstate-java" --strip-components=1
+          echo "JAVA_HOME=$RUNNER_TEMP/headstate-java" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/headstate-java/bin" >> "$GITHUB_PATH"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Compile native Android plugins
+        if: needs.mobile-changes.outputs.run == 'true'
+        run: make check-native-android
+
       - name: Rust formatting, Clippy, and plugin command names
         if: needs.mobile-changes.outputs.run == 'true'
         run: make lint-mobile
@@ -1013,7 +1031,7 @@ jobs:
     # GitHub's 360-minute default (#885).
     timeout-minutes: 30
     needs: mobile-changes
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.mobile-changes.outputs.run == 'true'
@@ -1021,6 +1039,14 @@ jobs:
         if: needs.mobile-changes.outputs.run == 'true'
         with:
           rust-workspaces: src-mobile
+      - name: Select native iOS compiler
+        if: needs.mobile-changes.outputs.run == 'true'
+        run: |
+          test -d /Applications/Xcode_26.3.app/Contents/Developer
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Compile native iOS plugins
+        if: needs.mobile-changes.outputs.run == 'true'
+        run: make check-native-ios
       - name: Rust target
         if: needs.mobile-changes.outputs.run == 'true'
         run: rustup target add aarch64-apple-ios

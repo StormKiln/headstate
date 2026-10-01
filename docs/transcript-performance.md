@@ -7,14 +7,56 @@ in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
 **Status.** The fixtures, the Rust read bench, the receive-side parse bench
-and the browser harness are in place. The harness measures B1 to B4 in
-Chromium and estimates B5 from real-text compression ratios. Nothing is
+and the browser harness are in place. The 8.2 run below measures twelve
+production windows, plus follow/growth in Chromium, and estimates B5 from
+historical real-text compression ratios. A bounded own-PID WKWebView runner
+is available but its locked/occluded execution produced no timing samples. Nothing is
 yet confirmed in WKWebView, and every phone figure is still **not
 measured**, not "passing". The 8.1 corrections and retest below cover exact
 paint timing, grown-file reads, idle controls, large-page mounting, and
 retention during eviction. The dated 2026-09-27 tables are historical.
 
-## Where each budget stands (2026-09-27)
+## Current 8.2 results — 2026-10-01
+
+The [full measured tables and method](transcript-performance-8.2-results.md)
+are the current production-window baseline. One opening sample per window,
+Apple M2 Max/macOS 26.6.2, Chromium headless shell 153; timings exclude app
+startup/native transport and use mock IPC with actual production payloads.
+No competing build ran during measurement. These results retain the bounded
+viewer/eviction design; they do not establish WKWebView or phone acceptance.
+
+| Budget | Current evidence | Qualification |
+|---|---|---|
+| B1 desktop <300ms | 44.4–101.4ms across twelve windows; end windows 50.3–90.7ms | Chromium Element Timing; middle/start timing is the selected page, not whole-file newest-message opening |
+| B2 scroll long tasks ≤50ms / 60fps target | zero scroll long tasks; frame p95 16.7–16.8ms | headless frame cadence, not physical-display FPS; open tasks reached 58ms |
+| B3 bounded desktop memory | post-scroll JS heap 3.9–6.4MiB; growth peak 15.1MiB | whole JS heap after GC; not process RSS/native allocations or phone <25MB acceptance |
+| B4 idle/visibility/nudge | 656–685B/read; 1.45–2.54ms script/read in measured read phases; zero idle row mutations/long tasks; zero hidden/same-size-nudge reads; new-byte nudge 3.4ms | mock IPC serialization included; status work is nonzero; hidden state simulated for the production hook |
+| B4 growth/retention | live readers appended 3,240/3,245 messages, retained 25/40 and 34/55 growth pages; parked readers detached at page 21/31 and rejoined | all four page-granular residency checks pass; at most 300 DOM rows mounted; subsequent growth spans explicitly synthetic |
+| B5 <150KB compressed | 2.7–57.2KB at historical worst ratio; 5.7–120.7KB uncompressed JSON | estimate across twelve windows, not measured LAN bytes; over-budget estimates now fail the driver |
+| Native desktop / physical phone | unavailable / unmeasured | owned native window hidden/occluded; no valid native timing samples, no device acceptance |
+
+The unchanged Rust reader was separately measured in release mode: newest
+page medians **1.08, 1.07, 0.94, 20.82ms** for 1k, 10k, 70MiB and 5MiB-result
+fixtures respectively; reverse-near-start **1.08, 1.05, 0.72, 20.89ms**; idle
+**0.02–0.03ms**. Seven warm samples per case. All meet the 50ms page/5ms idle
+budgets. Production read/fixture source is unchanged between the Rust run's
+reviewed aea3b77 tree and Task10's c873cd0 base. `preview::tail` rows in the
+raw Rust log concern the separate preview feature and are not these page
+measurements. Node receive-side parse max was 0.27ms; it is not browser heap
+or native receive latency.
+
+`make bench-transcript-native` now provides a [bounded own-PID WKWebView
+probe](../scripts/transcript-native/README.md), with separate host/WebContent
+RSS and physical-footprint samples and open/append/idle paint-opportunity
+proxies. Actual compiled execution returned **exit 3, unavailable**, because
+the window was hidden/occluded/inactive; zero samples were accepted. It never
+substitutes host RSS for renderer memory or compositor timing for double-rAF.
+A successful future proxy run still does not certify native budgets. Exact
+heap/CPU/presentation, native older navigation/eviction and all physical-phone
+measurements remain outstanding under the checklists below. #1487's device
+acceptance is therefore not declared complete.
+
+## Historical budget status (2026-09-27; 400-message stress inputs)
 
 Every figure below was taken on an Apple M2 Max, macOS 26.6, with
 Playwright 1.63.0 Chromium (headless shell 153) at 1280×800 for the browser
@@ -42,9 +84,9 @@ These are #1487's starting points, to be confirmed on hardware. "Desktop" is
 the Tauri app on macOS (WKWebView). "Phone" is an iPhone 12-class device on
 the LAN.
 
-| # | Budget | Target | How it is measured | Measured today |
+| # | Budget | Target | How it is measured | Historical observation (2026-09-27; see current 8.2 results below) |
 |---|---|---|---|---|
-| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message, else the second frame after it is in the DOM). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 20 to 122 ms** across every fixture page (2026-09-27; 43 to 105 ms on 2026-09-26). Not yet confirmed in WKWebView. Phone: not measured. |
+| B1 | Open to first paint at the newest message | desktop < 300 ms, phone < 800 ms on the LAN | Browser harness: from the selection that opens a fixture until the newest message has painted (Element Timing `renderTime` on the newest message; missing Element Timing fails. Second-frame timing is diagnostic only). Phone: Instruments, from the tap to the first frame showing the newest message. | **Desktop, Chromium: 20 to 122 ms** across every fixture page (2026-09-27; 43 to 105 ms on 2026-09-26). Not yet confirmed in WKWebView. Phone: not measured. |
 | B2 | Scrolling | no long task > 50 ms while scrolling; 60 fps on desktop and phone | Browser harness: a `longtask` PerformanceObserver during a scripted scroll from the newest message to the oldest and back, plus frame intervals counted with `requestAnimationFrame`. Phone: Instruments Time Profiler and the Animation Hitches instrument during a manual scroll. | **Desktop, Chromium: no long task while scrolling** on any page; frame p95 16.7 to 16.8 ms. The OPEN of a 400-message page is one 93 to 99 ms task (85 to 88 ms on 2026-09-26). Phone: not measured. |
 | B3 | Resident transcript memory | desktop < 50 MB, phone < 25 MB, **whatever the transcript's size** | Browser harness: JS heap after a forced GC (CDP `HeapProfiler.collectGarbage`, then `Runtime.getHeapUsage`), taken after opening and after the full scroll, on every fixture page. Rust: bytes each read holds (`bytes_read`), asserted in every `cargo test`. Phone: Instruments Allocations. | **Desktop, Chromium: at most 10.6 MB** after a full scroll, the 70 MB fixture's page included; 14.9 MB following 3,240 appended messages; 11.6 MB with the reader parked on a new turn, where the follow now detaches at the bound (#1524). Rust side: **bounded at any position** by the paged read (#1220): 260 to 268 KiB per page at the start, middle and end of every fixture. `follow`'s unbounded catch-up is gone (#1514): the viewer pages instead. Phone: not measured. |
 | B4 | Live follow | idle follow costs no main-thread work beyond one stat per tick; growth costs O(new bytes) | Rust: bytes and time of the page after the newest cursor with nothing appended (`page after (end, nothing new)`), the read an idle tick makes. Browser harness: reads, answer bytes, main-thread time, React commits, DOM mutations and long tasks at the active cadence, in the idle backoff, while hidden, and on nudges; then growth past the 2,000-message bound (see "Browser harness"). | **Idle tick: 12.0 KiB and 0.02 ms** in Rust, bounded by `IDLE_TICK_BOUND` in every `cargo test`. In Chromium: one commit per tick, which advances "Last read at" and touches no message row (#1525); 1.71 to 4.70 ms script per tick. Eviction binds for every reader (#1524). Phone: not measured. |
@@ -118,7 +160,7 @@ read or the viewer.
 
 ## Measured: 2026-09-26, Apple M2 Max, macOS 26.6, release build
 
-### Rust reads (`make bench-transcript`, step 1)
+### Historical Rust reads (`make bench-transcript`, step 1)
 
 Re-measured with #1220's paged reads beside the existing ones, 2026-09-26,
 same machine.
@@ -259,24 +301,29 @@ HARNESS_CHANNEL=chrome make bench-transcript-browser   # an installed Chrome ins
 
 It is **not in CI**, for the reason the Rust timings are not: its figures
 describe the machine. `playwright` is a pinned dev dependency (resolved under
-the `.yarnrc.yml` age gate like every other); CI installs it but downloads no
-browser.
+the `.yarnrc.yml` age gate like every other). CI now installs Chromium for the
+separate contrast regression gate; it does not run these timing benchmarks.
 
 How it is built:
 
-- **Payloads.** `read_bench::transcript_message_payloads` (ignored; a no-op
-  without `HEADSTATE_TRANSCRIPT_PAYLOADS_OUT`) writes, per fixture, the
-  `TranscriptPage` exactly as `transcript_model::tail` reads it
-  (`<fixture>.messages-tail.json`) and the whole file parsed as one page
-  (`<fixture>.messages-whole.json`). The read model caps a page at its newest
-  400 messages (`MAX_MESSAGES`), so "whole" is the fullest page a read can hand
-  the viewer today. It also writes the pages the viewer actually reads
-  (`<fixture>.window-{end,middle,start}.json`): the `TranscriptWindow` of
-  `claude_transcript_page` backwards from the end, backwards from the middle
-  and forwards from byte 0, as JSON exactly as it crosses to the webview and
-  the phone. B5 is estimated from these. The fixtures themselves are
-  generated into the test's own temporary directory, which is dropped; only
-  the payloads are written to the output directory.
+- **Payloads (8.2).** `read_bench::transcript_message_payloads` writes
+  `<fixture>.window-{end,middle,start}.json` using the production
+  `transcript_page::read_page` with `IndexUse::None`. B1–B3 open all twelve end/middle/start windows, capped at 200 messages.
+  B4 uses the two default end windows for follow and growth. The initial IPC response retains its
+  actual cursors/digests, seam, positions, clipping and read/scanned counters;
+  I/O bytes are never interpreted as its cursor span. Parsing that window
+  inside the mock IPC answer remains included in B1. All twelve windows also feed B5 estimates. For middle/start openings,
+  the measured text is the newest message within that selected window, not
+  the newest message in the whole file. These are page-render diagnostics
+  under the same 300 ms regression threshold. Static fixtures refuse adjacent
+  paging; this scroll measures the loaded window, not a whole-file traversal. Cached-index startup, command authorization, native IPC
+  and remote masking are not measured by this mock browser path.
+  Synthetic source files live in the writer's temporary directory; only
+  payloads go to the requested output directory. Existing saved payloads
+  are not deleted. Legacy tail/whole filenames are ignored by selection.
+  The old 400-message full-parser stress inputs are no longer generated or
+  benchmarked; the historical tables below retain their original workloads
+  and cannot be compared directly with the current 200-message pages.
 - **Target.** `vite.harness.config.ts` builds the app's own Vite config
   against `harness/transcript.html` into `dist-harness/`; the app bundle never
   includes it. The page (`src/harness/transcriptBench.tsx`) mounts
@@ -592,7 +639,9 @@ Chromium is not the app's engine. To mark B1 to B4 **met** on the desktop:
 Device: an iPhone 12-class phone, release build from TestFlight or
 `make ios-device`, paired over the LAN to a desktop that has the fixtures
 installed as sessions. Copy them into a scratch project directory under
-`~/.claude/projects/` on a test machine, and remove them afterwards.
+`~/.claude/projects/` on a dedicated test machine. Preserve the isolated
+fixture project and measurement outputs for comparison; do not replace real
+sessions or discard synthetic evidence.
 
 1. **B1, open.** Time Profiler plus the os_signpost lane. Mark the tap on a
    session. Record the time to the first frame that shows the newest message.
@@ -603,8 +652,11 @@ installed as sessions. Copy them into a scratch project directory under
    hitch ratio in Instruments' "good" band.
 3. **B3, memory.** Use Allocations with the WebContent process selected
    (WKWebView renders out of process, so the app's own process understates it).
-   Record persistent bytes after the open, after the full scroll, and after 60 s
-   idle. Do this for `messages-1k` and `tool-heavy-70mb`. Budget: < 25 MB, with
+   Verify attribution to that app’s WebContent process before recording;
+   do not select another app by a shared process name. Keep JS heap, native
+   allocations, RSS and physical footprint separately labelled; they are
+   different measurements. Record persistent bytes after the open, after the
+   full scroll, and after 60 s idle. Do this for `messages-1k` and `tool-heavy-70mb`. Budget: < 25 MB, with
    no growth between the two fixtures beyond it.
 4. **B4, idle follow.** Leave a followed session open for 60 s with nothing
    appended. Time Profiler should show no main-thread work beyond the poll's
@@ -616,7 +668,8 @@ installed as sessions. Copy them into a scratch project directory under
    let-go pages again. Record persistent bytes before, during and after.
 6. **B5, bandwidth.** Use the Network instrument, or the desktop's remote
    surface log, to record the compressed bytes of each page request. Budget:
-   < 150 KB. The estimate is at most 57.2 KB.
+   < 150 KB. The current synthetic-window estimate is reported below; it is not
+   a substitute for this measurement.
 7. **Decode CPU (#1478).** Time Profiler over 20 page loads of a long
    session: the time in the gzip decode per page. ~50 µs median on an M2 Max;
    record the phone's median and maximum.
@@ -709,3 +762,83 @@ cheaper, not free of long tasks.
 The full make target exited successfully: all eight B1/B2/B3 fixtures, both
 B4 follow fixtures, and all four residency scenarios passed. B5 remains a
 compression estimate; WKWebView and iOS device timings remain unmeasured.
+
+
+### Child activity watch tick (#1536, 2026-10-01)
+
+This measures the desktop metadata loop, separately from the B4 page-read and
+browser measurements above. The explicit-view registry holds at most 64
+canonical files, with 30-second leases renewed every 10 seconds by visible
+child views. Closing/backgrounding/covering a view stops renewal; the desktop
+may retain its metadata interest for the remaining lease. Duplicate viewers
+share a random opaque ID; no path, path hash or transcript content enters the
+new event. Main and child events share the existing eight-event-per-tick cap;
+rotating priority prevents continuous early writers starving later files.
+
+On this macOS arm64 host, using the **debug Rust test profile**, the opt-in
+`claude::activity::tests::synthetic_watch_tick_measurement` ran the actual
+`observe_tick` path over 200 main files and 64 nested child files. Each case
+used 10 warmups and 100 measured samples. Synthetic fixture creation, reset,
+and growth/shrink/removal happened outside timing. Each timed tick included
+lease expiry/snapshot sorting, canonical containment revalidation for children,
+metadata observations, baseline retention, fairness, and event payload creation.
+It excluded the 1-second sleep, global-registry mutex contention, Tauri emission,
+network/UI delivery, and the existing five-tick main registry/process refresh.
+There is no private corpus or native-device timing in these results.
+
+| Case | Median ms | p95 ms | Metadata observations* | Changed | Emitted | Deferred | Retained baselines |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unchanged | 2.510 | 2.945 | 264 | 0 | 0 | 0 | 264 |
+| All grow | 3.194 | 3.847 | 264 | 264 | 8 | 256 | 264 |
+| All shrink | 3.443 | 4.203 | 264 | 264 | 8 | 256 | 264 |
+| All missing | 3.090 | 3.905 | 200 | 0 | 0 | 0 | 200 |
+
+*These are the tracker metadata operations, not total filesystem syscalls:
+child path admission additionally canonicalizes root and file and checks file
+metadata. In the missing case all 64 child admissions fail and are returned for
+lease removal; they produce no false zero-size nudge. Steady-state missing main
+baselines are unknown and the resolver may refresh them on its ordinary cadence.
+
+A separate batch of **64 admission/renewal calls** (same canonical validation
+and bounded registry insertion/renewal; 10 warmups, 100 samples) measured
+**1.424 ms median / 1.559 ms p95**. It excludes IPC, preferences and remote privacy
+admission. These synthetic warm-filesystem results support a small tick cost
+under this load, not a universal latency guarantee. Release-profile, cold or
+remote filesystem, native emission, and physical-phone latency remain unmeasured.
+
+Reproduce without regenerating any saved benchmark fixtures:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib synthetic_watch_tick_measurement -- --ignored --nocapture
+```
+
+
+## 8.2 production-window harness migration (#1541)
+
+`transcript_model::tail` has been removed after migrating its full-text,
+offset and hint tests to the production page reader. `preview::tail` remains
+the separate supported stop-proposal reader. Production page tests retain
+UUID-less anchoring, oversized-record, partial-trailing-record and tiling
+coverage; the obsolete tail-only unanchored behavior is not emulated.
+
+Current B1–B3 selection includes all twelve production windows. Current B4 defaults are `messages-1k.window-end` and
+`tool-heavy-70mb.window-end`. `B4_FIXTURES` and `GROW_FIXTURE` select those
+names without `.json`; missing requested/default fixtures and empty or
+unknown selected phases fail before measurement. B5-only selection can use
+just middle/start windows, but cannot silently pass with no payloads.
+
+Growth retains replay recipes rather than generated message objects. Its
+subsequent cursors/positions remain explicitly synthetic; only the initial
+window is a real production payload. The planned growth count is at least
+30 chunks and enough to append 3,200 actual messages after filtering prompts
+for the continuing-turn case. Empty growth fails. Each run must show that
+initial plus appended messages exceeds 2,000 and the expected page was
+released: oldest for a live-edge reader, rejected newest for a parked reader
+that detaches. Existing heap/page-count bounds, rejoin, visibility, nudges,
+Element Timing and scroll checks remain. No fixed 30-chunk assumption can
+turn a below-cap run into an eviction success.
+
+The Task 7 migration itself recorded no replacement timings. Task 10
+measurements below use the final export/accessibility renderer. Historical
+400-message stress results, B5 compression estimates, and actual-device
+limitations remain qualified as originally measured.
