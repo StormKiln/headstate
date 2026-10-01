@@ -199,10 +199,30 @@ pub fn slice_detail_query(
     first_index: usize,
     first: u32,
 ) -> String {
+    slice_detail_page_query(q, slices, first_index, first, None)
+}
+
+/// A single background page per day; cursors survive in local storage.
+pub fn slice_detail_page_query(
+    q: &StatsQuery,
+    slices: &[Slice],
+    first_index: usize,
+    first: u32,
+    after: Option<&[Option<String>]>,
+) -> String {
     let mut doc = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
     for (i, s) in slices.iter().enumerate() {
         let alias = slice_alias(first_index + i);
-        let search = q.search_query(&s.from, &s.to);
+        let mut search = q.search_query(&s.from, &s.to);
+        let mut continuation = String::new();
+        let mut page_info = "";
+        if let Some(cursors) = after {
+            search.push_str(" sort:created-asc");
+            if let Some(Some(cursor)) = cursors.get(i) {
+                continuation = format!(", after: {}", graphql_string(cursor));
+            }
+            page_info = "pageInfo { hasNextPage endCursor }";
+        }
         doc.push_str(&format!(
             // The alias's own closing brace is INDENTED and kept off a
             // line of its own. A bare "}" on its own line is
@@ -211,8 +231,8 @@ pub fn slice_detail_query(
             // and that check is worth keeping sharp, because an extra or
             // missing top-level brace is a whole-document syntax error
             // that no mapper test would catch.
-            "  {alias}: search(query: {}, type: ISSUE, first: {first}) {{\n\
-             \x20   issueCount\n\
+            "  {alias}: search(query: {}, type: ISSUE, first: {first}{continuation}) {{\n\
+             \x20   issueCount {page_info}\n\
              \x20   nodes {{ ... on PullRequest {{ number title url repository {{ nameWithOwner }} author {{ login }} createdAt mergedAt additions deletions changedFiles reviews {{ totalCount }} }} }} }}\n",
             graphql_string(&search)
         ));

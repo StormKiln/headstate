@@ -1271,6 +1271,15 @@ const MIGRATIONS: &[&str] = &[
         payload TEXT NOT NULL,
         PRIMARY KEY (partition, day)
     );",
+    // 35: a dense day used to fetch its initial page forever (#1626).
+    "CREATE TABLE pr_backfill_page (
+        viewer TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        day TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        attempted INTEGER NOT NULL,
+        PRIMARY KEY (viewer, scope_key, day)
+    );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

@@ -3456,7 +3456,12 @@ static TABLE: &str = HIT_none_3;
             .collect::<Vec<_>>()
             .join("\n");
 
-        for table in ["pr_history", "pr_slice", "pr_backfill_scope"] {
+        for table in [
+            "pr_history",
+            "pr_slice",
+            "pr_backfill_scope",
+            "pr_backfill_page",
+        ] {
             assert!(
                 code.contains(&format!("{table}::clear(")),
                 "`note_stats_viewer` does not clear `{table}`. Every table \

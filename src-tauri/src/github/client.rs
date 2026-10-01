@@ -1859,7 +1859,15 @@ async fn graphql_with_transport(
                 return Ok(d);
             }
 
-            Ok(d.clone())
+            // Background page coverage must not turn a partial resolver
+            // response into a complete receipt merely because the remaining
+            // fields look well formed (#1626). Separate from the existing
+            // permission-refusal count so other callers keep their messaging.
+            let mut data = d.clone();
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("__partial_errors".into(), errs.len().into());
+            }
+            Ok(data)
         }
         (Some(d), _) => Ok(d.clone()),
         (None, Some(errs)) if !errs.is_empty() => {

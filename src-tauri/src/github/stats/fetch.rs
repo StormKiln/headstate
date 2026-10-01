@@ -1121,7 +1121,18 @@ pub async fn load_detail_into(
     let started = std::time::Instant::now();
     match tokio::time::timeout(
         LOAD_TIMEOUT,
-        detail_with_ladder(client, q, slices, budget, chunk, SLICE_PAGE_FULL, sink),
+        detail_with_ladder(
+            client,
+            q,
+            DetailPages {
+                slices,
+                after: None,
+            },
+            budget,
+            chunk,
+            SLICE_PAGE_FULL,
+            sink,
+        ),
     )
     .await
     {
@@ -1170,16 +1181,56 @@ pub async fn load_detail_into(
     }
 }
 
-async fn detail_with_ladder(
+#[derive(Clone, Copy)]
+struct DetailPages<'a> {
+    slices: &'a [Slice],
+    after: Option<&'a [Option<String>]>,
+}
+
+/// One resumable background page per selected day, sharing the foreground
+/// deadline, metering and degradation ladder. Completed waves survive timeout.
+pub async fn load_backfill_pages(
     client: &GitHubClient,
     q: &StatsQuery,
     slices: &[Slice],
+    after: &[Option<String>],
+    budget: &Budget,
+) -> Result<serde_json::Value, ClientError> {
+    let sink = PartialDetail::new();
+    let result = tokio::time::timeout(
+        LOAD_TIMEOUT,
+        detail_with_ladder(
+            client,
+            q,
+            DetailPages {
+                slices,
+                after: Some(after),
+            },
+            budget,
+            super::backfill::GROUP_SLICES,
+            SLICE_PAGE_FULL,
+            &sink,
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ if sink.progress().0 > 0 => Ok(sink.snapshot()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+    }
+}
+
+async fn detail_with_ladder(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    pages: DetailPages<'_>,
     budget: &Budget,
     chunk: usize,
     page: u32,
     sink: &PartialDetail,
 ) -> Result<serde_json::Value, ClientError> {
-    match detail_round(client, q, slices, budget, chunk, page, sink).await {
+    match detail_round(client, q, pages, budget, chunk, page, sink).await {
         Ok(v) => Ok(v),
         Err(e) if crate::github::client::server_gave_up_on(&e) => {
             let Some((next_chunk, next_page)) = degrade(chunk, page) else {
@@ -1193,7 +1244,7 @@ async fn detail_with_ladder(
                  retrying at {next_chunk}/{next_page} -- the load will take longer"
             );
             Box::pin(detail_with_ladder(
-                client, q, slices, budget, next_chunk, next_page, sink,
+                client, q, pages, budget, next_chunk, next_page, sink,
             ))
             .await
         }
@@ -1220,12 +1271,13 @@ async fn detail_with_ladder(
 async fn detail_round(
     client: &GitHubClient,
     q: &StatsQuery,
-    slices: &[Slice],
+    pages: DetailPages<'_>,
     budget: &Budget,
     chunk: usize,
     page: u32,
     sink: &PartialDetail,
 ) -> Result<serde_json::Value, ClientError> {
+    let slices = pages.slices;
     let mut merged = serde_json::Map::new();
     let mut refused = 0usize;
     let per_wave = chunk * READ_CONCURRENCY;
@@ -1249,7 +1301,16 @@ async fn detail_round(
         let mut set = tokio::task::JoinSet::new();
         for (n, part) in wave.chunks(chunk).enumerate() {
             let first_index = base + n * chunk;
-            let doc = slice_detail_query(q, part, first_index, page);
+            let doc = match pages.after {
+                Some(after) => super::query::slice_detail_page_query(
+                    q,
+                    part,
+                    first_index,
+                    page,
+                    Some(&after[first_index..first_index + part.len()]),
+                ),
+                None => slice_detail_query(q, part, first_index, page),
+            };
             let client = client.clone();
             let budget = budget.clone();
             set.spawn(async move { metered_read(&client, &budget, json!({ "query": doc })).await });

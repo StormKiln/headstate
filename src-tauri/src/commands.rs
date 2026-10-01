@@ -4978,6 +4978,7 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) -> Result<(), St
         crate::store::pr_history::clear(&tx).map_err(|e| e.to_string())?;
         crate::store::pr_slice::clear(&tx).map_err(|e| e.to_string())?;
         crate::store::pr_backfill_scope::clear(&tx).map_err(|e| e.to_string())?;
+        crate::store::pr_backfill_page::clear(&tx).map_err(|e| e.to_string())?;
     }
     crate::store::stats::note_viewer(&tx, viewer).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -8339,8 +8340,13 @@ mod tests {
             .unwrap()
             .is_none());
             // Removing every cache row must NOT prevent account isolation.
+            conn.execute("INSERT INTO pr_backfill_page(viewer,scope_key,day,payload,attempted) VALUES ('fixture-viewer','fixture','2026-09-01','{}',1)",[]).unwrap();
             crate::store::stats::clear(&conn).unwrap();
             super::note_stats_viewer(&conn, "different-viewer").unwrap();
+            let pending: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pr_backfill_page", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pending, 0);
             assert_eq!(crate::store::pr_slice::total_rows(&conn).unwrap(), 0);
             assert!(crate::store::pr_backfill_scope::next_to_work(&conn)
                 .unwrap()
