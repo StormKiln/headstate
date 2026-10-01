@@ -78,6 +78,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // diagnosing "why are there no worktrees" reasonably asks (#1154).
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
+    ("take_notification_pr", Class::Local),
     ("get_gitlab_auth_state", Class::Read),
     ("get_gitlab_host", Class::Read),
     ("set_gitlab_host", Class::Local),

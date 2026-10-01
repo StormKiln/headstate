@@ -135,10 +135,10 @@ fn has_checking(prs: &[PullRequest]) -> bool {
 /// Send one desktop notification for a newly-broken PR.
 ///
 /// Failure is logged and swallowed: a notification is an affordance, and
-/// losing one must never take down polling. Clicking is wired through the
-/// plugin's default behaviour rather than a custom handler, so there is no
-/// state to leak if the window is closed.
+/// losing one must never take down polling. macOS clicks carry the complete
+/// provider-qualified identity through the native notification delegate.
 fn notify_breakage(app: &AppHandle, b: &Breakage) {
+    #[cfg(not(target_os = "macos"))]
     use tauri_plugin_notification::NotificationExt;
 
     // Ask ONCE, before the first notification rather than at whatever
@@ -148,6 +148,7 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
     // the failure was swallowed by design ("a notification is an
     // affordance"). So a headline feature could be permanently dead with
     // no user-visible signal at all.
+    #[cfg(not(target_os = "macos"))]
     if !notification_allowed(app) {
         return;
     }
@@ -159,6 +160,20 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
         b.number,
         b.kind.reason()
     );
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        crate::notification_navigation::notify(
+            &b.title,
+            &body,
+            &crate::identity::PrIdentity {
+                source: b.source.clone(),
+                repo: b.repo.clone(),
+                number: b.number,
+            },
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Err(e) = app
         .notification()
         .builder()

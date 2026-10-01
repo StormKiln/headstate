@@ -2265,3 +2265,6 @@ export const gitLabAction = (request: import("../types/gitlabActions").GitLabAct
 /// Bounded metadata-only stack lookups for Ready rows (#1602).
 export const getReadyStacks = (rows: PrIdentity[]) =>
   call<(PrIdentity & { stack: PrStack })[]>("get_ready_stacks", { rows });
+
+/** Desktop notification clicks wait here until the app shell mounts. */
+export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");
