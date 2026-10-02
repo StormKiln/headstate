@@ -32,7 +32,7 @@ impl Rig {
             let body: Value = serde_json::from_slice(&req.body).unwrap();
             let doc = body["query"].as_str().unwrap();
             let fault = response_fault.lock().unwrap().clone();
-            let mut data = json!({"viewer":{"login":"fixture-viewer"},"rateLimit":{"remaining":if fault == "low-budget" {1} else {5000}}});
+            let mut data = json!({"viewer":{"login":"fixture-viewer"}});
             for i in 0..5 {
                 let Some((_,tail)) = doc.split_once(&format!("s{i}: search(")) else {continue};
                 let day = &tail.split_once("merged:").unwrap().1[..10];
@@ -69,7 +69,9 @@ impl Rig {
             }
             let mut response = json!({"data":data});
             if fault == "refused" {response["errors"] = json!([{"message":"synthetic refusal"}]);}
-            let reply = wiremock::ResponseTemplate::new(200).set_body_json(response);
+            let reply = wiremock::ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-remaining", if fault == "low-budget" { "1" } else { "5000" })
+                .set_body_json(response);
             if fault == "delay" {reply.set_delay(std::time::Duration::from_millis(200))} else {reply}
         }).mount(&server).await;
         let client = Arc::new(GitHubClient::new(
@@ -283,11 +285,38 @@ fn dense_backfill_budget_gate_does_not_issue_or_advance_pages() {
     run(|| async {
         let r = Rig::new(120, 1).await;
         r.fault("low-budget");
-        r.client.fetch_viewer().await.unwrap();
+        // The ordinary viewer is already cached. Observe a real response via
+        // the uncached metered read; headers affect only this client's quota.
+        r.client
+            .fetch_viewer_metered(&r.client.request_budget())
+            .await
+            .unwrap();
+        assert_eq!(r.client.observed_remaining(), Some(1));
+        let conn = crate::store::open_db(&r.db).unwrap();
+        let cursor_rows = || {
+            conn.query_row("SELECT COUNT(*) FROM pr_backfill_page", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(cursor_rows(), 0);
         let n = r.server.received_requests().await.unwrap().len();
-        assert!(matches!(r.tick().await, bf::TickOutcome::Skipped { .. }));
-        assert_eq!(r.server.received_requests().await.unwrap().len(), n);
+        let outcome = r.tick().await;
+        assert_eq!(
+            r.server.received_requests().await.unwrap().len(),
+            n,
+            "budget refusal must issue no HTTP requests"
+        );
         assert_eq!(r.count(), 0);
+        assert_eq!(
+            cursor_rows(),
+            0,
+            "budget refusal must not create cursor progress"
+        );
+        assert!(matches!(
+            outcome,
+            bf::TickOutcome::Skipped { remaining: Some(1) }
+        ));
     });
 }
 
