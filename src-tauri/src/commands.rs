@@ -778,6 +778,54 @@ pub async fn get_viewer(client: State<'_, GhClient>) -> Result<String, String> {
     client.fetch_viewer().await.map_err(|e| e.to_string())
 }
 
+/// Submit exactly once against the head the user viewed. Legacy review_pr remains unchanged.
+#[tauri::command]
+pub async fn review_pr_at_head(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    request: crate::github::mutate::BoundReviewRequest,
+) -> Result<crate::github::mutate::BoundReviewOutcome, String> {
+    use crate::github::mutate::BoundReviewOutcome;
+    let Some(client) = client.0.clone() else {
+        return Ok(BoundReviewOutcome::NotDispatched {
+            message: AUTH_ERR.into(),
+        });
+    };
+    let outcome = client.add_review_at_head(&request).await;
+    if let BoundReviewOutcome::Acknowledged { receipt } = &outcome {
+        let review = match receipt.state.as_str() {
+            "APPROVED" => Some(crate::github::model::ReviewState::Approved),
+            "CHANGES_REQUESTED" => Some(crate::github::model::ReviewState::ChangesRequested),
+            _ => None,
+        };
+        if let Some(review) = review {
+            crate::source_poll::record_confirmed_review(
+                &app,
+                &receipt.repo,
+                receipt.number,
+                &receipt.actor,
+                crate::inventory::ConfirmedReview {
+                    head_oid: receipt.commit_oid.clone(),
+                    review,
+                    confirmed_at: chrono::Utc::now(),
+                    receipt: Some(receipt.clone()),
+                    unresolved: false,
+                    confirmed_by_read: false,
+                },
+            )
+            .await;
+            let app = app.clone();
+            let receipt = receipt.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+                crate::source_poll::qualify_confirmed_review(&app, &receipt).await;
+            });
+        }
+        app.state::<crate::poll::Waker>().0.notify_one();
+    }
+    Ok(outcome)
+}
+
 /// Submit a review on a pull request.
 ///
 /// The first write path for a PR the user does not own. Body text is
@@ -1180,6 +1228,7 @@ pub async fn delete_head_branch(
 /// is a separate failure with a separate fix -- see the PR for #790.
 #[tauri::command]
 pub async fn get_pr_detail(
+    app: AppHandle,
     client: State<'_, GhClient>,
     repo: String,
     number: u64,
@@ -1202,10 +1251,14 @@ pub async fn get_pr_detail(
         crate::github::admission::ReadClass::Foreground,
         crate::poll::FETCH_TIMEOUT,
     ));
+    let review_generation = crate::source_poll::review_read_generation(&app);
     let out = client
         .fetch_pr_detail(&repo, number)
         .await
         .map_err(|e| e.to_string());
+    if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
+        crate::source_poll::record_review_readback(&app, detail, viewer, review_generation).await;
+    }
     crate::diag!(
         "[diag] cmd get_pr_detail end {}ms {}",
         started.elapsed().as_millis(),

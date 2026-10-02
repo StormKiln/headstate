@@ -22,7 +22,7 @@ export interface RowObservation {
   last_observed_at: string | null;
   unknown_fields: ReadinessField[];
   retained_fields: ReadinessField[];
-  confirmed_review?: { head_oid: string; review: ReviewState; confirmed_at: string } | null;
+  confirmed_review?: { head_oid: string; review: ReviewState; confirmed_at: string; receipt?: import("../api/tauri").SubmittedReview; unresolved?: boolean; confirmed_by_read?: boolean } | null;
 }
 
 export interface PullRequest extends PrIdentity {
@@ -98,7 +98,7 @@ export interface PullRequest extends PrIdentity {
   /// Assignees, used as a fallback when no reviewer was requested.
   assignees: string[];
   /// Who has already reviewed, and what they said.
-  latest_reviews: { author: string; state: string }[];
+  latest_reviews: { author: string; state: string; id?: string; submitted_at?: string; commit_oid?: string }[];
   /// How many entries each of the four lists above has, which those
   /// lists can be short of (#1089).
   ///
@@ -686,7 +686,7 @@ export interface PrDetail {
   /// AGGREGATE decision: it reads "changes_requested" when someone else
   /// blocked it. Matching the viewer's login against this is the only
   /// way to answer "did MY approval land".
-  latest_reviews: { author: string; state: string }[];
+  latest_reviews: { author: string; state: string; id?: string; submitted_at?: string; commit_oid?: string }[];
   /// Whether this pull request's base branch uses a merge queue.
   ///
   /// Chooses between Merge and Add to merge queue, so the user is not

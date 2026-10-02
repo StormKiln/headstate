@@ -177,6 +177,12 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
                 Some(ReviewerVerdict {
                     author: r["author"]["login"].as_str()?.to_string(),
                     state: r["state"].as_str()?.to_string(),
+                    id: r["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                    submitted_at: r["submittedAt"].as_str().and_then(|s| s.parse().ok()),
+                    commit_oid: r["commit"]["oid"].as_str().map(str::to_owned),
                 })
             })
             .collect(),
@@ -298,6 +304,12 @@ fn latest_reviews(node: &Value) -> Vec<ReviewerVerdict> {
                     Some(ReviewerVerdict {
                         author: r["author"]["login"].as_str()?.to_string(),
                         state: r["state"].as_str()?.to_string(),
+                        id: r["id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned),
+                        submitted_at: r["submittedAt"].as_str().and_then(|s| s.parse().ok()),
+                        commit_oid: r["commit"]["oid"].as_str().map(str::to_owned),
                     })
                 })
                 .collect()

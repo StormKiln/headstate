@@ -55,7 +55,11 @@ impl InventoryRow for crate::github::model::PullRequest {
             .as_ref()
             .and_then(|o| o.confirmed_review.as_ref())
         {
-            apply_confirmed_review(self, effect);
+            if let Some(next) =
+                reconciled_review_effect(effect, &self.head_oid, &self.latest_reviews)
+            {
+                apply_confirmed_review(self, &next);
+            }
         }
     }
     fn copy_field(&mut self, old: &Self, field: ReadinessField) {
@@ -91,7 +95,9 @@ impl InventoryRow for crate::gitlab::queues::MergeRequest {
             if self.head_oid.as_deref() == Some(effect.head_oid.as_str()) {
                 self.needs_my_review = Some(false);
                 if let Some(observation) = self.observation.as_mut() {
-                    observation.confirmed_review = Some(effect.clone());
+                    let mut qualified = effect.clone();
+                    qualify_review_effect(&mut qualified, Utc::now());
+                    observation.confirmed_review = Some(qualified);
                 }
             }
         }
@@ -188,7 +194,19 @@ pub fn reconcile<T: InventoryRow>(
                 confirmed_review: None,
             });
             observation.state = ObservationState::Retained;
+            if let Some(effect) = &mut observation.confirmed_review {
+                qualify_review_effect(effect, now);
+            }
             output.push(row);
+        }
+    }
+    for row in &mut output {
+        if let Some(effect) = row
+            .observation_mut()
+            .as_mut()
+            .and_then(|o| o.confirmed_review.as_mut())
+        {
+            qualify_review_effect(effect, now);
         }
     }
     output
@@ -262,6 +280,101 @@ pub struct ConfirmedReview {
     pub head_oid: String,
     pub review: crate::github::model::ReviewState,
     pub confirmed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<crate::github::mutate::SubmittedReview>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresolved: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed_by_read: bool,
+}
+
+/// Preserve the own-review fact separately from the aggregate requirements.
+fn reconciled_review_effect(
+    effect: &ConfirmedReview,
+    head: &str,
+    reviews: &[crate::github::model::ReviewerVerdict],
+) -> Option<ConfirmedReview> {
+    if !head.is_empty() && head != effect.head_oid {
+        return None;
+    }
+    let mut next = effect.clone();
+    let Some(receipt) = &effect.receipt else {
+        return Some(next);
+    };
+    if let Some(review) = reviews.iter().find(|review| {
+        review.author.eq_ignore_ascii_case(&receipt.actor)
+            && matches!(
+                review.state.as_str(),
+                "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED"
+            )
+            && (review.id.as_deref() == Some(&receipt.review_id)
+                || (review.id.as_ref().is_some_and(|id| !id.is_empty())
+                    && review
+                        .submitted_at
+                        .zip(receipt.submitted_at)
+                        .is_some_and(|(read, written)| read > written)))
+    }) {
+        let verdict = match review.state.as_str() {
+            "APPROVED" => crate::github::model::ReviewState::Approved,
+            "CHANGES_REQUESTED" => crate::github::model::ReviewState::ChangesRequested,
+            _ => return None,
+        };
+        // A later review on another/unknown commit cannot establish current-head approval.
+        if review.id.as_deref() != Some(&receipt.review_id)
+            && review.commit_oid.as_deref() != Some(effect.head_oid.as_str())
+        {
+            return None;
+        }
+        next.review = verdict;
+        next.confirmed_by_read = true;
+        next.unresolved = false;
+        next.receipt = Some(crate::github::mutate::SubmittedReview {
+            review_id: review
+                .id
+                .clone()
+                .unwrap_or_else(|| receipt.review_id.clone()),
+            state: review.state.clone(),
+            actor: review.author.clone(),
+            commit_oid: effect.head_oid.clone(),
+            submitted_at: review.submitted_at.or(receipt.submitted_at),
+            ..receipt.clone()
+        });
+    }
+    Some(next)
+}
+#[cfg(test)]
+fn review_effect_resolved(
+    effect: &ConfirmedReview,
+    head: &str,
+    reviews: &[crate::github::model::ReviewerVerdict],
+) -> bool {
+    reconciled_review_effect(effect, head, reviews).is_none()
+}
+pub fn qualify_review_effect(effect: &mut ConfirmedReview, now: DateTime<Utc>) {
+    if !effect.confirmed_by_read
+        && now.signed_duration_since(effect.confirmed_at) >= chrono::Duration::minutes(15)
+    {
+        effect.unresolved = true;
+    }
+}
+pub fn reconcile_detail_review(
+    row: &mut crate::github::model::PullRequest,
+    detail: &crate::github::model::PrDetail,
+) -> bool {
+    let Some(observation) = &mut row.observation else {
+        return false;
+    };
+    let Some(effect) = &mut observation.confirmed_review else {
+        return false;
+    };
+    let previous = effect.clone();
+    let mut next = reconciled_review_effect(effect, &detail.head_oid, &detail.latest_reviews);
+    if let Some(effect) = &mut next {
+        qualify_review_effect(effect, Utc::now());
+    }
+    let changed = next.as_ref() != Some(&previous);
+    observation.confirmed_review = next;
+    changed
 }
 
 /// A verified mutation is stronger than a lagging or omitted ordinary read.
@@ -411,6 +524,9 @@ pub fn apply_gitlab_action(
             head_oid: head.into(),
             review,
             confirmed_at: Utc::now(),
+            receipt: None,
+            unresolved: false,
+            confirmed_by_read: false,
         });
         changed = true;
     }
@@ -478,6 +594,9 @@ mod tests {
                 head_oid: "head-a".into(),
                 review: crate::github::model::ReviewState::Approved,
                 confirmed_at: now,
+                receipt: None,
+                unresolved: false,
+                confirmed_by_read: false,
             }
         ));
         for head in [
@@ -624,6 +743,9 @@ mod tests {
             head_oid: old.head_oid.clone(),
             review: crate::github::model::ReviewState::Approved,
             confirmed_at: Utc::now(),
+            receipt: None,
+            unresolved: false,
+            confirmed_by_read: false,
         };
         assert!(apply_confirmed_review(&mut old, &effect));
         let persisted = serde_json::to_vec(&old).unwrap();
@@ -733,5 +855,136 @@ mod tests {
             .iter()
             .all(|r| r.observation.as_ref().unwrap().state == ObservationState::Retained));
         assert!(reconcile(next, vec![], true, Utc::now()).is_empty());
+    }
+    #[test]
+    fn review_receipt_authority_survives_restart_lag_and_expires_to_qualification() {
+        use crate::github::{
+            model::{ReviewState, ReviewerVerdict},
+            mutate::SubmittedReview,
+        };
+        let now = Utc::now();
+        let mut effect = ConfirmedReview {
+            head_oid: "head".into(),
+            review: ReviewState::Approved,
+            confirmed_at: now,
+            unresolved: false,
+            confirmed_by_read: false,
+            receipt: Some(SubmittedReview {
+                review_id: "review".into(),
+                state: "APPROVED".into(),
+                actor: "fixture".into(),
+                commit_oid: "head".into(),
+                submitted_at: Some(now),
+                pr_id: "pr".into(),
+                repo: "fixture/project".into(),
+                number: 1,
+            }),
+        };
+        effect = serde_json::from_str(&serde_json::to_string(&effect).unwrap()).unwrap();
+        let mut read = ReviewerVerdict {
+            author: "fixture".into(),
+            state: "DISMISSED".into(),
+            ..Default::default()
+        };
+        assert!(!review_effect_resolved(&effect, "head", &[read.clone()]));
+        read.id = Some("older-review".into());
+        read.submitted_at = Some(now - chrono::Duration::seconds(1));
+        assert!(!review_effect_resolved(&effect, "head", &[read.clone()]));
+        let mut newer_effect = effect.clone();
+        newer_effect.receipt.as_mut().unwrap().review_id = "newer-ack".into();
+        newer_effect.receipt.as_mut().unwrap().submitted_at =
+            Some(now + chrono::Duration::seconds(2));
+        assert!(
+            !review_effect_resolved(&newer_effect, "head", &[read.clone()]),
+            "old readback cannot clear a newer acknowledgement"
+        );
+        read.id = Some("review".into());
+        assert!(review_effect_resolved(&effect, "head", &[read.clone()]));
+        read.id = Some("newer-review".into());
+        read.submitted_at = Some(now + chrono::Duration::seconds(1));
+        assert!(review_effect_resolved(&effect, "head", &[read]));
+        assert!(!review_effect_resolved(&effect, "", &[]));
+        assert!(review_effect_resolved(&effect, "new-head", &[]));
+        qualify_review_effect(&mut effect, now + chrono::Duration::minutes(14));
+        assert!(!effect.unresolved);
+        qualify_review_effect(&mut effect, now + chrono::Duration::minutes(15));
+        assert!(effect.unresolved);
+        assert!(!review_effect_resolved(&effect, "head", &[]));
+    }
+    #[test]
+    fn converged_own_review_survives_partial_omission_without_claiming_aggregate_approval() {
+        use crate::github::{
+            model::{ReviewState, ReviewerVerdict},
+            mutate::SubmittedReview,
+        };
+        let now = Utc::now();
+        let mut row = rows().remove(0);
+        row.head_oid = "head".into();
+        row.review = ReviewState::ReviewRequired;
+        let effect = ConfirmedReview {
+            head_oid: "head".into(),
+            review: ReviewState::Approved,
+            confirmed_at: now,
+            unresolved: false,
+            confirmed_by_read: false,
+            receipt: Some(SubmittedReview {
+                review_id: "review".into(),
+                state: "APPROVED".into(),
+                actor: "fixture".into(),
+                commit_oid: "head".into(),
+                submitted_at: Some(now),
+                pr_id: row.id.clone(),
+                repo: row.repo.clone(),
+                number: row.number,
+            }),
+        };
+        apply_confirmed_review(&mut row, &effect);
+        let mut fresh = row.clone();
+        fresh.observation.as_mut().unwrap().confirmed_review = None;
+        fresh.latest_reviews = vec![ReviewerVerdict {
+            author: "fixture".into(),
+            state: "APPROVED".into(),
+            id: Some("review".into()),
+            commit_oid: Some("head".into()),
+            submitted_at: Some(now),
+        }];
+        let converged = reconcile(vec![row], vec![fresh], false, now);
+        assert!(
+            converged[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .as_ref()
+                .unwrap()
+                .confirmed_by_read
+        );
+        assert_eq!(converged[0].review, ReviewState::ReviewRequired);
+        let retained = reconcile(converged, vec![], false, now + chrono::Duration::hours(1));
+        let own = retained[0]
+            .observation
+            .as_ref()
+            .unwrap()
+            .confirmed_review
+            .as_ref()
+            .unwrap();
+        assert!(own.confirmed_by_read);
+        assert!(!own.unresolved);
+        for new_head in [false, true] {
+            let mut fresh = retained[0].clone();
+            fresh.observation.as_mut().unwrap().confirmed_review = None;
+            if new_head {
+                fresh.head_oid = "new-head".into();
+            } else {
+                fresh.latest_reviews[0].state = "DISMISSED".into();
+            }
+            let retired = reconcile(retained.clone(), vec![fresh], false, now);
+            assert!(retired[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_none());
+        }
     }
 }

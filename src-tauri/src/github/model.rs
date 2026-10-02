@@ -457,6 +457,12 @@ pub struct ReviewerVerdict {
     /// narrowed to a bool -- a DISMISSED approval is not an approval,
     /// and collapsing it here would silently claim otherwise.
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

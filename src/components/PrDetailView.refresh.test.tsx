@@ -65,7 +65,7 @@ async function retained() {
   expect(screen.getByText("Synthetic check 7")).toBeTruthy();
   expect(screen.getByText("Synthetic change 7")).toBeTruthy();
   expect(screen.getByRole("link", { name: /github/i })).toBeTruthy();
-  for (const button of screen.queryAllByRole("button", { name: /^Approve$/ })) expect(button.matches(":disabled")).toBe(true);
+  for (const button of screen.queryAllByRole("button", { name: /^Approve$/ })) expect(button.matches(":disabled")).toBe(false);
 }
 
 describe("mounted detail refresh with real query hooks", () => {
@@ -308,4 +308,54 @@ it("keeps ancestry unknown when a legacy advisory reply has no verifiable lifeti
   await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "get_ready_stacks")).toHaveLength(1));
   for (const button of screen.getAllByRole("button", { name: /^Merge$/ })) expect(button.matches(":disabled")).toBe(true);
   expect(screen.getByRole("link", { name: "GitHub" })).toBeTruthy();
+});
+
+it("submits the viewed head after a background failure without a review preflight", async () => {
+  mount(); await loaded(); fail = true;
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await screen.findByRole("alert");
+  const existing = invoke.getMockImplementation()!;
+  invoke.mockImplementation(async (name, args) => name === "review_pr_at_head"
+    ? { outcome: "acknowledged", receipt: { review_id: "REVIEW-7", state: "APPROVED", actor: "reviewer", commit_oid: "head-7", submitted_at: "2026-10-01T12:00:00Z", pr_id: "PR_7", repo: "octocat/hello-world", number: 7 } }
+    : existing(name, args));
+  const before = reads;
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1));
+  const request = invoke.mock.calls.find(([name]) => name === "review_pr_at_head")![1]?.request;
+  expect(request).toMatchObject({ expected_head: "head-7", expected_viewer: "reviewer" });
+  expect(reads - before).toBeLessThanOrEqual(1); // optional post-write read, never a preflight
+  expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(0);
+});
+
+it("shares the actual mounted review across observers, lagging refresh and remount", async () => {
+  const base = invoke.getMockImplementation()!;
+  let finish!: (value: unknown) => void;
+  const posted = new Promise(resolve => { finish = resolve; });
+  invoke.mockImplementation((name, args) => name === "review_pr_at_head" ? posted : base(name, args));
+  const first = mount(); await loaded();
+  const second = mount();
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1));
+  for (const button of screen.queryAllByRole("button", { name: /^Approve$/ })) expect(button.matches(":disabled")).toBe(true);
+  await act(async () => finish({ outcome: "acknowledged", receipt: {
+    review_id: "REVIEW-7", state: "APPROVED", actor: "reviewer", commit_oid: "head-7",
+    submitted_at: "2026-10-01T12:00:00Z", pr_id: "PR_7", repo: "octocat/hello-world", number: 7,
+  } }));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(1));
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  first.unmount(); second.unmount(); mount();
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(0));
+  expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
+});
+
+it.each([new Error("Synthetic response was lost"), "Synthetic string failure"])("keeps uncertain submitted outcomes check-first after remount: %s", async error => {
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation((name, args) => name === "review_pr_at_head" ? Promise.reject(error) : base(name, args));
+  const view = mount(); await loaded();
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await screen.findByText(error instanceof Error ? error.message : error);
+  view.unmount(); mount();
+  await screen.findByRole("link", { name: "Check review on GitHub" });
+  for (const button of screen.queryAllByRole("button", { name: /^Approve$/ })) expect(button.matches(":disabled")).toBe(true);
+  expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
 });

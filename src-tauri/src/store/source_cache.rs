@@ -180,7 +180,16 @@ pub fn load_source_snapshot(
             });
             match source.provider {
                 Provider::Github => match serde_json::from_str::<Vec<PullRequest>>(&payload) {
-                    Ok(prs) if prs.iter().all(|pr| &pr.source == source) => {
+                    Ok(mut prs) if prs.iter().all(|pr| &pr.source == source) => {
+                        for pr in &mut prs {
+                            if let Some(effect) = pr
+                                .observation
+                                .as_mut()
+                                .and_then(|o| o.confirmed_review.as_mut())
+                            {
+                                crate::inventory::qualify_review_effect(effect, now);
+                            }
+                        }
                         SnapshotData::Available {
                             prs,
                             fetched_at: at,
@@ -398,6 +407,9 @@ mod tests {
             head_oid: a.head_oid.clone(),
             review: crate::github::model::ReviewState::Approved,
             confirmed_at: chrono::Utc::now(),
+            receipt: None,
+            unresolved: false,
+            confirmed_by_read: false,
         };
         crate::inventory::apply_confirmed_review(&mut a, &effect);
         let mut b = a.clone();

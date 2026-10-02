@@ -193,7 +193,7 @@ query($q: String!, $first: Int!, $after: String) {
         # reviewer who fell outside the window never enters it and is
         # reported as still pending when they have already APPROVED.
         # That names a person and tells you to chase someone who is done.
-        latestReviews(first: 20) { totalCount nodes { state author { login } } }
+        latestReviews(first: 20) { totalCount nodes { id state submittedAt commit { oid } author { login } } }
         labels(first: 20) { totalCount nodes { name color } }
         # 100, the connection maximum, so the badge is an exact count
         # rather than a cap (#810). It was `first: 20`, and the mapper
@@ -668,7 +668,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # `latestReviews` returns one review per reviewer, so a small page
       # covers any realistic pull request and the viewer's entry is
       # found by matching login.
-      latestReviews(first: 20) { nodes { state author { login } } }
+      latestReviews(first: 20) { nodes { id state submittedAt commit { oid } author { login } } }
       # `committedDate` is the head commit's own date for the header's
       # "last commit" (#1457). The COMMITTER's clock, not the push: a
       # rebase or a late push leaves it earlier than the push, which is
@@ -1864,6 +1864,21 @@ mod tests {
         }
         assert!(!query.contains("mergeable"));
         assert!(super::PRS_QUERY.contains("pageInfo { hasNextPage endCursor }"));
+    }
+
+    #[test]
+    fn review_authority_fields_are_selected_in_list_and_detail() {
+        for document in [PRS_QUERY, PR_DETAIL_QUERY] {
+            let selection = document
+                .lines()
+                .find(|line| line.trim_start().starts_with("latestReviews("))
+                .expect("review connection");
+            assert!(
+                selection
+                    .contains("nodes { id state submittedAt commit { oid } author { login } }"),
+                "review identity, ordering and head are required: {selection}"
+            );
+        }
     }
 
     #[test]

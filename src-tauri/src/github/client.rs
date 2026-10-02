@@ -1314,7 +1314,7 @@ impl GitHubClient {
         })
         .await;
         crate::diag!(
-            "[diag] provider mutation elapsed_ms={} acknowledged={}",
+            "[diag] provider mutation elapsed_ms={} response_received={}",
             started.elapsed().as_millis(),
             matches!(&posted, Ok(Ok(_)))
         );
@@ -1331,6 +1331,11 @@ impl GitHubClient {
 
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
+                // A partial review object alongside errors can follow a dispatched write.
+                // Do not turn that ambiguous receipt into permission to replay it.
+                if raw["data"]["addPullRequestReview"]["pullRequestReview"].is_object() {
+                    return Err(ClientError::UnconfirmedWrite);
+                }
                 let msg = errs
                     .iter()
                     .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
@@ -1348,9 +1353,7 @@ impl GitHubClient {
         // wrong with our request shape; do not report success for it.
         match raw.get("data") {
             Some(d) if !d.is_null() => Ok(d.clone()),
-            _ => Err(ClientError::Graphql(
-                "GitHub returned no result for the change".into(),
-            )),
+            _ => Err(ClientError::UnconfirmedWrite),
         }
     }
 
@@ -4817,6 +4820,205 @@ mod tests {
                 "NO_REFUSAL_READ excuses `{name}` ({why}), which no longer calls \
                  `graphql_partial_ok`. Remove the entry."
             );
+        }
+    }
+    async fn bound_client_for(server: &MockServer) -> GitHubClient {
+        GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("synthetic-token".to_string())
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        )
+    }
+    #[tokio::test]
+    async fn head_bound_review_sends_viewed_commit_once_and_returns_semantic_receipt() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/graphql")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW-1","state":"APPROVED","submittedAt":"2026-10-01T12:00:00Z","author":{"login":"fixture"},"commit":{"oid":"viewed-head"},"pullRequest":{"id":"PR-7","number":7,"repository":{"nameWithOwner":"fixture/project"}}}}}}))).mount(&server).await;
+        let result = bound_client_for(&server)
+            .await
+            .add_review_at_head(&BoundReviewRequest {
+                id: "PR-7".into(),
+                repo: "fixture/project".into(),
+                number: 7,
+                verdict: "approve".into(),
+                body: String::new(),
+                expected_head: "viewed-head".into(),
+                expected_viewer: "fixture".into(),
+            })
+            .await;
+        let calls = server.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1, "no read preflight or write replay");
+        let body: serde_json::Value = calls[0].body_json().unwrap();
+        assert_eq!(body["variables"]["head"], "viewed-head");
+        assert!(body["query"].as_str().unwrap().contains("commitOID: $head"));
+        assert!(
+            matches!(result,BoundReviewOutcome::Acknowledged{receipt} if receipt.review_id=="REVIEW-1" && receipt.commit_oid=="viewed-head")
+        );
+    }
+
+    #[tokio::test]
+    async fn head_bound_review_requires_identity_and_never_replays_ambiguous_results() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let request = BoundReviewRequest {
+            id: "PR-7".into(),
+            repo: "fixture/project".into(),
+            number: 7,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: "viewed-head".into(),
+            expected_viewer: "fixture".into(),
+        };
+        for (state, actor, head, present, acknowledged) in [
+            ("APPROVED", "fixture", "viewed-head", true, true),
+            ("FUTURE_SUBMITTED", "fixture", "viewed-head", true, true),
+            ("PENDING", "fixture", "viewed-head", true, false),
+            ("", "fixture", "viewed-head", true, false),
+            ("APPROVED", "other", "viewed-head", true, false),
+            ("APPROVED", "fixture", "other-head", true, false),
+            ("APPROVED", "fixture", "viewed-head", false, false),
+        ] {
+            let server = MockServer::start().await;
+            let receipt = if present {
+                json!({"id":"REVIEW-1", "state":state, "author":{"login":actor}, "commit":{"oid":head}, "pullRequest":{"id":"PR-7", "number":7, "repository":{"nameWithOwner":"fixture/project"}}})
+            } else {
+                serde_json::Value::Null
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"addPullRequestReview":{"pullRequestReview":receipt}}}),
+                ))
+                .mount(&server)
+                .await;
+            let outcome = bound_client_for(&server)
+                .await
+                .add_review_at_head(&request)
+                .await;
+            assert_eq!(
+                matches!(outcome, BoundReviewOutcome::Acknowledged { .. }),
+                acknowledged
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        for (status, body, rejected) in [
+            (
+                200,
+                json!({"errors":[{"message":"Cannot approve own pull request"}]}),
+                true,
+            ),
+            (200, json!({"data":null}), false),
+            (
+                403,
+                json!({"message":"Resource not accessible by integration"}),
+                true,
+            ),
+            (
+                200,
+                json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW-1"}}},"errors":[{"message":"optional review field refused"}]}),
+                false,
+            ),
+            (502, json!({"message":"temporary synthetic failure"}), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let outcome = bound_client_for(&server)
+                .await
+                .add_review_at_head(&request)
+                .await;
+            assert_eq!(
+                matches!(outcome, BoundReviewOutcome::Rejected { .. }),
+                rejected
+            );
+            assert!(!matches!(outcome, BoundReviewOutcome::Acknowledged { .. }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        let server = MockServer::start().await;
+        let mut missing = request;
+        missing.expected_head.clear();
+        assert!(matches!(
+            bound_client_for(&server)
+                .await
+                .add_review_at_head(&missing)
+                .await,
+            BoundReviewOutcome::NotDispatched { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn head_bound_review_timeout_is_uncertain_once_and_cooldown_never_dispatches() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let request = BoundReviewRequest {
+            id: "PR-7".into(),
+            repo: "fixture/project".into(),
+            number: 7,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: "viewed-head".into(),
+            expected_viewer: "fixture".into(),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(120))
+                    .set_body_json(json!({"data":null})),
+            )
+            .mount(&server)
+            .await;
+        let client = bound_client_for(&server).await;
+        let worker = tokio::spawn({
+            let client = client.clone();
+            let request = request.clone();
+            async move { client.add_review_at_head(&request).await }
+        });
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(SEARCH_BUDGET).await;
+        assert!(matches!(
+            worker.await.unwrap(),
+            BoundReviewOutcome::Uncertain { .. }
+        ));
+        tokio::time::resume();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let server = MockServer::start().await;
+        let client = bound_client_for(&server).await;
+        client
+            .read_transport
+            .admission
+            .limit(super::super::admission::Bucket::Graphql, 300, true);
+        assert!(matches!(
+            client.add_review_at_head(&request).await,
+            BoundReviewOutcome::NotDispatched { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn legacy_review_missing_receipt_is_not_success() {
+        use super::super::mutate::ReviewVerdict;
+        for receipt in [serde_json::Value::Null, json!({}), json!({"state":""})] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"addPullRequestReview":{"pullRequestReview":receipt}}}),
+                ))
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                bound_client_for(&server)
+                    .await
+                    .add_review("PR-7", ReviewVerdict::Approve, "")
+                    .await,
+                Err(ClientError::UnconfirmedWrite)
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
 }

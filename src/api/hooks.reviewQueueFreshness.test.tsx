@@ -81,6 +81,7 @@ async function landRefresh(rows: PullRequest[] = []): Promise<void> {
 /// A client whose list caches hold `row`.
 function seeded(row: PullRequest) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "fixture");
   qc.setQueryData<PullRequest[]>(["prs"], [row]);
   qc.setQueryData<PullRequest[]>(["reviewing"], [row]);
   return qc;
@@ -115,7 +116,8 @@ beforeEach(() => {
     // The read-back the user is waiting out; see `heldRefresh`.
     if (cmd === "refresh_now" || cmd === "get_reviewing") return heldRefresh();
     if (cmd === "get_cached") return Promise.resolve([]);
-    if (cmd === "get_pr_detail") return Promise.resolve({ latest_reviews: [] });
+    if (cmd === "get_pr_detail") return Promise.resolve({ ...readyRow(), latest_reviews: [] });
+    if (cmd === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "fixture", commit_oid: readyRow().head_oid, submitted_at: null, pr_id: "id", repo: "octocat/hello-world", number: 7 } });
     return Promise.resolve();
   });
 });
@@ -127,10 +129,11 @@ describe("a pull request the user approved and queued leaves the list at once", 
     expect(reviewingRows(qc).filter(readyForReview)).toHaveLength(1);
 
     const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
-    await result.current("id", "octocat/hello-world", 7, "approve", "");
+    await result.current("id", "octocat/hello-world", 7, "approve", "", readyRow().head_oid);
 
     expect(reviewingRows(qc).filter(readyForReview)).toHaveLength(0);
-    expect(reviewingRows(qc)[0].review).toBe("approved");
+    expect(reviewingRows(qc)[0].review).toBe("review_required");
+    expect(reviewingRows(qc)[0].observation?.confirmed_review?.review).toBe("approved");
 
     // `useReviewPr` fires the refresh WITHOUT awaiting it -- deliberately,
     // since awaiting made approving one pull request take ~20s to

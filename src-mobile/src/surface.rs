@@ -399,6 +399,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("act_on_pr", Class::Write),
     ("act_on_prs", Class::Write),
     ("review_pr", Class::Write),
+    ("review_pr_at_head", Class::Write),
     ("comment_on_pr", Class::Write),
     ("resolve_thread", Class::Write),
     ("unresolve_thread", Class::Write),

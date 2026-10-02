@@ -6,8 +6,9 @@ import type { PrDetail } from "@/types/pr";
 
 /// The detail response GitHub returns during its read-side lag: the
 /// approval succeeded, and `latestReviews` does not show it yet.
-const STALE_DETAIL = { latest_reviews: [] } as unknown as PrDetail;
+const STALE_DETAIL = { id: "id", repo: "o/r", number: 7, head_oid: "head", latest_reviews: [] } as unknown as PrDetail;
 
+const ACK = { outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "me", commit_oid: "head", submitted_at: "2026-10-01T00:00:00Z", pr_id: "id", repo: "o/r", number: 7 } };
 const invoke = vi.hoisted(() =>
   vi.fn<(cmd: string, ...a: unknown[]) => Promise<unknown>>(() => Promise.resolve()),
 );
@@ -28,6 +29,7 @@ describe("useReviewPr", () => {
   beforeEach(() => {
     invoke.mockReset();
     invoke.mockImplementation((cmd: string) => {
+      if (cmd === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "me", commit_oid: "head", submitted_at: "2026-10-01T00:00:00Z", pr_id: "id", repo: "o/r", number: 7 } });
       if (cmd === "get_pr_detail") return Promise.resolve(STALE_DETAIL);
       return Promise.resolve();
     });
@@ -53,7 +55,7 @@ describe("useReviewPr", () => {
     await result.current.review("id", "o/r", 7, "approve", "");
 
     const after = qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7]);
-    expect(after?.latest_reviews).toContainEqual({ author: "me", state: "APPROVED" });
+    expect(after?.latest_reviews).toContainEqual(expect.objectContaining({ author: "me", state: "APPROVED" }));
   });
 
   /// The seed must not become a lie that outlives the truth: once
@@ -74,9 +76,11 @@ describe("useReviewPr", () => {
 
     // GitHub has caught up and reports a DIFFERENT state.
     invoke.mockImplementation((cmd: string) => {
+      if (cmd === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "me", commit_oid: "head", submitted_at: "2026-10-01T00:00:00Z", pr_id: "id", repo: "o/r", number: 7 } });
       if (cmd === "get_pr_detail") {
         return Promise.resolve({
-          latest_reviews: [{ author: "me", state: "CHANGES_REQUESTED" }],
+          ...STALE_DETAIL,
+          latest_reviews: [{ author: "me", state: "CHANGES_REQUESTED", id: "newer", submitted_at: "2026-10-01T00:01:00Z" }],
         } as unknown as PrDetail);
       }
       return Promise.resolve();
@@ -84,7 +88,7 @@ describe("useReviewPr", () => {
     await qc.refetchQueries({ queryKey: ["pr-detail", "o/r", 7] });
 
     const after = qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7]);
-    expect(after?.latest_reviews).toEqual([{ author: "me", state: "CHANGES_REQUESTED" }]);
+    expect(after?.latest_reviews).toEqual([expect.objectContaining({ author: "me", state: "CHANGES_REQUESTED" })]);
   });
 });
 
@@ -99,6 +103,7 @@ describe("useReviewPr", () => {
 describe("useReviewPr and the merge buttons", () => {
   /// GitHub after the approval: mergeable, and auto-merge has queued it.
   const FRESH = {
+    ...STALE_DETAIL,
     latest_reviews: [],
     merge_status: "clean",
     merge_queue_enabled: true,
@@ -107,6 +112,7 @@ describe("useReviewPr and the merge buttons", () => {
 
   /// The cache before it: the pre-approval verdict.
   const BEFORE = {
+    ...STALE_DETAIL,
     latest_reviews: [],
     merge_status: "blocked",
     merge_queue_enabled: true,
@@ -116,6 +122,7 @@ describe("useReviewPr and the merge buttons", () => {
   beforeEach(() => {
     invoke.mockReset();
     invoke.mockImplementation((cmd: string) => {
+      if (cmd === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "me", commit_oid: "head", submitted_at: "2026-10-01T00:00:00Z", pr_id: "id", repo: "o/r", number: 7 } });
       if (cmd === "get_pr_detail") return Promise.resolve(FRESH);
       return Promise.resolve();
     });
@@ -174,7 +181,7 @@ describe("useReviewPr and the merge buttons", () => {
     expect(
       after?.latest_reviews,
       "the merge re-read overwrote the verdict, which is #440 all over again",
-    ).toContainEqual({ author: "me", state: "APPROVED" });
+    ).toContainEqual(expect.objectContaining({ author: "me", state: "APPROVED" }));
   });
 
   it("does not let an older detail query erase a verified approval", async () => {
@@ -187,7 +194,7 @@ describe("useReviewPr and the merge buttons", () => {
     const newRead = new Promise<PrDetail>(resolve => { finishNew = resolve; });
     let reads = 0;
     invoke.mockImplementation((cmd: string) => cmd === "get_pr_detail"
-      ? (++reads === 1 ? oldRead : newRead) : Promise.resolve());
+      ? (++reads === 1 ? oldRead : newRead) : Promise.resolve(ACK));
     const { result, unmount } = renderHook(() => ({ detail: usePrDetail("o/r", 7), review: useReviewPr() }), { wrapper: wrap(qc) });
     const older = result.current.detail.refetch();
     await waitFor(() => expect(reads).toBe(1));
@@ -207,7 +214,7 @@ describe("useReviewPr and the merge buttons", () => {
     qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
     let finish!: (value: PrDetail) => void;
     const pending = new Promise<PrDetail>((resolve) => { finish = resolve; });
-    invoke.mockImplementation((cmd: string) => cmd === "get_pr_detail" ? pending : Promise.resolve());
+    invoke.mockImplementation((cmd: string) => cmd === "get_pr_detail" ? pending : Promise.resolve(ACK));
     const { result, unmount } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
     let completed = false;
     const submitted = result.current("id", "o/r", 7, "approve", "").then(() => { completed = true; });
@@ -232,14 +239,14 @@ describe("useReviewPr and the merge buttons", () => {
     qc.setQueryData(["viewer"], "me");
     qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
     invoke.mockImplementation((cmd: string) =>
-      cmd === "get_pr_detail" ? Promise.reject(new Error("offline")) : Promise.resolve(),
+      cmd === "get_pr_detail" ? Promise.reject(new Error("offline")) : Promise.resolve(ACK),
     );
 
     const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
-    await expect(result.current("id", "o/r", 7, "approve", "")).resolves.toBeUndefined();
+    await expect(result.current("id", "o/r", 7, "approve", "")).resolves.toMatchObject({ state: "APPROVED" });
     // The seed still landed, so the approval is still visible.
     expect(
       qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.latest_reviews,
-    ).toContainEqual({ author: "me", state: "APPROVED" });
+    ).toContainEqual(expect.objectContaining({ author: "me", state: "APPROVED" }));
   });
 });

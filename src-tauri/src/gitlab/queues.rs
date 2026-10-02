@@ -656,6 +656,9 @@ mod tests {
             head_oid: "head-a".into(),
             review: crate::github::model::ReviewState::Approved,
             confirmed_at: chrono::Utc::now(),
+            receipt: None,
+            unresolved: false,
+            confirmed_by_read: false,
         });
         for head in [None, Some(Value::Null), Some(json!(""))] {
             let mut unread = raw.clone();

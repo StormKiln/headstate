@@ -103,6 +103,15 @@ pub struct Publication {
 }
 
 impl SourcePolls {
+    fn readback_is_current(&self, source: &Source, list: CachedList, generation: u64) -> bool {
+        *self
+            .5
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .unwrap_or(&0)
+            == generation
+    }
     fn before_mutation(&self, attempt: &Attempt) -> bool {
         self.5
             .lock()
@@ -781,8 +790,44 @@ fn reconcile_gitlab_snapshot(
 }
 
 enum GithubEffect {
+    ReviewReadback(Box<crate::github::model::PrDetail>, [u64; 2]),
+    QualifyReview(crate::github::mutate::SubmittedReview),
     Review(crate::inventory::ConfirmedReview),
     Remove(crate::github::mutate::ConfirmedRemoval),
+}
+pub fn review_read_generation(app: &AppHandle) -> [u64; 2] {
+    let polls = app.state::<SourcePolls>();
+    let generations = polls.5.lock().unwrap_or_else(|e| e.into_inner());
+    [CachedList::Authored, CachedList::Reviewing]
+        .map(|list| *generations.get(&(Source::default(), list)).unwrap_or(&0))
+}
+pub async fn record_review_readback(
+    app: &AppHandle,
+    detail: &crate::github::model::PrDetail,
+    viewer: &str,
+    generations: [u64; 2],
+) {
+    record_github_effect(
+        app,
+        &detail.repo,
+        detail.number,
+        viewer,
+        GithubEffect::ReviewReadback(Box::new(detail.clone()), generations),
+    )
+    .await;
+}
+pub async fn qualify_confirmed_review(
+    app: &AppHandle,
+    receipt: &crate::github::mutate::SubmittedReview,
+) {
+    record_github_effect(
+        app,
+        &receipt.repo,
+        receipt.number,
+        &receipt.actor,
+        GithubEffect::QualifyReview(receipt.clone()),
+    )
+    .await;
 }
 pub async fn record_confirmed_review(
     app: &AppHandle,
@@ -801,6 +846,31 @@ pub async fn record_confirmed_removal(
 ) {
     let viewer = effect.viewer.clone();
     record_github_effect(app, repo, number, &viewer, GithubEffect::Remove(effect)).await;
+}
+
+fn persist_github_effect(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    receipt: &FetchedList,
+) -> Result<(), crate::store::StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    crate::store::source_cache::save_owned_source_snapshot(
+        &tx,
+        source,
+        list,
+        &receipt.prs,
+        &receipt.coverage,
+        receipt.viewer.as_deref(),
+    )?;
+    crate::queue_scan::taint(
+        &tx,
+        source,
+        list,
+        receipt.viewer.as_deref().unwrap_or_default(),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 async fn record_github_effect(
@@ -861,6 +931,42 @@ async fn record_github_effect(
             }
         };
         let changed = match &effect {
+            GithubEffect::QualifyReview(submitted) => {
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number {
+                        if let Some(effect) = row
+                            .observation
+                            .as_mut()
+                            .and_then(|o| o.confirmed_review.as_mut())
+                        {
+                            if effect.receipt.as_ref().is_some_and(|r| {
+                                r.review_id == submitted.review_id
+                                    && r.actor == submitted.actor
+                                    && r.commit_oid == submitted.commit_oid
+                            }) {
+                                let before = effect.unresolved;
+                                crate::inventory::qualify_review_effect(effect, chrono::Utc::now());
+                                changed |= effect.unresolved != before;
+                            }
+                        }
+                    }
+                }
+                changed
+            }
+            GithubEffect::ReviewReadback(detail, generations) => {
+                let index = if list == CachedList::Authored { 0 } else { 1 };
+                if !polls.readback_is_current(&source, list, generations[index]) {
+                    continue;
+                }
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number && row.id == detail.id {
+                        changed |= crate::inventory::reconcile_detail_review(row, detail);
+                    }
+                }
+                changed
+            }
             GithubEffect::Review(effect) => {
                 let mut changed = false;
                 for row in &mut receipt.prs {
@@ -884,23 +990,7 @@ async fn record_github_effect(
         let saved_source = source.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
             let conn = crate::store::open_db(&path)?;
-            let tx = conn.unchecked_transaction()?;
-            crate::store::source_cache::save_owned_source_snapshot(
-                &tx,
-                &saved_source,
-                list,
-                &saved.prs,
-                &saved.coverage,
-                saved.viewer.as_deref(),
-            )?;
-            crate::queue_scan::taint(
-                &tx,
-                &saved_source,
-                list,
-                saved.viewer.as_deref().unwrap_or_default(),
-            )?;
-            tx.commit()?;
-            Ok::<_, crate::store::StoreError>(())
+            persist_github_effect(&conn, &saved_source, list, &saved)
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
@@ -1137,6 +1227,9 @@ mod tests {
                         head_oid: "head-a".into(),
                         review: crate::github::model::ReviewState::Approved,
                         confirmed_at: chrono::Utc::now(),
+                        receipt: None,
+                        unresolved: false,
+                        confirmed_by_read: false,
                     },
                 );
                 if empty {
@@ -1307,6 +1400,10 @@ mod tests {
                 polls.effect_generation(&source, CachedList::Reviewing);
             }
             assert!(polls.success_publication(&old).await.is_none());
+            assert!(
+                !polls.readback_is_current(&source, CachedList::Reviewing, 0),
+                "a pre-review detail receipt cannot clear the newer effect"
+            );
             let (new, _) = polls.begin_attempt(source, CachedList::Reviewing).await;
             assert!(polls.success_publication(&new).await.is_some());
         }
@@ -1908,5 +2005,77 @@ mod tests {
             .receipt_id
             .is_none());
         assert!(reconcile_gitlab_snapshot(&conn, &source, list, enriched, None).is_err());
+    }
+    #[test]
+    fn review_readback_persists_own_fact_and_taints_accepted_scan_without_losing_tail() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let mut incoming = receipt(1);
+        incoming.viewer = Some("fixture".into());
+        incoming.prs[0].head_oid = "head".into();
+        let scan = Commit {
+            expected_revision: 0,
+            state: State {
+                after: Some("synthetic-tail".into()),
+                receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                ..State::default()
+            },
+            removals: vec![],
+        };
+        incoming.scan = Some(scan.clone());
+        let mut accepted = reconcile_github_snapshot(&conn, &source, list, incoming, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let now = chrono::Utc::now();
+        let row = &mut accepted.prs[0];
+        let written = crate::github::mutate::SubmittedReview {
+            review_id: "review".into(),
+            state: "APPROVED".into(),
+            actor: "fixture".into(),
+            commit_oid: "head".into(),
+            submitted_at: Some(now),
+            pr_id: row.id.clone(),
+            repo: row.repo.clone(),
+            number: row.number,
+        };
+        crate::inventory::apply_confirmed_review(
+            row,
+            &crate::inventory::ConfirmedReview {
+                head_oid: "head".into(),
+                review: crate::github::model::ReviewState::Approved,
+                confirmed_at: now,
+                receipt: Some(written),
+                unresolved: false,
+                confirmed_by_read: false,
+            },
+        );
+        persist_github_effect(&conn, &source, list, &accepted).unwrap();
+        let checkpoint = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(checkpoint.state.after.as_deref(), Some("synthetic-tail"));
+        assert!(checkpoint.state.receipt_id.is_none());
+        assert!(!crate::queue_scan::accepted(&conn, &source, list, "fixture", &scan).unwrap());
+        let crate::store::source_cache::SnapshotData::Available { prs, .. } =
+            crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                .unwrap()
+                .data
+        else {
+            panic!("snapshot");
+        };
+        let effect = prs[0]
+            .observation
+            .as_ref()
+            .unwrap()
+            .confirmed_review
+            .as_ref()
+            .unwrap();
+        assert_eq!(effect.receipt.as_ref().unwrap().review_id, "review");
+        assert_eq!(
+            crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                .unwrap()
+                .as_deref(),
+            Some("fixture")
+        );
     }
 }

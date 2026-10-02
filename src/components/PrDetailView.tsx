@@ -1,3 +1,4 @@
+import { useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
 import { useReadyStacks } from "@/api/useReadyStacks";
 import { commandError } from "@/lib/errorKind";
 import { ExternalLink } from "./ExternalLink";
@@ -256,7 +257,12 @@ export function PrDetailView({
   const gate = pr
     ? gateVerdict(gates, pr, viewer, isPlaceholderData)
     : { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
-  const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
+  const [localReviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
+  const releaseReview = useReleaseCheckedReview();
+  const operation = useReviewOperation(pr?.repo ?? "", pr?.number ?? 0, pr?.head_oid ?? "");
+  const reviewing = operation?.state === "pending" ? operation.request.verdict : localReviewing;
+  const reviewBlocked = !pr?.head_oid || !viewer || operation?.state === "unresolved" || operation?.state === "acknowledged";
+
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
   /// Whether the remote-branch deletion is awaiting confirmation (#845).
@@ -290,7 +296,7 @@ export function PrDetailView({
   /// branch), but this closure is defined above the guard, so the guard
   /// is restated rather than asserted away.
   const submitReview = (verdict: ReviewVerdictName, body: string) => {
-    if (!pr || isError) return;
+    if (!pr || (verdict === "comment" ? isError : reviewBlocked)) return;
     setReviewing(verdict);
     const done = () => setReviewing(null);
     const label =
@@ -308,14 +314,16 @@ export function PrDetailView({
     const submit =
       verdict === "comment"
         ? comment(pr.id, pr.repo, pr.number, body)
-        : review(pr.id, pr.repo, pr.number, verdict, body);
+        : review(pr.id, pr.repo, pr.number, verdict, body, pr.head_oid, viewer);
     submit.then(
-      () => {
+      (receipt) => {
         done();
         // The after-approve state: an approval that will not count toward
         // merging still reads "Approved", so the toast says what it means
         // (#1451).
-        toast.success(`${label} ${pr.repo}#${pr.number}`, {
+        const confirmedLabel = receipt && ((verdict === "approve" && receipt.state !== "APPROVED") || (verdict === "request_changes" && receipt.state !== "CHANGES_REQUESTED"))
+          ? `Review recorded (${receipt.state}) on` : label;
+        toast.success(`${confirmedLabel} ${pr.repo}#${pr.number}`, {
           description:
             verdict === "approve" && gate.approveWontCount ? gate.approveWontCount : undefined,
         });
@@ -326,7 +334,7 @@ export function PrDetailView({
         // your own pull request" tells the user exactly what
         // happened where a generic message would not.
         toast.error(`Could not review #${pr.number}`, {
-          description: typeof e === "string" ? e : undefined,
+          description: e instanceof Error ? e.message : String(e),
         });
       },
     );
@@ -395,17 +403,17 @@ export function PrDetailView({
       {viewer !== undefined && viewer !== pr.author ? (
         <button
           type="button"
-          disabled={isError || approvedByViewer || reviewing !== null}
+          disabled={reviewBlocked || approvedByViewer || reviewing !== null}
           onClick={() => submitReview("approve", "")}
           title={
-            isError
-              ? "Refresh the pull request before reviewing"
+            reviewBlocked
+              ? "Check the account, viewed head and review state before reviewing"
               : approvedByViewer
               ? "You have already approved this pull request"
               : (gate.approveWontCount ?? "Approve without a comment")
           }
           className={`rounded px-2.5 py-1 text-sm font-medium ${
-            isError || approvedByViewer || reviewing !== null
+            reviewBlocked || approvedByViewer || reviewing !== null
               ? "border border-[#30363d] text-[#8b949e] disabled:opacity-50"
               : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
@@ -450,7 +458,7 @@ export function PrDetailView({
       {isError ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
         <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
-        <p>Refresh before acting on these details, or open GitHub for the current state.</p>
+        <p>Reviews use the loaded commit shown here. Refresh before merging or other actions, or open GitHub for the current state.</p>
         <button type="button" disabled={isFetching} onClick={() => void refetch({ cancelRefetch: false })}
           className="tap-target mt-2 rounded border border-[#30363d] px-3 py-1.5 disabled:opacity-50">
           {isFetching ? "Refreshing…" : "Retry refresh"}
@@ -602,19 +610,28 @@ export function PrDetailView({
 
       {!isError && <PrActions pr={pr} requireStackEvidence conversations={gate.mergeBlocked} />}
 
+      {operation?.state === "unresolved" ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
+        <p>{operation.message}</p>
+        <ExternalLink href={pr.url}>Check review on GitHub</ExternalLink>
+        <button type="button" className="tap-target block" onClick={() => releaseReview(pr.repo, pr.number, pr.head_oid)}>
+          I checked on GitHub; allow another review
+        </button>
+      </div> : null}
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
           pull request offers different actions depending on how you
           navigated to it -- and commenting on your own work is normal.
           Approving your own is the one case GitHub refuses, and
           ReviewBox handles that itself. */}
-      <fieldset disabled={isError} className="min-w-0">
+      <fieldset className="min-w-0">
         <ReviewBox
           viewer={viewer}
           author={pr.author}
           latestReviews={pr.latest_reviews}
           approveWontCount={gate.approveWontCount}
           approveCaveat={gate.approveCaveat}
+          commentDisabled={isError}
+          reviewDisabled={reviewBlocked}
           busy={reviewing}
           onSubmit={submitReview}
         />
@@ -679,7 +696,7 @@ export function PrDetailView({
                       // workflow run cannot be retried" says exactly why
                       // where a generic message would not.
                       toast.error(`Could not re-run checks on #${pr.number}`, {
-                        description: typeof e === "string" ? e : undefined,
+                        description: e instanceof Error ? e.message : String(e),
                       });
                     },
                   );
@@ -899,7 +916,7 @@ export function PrDetailView({
                     () => toast.success(`Deleted ${pr.head_ref}`),
                     (e: unknown) =>
                       toast.error(`Could not delete ${pr.head_ref}`, {
-                        description: typeof e === "string" ? e : undefined,
+                        description: e instanceof Error ? e.message : String(e),
                       }),
                   );
                 }}
