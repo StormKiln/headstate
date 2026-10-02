@@ -36,7 +36,7 @@ async function advance(ms: number) {
 
 it("refreshes mounted unknown and off-list membership without head changes, once per minute in a shared batch", async () => {
   let stack: PrStack = { kind: "unknown" };
-  invoke.mockImplementation(async () => rows.map((pr) => ({ repo: pr.repo, number: pr.number, head_oid: pr.head_oid, base_ref: pr.base_ref, stack })));
+  invoke.mockImplementation(async () => rows.map((pr) => ({ repo: pr.repo, number: pr.number, head_oid: pr.head_oid, base_ref: pr.base_ref, valid_for_ms: stack.kind === "unknown" ? 5_000 : 60_000, stack })));
   const view = renderHook(() => useReadyStacks(rows), { wrapper });
   await advance(1);
   expect(view.result.current.of(rows[0])).toEqual({ kind: "unknown" });
@@ -72,7 +72,7 @@ it("does not multiply pending metadata requests when refresh timers fire", async
 
 it("limits a large mounted owner to one finite demand window and stops hidden work", async () => {
   const many = Array.from({ length: 120 }, (_, i) => ({ ...rows[0], id: `task4-${i}`, number: i + 1, base_ref: `base-${i % 44}` }));
-  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof many).map((pr) => ({ ...pr, stack: { kind: "unknown" } })));
+  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof many).map((pr) => ({ ...pr, valid_for_ms: 60_000, stack: { kind: "unknown" } })));
   const view = renderHook(() => useReadyStacks(many), { wrapper });
   await advance(10);
   expect(invoke).toHaveBeenCalledTimes(1);
@@ -84,7 +84,7 @@ it("limits a large mounted owner to one finite demand window and stops hidden wo
 
 it("rejects legacy and mismatched head/base evidence and isolates account receipts", async () => {
   let owner = "octocat";
-  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof rows).map(pr => ({ ...pr, head_oid: owner === "octocat" ? "wrong" : pr.head_oid, stack: exact })));
+  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof rows).map(pr => ({ ...pr, valid_for_ms: 60_000, head_oid: owner === "octocat" ? "wrong" : pr.head_oid, stack: exact })));
   const view = renderHook(() => useReadyStacks(rows), { wrapper });
   await advance(2);
   expect(view.result.current.of(rows[0])).toEqual({ kind: "unknown" });
@@ -102,7 +102,7 @@ it("shares two owners and removes hidden queued demand without canceling a live 
   const b = renderHook(() => useReadyStacks(rows), { wrapper });
   await advance(1);
   a.unmount();
-  await act(async () => finish!(rows.map(pr => ({ ...pr, stack: exact }))));
+  await act(async () => finish!(rows.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: exact }))));
   await advance(2);
   expect(b.result.current.of(rows[0])).toEqual(exact);
   expect(invoke).toHaveBeenCalledTimes(1);
@@ -123,7 +123,7 @@ it("drops a closed owner's waiting batch while another owner's native call finis
   const closed = renderHook(() => useReadyStacks(otherRows), { wrapper });
   await advance(1);
   closed.unmount();
-  await act(async () => { finish!(rows.map(pr => ({ ...pr, stack: exact }))); });
+  await act(async () => { finish!(rows.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: exact }))); });
   await advance(2);
   expect(invoke).toHaveBeenCalledTimes(1);
   expect(live.result.current.of(rows[0])).toEqual(exact);

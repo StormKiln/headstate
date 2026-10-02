@@ -50,7 +50,7 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockImplementation((cmd: string, args) => {
     if (cmd === "get_viewer") return viewerLogin;
-    if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers.map(answer => ({ ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
+    if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers.map(answer => ({ valid_for_ms: 60_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
     if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
     return Promise.resolve(null);
   });
@@ -779,7 +779,7 @@ it("bounds two actual mounted 120-row owners and advances beyond the unreadable 
   const rows = Array.from({ length: 120 }, (_, i) => ({ ...ready, id: `task4-${i}`, number: i + 1, base_ref: `base-${i % 44}`, title: `Task4 row ${i}` }));
   invoke.mockImplementation(async (cmd, args) => {
     const asked = args?.rows as (PullRequest & { base: string })[];
-    if (cmd === "get_ready_stacks") return asked.map(pr => ({ ...pr, stack: { kind: "unknown" } }));
+    if (cmd === "get_ready_stacks") return asked.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: { kind: "unknown" } }));
     if (cmd === "get_ready_pushers") return asked.map(pr => ({ ...pr, rules: { state: "unreadable", reason: "synthetic refusal" }, last_pusher: { state: "unknown", reason: "synthetic refusal" } }));
     return null;
   });
@@ -810,7 +810,7 @@ it("does not reuse same-head last-push rules after the base changes", async () =
   const view = render(<ReadyStrip prs={[pr]} />);
   await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).toBeTruthy());
   let finish: ((value: unknown) => void) | undefined;
-  invoke.mockImplementation((cmd, args) => cmd === "get_ready_pushers" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(cmd === "get_viewer" ? "me" : (args?.rows as PullRequest[] ?? []).map(row => ({ ...row, stack: { kind: "unknown" } }))));
+  invoke.mockImplementation((cmd, args) => cmd === "get_ready_pushers" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(cmd === "get_viewer" ? "me" : (args?.rows as PullRequest[] ?? []).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "unknown" } }))));
   view.rerender(<ReadyStrip prs={[{ ...pr, base_ref: "changed-base" }]} />);
   expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
   await waitFor(() => expect(finish).toBeDefined());
@@ -829,7 +829,7 @@ it("prioritizes actual observed rows in the next bounded viewport window", async
     observe() {} disconnect() {}
   });
   const rows = Array.from({ length: 20 }, (_, i) => ({ ...ready, number: i + 1, id: `viewport-${i}`, title: `Viewport row ${i}` }));
-  invoke.mockImplementation(async (cmd, args) => cmd === "get_ready_stacks" ? (args?.rows as object[]).map(row => ({ ...row, stack: { kind: "unknown" } })) : []);
+  invoke.mockImplementation(async (cmd, args) => cmd === "get_ready_stacks" ? (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "unknown" } })) : []);
   const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={rows} /></QueryClientProvider>);
   await act(async () => { await vi.advanceTimersByTimeAsync(5); });
   const last = screen.getByText("Viewport row 19").closest("li")!;

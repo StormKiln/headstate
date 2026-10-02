@@ -63,17 +63,33 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         ttl: impl Fn(&V) -> Duration,
         work: F,
     ) -> Option<V> {
+        self.load_receipt(key, deadline, ttl, work)
+            .await
+            .map(|(value, _)| value)
+    }
+    /// Value and original remaining lifetime are read under the same slot lock.
+    pub async fn load_receipt<F: Future<Output = V>>(
+        &self,
+        key: K,
+        deadline: Instant,
+        ttl: impl Fn(&V) -> Duration,
+        work: F,
+    ) -> Option<(V, Duration)> {
         let slot = self.slot(key)?;
         tokio::time::timeout_at(deadline, async {
             let mut receipt = slot.lock().await;
             if let Some((until, value)) = receipt.as_ref() {
                 if *until > Instant::now() {
-                    return value.clone();
+                    return (
+                        value.clone(),
+                        until.saturating_duration_since(Instant::now()),
+                    );
                 }
             }
             let value = work.await;
-            *receipt = Some((Instant::now() + ttl(&value), value.clone()));
-            value
+            let lifetime = ttl(&value);
+            *receipt = Some((Instant::now() + lifetime, value.clone()));
+            (value, lifetime)
         })
         .await
         .ok()

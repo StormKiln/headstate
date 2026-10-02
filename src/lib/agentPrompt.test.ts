@@ -242,3 +242,11 @@ describe("where the agent should work", () => {
     expect(out.indexOf("merge conflicts")).toBeLessThan(out.indexOf("git worktree add"));
   });
 });
+
+it("qualifies partial all-green and unknown empty check evidence in copied prompts", () => {
+  for (const state of ["partial", "unknown"] as const) {
+    const text = agentPrompt(ctx({ checks: state === "partial" ? [{ name: "build", state: "success", url: "" }] : [], checks_coverage: { state, total: state === "partial" ? 5 : null } }));
+    expect(text).toContain("remaining checks could not be confirmed");
+    expect(text).toContain("Verify CI");
+  }
+});

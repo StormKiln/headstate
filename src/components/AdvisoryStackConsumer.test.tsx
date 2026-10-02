@@ -24,7 +24,7 @@ it("reuses matching warm selected-detail evidence and keeps singleton native Sta
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   qc.setQueryData(["viewer"], "octocat");
   invoke.mockImplementation(async (command, args) => {
-    if (command === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, stack: native }));
+    if (command === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: native }));
     if (command === "merge_stack") return { kind: "enqueued" };
     return null;
   });

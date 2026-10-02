@@ -11,8 +11,7 @@ use super::map::{
 use super::model::{CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats};
 use super::query::{
     cycle_trend_query, history_query_range, history_query_range_with_periods, periods_query,
-    COUNT_QUERY, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY, PRS_QUERY, PR_CHECKS_PAGE_QUERY,
-    PR_DETAIL_QUERY, STATS_QUERY,
+    COUNT_QUERY, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY, PRS_QUERY, PR_DETAIL_QUERY, STATS_QUERY,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{stream, StreamExt};
@@ -1361,9 +1360,9 @@ impl GitHubClient {
     /// The follow-ups are cursor-dependent and therefore strictly
     /// serial, which makes this the one fetch in the app whose latency
     /// is a multiple of a single POST rather than a single POST. That is
-    /// what #790 was: see `append_remaining_checks` for the page budget,
-    /// and `commands::get_pr_detail` for the wall-clock ceiling that now
-    /// bounds the whole chain.
+    /// what #790 was: `collect_detail_checks` bounds continuation attempts,
+    /// and the inherited absolute deadline bounds the whole chain without
+    /// discarding completed primary data when a continuation expires.
     ///
     /// `repo` is `owner/name`; it is split here rather than by the caller
     /// so a malformed value fails in one place with a clear message.
@@ -1387,7 +1386,7 @@ impl GitHubClient {
                 slot
             }
         };
-        let deadline = started + SEARCH_BUDGET;
+        let deadline = (started + SEARCH_BUDGET).min(self.read_context().deadline);
         let mut receipt = tokio::time::timeout_at(deadline, slot.lock())
             .await
             .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?;
@@ -1396,9 +1395,12 @@ impl GitHubClient {
                 return result.clone().map_err(ClientError::shared);
             }
         }
-        let result = tokio::time::timeout_at(deadline, self.fetch_pr_detail_uncached(repo, number))
+        let mut context = self.read_context();
+        context.deadline = deadline;
+        let result = self
+            .with_read_context(context)
+            .fetch_pr_detail_uncached(repo, number)
             .await
-            .unwrap_or(Err(ClientError::Timeout(SEARCH_BUDGET.as_secs())))
             .map_err(Arc::new);
         *receipt = Some((Instant::now(), generation, result.clone()));
         result.map_err(ClientError::shared)
@@ -1412,20 +1414,20 @@ impl GitHubClient {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| ClientError::Graphql(format!("malformed repository: {repo}")))?;
-        // The stack lookup runs BESIDE the detail query rather than after
-        // it (#1452), so it costs a point and not a round trip. It never
-        // fails the view: its own failures are `PrStack::Unknown`, and it
-        // stops itself at `stack::STACK_BUDGET`, well inside the command's
-        // ceiling.
         let body = json!({
             "query": PR_DETAIL_QUERY,
             "variables": { "owner": owner, "repo": name, "number": number }
         });
-        let (first, stack) = tokio::join!(
-            self.graphql_partial_ok(&body),
-            self.fetch_pr_stack(owner, name, number),
-        );
-        let mut v = first?;
+        let mut v = self.graphql_partial_ok(&body).await?;
+        let pr = &v["repository"]["pullRequest"];
+        if pr["number"].as_u64() != Some(number)
+            || pr["id"].as_str().is_none_or(str::is_empty)
+            || pr["headRefOid"].as_str().is_none_or(str::is_empty)
+        {
+            return Err(ClientError::Graphql(
+                "The pull request identity or viewed head could not be confirmed.".into(),
+            ));
+        }
         // A refusal on THIS document is not survivable by defaulting, and
         // this is the one path where that is counter-intuitive enough to
         // spell out (#854).
@@ -1452,158 +1454,15 @@ impl GitHubClient {
                  This usually clears on the next refresh."
             )));
         }
-        self.append_remaining_checks(&mut v, owner, name, number)
-            .await?;
-        let mut detail = map_detail(&v, repo);
-        detail.stack = stack;
-        Ok(detail)
-    }
-
-    /// Follow `statusCheckRollup.contexts` pagination into `v`.
-    ///
-    /// A truncated check list is the most dangerous shape this view can
-    /// take, because it does not look truncated: the panel renders a
-    /// full, plausible list of passing checks on a pull request the
-    /// rollup itself reports as FAILURE. Observed on a pull request with
-    /// 63 checks whose only two failures both sat past the first page.
-    /// That is why this loop exists at all, and none of what follows
-    /// weakens it: a 63-check pull request is still fetched complete.
-    ///
-    /// Stops on the first page that says there is no next one.
-    ///
-    /// MAX_PAGES was 20, which made this the slowest thing in the app
-    /// (#790). Each iteration is its own POST and the cursor makes them
-    /// strictly serial, so the budget is a latency budget: at the p90
-    /// per-POST latency measured for `poll::FETCH_TIMEOUT` (8,814ms)
-    /// twenty pages is three minutes of spinner, and the command had no
-    /// overall timeout to stop it. Worse, the user is waiting on the
-    /// CHEAPEST section of the view -- the body, the review threads and
-    /// the merge state all arrived on page 1.
-    ///
-    /// Cut to 3 (300 contexts). Two reasons that number and not another:
-    ///
-    /// - It is still past anything observed. The largest real rollup in
-    ///   the reports behind this is 63 contexts, which fits in one page;
-    ///   the second page exists for the pathological repository, the
-    ///   third for headroom.
-    /// - It bounds the serial chain at 4 POSTs, which fits inside the
-    ///   30s command ceiling added in `get_pr_detail` at p90 latency
-    ///   rather than blowing through it. A budget the timeout kills is
-    ///   not a budget, it is a guaranteed error message.
-    ///
-    /// REJECTED: backgrounding the extra pages (render page 1, fill the
-    /// rest in progressively). It is the better end state and the issue
-    /// asks for it, but it needs a second command, an event channel and
-    /// a partial-checks state in the view, and it cannot be done without
-    /// reintroducing exactly the silent-truncation bug this function was
-    /// written to fix -- a progressively-filling list is indistinguishable
-    /// from a truncated one until it finishes. Capping plus an honest
-    /// count is most of the win for a fraction of the surface, and the
-    /// `checks_total` field it adds is what the progressive version would
-    /// need anyway. Filed as follow-up rather than rushed here.
-    ///
-    /// REJECTED: a page budget of 1. The 63-check pull request above is
-    /// the reported bug; a cap that truncates it trades a slow correct
-    /// view for a fast wrong one.
-    ///
-    /// Hitting the cap is now a REAL possibility rather than a sign the
-    /// API is misbehaving, so it no longer returns silently: the total
-    /// from `totalCount` reaches `PrDetail::checks_total` and the panel
-    /// says "showing 300 of 412".
-    async fn append_remaining_checks(
-        &self,
-        v: &mut serde_json::Value,
-        owner: &str,
-        name: &str,
-        number: u64,
-    ) -> Result<(), ClientError> {
-        const MAX_PAGES: usize = 3;
-
-        // DIAGNOSTIC LOGGING (Settings > diagnostic log). The page count
-        // is what makes a slow click attributable: `[diag] graphql POST`
-        // lines alone leave "one slow POST" and "four serial POSTs"
-        // looking identical unless the reader counts log lines by hand,
-        // and those two have completely different fixes (#790). Logged
-        // on EVERY path including zero pages, so a fast click proves the
-        // loop was not involved rather than leaving it unaccounted for.
-        let started = std::time::Instant::now();
-        let mut pages = 0usize;
-        let out = self
-            .checks_pages(v, owner, name, number, MAX_PAGES, &mut pages)
+        let coverage = self
+            .collect_detail_checks(&mut v, owner, name, number)
             .await;
-        crate::diag!(
-            "[diag] checks pagination {} page(s) in {}ms{}",
-            pages,
-            started.elapsed().as_millis(),
-            if pages == MAX_PAGES { " (CAPPED)" } else { "" }
-        );
-        out
-    }
-
-    /// `append_remaining_checks` without the timing, so the logging
-    /// above brackets every exit rather than being repeated at each of
-    /// the four `return`s below.
-    async fn checks_pages(
-        &self,
-        v: &mut serde_json::Value,
-        owner: &str,
-        name: &str,
-        number: u64,
-        max_pages: usize,
-        pages: &mut usize,
-    ) -> Result<(), ClientError> {
-        for _ in 0..max_pages {
-            let contexts = &v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            if !contexts["pageInfo"]["hasNextPage"]
-                .as_bool()
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-            // A cursor is required to advance. Absent one, stop rather
-            // than re-request the same page forever.
-            let Some(cursor) = contexts["pageInfo"]["endCursor"].as_str() else {
-                return Ok(());
-            };
-            let cursor = cursor.to_string();
-
-            let page = self
-                .graphql_partial_ok(&json!({
-                    "query": PR_CHECKS_PAGE_QUERY,
-                    "variables": {
-                        "owner": owner, "repo": name, "number": number, "after": cursor
-                    }
-                }))
-                .await?;
-            *pages += 1;
-            let fetched = &page["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            let more = fetched["nodes"].as_array().cloned().unwrap_or_default();
-            let page_info = fetched["pageInfo"].clone();
-            let total = fetched["totalCount"].clone();
-
-            let target = &mut v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            match target["nodes"].as_array_mut() {
-                Some(existing) => existing.extend(more),
-                // No array to append to means the response shape is not
-                // what the mapper reads either; stop instead of looping.
-                None => return Ok(()),
-            }
-            target["pageInfo"] = page_info;
-            // The LATER page's total wins, for the reason the query's own
-            // comment gives: a rollup can grow while we walk it, and the
-            // stale number would understate what is missing. Only when
-            // the page actually carried one -- overwriting a good total
-            // with `null` from a partial response would make the panel
-            // fall back to "nothing missing" on the one shape where
-            // something is.
-            if !total.is_null() {
-                target["totalCount"] = total;
-            }
-        }
-        Ok(())
+        let mut detail = map_detail(&v, repo);
+        detail.checks_coverage = Some(coverage);
+        detail.stack = self
+            .peek_advisory_stack(repo, number, &detail.head_oid, &detail.base_ref)
+            .unwrap_or(super::model::PrStack::Unknown);
+        Ok(detail)
     }
 
     /// The PR list together with GitHub's own match count.
@@ -2106,6 +1965,7 @@ async fn graphql_with_transport(
                 // for the request it actually made.
                 let mut d = d.clone();
                 crate::inventory::mark_readiness_errors(&mut d, errs);
+                super::detail_checks::mark_errors(&mut d, errs);
                 mark_queue_cursor_error(&mut d, errs);
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("__refused".into(), errs.len().into());
@@ -2119,6 +1979,7 @@ async fn graphql_with_transport(
             // permission-refusal count so other callers keep their messaging.
             let mut data = d.clone();
             crate::inventory::mark_readiness_errors(&mut data, errs);
+            super::detail_checks::mark_errors(&mut data, errs);
             mark_queue_cursor_error(&mut data, errs);
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("__partial_errors".into(), errs.len().into());
@@ -4053,6 +3914,322 @@ mod tests {
     /// checks, both failures past the first page, so the detail view
     /// listed nothing but green while the rollup said FAILURE. Paging is
     /// what makes the list honest.
+    fn progress_detail_fixture() -> serde_json::Value {
+        json!({"repository":{"pullRequest":{"id":"PR-fixture","number":42,"title":"Primary detail","body":"Keep this description","headRefOid":"head-a","baseRefName":"main","mergeStateStatus":"CLEAN","commits":{"nodes":[{"commit":{"oid":"head-a","statusCheckRollup":{"state":"SUCCESS","contexts":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"first"},"nodes":[{"id":"check-a","name":"first check","conclusion":"SUCCESS"}]}}}}]}}}})
+    }
+
+    #[tokio::test]
+    async fn detail_progress_does_not_wait_for_or_dispatch_optional_stack() {
+        let server = MockServer::start().await;
+        let mut primary = progress_detail_fixture();
+        primary["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":primary})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query PrStack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(json!({"data":{}})),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let detail = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.fetch_pr_detail("acme/alpha", 42),
+        )
+        .await
+        .expect("primary must not await ancestry")
+        .unwrap();
+        assert_eq!(detail.title, "Primary detail");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "no detached ancestry read"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_progress_preserves_primary_when_check_continuation_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":progress_detail_fixture()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ChecksPage"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query PrStack"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{}})))
+            .mount(&server)
+            .await;
+        let detail = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .expect("later checks failure must keep primary");
+        assert_eq!(detail.title, "Primary detail");
+        assert_eq!(detail.checks.len(), 1);
+        let wire = serde_json::to_value(detail).unwrap();
+        assert_eq!(wire["checks_coverage"]["state"], "partial");
+        assert_eq!(wire["checks_coverage"]["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn detail_progress_checks_evidence_distinguishes_null_errors_and_bad_chains() {
+        for case in [
+            "no-ci",
+            "empty",
+            "missing-rollup",
+            "checks-error",
+            "unrelated-error",
+            "unrelated-commit-error",
+            "wrong-head",
+            "wrong-commit",
+            "count-conflict",
+            "missing-total",
+            "repeated-cursor",
+            "missing-cursor",
+            "duplicate",
+            "bad-node",
+        ] {
+            let server = MockServer::start().await;
+            let mut primary = progress_detail_fixture();
+            let rollup = "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup";
+            let context = format!("{rollup}/contexts");
+            let mut errors = json!([]);
+            match case {
+                "no-ci" | "checks-error" | "unrelated-error" | "unrelated-commit-error" => {
+                    *primary.pointer_mut(rollup).unwrap() = serde_json::Value::Null;
+                }
+                "missing-rollup" => {
+                    primary
+                        .pointer_mut("/repository/pullRequest/commits/nodes/0/commit")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("statusCheckRollup");
+                }
+                "empty" => {
+                    *primary.pointer_mut(&context).unwrap() = json!({"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+                }
+                "missing-cursor" => {
+                    primary.pointer_mut(&context).unwrap()["pageInfo"]["endCursor"] =
+                        serde_json::Value::Null;
+                }
+                _ => {}
+            }
+            if case == "checks-error" {
+                errors = json!([{"path":["repository","pullRequest","commits"],"message":"Synthetic unavailable"}]);
+            }
+            if case == "unrelated-commit-error" {
+                errors = json!([{"path":["repository","pullRequest","commits","nodes",0,"commit","committedDate"],"message":"Synthetic optional unavailable"}]);
+            }
+            if case == "unrelated-error" {
+                errors = json!([{"path":["repository","pullRequest","comments"],"message":"Synthetic unavailable"}]);
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("isMergeQueueEnabled"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":primary,"errors":errors})),
+                )
+                .mount(&server)
+                .await;
+            let mut page = progress_detail_fixture();
+            *page.pointer_mut(&context).unwrap() = json!({"totalCount":2,"nodes":[{"id":"check-b","name":"second check","conclusion":"FAILURE"}],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            match case {
+                "wrong-head" => page["repository"]["pullRequest"]["headRefOid"] = json!("head-b"),
+                "wrong-commit" => {
+                    page["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["oid"] =
+                        json!("head-b")
+                }
+                "count-conflict" => page.pointer_mut(&context).unwrap()["totalCount"] = json!(3),
+                "missing-total" => page
+                    .pointer_mut(&context)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("totalCount")
+                    .map(|_| ())
+                    .unwrap(),
+                "repeated-cursor" => {
+                    page.pointer_mut(&context).unwrap()["pageInfo"] =
+                        json!({"hasNextPage":true,"endCursor":"first"})
+                }
+                "duplicate" => {
+                    page.pointer_mut(&context).unwrap()["nodes"][0]["id"] = json!("check-a")
+                }
+                "bad-node" => page.pointer_mut(&context).unwrap()["nodes"] = json!([null]),
+                _ => {}
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("ChecksPage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":page})))
+                .mount(&server)
+                .await;
+            let d = client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(&d).unwrap();
+            let complete = matches!(
+                case,
+                "no-ci" | "empty" | "unrelated-error" | "unrelated-commit-error"
+            );
+            assert_eq!(
+                wire["checks_coverage"]["state"] == "complete",
+                complete,
+                "{case}"
+            );
+            if complete {
+                assert_eq!(wire["checks_coverage"]["total"], 0, "{case}");
+            }
+            if matches!(
+                case,
+                "wrong-head" | "wrong-commit" | "duplicate" | "bad-node" | "missing-cursor"
+            ) {
+                assert_eq!(d.checks.len(), 1, "{case}");
+            }
+            if matches!(
+                case,
+                "count-conflict"
+                    | "wrong-head"
+                    | "wrong-commit"
+                    | "repeated-cursor"
+                    | "missing-cursor"
+                    | "missing-rollup"
+                    | "checks-error"
+            ) {
+                assert!(wire["checks_coverage"]["total"].is_null(), "{case}");
+            }
+            assert!(
+                server.received_requests().await.unwrap().len() <= 2,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_progress_deadline_keeps_first_page_and_ends_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":progress_detail_fixture()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ChecksPage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(json!({"data":{}})),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            client_for(&server)
+                .await
+                .with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    std::time::Duration::from_millis(100),
+                ));
+        let started = Instant::now();
+        let d = client.fetch_pr_detail("acme/alpha", 42).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(d.checks.len(), 1);
+        assert_eq!(
+            d.checks_coverage.unwrap().state,
+            super::super::model::ChecksState::Partial
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn detail_progress_uses_only_exact_clients_cached_ancestry() {
+        let server = MockServer::start().await;
+        let mut primary = progress_detail_fixture();
+        primary["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":primary})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(body_string_contains("query PrStack")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequest":{"number":42,"headRefOid":"head-a","headRefName":"topic","baseRefName":"main","stackEntry":{"position":1,"stack":{"number":7,"size":1}}}}}}))).mount(&server).await;
+        let client = client_for(&server).await;
+        super::super::ready_stacks::ready_stacks(
+            &client,
+            vec![super::super::ready_stacks::StackAsk {
+                identity: crate::identity::PrIdentity {
+                    source: Default::default(),
+                    repo: "acme/alpha".into(),
+                    number: 42,
+                },
+                head_oid: Some("head-a".into()),
+                base_ref: Some("main".into()),
+            }],
+        )
+        .await
+        .unwrap();
+        let d = client.fetch_pr_detail("acme/alpha", 42).await.unwrap();
+        assert!(matches!(
+            d.stack,
+            super::super::model::PrStack::Stacked {
+                native: true,
+                size: 1,
+                ..
+            }
+        ));
+        let other = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .unwrap();
+        assert!(matches!(other.stack, super::super::model::PrStack::Unknown));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "one advisory and two primary reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_progress_missing_or_denied_primary_never_becomes_success() {
+        for raw in [
+            json!({"data":{"repository":{"pullRequest":null}}}),
+            json!({"errors":[{"message":"Synthetic denied"}]}),
+            json!({"data":{"repository":{"pullRequest":{"number":42,"id":"PR","headRefOid":null}}}}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(raw))
+                .mount(&server)
+                .await;
+            assert!(client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .is_err());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn pr_detail_follows_check_pagination() {
         let server = MockServer::start().await;
@@ -4063,12 +4240,13 @@ mod tests {
             .and(body_string_contains("mergeStateStatus"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42,
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42,
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "state": "FAILURE",
                         "contexts": {
+                            "totalCount":2,
                             "pageInfo": {"hasNextPage": true, "endCursor": "CUR1"},
-                            "nodes": [{"name": "passing-one", "conclusion": "SUCCESS",
+                            "nodes": [{"id":"passing", "name": "passing-one", "conclusion": "SUCCESS",
                                        "detailsUrl": "https://x/1"}]
                         }
                     }}}]}
@@ -4083,10 +4261,12 @@ mod tests {
             .and(body_string_contains("ChecksPage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "number":42,"headRefOid":"head-a",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
+                            "totalCount":2,
                             "pageInfo": {"hasNextPage": false, "endCursor": null},
-                            "nodes": [{"name": "failing-two", "conclusion": "FAILURE",
+                            "nodes": [{"id":"failing", "name": "failing-two", "conclusion": "FAILURE",
                                        "detailsUrl": "https://x/2"}]
                         }
                     }}}]}
@@ -4127,12 +4307,12 @@ mod tests {
             .and(body_string_contains("isMergeQueueEnabled"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42, "title": "t",
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
                             "totalCount": 412,
                             "pageInfo": {"hasNextPage": true, "endCursor": "CUR0"},
-                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                            "nodes": [{"id":"a", "name": "a", "conclusion": "SUCCESS"}]
                         }
                     }}}]}
                 }}}
@@ -4145,17 +4325,16 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("ChecksPage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {"repository": {"pullRequest": {
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
-                        "contexts": {
-                            "totalCount": 412,
-                            "pageInfo": {"hasNextPage": true, "endCursor": "CURn"},
-                            "nodes": [{"name": "b", "conclusion": "SUCCESS"}]
-                        }
-                    }}}]}
-                }}}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value=request.body_json().unwrap();
+                let cursor=body["variables"]["after"].as_str().unwrap();
+                let next=format!("{cursor}-next");
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"pullRequest":{
+                    "number":42,"headRefOid":"head-a","commits":{"nodes":[{"commit":{"oid":"head-a","statusCheckRollup":{"contexts":{
+                        "totalCount":412,"pageInfo":{"hasNextPage":true,"endCursor":next},"nodes":[{"id":cursor,"name":cursor,"conclusion":"SUCCESS"}]
+                    }}}}]}
+                }}}}))
+            })
             .mount(&server)
             .await;
 
@@ -4193,17 +4372,17 @@ mod tests {
     /// list, which is the failure mode `poll::truncation_payload` takes
     /// the same care over.
     #[tokio::test]
-    async fn pr_detail_without_a_check_total_reports_no_shortfall() {
+    async fn pr_detail_without_a_check_total_reports_unknown_coverage() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42, "title": "t",
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
                             "pageInfo": {"hasNextPage": false, "endCursor": null},
-                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                            "nodes": [{"id":"a", "name": "a", "conclusion": "SUCCESS"}]
                         }
                     }}}]}
                 }}}
@@ -4218,8 +4397,12 @@ mod tests {
             .unwrap();
         assert_eq!(d.checks.len(), 1);
         assert_eq!(
+            d.checks_coverage.as_ref().unwrap().state,
+            super::super::model::ChecksState::Unknown
+        );
+        assert_eq!(
             d.checks_total, 1,
-            "no total must mean complete, never a zero the UI subtracts from"
+            "legacy count remains compatible; modern coverage must qualify unknown"
         );
     }
 
@@ -4428,20 +4611,6 @@ mod tests {
             (
                 "fetch_viewer_metered",
                 "as `fetch_viewer`; this one also records the spend",
-            ),
-            // The cursor loop that appends extra pages into a response the
-            // CALLER then maps, so `fetch_pr_detail` owns the verdict for
-            // the whole chain -- and it refuses outright on a refusal,
-            // because `map_detail` defaults a missing total to "nothing
-            // missing".
-            //
-            // Named `checks_pages` rather than its delegating wrapper
-            // `append_remaining_checks`: the guard reports the function the
-            // call is IN, and the first version of this list named the
-            // wrapper, which the guard correctly would not accept.
-            (
-                "checks_pages",
-                "merges into the caller's response; `fetch_pr_detail` judges the whole chain",
             ),
             (
                 "merged_detail_page",

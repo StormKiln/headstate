@@ -27,6 +27,8 @@ pub struct RowStack {
     pub head_oid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_for_ms: Option<u64>,
 }
 
 impl GitHubClient {
@@ -67,6 +69,7 @@ pub async fn ready_stacks(
             stack: PrStack::Unknown,
             head_oid: None,
             base_ref: None,
+            valid_for_ms: None,
         })
         .collect();
     let mut canonical: Vec<_> = rows
@@ -92,7 +95,7 @@ pub async fn ready_stacks(
             .collect::<Vec<_>>(),
     )
     .buffer_unordered(2);
-    while let Ok(Some((i, stack))) =
+    while let Ok(Some((i, (stack, lifetime)))) =
         tokio::time::timeout_at(client.read_context().deadline, work.next()).await
     {
         // Unknown is not verified matching evidence. Legacy asks cannot acquire
@@ -107,6 +110,7 @@ pub async fn ready_stacks(
                 .as_ref()
                 .is_some_and(|base| !base.is_empty())
         {
+            out[i].valid_for_ms = lifetime;
             out[i].head_oid = rows[i].head_oid.clone();
             out[i].base_ref = rows[i].base_ref.clone();
         }
@@ -115,16 +119,16 @@ pub async fn ready_stacks(
     Ok(out)
 }
 
-async fn lookup(client: &GitHubClient, ask: &StackAsk) -> PrStack {
+async fn lookup(client: &GitHubClient, ask: &StackAsk) -> (PrStack, Option<u64>) {
     let row = &ask.identity;
     if row.source.provider != Provider::Github || row.source.host != "github.com" {
-        return PrStack::Unknown;
+        return (PrStack::Unknown, None);
     }
     let Some((owner, repo)) = row.repo.split_once('/') else {
-        return PrStack::Unknown;
+        return (PrStack::Unknown, None);
     };
     if owner.is_empty() || repo.is_empty() || repo.contains('/') || row.number == 0 {
-        return PrStack::Unknown;
+        return (PrStack::Unknown, None);
     }
     let budget = client.request_budget();
     let expected = ask
@@ -137,7 +141,7 @@ async fn lookup(client: &GitHubClient, ask: &StackAsk) -> PrStack {
         client
             .advisory
             .stacks
-            .load(
+            .load_receipt(
                 (row.repo.clone(), row.number, head.into(), base.into()),
                 client.read_context().deadline,
                 |s| {
@@ -150,9 +154,10 @@ async fn lookup(client: &GitHubClient, ask: &StackAsk) -> PrStack {
                 work,
             )
             .await
-            .unwrap_or(PrStack::Unknown)
+            .map(|(stack, ttl)| (stack, Some(ttl.as_millis() as u64)))
+            .unwrap_or((PrStack::Unknown, None))
     } else {
-        work.await
+        (work.await, None)
     }
 }
 
@@ -220,7 +225,17 @@ mod tests {
                 ..
             }
         ));
-        ready_stacks(&client, vec![ask]).await.unwrap();
+        assert!(got[0]
+            .valid_for_ms
+            .is_some_and(|ms| ms > 59_000 && ms <= 60_000));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(55)).await;
+        let aged = ready_stacks(&client, vec![ask]).await.unwrap();
+        assert_eq!(aged[0].stack, got[0].stack);
+        assert!(aged[0]
+            .valid_for_ms
+            .is_some_and(|ms| ms > 4_000 && ms <= 5_000));
+        tokio::time::resume();
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();

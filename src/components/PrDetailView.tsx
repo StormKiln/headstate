@@ -1,3 +1,4 @@
+import { useReadyStacks } from "@/api/useReadyStacks";
 import { commandError } from "@/lib/errorKind";
 import { ExternalLink } from "./ExternalLink";
 import { PrDetailNavigation } from "./PrDetailNavigation";
@@ -228,7 +229,7 @@ export function PrDetailView({
   // what lets the real view render immediately; the spinner branch below
   // is now only for a pull request with no cached row to seed from.
   const {
-    data: pr,
+    data: primary,
     isLoading,
     isPlaceholderData,
     isFetching,
@@ -236,6 +237,11 @@ export function PrDetailView({
     error,
     refetch,
   } = usePrDetail(repo, number);
+  const matchingFull = primary && !isPlaceholderData && primary.repo === repo && primary.number === number && !!primary.head_oid && !!primary.base_ref;
+  const ancestry = useReadyStacks(matchingFull ? [primary] : [], undefined, !!matchingFull);
+  const measuredStack = matchingFull ? ancestry.of(primary) : undefined;
+  const pr = primary ? { ...primary, stack: measuredStack ?? { kind: "unknown" as const } } : undefined;
+  const incompleteChecks = pr?.checks_coverage && pr.checks_coverage.state !== "complete";
   const deleteBranch = useDeleteHeadBranch();
   const review = useReviewPr();
   const comment = useCommentOnPr();
@@ -419,7 +425,7 @@ export function PrDetailView({
           Won't count toward merging
         </span>
       ) : null}
-      {!isError && <PrActions pr={pr} compact conversations={gate.mergeBlocked} />}
+      {!isError && <PrActions pr={pr} requireStackEvidence compact conversations={gate.mergeBlocked} />}
       {/* Claudify (#1455), which replaced "Copy for agent", pinned here
           since #1580: it sat at the very bottom, below every comment,
           so reaching it on a long pull request meant scrolling the whole
@@ -594,7 +600,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      {!isError && <PrActions pr={pr} conversations={gate.mergeBlocked} />}
+      {!isError && <PrActions pr={pr} requireStackEvidence conversations={gate.mergeBlocked} />}
 
       {/* Available on EVERY pull request, not only the review queue.
           Gating this on which list you arrived from would mean the same
@@ -635,7 +641,7 @@ export function PrDetailView({
         <p className="text-sm text-[#8b949e]">No description.</p>
       )}
 
-      {pr.checks.length > 0 ? (
+      {pr.checks.length > 0 || incompleteChecks ? (
         // COLLAPSED when everything passed. A wall of twenty green
         // check rows is the single largest block on a healthy pull
         // request and tells you nothing you did not already learn from
@@ -649,7 +655,7 @@ export function PrDetailView({
           // 112 contexts is the one case where the collapsed "everything
           // passed" summary is the least trustworthy (#790).
           defaultOpen={
-            pr.checks.some((c) => c.state !== "success") || pr.checks_total > pr.checks.length
+            !!incompleteChecks || pr.checks.some((c) => c.state !== "success") || pr.checks_total > pr.checks.length
           }
           // Offered only when something FAILED and that failure belongs
           // to an Actions workflow run. A status context and a
@@ -701,7 +707,13 @@ export function PrDetailView({
               length: the two numbers come from different pages of a
               rollup that can grow mid-fetch, so the total can legitimately
               be the smaller one and that is not a shortfall. */}
-          {pr.checks_total > pr.checks.length ? (
+          {incompleteChecks ? (
+            <p className="text-xs text-[#8b949e]">
+              {pr.checks_coverage?.total != null
+                ? `Showing ${pr.checks.length} of ${pr.checks_coverage.total} checks. Remaining checks could not be confirmed.`
+                : `${pr.checks.length} checks loaded; remaining checks could not be confirmed.`}
+            </p>
+          ) : pr.checks_total > pr.checks.length ? (
             <p className="px-2 py-1.5 text-xs text-[#d29922]">
               Showing {pr.checks.length} of {pr.checks_total} checks. A failure could be among
               the rest — see them on GitHub.

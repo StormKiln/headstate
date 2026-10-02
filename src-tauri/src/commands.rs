@@ -10,7 +10,7 @@ pub async fn save_markdown(
     crate::markdown_export::save_markdown(window, markdown).await
 }
 
-use crate::github::client::{ClientError, GitHubClient};
+use crate::github::client::GitHubClient;
 use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
 };
@@ -1196,15 +1196,16 @@ pub async fn get_pr_detail(
     crate::diag!("[diag] cmd get_pr_detail start");
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let out = match tokio::time::timeout(
+    // The scoped client owns one deadline and can return completed check pages
+    // when a continuation expires; an outer timeout would discard that progress.
+    let client = client.with_read_context(crate::github::admission::ReadContext::new(
+        crate::github::admission::ReadClass::Foreground,
         crate::poll::FETCH_TIMEOUT,
-        client.fetch_pr_detail(&repo, number),
-    )
-    .await
-    {
-        Ok(res) => res.map_err(|e| e.to_string()),
-        Err(_) => Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs()).to_string()),
-    };
+    ));
+    let out = client
+        .fetch_pr_detail(&repo, number)
+        .await
+        .map_err(|e| e.to_string());
     crate::diag!(
         "[diag] cmd get_pr_detail end {}ms {}",
         started.elapsed().as_millis(),

@@ -459,6 +459,19 @@ pub struct ReviewerVerdict {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksState {
+    Complete,
+    Partial,
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksCoverage {
+    pub state: ChecksState,
+    pub total: Option<u64>,
+}
+
 /// Everything the detail view renders.
 ///
 /// A separate type from `PullRequest`: that one is a LIST row fetched 100
@@ -593,7 +606,7 @@ pub struct PrDetail {
     /// Paired with `checks` the way `comment_count` is paired with
     /// `comments`, and for the same reason: the panel renders what
     /// arrived and annotates the gap rather than presenting a subset as
-    /// complete. `append_remaining_checks` explains why this matters
+    /// complete. Explicit checks coverage qualifies modern partial results
     /// more here than for comments -- a short check list reads as a
     /// green pull request.
     ///
@@ -604,6 +617,8 @@ pub struct PrDetail {
     /// `poll::truncation_payload` takes with `issueCount`.
     #[serde(default)]
     pub checks_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_coverage: Option<ChecksCoverage>,
     /// Where this pull request sits in a stack, asked of GitHub directly
     /// rather than inferred from whatever the list happens to hold (#1452).
     ///

@@ -106,9 +106,11 @@ const LABEL: Record<PrActionName, string> = {
 export function PrActions({
   pr,
   compact = false,
+  requireStackEvidence = false,
   conversations = null,
 }: {
   pr: PrDetail;
+  requireStackEvidence?: boolean;
   /// Why merge and enqueue must wait on conversations, from the base
   /// branch's rules (#1454), or null when nothing is known to require it.
   conversations?: string | null;
@@ -207,7 +209,9 @@ export function PrActions({
   return (
     <div className="flex flex-wrap items-center gap-2">
       {offered.map((action) => {
-        const why = unavailable(pr, action, conversations);
+        const why = requireStackEvidence && (!pr.stack || pr.stack.kind === "unknown") && (action === "merge" || action === "enqueue")
+          ? "Stack membership could not be confirmed. Check this pull request on GitHub."
+          : unavailable(pr, action, conversations);
         const primary = action === primaryMerge && action !== "dequeue";
         // Closing a pull request is destructive and irreversible from
         // here (`inverseOf` deliberately gives close no undo), so it is

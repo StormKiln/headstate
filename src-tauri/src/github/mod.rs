@@ -17,3 +17,5 @@ pub mod admission;
 mod read_transport;
 
 pub(crate) mod scan;
+
+mod detail_checks;

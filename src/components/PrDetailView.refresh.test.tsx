@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PrDetail, PullRequest } from "@/types/pr";
@@ -44,6 +44,7 @@ beforeEach(() => {
   stubViewport(1200);
   invoke.mockImplementation(async (name, args) => {
     if (name === "get_viewer") return "reviewer";
+    if (name === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } }));
     if (name === "get_pr_detail") {
       reads++;
       if (fail) throw new Error("Synthetic refresh unavailable");
@@ -162,4 +163,149 @@ it("ignores a delayed failed refresh after switching to another PR", async () =>
   expect(screen.getByText("Retained description 8")).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(screen.queryByText("Retained description 7")).toBeNull();
+});
+
+it("keeps zero-row unknown checks visible without inventing a complete empty result", async () => {
+  const unknown = { ...detail(), checks: [], checks_total: 0, checks_coverage: { state: "unknown", total: null } };
+  invoke.mockImplementation(async (name) => name === "get_pr_detail" ? unknown : name === "get_viewer" ? "reviewer" : []);
+  mount();
+  await screen.findByText("Retained description 7");
+  expect(screen.getByText(/remaining checks could not be confirmed/i)).toBeTruthy();
+});
+
+it("owns selected ancestry after primary renders and blocks ordinary merge while unknown", async () => {
+  let finish!: (value: unknown) => void;
+  invoke.mockImplementation((name, args) => {
+    if (name === "get_pr_detail") return Promise.resolve({ ...detail(), stack: { kind: "unknown" } });
+    if (name === "get_viewer") return Promise.resolve("reviewer");
+    if (name === "get_ready_stacks") return new Promise(resolve => { finish = () => resolve((args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } }))); });
+    return Promise.resolve(null);
+  });
+  mount(); await loaded();
+  for (const button of screen.getAllByRole("button", { name: /^Merge$/ })) expect(button.matches(":disabled")).toBe(true);
+  await waitFor(() => expect(finish).toBeDefined());
+  await act(async () => { finish(null); });
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Merge$/ }).every(b => !b.matches(":disabled"))).toBe(true));
+  expect(invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(1);
+});
+
+
+it.each([1, 2])("routes actual selected-detail native stack size %s through StackMerge at both widths", async size => {
+  const stack = { kind: "stacked", native: true, stack_number: 3, position: size, size, position_exact: true, size_exact: true, below: size === 1 ? null : 6,
+    members_complete: true, members: Array.from({ length: size }, (_, i) => ({ position: i + 1, number: 8 - size + i, title: "Synthetic layer", state: "open" })) };
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_pr_detail") return { ...detail(), stack: { kind: "unknown" } };
+    if (name === "get_viewer") return "reviewer";
+    if (name === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack }));
+    if (name === "merge_stack") return { kind: "enqueued" };
+    return null;
+  });
+  stubViewport(size === 1 ? 390 : 1200);
+  mount(); await loaded();
+  await screen.findAllByText(new RegExp(`stack ${size}/${size}`));
+  const buttons = await screen.findAllByRole("button", { name: size === 1 ? /^Merge$/ : /Merge 2 pull requests…/ });
+  if (size === 1) expect(buttons.length).toBeGreaterThanOrEqual(2);
+  else {
+    expect(buttons).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /^Merge$/ }).every(b => b.matches(":disabled"))).toBe(true);
+  }
+  expect(buttons.every(b => !b.matches(":disabled"))).toBe(true);
+  fireEvent.click(buttons[0]);
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: `Merge ${size} pull request${size === 1 ? "" : "s"}` }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("merge_stack", expect.objectContaining({ expectedHead: "head-7" })));
+  expect(invoke.mock.calls.some(([name]) => name === "act_on_pr")).toBe(false);
+});
+
+it("does not attach an old-head advisory response after the displayed head changes", async () => {
+  let finish!: () => void;
+  invoke.mockImplementation((name, args) => {
+    if (name === "get_viewer") return Promise.resolve("reviewer");
+    if (name === "get_pr_detail") return Promise.resolve({ ...detail(), stack: { kind: "unknown" } });
+    if (name === "get_ready_stacks") return new Promise(resolve => { finish = () => resolve((args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } }))); });
+    return Promise.resolve(null);
+  });
+  mount(); await loaded(); await waitFor(() => expect(finish).toBeDefined());
+  const old = finish;
+  await act(async () => { qc.setQueryData(key, { ...detail(), head_oid: "new-head", stack: { kind: "unknown" } }); });
+  await act(async () => old());
+  for (const b of screen.getAllByRole("button", { name: /^Merge$/ })) expect(b.matches(":disabled")).toBe(true);
+});
+
+
+it("accepts legacy detail wire replies and validates optional coverage without coercion", async () => {
+  const { assertRemoteReply } = await import("@/api/wireContract");
+  expect(() => assertRemoteReply("get_pr_detail", detail())).not.toThrow();
+  for (const state of ["complete", "partial", "unknown"]) {
+    expect(() => assertRemoteReply("get_pr_detail", { ...detail(), checks_coverage: { state, total: state === "unknown" ? null : 2 } })).not.toThrow();
+  }
+  for (const checks_coverage of [{ state: "assumed", total: 0 }, { state: "partial" }, { state: "unknown", total: "private value" }]) {
+    expect(() => assertRemoteReply("get_pr_detail", { ...detail(), checks_coverage })).toThrow(/checks_coverage/);
+  }
+});
+
+it("shows a partial green subset as incomplete while preserving an authoritative clean merge verdict", async () => {
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_viewer") return "reviewer";
+    if (name === "get_pr_detail") return { ...detail(), checks: [{ name: "Observed passing check", state: "success", url: "", run_id: null }], checks_total: 5, checks_coverage: { state: "partial", total: 5 } };
+    if (name === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } }));
+    return null;
+  });
+  mount();
+  await screen.findByText("Observed passing check");
+  expect(screen.getByText(/Showing 1 of 5 checks.*could not be confirmed/)).toBeTruthy();
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Merge$/ }).every(b => !b.matches(":disabled"))).toBe(true));
+});
+
+it("does not schedule selected ancestry from placeholders or hidden full detail", async () => {
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+  let finish!: (value: PrDetail) => void;
+  qc.setQueryData(["prs"], [detail() as unknown as PullRequest]);
+  invoke.mockImplementation((name, args) => {
+    if (name === "get_viewer") return Promise.resolve("reviewer");
+    if (name === "get_pr_detail") return new Promise(resolve => { finish = resolve; });
+    if (name === "get_ready_stacks") return Promise.resolve((args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } })));
+    return Promise.resolve(null);
+  });
+  const view = mount();
+  await waitFor(() => expect(finish).toBeDefined());
+  expect(invoke.mock.calls.some(([name]) => name === "get_ready_stacks")).toBe(false);
+  await act(async () => finish(detail()));
+  await loaded();
+  expect(invoke.mock.calls.some(([name]) => name === "get_ready_stacks")).toBe(false);
+  visibility.mockReturnValue("visible");
+  await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+  await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "get_ready_stacks")).toHaveLength(1));
+  view.unmount(); visibility.mockRestore();
+});
+
+it("does not renew an aged native stack receipt after a delayed advisory reply", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_viewer") return "reviewer";
+    if (name === "get_pr_detail") return { ...detail(), stack: { kind: "none" } };
+    if (name === "get_ready_stacks") {
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+      return (args?.rows as object[]).map(row => ({ ...row, stack: { kind: "none" }, valid_for_ms: 5_000 }));
+    }
+    return null;
+  });
+  mount(); await loaded();
+  await act(async () => { await vi.advanceTimersByTimeAsync(3_050); });
+  expect(screen.getAllByRole("button", { name: /^Merge$/ }).every(b => !b.matches(":disabled"))).toBe(true);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_050); });
+  expect(screen.getAllByRole("button", { name: /^Merge$/ }).every(b => b.matches(":disabled"))).toBe(true);
+  expect(invoke.mock.calls.filter(([name]) => name === "get_ready_stacks")).toHaveLength(1);
+});
+
+it("keeps ancestry unknown when a legacy advisory reply has no verifiable lifetime", async () => {
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_viewer") return "reviewer";
+    if (name === "get_pr_detail") return { ...detail(), stack: { kind: "none" } };
+    if (name === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, stack: { kind: "none" } }));
+    return null;
+  });
+  mount(); await loaded();
+  await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "get_ready_stacks")).toHaveLength(1));
+  for (const button of screen.getAllByRole("button", { name: /^Merge$/ })) expect(button.matches(":disabled")).toBe(true);
+  expect(screen.getByRole("link", { name: "GitHub" })).toBeTruthy();
 });

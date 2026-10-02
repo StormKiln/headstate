@@ -206,6 +206,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
             .as_u64()
             .unwrap_or(checks.len() as u64),
         checks,
+        checks_coverage: None,
         // Not in this document: `fetch_pr_detail` fills it from its own
         // lookup (#1452). Unknown until then, never "not stacked".
         stack: PrStack::Unknown,

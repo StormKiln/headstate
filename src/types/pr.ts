@@ -751,6 +751,7 @@ export interface PrDetail {
   /// mid-fetch, so a total BELOW the length is possible and is not a
   /// negative shortfall.
   checks_total: number;
+  checks_coverage?: { state: "complete" | "partial" | "unknown"; total: number | null };
   /// Where this pull request sits in a stack, asked of GitHub directly
   /// (#1452) rather than inferred from the rows on screen.
   ///

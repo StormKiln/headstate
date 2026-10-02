@@ -1,3 +1,4 @@
+vi.mock("@/api/useReadyStacks", () => ({ useReadyStacks: () => ({ of: (pr: PrDetail) => pr.stack }) }));
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrDetail } from "@/types/pr";
