@@ -361,6 +361,8 @@ export function readyToQueue(pr: PullRequest): boolean {
 /// this section is what is still WAITING.
 export function readyForReview(pr: PullRequest): boolean {
   return (
+    !pr.observation?.unknown_fields.length &&
+    !pr.observation?.confirmed_review &&
     !pr.is_draft &&
     (pr.ci === "success" || pr.ci === "none") &&
     pr.merge !== "conflicted" &&

@@ -27,8 +27,9 @@ export function receiptAdvisory(snapshot: Snapshot, kind: "total" | "missing"): 
   if (coverage === undefined || prs === undefined) return undefined;
   if (coverage === "complete") return 0;
   const total = typeof coverage === "object" && coverage !== null ? coverage.partial.total : null;
-  if (total === null || total <= prs.length) return null;
-  return kind === "total" ? total : total - prs.length;
+  const observed = prs.filter((pr) => pr.observation?.state !== "retained").length;
+  if (total === null || total <= observed) return null;
+  return kind === "total" ? total : total - observed;
 }
 
 /// Reconcile the command and event connections independently. Provider outcomes

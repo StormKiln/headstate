@@ -1,3 +1,4 @@
+import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -39,9 +40,6 @@ import type {
   NetProcess,
   PrDetail,
   PullRequest,
-  PusherAsk,
-  RowPusher,
-  ReviewState,
   Upstream,
   Venv,
   Worktree,
@@ -67,7 +65,6 @@ import { createCoalescer } from "@/lib/coalesce";
 import { createLimiter, withDeadline } from "@/lib/limiter";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { matchPrLinks, parsePrQuery, type PrQuery } from "@/lib/claudePrs";
-import { readyPusher, type ReadyPusher, type ViewerLogin } from "@/lib/readyPusher";
 import {
   toolVersions,
   readLogTail,
@@ -110,7 +107,6 @@ import {
   mergeStack,
   getPrDetail,
   getReviewGates,
-  getReadyPushers,
   getWorktreeDirs,
   classifyRepoUpstream,
   classifyWorktrees,
@@ -187,7 +183,6 @@ import {
   setPollInterval,
   setViewNeedsGithub,
   setWorktreeDirs,
-  reviewPr,
   commentOnPr,
   replyToThread,
   resolveThread,
@@ -641,26 +636,6 @@ export const REVIEW_STATE: Partial<Record<ReviewVerdictName, string>> = {
   request_changes: "CHANGES_REQUESTED",
 };
 
-/// The same verdict in the LIST row's vocabulary.
-///
-/// `PullRequest.review` is a lowercase `ReviewState`, not the uppercase
-/// GraphQL string `latest_reviews` carries, so this cannot reuse
-/// `REVIEW_STATE`. Both maps omit `comment` for the same reason: a
-/// COMMENT review changes no verdict, and writing one would invent a
-/// state change that did not happen.
-///
-/// Note this sets the pull request's AGGREGATE verdict from the
-/// viewer's own, which is exact for `approve` on the surface that
-/// motivated it -- `readyForReview` drops a row the moment `review` is
-/// `approved`, and one approval is what produces that -- and is at
-/// worst redundant for `request_changes`, where the aggregate was
-/// already blocked or is now correctly blocked. The refresh that
-/// follows overwrites it either way.
-const REVIEW_ROW_STATE: Partial<Record<ReviewVerdictName, ReviewState>> = {
-  approve: "approved",
-  request_changes: "changes_requested",
-};
-
 /// `detail` with the viewer's own review replaced by `state`.
 ///
 /// Pure and non-mutating: React Query compares by reference, and editing
@@ -707,14 +682,17 @@ async function mergeFieldsAfterReview(
     prev ? { ...prev, merge_status: "unknown" } : prev,
   );
   try {
-    const fresh = await getPrDetail(repo, number);
-    if (pending.get(key) !== generation) return;
+    const accountGeneration = reviewAccountGeneration(qc);
+    const readGeneration = reviewReadGeneration(qc);
+    const fresh = reconcileReviewDetail(qc, await getPrDetail(repo, number), readGeneration);
+    if (pending.get(key) !== generation || reviewAccountGeneration(qc) !== accountGeneration) return;
     qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
       prev === undefined || prev.latest_reviews !== before?.latest_reviews
         || prev.head_oid !== before?.head_oid || fresh.head_oid !== before?.head_oid
         ? prev
         : {
             ...prev,
+            latest_reviews: fresh.latest_reviews,
             merge_status: fresh.merge_status,
             merge_queue_enabled: fresh.merge_queue_enabled,
             in_merge_queue: fresh.in_merge_queue,
@@ -740,106 +718,33 @@ async function mergeFieldsAfterReview(
 /// user is standing on when they do this.
 export function useReviewPr() {
   const qc = useQueryClient();
-  return (
-    id: string,
-    repo: string,
-    number: number,
-    verdict: ReviewVerdictName,
-    body: string,
-  ) =>
-    reviewPr(id, repo, number, verdict, body).then(async () => {
-      // A pre-write read must not publish over the verified verdict.
-      await qc.cancelQueries({ queryKey: ["pr-detail", repo, number], exact: true });
-      void qc.invalidateQueries({ queryKey: ["reviewing"] });
-      // Write the verdict we KNOW landed straight into the cache, before
-      // asking GitHub anything.
-      //
-      // `latestReviews` lags `addPullRequestReview`: for a second or two
-      // afterwards GitHub still returns the pre-approval review set. The
-      // refetch below can land inside that window, and `staleTime` means
-      // nothing asks again -- so the button reverted to "Approve" for an
-      // approval that had succeeded, which reads as "the click did
-      // nothing" and invites a second review.
-      //
-      // The mutation already verified the outcome (it rejects a PENDING
-      // review), so this is not optimism about whether it worked. It is
-      // the authoritative answer, applied while GitHub's read side
-      // catches up. The refetch that follows overwrites it either way.
-      // From the cache rather than a hook argument: `useViewer` has
-      // `staleTime: Infinity` and is fetched once at launch, so by the
-      // time anyone can click Approve it is populated. Undefined means we
-      // genuinely could not ask, and then the seed is skipped rather than
-      // attributed to the wrong person.
-      const viewer = qc.getQueryData<string>(["viewer"]);
-      const state = REVIEW_STATE[verdict];
-      if (state !== undefined && viewer !== undefined) {
-        qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
-          prev === undefined ? prev : withOwnReview(prev, viewer, state),
-        );
+  return async (id: string, repo: string, number: number, verdict: ReviewVerdictName, body: string, expectedHead?: string, expectedViewer?: string) => {
+    const before = qc.getQueryData<PrDetail>(["pr-detail", repo, number]);
+    const viewer = qc.getQueryData<string>(["viewer"]);
+    const outcome = await submitBoundReview(qc, { id, repo, number, verdict, body,
+      expected_head: expectedHead ?? before?.head_oid ?? "", expected_viewer: expectedViewer ?? viewer ?? "" });
+    if (outcome.outcome !== "acknowledged") throw new Error(outcome.message);
+    await qc.cancelQueries({ queryKey: ["pr-detail", repo, number], exact: true });
+    qc.setQueryData<PrDetail>(["pr-detail", repo, number], prev => prev ? reconcileReviewDetail(qc, prev) : prev);
+    const receipt = outcome.receipt;
+    if (receipt.state === "APPROVED" || receipt.state === "CHANGES_REQUESTED") {
+      for (const key of LIST_KEYS) {
+        const apply = (rows: PullRequest[]) => rows.map(row => row.repo === repo && row.number === number && row.head_oid === receipt.commit_oid ? {
+          ...row, observation: {
+            ...(row.observation ?? { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] }),
+            confirmed_review: { head_oid: receipt.commit_oid, review: receipt.state === "APPROVED" ? "approved" as const : "changes_requested" as const,
+              confirmed_at: new Date().toISOString(), receipt },
+          },
+        } : row);
+        const patched = patchSourceRows(qc, key[0] === "prs" ? "authored" : "reviewing", apply);
+        qc.setQueryData<PullRequest[]>(key, rows => patched ?? (rows ? apply(rows) : rows));
       }
-      // The LIST row's half of the same seed (#1276).
-      //
-      // Without this, approving a pull request left it sitting in
-      // "Ready for review" -- `readyForReview` tests `pr.review`, the
-      // detail seed above never touches the list, and the two refreshes
-      // below are whole-account searches. The user went "Back to list"
-      // to find the row they had just handled still there, which is the
-      // re-scanning the issue describes.
-      //
-      // No viewer check, unlike the seed above. That one attributes a
-      // review to a NAMED author and must not guess who; this one sets
-      // an aggregate verdict that does not name anyone, so a failed
-      // `useViewer` is not a reason to leave the list wrong.
-      const rowState = REVIEW_ROW_STATE[verdict];
-      if (rowState !== undefined) patchListRows(qc, repo, number, { review: rowState });
-      // The REVIEW is not refetched here, and that is deliberate.
-      //
-      // The seed above writes the verdict we know landed. Immediately
-      // awaiting a refetch of THE SAME KEY replaced it with GitHub's
-      // pre-approval review set -- inside the exact lag window the seed
-      // exists to cover. So the button reverted to "Approve" for an
-      // approval that had succeeded, and only corrected itself when
-      // something else refetched later: clicking Merge, or leaving the
-      // PR and coming back.
-      //
-      // The seed is authoritative rather than optimistic (the mutation
-      // rejects a PENDING review), so there is nothing to confirm.
-      //
-      // But MERGEABILITY is a different field with the opposite
-      // problem, and leaving it alone was a bug (#699). An approval is
-      // exactly what makes a pull request mergeable, or auto-merge
-      // enqueue it -- so `merge_status` and `in_merge_queue` are stale
-      // the instant the review lands, and nothing was re-reading them:
-      //
-      // - a queue-enabled PR still showed "Add to merge queue" for a
-      //   pull request GitHub had already queued, and clicking it got
-      //   an "already in the merge queue" error;
-      // - a PR that became mergeable kept a disabled Merge button, so
-      //   the user had to finish the job on github.com.
-      //
-      // `usePrDetail` polls while `merge_status` is `unknown`, but that
-      // could never fix this: the stale value is not `unknown`, it is
-      // the PRE-approval verdict (`blocked`), which looks like a
-      // settled answer. Something has to ask again once, and the poller
-      // takes over from there if GitHub is still recomputing.
-      //
-      // `mergeFieldsAfterReview` re-reads the one pull request and
-      // copies ONLY those fields over, so the seeded verdict survives.
-      // Reconciliation must not hold the verified review pending (#1599).
-      void mergeFieldsAfterReview(qc, repo, number);
-      // NOT awaited: the whole-world list refresh.
-      //
-      // `refreshPrs` calls `refresh_now`, which searches EVERY watched
-      // repository. Awaiting it meant approving one pull request took
-      // ~20s to register in the UI while the write itself had landed on
-      // GitHub instantly -- the click looked ignored, and re-clicking
-      // was the natural response.
-      //
-      // The list still updates: this runs, and the Rust side wakes the
-      // poll loop on success besides. It just no longer stands between
-      // the user and the button they pressed.
-      void refreshPrs(qc);
-    });
+    }
+    void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    void mergeFieldsAfterReview(qc, repo, number);
+    void refreshPrs(qc);
+    return outcome.receipt;
+  };
 }
 
 /// Comment on a pull request.
@@ -2636,6 +2541,8 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
   const polling = useMemo(() => new DetailPollBackoff(), [repo, number]);
   return useQuery({
     queryKey: ["pr-detail", repo, number],
+    // Observer option updates must preserve the query-owned confirmed review fact.
+    meta: qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true })?.meta ?? {},
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). `timeCall` rather
     // than `timed`, because the query function closes over per-render
     // arguments and so cannot be hoisted to module scope -- see
@@ -2643,7 +2550,13 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // RENDER: the Rust side's `[diag] cmd get_pr_detail` pair brackets
     // the fetch, and the gap between the two is React's (#790).
     queryFn: () =>
-      timeCall(`pr-detail`, () => getPrDetail(repo as string, number as number)),
+      timeCall(`pr-detail`, async () => {
+        const generation = reviewReadGeneration(qc);
+        const accountGeneration = reviewAccountGeneration(qc);
+        const fresh = await getPrDetail(repo as string, number as number);
+        if (reviewAccountGeneration(qc) !== accountGeneration) throw new Error("The GitHub account changed; reload this pull request.");
+        return reconcileReviewDetail(qc, fresh, generation);
+      }),
     enabled: Boolean(repo && number),
     staleTime: 30_000,
     // Evaluated on every render, which is what makes it work: the row
@@ -2719,66 +2632,7 @@ export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean)
   });
 }
 
-/// Re-ask while any row is undecided -- declined past the budget or the
-/// per-refresh cap, or unknown because the activity log lagged a push.
-/// Known answers are cached by head commit on the desktop, so a re-ask
-/// spends only on the rows still open.
-const READY_PUSHERS_RETRY_MS = 120_000;
-
-/// Who pushed each Ready for review row's head, and each base's
-/// last-push rule (#1576).
-///
-/// `of(pr)` is the seam: the strip's tag and filter read it, and so can
-/// anything else on the strip that needs the pusher (a batch action's
-/// prompt list, say). It returns `readyPusher`'s states, so a caller
-/// cannot mistake "not checked" for "someone else pushed".
-///
-/// One query for the whole strip, keyed by every row's head commit in
-/// the strip's order: the desktop answers the top rows first when it
-/// caps a refresh. The previous answer is kept while a new key loads,
-/// and `readyPusher` drops any answer whose head commit no longer
-/// matches, so a moved branch reads as not checked rather than as its
-/// old pusher.
-export function useReadyPushers(prs: PullRequest[]) {
-  const asks: PusherAsk[] = prs.map((pr) => ({
-    repo: pr.repo,
-    number: pr.number,
-    base: pr.base_ref,
-    head_repo: pr.head_repo ?? null,
-    head_ref: pr.head_ref,
-    head_oid: pr.head_oid,
-  }));
-  const key = asks.map((a) => `${a.repo}#${a.number}@${a.head_oid}`).join(",");
-  const viewerQ = useViewer();
-  const q = useQuery({
-    queryKey: ["ready-pushers", key],
-    queryFn: () => getReadyPushers(asks),
-    enabled: asks.length > 0,
-    staleTime: 60_000,
-    placeholderData: (prev) => prev,
-    retry: 0,
-    refetchInterval: (query) =>
-      (query.state.data ?? []).some(
-        (r) => r.last_pusher.state === "declined" || r.last_pusher.state === "unknown",
-      )
-        ? READY_PUSHERS_RETRY_MS
-        : false,
-  });
-  const byRow = useMemo(() => {
-    const m = new Map<string, RowPusher>();
-    for (const r of q.data ?? []) m.set(`${r.repo}#${r.number}`, r);
-    return m;
-  }, [q.data]);
-  // `undefined` while loading, `null` once it has failed: the second is
-  // "could not tell", the first "not checked yet".
-  const viewer: ViewerLogin = viewerQ.isError ? null : viewerQ.data;
-  const of = useCallback(
-    (pr: PullRequest): ReadyPusher =>
-      readyPusher(pr, byRow.get(`${pr.repo}#${pr.number}`), viewer),
-    [byRow, viewer],
-  );
-  return { of, isPending: q.isPending && asks.length > 0 };
-}
+export { useReadyPushers } from "./useReadyPushers";
 
 /// Repos with worktrees. Listing only -- see `useWorktreeSafety`.
 ///

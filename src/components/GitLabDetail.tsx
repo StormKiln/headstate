@@ -1,3 +1,4 @@
+import { commandError } from "../lib/errorKind";
 import { useWritesPaused } from "../lib/useWritesPaused";
 import { useGitLabViewer } from "../api/authAvailability";
 import { useState } from "react";
@@ -72,8 +73,9 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
       setUncertain(result.outcome === "unverified");
       if (result.outcome === "verified" && request.action === "comment") setComment("");
     } catch (e) {
-      setError(`${String(e)} Refresh the MR before trying again.`);
-      setUncertain(true);
+      const failure = commandError(e);
+      setError(failure.kind === "not-asked" ? failure.message : `${failure.message} Refresh the MR before trying again.`);
+      setUncertain(failure.kind !== "not-asked");
     } finally {
       setBusy(false);
     }

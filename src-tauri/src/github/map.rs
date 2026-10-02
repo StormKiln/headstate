@@ -177,6 +177,12 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
                 Some(ReviewerVerdict {
                     author: r["author"]["login"].as_str()?.to_string(),
                     state: r["state"].as_str()?.to_string(),
+                    id: r["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                    submitted_at: r["submittedAt"].as_str().and_then(|s| s.parse().ok()),
+                    commit_oid: r["commit"]["oid"].as_str().map(str::to_owned),
                 })
             })
             .collect(),
@@ -206,6 +212,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
             .as_u64()
             .unwrap_or(checks.len() as u64),
         checks,
+        checks_coverage: None,
         // Not in this document: `fetch_pr_detail` fills it from its own
         // lookup (#1452). Unknown until then, never "not stacked".
         stack: PrStack::Unknown,
@@ -297,6 +304,12 @@ fn latest_reviews(node: &Value) -> Vec<ReviewerVerdict> {
                     Some(ReviewerVerdict {
                         author: r["author"]["login"].as_str()?.to_string(),
                         state: r["state"].as_str()?.to_string(),
+                        id: r["id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned),
+                        submitted_at: r["submittedAt"].as_str().and_then(|s| s.parse().ok()),
+                        commit_oid: r["commit"]["oid"].as_str().map(str::to_owned),
                     })
                 })
                 .collect()
@@ -547,6 +560,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
     let is_draft = node["isDraft"].as_bool().unwrap_or(false);
 
     Some(PullRequest {
+        observation: Some(crate::inventory::github_observation(node, false)),
         source: Default::default(),
         id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
@@ -612,7 +626,15 @@ pub fn map_list(v: &Value, alias: &str) -> Vec<PullRequest> {
     v[alias]["nodes"]
         .as_array()
         .map(|a| {
-            let mapped: Vec<PullRequest> = a.iter().filter_map(map_node).collect();
+            let partial = v["__readiness_unknown"] == true;
+            let mapped: Vec<PullRequest> = a
+                .iter()
+                .filter_map(|node| {
+                    let mut row = map_node(node)?;
+                    row.observation = Some(crate::inventory::github_observation(node, partial));
+                    Some(row)
+                })
+                .collect();
             // Dropping a node is SILENT and it is how a refused field
             // empties a list: GitHub nulls the fields it could not
             // compute, `map_node` requires title/url/repository, and

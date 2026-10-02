@@ -237,19 +237,29 @@ async fn preferences(app: &AppHandle) -> NotifyPrefs {
 }
 
 async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &FetchedList) {
+    if result.scan.is_some() {
+        return;
+    }
     let saved = match app.path().app_data_dir() {
         Ok(dir) => {
             let source = source.clone();
             let receipt = result.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let conn = open_db(&dir.join("headstate.db"))?;
-                crate::store::source_cache::save_gitlab_snapshot(
-                    &conn,
-                    &source,
-                    list,
-                    &receipt.mrs,
-                    &receipt.coverage,
-                )
+                let save = || {
+                    crate::store::source_cache::save_owned_gitlab_snapshot(
+                        &conn,
+                        &source,
+                        list,
+                        &receipt.mrs,
+                        &receipt.coverage,
+                        receipt.viewer.as_deref(),
+                    )
+                };
+                match &receipt.session {
+                    Some(owner) => owner.with_current(save).unwrap_or(Ok(())),
+                    None => save(),
+                }
             })
             .await
             .is_ok_and(|result| result.is_ok())
@@ -272,15 +282,35 @@ async fn fetch_and_persist(
     let attempt = source_poll::begin(app, source.clone(), list).await;
     // The accumulating loader enforces FETCH_TIMEOUT itself. Wrapping it in
     // timeout/select would throw away pages that already arrived.
-    match queues::fetch(source, list, |receipt| async {
-        if let Some(publication) = source_poll::success_publication(app, &attempt).await {
-            source_poll::complete_gitlab(app, publication, Ok(receipt));
-        }
-    })
+    match queues::fetch(
+        source,
+        list,
+        &crate::commands::db_path(app),
+        |receipt| async {
+            if let Some(publication) = source_poll::success_publication(app, &attempt).await {
+                match source_poll::reconcile_gitlab(app, &publication, receipt).await {
+                    Ok(receipt) => {
+                        persist(app, source, list, &receipt).await;
+                        source_poll::complete_gitlab(app, publication, Ok(receipt));
+                        return true;
+                    }
+                    Err(error) => source_poll::complete_gitlab(app, publication, Err(error)),
+                }
+            }
+            false
+        },
+    )
     .await
     {
         Ok(receipt) => {
             let publication = source_poll::success_publication(app, &attempt).await?;
+            let receipt = match source_poll::reconcile_gitlab(app, &publication, receipt).await {
+                Ok(r) => r,
+                Err(error) => {
+                    source_poll::complete_gitlab(app, publication, Err(error));
+                    return None;
+                }
+            };
             persist(app, source, list, &receipt).await;
             Some((publication, receipt))
         }
@@ -328,10 +358,17 @@ async fn poll_queue(
     else {
         return;
     };
-    if control.is_current(selection) {
-        for notice in baseline.observe(source, list, &receipt) {
-            notify(app, notice, &prefs);
+    let mut publish_notices = || {
+        if control.is_current(selection) {
+            for notice in baseline.observe(source, list, &receipt) {
+                notify(app, notice, &prefs);
+            }
         }
+    };
+    if let Some(session) = &receipt.session {
+        session.with_current(publish_notices);
+    } else {
+        publish_notices();
     }
     // The permit holds until both the persisted receipt and terminal
     // event are published. Newer foreground successes win atomically.
@@ -419,6 +456,8 @@ mod tests {
 
     fn receipt(mrs: Vec<MergeRequest>, coverage: Coverage) -> FetchedList {
         FetchedList {
+            session: None,
+            scan: None,
             viewer: Some("fixture-account".into()),
             total: matches!(coverage, Coverage::Complete).then_some(mrs.len() as u64),
             mrs,

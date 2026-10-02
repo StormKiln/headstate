@@ -19,6 +19,7 @@ pub mod identity;
 /// here so `cargo test` compiles it.
 #[cfg(test)]
 mod invariants;
+pub mod inventory;
 mod markdown_export;
 mod notification_navigation;
 pub mod packages;
@@ -337,6 +338,7 @@ pub fn run() {
             commands::get_notify_prefs,
             commands::set_notify_prefs,
             commands::review_pr,
+            commands::review_pr_at_head,
             commands::comment_on_pr,
             commands::scan_artifacts,
             commands::read_cached_scan,
@@ -1313,3 +1315,5 @@ mod tests {
         assert_eq!(*window.calls.borrow(), ["show", "unminimize", "set_focus"]);
     }
 }
+
+pub mod queue_scan;

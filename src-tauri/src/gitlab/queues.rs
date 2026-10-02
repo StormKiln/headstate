@@ -1,5 +1,6 @@
 //! Bounded GitLab merge-request lists. `glab` owns credentials; neither
 //! the credential nor raw CLI diagnostics leave this module.
+mod scan;
 use crate::{
     github::model::{CiState, Label, ReviewState},
     identity::{PrIdentity, Provider, Source},
@@ -8,9 +9,10 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 const PAGE_SIZE: usize = 100;
+#[cfg(all(test, unix))]
 const MAX_PAGES: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,6 +33,8 @@ pub fn invalidate() {
 /// deserialized as a GitHub PullRequest or sent through GitHub row events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::inventory::RowObservation>,
     #[serde(default)]
     pub viewer: Option<String>,
     pub source: Source,
@@ -76,10 +80,34 @@ impl MergeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedList {
+    pub(crate) session: Option<super::process_session::Token>,
+    pub scan: Option<crate::queue_scan::Commit>,
     pub viewer: Option<String>,
     pub mrs: Vec<MergeRequest>,
     pub total: Option<u64>,
     pub coverage: Coverage,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn verified_test_session(
+    program: &std::path::Path,
+    host: &str,
+) -> super::process_session::Token {
+    super::test_support::scripted(program, async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let context = super::transport::Context::new(
+            program,
+            host,
+            super::transport::Class::Foreground,
+            deadline,
+        );
+        super::transport::api(program, host, "user", "GET", None, &context)
+            .await
+            .unwrap();
+        super::transport::Context::new(program, host, super::transport::Class::Foreground, deadline)
+            .token()
+    })
+    .await
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -116,11 +144,13 @@ struct Page {
     total: Option<u64>,
     next: Option<usize>,
     terminal_known: bool,
+    confirmation_terminal: bool,
 }
 
-pub async fn fetch<F: std::future::Future<Output = ()>>(
+pub async fn fetch<F: std::future::Future<Output = bool>>(
     source: &Source,
     list: CachedList,
+    db_path: &Path,
     progress: impl FnOnce(FetchedList) -> F,
 ) -> Result<FetchedList, QueueError> {
     if source.provider != Provider::Gitlab || super::host::validate(&source.host).is_err() {
@@ -129,57 +159,146 @@ pub async fn fetch<F: std::future::Future<Output = ()>>(
     let program = super::auth::find_glab().ok_or(QueueError::MissingCli)?;
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<FetchedList, QueueError>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
-    let viewer = super::auth::viewer(&program, &source.host)
+    let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
+    let initial = super::transport::Context::new(
+        &program,
+        &source.host,
+        super::transport::Class::Background,
+        deadline,
+    );
+    let (viewer, context) = super::auth::viewer_with_context(&program, &source.host, &initial)
         .await
-        .map_err(|_| QueueError::Unauthorized)?;
+        .map_err(|issue| {
+            if issue == super::detail::DetailIssue::Timeout {
+                QueueError::Timeout
+            } else {
+                QueueError::Unauthorized
+            }
+        })?;
     let key = format!(
-        "{}:{viewer}:{list:?}:{}",
+        "{program:?}:{}:{}:{viewer}:{list:?}:{}",
+        context.generation,
         source.host,
         GENERATION.load(std::sync::atomic::Ordering::Acquire)
     );
     READS
-        .run(key, async {
-            let started = tokio::time::Instant::now();
-            let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
-            let mut result = fetch_with_program(&program, source, list, FETCH_TIMEOUT).await?;
-            result.viewer = Some(viewer.clone());
-            for row in &mut result.mrs {
-                row.viewer = Some(viewer.clone());
-            }
-            if super::auth::viewer(&program, &source.host)
+        .run_until(
+            key,
+            async {
+                let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
+                let path = db_path.to_path_buf();
+                let owned_source = source.clone();
+                let owner = viewer.clone();
+                let (loaded, previous) = tauri::async_runtime::spawn_blocking(
+                    move || -> Result<_, crate::store::StoreError> {
+                        let conn = crate::store::open_db(&path)?;
+                        let conn = conn.unchecked_transaction()?;
+                        let loaded = crate::queue_scan::load(&conn, &owned_source, list, &owner)?;
+                        let rows = if crate::store::source_cache::snapshot_owner(
+                            &conn,
+                            &owned_source,
+                            list,
+                        )?
+                        .as_deref()
+                            == Some(&owner)
+                        {
+                            match crate::store::source_cache::load_source_snapshot(
+                                &conn,
+                                &owned_source,
+                                list,
+                            )?
+                            .data
+                            {
+                                crate::store::source_cache::SnapshotData::GitLabAvailable {
+                                    mrs,
+                                    ..
+                                } => mrs,
+                                _ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        };
+                        Ok((loaded, rows))
+                    },
+                )
                 .await
-                .map_err(|_| QueueError::Unauthorized)?
-                != viewer
-            {
-                return Err(QueueError::Unauthorized);
-            }
-            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(QueueError::Request);
-            }
-            super::enrichment::fill_cached(&mut result.mrs, generation);
-            progress(result.clone()).await;
-            super::enrichment::enrich(
-                &program,
-                &mut result.mrs,
-                FETCH_TIMEOUT.saturating_sub(started.elapsed()),
-                generation,
-            )
-            .await;
-            if super::auth::viewer(&program, &source.host)
+                .map_err(|_| QueueError::Request)?
+                .map_err(|_| QueueError::Request)?;
+                let mut result = scan::advance_context(
+                    &context,
+                    &program,
+                    scan::Target {
+                        source,
+                        list,
+                        owner: &viewer,
+                    },
+                    loaded,
+                    &previous,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    Utc::now().timestamp(),
+                )
+                .await?;
+                result.session = Some(context.token());
+                result.viewer = Some(viewer.clone());
+                for row in &mut result.mrs {
+                    row.viewer = Some(viewer.clone());
+                }
+                if tokio::time::timeout_at(
+                    deadline,
+                    super::auth::viewer_context(&program, &source.host, &context),
+                )
                 .await
+                .map_err(|_| QueueError::Timeout)?
                 .map_err(|_| QueueError::Unauthorized)?
-                != viewer
-            {
-                return Err(QueueError::Unauthorized);
-            }
-            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(QueueError::Request);
-            }
-            Ok(result)
-        })
+                    != viewer
+                {
+                    return Err(QueueError::Unauthorized);
+                }
+                if !context.current()
+                    || generation != GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(QueueError::Request);
+                }
+                super::enrichment::fill_cached(&program, &mut result.mrs, generation);
+                if progress(result.clone()).await {
+                    if let Some(scan) = result.scan.as_mut() {
+                        scan.expected_revision += 1;
+                    }
+                }
+                super::enrichment::enrich_owned(
+                    &context,
+                    &program,
+                    &mut result.mrs,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    generation,
+                )
+                .await;
+                if tokio::time::timeout_at(
+                    deadline,
+                    super::auth::viewer_context(&program, &source.host, &context),
+                )
+                .await
+                .map_err(|_| QueueError::Timeout)?
+                .map_err(|_| QueueError::Unauthorized)?
+                    != viewer
+                {
+                    return Err(QueueError::Unauthorized);
+                }
+                if !context.current()
+                    || generation != GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(QueueError::Request);
+                }
+                Ok(result)
+            },
+            Result::is_ok,
+            deadline,
+        )
         .await
+        .map_err(|_| QueueError::Timeout)?
 }
 
+#[cfg(all(test, unix))]
 async fn fetch_with_program(
     program: &Path,
     source: &Source,
@@ -278,6 +397,8 @@ async fn fetch_with_program(
         Coverage::Unknown
     };
     Ok(FetchedList {
+        session: None,
+        scan: None,
         viewer: None,
         mrs,
         total,
@@ -285,27 +406,35 @@ async fn fetch_with_program(
     })
 }
 
+#[cfg(all(test, unix))]
 async fn request(
     program: &Path,
     host: &str,
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Page, QueueError> {
-    let mut command =
-        super::host::constrained_command(program, host).map_err(|_| QueueError::UnsupportedHost)?;
-    command
-        .args(["api", "--hostname", host, "-i", endpoint])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let (raw, status) = tokio::time::timeout(timeout, super::transport::output(&mut command))
+    let context = super::transport::Context::new(
+        program,
+        host,
+        super::transport::Class::Background,
+        tokio::time::Instant::now() + timeout,
+    );
+    request_context(program, host, endpoint, &context).await
+}
+async fn request_context(
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    context: &super::transport::Context,
+) -> Result<Page, QueueError> {
+    let response = super::transport::api(program, host, endpoint, "GET", None, context)
         .await
-        .map_err(|_| QueueError::Timeout)?
-        .map_err(|error| match error {
-            super::transport::Error::TooLarge => QueueError::InvalidPage,
-            super::transport::Error::Io => QueueError::Request,
+        .map_err(|failure| match failure.issue {
+            super::detail::DetailIssue::Timeout => QueueError::Timeout,
+            super::detail::DetailIssue::InvalidResponse => QueueError::InvalidPage,
+            _ => QueueError::Request,
         })?;
-    parse_page(&raw, status.success())
+    parse_page(&response.bytes(), true)
 }
 
 fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
@@ -372,7 +501,103 @@ fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
         total,
         next,
         terminal_known: next_seen,
+        confirmation_terminal: confirmation_terminal(headers),
     })
+}
+
+/// Stronger than normal traversal metadata: only an unambiguous first-page
+/// terminal envelope may support exact-IID absence. Missing totals remain unknown.
+fn confirmation_terminal(headers: &str) -> bool {
+    let mut evidence = std::collections::HashMap::new();
+    for line in headers.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        if key.trim() != key {
+            return false;
+        }
+        let key = key.to_ascii_lowercase();
+        if !matches!(
+            key.as_str(),
+            "x-total"
+                | "x-total-pages"
+                | "x-page"
+                | "x-next-page"
+                | "x-prev-page"
+                | "x-per-page"
+                | "link"
+        ) {
+            continue;
+        }
+        let value = value.trim();
+        if value.len() > 4096 {
+            return false;
+        }
+        if evidence.insert(key, value).is_some_and(|old| old != value) {
+            return false;
+        }
+    }
+    let number = |value: &str| -> Option<u64> {
+        (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| value.parse().ok())
+            .flatten()
+    };
+    let Some(total) = evidence.get("x-total").and_then(|s| number(s)) else {
+        return false;
+    };
+    if evidence.get("x-next-page") != Some(&"") {
+        return false;
+    }
+    for (key, value) in &evidence {
+        let valid = match key.as_str() {
+            "x-page" => number(value) == Some(1),
+            "x-total-pages" => number(value).is_some_and(|n| n == 1 || (n == 0 && total == 0)),
+            "x-prev-page" => value.is_empty(),
+            "x-per-page" => number(value).is_some_and(|n| (1..=25).contains(&n)),
+            "link" => value.split(',').all(|link| {
+                let Some((url, attributes)) = link.trim().split_once('>') else {
+                    return false;
+                };
+                let Some(url) = url
+                    .strip_prefix('<')
+                    .and_then(|s| reqwest::Url::parse(s).ok())
+                else {
+                    return false;
+                };
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return false;
+                }
+                let pages: Vec<_> = url.query_pairs().filter(|(key, _)| key == "page").collect();
+                if pages.len() != 1 || pages[0].1 != "1" {
+                    return false;
+                }
+                let Some(relation) = attributes
+                    .trim()
+                    .strip_prefix(';')
+                    .map(str::trim)
+                    .and_then(|s| s.strip_prefix("rel="))
+                else {
+                    return false;
+                };
+                let relation = if relation.starts_with('"') {
+                    let Some(relation) =
+                        relation.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                    else {
+                        return false;
+                    };
+                    relation
+                } else {
+                    relation
+                };
+                matches!(relation, "first" | "last" | "self")
+            }),
+            _ => true,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
@@ -408,6 +633,7 @@ fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
     let comment_count = v.get("user_notes_count")?.as_u64()?;
     let id = v.get("id")?.as_u64()?;
     Some(MergeRequest {
+        observation: None,
         viewer: None,
         source: source.clone(),
         id,
@@ -476,6 +702,72 @@ mod tests {
             "assignees": [], "user_notes_count": 2,
             "detailed_merge_status": "draft_status", "sha": "deadbeef"
         })
+    }
+
+    #[test]
+    fn unread_mr_head_preserves_confirmed_review_until_a_real_change() {
+        use crate::inventory::{
+            gitlab_observation, reconcile, ConfirmedReview, ObservationState, ReadinessField,
+        };
+        let source = Source {
+            provider: crate::identity::Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let mut raw = row("gitlab.com", "group/project", 7);
+        raw["sha"] = json!("head-a");
+        let mut old = map_row(&raw, &source).unwrap();
+        old.observation = Some(gitlab_observation(&old));
+        old.needs_my_review = Some(false);
+        old.observation.as_mut().unwrap().confirmed_review = Some(ConfirmedReview {
+            head_oid: "head-a".into(),
+            review: crate::github::model::ReviewState::Approved,
+            confirmed_at: chrono::Utc::now(),
+            receipt: None,
+            unresolved: false,
+            confirmed_by_read: false,
+        });
+        for head in [None, Some(Value::Null), Some(json!(""))] {
+            let mut unread = raw.clone();
+            if let Some(head) = head {
+                unread["sha"] = head;
+            } else {
+                unread.as_object_mut().unwrap().remove("sha");
+            }
+            let mapped = map_row(&unread, &source).unwrap();
+            let fresh = reconcile(vec![], vec![mapped.clone()], false, chrono::Utc::now());
+            assert!(fresh[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .unknown_fields
+                .contains(&ReadinessField::Head));
+            let retained = reconcile(vec![old.clone()], vec![mapped], false, chrono::Utc::now());
+            assert_eq!(retained[0].head_oid.as_deref(), Some("head-a"));
+            assert_eq!(
+                retained[0].observation.as_ref().unwrap().state,
+                ObservationState::Retained
+            );
+            assert_eq!(retained[0].needs_my_review, Some(false));
+            let mut lagging = map_row(&raw, &source).unwrap();
+            lagging.needs_my_review = Some(true);
+            let same = reconcile(retained, vec![lagging.clone()], true, chrono::Utc::now());
+            assert!(same[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_some());
+            assert_eq!(same[0].needs_my_review, Some(false));
+            lagging.head_oid = Some("head-b".into());
+            let changed = reconcile(same, vec![lagging], true, chrono::Utc::now());
+            assert!(changed[0]
+                .observation
+                .as_ref()
+                .unwrap()
+                .confirmed_review
+                .is_none());
+            assert_eq!(changed[0].needs_my_review, Some(true));
+        }
     }
 
     #[test]

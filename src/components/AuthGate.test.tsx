@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSourceSelection } from "../store/sourceSelection";
 import { AuthGate } from "./AuthGate";
 import { AUTH_EXPIRED, NOT_ASKED } from "@/lib/notAsked";
@@ -11,6 +11,7 @@ afterEach(() => {
   // See src/api/hooks.test.tsx: unmount before clearing the mocked Tauri
   // IPC internals so effect cleanup doesn't call a deleted unlisten fn.
   cleanup();
+  useSourceSelection.setState({ selection: "github" });
   clearMocks();
 });
 
@@ -43,6 +44,7 @@ describe("AuthGate", () => {
   });
 
   it("keeps local views available when GitHub is not authenticated", async () => {
+    useSourceSelection.setState({ selection: "both" });
     renderGated({
       ok: false,
       message: "gh auth status: not logged in to github.com",
@@ -52,10 +54,11 @@ describe("AuthGate", () => {
     expect(
       screen.getByText(/GitHub is unavailable: gh auth status: not logged in to github.com/),
     ).toBeTruthy();
-    expect(await screen.findByText(/GitLab.com authentication could not be verified/)).toBeTruthy();
+    expect((await screen.findAllByText(/GitLab.com authentication could not be verified/)).length).toBeGreaterThan(0);
   });
 
   it("allows GitLab sign-in when gh is missing", async () => {
+    useSourceSelection.setState({ selection: "both" });
     renderGated({ ok: false, message: "gh was not found" }, true);
     expect(await screen.findByText("protected content")).toBeTruthy();
     expect(await screen.findByText(/GitLab sign-in for gitlab.com is verified/)).toBeTruthy();
@@ -264,4 +267,24 @@ it("reports GitLab authentication failure in GitLab-only mode without hiding con
     expect(await screen.findByRole("button", { name: "Retry GitLab authentication" })).toBeTruthy();
     expect(screen.getByText("protected content")).toBeTruthy();
   } finally { useSourceSelection.setState({ selection: "github" }); }
+});
+
+it("starts no automatic GitLab auth on a GitHub-only mount, focus or timer", async () => {
+  useSourceSelection.setState({ selection: "github" });
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let calls = 0;
+  mockIPC(cmd => {
+    if (cmd === "get_auth_state") return { ok: true, message: "" };
+    if (cmd === "get_gitlab_host") return "gitlab.com";
+    if (cmd === "get_gitlab_auth_state") { calls++; return { ok: true, host: "gitlab.com" }; }
+    return undefined;
+  }, { shouldMockEvents: true });
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  try {
+    render(<QueryClientProvider client={qc}><AuthGate><div>protected zero-process mode</div></AuthGate></QueryClientProvider>);
+    await screen.findByText("protected zero-process mode");
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(120_001);
+    expect(calls).toBe(0);
+  } finally { cleanup(); qc.clear(); vi.useRealTimers(); }
 });

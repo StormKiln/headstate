@@ -1,8 +1,10 @@
+import type { RowObservation } from "./pr";
 import type { Source } from "./identity";
 import type { CiState, Label, ReviewState } from "./pr";
 
 /// Rust gitlab::queues::MergeRequest. Null means the list did not measure it.
 export interface MergeRequest {
+  observation?: RowObservation | null;
   viewer?: string | null;
   source: Source;
   id: number;

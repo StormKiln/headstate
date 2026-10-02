@@ -11,9 +11,10 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
-    process::Stdio,
     time::Duration,
 };
+
+use super::transport::{Class, Context as ProcessContext};
 
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
@@ -308,28 +309,41 @@ fn parse(raw: &[u8], success: bool) -> Result<Response, RequestFailure> {
     }
     Ok(out)
 }
+#[cfg(all(test, unix))]
 async fn request(
     program: &Path,
     host: &str,
     endpoint: &str,
     budget: Duration,
 ) -> Result<Response, RequestFailure> {
-    let mut command =
-        super::host::constrained_command(program, host).map_err(|_| Stop::InvalidData)?;
-    command
-        .args(["api", "--hostname", host, "-i", endpoint])
-        .stdin(Stdio::null());
-    let (raw, status) = tokio::time::timeout(
-        budget.min(REQUEST_TIMEOUT),
-        super::transport::output(&mut command),
-    )
-    .await
-    .map_err(|_| Stop::Timeout)?
-    .map_err(|error| match error {
-        super::transport::Error::TooLarge => Stop::InvalidData,
-        super::transport::Error::Io => Stop::RequestFailed,
-    })?;
-    parse(&raw, status.success())
+    let context = super::transport::Context::new(
+        program,
+        host,
+        super::transport::Class::Foreground,
+        tokio::time::Instant::now() + budget.min(REQUEST_TIMEOUT),
+    );
+    request_context(&context, program, host, endpoint, budget).await
+}
+async fn request_context(
+    context: &ProcessContext,
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    budget: Duration,
+) -> Result<Response, RequestFailure> {
+    let mut context = context.clone();
+    context.deadline = context
+        .deadline
+        .min(tokio::time::Instant::now() + budget.min(REQUEST_TIMEOUT));
+    let response = super::transport::api(program, host, endpoint, "GET", None, &context)
+        .await
+        .map_err(|failure| match failure.issue {
+            super::detail::DetailIssue::Timeout => Stop::Timeout,
+            super::detail::DetailIssue::InvalidResponse => Stop::InvalidData,
+            super::detail::DetailIssue::BudgetExhausted => Stop::RateLimited,
+            _ => Stop::RequestFailed,
+        })?;
+    parse(&response.bytes(), true)
 }
 fn error(stop: &Stop) -> String {
     match stop {
@@ -342,17 +356,30 @@ fn error(stop: &Stop) -> String {
     }
     .into()
 }
-async fn viewer(program: &Path, host: &str) -> Result<String, String> {
-    let out = request(program, host, "user", REQUEST_TIMEOUT)
+async fn viewer_context(
+    program: &Path,
+    host: &str,
+    context: &ProcessContext,
+) -> Result<String, String> {
+    let body = super::auth::identity_context(program, host, context)
         .await
-        .map_err(|failure| error(&failure.stop))?;
-    // Numeric id is stable across username changes and isolates accounts.
-    out.body
-        .get("id")
-        .and_then(Value::as_u64)
+        .map_err(|_| error(&Stop::Unauthorized))?;
+    body["id"]
+        .as_u64()
         .map(|id| id.to_string())
         .ok_or_else(|| error(&Stop::InvalidData))
 }
+
+async fn pages_context(
+    context: &ProcessContext,
+    program: &Path,
+    host: &str,
+    base: &str,
+    budget: Duration,
+) -> Result<(Vec<Value>, Coverage), RequestFailure> {
+    pages_limited_context(context, program, host, base, budget, MAX_PAGES).await
+}
+#[cfg(all(test, unix))]
 async fn pages(
     program: &Path,
     host: &str,
@@ -361,7 +388,24 @@ async fn pages(
 ) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     pages_limited(program, host, base, budget, MAX_PAGES).await
 }
+#[cfg(all(test, unix))]
 async fn pages_limited(
+    program: &Path,
+    host: &str,
+    base: &str,
+    budget: Duration,
+    max_pages: usize,
+) -> Result<(Vec<Value>, Coverage), RequestFailure> {
+    let context = ProcessContext::new(
+        program,
+        host,
+        Class::Foreground,
+        tokio::time::Instant::now() + budget,
+    );
+    pages_limited_context(&context, program, host, base, budget, max_pages).await
+}
+async fn pages_limited_context(
+    context: &ProcessContext,
     program: &Path,
     host: &str,
     base: &str,
@@ -381,7 +425,8 @@ async fn pages_limited(
             coverage.stop = Stop::Timeout;
             break;
         }
-        let out = match request(
+        let out = match request_context(
+            context,
             program,
             host,
             &format!("{base}{separator}per_page={PAGE_SIZE}&page={page_number}"),
@@ -463,40 +508,76 @@ async fn pages_limited(
 }
 
 pub async fn tree(host: &str) -> Result<Tree, String> {
-    let source = source(host)?;
     let program =
         super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
-    let viewer = viewer(&program, host).await?;
-    let account = super::auth::viewer(&program, host)
+    tree_with_program(&program, host).await
+}
+async fn tree_with_program(program: &Path, host: &str) -> Result<Tree, String> {
+    let source = source(host)?;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let initial = ProcessContext::new(program, host, Class::Foreground, deadline);
+    let (identity, context) = super::auth::verified_identity(program, host, &initial)
         .await
         .map_err(|_| "GitLab account unavailable")?;
+    let viewer = identity["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("GitLab account unavailable")?
+        .to_string();
+    let account = identity["username"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("GitLab account unavailable")?
+        .to_string();
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Tree, String>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
     let mut tree = READS
-        .run(
-            format!("{host}:{viewer}"),
-            discover_tree(&program, source, viewer, BUDGET),
+        .run_until(
+            format!("{program:?}:{host}:{viewer}:{}", context.generation),
+            discover_tree_context(
+                &context,
+                program,
+                source,
+                viewer.clone(),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
+            Result::is_ok,
+            deadline,
         )
-        .await?;
-    if super::auth::viewer(&program, host)
         .await
-        .map_err(|_| "GitLab account unavailable")?
-        != account
-    {
+        .map_err(|_| "GitLab statistics deadline exceeded")??;
+    if viewer_context(program, host, &context).await? != viewer || !context.current() {
         return Err("GitLab account changed while loading scopes. Refresh to try again.".into());
     }
     tree.account = Some(account);
     Ok(tree)
 }
 
+#[cfg(all(test, unix))]
 async fn discover_tree(
     program: &Path,
     source: Source,
     viewer: String,
     budget: Duration,
 ) -> Result<Tree, String> {
+    let context = ProcessContext::new(
+        program,
+        &source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + budget,
+    );
+    discover_tree_context(&context, program, source, viewer, budget).await
+}
+async fn discover_tree_context(
+    context: &ProcessContext,
+    program: &Path,
+    source: Source,
+    viewer: String,
+    budget: Duration,
+) -> Result<Tree, String> {
     let started = tokio::time::Instant::now();
-    let (rows, mut coverage) = match pages(
+    let (rows, mut coverage) = match pages_context(
+        context,
         program,
         &source.host,
         "projects?membership=true&simple=true&order_by=id&sort=asc",
@@ -550,7 +631,8 @@ async fn discover_tree(
     if coverage.rate_limited() || started.elapsed() >= budget {
         group_error = Some("Request budget exhausted before requesting groups".into());
     } else {
-        match pages(
+        match pages_context(
+            context,
             program,
             &source.host,
             // all_available=true scans every accessible group on GitLab.com;
@@ -767,15 +849,34 @@ pub async fn load(
     db: std::path::PathBuf,
     refresh: bool,
 ) -> Result<Report, String> {
+    let program =
+        super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
+    load_with_program(&program, host, scope, days, db, refresh).await
+}
+async fn load_with_program(
+    program: &Path,
+    host: &str,
+    scope: Scope,
+    days: u32,
+    db: std::path::PathBuf,
+    refresh: bool,
+) -> Result<Report, String> {
     let generation = CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let source = source(host)?;
     endpoint(&scope)?;
     if !(1..=90).contains(&days) {
         return Err("GitLab statistics window must be 1 to 90 days".into());
     }
-    let program =
-        super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
-    let viewer = viewer(&program, host).await?;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let initial = ProcessContext::new(program, host, Class::Foreground, deadline);
+    let (identity, context) = super::auth::verified_identity(program, host, &initial)
+        .await
+        .map_err(|_| "GitLab account unavailable")?;
+    let viewer = identity["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("GitLab account unavailable")?
+        .to_string();
     // Whole UTC dates give a stable cache window; today's cohort is still live.
     let end = Utc::now();
     let start = (end.date_naive() - chrono::Duration::days(i64::from(days) - 1))
@@ -800,19 +901,22 @@ pub async fn load(
                 .ok()
                 .and_then(Result::ok)
                 .flatten();
-        if let Some(report) = cached {
+        if let Some(report) = cached.filter(|_| context.current()) {
             return Ok(report);
         }
     }
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Report, String>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
     let report = READS
-        .run(
-            format!("{key}:{generation}"),
-            load_window(&program, source, viewer.clone(), scope, start, end),
+        .run_until(
+            format!("{program:?}:{key}:{generation}:{}", context.generation),
+            load_window_context(&context, program, source, viewer.clone(), scope, start, end),
+            Result::is_ok,
+            deadline,
         )
-        .await?;
-    if self::viewer(&program, host).await? != viewer {
+        .await
+        .map_err(|_| "GitLab statistics deadline exceeded")??;
+    if viewer_context(program, host, &context).await? != viewer || !context.current() {
         return Err(
             "GitLab account changed while loading statistics. Refresh to try again.".into(),
         );
@@ -822,17 +926,24 @@ pub async fn load(
     }
     let saved = report.clone();
     // Cache trouble never discards a measured result.
+    let owner = context.token();
     let _ = tokio::task::spawn_blocking(move || {
         let _guard = CACHE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
         if generation != CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        crate::store::gitlab_stats::put(&db, &key, &saved)
+        owner
+            .with_current(|| crate::store::gitlab_stats::put(&db, &key, &saved))
+            .unwrap_or(Ok(()))
     })
     .await;
+    if !context.current() {
+        return Err("GitLab account changed while saving statistics.".into());
+    }
     Ok(report)
 }
 
+#[cfg(all(test, unix))]
 async fn load_window(
     program: &Path,
     source: Source,
@@ -841,7 +952,25 @@ async fn load_window(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Report, String> {
+    let context = ProcessContext::new(
+        program,
+        &source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + BUDGET,
+    );
+    load_window_context(&context, program, source, account, scope, start, end).await
+}
+async fn load_window_context(
+    context: &ProcessContext,
+    program: &Path,
+    source: Source,
+    account: String,
+    scope: Scope,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Report, String> {
     let started = tokio::time::Instant::now();
+    let budget = context.deadline.saturating_duration_since(started);
     let base = endpoint(&scope)?;
     let dates = |prefix: &str| {
         format!(
@@ -854,7 +983,7 @@ async fn load_window(
         "{base}&state=all&order_by=created_at&sort=desc&{}",
         dates("created")
     );
-    let (raw, coverage) = pages(program, &source.host, &created_url, BUDGET)
+    let (raw, coverage) = pages_context(context, program, &source.host, &created_url, budget)
         .await
         .map_err(|failure| error(&failure.stop))?;
     let mut report = summarize(source.clone(), account, scope, start, end, raw, coverage);
@@ -868,12 +997,13 @@ async fn load_window(
     if limited {
         report.merged_error =
             Some("GitLab request budget exhausted; merged MRs were not requested".into());
-    } else if started.elapsed() < BUDGET {
-        match pages(
+    } else if started.elapsed() < budget {
+        match pages_context(
+            context,
             program,
             &source.host,
             &merged_url,
-            BUDGET.saturating_sub(started.elapsed()),
+            budget.saturating_sub(started.elapsed()),
         )
         .await
         {
@@ -897,13 +1027,14 @@ async fn load_window(
         .as_ref()
         .is_some_and(|m| m.coverage.rate_limited());
     report.activity = Some(
-        activity::load(
+        activity::load_context(
+            context,
             program,
             &report,
             if limited {
                 Duration::ZERO
             } else {
-                BUDGET.saturating_sub(started.elapsed())
+                budget.saturating_sub(started.elapsed())
             },
         )
         .await,
@@ -913,13 +1044,14 @@ async fn load_window(
         .as_ref()
         .is_some_and(|a| a.rate_limited || a.rate_remaining == Some(0));
     report.review_evidence = Some(
-        review_evidence::load(
+        review_evidence::load_context(
+            context,
             program,
             &report,
             if limited {
                 Duration::ZERO
             } else {
-                BUDGET.saturating_sub(started.elapsed())
+                budget.saturating_sub(started.elapsed())
             },
         )
         .await,
@@ -1018,6 +1150,179 @@ mod tests {
             rows,
             coverage(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_stats_reverify_external_account_before_publishing_and_recover_as_new_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        for tree in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let program = dir.path().join("glab");
+            let db = dir.path().join("stats.sqlite");
+            std::fs::write(&program, r#"#!/bin/sh
+echo "$5" >> "$0.calls"
+case "$5" in
+user) id=1; test ! -f "$0.switched" || id=2; printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture%s"}' "$id" "$id";;
+*) touch "$0.switched"; printf 'HTTP/2 200\nx-next-page: \nx-total: 0\n\n[]';;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::gitlab::test_support::scripted(&program, async {
+                if tree {
+                    assert!(tree_with_program(&program, "gitlab.example").await.is_err());
+                    assert_eq!(
+                        tree_with_program(&program, "gitlab.example")
+                            .await
+                            .unwrap()
+                            .account
+                            .as_deref(),
+                        Some("fixture2")
+                    );
+                } else {
+                    assert!(load_with_program(
+                        &program,
+                        "gitlab.example",
+                        Scope::Mine,
+                        1,
+                        db.clone(),
+                        true
+                    )
+                    .await
+                    .is_err());
+                    let conn = crate::store::open_db(&db).unwrap();
+                    assert_eq!(
+                        conn.query_row("SELECT count(*) FROM gitlab_stats_cache", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                    let report = load_with_program(
+                        &program,
+                        "gitlab.example",
+                        Scope::Mine,
+                        1,
+                        db.clone(),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(report.viewer, "2");
+                    assert_eq!(
+                        conn.query_row("SELECT count(*) FROM gitlab_stats_cache", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stats_helpers_never_renew_the_parent_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho call >> \"$0.calls\"\nprintf 'HTTP/2 200\\nX-Next-Page: \\n\\n[]'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(&program, async {
+            let ctx = ProcessContext::new(
+                &program,
+                "gitlab.example",
+                Class::Foreground,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            assert!(request_context(
+                &ctx,
+                &program,
+                "gitlab.example",
+                "projects",
+                Duration::from_secs(30)
+            )
+            .await
+            .is_ok());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_eq!(
+                request_context(
+                    &ctx,
+                    &program,
+                    "gitlab.example",
+                    "projects",
+                    Duration::from_secs(30)
+                )
+                .await
+                .err()
+                .unwrap()
+                .stop,
+                Stop::Timeout
+            );
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stats_429_defers_detail_and_write_without_another_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(&program, "#!/bin/sh\necho call >> \"$0.calls\"\nprintf 'HTTP/2 429\\nRetry-After: 300\\n\\nlimited'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(&program, async {
+            assert_eq!(
+                request(
+                    &program,
+                    "gitlab.example",
+                    "projects",
+                    Duration::from_secs(1)
+                )
+                .await
+                .err()
+                .unwrap()
+                .stop,
+                Stop::RateLimited
+            );
+            for method in ["GET", "PUT"] {
+                let context = crate::gitlab::transport::Context::new(
+                    &program,
+                    "gitlab.example",
+                    crate::gitlab::transport::Class::Foreground,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                );
+                let result = crate::gitlab::detail::request_json_context(
+                    &program,
+                    "gitlab.example",
+                    "projects/1/merge_requests/1",
+                    method,
+                    None,
+                    &context,
+                )
+                .await;
+                assert!(!result.err().unwrap().dispatched);
+            }
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(program.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
     #[test]
     fn merged_window_includes_old_creation_and_rejects_out_of_window_evidence() {

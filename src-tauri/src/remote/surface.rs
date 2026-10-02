@@ -649,6 +649,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("act_on_pr", Class::Write),
     ("act_on_prs", Class::Write),
     ("review_pr", Class::Write),
+    ("review_pr_at_head", Class::Write),
     ("comment_on_pr", Class::Write),
     ("resolve_thread", Class::Write),
     ("unresolve_thread", Class::Write),
@@ -1172,7 +1173,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         }
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {
-            res(commands::get_pr_detail(app.state(), a.get("repo")?, a.get("number")?).await)
+            res(
+                commands::get_pr_detail(app.clone(), app.state(), a.get("repo")?, a.get("number")?)
+                    .await,
+            )
         }
         "get_review_gates" => res(commands::get_review_gates(
             app.state(),
@@ -1361,6 +1365,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
 
         // ---- write ------------------------------------------------------
         "act_on_pr" => res(commands::act_on_pr(
+            app.clone(),
             app.state(),
             app.state(),
             a.get("id")?,
@@ -1369,14 +1374,19 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("action")?,
         )
         .await),
-        "act_on_prs" => {
-            res(
-                commands::act_on_prs(app.state(), app.state(), a.get("prs")?, a.get("action")?)
-                    .await,
-            )
+        "act_on_prs" => res(commands::act_on_prs(
+            app.clone(),
+            app.state(),
+            app.state(),
+            a.get("prs")?,
+            a.get("action")?,
+        )
+        .await),
+        "review_pr_at_head" => {
+            res(commands::review_pr_at_head(app.clone(), app.state(), a.get("request")?).await)
         }
         "review_pr" => res(commands::review_pr(
-            app.state(),
+            app.clone(),
             app.state(),
             a.get("id")?,
             a.get("repo")?,

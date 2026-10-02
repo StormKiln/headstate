@@ -43,9 +43,9 @@
 //!   cherry-pick, or pushing someone else's commits all break it), and the
 //!   claim this feeds -- "your approval won't count" -- disables a button.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use super::advisory::{FAILURE_TTL, SUCCESS_TTL};
+use futures_util::{stream, StreamExt};
+use std::time::Duration;
 
 use super::client::GitHubClient;
 use super::stats::Budget;
@@ -95,29 +95,6 @@ pub struct ReviewGates {
 /// while keeping a triage session that opens twenty PRs into `main` at one
 /// request rather than twenty.
 const RULES_TTL: Duration = Duration::from_secs(600);
-
-/// Successful reads only. A failure is not cached, so a transient 502
-/// does not suppress the gate for ten minutes; the next open asks again.
-static RULES_CACHE: Mutex<Option<RulesCache>> = Mutex::new(None);
-
-/// (repository, base branch) -> when read, and
-/// `(require_last_push_approval, required_review_thread_resolution)`.
-type RulesCache = HashMap<(String, String), (Instant, (bool, bool))>;
-
-fn cached_rules(repo: &str, base: &str) -> Option<(bool, bool)> {
-    let guard = RULES_CACHE.lock().ok()?;
-    let (at, rules) = guard.as_ref()?.get(&(repo.to_string(), base.to_string()))?;
-    (at.elapsed() < RULES_TTL).then_some(*rules)
-}
-
-fn store_rules(repo: &str, base: &str, rules: (bool, bool)) {
-    if let Ok(mut guard) = RULES_CACHE.lock() {
-        guard.get_or_insert_with(HashMap::new).insert(
-            (repo.to_string(), base.to_string()),
-            (Instant::now(), rules),
-        );
-    }
-}
 
 /// `(require_last_push_approval, required_review_thread_resolution)` from a
 /// `rules/branches` response, or `None` if it is not the documented list.
@@ -220,13 +197,34 @@ pub async fn base_rules(
             reason: "no base branch to ask about".into(),
         };
     }
-    if let Some((a, b)) = cached_rules(repo, base) {
-        return BaseRules::Read {
-            require_last_push_approval: a,
-            required_review_thread_resolution: b,
-        };
-    }
-    if !budget.permits_rest(1) {
+    client
+        .advisory
+        .rules
+        .load(
+            (repo.into(), base.into()),
+            client.read_context().deadline,
+            |value| {
+                if matches!(value, BaseRules::Read { .. }) {
+                    RULES_TTL
+                } else {
+                    FAILURE_TTL
+                }
+            },
+            base_rules_uncached(client, budget, repo, base),
+        )
+        .await
+        .unwrap_or_else(|| BaseRules::Declined {
+            reason: "not checked before the request deadline".into(),
+        })
+}
+
+async fn base_rules_uncached(
+    client: &GitHubClient,
+    budget: &Budget,
+    repo: &str,
+    base: &str,
+) -> BaseRules {
+    if !client.rest_reserve_allows() {
         return BaseRules::Declined {
             reason: "the REST rate-limit budget is nearly spent".into(),
         };
@@ -234,17 +232,18 @@ pub async fn base_rules(
     let path = format!("/repos/{repo}/rules/branches/{}", encode(base));
     match client.rest_get(&path, budget).await {
         Ok(v) => match map_rules(&v) {
-            Some((a, b)) => {
-                store_rules(repo, base, (a, b));
-                BaseRules::Read {
-                    require_last_push_approval: a,
-                    required_review_thread_resolution: b,
-                }
-            }
+            Some((a, b)) => BaseRules::Read {
+                require_last_push_approval: a,
+                required_review_thread_resolution: b,
+            },
             None => BaseRules::Unreadable {
                 reason: "GitHub's rules answer was not a list".into(),
             },
         },
+        Err(
+            super::client::ClientError::NotDispatched(reason)
+            | super::client::ClientError::RateLimited(reason),
+        ) => BaseRules::Declined { reason },
         Err(e) => BaseRules::Unreadable {
             reason: e.to_string(),
         },
@@ -272,7 +271,35 @@ pub async fn last_pusher(
             reason: "the head branch is not known".into(),
         };
     }
-    if !budget.permits_rest(1) {
+    client
+        .advisory
+        .pushers
+        .load(
+            (head_repo.into(), head_ref.into(), head_oid.into()),
+            client.read_context().deadline,
+            |value| {
+                if matches!(value, LastPusher::Known { .. }) {
+                    SUCCESS_TTL
+                } else {
+                    FAILURE_TTL
+                }
+            },
+            last_pusher_uncached(client, budget, head_repo, head_ref, head_oid),
+        )
+        .await
+        .unwrap_or_else(|| LastPusher::Declined {
+            reason: "not checked before the request deadline".into(),
+        })
+}
+
+async fn last_pusher_uncached(
+    client: &GitHubClient,
+    budget: &Budget,
+    head_repo: &str,
+    head_ref: &str,
+    head_oid: &str,
+) -> LastPusher {
+    if !client.rest_reserve_allows() {
         return LastPusher::Declined {
             reason: "the REST rate-limit budget is nearly spent".into(),
         };
@@ -286,6 +313,10 @@ pub async fn last_pusher(
     );
     match client.rest_get(&path, budget).await {
         Ok(v) => map_last_pusher(&v, head_oid),
+        Err(
+            super::client::ClientError::NotDispatched(reason)
+            | super::client::ClientError::RateLimited(reason),
+        ) => LastPusher::Declined { reason },
         Err(e) => LastPusher::Unknown {
             reason: e.to_string(),
         },
@@ -360,6 +391,9 @@ pub struct RowPusher {
     pub repo: String,
     pub number: u64,
     pub head_oid: String,
+    pub base: String,
+    pub head_ref: String,
+    pub head_repo: Option<String>,
     pub rules: BaseRules,
     /// Never `NotNeeded` here: the strip's tag wants the pusher whatever
     /// the rules say. `Declined` is "not checked" -- the budget, the
@@ -368,180 +402,108 @@ pub struct RowPusher {
     pub last_pusher: LastPusher,
 }
 
-/// At most this many activity reads per strip refresh. The rest are
-/// declined for THIS refresh and asked on a later one, so a strip of
-/// eighty rows costs thirty requests, not eighty, and none of it twice:
-/// answers are cached by head commit.
-pub const STRIP_LOOKUP_CAP: usize = 30;
-
-/// Activity reads in flight at once. `BATCH_CONCURRENCY`'s figure in
-/// `commands.rs`, for the same reason: well inside GitHub's secondary
-/// limits while finishing a batch promptly.
-const STRIP_CONCURRENCY: usize = 4;
-
-/// Known pushers, by (head repository, head commit). A pusher cannot
-/// change without the head commit changing, so an entry never goes stale;
-/// only `Known` is cached, because an `Unknown` is often the activity log
-/// lagging a fresh push and the next refresh may read it.
-static PUSHER_CACHE: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
-
-/// Past this many entries the cache is dropped and refilled. A crude
-/// bound, and enough: the strip holds dozens of rows, not thousands.
-const PUSHER_CACHE_CAP: usize = 4096;
-
-fn cached_pusher(head_repo: &str, head_oid: &str) -> Option<String> {
-    let guard = PUSHER_CACHE.lock().ok()?;
-    guard
-        .as_ref()?
-        .get(&(head_repo.to_string(), head_oid.to_string()))
-        .cloned()
-}
-
-fn store_pusher(head_repo: &str, head_oid: &str, login: &str) {
-    if let Ok(mut guard) = PUSHER_CACHE.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        if map.len() >= PUSHER_CACHE_CAP {
-            map.clear();
-        }
-        map.insert(
-            (head_repo.to_string(), head_oid.to_string()),
-            login.to_string(),
-        );
-    }
-}
-
-/// Rules and pusher for every row of the strip, spending only within the
-/// REST budget.
-///
-/// - Rules: one read per distinct (repository, base), through
-///   `base_rules` and its ten-minute cache.
-/// - Pushers: from the cache by (head repository, head commit), else one
-///   activity read each, for at most `STRIP_LOOKUP_CAP` rows in the
-///   order given (the strip's own order, so the top rows are answered
-///   first), `STRIP_CONCURRENCY` at a time. Past the cap or the budget a
-///   row is `Declined`: not checked, which is not "unknown".
-///
-/// Every read has its own `per_request` ceiling and every answer is kept
-/// as it lands, so one hung lookup costs its own row and nothing else
-/// (partial is not nothing, #1044). Never fails: a lost task becomes that
-/// row's `Unknown`.
 pub async fn strip_pushers(
     client: &GitHubClient,
     budget: &Budget,
     asks: &[PusherAsk],
     per_request: Duration,
 ) -> Vec<RowPusher> {
-    // Rules first, per distinct (repo, base), concurrently: most answer
-    // from the cache, and a slow one must not hold up the rest.
-    let mut keys: Vec<(String, String)> = Vec::new();
-    for a in asks {
-        let key = (a.repo.clone(), a.base.clone());
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-    let mut rules: HashMap<(String, String), BaseRules> = HashMap::new();
-    for chunk in keys.chunks(STRIP_CONCURRENCY) {
-        let mut set = tokio::task::JoinSet::new();
-        for (repo, base) in chunk.iter().cloned() {
-            let (client, budget) = (client.clone(), budget.clone());
-            set.spawn(async move {
-                let r =
-                    tokio::time::timeout(per_request, base_rules(&client, &budget, &repo, &base))
-                        .await
-                        .unwrap_or_else(|_| BaseRules::Unreadable {
-                            reason: format!("timed out after {}s", per_request.as_secs()),
-                        });
-                ((repo, base), r)
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            // A lost task leaves its key out; the row reads Unreadable below.
-            if let Ok((key, r)) = res {
-                rules.insert(key, r);
-            }
-        }
-    }
-
-    // Pushers: answer from the cache where possible, and pick which of
-    // the rest this refresh may ask about.
-    let mut pushers: Vec<Option<LastPusher>> = vec![None; asks.len()];
-    let mut to_ask: Vec<usize> = Vec::new();
-    for (i, a) in asks.iter().enumerate() {
-        let Some(repo) = a.head_repo.as_deref() else {
-            // Nothing to ask, and it costs no slot under the cap. The
-            // base repository is never asked in its place.
-            pushers[i] = Some(LastPusher::Declined {
-                reason: "the head repository is not known".into(),
-            });
-            continue;
-        };
-        if let Some(login) = cached_pusher(repo, &a.head_oid) {
-            pushers[i] = Some(LastPusher::Known { login });
-            continue;
-        }
-        if to_ask.len() < STRIP_LOOKUP_CAP {
-            to_ask.push(i);
-        } else {
-            pushers[i] = Some(LastPusher::Declined {
-                reason: "not checked on this refresh".into(),
-            });
-        }
-    }
-
-    for chunk in to_ask.chunks(STRIP_CONCURRENCY) {
-        let mut set = tokio::task::JoinSet::new();
-        for &i in chunk {
-            let (client, budget, a) = (client.clone(), budget.clone(), asks[i].clone());
-            set.spawn(async move {
-                let p = tokio::time::timeout(
-                    per_request,
-                    last_pusher(
-                        &client,
-                        &budget,
-                        a.head_repo.as_deref(),
-                        &a.head_ref,
-                        &a.head_oid,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|_| LastPusher::Unknown {
-                    reason: format!("timed out after {}s", per_request.as_secs()),
-                });
-                (i, p)
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            // A panicked task has lost its index; its row stays `None`
-            // and becomes Unknown below rather than vanishing.
-            if let Ok((i, p)) = res {
-                if let (LastPusher::Known { login }, Some(repo)) =
-                    (&p, asks[i].head_repo.as_deref())
-                {
-                    store_pusher(repo, &asks[i].head_oid, login);
-                }
-                pushers[i] = Some(p);
-            }
-        }
-    }
-
-    asks.iter()
-        .zip(pushers)
-        .map(|(a, p)| RowPusher {
+    let client = client.with_read_context(super::admission::ReadContext::new(
+        super::admission::ReadClass::Advisory,
+        Duration::from_secs(10),
+    ));
+    let keys: Vec<_> = asks
+        .iter()
+        .map(|a| serde_json::to_string(a).expect("string-only advisory identity"))
+        .collect();
+    let order = client.advisory.order(&keys);
+    let mut out: Vec<RowPusher> = asks
+        .iter()
+        .map(|a| RowPusher {
             repo: a.repo.clone(),
             number: a.number,
             head_oid: a.head_oid.clone(),
-            rules: rules
-                .get(&(a.repo.clone(), a.base.clone()))
-                .cloned()
-                .unwrap_or_else(|| BaseRules::Unreadable {
-                    reason: "the lookup failed".into(),
-                }),
-            last_pusher: p.unwrap_or_else(|| LastPusher::Unknown {
-                reason: "the lookup failed".into(),
-            }),
+            base: a.base.clone(),
+            head_ref: a.head_ref.clone(),
+            head_repo: a.head_repo.clone(),
+            rules: BaseRules::Declined {
+                reason: "not checked on this refresh".into(),
+            },
+            last_pusher: LastPusher::Declined {
+                reason: "not checked on this refresh".into(),
+            },
         })
-        .collect()
+        .collect();
+    let mut work = stream::iter(
+        order
+            .into_iter()
+            .map(|i| {
+                let client = client.clone();
+                let budget = budget.clone();
+                let a = asks[i].clone();
+                async move {
+                    let rules = tokio::time::timeout(
+                        per_request,
+                        base_rules(&client, &budget, &a.repo, &a.base),
+                    )
+                    .await
+                    .unwrap_or_else(|_| BaseRules::Unreadable {
+                        reason: "rules lookup timed out".into(),
+                    });
+                    let pusher = tokio::time::timeout(
+                        per_request,
+                        last_pusher(
+                            &client,
+                            &budget,
+                            a.head_repo.as_deref(),
+                            &a.head_ref,
+                            &a.head_oid,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| LastPusher::Unknown {
+                        reason: "pusher lookup timed out".into(),
+                    });
+                    (i, rules, pusher)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .buffer_unordered(2);
+    // Keep completed rows when the shared command deadline expires. Dropping
+    // this stream cancels its futures; there is no detached batch worker.
+    while let Ok(Some((i, rules, pusher))) =
+        tokio::time::timeout_at(client.read_context().deadline, work.next()).await
+    {
+        if !matches!(pusher, LastPusher::Declined { .. }) {
+            client.advisory.served(keys[i].clone());
+        }
+        out[i].rules = rules;
+        out[i].last_pusher = pusher;
+    }
+    for (row, ask) in out.iter_mut().zip(asks) {
+        if matches!(row.rules, BaseRules::Declined { .. }) {
+            if let Some(rules) = client
+                .advisory
+                .rules
+                .peek(&(ask.repo.clone(), ask.base.clone()))
+            {
+                row.rules = rules;
+            }
+        }
+        if matches!(row.last_pusher, LastPusher::Declined { .. }) {
+            if let Some(repo) = &ask.head_repo {
+                if let Some(pusher) = client.advisory.pushers.peek(&(
+                    repo.clone(),
+                    ask.head_ref.clone(),
+                    ask.head_oid.clone(),
+                )) {
+                    row.last_pusher = pusher;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -559,6 +521,162 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn rules_receipts_are_owned_by_authenticated_client_and_coalesce() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(30))
+                    .set_body_json(json!([])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let a = client_for(&server).await;
+        let b = client_for(&server).await;
+        let budget = a.request_budget();
+        let (one, two) = tokio::join!(
+            base_rules(&a, &budget, "octocat/hello-world", "task4-owner"),
+            base_rules(&a, &budget, "octocat/hello-world", "task4-owner")
+        );
+        assert_eq!(one, two);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "same-client requests must coalesce"
+        );
+        base_rules(&a, &budget, "octocat/hello-world", "task4-owner").await;
+        base_rules(
+            &b,
+            &b.request_budget(),
+            "octocat/hello-world",
+            "task4-owner",
+        )
+        .await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_windows_120_rows_44_bases_share_attempts_and_reach_later_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(|request: &wiremock::Request| {
+            if request.url.path().contains("/activity") {
+                ResponseTemplate::new(200).set_body_json(json!([{"activity_type":"push", "after":HEAD, "actor":{"login":"octocat"}}]))
+            } else if request.url.path().ends_with("base-0") {
+                ResponseTemplate::new(403).set_body_json(json!({"message":"synthetic permission refusal"}))
+            } else { ResponseTemplate::new(200).set_body_json(json!([])) }
+        }).mount(&server).await;
+        let client = client_for(&server).await;
+        let asks: Vec<_> = (1..=120)
+            .map(|i| {
+                let mut a = ask("octocat/hello-world", i, HEAD);
+                a.base = format!("base-{}", i % 44);
+                a
+            })
+            .collect();
+        let mut known = std::collections::HashSet::new();
+        let mut prior = 0;
+        for _ in 0..40 {
+            let budget = client.request_budget();
+            let (a, b) = tokio::join!(
+                strip_pushers(&client, &budget, &asks, T),
+                strip_pushers(&client, &budget, &asks, T)
+            );
+            for row in a.iter().chain(&b) {
+                if matches!(row.last_pusher, LastPusher::Known { .. }) {
+                    known.insert(row.number);
+                }
+            }
+            let count = server.received_requests().await.unwrap().len();
+            assert!(count - prior <= 8, "actual HTTP attempts per shared cycle");
+            prior = count;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+        }
+        assert_eq!(
+            known.len(),
+            120,
+            "failure at the prefix must not starve later rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_and_pusher_commands_share_the_same_eight_http_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let number = body["variables"]["number"].as_u64().unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequest":{"number":number,"headRefName":"feature","baseRefName":"main","stackEntry":{"position":1,"stack":{"number":1,"size":1}}}}}}))
+        }).mount(&server).await;
+        let client = client_for(&server).await;
+        let asks: Vec<_> = (1..=120)
+            .map(|i| ask("octocat/hello-world", i, HEAD))
+            .collect();
+        let stacks = (1..=8)
+            .map(|number| super::super::ready_stacks::StackAsk {
+                identity: crate::identity::PrIdentity {
+                    source: crate::identity::Source::default(),
+                    repo: "octocat/hello-world".into(),
+                    number,
+                },
+                head_oid: None,
+                base_ref: None,
+            })
+            .collect();
+        let budget = client.request_budget();
+        let (pushers, stacks) = tokio::join!(
+            strip_pushers(&client, &budget, &asks, T),
+            super::super::ready_stacks::ready_stacks(&client, stacks)
+        );
+        assert_eq!(pushers.len(), 120);
+        assert_eq!(stacks.unwrap().len(), 8);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 8);
+        assert!(requests.iter().any(|r| r.method == "POST"));
+        assert!(requests.iter().any(|r| r.method == "GET"));
+    }
+
+    #[tokio::test]
+    async fn command_deadline_retains_rules_completed_before_slow_activity() {
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/octocat/hello-world/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/octocat/hello-world/activity"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            client_for(&server)
+                .await
+                .with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Advisory,
+                    Duration::from_millis(80),
+                ));
+        let start = tokio::time::Instant::now();
+        let rows = strip_pushers(
+            &client,
+            &client.request_budget(),
+            &[ask("octocat/hello-world", 1, HEAD)],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(matches!(rows[0].rules, BaseRules::Read { .. }));
+        assert!(!matches!(rows[0].last_pusher, LastPusher::Known { .. }));
     }
 
     fn pr_rule(last_push: bool, resolution: bool) -> serde_json::Value {
@@ -784,10 +902,9 @@ mod tests {
     }
 
     /// A refused lookup (404: the viewer cannot read the rules) is
-    /// Unreadable, NOT an empty rule set -- and is not cached, so the next
-    /// open asks again.
+    /// Unreadable, NOT an empty rule set; retry after short failure eligibility.
     #[tokio::test]
-    async fn refused_rules_are_unreadable_and_not_cached() {
+    async fn refused_rules_are_unreadable_and_retry_after_short_eligibility() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/gate-org/gate-three/rules/branches/main"))
@@ -813,6 +930,9 @@ mod tests {
             .await;
             assert!(matches!(g.rules, BaseRules::Unreadable { .. }), "{g:?}");
             assert_eq!(g.last_pusher, LastPusher::NotNeeded);
+            tokio::time::pause();
+            tokio::time::advance(FAILURE_TTL).await;
+            tokio::time::resume();
         }
     }
 
@@ -842,13 +962,26 @@ mod tests {
     #[tokio::test]
     async fn a_low_rest_budget_declines_without_asking() {
         let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "10")
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+        client
+            .rest_get("/quota", &client.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
             .expect(0)
             .mount(&server)
             .await;
-        let client = client_for(&server).await;
-        let budget = Budget::seeded_rest_for_test(10);
+        let budget = client.request_budget();
         let r = base_rules(&client, &budget, "gate-org/gate-five", "main").await;
         assert!(matches!(r, BaseRules::Declined { .. }), "{r:?}");
         let p = last_pusher(&client, &budget, Some("gate-org/gate-five"), "x", HEAD).await;
@@ -974,10 +1107,9 @@ mod tests {
         assert_eq!(budget.rest_requests(), 3);
     }
 
-    /// An Unknown is not cached: the log often lags a fresh push, and the
-    /// next refresh should read it again.
+    /// Activity can lag a fresh push: Unknown has short retry eligibility.
     #[tokio::test]
-    async fn an_unknown_strip_pusher_is_asked_again() {
+    async fn an_unknown_strip_pusher_retries_after_short_eligibility() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/strip-org/strip-two/rules/branches/main"))
@@ -999,6 +1131,9 @@ mod tests {
                 matches!(out[0].last_pusher, LastPusher::Unknown { .. }),
                 "{out:?}"
             );
+            tokio::time::pause();
+            tokio::time::advance(FAILURE_TTL).await;
+            tokio::time::resume();
         }
     }
 
@@ -1017,18 +1152,18 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/strip-org/strip-three/activity"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .expect(STRIP_LOOKUP_CAP as u64)
+            .expect(7)
             .mount(&server)
             .await;
         let client = client_for(&server).await;
-        let asks: Vec<PusherAsk> = (0..STRIP_LOOKUP_CAP as u64 + 2)
+        let asks: Vec<PusherAsk> = (0..32)
             .map(|n| ask("strip-org/strip-three", n, &format!("{n:040}")))
             .collect();
         let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &asks, T).await;
         assert_eq!(out.len(), asks.len(), "every row answered, none dropped");
         for (i, row) in out.iter().enumerate() {
             assert_eq!(row.number, i as u64, "answers stay in the rows' order");
-            if i < STRIP_LOOKUP_CAP {
+            if i < 7 {
                 assert!(
                     matches!(row.last_pusher, LastPusher::Unknown { .. }),
                     "{row:?}"
@@ -1048,15 +1183,28 @@ mod tests {
     #[tokio::test]
     async fn a_spent_budget_leaves_strip_rows_not_checked() {
         let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "10")
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+        client
+            .rest_get("/quota", &client.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
             .expect(0)
             .mount(&server)
             .await;
-        let client = client_for(&server).await;
         let out = strip_pushers(
             &client,
-            &Budget::seeded_rest_for_test(10),
+            &client.request_budget(),
             &[ask("strip-org/strip-four", 4, HEAD)],
             T,
         )

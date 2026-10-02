@@ -48,6 +48,16 @@ describe("GitLab actions", () => {
     expect(screen.queryByRole("button", { name: "Merge MR" })).toBeNull();
   });
 
+  it.each([new Error("headstate:not-asked cooldown"), "headstate:not-asked cooldown"])("keeps a definitely unasked action distinct from uncertain dispatch: %s", async error => {
+    vi.mocked(gitLabAction).mockRejectedValue(error);
+    wrap(<GitLabDetail identity={identity} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Close MR" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await screen.findByRole("alert");
+    expect((screen.getByRole("button", { name: "Close MR" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(gitLabAction).toHaveBeenCalledTimes(1);
+  });
+
   it("shows an unverified write without success or automatic retry", async () => {
     vi.mocked(gitLabAction).mockResolvedValue({ identity, action: "close", outcome: "unverified", message: "The action may have applied. Refresh before trying again." });
     wrap(<GitLabDetail identity={identity} />);

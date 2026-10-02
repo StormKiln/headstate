@@ -7,14 +7,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PAGES: usize = 5;
 const PAGE_SIZE: usize = 100;
-const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,16 +167,37 @@ pub struct MergeRequestDetail {
 pub async fn fetch(identity: &PrIdentity) -> Result<MergeRequestDetail, DetailIssue> {
     validate_identity(identity)?;
     let program = super::auth::find_glab().ok_or(DetailIssue::MissingCli)?;
-    let viewer = super::auth::viewer(&program, &identity.source.host).await?;
+    let deadline = tokio::time::Instant::now() + DETAIL_TIMEOUT;
+    let initial = super::transport::Context::new(
+        &program,
+        &identity.source.host,
+        super::transport::Class::Foreground,
+        deadline,
+    );
+    let (viewer, context) =
+        super::auth::viewer_with_context(&program, &identity.source.host, &initial).await?;
     static READS: std::sync::LazyLock<
         super::coalesce::Reads<Result<MergeRequestDetail, DetailIssue>>,
     > = std::sync::LazyLock::new(super::coalesce::Reads::default);
-    let key = serde_json::to_string(&(identity, &viewer, super::queues::generation()))
-        .expect("serializable identity");
+    let key = serde_json::to_string(&(
+        identity,
+        &viewer,
+        context.generation,
+        super::queues::generation(),
+    ))
+    .expect("serializable identity");
     let mut detail = READS
-        .run(key, fetch_with_program(&program, identity, DETAIL_TIMEOUT))
-        .await?;
-    if super::auth::viewer(&program, &identity.source.host).await? != viewer {
+        .run_until(
+            key,
+            fetch_context(&program, identity, &context),
+            Result::is_ok,
+            deadline,
+        )
+        .await
+        .map_err(|_| DetailIssue::Timeout)??;
+    if super::auth::viewer_context(&program, &identity.source.host, &context).await? != viewer
+        || !context.current()
+    {
         return Err(DetailIssue::Unauthorized);
     }
     detail.viewer = Some(viewer);
@@ -203,16 +222,32 @@ pub(super) fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue
     Ok(())
 }
 
+#[cfg(all(test, unix))]
 async fn fetch_with_program(
     program: &Path,
     identity: &PrIdentity,
     budget: Duration,
 ) -> Result<MergeRequestDetail, DetailIssue> {
+    let context = super::transport::Context::new(
+        program,
+        &identity.source.host,
+        super::transport::Class::Foreground,
+        tokio::time::Instant::now() + budget,
+    );
+    fetch_context(program, identity, &context).await
+}
+async fn fetch_context(
+    program: &Path,
+    identity: &PrIdentity,
+    context: &super::transport::Context,
+) -> Result<MergeRequestDetail, DetailIssue> {
     validate_identity(identity)?;
     let started = tokio::time::Instant::now();
+    let budget = context.deadline.saturating_duration_since(started);
     let project = encode_project(&identity.repo);
     let base = format!("projects/{project}/merge_requests/{}", identity.number);
     let core_page = request(
+        context,
         program,
         &identity.source.host,
         &base,
@@ -222,6 +257,7 @@ async fn fetch_with_program(
     let core = map_core(&core_page.body, identity).ok_or(DetailIssue::InvalidResponse)?;
 
     let pipelines = read_pages(
+        context,
         program,
         &identity.source.host,
         &format!("{base}/pipelines"),
@@ -247,6 +283,7 @@ async fn fetch_with_program(
     let current_head_jobs = if let Some((pipeline_project, id)) = current {
         Some(
             read_pages(
+                context,
                 program,
                 &identity.source.host,
                 &format!("projects/{pipeline_project}/pipelines/{id}/jobs"),
@@ -261,6 +298,7 @@ async fn fetch_with_program(
         None
     };
     let approvals = read_one(
+        context,
         program,
         &identity.source.host,
         &format!("{base}/approvals"),
@@ -270,6 +308,7 @@ async fn fetch_with_program(
     )
     .await;
     let approval_rules = read_one(
+        context,
         program,
         &identity.source.host,
         &format!("{base}/approval_state"),
@@ -279,6 +318,7 @@ async fn fetch_with_program(
     )
     .await;
     let comments = read_pages(
+        context,
         program,
         &identity.source.host,
         &format!("{base}/notes"),
@@ -289,6 +329,7 @@ async fn fetch_with_program(
     )
     .await;
     let discussions = match read_pages(
+        context,
         program,
         &identity.source.host,
         &format!("{base}/discussions"),
@@ -334,6 +375,7 @@ fn remaining(started: tokio::time::Instant, budget: Duration) -> Result<Duration
 }
 
 async fn read_one<T>(
+    context: &super::transport::Context,
     program: &Path,
     host: &str,
     endpoint: &str,
@@ -342,14 +384,23 @@ async fn read_one<T>(
     mapper: fn(&Value) -> Option<T>,
 ) -> ReadState<T> {
     let result = async {
-        let response = request(program, host, endpoint, remaining(started, budget)?).await?;
+        let response = request(
+            context,
+            program,
+            host,
+            endpoint,
+            remaining(started, budget)?,
+        )
+        .await?;
         mapper(&response.body).ok_or(DetailIssue::InvalidResponse)
     }
     .await;
     result.into()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_pages<T, K>(
+    context: &super::transport::Context,
     program: &Path,
     host: &str,
     endpoint: &str,
@@ -379,7 +430,7 @@ where
             }
         };
         let url = format!("{endpoint}?per_page={PAGE_SIZE}&page={page_number}");
-        let response = match request(program, host, &url, timeout).await {
+        let response = match request(context, program, host, &url, timeout).await {
             Ok(response) => response,
             Err(issue) if page_number == 1 => return ReadState::Unavailable { issue },
             Err(_) => {
@@ -456,16 +507,22 @@ pub(super) struct Response {
 }
 
 async fn request(
+    context: &super::transport::Context,
     program: &Path,
     host: &str,
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Response, DetailIssue> {
-    request_json(program, host, endpoint, "GET", None, timeout).await
+    let mut context = context.clone();
+    context.deadline = context.deadline.min(tokio::time::Instant::now() + timeout);
+    request_json_context(program, host, endpoint, "GET", None, &context)
+        .await
+        .map_err(|e| e.issue)
 }
 
 /// Shared bounded transport. Request bodies go through stdin, never process
 /// arguments, and glab retains ownership of credentials and OAuth refresh.
+#[cfg(all(test, unix))]
 pub(super) async fn request_json(
     program: &Path,
     host: &str,
@@ -474,53 +531,32 @@ pub(super) async fn request_json(
     body: Option<Value>,
     timeout: Duration,
 ) -> Result<Response, DetailIssue> {
-    let mut command = super::host::constrained_command(program, host)
-        .map_err(|_| DetailIssue::UnsupportedHost)?;
-    command.args(["api", "--hostname", host, "-i", endpoint]);
-    if method != "GET" {
-        command.args(["--method", method]);
-    }
-    if body.is_some() {
-        command.args(["--input", "-", "--header", "Content-Type: application/json"]);
-    }
-    command
-        .stdin(if body.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let operation = async {
-        let _permit = super::transport::acquire(program).await;
-        let mut child = command.spawn().map_err(|_| DetailIssue::Request)?;
-        let stdout = child.stdout.take().ok_or(DetailIssue::Request)?;
-        if let Some(body) = body {
-            let bytes = serde_json::to_vec(&body).map_err(|_| DetailIssue::InvalidResponse)?;
-            let mut stdin = child.stdin.take().ok_or(DetailIssue::Request)?;
-            stdin
-                .write_all(&bytes)
-                .await
-                .map_err(|_| DetailIssue::Request)?;
-            stdin.shutdown().await.map_err(|_| DetailIssue::Request)?;
-            drop(stdin);
-        }
-        let mut raw = Vec::new();
-        stdout
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|_| DetailIssue::Request)?;
-        if raw.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err(DetailIssue::InvalidResponse);
-        }
-        let status = child.wait().await.map_err(|_| DetailIssue::Request)?;
-        parse_response(&raw, status.success(), endpoint == "graphql")
-    };
-    tokio::time::timeout(timeout, operation)
+    let context = super::transport::Context::new(
+        program,
+        host,
+        super::transport::Class::Foreground,
+        tokio::time::Instant::now() + timeout,
+    );
+    request_json_context(program, host, endpoint, method, body, &context)
         .await
-        .map_err(|_| DetailIssue::Timeout)?
+        .map_err(|failure| failure.issue)
+}
+
+pub(super) async fn request_json_context(
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    method: &str,
+    body: Option<Value>,
+    context: &super::transport::Context,
+) -> Result<Response, super::transport::Failure> {
+    let envelope = super::transport::api(program, host, endpoint, method, body, context).await?;
+    parse_response(&envelope.bytes(), true, endpoint == "graphql").map_err(|issue| {
+        super::transport::Failure {
+            issue,
+            dispatched: true,
+        }
+    })
 }
 
 fn parse_response(raw: &[u8], successful: bool, graphql: bool) -> Result<Response, DetailIssue> {
@@ -786,6 +822,46 @@ mod tests {
             "detailed_merge_status": "draft_status", "merge_status": "can_be_merged",
             "blocking_discussions_resolved": true, "head_pipeline": null
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cooldown_prevents_a_second_api_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab-fixture");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+echo call >> "$(dirname "$0")/calls"
+printf 'HTTP/2 429\nRetry-After: 300\n\n{"message":"synthetic throttle"}'
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::test_support::scripted(&program, async {
+            for _ in 0..2 {
+                assert!(request_json(
+                    &program,
+                    "gitlab.example",
+                    "user",
+                    "GET",
+                    None,
+                    Duration::from_secs(2)
+                )
+                .await
+                .is_err());
+            }
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     #[test]

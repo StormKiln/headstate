@@ -73,6 +73,7 @@ fn reviewer_states(body: &Value) -> Option<Vec<String>> {
 }
 
 async fn evidence_request(
+    context: &ProcessContext,
     program: &Path,
     host: &str,
     endpoint: &str,
@@ -80,13 +81,13 @@ async fn evidence_request(
     budget: Duration,
 ) -> Result<(Value, Coverage), RequestFailure> {
     if !is_approval {
-        return pages_limited(program, host, endpoint, budget, MAX_REVIEWER_PAGES)
+        return pages_limited_context(context, program, host, endpoint, budget, MAX_REVIEWER_PAGES)
             .await
             .map(|(rows, coverage)| (Value::Array(rows), coverage));
     }
     // Approvals is one object containing all current approvers. Reviewers is
     // a paginated list and must carry its pagination receipt through parsing.
-    let response = request(program, host, endpoint, budget).await?;
+    let response = request_context(context, program, host, endpoint, budget).await?;
     Ok((
         response.body,
         Coverage {
@@ -101,7 +102,22 @@ async fn evidence_request(
     ))
 }
 
+#[cfg(all(test, unix))]
 pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> ReviewEvidence {
+    let context = ProcessContext::new(
+        program,
+        &report.source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + budget,
+    );
+    load_context(&context, program, report, budget).await
+}
+pub(super) async fn load_context(
+    context: &ProcessContext,
+    program: &Path,
+    report: &Report,
+    budget: Duration,
+) -> ReviewEvidence {
     let started = tokio::time::Instant::now();
     let mut result = ReviewEvidence {
         mrs_total: report.history.len(),
@@ -133,6 +149,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> R
                 break;
             }
             match evidence_request(
+                context,
                 program,
                 &report.source.host,
                 &format!("{base}/{suffix}"),

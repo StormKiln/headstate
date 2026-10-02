@@ -17,6 +17,7 @@ export interface AgentContext {
   unresolved_threads: number;
   /// Only the detail view has per-check names and URLs. When absent the
   /// prompt says so rather than implying CI was clean.
+  checks_coverage?: PrDetail["checks_coverage"];
   checks?: { name: string; state: string; url: string }[];
   /// The size of the change, from the detail view. Absent on a list row,
   /// and absent is not zero: the review criteria leave the size out
@@ -145,6 +146,10 @@ export function agentPrompt(pr: AgentContext): string {
     out.push("", "Failing checks: not loaded — open the PR for details.");
   }
 
+  if (pr.checks_coverage && pr.checks_coverage.state !== "complete") {
+    out.push("", `Only ${pr.checks?.length ?? 0} checks loaded${pr.checks_coverage.total == null ? "" : ` of ${pr.checks_coverage.total}`}; remaining checks could not be confirmed. Verify CI before concluding it passed.`);
+  }
+
   if (pr.merge_status === "dirty") out.push("", "This branch has merge conflicts with its base.");
   if (pr.unresolved_threads > 0) {
     out.push(
@@ -226,6 +231,7 @@ export function toAgentContext(pr: PullRequest | PrDetail, checkout?: string): A
     merge_status: pr.merge_status,
     unresolved_threads: pr.unresolved_threads,
     checks: "checks" in pr ? pr.checks : undefined,
+    checks_coverage: "checks_coverage" in pr ? pr.checks_coverage : undefined,
     size:
       "changed_files" in pr
         ? { additions: pr.additions, deletions: pr.deletions, changed_files: pr.changed_files }

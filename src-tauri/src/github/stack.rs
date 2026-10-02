@@ -248,7 +248,7 @@ impl GitHubClient {
     /// Where `number` sits in a stack. Never an error: every failure is
     /// `PrStack::Unknown`, or a partial answer qualified as one.
     pub async fn fetch_pr_stack(&self, owner: &str, name: &str, number: u64) -> PrStack {
-        self.fetch_stack_with_budget(owner, name, number, &Budget::new(), false)
+        self.fetch_stack_with_budget(owner, name, number, &self.request_budget(), false, None)
             .await
     }
 
@@ -261,11 +261,13 @@ impl GitHubClient {
         name: &str,
         number: u64,
         budget: &Budget,
+        expected: Option<(&str, &str)>,
     ) -> PrStack {
-        self.fetch_stack_with_budget(owner, name, number, budget, true)
+        self.fetch_stack_with_budget(owner, name, number, budget, true, expected)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_stack_with_budget(
         &self,
         owner: &str,
@@ -273,6 +275,7 @@ impl GitHubClient {
         number: u64,
         budget: &Budget,
         advisory: bool,
+        expected: Option<(&str, &str)>,
     ) -> PrStack {
         if advisory && !budget.permits(8) {
             return PrStack::Unknown;
@@ -300,6 +303,15 @@ impl GitHubClient {
         // `stackEntry` could be a native stack GitHub declined to describe.
         if super::client::refused_fields_of(&v) > 0 {
             return PrStack::Unknown;
+        }
+        if let Some((head, base)) = expected {
+            let row = &v["repository"]["pullRequest"];
+            if row["number"].as_u64() != Some(number)
+                || row["headRefOid"].as_str() != Some(head)
+                || row["baseRefName"].as_str() != Some(base)
+            {
+                return PrStack::Unknown;
+            }
         }
         let Some(down) = parse_down(&v) else {
             return PrStack::Unknown;

@@ -26,6 +26,7 @@ import { PR_FIXTURES } from "../fixtures/prs";
 const pr = (number: number) => ({ number, title: `PR ${number}` }) as PullRequest;
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["viewer"], "fixture");
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
@@ -171,6 +172,7 @@ describe("background reviewing publications", () => {
     const pending = new Promise<PullRequest[]>((yes) => { resolve = yes; });
     ipc.call.mockImplementation((command: string) => command === "refresh_now" ? pending : Promise.resolve(undefined));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["viewer"], "fixture");
     const wrap = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
     const { result } = renderHook(() => {
       useRefreshRequested();
@@ -197,6 +199,7 @@ describe("background reviewing publications", () => {
     const pending = new Promise((yes, no) => { resolve = yes; reject = no; });
     ipc.call.mockImplementation((command: string) => command === "refresh_now" ? pending : Promise.resolve(undefined));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["viewer"], "fixture");
     const wrap = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
     const { result } = renderHook(() => { useRefreshRequested(); return usePollError(); }, { wrapper: wrap });
     act(() => emit("refresh-requested", null));
@@ -244,6 +247,7 @@ describe("background reviewing publications", () => {
     ipc.call.mockImplementation((command: string) => {
       if (command === "get_cached") return Promise.resolve([row]);
       if (command === "refresh_now") return pending;
+      if (command === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "fixture", commit_oid: row.head_oid, submitted_at: null, pr_id: "id", repo: "o/r", number: 1 } });
       return Promise.resolve(undefined);
     });
     const { result } = renderHook(() => ({
@@ -256,13 +260,13 @@ describe("background reviewing publications", () => {
         receipt_revision: 2, prs: [row], phase: "ready", error: null,
       });
     });
-    let mutation!: Promise<void>;
+    let mutation!: Promise<unknown>;
     act(() => {
       mutation = action === "approve"
-        ? result.current.review("id", "o/r", 1, "approve", "")
+        ? result.current.review("id", "o/r", 1, "approve", "", row.head_oid)
         : result.current.action("id", "o/r", 1, action);
     });
-    const patch = action === "approve" ? { review: "approved" }
+    const patch = action === "approve" ? { review: "review_required", observation: { confirmed_review: { review: "approved" } } }
       : action === "enqueue" ? { in_merge_queue: true } : { is_draft: action === "draft" };
     await waitFor(() => expect(result.current.authored.data?.[0]).toMatchObject(patch));
     expect(result.current.reviewing.data?.[0]).toMatchObject(patch);

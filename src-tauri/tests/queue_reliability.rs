@@ -17,6 +17,7 @@ async fn client(server: &MockServer) -> GitHubClient {
             .base_uri(server.uri())
             .unwrap()
             .personal_token("synthetic-token".to_string())
+            .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
             .build()
             .unwrap(),
     )
@@ -26,6 +27,39 @@ fn page(total: u64) -> serde_json::Value {
         serde_json::from_str(include_str!("fixtures/search.json")).unwrap();
     body["authored"]["issueCount"] = total.into();
     serde_json::json!({"data":body})
+}
+
+// A real primary document with verified identity/head and measured no-CI.
+// Optional ancestry is resolved by its separate advisory owner, not this read.
+fn detail() -> serde_json::Value {
+    serde_json::json!({"data":{"repository":{"pullRequest":{
+        "id":"PR_7", "number":7, "title":"Synthetic detail", "body":"Synthetic description",
+        "url":"https://github.com/octocat/hello-world/pull/7", "state":"OPEN", "isDraft":false,
+        "author":{"login":"octocat"}, "headRefOid":"head-seven", "headRefName":"topic", "baseRefName":"main",
+        "mergeStateStatus":"CLEAN", "mergeable":"MERGEABLE", "reviewDecision":null,
+        "latestReviews":{"totalCount":0,"nodes":[]}, "comments":{"totalCount":0,"nodes":[]},
+        "reviewThreads":{"totalCount":0,"nodes":[]},
+        "commits":{"nodes":[{"commit":{"oid":"head-seven","statusCheckRollup":null}}]}
+    }}}})
+}
+fn assert_detail(detail: &headstate_lib::github::model::PrDetail) {
+    assert_eq!(detail.id, "PR_7");
+    assert_eq!(detail.repo, "octocat/hello-world");
+    assert_eq!(detail.number, 7);
+    assert_eq!(detail.head_oid, "head-seven");
+    assert_eq!(detail.body, "Synthetic description");
+    assert!(matches!(
+        detail.stack,
+        headstate_lib::github::model::PrStack::Unknown
+    ));
+    assert!(detail.checks.is_empty());
+    assert_eq!(
+        detail.checks_coverage,
+        Some(headstate_lib::github::model::ChecksCoverage {
+            state: headstate_lib::github::model::ChecksState::Complete,
+            total: Some(0),
+        })
+    );
 }
 
 #[tokio::test]
@@ -156,24 +190,23 @@ async fn clients_and_list_kinds_do_not_share_results() {
 }
 
 #[tokio::test]
-async fn overlapping_details_share_the_document_and_optional_stack_lookup() {
+async fn overlapping_details_share_one_primary_document_without_optional_stack_reads() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(40))
-                .set_body_json(
-                    serde_json::json!({"data":{"repository":{"pullRequest":{"number":7}}}}),
-                ),
+                .set_body_json(detail()),
         )
         .mount(&server)
         .await;
     let client = client(&server).await;
     let (a, b) = tokio::join!(
-        client.fetch_pr_detail("synthetic/demo", 7),
-        client.fetch_pr_detail("synthetic/demo", 7)
+        client.fetch_pr_detail("octocat/hello-world", 7),
+        client.fetch_pr_detail("octocat/hello-world", 7)
     );
-    assert!(a.is_ok() && b.is_ok());
+    assert_detail(&a.unwrap());
+    assert_detail(&b.unwrap());
     let requests = server.received_requests().await.unwrap();
     let details = requests
         .iter()
@@ -183,6 +216,11 @@ async fn overlapping_details_share_the_document_and_optional_stack_lookup() {
         })
         .count();
     assert_eq!(details, 1, "the same detail read was fetched twice");
+    assert_eq!(
+        requests.len(),
+        1,
+        "primary detail dispatched optional network work"
+    );
 }
 
 #[tokio::test]
@@ -239,9 +277,7 @@ async fn post_write_detail_does_not_wait_behind_an_old_generation() {
                     "data":{"addPullRequestReview":{"pullRequestReview":{"state":"APPROVED"}}}
                 }));
             }
-            let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data":{"repository":{"pullRequest":{"number":7}}}
-            }));
+            let response = ResponseTemplate::new(200).set_body_json(detail());
             if query == headstate_lib::github::query::PR_DETAIL_QUERY
                 && seen.fetch_add(1, Ordering::SeqCst) == 0
             {
@@ -254,7 +290,8 @@ async fn post_write_detail_does_not_wait_behind_an_old_generation() {
         .await;
     let client = client(&server).await;
     let old_client = client.clone();
-    let old = tokio::spawn(async move { old_client.fetch_pr_detail("synthetic/demo", 7).await });
+    let old =
+        tokio::spawn(async move { old_client.fetch_pr_detail("octocat/hello-world", 7).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -269,14 +306,21 @@ async fn post_write_detail_does_not_wait_behind_an_old_generation() {
         .unwrap();
     let fresh = tokio::time::timeout(
         Duration::from_secs(2),
-        client.fetch_pr_detail("synthetic/demo", 7),
+        client.fetch_pr_detail("octocat/hello-world", 7),
     )
     .await;
     old.abort();
     let _ = old.await;
-    assert!(fresh
-        .expect("new generation waited behind old detail")
-        .is_ok());
+    assert_detail(
+        &fresh
+            .expect("new generation waited behind old detail")
+            .unwrap(),
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        3,
+        "expected only old/new primary documents and one write"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(
         !client.has_interactive_reads(),

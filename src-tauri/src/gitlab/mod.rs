@@ -11,4 +11,5 @@ mod test_support;
 
 mod coalesce;
 mod enrichment;
+mod process_session;
 mod transport;

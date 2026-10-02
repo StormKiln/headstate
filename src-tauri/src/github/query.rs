@@ -35,6 +35,7 @@ query($q: String!, $first: Int!, $after: String) {
   viewer { login }
   authored: search(query: $q, type: ISSUE, first: $first, after: $after) {
     issueCount
+    pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
         id number title url isDraft createdAt updatedAt
@@ -192,7 +193,7 @@ query($q: String!, $first: Int!, $after: String) {
         # reviewer who fell outside the window never enters it and is
         # reported as still pending when they have already APPROVED.
         # That names a person and tells you to chase someone who is done.
-        latestReviews(first: 20) { totalCount nodes { state author { login } } }
+        latestReviews(first: 20) { totalCount nodes { id state submittedAt commit { oid } author { login } } }
         labels(first: 20) { totalCount nodes { name color } }
         # 100, the connection maximum, so the badge is an exact count
         # rather than a cap (#810). It was `first: 20`, and the mapper
@@ -667,13 +668,13 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # `latestReviews` returns one review per reviewer, so a small page
       # covers any realistic pull request and the viewer's entry is
       # found by matching login.
-      latestReviews(first: 20) { nodes { state author { login } } }
+      latestReviews(first: 20) { nodes { id state submittedAt commit { oid } author { login } } }
       # `committedDate` is the head commit's own date for the header's
       # "last commit" (#1457). The COMMITTER's clock, not the push: a
       # rebase or a late push leaves it earlier than the push, which is
       # why the view never calls it one.
       commits(last: 1) {
-        nodes { commit { committedDate statusCheckRollup {
+        nodes { commit { oid committedDate statusCheckRollup {
           state
           # 100 is the connection maximum. The page is NOT the cost --
           # measured on the list query, `first: 1` and `first: 20` cost
@@ -684,7 +685,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # missing rather than rendering a plausible-looking subset.
           # #790 cut the page budget from 20 to 3, which means the cap
           # is now reachable on a real pull request -- and the whole
-          # reason the pagination exists (see `append_remaining_checks`)
+          # reason the pagination exists (see `collect_detail_checks`)
           # is that a truncated check list does not look truncated.
           # Free: GitHub charges the connection, not the fields on it,
           # and the detail query still totals 1 point.
@@ -693,6 +694,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
             pageInfo { hasNextPage endCursor }
             nodes {
             ... on CheckRun {
+              id
               name conclusion detailsUrl
               # The workflow RUN, not the check run: re-running failed
               # jobs is one REST call per run, where per-check would be
@@ -702,7 +704,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
               # treats it as optional rather than assuming it.
               checkSuite { workflowRun { databaseId } }
             }
-            ... on StatusContext { context state targetUrl }
+            ... on StatusContext { id context state targetUrl }
             }
           }
         } } }
@@ -733,23 +735,21 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
+      number headRefOid
       commits(last: 1) {
-        nodes { commit { statusCheckRollup {
+        nodes { commit { oid statusCheckRollup {
           contexts(first: 100, after: $after) {
-            # Re-selected per page so the merged value is the one from
-            # the LAST page fetched. A rollup that grows mid-pagination
-            # (a workflow that queues more jobs) would otherwise report
-            # a total from before the growth, understating what is
-            # missing -- and understating is the failure mode #790's cap
-            # is specifically guarding against.
+            # Re-selected to detect rollup changes between pages. A
+            # conflicting total is unknown, never a guessed complete count.
             totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
               ... on CheckRun {
+                id
                 name conclusion detailsUrl
                 checkSuite { workflowRun { databaseId } }
               }
-              ... on StatusContext { context state targetUrl }
+              ... on StatusContext { id context state targetUrl }
             }
           }
         } } }
@@ -794,7 +794,7 @@ query PrStack($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     defaultBranchRef { name }
     pullRequest(number: $number) {
-      number headRefName baseRefName isCrossRepository
+      number headRefName headRefOid baseRefName isCrossRepository
       # `entries` is the native stack's whole membership, bottom first
       # (#1468): the stack-merge confirmation names every open pull
       # request a merge would land. 50 is past any stack `gh stack` makes;
@@ -940,6 +940,19 @@ pub fn merged_heads_query(n: usize) -> String {
          repository(owner: $owner, name: $name) {{\n    \
          defaultBranchRef {{ name }}\n{aliases}  }}\n}}\n"
     )
+}
+
+/// Small identity/membership probes; variables keep repository and search data out of the document.
+pub fn membership_confirmation_query(count: usize) -> String {
+    assert!((1..=4).contains(&count));
+    let vars = (0..count)
+        .map(|i| format!("$o{i}:String!,$r{i}:String!,$n{i}:Int!,$q{i}:String!"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fields = (0..count).map(|i| format!(r#"
+      p{i}:repository(owner:$o{i},name:$r{i}) {{ pullRequest(number:$n{i}) {{ id number state headRefOid createdAt repository {{ nameWithOwner }} }} }}
+      m{i}:search(query:$q{i},type:ISSUE,first:25) {{ issueCount pageInfo {{ hasNextPage endCursor }} nodes {{ ... on PullRequest {{ id number repository {{ nameWithOwner }} }} }} }}"#)).collect::<String>();
+    format!("query QueueConfirmation({vars}) {{ viewer {{ login }} rateLimit {{ cost remaining resetAt }} {fields} }}")
 }
 
 #[cfg(test)]
@@ -1577,7 +1590,15 @@ mod tests {
         }
         // What the PAGINATION reads, which no mapper names. Without these the
         // loop stops after one page and the list is short without saying so.
-        for f in ["pageInfo", "hasNextPage", "endCursor"] {
+        for f in [
+            "pageInfo",
+            "hasNextPage",
+            "endCursor",
+            "id",
+            "oid",
+            "headRefOid",
+            "number",
+        ] {
             assert!(
                 q.contains(f),
                 "the cursor loop at client.rs:822 reads `{f}`; without it \
@@ -1826,6 +1847,41 @@ mod tests {
     ///   partial answer, which is the property this whole family of guards
     ///   is about. Out of scope deliberately, not overlooked.
     #[test]
+    fn membership_confirmation_query_has_identity_bucket_and_complete_evidence() {
+        let query = super::membership_confirmation_query(4);
+        for i in 0..4 {
+            assert!(query.contains(&format!("p{i}:repository(owner:$o{i},name:$r{i})")));
+            assert!(query.contains(&format!("m{i}:search(query:$q{i},type:ISSUE,first:25)")));
+        }
+        for field in [
+            "id number state headRefOid createdAt",
+            "repository { nameWithOwner }",
+            "issueCount pageInfo { hasNextPage endCursor }",
+            "viewer { login }",
+            "rateLimit { cost remaining resetAt }",
+        ] {
+            assert!(query.contains(field), "missing {field}");
+        }
+        assert!(!query.contains("mergeable"));
+        assert!(super::PRS_QUERY.contains("pageInfo { hasNextPage endCursor }"));
+    }
+
+    #[test]
+    fn review_authority_fields_are_selected_in_list_and_detail() {
+        for document in [PRS_QUERY, PR_DETAIL_QUERY] {
+            let selection = document
+                .lines()
+                .find(|line| line.trim_start().starts_with("latestReviews("))
+                .expect("review connection");
+            assert!(
+                selection
+                    .contains("nodes { id state submittedAt commit { oid } author { login } }"),
+                "review identity, ordering and head are required: {selection}"
+            );
+        }
+    }
+
+    #[test]
     fn every_graphql_document_has_a_shape_guard() {
         /// Documents with no shape guard, and why.
         ///
@@ -2026,7 +2082,7 @@ mod tests {
         for f in [
             "rateLimit { cost remaining resetAt }",
             "defaultBranchRef { name }",
-            "number headRefName baseRefName isCrossRepository",
+            "number headRefName headRefOid baseRefName isCrossRepository",
             "stackEntry { position stack { number size",
             "entries(first: 50) { totalCount nodes { position pullRequest {",
             "number title state isDraft reviewDecision",

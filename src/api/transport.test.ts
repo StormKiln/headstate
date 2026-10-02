@@ -131,6 +131,7 @@ const ROWS: Row[] = [
   row(api.buildTarget, [], "build_target"),
   row(api.countReviewing, [], "count_reviewing"),
   row(api.getViewer, [], "get_viewer"),
+  row(api.reviewPrAtHead, [{ id, repo, number, verdict, body, expected_head: "fixture-head", expected_viewer: "fixture" }], "review_pr_at_head", { request: { id, repo, number, verdict, body, expected_head: "fixture-head", expected_viewer: "fixture" } }),
   row(api.reviewPr, [id, repo, number, verdict, body], "review_pr", { id, repo, number, verdict, body }),
   row(api.commentOnPr, [id, repo, number, body], "comment_on_pr", { id, repo, number, body }),
   row(api.resolveThread, [threadId, repo, number], "resolve_thread", { threadId, repo, number }),

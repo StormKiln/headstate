@@ -103,6 +103,15 @@ pub struct Publication {
 }
 
 impl SourcePolls {
+    fn readback_is_current(&self, source: &Source, list: CachedList, generation: u64) -> bool {
+        *self
+            .5
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .unwrap_or(&0)
+            == generation
+    }
     fn before_mutation(&self, attempt: &Attempt) -> bool {
         self.5
             .lock()
@@ -125,6 +134,15 @@ impl SourcePolls {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert((source.clone(), list), minimum);
         }
+    }
+    /// Caller holds the publication gate; the effect retires pre-write work.
+    fn effect_generation(&self, source: &Source, list: CachedList) -> u64 {
+        let (generation, _) = self.begin_request(source, list, None);
+        self.5
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.clone(), list), generation);
+        generation
     }
     fn gate(&self, source: &Source, list: CachedList) -> Arc<tokio::sync::Mutex<()>> {
         self.1
@@ -226,20 +244,28 @@ impl SourcePolls {
         result: Result<crate::gitlab::queues::FetchedList, Failure>,
         emit: impl FnOnce(Status),
     ) {
-        let attempt = &publication.attempt;
-        let status_result = match result {
-            Ok(result) => {
-                let coverage = result.coverage.clone();
-                self.4.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    (attempt.source.clone(), attempt.list),
-                    (attempt.generation, result),
-                );
-                Ok(coverage)
+        let session = result.as_ref().ok().and_then(|r| r.session.clone());
+        let complete = || {
+            let attempt = &publication.attempt;
+            let status_result = match result {
+                Ok(result) => {
+                    let coverage = result.coverage.clone();
+                    self.4.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        (attempt.source.clone(), attempt.list),
+                        (attempt.generation, result),
+                    );
+                    Ok(coverage)
+                }
+                Err(error) => Err(error),
+            };
+            if let Some(status) = self.finish(attempt, status_result) {
+                emit(status);
             }
-            Err(error) => Err(error),
         };
-        if let Some(status) = self.finish(attempt, status_result) {
-            emit(status);
+        if let Some(session) = session {
+            session.with_current(complete);
+        } else {
+            complete();
         }
     }
     fn winner(
@@ -498,6 +524,652 @@ pub fn winner_gitlab(
     app.state::<SourcePolls>().winner_gitlab(attempt, fallback)
 }
 
+/// Load a durable checkpoint only after authenticating this immutable client.
+/// The operation allowance also covers a cold viewer lookup.
+pub async fn fetch_github_step(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+) -> Result<FetchedList, crate::github::client::ClientError> {
+    use crate::github::{admission::ReadContext, client::ClientError};
+    let client = client
+        .with_read_context(ReadContext::new(client.read_context().class, budget))
+        .with_attempt_limit(3);
+    let viewer = match client.known_viewer().filter(|v| !v.is_empty()) {
+        Some(v) => v.to_string(),
+        None => client.fetch_viewer().await?,
+    };
+    let owner = viewer.clone();
+    let path = crate::commands::db_path(app);
+    let (loaded, rows) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
+            let conn = crate::store::open_db(&path)?;
+            let conn = conn.unchecked_transaction()?;
+            let source = Source::default();
+            let checkpoint = crate::queue_scan::load(&conn, &source, list, &owner)?;
+            let rows = if crate::store::source_cache::snapshot_owner(&conn, &source, list)?
+                .as_deref()
+                == Some(&owner)
+            {
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)?.data {
+                    crate::store::source_cache::SnapshotData::Available { prs, .. } => prs,
+                    _ => vec![],
+                }
+            } else {
+                vec![]
+            };
+            Ok((checkpoint, rows))
+        })
+        .await
+        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
+        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
+    client
+        .advance_scan(list, loaded, &rows, chrono::Utc::now().timestamp())
+        .await
+}
+
+/// Called with the source publication permit held, before persistence and emission.
+/// The last committed receipt wins over disk; disk is only the restart baseline.
+pub async fn reconcile_github(
+    app: &AppHandle,
+    publication: &Publication,
+    result: FetchedList,
+) -> Result<FetchedList, Failure> {
+    let list = publication.attempt.list;
+    let source = publication.attempt.source.clone();
+    let previous = app
+        .state::<SourcePolls>()
+        .2
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .map(|(_, receipt)| receipt.clone());
+    let path = crate::commands::db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::open_db(&path)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
+        reconcile_github_snapshot(&conn, &source, list, result, previous)
+    })
+    .await
+    .map_err(|_| inventory_failure("The inventory refresh could not be completed."))?
+}
+
+fn inventory_failure(message: &str) -> Failure {
+    Failure {
+        message: message.into(),
+        transient: true,
+        not_asked: false,
+    }
+}
+
+/// Publication preparation is shared by foreground, background and recheck.
+/// Never guess ownership from disk: an unverified response is an error, not a
+/// replacement receipt. The caller completes that failure without saving rows.
+fn reconcile_github_snapshot(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    mut result: FetchedList,
+    previous: Option<FetchedList>,
+) -> Result<FetchedList, Failure> {
+    let owner = result
+        .viewer
+        .as_deref()
+        .filter(|viewer| !viewer.is_empty())
+        .ok_or_else(|| {
+            inventory_failure(
+                "The account could not be confirmed. Showing the last known inventory.",
+            )
+        })?;
+    if let Some(scan) = &result.scan {
+        if crate::queue_scan::accepted(conn, source, list, owner, scan)
+            .map_err(|_| inventory_failure("The saved queue receipt could not be read."))?
+        {
+            if let crate::store::source_cache::SnapshotData::Available { prs, coverage, .. } =
+                crate::store::source_cache::load_source_snapshot(conn, source, list)
+                    .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+                    .data
+            {
+                result.prs = prs;
+                result.coverage = coverage;
+                return Ok(result);
+            }
+            return Err(inventory_failure(
+                "The accepted queue inventory is unavailable.",
+            ));
+        }
+    }
+    let previous = if let Some(receipt) =
+        previous.filter(|receipt| receipt.viewer.as_deref() == Some(owner))
+    {
+        receipt.prs
+    } else if crate::store::source_cache::snapshot_owner(conn, source, list)
+        .map_err(|_| inventory_failure("The saved inventory owner could not be read."))?
+        .as_deref()
+        == Some(owner)
+    {
+        match crate::store::source_cache::load_source_snapshot(conn, source, list)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+            .data
+        {
+            crate::store::source_cache::SnapshotData::Available { prs, .. } => prs,
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
+    result.prs = crate::inventory::reconcile(
+        previous,
+        result.prs,
+        matches!(result.coverage, Coverage::Complete),
+        chrono::Utc::now(),
+    );
+    if let Some(scan) = &result.scan {
+        result
+            .prs
+            .retain(|row| !scan.removals.contains(&row.identity()));
+        let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            crate::store::source_cache::save_owned_source_snapshot(
+                tx,
+                source,
+                list,
+                &result.prs,
+                &result.coverage,
+                Some(owner),
+            )
+        })
+        .map_err(|_| inventory_failure("The queue progress could not be saved."))?;
+        if !committed {
+            return Err(inventory_failure(
+                "The queue changed during this step. Its newer progress was retained.",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+/// GitLab uses the same qualified inventory semantics as GitHub.
+pub async fn reconcile_gitlab(
+    app: &AppHandle,
+    publication: &Publication,
+    result: crate::gitlab::queues::FetchedList,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let source = publication.attempt.source.clone();
+    let list = publication.attempt.list;
+    let previous = app
+        .state::<SourcePolls>()
+        .4
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .map(|(_, r)| r.clone());
+    let path = crate::commands::db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::open_db(&path)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
+        reconcile_gitlab_snapshot(&conn, &source, list, result, previous)
+    })
+    .await
+    .map_err(|_| inventory_failure("The queue step could not be completed."))?
+}
+fn reconcile_gitlab_snapshot(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    result: crate::gitlab::queues::FetchedList,
+    previous: Option<crate::gitlab::queues::FetchedList>,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let session = result.session.clone();
+    let reconcile = || reconcile_gitlab_snapshot_current(conn, source, list, result, previous);
+    match session {
+        Some(owner) => owner.with_current(reconcile).unwrap_or_else(|| {
+            Err(inventory_failure(
+                "The GitLab account changed before publication.",
+            ))
+        }),
+        None => reconcile(),
+    }
+}
+fn reconcile_gitlab_snapshot_current(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    mut result: crate::gitlab::queues::FetchedList,
+    previous: Option<crate::gitlab::queues::FetchedList>,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let owner = result
+        .viewer
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| inventory_failure("The GitLab account could not be confirmed."))?;
+    if let Some(scan) = &result.scan {
+        if crate::queue_scan::accepted(conn, source, list, owner, scan)
+            .map_err(|_| inventory_failure("The saved GitLab queue receipt could not be read."))?
+        {
+            if let crate::store::source_cache::SnapshotData::GitLabAvailable {
+                mrs, coverage, ..
+            } = crate::store::source_cache::load_source_snapshot(conn, source, list)
+                .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+                .data
+            {
+                result.mrs = mrs;
+                result.coverage = coverage;
+                return Ok(result);
+            }
+            return Err(inventory_failure(
+                "The accepted GitLab inventory is unavailable.",
+            ));
+        }
+    }
+    let previous = if let Some(old) = previous.filter(|r| r.viewer.as_deref() == Some(owner)) {
+        old.mrs
+    } else if crate::store::source_cache::snapshot_owner(conn, source, list)
+        .map_err(|_| inventory_failure("The saved owner could not be read."))?
+        .as_deref()
+        == Some(owner)
+    {
+        match crate::store::source_cache::load_source_snapshot(conn, source, list)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+            .data
+        {
+            crate::store::source_cache::SnapshotData::GitLabAvailable { mrs, .. } => mrs,
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
+    for row in &mut result.mrs {
+        row.observation = Some(crate::inventory::gitlab_observation(row));
+    }
+    result.mrs = crate::inventory::reconcile(
+        previous
+            .into_iter()
+            .filter(|r| r.viewer.as_deref() == Some(owner))
+            .collect(),
+        result.mrs,
+        matches!(result.coverage, Coverage::Complete),
+        chrono::Utc::now(),
+    );
+    if let Some(scan) = &result.scan {
+        result
+            .mrs
+            .retain(|r| !scan.removals.contains(&r.identity()));
+        let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            crate::store::source_cache::save_owned_gitlab_snapshot(
+                tx,
+                source,
+                list,
+                &result.mrs,
+                &result.coverage,
+                Some(owner),
+            )
+        })
+        .map_err(|_| inventory_failure("The GitLab queue progress could not be saved."))?;
+        if !committed {
+            return Err(inventory_failure(
+                "The GitLab queue changed during this step. Newer progress was retained.",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+enum GithubEffect {
+    ReviewReadback(Box<crate::github::model::PrDetail>, [u64; 2]),
+    QualifyReview(crate::github::mutate::SubmittedReview),
+    Review(crate::inventory::ConfirmedReview),
+    Remove(crate::github::mutate::ConfirmedRemoval),
+}
+pub fn review_read_generation(app: &AppHandle) -> [u64; 2] {
+    let polls = app.state::<SourcePolls>();
+    let generations = polls.5.lock().unwrap_or_else(|e| e.into_inner());
+    [CachedList::Authored, CachedList::Reviewing]
+        .map(|list| *generations.get(&(Source::default(), list)).unwrap_or(&0))
+}
+pub async fn record_review_readback(
+    app: &AppHandle,
+    detail: &crate::github::model::PrDetail,
+    viewer: &str,
+    generations: [u64; 2],
+) {
+    record_github_effect(
+        app,
+        &detail.repo,
+        detail.number,
+        viewer,
+        GithubEffect::ReviewReadback(Box::new(detail.clone()), generations),
+    )
+    .await;
+}
+pub async fn qualify_confirmed_review(
+    app: &AppHandle,
+    receipt: &crate::github::mutate::SubmittedReview,
+) {
+    record_github_effect(
+        app,
+        &receipt.repo,
+        receipt.number,
+        &receipt.actor,
+        GithubEffect::QualifyReview(receipt.clone()),
+    )
+    .await;
+}
+pub async fn record_confirmed_review(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: crate::inventory::ConfirmedReview,
+) {
+    record_github_effect(app, repo, number, viewer, GithubEffect::Review(effect)).await;
+}
+pub async fn record_confirmed_removal(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    effect: crate::github::mutate::ConfirmedRemoval,
+) {
+    let viewer = effect.viewer.clone();
+    record_github_effect(app, repo, number, &viewer, GithubEffect::Remove(effect)).await;
+}
+
+fn persist_github_effect(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    receipt: &FetchedList,
+) -> Result<(), crate::store::StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    crate::store::source_cache::save_owned_source_snapshot(
+        &tx,
+        source,
+        list,
+        &receipt.prs,
+        &receipt.coverage,
+        receipt.viewer.as_deref(),
+    )?;
+    crate::queue_scan::taint(
+        &tx,
+        source,
+        list,
+        receipt.viewer.as_deref().unwrap_or_default(),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+async fn record_github_effect(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: GithubEffect,
+) {
+    let source = Source::default();
+    let polls = app.state::<SourcePolls>();
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let _guard = polls.gate(&source, list).lock_owned().await;
+        let existing = polls
+            .2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .filter(|(_, r)| r.viewer.as_deref() == Some(viewer))
+            .map(|(_, r)| r.clone());
+        let mut receipt = if let Some(receipt) = existing {
+            receipt
+        } else {
+            let path = crate::commands::db_path(app);
+            let source = source.clone();
+            let owner = viewer.to_string();
+            let rows = tauri::async_runtime::spawn_blocking(move || {
+                let conn = crate::store::open_db(&path).ok()?;
+                if crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                    .ok()?
+                    .as_deref()
+                    != Some(&owner)
+                {
+                    return None;
+                }
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                    .ok()?
+                    .data
+                {
+                    crate::store::source_cache::SnapshotData::Available {
+                        prs, coverage, ..
+                    } => Some((prs, coverage)),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some((prs, coverage)) = rows else {
+                continue;
+            };
+            FetchedList {
+                scan: None,
+                viewer: Some(viewer.into()),
+                prs,
+                total: None,
+                coverage,
+            }
+        };
+        let changed = match &effect {
+            GithubEffect::QualifyReview(submitted) => {
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number {
+                        if let Some(effect) = row
+                            .observation
+                            .as_mut()
+                            .and_then(|o| o.confirmed_review.as_mut())
+                        {
+                            if effect.receipt.as_ref().is_some_and(|r| {
+                                r.review_id == submitted.review_id
+                                    && r.actor == submitted.actor
+                                    && r.commit_oid == submitted.commit_oid
+                            }) {
+                                let before = effect.unresolved;
+                                crate::inventory::qualify_review_effect(effect, chrono::Utc::now());
+                                changed |= effect.unresolved != before;
+                            }
+                        }
+                    }
+                }
+                changed
+            }
+            GithubEffect::ReviewReadback(detail, generations) => {
+                let index = if list == CachedList::Authored { 0 } else { 1 };
+                if !polls.readback_is_current(&source, list, generations[index]) {
+                    continue;
+                }
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number && row.id == detail.id {
+                        changed |= crate::inventory::reconcile_detail_review(row, detail);
+                    }
+                }
+                changed
+            }
+            GithubEffect::Review(effect) => {
+                let mut changed = false;
+                for row in &mut receipt.prs {
+                    if row.repo == repo && row.number == number {
+                        changed |= crate::inventory::apply_confirmed_review(row, effect);
+                    }
+                }
+                changed
+            }
+            GithubEffect::Remove(effect) => {
+                crate::inventory::apply_github_removal(&mut receipt.prs, repo, number, effect)
+            }
+        };
+        if !changed {
+            continue;
+        }
+        // The effect itself advances generation before any old request can publish.
+        let generation = polls.effect_generation(&source, list);
+        let path = crate::commands::db_path(app);
+        let saved = receipt.clone();
+        let saved_source = source.clone();
+        let persisted = tauri::async_runtime::spawn_blocking(move || {
+            let conn = crate::store::open_db(&path)?;
+            persist_github_effect(&conn, &saved_source, list, &saved)
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            let _ = app.emit(
+                "store-error",
+                "The confirmed review could not be saved for offline use.",
+            );
+        }
+        polls
+            .2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.clone(), list), (generation, receipt.clone()));
+        let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
+            status.revision += 1;
+            status.receipt_revision = Some(status.revision);
+            status.coverage = Some(receipt.coverage);
+            status.phase = Phase::Unknown;
+            let update = polls.update(status.clone(), None);
+            let _ = app.emit("source-poll-status", update);
+        }
+    }
+}
+
+/// GitLab execute has already validated expected viewer/head and read back the
+/// write. Unverified receipts do not modify durable inventory.
+pub async fn record_gitlab_action(
+    app: &AppHandle,
+    request: &crate::gitlab::actions::ActionRequest,
+    action: &crate::gitlab::actions::Receipt,
+) {
+    if action.outcome != crate::gitlab::actions::Outcome::Verified {
+        return;
+    }
+    let Some(session) = action.session.as_ref() else {
+        return;
+    };
+    let Some(viewer) = request.expected_viewer.as_ref().filter(|v| !v.is_empty()) else {
+        return;
+    };
+    let source = &request.identity.source;
+    let polls = app.state::<SourcePolls>();
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let _guard = polls.gate(source, list).lock_owned().await;
+        let existing = polls
+            .4
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(source.clone(), list))
+            .filter(|(_, r)| r.viewer.as_ref() == Some(viewer))
+            .map(|(_, r)| r.clone());
+        let mut receipt = if let Some(receipt) = existing {
+            receipt
+        } else {
+            let path = crate::commands::db_path(app);
+            let source = source.clone();
+            let owner = viewer.clone();
+            let cached = tauri::async_runtime::spawn_blocking(move || {
+                let conn = crate::store::open_db(&path).ok()?;
+                if crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                    .ok()?
+                    .as_ref()
+                    != Some(&owner)
+                {
+                    return None;
+                }
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                    .ok()?
+                    .data
+                {
+                    crate::store::source_cache::SnapshotData::GitLabAvailable {
+                        mrs,
+                        coverage,
+                        ..
+                    } => Some((mrs, coverage)),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some((mrs, coverage)) = cached else {
+                continue;
+            };
+            crate::gitlab::queues::FetchedList {
+                session: None,
+                scan: None,
+                viewer: Some(viewer.clone()),
+                mrs,
+                total: None,
+                coverage,
+            }
+        };
+        if !crate::inventory::apply_gitlab_action(&mut receipt.mrs, request, action) {
+            continue;
+        }
+        receipt.session = Some(session.clone());
+        let path = crate::commands::db_path(app);
+        let saved_source = source.clone();
+        let saved = receipt.clone();
+        let saved_session = session.clone();
+        let persisted = tauri::async_runtime::spawn_blocking(move || {
+            saved_session.with_current(|| {
+                let conn = crate::store::open_db(&path)?;
+                let tx = conn.unchecked_transaction()?;
+                crate::store::source_cache::save_owned_gitlab_snapshot(
+                    &tx,
+                    &saved_source,
+                    list,
+                    &saved.mrs,
+                    &saved.coverage,
+                    saved.viewer.as_deref(),
+                )?;
+                crate::queue_scan::taint(
+                    &tx,
+                    &saved_source,
+                    list,
+                    saved.viewer.as_deref().unwrap_or_default(),
+                )?;
+                tx.commit()?;
+                Ok::<_, crate::store::StoreError>(())
+            })
+        })
+        .await;
+        if matches!(persisted, Ok(None)) {
+            continue;
+        }
+        if !matches!(persisted, Ok(Some(Ok(())))) {
+            let _ = app.emit(
+                "store-error",
+                "The confirmed action could not be saved for offline use.",
+            );
+        }
+        session.with_current(|| {
+            let generation = polls.effect_generation(source, list);
+            polls
+                .4
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((source.clone(), list), (generation, receipt.clone()));
+            let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
+                status.revision += 1;
+                status.receipt_revision = Some(status.revision);
+                status.coverage = Some(receipt.coverage);
+                status.phase = Phase::Unknown;
+                let _ = app.emit("source-poll-status", polls.update(status.clone(), None));
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +1199,8 @@ mod tests {
         }))
         .unwrap();
         FetchedList {
+            scan: None,
+            viewer: None,
             prs: vec![pr],
             total: Some(1),
             coverage: Coverage::Complete,
@@ -545,6 +1219,154 @@ mod tests {
             "review": null, "unresolved_threads": null
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unread_viewer_cannot_destroy_owned_publication_or_restart_baseline() {
+        use crate::store::source_cache::{
+            load_source_snapshot, save_owned_source_snapshot, snapshot_owner, SnapshotData,
+        };
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        for known in [false, true] {
+            for empty in [false, true] {
+                let server = MockServer::start().await;
+                let client = crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(server.uri())
+                        .unwrap()
+                        .personal_token("synthetic")
+                        .build()
+                        .unwrap(),
+                );
+                if known {
+                    Mock::given(method("POST"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(
+                            serde_json::json!({"data":{"viewer":{"login":"fixture"}}}),
+                        ))
+                        .mount(&server)
+                        .await;
+                    assert_eq!(client.fetch_viewer().await.unwrap(), "fixture");
+                    server.reset().await;
+                }
+                let mut raw: serde_json::Value =
+                    serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+                for node in raw["authored"]["nodes"].as_array_mut().unwrap() {
+                    node["headRefOid"] = serde_json::json!("head-a");
+                }
+                let mut baseline = FetchedList {
+                    scan: None,
+                    viewer: Some("fixture".into()),
+                    prs: crate::github::map::map_list(&raw, "authored"),
+                    total: Some(3),
+                    coverage: Coverage::Complete,
+                };
+                crate::inventory::apply_confirmed_review(
+                    &mut baseline.prs[1],
+                    &crate::inventory::ConfirmedReview {
+                        head_oid: "head-a".into(),
+                        review: crate::github::model::ReviewState::Approved,
+                        confirmed_at: chrono::Utc::now(),
+                        receipt: None,
+                        unresolved: false,
+                        confirmed_by_read: false,
+                    },
+                );
+                if empty {
+                    baseline.prs.clear();
+                    baseline.total = Some(0);
+                }
+                let nodes = if empty {
+                    vec![]
+                } else {
+                    vec![raw["authored"]["nodes"][0].clone()]
+                };
+                let mut response = serde_json::json!({
+                    "data": {"viewer":null, "authored":{"nodes":nodes,"issueCount":3}}, "errors":[{"path":["viewer"]}]
+                });
+                if empty {
+                    response["data"].as_object_mut().unwrap().remove("viewer");
+                }
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .mount(&server)
+                    .await;
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("inventory.db");
+                let conn = crate::store::open_db(&path).unwrap();
+                let source = Source::default();
+                let list = CachedList::Reviewing;
+                save_owned_source_snapshot(
+                    &conn,
+                    &source,
+                    list,
+                    &baseline.prs,
+                    &baseline.coverage,
+                    baseline.viewer.as_deref(),
+                )
+                .unwrap();
+                let polls = SourcePolls::default();
+                let first = attempt(&polls, &source, list);
+                polls.complete(
+                    polls.publication(&first).await.unwrap(),
+                    Ok(baseline.clone()),
+                    |_| {},
+                );
+                // Deliberately use disk as the preparation baseline, as after a restart.
+                let next = attempt(&polls, &source, list);
+                let permit = polls.publication(&next).await.unwrap();
+                let fetched = client.fetch_reviewing_snapshot().await.unwrap();
+                let prepared = reconcile_github_snapshot(&conn, &source, list, fetched, None);
+                assert_eq!(prepared.is_ok(), known);
+                if let Ok(receipt) = &prepared {
+                    save_owned_source_snapshot(
+                        &conn,
+                        &source,
+                        list,
+                        &receipt.prs,
+                        &receipt.coverage,
+                        receipt.viewer.as_deref(),
+                    )
+                    .unwrap();
+                }
+                let mut emitted = None;
+                polls.complete(permit, prepared, |status| {
+                    let update = polls.update(status, None);
+                    let rows = update.prs.unwrap();
+                    assert_eq!(rows.len(), baseline.prs.len());
+                    if !empty {
+                        assert!(rows.iter().any(|r| r
+                            .observation
+                            .as_ref()
+                            .is_some_and(|o| o.confirmed_review.is_some())));
+                    }
+                    assert_eq!(update.status.error.is_some(), !known);
+                    emitted = Some(serde_json::to_value(rows).unwrap());
+                });
+                drop(conn);
+                let restarted = crate::store::open_db(&path).unwrap();
+                assert_eq!(
+                    snapshot_owner(&restarted, &source, list)
+                        .unwrap()
+                        .as_deref(),
+                    Some("fixture")
+                );
+                let SnapshotData::Available { prs, .. } =
+                    load_source_snapshot(&restarted, &source, list)
+                        .unwrap()
+                        .data
+                else {
+                    panic!("lost owned snapshot")
+                };
+                assert_eq!(serde_json::to_value(&prs).unwrap(), emitted.unwrap());
+                assert_eq!(prs.len(), baseline.prs.len());
+                if !empty {
+                    assert!(prs.iter().any(|r| r
+                        .observation
+                        .as_ref()
+                        .is_some_and(|o| o.confirmed_review.is_some())));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -569,6 +1391,8 @@ mod tests {
         polls.complete_gitlab(
             published,
             Ok(crate::gitlab::queues::FetchedList {
+                session: None,
+                scan: None,
                 viewer: None,
                 mrs: vec![gitlab_mr(&source)],
                 total: None,
@@ -596,6 +1420,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_effect_retires_old_success_without_blocking_the_next_attempt() {
+        for source in [
+            Source::default(),
+            Source {
+                provider: Provider::Gitlab,
+                host: "gitlab.com".into(),
+            },
+        ] {
+            let polls = SourcePolls::default();
+            let (old, _) = polls
+                .begin_attempt(source.clone(), CachedList::Reviewing)
+                .await;
+            {
+                let _guard = polls
+                    .gate(&source, CachedList::Reviewing)
+                    .lock_owned()
+                    .await;
+                polls.effect_generation(&source, CachedList::Reviewing);
+            }
+            assert!(polls.success_publication(&old).await.is_none());
+            assert!(
+                !polls.readback_is_current(&source, CachedList::Reviewing, 0),
+                "a pre-review detail receipt cannot clear the newer effect"
+            );
+            let (new, _) = polls.begin_attempt(source, CachedList::Reviewing).await;
+            assert!(polls.success_publication(&new).await.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn mutation_retires_both_old_lists_even_if_the_reconciliation_fails() {
         let polls = SourcePolls::default();
         let source = Source {
@@ -618,6 +1472,8 @@ mod tests {
             .winner_gitlab(
                 &authored,
                 Ok(crate::gitlab::queues::FetchedList {
+                    session: None,
+                    scan: None,
                     viewer: None,
                     mrs: vec![],
                     total: Some(0),
@@ -652,6 +1508,8 @@ mod tests {
             .await;
         let (foreground, _) = polls.begin_attempt(source, CachedList::Authored).await;
         let receipt = crate::gitlab::queues::FetchedList {
+            session: None,
+            scan: None,
             viewer: None,
             mrs: vec![],
             total: Some(0),
@@ -681,6 +1539,8 @@ mod tests {
             .begin_attempt(source.clone(), CachedList::Authored)
             .await;
         let receipt = crate::gitlab::queues::FetchedList {
+            session: None,
+            scan: None,
             viewer: None,
             mrs: vec![gitlab_mr(&source)],
             total: Some(2),
@@ -990,4 +1850,332 @@ mod tests {
         assert_eq!(result.consecutive_failures, 0);
         assert_eq!(result.last_received_at, None);
     }
+    #[test]
+    fn accepted_scan_persists_exact_inventory_and_only_this_steps_rows_are_fresh() {
+        use crate::{
+            inventory::ObservationState,
+            queue_scan::{Commit, State},
+            store::source_cache::{load_source_snapshot, SnapshotData},
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let scan = |revision, after: &str| {
+            Some(Commit {
+                expected_revision: revision,
+                state: State {
+                    after: Some(after.into()),
+                    ..State::default()
+                },
+                removals: vec![],
+            })
+        };
+        let mut first = receipt(1);
+        first.viewer = Some("fixture".into());
+        first.prs[0].head_oid = "head-1".into();
+        first.coverage = Coverage::Partial { total: Some(2) };
+        first.scan = scan(0, "tail-25");
+        let first = reconcile_github_snapshot(&conn, &source, list, first, None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let stamp = first.prs[0].observation.as_ref().unwrap().last_observed_at;
+        let mut second = receipt(2);
+        second.viewer = Some("fixture".into());
+        second.prs[0].head_oid = "head-2".into();
+        second.coverage = Coverage::Partial { total: Some(2) };
+        second.scan = scan(1, "tail-50");
+        let stale = second.clone();
+        let accepted = reconcile_github_snapshot(&conn, &source, list, second, None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let old = accepted
+            .prs
+            .iter()
+            .find(|r| r.number == 1)
+            .unwrap()
+            .observation
+            .as_ref()
+            .unwrap();
+        assert_eq!(old.state, ObservationState::Retained);
+        assert_eq!(old.last_observed_at, stamp);
+        assert_eq!(
+            accepted
+                .prs
+                .iter()
+                .find(|r| r.number == 2)
+                .unwrap()
+                .observation
+                .as_ref()
+                .unwrap()
+                .state,
+            ObservationState::Observed
+        );
+        let SnapshotData::Available { prs, .. } =
+            load_source_snapshot(&conn, &source, list).unwrap().data
+        else {
+            panic!("missing persisted rows")
+        };
+        assert_eq!(prs, accepted.prs);
+        assert!(reconcile_github_snapshot(&conn, &source, list, stale, None).is_err());
+        let checkpoint = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(checkpoint.revision, 2);
+        assert_eq!(checkpoint.state.after.as_deref(), Some("tail-50"));
+        // A confirmed action retires the pending publication but keeps traversal progress.
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        let mut before_action = accepted.clone();
+        before_action.scan = scan(2, "tail-75");
+        assert!(reconcile_github_snapshot(&conn, &source, list, before_action, None).is_err());
+        let after_action = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(after_action.state.after.as_deref(), Some("tail-50"));
+        assert!(after_action.state.tainted);
+    }
+    #[test]
+    fn duplicate_step_reuses_saved_rows_without_advancing_measurement_and_new_steps_retire_it() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Authored;
+        let mut fresh = receipt(7);
+        fresh.viewer = Some("fixture".into());
+        fresh.prs[0].head_oid = "head".into();
+        fresh.scan = Some(Commit {
+            expected_revision: 0,
+            state: State {
+                receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                ..State::default()
+            },
+            removals: vec![],
+        });
+        let accepted = reconcile_github_snapshot(&conn, &source, list, fresh.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let saved = crate::store::source_cache::load_source_snapshot(&conn, &source, list).unwrap();
+        let duplicate = reconcile_github_snapshot(&conn, &source, list, fresh.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(duplicate.prs, accepted.prs);
+        assert_eq!(
+            crate::queue_scan::load(&conn, &source, list, "fixture")
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(
+            crate::store::source_cache::load_source_snapshot(&conn, &source, list).unwrap(),
+            saved
+        );
+        let mut next = fresh.clone();
+        let scan = next.scan.as_mut().unwrap();
+        scan.expected_revision = 1;
+        scan.state.receipt_id = Some(crate::queue_scan::new_receipt_id());
+        reconcile_github_snapshot(&conn, &source, list, next.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert!(reconcile_github_snapshot(&conn, &source, list, fresh, None).is_err());
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        assert!(reconcile_github_snapshot(&conn, &source, list, next.clone(), None).is_err());
+        assert!(!crate::queue_scan::accepted(
+            &conn,
+            &source,
+            list,
+            "other",
+            next.scan.as_ref().unwrap()
+        )
+        .unwrap());
+        let mut wrong_query = next.scan.unwrap();
+        wrong_query.expected_revision = 2;
+        wrong_query.state.version += 1;
+        assert!(
+            !crate::queue_scan::accepted(&conn, &source, list, "fixture", &wrong_query).unwrap()
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitlab_owner_rotation_while_publication_waits_refuses_persist_and_emit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+id=1; test ! -f "$0.other" || id=2
+printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "publication-fixture.example".into(),
+        };
+        let list = CachedList::Reviewing;
+        let old = crate::gitlab::queues::verified_test_session(&program, &source.host).await;
+        let receipt = crate::gitlab::queues::FetchedList {
+            session: Some(old),
+            scan: None,
+            viewer: Some("fixture".into()),
+            mrs: vec![gitlab_mr(&source)],
+            total: Some(1),
+            coverage: Coverage::Complete,
+        };
+        let polls = SourcePolls::default();
+        let (attempt, _) = polls.begin_attempt(source.clone(), list).await;
+        let held = polls.gate(&source, list).lock_owned().await;
+        let waiting = polls.success_publication(&attempt);
+        tokio::pin!(waiting);
+        tokio::select! { biased; _ = &mut waiting => panic!("publication bypassed held gate"), _ = tokio::task::yield_now() => {} }
+        std::fs::write(program.with_extension("other"), "").unwrap();
+        crate::gitlab::queues::verified_test_session(&program, &source.host).await;
+        drop(held);
+        let publication = waiting.await.unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        assert!(reconcile_gitlab_snapshot(&conn, &source, list, receipt.clone(), None).is_err());
+        assert_eq!(
+            crate::store::source_cache::snapshot_owner(&conn, &source, list).unwrap(),
+            None
+        );
+        let mut emitted = false;
+        polls.complete_gitlab(publication, Ok(receipt), |_| emitted = true);
+        assert!(!emitted);
+        assert!(!polls.4.lock().unwrap().contains_key(&(source, list)));
+    }
+
+    #[test]
+    fn gitlab_progress_and_enrichment_commit_separately_and_duplicates_reuse_exact_rows() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source {
+            provider: crate::identity::Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let list = CachedList::Reviewing;
+        let mut mr = gitlab_mr(&source);
+        mr.viewer = Some("fixture".into());
+        mr.head_oid = Some("head".into());
+        let progress = crate::gitlab::queues::FetchedList {
+            session: None,
+            viewer: Some("fixture".into()),
+            mrs: vec![mr],
+            total: Some(2),
+            coverage: Coverage::Partial { total: Some(2) },
+            scan: Some(Commit {
+                expected_revision: 0,
+                state: State {
+                    receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                    after: Some("2".into()),
+                    tainted: true,
+                    ..State::default()
+                },
+                removals: vec![],
+            }),
+        };
+        let core = reconcile_gitlab_snapshot(&conn, &source, list, progress.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let duplicate = reconcile_gitlab_snapshot(&conn, &source, list, progress.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(core, duplicate);
+        let mut enriched = progress;
+        enriched.scan.as_mut().unwrap().expected_revision = 1;
+        enriched.mrs[0].ci = Some(crate::github::model::CiState::Success);
+        let final_rows =
+            reconcile_gitlab_snapshot(&conn, &source, list, enriched.clone(), Some(core))
+                .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(
+            final_rows.mrs[0].ci,
+            Some(crate::github::model::CiState::Success)
+        );
+        assert_eq!(
+            crate::queue_scan::load(&conn, &source, list, "fixture")
+                .unwrap()
+                .revision,
+            2
+        );
+        let duplicate = reconcile_gitlab_snapshot(&conn, &source, list, enriched.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(duplicate, final_rows);
+        // Even already-tainted progress cannot mistake an action's revision for
+        // an accepted enrichment phase: actions clear the receipt identity.
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        assert!(crate::queue_scan::load(&conn, &source, list, "fixture")
+            .unwrap()
+            .state
+            .receipt_id
+            .is_none());
+        assert!(reconcile_gitlab_snapshot(&conn, &source, list, enriched, None).is_err());
+    }
+    #[test]
+    fn review_readback_persists_own_fact_and_taints_accepted_scan_without_losing_tail() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let mut incoming = receipt(1);
+        incoming.viewer = Some("fixture".into());
+        incoming.prs[0].head_oid = "head".into();
+        let scan = Commit {
+            expected_revision: 0,
+            state: State {
+                after: Some("synthetic-tail".into()),
+                receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                ..State::default()
+            },
+            removals: vec![],
+        };
+        incoming.scan = Some(scan.clone());
+        let mut accepted = reconcile_github_snapshot(&conn, &source, list, incoming, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let now = chrono::Utc::now();
+        let row = &mut accepted.prs[0];
+        let written = crate::github::mutate::SubmittedReview {
+            review_id: "review".into(),
+            state: "APPROVED".into(),
+            actor: "fixture".into(),
+            commit_oid: "head".into(),
+            submitted_at: Some(now),
+            pr_id: row.id.clone(),
+            repo: row.repo.clone(),
+            number: row.number,
+        };
+        crate::inventory::apply_confirmed_review(
+            row,
+            &crate::inventory::ConfirmedReview {
+                head_oid: "head".into(),
+                review: crate::github::model::ReviewState::Approved,
+                confirmed_at: now,
+                receipt: Some(written),
+                unresolved: false,
+                confirmed_by_read: false,
+            },
+        );
+        persist_github_effect(&conn, &source, list, &accepted).unwrap();
+        let checkpoint = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(checkpoint.state.after.as_deref(), Some("synthetic-tail"));
+        assert!(checkpoint.state.receipt_id.is_none());
+        assert!(!crate::queue_scan::accepted(&conn, &source, list, "fixture", &scan).unwrap());
+        let crate::store::source_cache::SnapshotData::Available { prs, .. } =
+            crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+                .unwrap()
+                .data
+        else {
+            panic!("snapshot");
+        };
+        let effect = prs[0]
+            .observation
+            .as_ref()
+            .unwrap()
+            .confirmed_review
+            .as_ref()
+            .unwrap();
+        assert_eq!(effect.receipt.as_ref().unwrap().review_id, "review");
+        assert_eq!(
+            crate::store::source_cache::snapshot_owner(&conn, &source, list)
+                .unwrap()
+                .as_deref(),
+            Some("fixture")
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "source_poll_integration_tests.rs"]
+mod integration_tests;

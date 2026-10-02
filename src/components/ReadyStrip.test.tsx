@@ -23,9 +23,16 @@ const invoke = vi.hoisted(() =>
   vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+const eventHandlers = vi.hoisted(() => new Map<string, (event: { payload: unknown }) => void>());
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+  eventHandlers.set(name, handler);
+  return Promise.resolve(() => eventHandlers.delete(name));
+}) }));
 
 import { ReadyStrip } from "./ReadyStrip";
+import { useSourceRefresh } from "@/api/sourceRefreshHooks";
+import { remoteEventError } from "@/api/wireContract";
+import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
 import type { PullRequest, RowPusher } from "@/types/pr";
@@ -36,14 +43,15 @@ let stackAnswers: { repo: string; number: number; stack: unknown }[] = [];
 let viewerLogin: Promise<unknown> = Promise.resolve("me");
 
 beforeEach(() => {
+  eventHandlers.clear();
   pusherAnswers = [];
   stackAnswers = [];
   viewerLogin = Promise.resolve("me");
   invoke.mockReset();
-  invoke.mockImplementation((cmd: string) => {
+  invoke.mockImplementation((cmd: string, args) => {
     if (cmd === "get_viewer") return viewerLogin;
-    if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers);
-    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers);
+    if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers.map(answer => ({ valid_for_ms: 60_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
+    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
     return Promise.resolve(null);
   });
 });
@@ -76,6 +84,33 @@ const ready: PullRequest = {
 };
 
 describe("ReadyStrip", () => {
+  it("keeps unread-head transport receipts out of Ready until a positively changed head", async () => {
+    function FromSource() {
+      const state = useSourceRefresh("reviewing");
+      return <ReadyStrip prs={state.prs ?? []} onOpen={vi.fn()} />;
+    }
+    render(<FromSource />);
+    await waitFor(() => expect(eventHandlers.has("source-poll-status")).toBe(true));
+    let revision = 0;
+    for (const [stage, fields] of Object.entries(headTransitions.expected)) {
+      // Rust's mapper→reconcile regression pins every readiness input here.
+      const row = { ...ready, ...fields };
+      const payload = {
+        source: { provider: "github", host: "github.com" }, list: "reviewing",
+        phase: "partial", revision: ++revision, receipt_revision: revision,
+        session: "synthetic-desktop", request_id: null, completed_request: null,
+        consecutive_failures: 0, last_received_at: headTransitions.time,
+        coverage: { partial: { total: 1 } }, error: null, prs: [row], mrs: null,
+      };
+      expect(remoteEventError("source-poll-status", payload)).toBeNull();
+      act(() => eventHandlers.get("source-poll-status")!({ payload }));
+      if (stage === "changed_head" || stage === "retained_unread_without_effect") {
+        await waitFor(() => expect(screen.getByText("Ready one")).toBeTruthy());
+        if (stage === "retained_unread_without_effect") expect(screen.getByText(/Last known — not confirmed/)).toBeTruthy();
+      } else expect(screen.queryByText("Ready one")).toBeNull();
+    }
+  });
+
   it("lists what a reviewer can pick up", () => {
     render(<ReadyStrip prs={[ready]} onOpen={vi.fn()} />);
     expect(screen.getByText("Ready one")).toBeTruthy();
@@ -720,13 +755,91 @@ describe("Ready stack context (#1602)", () => {
     let calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
     expect(calls).toHaveLength(1);
     expect((calls[0][1]?.rows as unknown[]).length).toBeLessThanOrEqual(8);
-    // The next batches start only when the previous call has finished.
+    // Finishing one batch must not drain the rest of the invisible list.
     for (let i = 0; i < 3; i++) {
       const resolve = resolveFirst!;
       await act(async () => { resolve([]); });
     }
     calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(1);
     view.unmount();
   });
+});
+
+it("keeps an omitted last-known Ready row visibly qualified", async () => {
+  render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
+  expect(screen.getByText("Ready one")).toBeTruthy();
+  expect(screen.getByText("Last known — not confirmed by latest refresh")).toBeTruthy();
+});
+
+it("bounds two actual mounted 120-row owners and advances beyond the unreadable prefix", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "octocat");
+  const rows = Array.from({ length: 120 }, (_, i) => ({ ...ready, id: `task4-${i}`, number: i + 1, base_ref: `base-${i % 44}`, title: `Task4 row ${i}` }));
+  invoke.mockImplementation(async (cmd, args) => {
+    const asked = args?.rows as (PullRequest & { base: string })[];
+    if (cmd === "get_ready_stacks") return asked.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: { kind: "unknown" } }));
+    if (cmd === "get_ready_pushers") return asked.map(pr => ({ ...pr, rules: { state: "unreadable", reason: "synthetic refusal" }, last_pusher: { state: "unknown", reason: "synthetic refusal" } }));
+    return null;
+  });
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={rows} /><ReadyStrip prs={rows} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  expect(screen.getAllByText("Task4 row 119")).toHaveLength(2);
+  for (const command of ["get_ready_stacks", "get_ready_pushers"]) {
+    const calls = invoke.mock.calls.filter(([cmd]) => cmd === command);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]?.rows).toHaveLength(8);
+  }
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
+  expect(calls).toHaveLength(2);
+  const first = new Set((calls[0][1]?.rows as PullRequest[]).map(pr => pr.number));
+  expect((calls[1][1]?.rows as PullRequest[]).every(pr => !first.has(pr.number))).toBe(true);
+  view.unmount();
+  await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
+  qc.clear();
+  vi.useRealTimers();
+});
+
+it("does not reuse same-head last-push rules after the base changes", async () => {
+  const pr = { ...ready, head_repo: ready.repo, head_ref: "feature" };
+  pusherAnswers = [{ repo: pr.repo, number: pr.number, head_oid: pr.head_oid, rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false }, last_pusher: { state: "known", login: "me" } }];
+  const view = render(<ReadyStrip prs={[pr]} />);
+  await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).toBeTruthy());
+  let finish: ((value: unknown) => void) | undefined;
+  invoke.mockImplementation((cmd, args) => cmd === "get_ready_pushers" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(cmd === "get_viewer" ? "me" : (args?.rows as PullRequest[] ?? []).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "unknown" } }))));
+  view.rerender(<ReadyStrip prs={[{ ...pr, base_ref: "changed-base" }]} />);
+  expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
+  await waitFor(() => expect(finish).toBeDefined());
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_pushers").at(-1)?.[1]?.rows).toEqual([expect.objectContaining({ base: "changed-base", head_oid: pr.head_oid })]);
+  await act(async () => { finish!([]); });
+  expect(screen.getByText(pr.title)).toBeTruthy();
+});
+
+it("prioritizes actual observed rows in the next bounded viewport window", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "octocat");
+  let observed: ((entries: IntersectionObserverEntry[]) => void) | undefined;
+  vi.stubGlobal("IntersectionObserver", class {
+    constructor(callback: (entries: IntersectionObserverEntry[]) => void) { observed = callback; }
+    observe() {} disconnect() {}
+  });
+  const rows = Array.from({ length: 20 }, (_, i) => ({ ...ready, number: i + 1, id: `viewport-${i}`, title: `Viewport row ${i}` }));
+  invoke.mockImplementation(async (cmd, args) => cmd === "get_ready_stacks" ? (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "unknown" } })) : []);
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={rows} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  const last = screen.getByText("Viewport row 19").closest("li")!;
+  const rect = last.getBoundingClientRect();
+  await act(async () => { observed!([{ target: last, isIntersecting: true, boundingClientRect: rect, intersectionRatio: 1, intersectionRect: rect, rootBounds: null, time: 0 }]); });
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
+  expect(calls).toHaveLength(2);
+  expect((calls[1][1]?.rows as PullRequest[]).map(pr => pr.number)).toContain(20);
+  view.unmount(); qc.clear(); vi.unstubAllGlobals(); vi.useRealTimers();
 });

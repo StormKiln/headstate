@@ -98,9 +98,11 @@ function productionClient() {
   return new QueryClient();
 }
 
-async function renderGate(target: string, client: QueryClient = productionClient()) {
+async function renderGate(target: string, client: QueryClient = productionClient(), selection: "github" | "both" = "github") {
   vi.stubEnv("VITE_TARGET", target);
   vi.resetModules();
+  const { useSourceSelection } = await import("../store/sourceSelection");
+  useSourceSelection.setState({ selection });
   const { AuthGate } = await import("./AuthGate");
   const { useGitHubAuthAvailable } = await import("../api/authAvailability");
   function AuthAvailability() {
@@ -232,8 +234,8 @@ describe("the companion WITH its desktop reachable", () => {
       host: "gitlab.com", ok: false, issue: "missingCli",
       message: "GitLab CLI (glab) was not found on the desktop running Headstate. Install glab there and run `glab auth login --hostname gitlab.com`.",
     });
-    await renderGate("mobile");
-    expect(await screen.findByText(/Install glab there and run/)).toBeTruthy();
+    await renderGate("mobile", productionClient(), "both");
+    expect((await screen.findAllByText(/Install glab there and run/)).length).toBeGreaterThan(0);
     expect(screen.queryByText(/on this computer/)).toBeNull();
     expect(screen.getByText("the app")).toBeTruthy();
   });
@@ -244,8 +246,8 @@ describe("the companion WITH its desktop reachable", () => {
       host: "gitlab.com", ok: false, issue: "unverified",
       message: "GitLab.com authentication could not be verified. Run `glab auth status --hostname gitlab.com` on the desktop running Headstate; sign in again there if the credential expired.",
     });
-    await renderGate("mobile");
-    expect(await screen.findByText(/Run `glab auth status --hostname gitlab.com` on the desktop/)).toBeTruthy();
+    await renderGate("mobile", productionClient(), "both");
+    expect((await screen.findAllByText(/Run `glab auth status --hostname gitlab.com` on the desktop/)).length).toBeGreaterThan(0);
     expect(screen.queryByText(/on this computer/)).toBeNull();
     expect(screen.getByText("the app")).toBeTruthy();
   });

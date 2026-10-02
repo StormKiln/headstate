@@ -11,8 +11,7 @@ use super::map::{
 use super::model::{CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats};
 use super::query::{
     cycle_trend_query, history_query_range, history_query_range_with_periods, periods_query,
-    COUNT_QUERY, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY, PRS_QUERY, PR_CHECKS_PAGE_QUERY,
-    PR_DETAIL_QUERY, STATS_QUERY,
+    COUNT_QUERY, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY, PRS_QUERY, PR_DETAIL_QUERY, STATS_QUERY,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{stream, StreamExt};
@@ -60,6 +59,8 @@ pub enum ClientError {
     /// wait rather than implying a network fault the user might chase.
     #[error("GitHub rate limit reached — polling will resume automatically ({0})")]
     RateLimited(String),
+    #[error("headstate:not-asked {0}")]
+    NotDispatched(String),
     /// GitHub refused the token: HTTP 401, or a GraphQL body saying so.
     ///
     /// # Why this is a variant rather than a message the UI recognises
@@ -103,7 +104,7 @@ pub enum ClientError {
 impl ClientError {
     // Preserve typed refusals/timeouts for callers; only octocrab's non-Clone
     // transport error needs an Arc wrapper when an in-flight result is shared.
-    fn shared(error: Arc<Self>) -> Self {
+    pub(super) fn shared(error: Arc<Self>) -> Self {
         match error.as_ref() {
             Self::Shared(inner) => Self::shared(inner.clone()),
             Self::Api(_) => Self::Shared(error),
@@ -112,6 +113,7 @@ impl ClientError {
             Self::Timeout(seconds) => Self::Timeout(*seconds),
             Self::Graphql(message) => Self::Graphql(message.clone()),
             Self::RateLimited(message) => Self::RateLimited(message.clone()),
+            Self::NotDispatched(message) => Self::NotDispatched(message.clone()),
             Self::TokenRejected { said } => Self::TokenRejected { said: said.clone() },
             Self::UnconfirmedWrite => Self::UnconfirmedWrite,
         }
@@ -132,7 +134,7 @@ impl ClientError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Shared(error) => error.is_transient(),
-            Self::UnconfirmedWrite => false,
+            Self::UnconfirmedWrite | Self::NotDispatched(_) => false,
             // The request never reached GitHub, or the response never
             // came back. Retrying is exactly the right response.
             ClientError::Timeout(_) => true,
@@ -325,8 +327,11 @@ fn server_gave_up(e: &ClientError) -> bool {
 pub struct GitHubClient {
     octocrab: Octocrab,
     searches: Arc<Searches>,
+    pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
+    pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
+    read_context: Option<super::admission::ReadContext>,
 }
 
 // Client-local: separate accounts never share a result. Only callers which
@@ -345,7 +350,7 @@ struct Searches {
     details: ReadSlots<(String, u64, u64), DetailReceipt>,
 }
 
-struct ActiveRead<'a>(&'a AtomicU64);
+pub(super) struct ActiveRead<'a>(&'a AtomicU64);
 impl<'a> ActiveRead<'a> {
     fn new(count: &'a AtomicU64) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
@@ -376,13 +381,40 @@ pub static REFUSED_FIELDS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// `graphql_partial_ok` stashes the count under a key the mapper
 /// ignores, so it travels with its own response rather than through
 /// shared state that the next request would overwrite.
-fn refused_fields(v: &serde_json::Value) -> usize {
+pub(super) fn refused_fields(v: &serde_json::Value) -> usize {
     v["__refused"].as_u64().unwrap_or(0) as usize
+}
+
+pub(super) fn invalid_cursor_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("invalid cursor")
+        || message.contains("cursor is invalid")
+        || message.contains("not a valid cursor")
+}
+
+// Internal classification for the bounded queue search alias only. Neither
+// provider prose nor error paths are stored or added to the wire model.
+fn mark_queue_cursor_error(data: &mut serde_json::Value, errors: &[serde_json::Value]) {
+    let invalid = errors.iter().any(|error| {
+        error["path"]
+            .as_array()
+            .is_some_and(|path| path.len() == 1 && path[0] == "authored")
+            && error["message"]
+                .as_str()
+                .is_some_and(invalid_cursor_message)
+    });
+    if invalid {
+        if let Some(data) = data.as_object_mut() {
+            data.insert("__queue_cursor_invalid".into(), true.into());
+        }
+    }
 }
 
 /// List evidence retained before legacy numeric wrappers apply defaults.
 #[derive(Clone)]
 pub struct FetchedList {
+    pub scan: Option<crate::queue_scan::Commit>,
+    pub viewer: Option<String>,
     pub prs: Vec<PullRequest>,
     pub total: Option<u64>,
     pub coverage: crate::store::source_cache::Coverage,
@@ -390,15 +422,25 @@ pub struct FetchedList {
 
 fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
     use crate::store::source_cache::Coverage;
-    let total = v["headstate_paging"]["truest_total"]
-        .as_u64()
-        .or_else(|| v["authored"]["issueCount"].as_u64());
-    let refused = refused_fields(v) > 0;
+    let total = (!v["headstate_paging"]["count_conflict"]
+        .as_bool()
+        .unwrap_or(false))
+    .then(|| {
+        v["headstate_paging"]["truest_total"]
+            .as_u64()
+            .or_else(|| v["authored"]["issueCount"].as_u64())
+    })
+    .flatten();
+    let refused = refused_fields(v) > 0 || v["__partial_errors"].as_u64().unwrap_or(0) > 0;
     let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0) > 0;
     let malformed = v["authored"]["nodes"]
         .as_array()
         .is_none_or(|nodes| nodes.len() != prs.len());
-    let coverage = if refused || failed || malformed || total.is_some_and(|n| n > prs.len() as u64)
+    let coverage = if refused
+        || failed
+        || malformed
+        || v["headstate_paging"]["count_conflict"] == true
+        || total.is_some_and(|n| n != prs.len() as u64)
     {
         Coverage::Partial { total }
     } else if total.is_none() || v["headstate_paging"]["count_unknown"] == true {
@@ -407,6 +449,11 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
         Coverage::Complete
     };
     FetchedList {
+        scan: None,
+        viewer: v["viewer"]["login"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         prs,
         total,
         coverage,
@@ -414,12 +461,63 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
 }
 
 impl GitHubClient {
+    /// Immutable operation view. Account/cache/admission owners remain shared.
+    pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
+        if let Some(parent) = &self.read_context {
+            context.deadline = context.deadline.min(parent.deadline);
+            if parent.attempts.is_some() {
+                context.attempts = parent.attempts.clone();
+            }
+        }
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
+        self.read_context.clone().unwrap_or_else(|| {
+            super::admission::ReadContext::new(
+                super::admission::ReadClass::Foreground,
+                SEARCH_BUDGET,
+            )
+        })
+    }
+    pub(crate) fn with_attempt_limit(&self, limit: usize) -> Self {
+        let mut view = self.clone();
+        let mut context = self.read_context();
+        context.attempts = Some(context.attempts.as_ref().map_or_else(
+            || super::admission::AttemptAllowance::new(limit),
+            |parent| parent.child(limit),
+        ));
+        view.read_context = Some(context);
+        view
+    }
+    pub(crate) fn attempts_remaining(&self) -> usize {
+        self.read_context()
+            .attempts
+            .as_ref()
+            .map_or(usize::MAX, |a| a.remaining())
+    }
+
+    pub(crate) fn request_budget(&self) -> super::stats::Budget {
+        super::stats::Budget::with_transport(self.read_transport.clone())
+    }
+    pub(crate) fn observed_remaining(&self) -> Option<u64> {
+        self.read_transport
+            .admission
+            .remaining(super::admission::Bucket::Graphql)
+    }
+    pub(crate) fn rest_reserve_allows(&self) -> bool {
+        self.read_transport.admission.rest_available()
+    }
     pub fn new(octocrab: Octocrab) -> Self {
         Self {
             octocrab,
             searches: Arc::new(Searches::default()),
+            scans: Arc::default(),
             viewer: Arc::default(),
+            advisory: Arc::default(),
             read_transport: Arc::default(),
+            read_context: None,
         }
     }
 
@@ -442,7 +540,13 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        graphql_with_transport(&self.octocrab, body, &self.read_transport).await
+        graphql_with_transport(
+            &self.octocrab,
+            body,
+            &self.read_transport,
+            self.read_context(),
+        )
+        .await
     }
 
     /// Share overlapping equivalent searches, with a deadline that includes
@@ -505,6 +609,10 @@ impl GitHubClient {
             .swap(reviewing, Ordering::Relaxed)
     }
 
+    pub(super) fn active_queue_read(&self) -> ActiveRead<'_> {
+        ActiveRead::new(&self.searches.queue_reads)
+    }
+
     pub fn has_interactive_reads(&self) -> bool {
         self.searches.detail_reads.load(Ordering::Relaxed) > 0
             || self.searches.queue_reads.load(Ordering::Relaxed) > 0
@@ -564,12 +672,19 @@ impl GitHubClient {
         // every approval removes one.
         let mut truest_total = total;
         let mut count_unknown = false;
+        let mut count_conflict = false;
+        let mut partial_errors = merged["__partial_errors"].as_u64().unwrap_or(0);
         let mut all_refused = refused_fields(&merged);
         for page in rest {
             match page {
                 Ok(v) => {
                     all_refused += refused_fields(&v);
+                    if v["__readiness_unknown"] == true {
+                        merged["__readiness_unknown"] = true.into();
+                    }
+                    partial_errors += v["__partial_errors"].as_u64().unwrap_or(0);
                     if let Some(t) = v["authored"]["issueCount"].as_u64() {
+                        count_conflict |= t != u64::from(total);
                         truest_total = truest_total.min(t as u32);
                     } else {
                         count_unknown = true;
@@ -611,8 +726,10 @@ impl GitHubClient {
         // than the number of boundaries is ordinary drift and not worth
         // a warning; anything beyond that is worth seeing.
         merged["__refused"] = json!(all_refused);
+        merged["__partial_errors"] = json!(partial_errors);
         merged["headstate_paging"] = json!({
             "count_unknown": count_unknown,
+            "count_conflict": count_conflict,
             "boundaries": pages.saturating_sub(1),
             "failed_pages": failed_pages,
             "truest_total": truest_total,
@@ -743,6 +860,23 @@ impl GitHubClient {
         })
     }
 
+    fn owned_list_evidence(&self, value: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
+        let mut result = list_evidence(value, prs);
+        // This cell belongs to the immutable authenticated client, not to a
+        // previous on-disk account. A refused viewer field cannot erase it.
+        if result.viewer.is_none() {
+            result.viewer = self
+                .known_viewer()
+                .filter(|viewer| !viewer.is_empty())
+                .map(str::to_owned);
+        }
+        result
+    }
+
+    pub(crate) fn known_viewer(&self) -> Option<&str> {
+        self.viewer.get().map(String::as_str)
+    }
+
     pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_reviewing_snapshot_with_budget(SEARCH_BUDGET)
             .await
@@ -767,6 +901,9 @@ impl GitHubClient {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log).
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
+        if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            let _ = self.viewer.set(viewer);
+        }
         // Counted from THIS response, not from shared state. A global
         // counter raced the next poll -- and, in the test suite, other
         // tests running in parallel.
@@ -817,7 +954,8 @@ impl GitHubClient {
             );
         }
         let refused = refused_fields(&v);
-        Self::reject_empty_after_refusals(mapped, refused).map(|prs| list_evidence(&v, prs))
+        Self::reject_empty_after_refusals(mapped, refused)
+            .map(|prs| self.owned_list_evidence(&v, prs))
     }
 
     /// How many pull requests await the user's review.
@@ -918,6 +1056,10 @@ impl GitHubClient {
     /// bytes and discards them rather than trying to deserialise
     /// nothing, which is what a plain `post::<_, T>` would do and fail.
     pub(super) async fn rest_post(&self, path: &str) -> Result<(), ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -925,9 +1067,33 @@ impl GitHubClient {
                 ._post(path, None::<&()>)
                 .await
                 .map_err(write_error)?;
-            octocrab::map_github_error(response)
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            let response = octocrab::map_github_error(response)
+                .await
+                .map_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Rest,
+                            &error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                    write_error(error)
+                })?;
+            self.octocrab
+                .body_to_string(response)
                 .await
                 .map_err(write_error)?;
+            admission.complete();
             Ok(())
         })
         .await
@@ -944,6 +1110,10 @@ impl GitHubClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -951,15 +1121,36 @@ impl GitHubClient {
                 ._post(path, Some(body))
                 .await
                 .map_err(write_error)?;
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
             let response = octocrab::map_github_error(response)
                 .await
-                .map_err(write_error)?;
+                .map_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Rest,
+                            &error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                    write_error(error)
+                })?;
             let text = self
                 .octocrab
                 .body_to_string(response)
                 .await
                 .map_err(write_error)?;
-            serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)
+            let value = serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
+            admission.complete();
+            Ok(value)
         })
         .await
         .map_err(|_| ClientError::UnconfirmedWrite)?
@@ -992,7 +1183,9 @@ impl GitHubClient {
         path: &str,
         budget: &crate::github::stats::Budget,
     ) -> Result<serde_json::Value, ClientError> {
-        self.read_transport.get(&self.octocrab, path, budget).await
+        self.read_transport
+            .get(&self.octocrab, path, budget, self.read_context())
+            .await
     }
 
     /// A REST PUT with a JSON body, metered into `budget`, returning the
@@ -1006,14 +1199,17 @@ impl GitHubClient {
     /// judges the status. Metered before anything else, for `rest_get`'s
     /// reason: a refusal still spent a `core` request.
     ///
-    /// A body that is not JSON comes back as `Null`, and the caller reads
-    /// the status alone.
+    /// An unreadable body leaves the dispatched write unconfirmed.
     pub(super) async fn rest_put(
         &self,
         path: &str,
         body: &serde_json::Value,
         budget: &crate::github::stats::Budget,
     ) -> Result<(u16, serde_json::Value), ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
             let response = self
@@ -1021,13 +1217,19 @@ impl GitHubClient {
                 ._put(path, Some(body))
                 .await
                 .map_err(write_error)?;
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
+                super::admission::Bucket::Rest,
+                response.status().as_u16(),
+                response.headers(),
+            );
             let remaining = response
                 .headers()
                 .get("x-ratelimit-remaining")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok());
-            budget.record_rest(remaining);
-            let status = response.status().as_u16();
+            budget.record_rest_local(remaining);
             if status >= 500 {
                 return Err(ClientError::UnconfirmedWrite);
             }
@@ -1036,10 +1238,14 @@ impl GitHubClient {
                 .body_to_string(response)
                 .await
                 .map_err(write_error)?;
-            Ok((
-                status,
-                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-            ))
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
+            // PUT's non-success JSON is a semantic answer consumed by its caller.
+            if current_window {
+                self.read_transport.observe_rest_body(&value, retry);
+            }
+            admission.complete();
+            Ok((status, value))
         })
         .await
         .map_err(|_| ClientError::UnconfirmedWrite)?
@@ -1069,12 +1275,46 @@ impl GitHubClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        let mut admission = self
+            .read_transport
+            .admission
+            .write(super::admission::Bucket::Graphql)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         let started = std::time::Instant::now();
-        let posted =
-            tokio::time::timeout(SEARCH_BUDGET, self.octocrab.post("/graphql", Some(body))).await;
+        let posted = tokio::time::timeout(SEARCH_BUDGET, async {
+            let response = self.octocrab._post("/graphql", Some(body)).await?;
+            let status = response.status().as_u16();
+            let retry = super::read_transport::response_retry(response.headers());
+            let current_window = self.read_transport.observe_headers(
+                super::admission::Bucket::Graphql,
+                response.status().as_u16(),
+                response.headers(),
+            );
+            let response = octocrab::map_github_error(response)
+                .await
+                .inspect_err(|error| {
+                    if current_window {
+                        self.read_transport.observe_error(
+                            super::admission::Bucket::Graphql,
+                            error,
+                            retry,
+                        );
+                    }
+                    if status < 500 && matches!(error, octocrab::Error::GitHub { .. }) {
+                        admission.complete();
+                    }
+                })?;
+            let value =
+                <serde_json::Value as octocrab::FromResponse>::from_response(response).await?;
+            if current_window {
+                self.read_transport.observe_graphql(&value, retry);
+            }
+            admission.complete();
+            Ok(value)
+        })
+        .await;
         crate::diag!(
-            "[diag] provider mutation elapsed_ms={} acknowledged={}",
+            "[diag] provider mutation elapsed_ms={} response_received={}",
             started.elapsed().as_millis(),
             matches!(&posted, Ok(Ok(_)))
         );
@@ -1091,6 +1331,11 @@ impl GitHubClient {
 
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
+                // A partial review object alongside errors can follow a dispatched write.
+                // Do not turn that ambiguous receipt into permission to replay it.
+                if raw["data"]["addPullRequestReview"]["pullRequestReview"].is_object() {
+                    return Err(ClientError::UnconfirmedWrite);
+                }
                 let msg = errs
                     .iter()
                     .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
@@ -1108,9 +1353,7 @@ impl GitHubClient {
         // wrong with our request shape; do not report success for it.
         match raw.get("data") {
             Some(d) if !d.is_null() => Ok(d.clone()),
-            _ => Err(ClientError::Graphql(
-                "GitHub returned no result for the change".into(),
-            )),
+            _ => Err(ClientError::UnconfirmedWrite),
         }
     }
 
@@ -1120,9 +1363,9 @@ impl GitHubClient {
     /// The follow-ups are cursor-dependent and therefore strictly
     /// serial, which makes this the one fetch in the app whose latency
     /// is a multiple of a single POST rather than a single POST. That is
-    /// what #790 was: see `append_remaining_checks` for the page budget,
-    /// and `commands::get_pr_detail` for the wall-clock ceiling that now
-    /// bounds the whole chain.
+    /// what #790 was: `collect_detail_checks` bounds continuation attempts,
+    /// and the inherited absolute deadline bounds the whole chain without
+    /// discarding completed primary data when a continuation expires.
     ///
     /// `repo` is `owner/name`; it is split here rather than by the caller
     /// so a malformed value fails in one place with a clear message.
@@ -1146,7 +1389,7 @@ impl GitHubClient {
                 slot
             }
         };
-        let deadline = started + SEARCH_BUDGET;
+        let deadline = (started + SEARCH_BUDGET).min(self.read_context().deadline);
         let mut receipt = tokio::time::timeout_at(deadline, slot.lock())
             .await
             .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?;
@@ -1155,9 +1398,12 @@ impl GitHubClient {
                 return result.clone().map_err(ClientError::shared);
             }
         }
-        let result = tokio::time::timeout_at(deadline, self.fetch_pr_detail_uncached(repo, number))
+        let mut context = self.read_context();
+        context.deadline = deadline;
+        let result = self
+            .with_read_context(context)
+            .fetch_pr_detail_uncached(repo, number)
             .await
-            .unwrap_or(Err(ClientError::Timeout(SEARCH_BUDGET.as_secs())))
             .map_err(Arc::new);
         *receipt = Some((Instant::now(), generation, result.clone()));
         result.map_err(ClientError::shared)
@@ -1171,20 +1417,20 @@ impl GitHubClient {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| ClientError::Graphql(format!("malformed repository: {repo}")))?;
-        // The stack lookup runs BESIDE the detail query rather than after
-        // it (#1452), so it costs a point and not a round trip. It never
-        // fails the view: its own failures are `PrStack::Unknown`, and it
-        // stops itself at `stack::STACK_BUDGET`, well inside the command's
-        // ceiling.
         let body = json!({
             "query": PR_DETAIL_QUERY,
             "variables": { "owner": owner, "repo": name, "number": number }
         });
-        let (first, stack) = tokio::join!(
-            self.graphql_partial_ok(&body),
-            self.fetch_pr_stack(owner, name, number),
-        );
-        let mut v = first?;
+        let mut v = self.graphql_partial_ok(&body).await?;
+        let pr = &v["repository"]["pullRequest"];
+        if pr["number"].as_u64() != Some(number)
+            || pr["id"].as_str().is_none_or(str::is_empty)
+            || pr["headRefOid"].as_str().is_none_or(str::is_empty)
+        {
+            return Err(ClientError::Graphql(
+                "The pull request identity or viewed head could not be confirmed.".into(),
+            ));
+        }
         // A refusal on THIS document is not survivable by defaulting, and
         // this is the one path where that is counter-intuitive enough to
         // spell out (#854).
@@ -1211,158 +1457,15 @@ impl GitHubClient {
                  This usually clears on the next refresh."
             )));
         }
-        self.append_remaining_checks(&mut v, owner, name, number)
-            .await?;
-        let mut detail = map_detail(&v, repo);
-        detail.stack = stack;
-        Ok(detail)
-    }
-
-    /// Follow `statusCheckRollup.contexts` pagination into `v`.
-    ///
-    /// A truncated check list is the most dangerous shape this view can
-    /// take, because it does not look truncated: the panel renders a
-    /// full, plausible list of passing checks on a pull request the
-    /// rollup itself reports as FAILURE. Observed on a pull request with
-    /// 63 checks whose only two failures both sat past the first page.
-    /// That is why this loop exists at all, and none of what follows
-    /// weakens it: a 63-check pull request is still fetched complete.
-    ///
-    /// Stops on the first page that says there is no next one.
-    ///
-    /// MAX_PAGES was 20, which made this the slowest thing in the app
-    /// (#790). Each iteration is its own POST and the cursor makes them
-    /// strictly serial, so the budget is a latency budget: at the p90
-    /// per-POST latency measured for `poll::FETCH_TIMEOUT` (8,814ms)
-    /// twenty pages is three minutes of spinner, and the command had no
-    /// overall timeout to stop it. Worse, the user is waiting on the
-    /// CHEAPEST section of the view -- the body, the review threads and
-    /// the merge state all arrived on page 1.
-    ///
-    /// Cut to 3 (300 contexts). Two reasons that number and not another:
-    ///
-    /// - It is still past anything observed. The largest real rollup in
-    ///   the reports behind this is 63 contexts, which fits in one page;
-    ///   the second page exists for the pathological repository, the
-    ///   third for headroom.
-    /// - It bounds the serial chain at 4 POSTs, which fits inside the
-    ///   30s command ceiling added in `get_pr_detail` at p90 latency
-    ///   rather than blowing through it. A budget the timeout kills is
-    ///   not a budget, it is a guaranteed error message.
-    ///
-    /// REJECTED: backgrounding the extra pages (render page 1, fill the
-    /// rest in progressively). It is the better end state and the issue
-    /// asks for it, but it needs a second command, an event channel and
-    /// a partial-checks state in the view, and it cannot be done without
-    /// reintroducing exactly the silent-truncation bug this function was
-    /// written to fix -- a progressively-filling list is indistinguishable
-    /// from a truncated one until it finishes. Capping plus an honest
-    /// count is most of the win for a fraction of the surface, and the
-    /// `checks_total` field it adds is what the progressive version would
-    /// need anyway. Filed as follow-up rather than rushed here.
-    ///
-    /// REJECTED: a page budget of 1. The 63-check pull request above is
-    /// the reported bug; a cap that truncates it trades a slow correct
-    /// view for a fast wrong one.
-    ///
-    /// Hitting the cap is now a REAL possibility rather than a sign the
-    /// API is misbehaving, so it no longer returns silently: the total
-    /// from `totalCount` reaches `PrDetail::checks_total` and the panel
-    /// says "showing 300 of 412".
-    async fn append_remaining_checks(
-        &self,
-        v: &mut serde_json::Value,
-        owner: &str,
-        name: &str,
-        number: u64,
-    ) -> Result<(), ClientError> {
-        const MAX_PAGES: usize = 3;
-
-        // DIAGNOSTIC LOGGING (Settings > diagnostic log). The page count
-        // is what makes a slow click attributable: `[diag] graphql POST`
-        // lines alone leave "one slow POST" and "four serial POSTs"
-        // looking identical unless the reader counts log lines by hand,
-        // and those two have completely different fixes (#790). Logged
-        // on EVERY path including zero pages, so a fast click proves the
-        // loop was not involved rather than leaving it unaccounted for.
-        let started = std::time::Instant::now();
-        let mut pages = 0usize;
-        let out = self
-            .checks_pages(v, owner, name, number, MAX_PAGES, &mut pages)
+        let coverage = self
+            .collect_detail_checks(&mut v, owner, name, number)
             .await;
-        crate::diag!(
-            "[diag] checks pagination {} page(s) in {}ms{}",
-            pages,
-            started.elapsed().as_millis(),
-            if pages == MAX_PAGES { " (CAPPED)" } else { "" }
-        );
-        out
-    }
-
-    /// `append_remaining_checks` without the timing, so the logging
-    /// above brackets every exit rather than being repeated at each of
-    /// the four `return`s below.
-    async fn checks_pages(
-        &self,
-        v: &mut serde_json::Value,
-        owner: &str,
-        name: &str,
-        number: u64,
-        max_pages: usize,
-        pages: &mut usize,
-    ) -> Result<(), ClientError> {
-        for _ in 0..max_pages {
-            let contexts = &v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            if !contexts["pageInfo"]["hasNextPage"]
-                .as_bool()
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-            // A cursor is required to advance. Absent one, stop rather
-            // than re-request the same page forever.
-            let Some(cursor) = contexts["pageInfo"]["endCursor"].as_str() else {
-                return Ok(());
-            };
-            let cursor = cursor.to_string();
-
-            let page = self
-                .graphql_partial_ok(&json!({
-                    "query": PR_CHECKS_PAGE_QUERY,
-                    "variables": {
-                        "owner": owner, "repo": name, "number": number, "after": cursor
-                    }
-                }))
-                .await?;
-            *pages += 1;
-            let fetched = &page["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            let more = fetched["nodes"].as_array().cloned().unwrap_or_default();
-            let page_info = fetched["pageInfo"].clone();
-            let total = fetched["totalCount"].clone();
-
-            let target = &mut v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
-                ["statusCheckRollup"]["contexts"];
-            match target["nodes"].as_array_mut() {
-                Some(existing) => existing.extend(more),
-                // No array to append to means the response shape is not
-                // what the mapper reads either; stop instead of looping.
-                None => return Ok(()),
-            }
-            target["pageInfo"] = page_info;
-            // The LATER page's total wins, for the reason the query's own
-            // comment gives: a rollup can grow while we walk it, and the
-            // stale number would understate what is missing. Only when
-            // the page actually carried one -- overwriting a good total
-            // with `null` from a partial response would make the panel
-            // fall back to "nothing missing" on the one shape where
-            // something is.
-            if !total.is_null() {
-                target["totalCount"] = total;
-            }
-        }
-        Ok(())
+        let mut detail = map_detail(&v, repo);
+        detail.checks_coverage = Some(coverage);
+        detail.stack = self
+            .peek_advisory_stack(repo, number, &detail.head_oid, &detail.base_ref)
+            .unwrap_or(super::model::PrStack::Unknown);
+        Ok(detail)
     }
 
     /// The PR list together with GitHub's own match count.
@@ -1388,19 +1491,22 @@ impl GitHubClient {
     /// accumulator to report into and use this; everything in a stats load
     /// uses [`Self::fetch_viewer_metered`] instead.
     pub async fn fetch_viewer(&self) -> Result<String, ClientError> {
-        let v = self
-            .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
-            .await?;
-        // Fed to the stats GATE even from the unmetered callers: this is a
-        // real reading of the hour's remaining budget, and startup is exactly
-        // when the gate has nothing else to go on (#843).
-        if let Some((remaining, _)) = map_rate_limit(&v) {
-            crate::github::stats::budget::note_remaining(remaining);
-        }
-        let login = map_viewer(&v)
-            .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
-        let _ = self.viewer.set(login.clone());
-        Ok(login)
+        tokio::time::timeout_at(
+            self.read_context().deadline,
+            self.viewer.get_or_try_init(|| async {
+                let v = self
+                    .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
+                    .await?;
+                if let Some((remaining, _)) = map_rate_limit(&v) {
+                    crate::github::stats::budget::note_remaining(remaining);
+                }
+                map_viewer(&v)
+                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+            }),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
+        .cloned()
     }
 
     /// [`Self::fetch_viewer`], reported into a load's accumulator.
@@ -1418,8 +1524,7 @@ impl GitHubClient {
     /// answers the UI, the remote gate authenticates, startup probes the token
     /// -- so there is nothing for them to report into, and inventing a
     /// throwaway `Budget` to discard would be accounting theatre. They still
-    /// feed the process-wide figure, which is the part that matters outside a
-    /// load.
+    /// feed their authenticated client transport quota observations.
     pub async fn fetch_viewer_metered(
         &self,
         budget: &crate::github::stats::Budget,
@@ -1439,10 +1544,14 @@ impl GitHubClient {
     ) -> Result<String, ClientError> {
         // The immutable client owns the token. Never reuse disk identity or
         // another client's login, and never cache a failed lookup.
-        self.viewer
-            .get_or_try_init(|| self.fetch_viewer_metered(budget))
-            .await
-            .cloned()
+        tokio::time::timeout_at(
+            self.read_context().deadline,
+            self.viewer
+                .get_or_try_init(|| self.fetch_viewer_metered(budget)),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
+        .cloned()
     }
 
     /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
@@ -1494,6 +1603,9 @@ impl GitHubClient {
     ) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
+        if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            let _ = self.viewer.set(viewer);
+        }
         // How long GitHub took, and what it was asked for. A slow
         // response is the leading indicator of the timeout that follows,
         // and neither was recorded anywhere. Counts and timings only --
@@ -1523,7 +1635,7 @@ impl GitHubClient {
             // from the other at different moments.
             crate::github::stats::budget::note_remaining(remaining);
         }
-        Ok(list_evidence(&v, map_search(&v)))
+        Ok(self.owned_list_evidence(&v, map_search(&v)))
     }
 
     /// The two historical counters. The other five dashboard numbers are
@@ -1765,6 +1877,7 @@ async fn graphql_partial_ok(
         octocrab,
         body,
         &super::read_transport::ReadTransport::default(),
+        super::admission::ReadContext::new(super::admission::ReadClass::Foreground, SEARCH_BUDGET),
     )
     .await
 }
@@ -1773,8 +1886,9 @@ async fn graphql_with_transport(
     octocrab: &Octocrab,
     body: &serde_json::Value,
     transport: &super::read_transport::ReadTransport,
+    context: super::admission::ReadContext,
 ) -> Result<serde_json::Value, ClientError> {
-    let raw = transport.post(octocrab, body).await?;
+    let raw = transport.post_with(octocrab, body, context).await?;
 
     let errors = raw.get("errors").and_then(|e| e.as_array());
     let data = raw.get("data").filter(|d| !d.is_null());
@@ -1853,6 +1967,9 @@ async fn graphql_with_transport(
                 // Also on the response, so a caller can read the count
                 // for the request it actually made.
                 let mut d = d.clone();
+                crate::inventory::mark_readiness_errors(&mut d, errs);
+                super::detail_checks::mark_errors(&mut d, errs);
+                mark_queue_cursor_error(&mut d, errs);
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("__refused".into(), errs.len().into());
                 }
@@ -1864,6 +1981,9 @@ async fn graphql_with_transport(
             // fields look well formed (#1626). Separate from the existing
             // permission-refusal count so other callers keep their messaging.
             let mut data = d.clone();
+            crate::inventory::mark_readiness_errors(&mut data, errs);
+            super::detail_checks::mark_errors(&mut data, errs);
+            mark_queue_cursor_error(&mut data, errs);
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("__partial_errors".into(), errs.len().into());
             }
@@ -1917,6 +2037,27 @@ mod tests {
     /// Offset cursors index a live list, so an item entering mid-fetch
     /// shifts the boundary and hands the same node to two pages. The
     /// merge used to keep both.
+    #[test]
+    fn conflicting_page_counts_do_not_authorize_removal() {
+        let response = json!({"authored": {"nodes": [], "issueCount": 0},
+            "headstate_paging": {"count_conflict": true, "truest_total": 0}});
+        let result = list_evidence(&response, vec![]);
+        assert_eq!(result.total, None);
+        assert_eq!(
+            result.coverage,
+            crate::store::source_cache::Coverage::Partial { total: None }
+        );
+    }
+
+    #[test]
+    fn resolver_errors_never_prove_complete_inventory() {
+        let response = json!({"authored": {"nodes": [], "issueCount": 0}, "__partial_errors": 1});
+        assert_eq!(
+            list_evidence(&response, vec![]).coverage,
+            crate::store::source_cache::Coverage::Partial { total: Some(0) }
+        );
+    }
+
     #[test]
     fn source_coverage_distinguishes_missing_totals_from_measured_zero() {
         use crate::store::source_cache::Coverage;
@@ -2046,6 +2187,423 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn short_viewer_waiter_cannot_outlive_its_own_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(json!({"data":{"viewer":{"login":"octocat"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let leader_client = client.clone();
+        let leader = tokio::spawn(async move { leader_client.fetch_viewer().await });
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let short = client.with_read_context(super::super::admission::ReadContext::new(
+            super::super::admission::ReadClass::Background,
+            std::time::Duration::from_millis(10),
+        ));
+        assert!(
+            short.fetch_viewer().await.is_err(),
+            "queued identity wait shares the caller deadline"
+        );
+        assert_eq!(leader.await.unwrap().unwrap(), "octocat");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "octocat");
+    }
+
+    #[tokio::test]
+    async fn ordinary_viewer_coalesces_success_and_retries_failure() {
+        let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"message":"synthetic refusal"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(client.fetch_viewer().await.is_err());
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(30))
+                    .set_body_json(json!({"data":{"viewer":{"login":"octocat"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (a, b) = tokio::join!(client.fetch_viewer(), client.fetch_viewer());
+        assert_eq!(a.unwrap(), "octocat");
+        assert_eq!(b.unwrap(), "octocat");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "octocat");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn secondary_body_retry_deadline_is_shared_by_reads_and_writes() {
+        use super::super::admission::Bucket;
+        for mutation in [false, true] {
+            for (status, retry, secondary) in [
+                (200, Some("300"), true),
+                (403, None, true),
+                (403, None, false),
+            ] {
+                let server = MockServer::start().await;
+                let message = if secondary {
+                    "You have exceeded a secondary rate limit"
+                } else {
+                    "Resource not accessible by integration"
+                };
+                let body = if status == 200 {
+                    json!({"errors":[{"message":message}]})
+                } else {
+                    json!({"message":message})
+                };
+                let mut response = ResponseTemplate::new(status).set_body_json(body);
+                if let Some(retry) = retry {
+                    response = response.insert_header("retry-after", retry);
+                }
+                Mock::given(method("POST"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let client = client_for(&server).await;
+                let query = json!({"query":"synthetic"});
+                if mutation {
+                    assert!(client.graphql_mutation_inner(&query).await.is_err());
+                } else {
+                    assert!(client.stats_graphql(&query).await.is_err());
+                }
+                tokio::time::pause();
+                if secondary {
+                    assert!(client.stats_graphql(&query).await.is_err());
+                    assert!(client
+                        .rest_get("/synthetic", &client.request_budget())
+                        .await
+                        .is_err());
+                    assert!(matches!(
+                        client.graphql_mutation_inner(&query).await,
+                        Err(ClientError::NotDispatched(_))
+                    ));
+                    assert!(matches!(
+                        client.rest_post("/synthetic").await,
+                        Err(ClientError::NotDispatched(_))
+                    ));
+                    tokio::time::advance(std::time::Duration::from_secs(if retry.is_some() {
+                        299
+                    } else {
+                        59
+                    }))
+                    .await;
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                    let probe = client.read_transport.admission.write(Bucket::Rest).unwrap();
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                    drop(probe);
+                } else {
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_ok());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_ok());
+                }
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    1,
+                    "blocked cross-protocol calls must not dispatch"
+                );
+                tokio::time::resume();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_write_bodies_keep_recovery_closed_after_cancellation() {
+        use super::super::admission::Bucket;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for kind in 0..4 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let received = socket.read(&mut bytes).await.unwrap();
+                assert!(received > 0, "the server must receive a real write");
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{").await.unwrap();
+                headers_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client = GitHubClient::new(
+                Octocrab::builder()
+                    .base_uri(format!("http://{address}"))
+                    .unwrap()
+                    .personal_token("synthetic")
+                    .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                    .build()
+                    .unwrap(),
+            );
+            client
+                .read_transport
+                .admission
+                .limit(Bucket::Graphql, 1, true);
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::time::resume();
+            let worker_client = client.clone();
+            let worker = tokio::spawn(async move {
+                match kind {
+                    0 => worker_client
+                        .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                        .await
+                        .map(|_| ()),
+                    1 => worker_client
+                        .rest_post_json("/synthetic", &json!({}))
+                        .await
+                        .map(|_| ()),
+                    2 => worker_client
+                        .rest_put("/synthetic", &json!({}), &worker_client.request_budget())
+                        .await
+                        .map(|_| ()),
+                    _ => worker_client.rest_post("/synthetic").await,
+                }
+            });
+            headers_rx.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !worker.is_finished(),
+                "write kind {kind} must consume its body"
+            );
+            assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+            tokio::time::pause();
+            if kind == 0 {
+                tokio::time::advance(SEARCH_BUDGET).await;
+                assert!(matches!(
+                    worker.await.unwrap(),
+                    Err(ClientError::UnconfirmedWrite)
+                ));
+            } else {
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+            }
+            assert!(
+                client.read_transport.admission.write(Bucket::Rest).is_err(),
+                "kind {kind}"
+            );
+            assert!(
+                client
+                    .read_transport
+                    .admission
+                    .write(Bucket::Graphql)
+                    .is_err(),
+                "kind {kind}"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            let probe = client.read_transport.admission.write(Bucket::Rest).unwrap();
+            assert!(client
+                .read_transport
+                .admission
+                .write(Bucket::Graphql)
+                .is_err());
+            drop(probe);
+            server.abort();
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn consumed_write_responses_recover_but_malformed_json_does_not() {
+        use super::super::admission::Bucket;
+        for kind in 0..4 {
+            for case in 0..3 {
+                if kind == 3 && case == 1 {
+                    continue;
+                }
+                let malformed = case == 1;
+                let server = MockServer::start().await;
+                let text = if case == 2 {
+                    r#"{"message":"Resource not accessible by integration"}"#
+                } else if malformed {
+                    "{"
+                } else {
+                    r#"{"data":{"accepted":true}}"#
+                };
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(
+                        ResponseTemplate::new(if case == 2 { 403 } else { 200 })
+                            .set_body_string(text),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let client = client_for(&server).await;
+                client
+                    .read_transport
+                    .admission
+                    .limit(Bucket::Graphql, 1, true);
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                tokio::time::resume();
+                let result = match kind {
+                    0 => client
+                        .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                        .await
+                        .map(|_| ()),
+                    1 => client
+                        .rest_post_json("/synthetic", &json!({}))
+                        .await
+                        .map(|_| ()),
+                    2 => client
+                        .rest_put("/synthetic", &json!({}), &client.request_budget())
+                        .await
+                        .map(|_| ()),
+                    _ => client.rest_post("/synthetic").await,
+                };
+                tokio::time::pause();
+                if malformed {
+                    assert!(
+                        matches!(result, Err(ClientError::UnconfirmedWrite)),
+                        "kind {kind}: {result:?}"
+                    );
+                    assert!(client.read_transport.admission.write(Bucket::Rest).is_err());
+                    assert!(client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .is_err());
+                } else {
+                    if case == 2 && kind != 2 {
+                        assert!(matches!(result, Err(ClientError::Api(_))));
+                    } else {
+                        result.unwrap();
+                    }
+                    let a = client.read_transport.admission.write(Bucket::Rest).unwrap();
+                    let b = client
+                        .read_transport
+                        .admission
+                        .write(Bucket::Graphql)
+                        .unwrap();
+                    drop((a, b));
+                }
+                tokio::time::resume();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_body_limit_prevents_the_next_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"errors":[{"type":"RATE_LIMITED","message":"rate limit exceeded"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        assert!(client
+            .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+            .await
+            .is_err());
+        assert!(matches!(
+            client
+                .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                .await,
+            Err(ClientError::NotDispatched(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scan_allowance_counts_dispatches_and_confirmation_cannot_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("fixture".to_string())
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        );
+        let step = client.with_attempt_limit(3);
+        let confirmation = step.with_attempt_limit(1);
+        assert!(confirmation
+            .graphql_partial_ok(&json!({"query":"query Confirm { viewer { login } }"}))
+            .await
+            .is_err());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "confirmation has one actual attempt"
+        );
+        let tail = step
+            .clone()
+            .with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Background,
+                std::time::Duration::from_secs(5),
+            ));
+        assert!(tail
+            .graphql_partial_ok(&json!({"query":"query Tail { viewer { login } }"}))
+            .await
+            .is_err());
+        assert!(step
+            .graphql_partial_ok(&json!({"query":"query Extra { viewer { login } }"}))
+            .await
+            .is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn partial_lists_reuse_only_the_same_clients_verified_viewer() {
+        let server = MockServer::start().await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"viewer": null, "authored": {"issueCount": 3, "nodes": [fixture["authored"]["nodes"][0].clone()]}},
+            "errors": [{"path": ["viewer"]}]
+        }))).mount(&server).await;
+        let client = client_for(&server).await;
+        client.viewer.set("fixture".into()).unwrap();
+        for result in [
+            client.fetch_prs_snapshot().await.unwrap(),
+            client.fetch_reviewing_snapshot().await.unwrap(),
+        ] {
+            assert_eq!(result.viewer.as_deref(), Some("fixture"));
+            assert_eq!(result.prs.len(), 1);
+            assert!(matches!(
+                result.coverage,
+                crate::store::source_cache::Coverage::Partial { .. }
+            ));
+        }
+        let unknown = client_for(&server).await;
+        assert_eq!(
+            unknown.fetch_reviewing_snapshot().await.unwrap().viewer,
+            None
+        );
     }
 
     #[tokio::test]
@@ -2560,6 +3118,49 @@ mod tests {
             .unwrap();
         assert_eq!(total, 30, "the true total comes from issueCount");
         assert_eq!(prs.len(), 2, "both pages are merged: {prs:?}");
+    }
+
+    #[tokio::test]
+    async fn later_page_resolver_evidence_survives_aggregation() {
+        let server = MockServer::start().await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
+        let first = fixture["authored"]["nodes"][0].clone();
+        let mut second = first.clone();
+        second["number"] = 999.into();
+        second["id"] = "PR-second".into();
+        second["commits"] = serde_json::Value::Null;
+        Mock::given(method("POST")).and(path("/graphql")).and(body_string_contains("\"after\":null"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"viewer": {"login": "fixture"}, "authored": {"issueCount": 26, "nodes": [first]}}})))
+            .mount(&server).await;
+        Mock::given(method("POST")).and(path("/graphql")).and(body_string_contains("Y3Vyc29yOjI1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"authored": {"issueCount": 27, "nodes": [second]}}, "errors": [{"type": "INTERNAL", "path": ["authored", "nodes", 0, "commits"]}]})))
+            .mount(&server).await;
+        let raw = client_for(&server)
+            .await
+            .collect_search_pages(
+                REVIEW_REQUESTED,
+                tokio::time::Instant::now() + SEARCH_BUDGET,
+                SEARCH_BUDGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw["__partial_errors"], 1);
+        assert_eq!(raw["headstate_paging"]["count_conflict"], true);
+        let rows = map_list(&raw, "authored");
+        assert!(rows[1]
+            .observation
+            .as_ref()
+            .unwrap()
+            .unknown_fields
+            .contains(&crate::inventory::ReadinessField::Ci));
+        let evidence = list_evidence(&raw, rows);
+        assert_eq!(evidence.total, None);
+        assert_eq!(evidence.viewer.as_deref(), Some("fixture"));
+        assert_eq!(
+            evidence.coverage,
+            crate::store::source_cache::Coverage::Partial { total: None }
+        );
     }
 
     /// A page that FAILS is a short list, not a failed fetch.
@@ -3316,6 +3917,390 @@ mod tests {
     /// checks, both failures past the first page, so the detail view
     /// listed nothing but green while the rollup said FAILURE. Paging is
     /// what makes the list honest.
+    fn progress_detail_fixture() -> serde_json::Value {
+        json!({"repository":{"pullRequest":{"id":"PR-fixture","number":42,"title":"Primary detail","body":"Keep this description","headRefOid":"head-a","baseRefName":"main","mergeStateStatus":"CLEAN","commits":{"nodes":[{"commit":{"oid":"head-a","statusCheckRollup":{"state":"SUCCESS","contexts":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"first"},"nodes":[{"id":"check-a","name":"first check","conclusion":"SUCCESS"}]}}}}]}}}})
+    }
+
+    #[tokio::test]
+    async fn detail_progress_does_not_wait_for_or_dispatch_optional_stack() {
+        let server = MockServer::start().await;
+        let mut primary = progress_detail_fixture();
+        primary["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":primary})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query PrStack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(json!({"data":{}})),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let detail = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.fetch_pr_detail("acme/alpha", 42),
+        )
+        .await
+        .expect("primary must not await ancestry")
+        .unwrap();
+        assert_eq!(detail.title, "Primary detail");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "no detached ancestry read"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_progress_preserves_primary_when_check_continuation_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":progress_detail_fixture()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ChecksPage"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query PrStack"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{}})))
+            .mount(&server)
+            .await;
+        let detail = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .expect("later checks failure must keep primary");
+        assert_eq!(detail.title, "Primary detail");
+        assert_eq!(detail.checks.len(), 1);
+        let wire = serde_json::to_value(detail).unwrap();
+        assert_eq!(wire["checks_coverage"]["state"], "partial");
+        assert_eq!(wire["checks_coverage"]["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn detail_progress_checks_evidence_distinguishes_null_errors_and_bad_chains() {
+        for case in [
+            "no-ci",
+            "empty",
+            "missing-rollup",
+            "checks-error",
+            "unrelated-error",
+            "unrelated-commit-error",
+            "wrong-head",
+            "wrong-commit",
+            "count-conflict",
+            "missing-total",
+            "repeated-cursor",
+            "missing-cursor",
+            "duplicate",
+            "bad-node",
+        ] {
+            let server = MockServer::start().await;
+            let mut primary = progress_detail_fixture();
+            let rollup = "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup";
+            let context = format!("{rollup}/contexts");
+            let mut errors = json!([]);
+            match case {
+                "no-ci" | "checks-error" | "unrelated-error" | "unrelated-commit-error" => {
+                    *primary.pointer_mut(rollup).unwrap() = serde_json::Value::Null;
+                }
+                "missing-rollup" => {
+                    primary
+                        .pointer_mut("/repository/pullRequest/commits/nodes/0/commit")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("statusCheckRollup");
+                }
+                "empty" => {
+                    *primary.pointer_mut(&context).unwrap() = json!({"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+                }
+                "missing-cursor" => {
+                    primary.pointer_mut(&context).unwrap()["pageInfo"]["endCursor"] =
+                        serde_json::Value::Null;
+                }
+                _ => {}
+            }
+            if case == "checks-error" {
+                errors = json!([{"path":["repository","pullRequest","commits"],"message":"Synthetic unavailable"}]);
+            }
+            if case == "unrelated-commit-error" {
+                errors = json!([{"path":["repository","pullRequest","commits","nodes",0,"commit","committedDate"],"message":"Synthetic optional unavailable"}]);
+            }
+            if case == "unrelated-error" {
+                errors = json!([{"path":["repository","pullRequest","comments"],"message":"Synthetic unavailable"}]);
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("isMergeQueueEnabled"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":primary,"errors":errors})),
+                )
+                .mount(&server)
+                .await;
+            let mut page = progress_detail_fixture();
+            *page.pointer_mut(&context).unwrap() = json!({"totalCount":2,"nodes":[{"id":"check-b","name":"second check","conclusion":"FAILURE"}],"pageInfo":{"hasNextPage":false,"endCursor":"second"}});
+            match case {
+                "wrong-head" => page["repository"]["pullRequest"]["headRefOid"] = json!("head-b"),
+                "wrong-commit" => {
+                    page["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["oid"] =
+                        json!("head-b")
+                }
+                "count-conflict" => page.pointer_mut(&context).unwrap()["totalCount"] = json!(3),
+                "missing-total" => page
+                    .pointer_mut(&context)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("totalCount")
+                    .map(|_| ())
+                    .unwrap(),
+                "repeated-cursor" => {
+                    page.pointer_mut(&context).unwrap()["pageInfo"] =
+                        json!({"hasNextPage":true,"endCursor":"first"})
+                }
+                "duplicate" => {
+                    page.pointer_mut(&context).unwrap()["nodes"][0]["id"] = json!("check-a")
+                }
+                "bad-node" => page.pointer_mut(&context).unwrap()["nodes"] = json!([null]),
+                _ => {}
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("ChecksPage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":page})))
+                .mount(&server)
+                .await;
+            let d = client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(&d).unwrap();
+            let complete = matches!(
+                case,
+                "no-ci" | "empty" | "unrelated-error" | "unrelated-commit-error"
+            );
+            assert_eq!(
+                wire["checks_coverage"]["state"] == "complete",
+                complete,
+                "{case}"
+            );
+            if complete {
+                assert_eq!(wire["checks_coverage"]["total"], 0, "{case}");
+            }
+            if matches!(
+                case,
+                "wrong-head" | "wrong-commit" | "duplicate" | "bad-node" | "missing-cursor"
+            ) {
+                assert_eq!(d.checks.len(), 1, "{case}");
+            }
+            if matches!(
+                case,
+                "count-conflict"
+                    | "wrong-head"
+                    | "wrong-commit"
+                    | "repeated-cursor"
+                    | "missing-cursor"
+                    | "missing-rollup"
+                    | "checks-error"
+            ) {
+                assert!(wire["checks_coverage"]["total"].is_null(), "{case}");
+            }
+            assert!(
+                server.received_requests().await.unwrap().len() <= 2,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_progress_terminal_cursor_must_prove_a_coherent_chain() {
+        for case in [
+            "valid",
+            "repeated",
+            "missing",
+            "null",
+            "empty",
+            "oversized",
+            "cyclic",
+        ] {
+            let server = MockServer::start().await;
+            let context =
+                "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts";
+            let count = if case == "cyclic" { 3 } else { 2 };
+            let mut primary = progress_detail_fixture();
+            primary.pointer_mut(context).unwrap()["totalCount"] = json!(count);
+            Mock::given(method("POST"))
+                .and(body_string_contains("isMergeQueueEnabled"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": primary})))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("ChecksPage"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    let middle = case == "cyclic" && body["variables"]["after"] == "first";
+                    let cursor = match case {
+                        "repeated" => json!("first"),
+                        "cyclic" if !middle => json!("first"),
+                        "null" => serde_json::Value::Null,
+                        "empty" => json!(""),
+                        "oversized" => json!("x".repeat(4097)),
+                        _ => json!("second"),
+                    };
+                    let mut page = progress_detail_fixture();
+                    *page.pointer_mut(context).unwrap() = json!({"totalCount":count,
+                        "nodes":[{"id":if middle { "check-middle" } else { "check-terminal" },"name":"observed check","conclusion":"SUCCESS"}],
+                        "pageInfo":{"hasNextPage":middle,"endCursor":cursor}});
+                    if case == "missing" {
+                        page.pointer_mut(context).unwrap()["pageInfo"].as_object_mut().unwrap().remove("endCursor");
+                    }
+                    ResponseTemplate::new(200).set_body_json(json!({"data":page}))
+                }).mount(&server).await;
+            let d = client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .unwrap();
+            let coverage = serde_json::to_value(&d.checks_coverage).unwrap();
+            assert_eq!(d.number, 42, "{case}: primary retained");
+            assert_eq!(
+                d.checks.len(),
+                count,
+                "{case}: all valid observations retained"
+            );
+            assert_eq!(coverage["state"] == "complete", case == "valid", "{case}");
+            if case != "valid" {
+                assert!(coverage["total"].is_null(), "{case}");
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                count,
+                "{case}: no additional requests"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_progress_deadline_keeps_first_page_and_ends_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":progress_detail_fixture()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ChecksPage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(json!({"data":{}})),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            client_for(&server)
+                .await
+                .with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    std::time::Duration::from_millis(100),
+                ));
+        let started = Instant::now();
+        let d = client.fetch_pr_detail("acme/alpha", 42).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(d.checks.len(), 1);
+        assert_eq!(
+            d.checks_coverage.unwrap().state,
+            super::super::model::ChecksState::Partial
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn detail_progress_uses_only_exact_clients_cached_ancestry() {
+        let server = MockServer::start().await;
+        let mut primary = progress_detail_fixture();
+        primary["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":primary})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(body_string_contains("query PrStack")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequest":{"number":42,"headRefOid":"head-a","headRefName":"topic","baseRefName":"main","stackEntry":{"position":1,"stack":{"number":7,"size":1}}}}}}))).mount(&server).await;
+        let client = client_for(&server).await;
+        super::super::ready_stacks::ready_stacks(
+            &client,
+            vec![super::super::ready_stacks::StackAsk {
+                identity: crate::identity::PrIdentity {
+                    source: Default::default(),
+                    repo: "acme/alpha".into(),
+                    number: 42,
+                },
+                head_oid: Some("head-a".into()),
+                base_ref: Some("main".into()),
+            }],
+        )
+        .await
+        .unwrap();
+        let d = client.fetch_pr_detail("acme/alpha", 42).await.unwrap();
+        assert!(matches!(
+            d.stack,
+            super::super::model::PrStack::Stacked {
+                native: true,
+                size: 1,
+                ..
+            }
+        ));
+        let other = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .unwrap();
+        assert!(matches!(other.stack, super::super::model::PrStack::Unknown));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "one advisory and two primary reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_progress_missing_or_denied_primary_never_becomes_success() {
+        for raw in [
+            json!({"data":{"repository":{"pullRequest":null}}}),
+            json!({"errors":[{"message":"Synthetic denied"}]}),
+            json!({"data":{"repository":{"pullRequest":{"number":42,"id":"PR","headRefOid":null}}}}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(raw))
+                .mount(&server)
+                .await;
+            assert!(client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .is_err());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn pr_detail_follows_check_pagination() {
         let server = MockServer::start().await;
@@ -3326,12 +4311,13 @@ mod tests {
             .and(body_string_contains("mergeStateStatus"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42,
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42,
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "state": "FAILURE",
                         "contexts": {
+                            "totalCount":2,
                             "pageInfo": {"hasNextPage": true, "endCursor": "CUR1"},
-                            "nodes": [{"name": "passing-one", "conclusion": "SUCCESS",
+                            "nodes": [{"id":"passing", "name": "passing-one", "conclusion": "SUCCESS",
                                        "detailsUrl": "https://x/1"}]
                         }
                     }}}]}
@@ -3346,10 +4332,12 @@ mod tests {
             .and(body_string_contains("ChecksPage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "number":42,"headRefOid":"head-a",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
-                            "pageInfo": {"hasNextPage": false, "endCursor": null},
-                            "nodes": [{"name": "failing-two", "conclusion": "FAILURE",
+                            "totalCount":2,
+                            "pageInfo": {"hasNextPage": false, "endCursor": "CUR1"},
+                            "nodes": [{"id":"failing", "name": "failing-two", "conclusion": "FAILURE",
                                        "detailsUrl": "https://x/2"}]
                         }
                     }}}]}
@@ -3390,12 +4378,12 @@ mod tests {
             .and(body_string_contains("isMergeQueueEnabled"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42, "title": "t",
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
                             "totalCount": 412,
                             "pageInfo": {"hasNextPage": true, "endCursor": "CUR0"},
-                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                            "nodes": [{"id":"a", "name": "a", "conclusion": "SUCCESS"}]
                         }
                     }}}]}
                 }}}
@@ -3408,17 +4396,16 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("ChecksPage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {"repository": {"pullRequest": {
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
-                        "contexts": {
-                            "totalCount": 412,
-                            "pageInfo": {"hasNextPage": true, "endCursor": "CURn"},
-                            "nodes": [{"name": "b", "conclusion": "SUCCESS"}]
-                        }
-                    }}}]}
-                }}}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value=request.body_json().unwrap();
+                let cursor=body["variables"]["after"].as_str().unwrap();
+                let next=format!("{cursor}-next");
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"pullRequest":{
+                    "number":42,"headRefOid":"head-a","commits":{"nodes":[{"commit":{"oid":"head-a","statusCheckRollup":{"contexts":{
+                        "totalCount":412,"pageInfo":{"hasNextPage":true,"endCursor":next},"nodes":[{"id":cursor,"name":cursor,"conclusion":"SUCCESS"}]
+                    }}}}]}
+                }}}}))
+            })
             .mount(&server)
             .await;
 
@@ -3456,17 +4443,17 @@ mod tests {
     /// list, which is the failure mode `poll::truncation_payload` takes
     /// the same care over.
     #[tokio::test]
-    async fn pr_detail_without_a_check_total_reports_no_shortfall() {
+    async fn pr_detail_without_a_check_total_reports_unknown_coverage() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"repository": {"pullRequest": {
-                    "number": 42, "title": "t",
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                    "id":"PR-fixture", "headRefOid":"head-a", "baseRefName":"main", "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
                             "pageInfo": {"hasNextPage": false, "endCursor": null},
-                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                            "nodes": [{"id":"a", "name": "a", "conclusion": "SUCCESS"}]
                         }
                     }}}]}
                 }}}
@@ -3481,8 +4468,12 @@ mod tests {
             .unwrap();
         assert_eq!(d.checks.len(), 1);
         assert_eq!(
+            d.checks_coverage.as_ref().unwrap().state,
+            super::super::model::ChecksState::Unknown
+        );
+        assert_eq!(
             d.checks_total, 1,
-            "no total must mean complete, never a zero the UI subtracts from"
+            "legacy count remains compatible; modern coverage must qualify unknown"
         );
     }
 
@@ -3692,20 +4683,6 @@ mod tests {
                 "fetch_viewer_metered",
                 "as `fetch_viewer`; this one also records the spend",
             ),
-            // The cursor loop that appends extra pages into a response the
-            // CALLER then maps, so `fetch_pr_detail` owns the verdict for
-            // the whole chain -- and it refuses outright on a refusal,
-            // because `map_detail` defaults a missing total to "nothing
-            // missing".
-            //
-            // Named `checks_pages` rather than its delegating wrapper
-            // `append_remaining_checks`: the guard reports the function the
-            // call is IN, and the first version of this list named the
-            // wrapper, which the guard correctly would not accept.
-            (
-                "checks_pages",
-                "merges into the caller's response; `fetch_pr_detail` judges the whole chain",
-            ),
             (
                 "merged_detail_page",
                 "one page for `fetch_merged_detail`, which maps the result",
@@ -3843,6 +4820,205 @@ mod tests {
                 "NO_REFUSAL_READ excuses `{name}` ({why}), which no longer calls \
                  `graphql_partial_ok`. Remove the entry."
             );
+        }
+    }
+    async fn bound_client_for(server: &MockServer) -> GitHubClient {
+        GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("synthetic-token".to_string())
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        )
+    }
+    #[tokio::test]
+    async fn head_bound_review_sends_viewed_commit_once_and_returns_semantic_receipt() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/graphql")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW-1","state":"APPROVED","submittedAt":"2026-10-01T12:00:00Z","author":{"login":"fixture"},"commit":{"oid":"viewed-head"},"pullRequest":{"id":"PR-7","number":7,"repository":{"nameWithOwner":"fixture/project"}}}}}}))).mount(&server).await;
+        let result = bound_client_for(&server)
+            .await
+            .add_review_at_head(&BoundReviewRequest {
+                id: "PR-7".into(),
+                repo: "fixture/project".into(),
+                number: 7,
+                verdict: "approve".into(),
+                body: String::new(),
+                expected_head: "viewed-head".into(),
+                expected_viewer: "fixture".into(),
+            })
+            .await;
+        let calls = server.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1, "no read preflight or write replay");
+        let body: serde_json::Value = calls[0].body_json().unwrap();
+        assert_eq!(body["variables"]["head"], "viewed-head");
+        assert!(body["query"].as_str().unwrap().contains("commitOID: $head"));
+        assert!(
+            matches!(result,BoundReviewOutcome::Acknowledged{receipt} if receipt.review_id=="REVIEW-1" && receipt.commit_oid=="viewed-head")
+        );
+    }
+
+    #[tokio::test]
+    async fn head_bound_review_requires_identity_and_never_replays_ambiguous_results() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let request = BoundReviewRequest {
+            id: "PR-7".into(),
+            repo: "fixture/project".into(),
+            number: 7,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: "viewed-head".into(),
+            expected_viewer: "fixture".into(),
+        };
+        for (state, actor, head, present, acknowledged) in [
+            ("APPROVED", "fixture", "viewed-head", true, true),
+            ("FUTURE_SUBMITTED", "fixture", "viewed-head", true, true),
+            ("PENDING", "fixture", "viewed-head", true, false),
+            ("", "fixture", "viewed-head", true, false),
+            ("APPROVED", "other", "viewed-head", true, false),
+            ("APPROVED", "fixture", "other-head", true, false),
+            ("APPROVED", "fixture", "viewed-head", false, false),
+        ] {
+            let server = MockServer::start().await;
+            let receipt = if present {
+                json!({"id":"REVIEW-1", "state":state, "author":{"login":actor}, "commit":{"oid":head}, "pullRequest":{"id":"PR-7", "number":7, "repository":{"nameWithOwner":"fixture/project"}}})
+            } else {
+                serde_json::Value::Null
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"addPullRequestReview":{"pullRequestReview":receipt}}}),
+                ))
+                .mount(&server)
+                .await;
+            let outcome = bound_client_for(&server)
+                .await
+                .add_review_at_head(&request)
+                .await;
+            assert_eq!(
+                matches!(outcome, BoundReviewOutcome::Acknowledged { .. }),
+                acknowledged
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        for (status, body, rejected) in [
+            (
+                200,
+                json!({"errors":[{"message":"Cannot approve own pull request"}]}),
+                true,
+            ),
+            (200, json!({"data":null}), false),
+            (
+                403,
+                json!({"message":"Resource not accessible by integration"}),
+                true,
+            ),
+            (
+                200,
+                json!({"data":{"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW-1"}}},"errors":[{"message":"optional review field refused"}]}),
+                false,
+            ),
+            (502, json!({"message":"temporary synthetic failure"}), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let outcome = bound_client_for(&server)
+                .await
+                .add_review_at_head(&request)
+                .await;
+            assert_eq!(
+                matches!(outcome, BoundReviewOutcome::Rejected { .. }),
+                rejected
+            );
+            assert!(!matches!(outcome, BoundReviewOutcome::Acknowledged { .. }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        let server = MockServer::start().await;
+        let mut missing = request;
+        missing.expected_head.clear();
+        assert!(matches!(
+            bound_client_for(&server)
+                .await
+                .add_review_at_head(&missing)
+                .await,
+            BoundReviewOutcome::NotDispatched { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn head_bound_review_timeout_is_uncertain_once_and_cooldown_never_dispatches() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let request = BoundReviewRequest {
+            id: "PR-7".into(),
+            repo: "fixture/project".into(),
+            number: 7,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: "viewed-head".into(),
+            expected_viewer: "fixture".into(),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(120))
+                    .set_body_json(json!({"data":null})),
+            )
+            .mount(&server)
+            .await;
+        let client = bound_client_for(&server).await;
+        let worker = tokio::spawn({
+            let client = client.clone();
+            let request = request.clone();
+            async move { client.add_review_at_head(&request).await }
+        });
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(SEARCH_BUDGET).await;
+        assert!(matches!(
+            worker.await.unwrap(),
+            BoundReviewOutcome::Uncertain { .. }
+        ));
+        tokio::time::resume();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let server = MockServer::start().await;
+        let client = bound_client_for(&server).await;
+        client
+            .read_transport
+            .admission
+            .limit(super::super::admission::Bucket::Graphql, 300, true);
+        assert!(matches!(
+            client.add_review_at_head(&request).await,
+            BoundReviewOutcome::NotDispatched { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn legacy_review_missing_receipt_is_not_success() {
+        use super::super::mutate::ReviewVerdict;
+        for receipt in [serde_json::Value::Null, json!({}), json!({"state":""})] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"addPullRequestReview":{"pullRequestReview":receipt}}}),
+                ))
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                bound_client_for(&server)
+                    .await
+                    .add_review("PR-7", ReviewVerdict::Approve, "")
+                    .await,
+                Err(ClientError::UnconfirmedWrite)
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
 }

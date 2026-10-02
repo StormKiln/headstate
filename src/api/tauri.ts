@@ -307,6 +307,20 @@ export const reviewPr = (
   body: string,
 ) => call<void>("review_pr", { id, repo, number, verdict, body });
 
+export interface BoundReviewRequest {
+  id: string; repo: string; number: number; verdict: ReviewVerdictName; body: string;
+  expected_head: string; expected_viewer: string;
+}
+export interface SubmittedReview {
+  review_id: string; state: string; actor: string; commit_oid: string;
+  submitted_at: string | null; pr_id: string; repo: string; number: number;
+}
+export type BoundReviewOutcome =
+  | { outcome: "acknowledged"; receipt: SubmittedReview }
+  | { outcome: "uncertain" | "not_dispatched" | "rejected"; message: string };
+export const reviewPrAtHead = (request: BoundReviewRequest) =>
+  call<BoundReviewOutcome>("review_pr_at_head", { request });
+
 /// Comment on a pull request without reviewing it.
 export const commentOnPr = (id: string, repo: string, number: number, body: string) =>
   call<void>("comment_on_pr", { id, repo, number, body });
@@ -2267,8 +2281,9 @@ export const gitLabAction = (request: import("../types/gitlabActions").GitLabAct
   call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });
 
 /// Bounded metadata-only stack lookups for Ready rows (#1602).
-export const getReadyStacks = (rows: PrIdentity[]) =>
-  call<(PrIdentity & { stack: PrStack })[]>("get_ready_stacks", { rows });
+export type StackAsk = PrIdentity & { head_oid?: string; base_ref?: string };
+export const getReadyStacks = (rows: StackAsk[]) =>
+  call<(PrIdentity & { stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number })[]>("get_ready_stacks", { rows });
 
 /** Desktop notification clicks wait here until the app shell mounts. */
 export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");

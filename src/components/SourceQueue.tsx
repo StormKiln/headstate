@@ -1,3 +1,4 @@
+import { observationLabel } from "@/lib/rowObservation";
 import { useGitLabViewer } from "../api/authAvailability";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -52,7 +53,7 @@ function coverageMessage(provider: string, coverage: SourceCoverage | null, coun
   if (typeof coverage === "object") {
     const total = coverage.partial.total;
     return total !== null && total > count
-      ? `${provider}: showing ${count} of ${total}; the rest did not load.`
+      ? `${provider}: refreshed ${count} of ${total}; the rest were not confirmed.`
       : `${provider}: this list is partial; more rows may be open.`;
   }
   return null;
@@ -98,7 +99,7 @@ function GitLabRow({ mr, parent, onOpen, opened, cursored }: { mr: MergeRequest;
   return (
     <div role="button" tabIndex={0} aria-current={current(opened)} onClick={onOpen} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }} className={`cursor-pointer border-b border-[#30363d] px-4 ${density === "dense" ? "py-1.5" : "py-3"} hover:bg-[#161b22] ${cursored ? "ring-2 ring-inset ring-[#1f6feb]" : ""}`}>
       <div className="text-xs text-[#8b949e]">GitLab · {mr.source.host} · {mr.repo}</div>
-      <div className="mt-1 font-semibold">{mr.title} <span className="text-xs font-normal text-[#8b949e]">!{mr.number}</span></div>
+      <div className="mt-1 font-semibold">{mr.title} {observationLabel(mr) && <span className="text-xs text-amber-400">{observationLabel(mr)}</span>} <span className="text-xs font-normal text-[#8b949e]">!{mr.number}</span></div>
       <div className="mt-1 text-xs text-[#8b949e]">
         {mr.is_draft ? "Draft · " : ""}{mr.author} · {mr.head_ref} → {mr.base_ref}
         {mr.ci === null ? " · CI unknown" : ` · CI ${mr.ci}`}
@@ -199,8 +200,8 @@ export function SourceQueue({
     if (cursor !== null && cursor >= rows.length) setCursor(rows.length > 0 ? rows.length - 1 : null);
   }, [cursor, rows.length, setCursor]);
   const sources = [
-    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub }]),
-    { name: "GitLab", rows: gitlab?.length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab },
+    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.filter((row) => row.observation?.state !== "retained").length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub }]),
+    { name: "GitLab", rows: gitlab?.filter((row) => row.observation?.state !== "retained").length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab },
   ];
   return <div className="space-y-3">
     <p className="text-xs text-[#8b949e]">GitLab queues use the host configured in Settings on the desktop.</p>

@@ -75,6 +75,8 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::inventory::RowObservation>,
     /// Absent only in snapshots written before provider identity was added.
     #[serde(default)]
     pub source: Source,
@@ -455,6 +457,25 @@ pub struct ReviewerVerdict {
     /// narrowed to a bool -- a DISMISSED approval is not an approval,
     /// and collapsing it here would silently claim otherwise.
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksState {
+    Complete,
+    Partial,
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksCoverage {
+    pub state: ChecksState,
+    pub total: Option<u64>,
 }
 
 /// Everything the detail view renders.
@@ -591,7 +612,7 @@ pub struct PrDetail {
     /// Paired with `checks` the way `comment_count` is paired with
     /// `comments`, and for the same reason: the panel renders what
     /// arrived and annotates the gap rather than presenting a subset as
-    /// complete. `append_remaining_checks` explains why this matters
+    /// complete. Explicit checks coverage qualifies modern partial results
     /// more here than for comments -- a short check list reads as a
     /// green pull request.
     ///
@@ -602,6 +623,8 @@ pub struct PrDetail {
     /// `poll::truncation_payload` takes with `issueCount`.
     #[serde(default)]
     pub checks_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_coverage: Option<ChecksCoverage>,
     /// Where this pull request sits in a stack, asked of GitHub directly
     /// rather than inferred from whatever the list happens to hold (#1452).
     ///
@@ -692,6 +715,7 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            observation: None,
             source: Default::default(),
             id: "PR_test".into(),
             number: 1,

@@ -1,3 +1,4 @@
+import { observationLabel } from "@/lib/rowObservation";
 import { ExternalLink } from "./ExternalLink";
 import {
   Check,
@@ -366,13 +367,15 @@ export function PrRow({
               no detail view to open, the title stays a link rather than
               becoming inert. */}
           {onOpen ? (
-            <span className="font-semibold text-[#e6edf3]">{pr.title}</span>
+            <><span className="font-semibold text-[#e6edf3]">{pr.title}</span>
+            {observationLabel(pr) && <span className="ml-2 text-xs text-amber-400">{observationLabel(pr)}</span>}</>
           ) : (
             <ExternalLink
               href={pr.url}
               className="font-semibold text-[#e6edf3] hover:text-[#4493f8]"
             >
               {pr.title}
+              {observationLabel(pr) && <span className="ml-2 text-xs text-amber-400">{observationLabel(pr)}</span>}
             </ExternalLink>
           )}
           {/* The number moves up in dense mode: it lives on the prose

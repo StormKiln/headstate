@@ -342,7 +342,7 @@ async fn rest_get_retries_once_and_meters_the_refused_attempt() {
 }
 
 #[tokio::test]
-async fn rest_and_graphql_cooldowns_are_independent() {
+async fn graphql_secondary_cooldown_blocks_rest_without_dispatch() {
     use headstate_lib::github::{
         gates::{base_rules, BaseRules},
         stats::Budget,
@@ -364,9 +364,9 @@ async fn rest_and_graphql_cooldowns_are_independent() {
     assert!(client.fetch_prs_snapshot().await.is_err());
     let budget = Budget::new();
     let rules = base_rules(&client, &budget, "synthetic/separate-pools", "main").await;
-    assert!(matches!(rules, BaseRules::Read { .. }), "{rules:?}");
-    assert_eq!(budget.rest_requests(), 1);
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert!(matches!(rules, BaseRules::Declined { .. }), "{rules:?}");
+    assert_eq!(budget.rest_requests(), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -400,7 +400,7 @@ async fn successful_exhausted_reads_keep_the_last_answer() {
 }
 
 #[tokio::test]
-async fn rest_cooldown_blocks_later_rest_reads_but_not_graphql() {
+async fn rest_secondary_cooldown_blocks_both_resources_without_another_dispatch() {
     use headstate_lib::github::{
         gates::{base_rules, BaseRules},
         stats::Budget,
@@ -420,17 +420,77 @@ async fn rest_cooldown_blocks_later_rest_reads_but_not_graphql() {
         .await;
     let client = client(&server, "synthetic-rest-pool-limit");
     let budget = Budget::new();
-    for base in ["first", "second"] {
-        let rules = base_rules(&client, &budget, "synthetic/rest-pool-limit", base).await;
-        assert!(matches!(rules, BaseRules::Unreadable { .. }), "{rules:?}");
-    }
+    let first = base_rules(&client, &budget, "synthetic/rest-pool-limit", "first").await;
+    // The rules API intentionally classifies both a received rate-limit refusal
+    // and local cooldown suppression as Declined; wire counts distinguish them.
+    assert!(matches!(first, BaseRules::Declined { .. }), "{first:?}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let second = base_rules(&client, &budget, "synthetic/rest-pool-limit", "second").await;
+    assert!(matches!(second, BaseRules::Declined { .. }), "{second:?}");
     assert_eq!(
         budget.rest_requests(),
         1,
         "the cooldown refusal made no HTTP request"
     );
-    assert_eq!(client.fetch_prs_snapshot().await.unwrap().prs.len(), 3);
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert!(client.fetch_prs_snapshot().await.is_err());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn primary_resource_quotas_are_independent_without_secondary_cooldown() {
+    use headstate_lib::github::{
+        gates::{base_rules, BaseRules},
+        stats::Budget,
+    };
+    for exhausted_graphql in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "x-ratelimit-remaining",
+                        if exhausted_graphql { "0" } else { "5000" },
+                    )
+                    .set_body_json(page()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "x-ratelimit-remaining",
+                        if exhausted_graphql { "5000" } else { "0" },
+                    )
+                    .set_body_json(serde_json::json!([])),
+            )
+            .mount(&server)
+            .await;
+        let client = client(&server, "synthetic-primary-resources");
+        let budget = Budget::new();
+        if exhausted_graphql {
+            assert_eq!(client.fetch_prs_snapshot().await.unwrap().prs.len(), 3);
+            assert!(client.fetch_reviewing_snapshot().await.is_err());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert!(matches!(
+                base_rules(&client, &budget, "octocat/hello-world", "main").await,
+                BaseRules::Read { .. }
+            ));
+        } else {
+            assert!(matches!(
+                base_rules(&client, &budget, "octocat/hello-world", "main").await,
+                BaseRules::Read { .. }
+            ));
+            assert!(matches!(
+                base_rules(&client, &budget, "octocat/hello-world", "other").await,
+                BaseRules::Declined { .. }
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(client.fetch_prs_snapshot().await.unwrap().prs.len(), 3);
+        }
+        assert_eq!(budget.rest_requests(), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 }
 
 #[tokio::test]

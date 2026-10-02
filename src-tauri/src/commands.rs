@@ -10,7 +10,7 @@ pub async fn save_markdown(
     crate::markdown_export::save_markdown(window, markdown).await
 }
 
-use crate::github::client::{ClientError, GitHubClient};
+use crate::github::client::GitHubClient;
 use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
 };
@@ -408,10 +408,8 @@ async fn refresh_source_request(
     }
     // The loader owns its deadline so completed pages survive a timeout.
     let client = client.0.as_ref().expect("checked above");
-    let result = match list {
-        CachedList::Authored => client.fetch_prs_snapshot().await,
-        CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
-    };
+    let result =
+        source_poll::fetch_github_step(&app, client, list, crate::poll::FETCH_TIMEOUT).await;
     let fetched = result.map_err(|error| Failure::from(&error));
     match fetched {
         Ok(result) => {
@@ -425,8 +423,18 @@ async fn refresh_source_request(
                     coverage: winner.coverage,
                 });
             };
+            let result = match source_poll::reconcile_github(&app, &publication, result).await {
+                Ok(result) => result,
+                Err(failure) => {
+                    let message = failure.message.clone();
+                    source_poll::complete(&app, publication, Err(failure));
+                    return Err(message);
+                }
+            };
             let receipt = result.clone();
             let crate::github::client::FetchedList {
+                scan,
+                viewer,
                 prs,
                 total,
                 coverage,
@@ -435,18 +443,23 @@ async fn refresh_source_request(
             let owned = prs.clone();
             let owned_source = source.clone();
             let owned_coverage = coverage.clone();
-            let saved = tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_source_snapshot(
-                    &conn,
-                    &owned_source,
-                    list,
-                    &owned,
-                    &owned_coverage,
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await;
+            let saved = if scan.is_some() {
+                Ok(Ok(()))
+            } else {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let conn = open_db(&path).map_err(|e| e.to_string())?;
+                    crate::store::source_cache::save_owned_source_snapshot(
+                        &conn,
+                        &owned_source,
+                        list,
+                        &owned,
+                        &owned_coverage,
+                        viewer.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+            };
             if !matches!(saved, Ok(Ok(()))) {
                 let _ = app.emit(
                     "store-error",
@@ -456,7 +469,13 @@ async fn refresh_source_request(
             if list == CachedList::Reviewing {
                 crate::poll::emit_reviewing(&app, &receipt);
             } else {
-                let truncated = total.map(|total| if total > prs.len() as u64 { total } else { 0 });
+                let truncated = total.map(|total| {
+                    if total > crate::inventory::observed_count(&prs) {
+                        total
+                    } else {
+                        0
+                    }
+                });
                 let _ = app.emit("prs-truncated", truncated);
             }
             source_poll::complete(&app, publication, Ok(receipt));
@@ -494,10 +513,17 @@ async fn refresh_gitlab_request(
     attempt: crate::source_poll::Attempt,
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
-    match crate::gitlab::queues::fetch(&source, list, |receipt| async {
+    match crate::gitlab::queues::fetch(&source, list, &db_path(&app), |receipt| async {
         if let Some(publication) = source_poll::success_publication(&app, &attempt).await {
-            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+            match source_poll::reconcile_gitlab(&app, &publication, receipt).await {
+                Ok(receipt) => {
+                    source_poll::complete_gitlab(&app, publication, Ok(receipt));
+                    return true;
+                }
+                Err(error) => source_poll::complete_gitlab(&app, publication, Err(error)),
+            }
         }
+        false
     })
     .await
     {
@@ -512,23 +538,37 @@ async fn refresh_gitlab_request(
                     coverage: winner.coverage,
                 });
             };
+            let result = match source_poll::reconcile_gitlab(&app, &publication, result).await {
+                Ok(r) => r,
+                Err(error) => {
+                    let message = error.message.clone();
+                    source_poll::complete_gitlab(&app, publication, Err(error));
+                    return Err(message);
+                }
+            };
             let receipt = result.clone();
             let path = db_path(&app);
             let owned_source = source.clone();
             let owned = result.mrs.clone();
             let owned_coverage = result.coverage.clone();
-            let saved = tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_gitlab_snapshot(
-                    &conn,
-                    &owned_source,
-                    list,
-                    &owned,
-                    &owned_coverage,
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await;
+            let owner = result.viewer.clone();
+            let saved = if result.scan.is_some() {
+                Ok(Ok(()))
+            } else {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let conn = open_db(&path).map_err(|e| e.to_string())?;
+                    crate::store::source_cache::save_owned_gitlab_snapshot(
+                        &conn,
+                        &owned_source,
+                        list,
+                        &owned,
+                        &owned_coverage,
+                        owner.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+            };
             if !matches!(saved, Ok(Ok(()))) {
                 let _ = app.emit(
                     "store-error",
@@ -604,6 +644,7 @@ pub async fn get_cycle_trend(client: State<'_, GhClient>) -> Result<CycleTrend, 
 /// so "did I merge that?" has an answer.
 #[tauri::command]
 pub async fn act_on_pr(
+    app: AppHandle,
     client: State<'_, GhClient>,
     waker: State<'_, crate::poll::Waker>,
     id: String,
@@ -615,7 +656,10 @@ pub async fn act_on_pr(
     let act = parse_action(&action)?;
 
     match client.mutate_pr(&id, act).await {
-        Ok(()) => {
+        Ok(effect) => {
+            if let Some(effect) = effect {
+                crate::source_poll::record_confirmed_removal(&app, &repo, number, effect).await;
+            }
             log::info!("{repo}#{number} {}", act.describe());
             // Refresh promptly rather than waiting out the poll interval:
             // the list would otherwise keep showing a PR as open for up
@@ -656,8 +700,8 @@ pub async fn merge_stack(
     use crate::github::stack_merge::{StackMergeAction, StackMergeOutcome};
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let action = StackMergeAction::parse(&action)?;
-    let budget = crate::github::stats::Budget::new();
-    if !budget.permits_rest(1) {
+    let budget = client.request_budget();
+    if !client.rest_reserve_allows() {
         return Err(
             "Not submitted: GitHub's REST rate limit is nearly spent. Try again after it resets."
                 .into(),
@@ -734,6 +778,54 @@ pub async fn get_viewer(client: State<'_, GhClient>) -> Result<String, String> {
     client.fetch_viewer().await.map_err(|e| e.to_string())
 }
 
+/// Submit exactly once against the head the user viewed. Legacy review_pr remains unchanged.
+#[tauri::command]
+pub async fn review_pr_at_head(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    request: crate::github::mutate::BoundReviewRequest,
+) -> Result<crate::github::mutate::BoundReviewOutcome, String> {
+    use crate::github::mutate::BoundReviewOutcome;
+    let Some(client) = client.0.clone() else {
+        return Ok(BoundReviewOutcome::NotDispatched {
+            message: AUTH_ERR.into(),
+        });
+    };
+    let outcome = client.add_review_at_head(&request).await;
+    if let BoundReviewOutcome::Acknowledged { receipt } = &outcome {
+        let review = match receipt.state.as_str() {
+            "APPROVED" => Some(crate::github::model::ReviewState::Approved),
+            "CHANGES_REQUESTED" => Some(crate::github::model::ReviewState::ChangesRequested),
+            _ => None,
+        };
+        if let Some(review) = review {
+            crate::source_poll::record_confirmed_review(
+                &app,
+                &receipt.repo,
+                receipt.number,
+                &receipt.actor,
+                crate::inventory::ConfirmedReview {
+                    head_oid: receipt.commit_oid.clone(),
+                    review,
+                    confirmed_at: chrono::Utc::now(),
+                    receipt: Some(receipt.clone()),
+                    unresolved: false,
+                    confirmed_by_read: false,
+                },
+            )
+            .await;
+            let app = app.clone();
+            let receipt = receipt.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+                crate::source_poll::qualify_confirmed_review(&app, &receipt).await;
+            });
+        }
+        app.state::<crate::poll::Waker>().0.notify_one();
+    }
+    Ok(outcome)
+}
+
 /// Submit a review on a pull request.
 ///
 /// The first write path for a PR the user does not own. Body text is
@@ -742,8 +834,8 @@ pub async fn get_viewer(client: State<'_, GhClient>) -> Result<String, String> {
 /// worse error than refusing it before one.
 #[tauri::command]
 pub async fn review_pr(
+    app: AppHandle,
     client: State<'_, GhClient>,
-    waker: State<'_, crate::poll::Waker>,
     id: String,
     repo: String,
     number: u64,
@@ -763,11 +855,15 @@ pub async fn review_pr(
     }
 
     match client.add_review(&id, v, &body).await {
-        Ok(()) => {
+        Ok(effect) => {
+            if let Some((viewer, effect)) = effect {
+                crate::source_poll::record_confirmed_review(&app, &repo, number, &viewer, effect)
+                    .await;
+            }
             // Never log the body: review text is the user's words about
             // someone else's work, and logs are not the place for it.
             log::info!("{repo}#{number} {}", v.describe());
-            waker.0.notify_one();
+            app.state::<crate::poll::Waker>().0.notify_one();
             Ok(())
         }
         Err(e) => {
@@ -942,6 +1038,7 @@ const BATCH_CONCURRENCY: usize = 4;
 /// would fire every mutation at once and wake the poll loop once per
 /// success. This bounds concurrency and wakes once at the end.
 pub async fn act_on_prs(
+    app: AppHandle,
     client: State<'_, GhClient>,
     waker: State<'_, crate::poll::Waker>,
     prs: Vec<(String, String, u64)>,
@@ -955,9 +1052,16 @@ pub async fn act_on_prs(
         let mut set = tokio::task::JoinSet::new();
         for (id, repo, number) in chunk {
             let (client, id, repo, number) = (client.clone(), id.clone(), repo.clone(), *number);
+            let app = app.clone();
             set.spawn(async move {
                 let error = match client.mutate_pr(&id, act).await {
-                    Ok(()) => {
+                    Ok(effect) => {
+                        if let Some(effect) = effect {
+                            crate::source_poll::record_confirmed_removal(
+                                &app, &repo, number, effect,
+                            )
+                            .await;
+                        }
                         log::info!("{repo}#{number} {}", act.describe());
                         None
                     }
@@ -1124,6 +1228,7 @@ pub async fn delete_head_branch(
 /// is a separate failure with a separate fix -- see the PR for #790.
 #[tauri::command]
 pub async fn get_pr_detail(
+    app: AppHandle,
     client: State<'_, GhClient>,
     repo: String,
     number: u64,
@@ -1140,15 +1245,20 @@ pub async fn get_pr_detail(
     crate::diag!("[diag] cmd get_pr_detail start");
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let out = match tokio::time::timeout(
+    // The scoped client owns one deadline and can return completed check pages
+    // when a continuation expires; an outer timeout would discard that progress.
+    let client = client.with_read_context(crate::github::admission::ReadContext::new(
+        crate::github::admission::ReadClass::Foreground,
         crate::poll::FETCH_TIMEOUT,
-        client.fetch_pr_detail(&repo, number),
-    )
-    .await
-    {
-        Ok(res) => res.map_err(|e| e.to_string()),
-        Err(_) => Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs()).to_string()),
-    };
+    ));
+    let review_generation = crate::source_poll::review_read_generation(&app);
+    let out = client
+        .fetch_pr_detail(&repo, number)
+        .await
+        .map_err(|e| e.to_string());
+    if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
+        crate::source_poll::record_review_readback(&app, detail, viewer, review_generation).await;
+    }
     crate::diag!(
         "[diag] cmd get_pr_detail end {}ms {}",
         started.elapsed().as_millis(),
@@ -1191,7 +1301,7 @@ pub async fn get_review_gates(
     crate::diag!("[diag] cmd get_review_gates start");
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let budget = crate::github::stats::Budget::new();
+    let budget = client.request_budget();
     let out = crate::github::gates::review_gates(
         &client,
         &budget,
@@ -1222,7 +1332,7 @@ const STRIP_PER_REQUEST: std::time::Duration = std::time::Duration::from_secs(10
 /// The strip's batched counterpart of `get_review_gates`, built from the
 /// same parts (`github::gates`): rules cached per (repository, base),
 /// pushers cached per (head repository, head commit), and at most
-/// `STRIP_LOOKUP_CAP` new activity reads per call, inside the REST
+/// a shared actual-attempt allowance across calls, inside the REST
 /// budget. A row past the cap or the budget comes back `Declined` -- not
 /// checked -- so the strip never mistakes "we did not ask" for "we could
 /// not tell" (#1050).
@@ -1237,7 +1347,7 @@ pub async fn get_ready_pushers(
     crate::diag!("[diag] cmd get_ready_pushers start rows={}", rows.len());
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let budget = crate::github::stats::Budget::new();
+    let budget = client.request_budget();
     let out = crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await;
     crate::diag!(
         "[diag] cmd get_ready_pushers end {}ms rest_requests={}",
@@ -4661,7 +4771,7 @@ pub async fn stats_count(
     measure: String,
     days: i64,
 ) -> Result<crate::github::stats::Outcome, String> {
-    use crate::github::stats::{Budget, Measure, Scope, Slice, StatsQuery, Subject};
+    use crate::github::stats::{Measure, Scope, Slice, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let days = clamp_days(days);
@@ -4713,7 +4823,7 @@ pub async fn stats_count(
     // constructing the accumulator afterwards meant the point was spent
     // outside anything that could count it -- so `Spend.points` understated
     // by one per call while `is_exact()` returned true.
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // The cache key needs `@me` RESOLVED, because two accounts on one
     // machine share this database and a row keyed on the literal would be
     // served to whichever asked second. `fetch_viewer_metered` is one cheap
@@ -5285,7 +5395,7 @@ async fn stats_board_for_client(
     measure: String,
     days: i64,
 ) -> Result<StatsBoard, String> {
-    use crate::github::stats::{Budget, Measure};
+    use crate::github::stats::Measure;
 
     let measure = match measure.as_str() {
         "merged" => Measure::Merged,
@@ -5311,7 +5421,7 @@ async fn stats_board_for_client(
     // land outside any accumulator (#844) -- `board_projection` already
     // budgeted for it (`// +1 for fetch_viewer.`), so the projection knew
     // about a request the accounting did not.
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // Reuse this immutable client's verified identity (normally resolved
     // at startup). A new client must verify its own token once; subsequent
     // covered clicks issue no provider requests, including viewer lookups.
@@ -5432,7 +5542,7 @@ async fn stats_board_for_client(
         log::warn!("discarding an unreadable stats board cache row");
     }
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     let projected = board_projection(clamp_days(days));
     if !budget.permits(projected) {
         return Err(format!(
@@ -5860,7 +5970,7 @@ pub async fn stats_series(
     scope_value: Option<String>,
     days: i64,
 ) -> Result<crate::github::stats::Series, String> {
-    use crate::github::stats::{Budget, Measure, StatsQuery, Subject};
+    use crate::github::stats::{Measure, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let subject = match subject {
@@ -5875,7 +5985,7 @@ pub async fn stats_series(
     let now = chrono::Utc::now();
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // One request per `ALIAS_CHUNK` days, at the measured 1 point each,
     // plus slack. Far cheaper than a board, and gated anyway: the check
     // exists for the case where something else has already spent the
@@ -6085,7 +6195,7 @@ pub async fn stats_reviewers(
     logins: Vec<String>,
     days: i64,
 ) -> Result<crate::github::stats::Reviewers, String> {
-    use crate::github::stats::{Budget, Measure, StatsQuery};
+    use crate::github::stats::{Measure, StatsQuery};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let now = chrono::Utc::now();
@@ -6108,7 +6218,7 @@ pub async fn stats_reviewers(
         return Err("no reviewer logins to count".into());
     }
 
-    let budget = Budget::new();
+    let budget = client.request_budget();
     // One request per `ALIAS_CHUNK` logins at 1 point each, plus slack.
     let projected =
         (logins.len() as u64).div_ceil(crate::github::stats::query::ALIAS_CHUNK as u64) + 1;
@@ -8036,7 +8146,7 @@ pub async fn claude_permission_ownership(
 #[tauri::command]
 pub async fn get_ready_stacks(
     client: State<'_, GhClient>,
-    rows: Vec<crate::identity::PrIdentity>,
+    rows: Vec<crate::github::ready_stacks::StackAsk>,
 ) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     crate::github::ready_stacks::ready_stacks(&client, rows).await
@@ -10840,10 +10950,14 @@ pub async fn gitlab_action(
     app: AppHandle,
     request: crate::gitlab::actions::ActionRequest,
 ) -> Result<crate::gitlab::actions::Receipt, String> {
-    require_gitlab_host(&app, &request.identity.source.host)?;
+    require_gitlab_host(&app, &request.identity.source.host)
+        .map_err(|message| format!("{NOT_ASKED} {message}"))?;
     crate::gitlab::poll::after_mutation(
         async {
             let result = crate::gitlab::actions::execute(&request).await;
+            if let Ok(receipt) = &result {
+                crate::source_poll::record_gitlab_action(&app, &request, receipt).await;
+            }
             crate::source_poll::invalidate_gitlab(&app, &request.identity.source).await;
             crate::gitlab::queues::invalidate_identity(&request.identity);
             crate::gitlab::stats::invalidate(request.identity.source.host.clone(), db_path(&app))

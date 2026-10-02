@@ -103,8 +103,18 @@ pub async fn backfill(
     }
     let program =
         super::super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
-    let viewer = viewer(&program, host).await?;
-    backfill_with(
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let initial = ProcessContext::new(&program, host, Class::Foreground, deadline);
+    let (identity, context) = super::super::auth::verified_identity(&program, host, &initial)
+        .await
+        .map_err(|_| "GitLab account unavailable")?;
+    let viewer = identity["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("GitLab account unavailable")?
+        .to_string();
+    backfill_context(
+        &context,
         &program,
         source,
         viewer,
@@ -123,8 +133,29 @@ fn complete(r: &Report) -> bool {
             .is_some_and(|m| m.coverage.complete)
 }
 
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 async fn backfill_with(
+    program: &Path,
+    source: Source,
+    viewer: String,
+    scope: Scope,
+    days: u32,
+    db: std::path::PathBuf,
+    today: chrono::NaiveDate,
+) -> Result<Backfill, String> {
+    let context = ProcessContext::new(
+        program,
+        &source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + BUDGET,
+    );
+    backfill_context(&context, program, source, viewer, scope, days, db, today).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn backfill_context(
+    context: &ProcessContext,
     program: &Path,
     source: Source,
     viewer: String,
@@ -192,7 +223,17 @@ async fn backfill_with(
             report: prior.as_ref().and_then(|r| r.report.clone()),
             error: None,
         };
-        match load_window(program, source.clone(), viewer.clone(), scope, start, end).await {
+        match load_window_context(
+            context,
+            program,
+            source.clone(),
+            viewer.clone(),
+            scope,
+            start,
+            end,
+        )
+        .await
+        {
             Ok(report) => {
                 receipt.report = Some(report);
             }
@@ -200,7 +241,7 @@ async fn backfill_with(
                 receipt.error = Some(error);
             }
         }
-        if super::viewer(program, &source.host).await? != viewer {
+        if viewer_context(program, &source.host, context).await? != viewer || !context.current() {
             return Err(
                 "GitLab account changed while loading history. Refresh to try again.".into(),
             );
@@ -213,10 +254,18 @@ async fn backfill_with(
         let key = partition.clone();
         let date = day.to_string();
         let saved = receipt.clone();
+        let owner = context.token();
         let saved_result = tokio::task::spawn_blocking(move || {
-            crate::store::gitlab_stats::history_put(&path, &key, &date, &saved)
+            owner
+                .with_current(|| {
+                    crate::store::gitlab_stats::history_put(&path, &key, &date, &saved)
+                })
+                .unwrap_or(Ok(saved))
         })
         .await;
+        if !context.current() {
+            return Err("GitLab account changed while saving history.".into());
+        }
         match saved_result {
             Ok(Ok(saved)) => {
                 receipt = saved;
@@ -254,6 +303,60 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         program
     }
+    #[tokio::test]
+    async fn measured_history_without_final_identity_never_persists_or_spawns_overdue_probe() {
+        for limited in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("history.sqlite");
+            let cli = dir.path().join("glab");
+            let refusal = if limited {
+                "printf 'HTTP/2 429\\nRetry-After: 300\\n\\n{}'"
+            } else {
+                "touch \"$0.timeout\"; exec sleep 60"
+            };
+            std::fs::write(
+                &cli,
+                format!(
+                    r#"#!/bin/sh
+echo "$5" >> "$0.calls"
+if test -f "$0.measured"; then {refusal}; exit 0; fi
+touch "$0.measured"
+printf 'HTTP/2 200\nX-Next-Page: \nX-Total: 0\n\n[]'
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::gitlab::test_support::scripted(&cli, async {
+                let result = backfill_with(
+                    &cli,
+                    source("gitlab.example").unwrap(),
+                    "1".into(),
+                    Scope::Mine,
+                    1,
+                    db.clone(),
+                    "2026-09-04".parse().unwrap(),
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "unverified owner cannot authorize history persistence"
+                );
+                let calls = std::fs::read_to_string(cli.with_extension("calls")).unwrap();
+                assert_eq!(calls.lines().count(), 2);
+                assert!(!calls.lines().any(|line| line == "user"));
+                let conn = crate::store::open_db(&db).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM gitlab_stats_history", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            })
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn resume_skips_complete_days_and_partitions_accounts_hosts_and_scopes() {
         let dir = tempfile::tempdir().unwrap();

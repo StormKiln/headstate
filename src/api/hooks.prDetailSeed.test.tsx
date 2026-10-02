@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { PrDetail, PullRequest } from "@/types/pr";
@@ -46,7 +46,13 @@ const ROW: PullRequest = {
 };
 
 /// What the command eventually answers with.
-const DETAIL = {
+const DETAIL: PrDetail = {
+  ...ROW,
+  state: "OPEN",
+  merge_queue_enabled: false,
+  comments: [],
+  review_threads: [],
+  review_threads_total: 0,
   id: "PR_row",
   number: 7,
   title: "Cap the check pagination",
@@ -56,7 +62,7 @@ const DETAIL = {
   changed_files: 4,
   checks: [{ name: "build", state: "success", url: "", run_id: null }],
   checks_total: 1,
-} as unknown as PrDetail;
+};
 
 /// A never-resolving command, so the PLACEHOLDER window can be asserted
 /// on at all. The bug in #790 is entirely about what is on screen while
@@ -198,15 +204,45 @@ describe("usePrDetail seeding", () => {
   /// And the real answer replaces the seed, rather than the seed
   /// sticking as a permanently body-less page.
   it("replaces the seed with the fetched detail", async () => {
+    let resolve!: (detail: PrDetail) => void;
+    const pending = new Promise<PrDetail>(done => { resolve = done; });
     invoke.mockImplementation((cmd: string) =>
-      cmd === "get_pr_detail" ? Promise.resolve(DETAIL) : Promise.resolve(),
+      cmd === "get_pr_detail" ? pending : Promise.resolve(),
     );
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     qc.setQueryData<PullRequest[]>(["prs"], [ROW]);
 
     const { result } = renderHook(() => usePrDetail("o/r", 7), { wrapper: wrap(qc) });
-    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(true));
+    expect(result.current.data?.title).toBe(ROW.title);
+    expect(qc.getQueryData(["pr-detail", "o/r", 7])).toBeUndefined();
+    await act(async () => resolve(DETAIL));
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+    expect(result.current.isError).toBe(false);
+    expect(result.current.error).toBeNull();
     expect(result.current.data?.body).toContain("21 serial POSTs");
     expect(result.current.data?.changed_files).toBe(4);
+    expect(result.current.data?.checks).toEqual(DETAIL.checks);
+    expect(qc.getQueryData(["pr-detail", "o/r", 7])).toEqual(DETAIL);
+  });
+
+  it("does not mistake a rejected placeholder fetch for successful replacement", async () => {
+    let reject!: (error: Error) => void;
+    const pending = new Promise<PrDetail>((_resolve, fail) => { reject = fail; });
+    invoke.mockImplementation(cmd => cmd === "get_pr_detail" ? pending : Promise.resolve());
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData<PullRequest[]>(["prs"], [ROW]);
+    const { result } = renderHook(() => usePrDetail("o/r", 7), { wrapper: wrap(qc) });
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(true));
+    expect(qc.getQueryData(["pr-detail", "o/r", 7])).toBeUndefined();
+    await act(async () => reject(new Error("Synthetic detail unavailable")));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.isPlaceholderData).toBe(false);
+    expect(result.current.isSuccess).toBe(false);
+    expect(result.current.error?.message).toBe("Synthetic detail unavailable");
+    expect(qc.getQueryData(["pr-detail", "o/r", 7])).toBeUndefined();
   });
 });

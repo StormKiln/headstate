@@ -1,3 +1,5 @@
+vi.mock("../api/reviewOperations", () => ({ useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
+vi.mock("@/api/useReadyStacks", () => ({ useReadyStacks: () => ({ of: (pr: PrDetail) => pr.stack }) }));
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFilters } from "../store/filters";
@@ -1009,6 +1011,7 @@ describe("PrDetailView", () => {
   });
 
   it("submits a verdict through the review hook", async () => {
+    viewer.current = "reviewer";
     view();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "needs work" } });
     fireEvent.click(screen.getByRole("button", { name: /request changes/i }));
@@ -1019,6 +1022,8 @@ describe("PrDetailView", () => {
         42,
         "request_changes",
         "needs work",
+        state.data?.head_oid,
+        "reviewer",
       ),
     );
   });

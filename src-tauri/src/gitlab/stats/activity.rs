@@ -25,7 +25,22 @@ pub struct Participant {
     pub mrs: usize,
 }
 
+#[cfg(all(test, unix))]
 pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> Activity {
+    let context = ProcessContext::new(
+        program,
+        &report.source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + budget,
+    );
+    load_context(&context, program, report, budget).await
+}
+pub(super) async fn load_context(
+    context: &ProcessContext,
+    program: &Path,
+    report: &Report,
+    budget: Duration,
+) -> Activity {
     let started = tokio::time::Instant::now();
     let mut result = Activity {
         complete: report.coverage.complete,
@@ -56,21 +71,29 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
             encode(&mr.project),
             mr.iid
         );
-        let (notes, coverage) =
-            match pages_limited(program, &report.source.host, &endpoint, remaining, 1).await {
-                Ok(value) => value,
-                Err(failure) => {
-                    result.failures.push(error(&failure.stop));
-                    result.complete = false;
-                    if failure.stop == Stop::RateLimited {
-                        result.rate_limited = true;
-                        result.rate_remaining = failure.remaining;
-                        result.rate_reset = failure.reset;
-                        break;
-                    }
-                    continue;
+        let (notes, coverage) = match pages_limited_context(
+            context,
+            program,
+            &report.source.host,
+            &endpoint,
+            remaining,
+            1,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(failure) => {
+                result.failures.push(error(&failure.stop));
+                result.complete = false;
+                if failure.stop == Stop::RateLimited {
+                    result.rate_limited = true;
+                    result.rate_remaining = failure.remaining;
+                    result.rate_reset = failure.reset;
+                    break;
                 }
-            };
+                continue;
+            }
+        };
         result.rate_remaining = coverage.rate_remaining;
         result.rate_reset = coverage.rate_reset;
         let (valid, first) = absorb(

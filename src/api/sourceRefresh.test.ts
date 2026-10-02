@@ -132,3 +132,8 @@ describe("correlated source refreshes", () => {
     state.accept(update(4));
     expect(state.snapshot()).toMatchObject({ prs: rows(4), error: null });
   });
+
+it("counts new observations separately from retained inventory", () => {
+  const prs = [...rows(1), { ...rows(2)[0], observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } }];
+  expect(receiptAdvisory({ prs, error: null, modern: true, coverage: { partial: { total: 2 } } }, "missing")).toBe(1);
+});

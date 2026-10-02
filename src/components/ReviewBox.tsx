@@ -19,6 +19,8 @@ export function ReviewBox({
   latestReviews,
   approveWontCount = null,
   approveCaveat = null,
+  commentDisabled = false,
+  reviewDisabled = false,
 }: {
   onSubmit: (verdict: ReviewVerdictName, body: string) => void;
   /// Which verdict is in flight, or null. All three disable together:
@@ -36,6 +38,8 @@ export function ReviewBox({
   approveWontCount?: string | null;
   /// The same rule with the pusher unknown: a qualifier, Approve stays.
   approveCaveat?: string | null;
+  commentDisabled?: boolean;
+  reviewDisabled?: boolean;
 }) {
   const [body, setBody] = useState("");
 
@@ -75,10 +79,10 @@ export function ReviewBox({
     {
       name: "approve",
       label: alreadyApproved ? "Approved" : "Approve",
-      enabled: !alreadyApproved,
+      enabled: !alreadyApproved && !reviewDisabled,
     },
-    { name: "request_changes", label: "Request changes", enabled: hasBody },
-    { name: "comment", label: "Comment", enabled: hasBody },
+    { name: "request_changes", label: "Request changes", enabled: hasBody && !reviewDisabled },
+    { name: "comment", label: "Comment", enabled: hasBody && !commentDisabled },
   ];
 
   return (
