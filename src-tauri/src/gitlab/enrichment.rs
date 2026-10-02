@@ -115,7 +115,7 @@ fn reduced_query(query: &str, response: &serde_json::Value) -> Option<String> {
 
 static QUERIES: LazyLock<Mutex<HashMap<String, (tokio::time::Instant, String)>>> =
     LazyLock::new(Mutex::default);
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn measure(
     program: &Path,
     identity: &crate::identity::PrIdentity,
@@ -415,7 +415,7 @@ pub fn fill_cached(program: &Path, rows: &mut [MergeRequest], generation: u64) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub async fn enrich(program: &Path, rows: &mut [MergeRequest], budget: Duration, generation: u64) {
     enrich_inner(None, program, rows, budget, generation).await;
 }
@@ -646,6 +646,7 @@ printf 'HTTP/2 200\n\n{"data":{"project":{"mergeRequest":{"iid":"%s","webUrl":"h
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn old_owner_coalesced_enrichment_cannot_publish_after_verified_rotation() {
         use std::os::unix::fs::PermissionsExt;
@@ -703,6 +704,7 @@ esac
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn fresh_core_evidence_is_reused_but_a_changed_head_is_not() {
         use std::os::unix::fs::PermissionsExt;
