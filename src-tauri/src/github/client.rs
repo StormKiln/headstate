@@ -105,7 +105,7 @@ pub enum ClientError {
 impl ClientError {
     // Preserve typed refusals/timeouts for callers; only octocrab's non-Clone
     // transport error needs an Arc wrapper when an in-flight result is shared.
-    fn shared(error: Arc<Self>) -> Self {
+    pub(super) fn shared(error: Arc<Self>) -> Self {
         match error.as_ref() {
             Self::Shared(inner) => Self::shared(inner.clone()),
             Self::Api(_) => Self::Shared(error),
@@ -328,6 +328,7 @@ fn server_gave_up(e: &ClientError) -> bool {
 pub struct GitHubClient {
     octocrab: Octocrab,
     searches: Arc<Searches>,
+    pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
@@ -350,7 +351,7 @@ struct Searches {
     details: ReadSlots<(String, u64, u64), DetailReceipt>,
 }
 
-struct ActiveRead<'a>(&'a AtomicU64);
+pub(super) struct ActiveRead<'a>(&'a AtomicU64);
 impl<'a> ActiveRead<'a> {
     fn new(count: &'a AtomicU64) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
@@ -381,13 +382,14 @@ pub static REFUSED_FIELDS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// `graphql_partial_ok` stashes the count under a key the mapper
 /// ignores, so it travels with its own response rather than through
 /// shared state that the next request would overwrite.
-fn refused_fields(v: &serde_json::Value) -> usize {
+pub(super) fn refused_fields(v: &serde_json::Value) -> usize {
     v["__refused"].as_u64().unwrap_or(0) as usize
 }
 
 /// List evidence retained before legacy numeric wrappers apply defaults.
 #[derive(Clone)]
 pub struct FetchedList {
+    pub scan: Option<crate::queue_scan::Commit>,
     pub viewer: Option<String>,
     pub prs: Vec<PullRequest>,
     pub total: Option<u64>,
@@ -423,6 +425,7 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
         Coverage::Complete
     };
     FetchedList {
+        scan: None,
         viewer: v["viewer"]["login"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -436,21 +439,41 @@ fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
 impl GitHubClient {
     /// Immutable operation view. Account/cache/admission owners remain shared.
     pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
-        if let Some(parent) = self.read_context {
+        if let Some(parent) = &self.read_context {
             context.deadline = context.deadline.min(parent.deadline);
+            if parent.attempts.is_some() {
+                context.attempts = parent.attempts.clone();
+            }
         }
         let mut view = self.clone();
         view.read_context = Some(context);
         view
     }
     pub(crate) fn read_context(&self) -> super::admission::ReadContext {
-        self.read_context.unwrap_or_else(|| {
+        self.read_context.clone().unwrap_or_else(|| {
             super::admission::ReadContext::new(
                 super::admission::ReadClass::Foreground,
                 SEARCH_BUDGET,
             )
         })
     }
+    pub(crate) fn with_attempt_limit(&self, limit: usize) -> Self {
+        let mut view = self.clone();
+        let mut context = self.read_context();
+        context.attempts = Some(context.attempts.as_ref().map_or_else(
+            || super::admission::AttemptAllowance::new(limit),
+            |parent| parent.child(limit),
+        ));
+        view.read_context = Some(context);
+        view
+    }
+    pub(crate) fn attempts_remaining(&self) -> usize {
+        self.read_context()
+            .attempts
+            .as_ref()
+            .map_or(usize::MAX, |a| a.remaining())
+    }
+
     pub(crate) fn request_budget(&self) -> super::stats::Budget {
         super::stats::Budget::with_transport(self.read_transport.clone())
     }
@@ -466,6 +489,7 @@ impl GitHubClient {
         Self {
             octocrab,
             searches: Arc::new(Searches::default()),
+            scans: Arc::default(),
             viewer: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
@@ -559,6 +583,10 @@ impl GitHubClient {
         self.searches
             .reviewing_first
             .swap(reviewing, Ordering::Relaxed)
+    }
+
+    pub(super) fn active_queue_read(&self) -> ActiveRead<'_> {
+        ActiveRead::new(&self.searches.queue_reads)
     }
 
     pub fn has_interactive_reads(&self) -> bool {
@@ -2612,6 +2640,50 @@ mod tests {
                 .await,
             Err(ClientError::NotDispatched(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn scan_allowance_counts_dispatches_and_confirmation_cannot_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("fixture".to_string())
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        );
+        let step = client.with_attempt_limit(3);
+        let confirmation = step.with_attempt_limit(1);
+        assert!(confirmation
+            .graphql_partial_ok(&json!({"query":"query Confirm { viewer { login } }"}))
+            .await
+            .is_err());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "confirmation has one actual attempt"
+        );
+        let tail = step
+            .clone()
+            .with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Background,
+                std::time::Duration::from_secs(5),
+            ));
+        assert!(tail
+            .graphql_partial_ok(&json!({"query":"query Tail { viewer { login } }"}))
+            .await
+            .is_err());
+        assert!(step
+            .graphql_partial_ok(&json!({"query":"query Extra { viewer { login } }"}))
+            .await
+            .is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

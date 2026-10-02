@@ -1314,3 +1314,5 @@ mod tests {
         assert_eq!(*window.calls.borrow(), ["show", "unminimize", "set_focus"]);
     }
 }
+
+pub mod queue_scan;

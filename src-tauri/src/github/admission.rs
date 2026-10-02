@@ -1,6 +1,9 @@
 //! Account-owned admission. Guards hold no mutex across network awaits.
 use super::client::ClientError;
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     sync::{Semaphore, SemaphorePermit},
     time::Instant,
@@ -13,19 +16,64 @@ pub enum ReadClass {
     Background,
     Advisory,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ReadContext {
     pub class: ReadClass,
     pub deadline: Instant,
+    pub(crate) attempts: Option<AttemptAllowance>,
 }
 impl ReadContext {
     pub fn new(class: ReadClass, budget: Duration) -> Self {
         Self {
             class,
             deadline: Instant::now() + budget,
+            attempts: None,
         }
     }
 }
+/// One operation's limits; child reservations share the same atomic ledger.
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptAllowance {
+    ledger: Arc<Mutex<Vec<usize>>>,
+    slots: Vec<usize>,
+}
+impl AttemptAllowance {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            ledger: Arc::new(Mutex::new(vec![limit])),
+            slots: vec![0],
+        }
+    }
+    pub(crate) fn child(&self, limit: usize) -> Self {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.slots.clone();
+        slots.push(ledger.len());
+        ledger.push(limit);
+        Self {
+            ledger: self.ledger.clone(),
+            slots,
+        }
+    }
+    pub(crate) fn remaining(&self) -> usize {
+        let ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        self.slots
+            .iter()
+            .map(|slot| ledger[*slot])
+            .min()
+            .unwrap_or(0)
+    }
+    fn debit(&self) -> Result<(), ClientError> {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if self.slots.iter().any(|slot| ledger[*slot] == 0) {
+            return Err(refused("operation attempt allowance is spent"));
+        }
+        for slot in &self.slots {
+            ledger[*slot] -= 1;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Bucket {
     Graphql = 0,
@@ -112,7 +160,12 @@ impl Drop for Attempt<'_> {
     }
 }
 impl Admission {
-    fn enter(&self, bucket: Bucket, class: Option<ReadClass>) -> Result<Attempt<'_>, ClientError> {
+    fn enter(
+        &self,
+        bucket: Bucket,
+        class: Option<ReadClass>,
+        allowance: Option<&AttemptAllowance>,
+    ) -> Result<Attempt<'_>, ClientError> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.secondary.is_some_and(|until| until > now) {
@@ -136,6 +189,20 @@ impl Admission {
         if secondary_recovery && state.quotas.iter().any(|q| q.probing) {
             return Err(refused("provider recovery probe is in progress"));
         }
+        if class == Some(ReadClass::Advisory) {
+            if now.duration_since(state.cycle) >= Duration::from_secs(30) {
+                state.cycle = now;
+                state.spent = 0;
+            }
+            if state.spent >= 8 {
+                return Err(refused(
+                    "advisory attempt allowance is spent for this cycle",
+                ));
+            }
+        }
+        if let Some(allowance) = allowance {
+            allowance.debit()?;
+        }
         let probe = if deadline.is_some() || secondary_recovery {
             let quota = &mut state.quotas[bucket as usize];
             quota.probing = true;
@@ -144,18 +211,6 @@ impl Admission {
             None
         };
         if class == Some(ReadClass::Advisory) {
-            if now.duration_since(state.cycle) >= Duration::from_secs(30) {
-                state.cycle = now;
-                state.spent = 0;
-            }
-            if state.spent >= 8 {
-                if probe.is_some() {
-                    state.quotas[bucket as usize].probing = false;
-                }
-                return Err(refused(
-                    "advisory attempt allowance is spent for this cycle",
-                ));
-            }
             state.spent += 1;
         }
         Ok(Attempt {
@@ -191,14 +246,14 @@ impl Admission {
             if Instant::now() >= context.deadline {
                 return Err(refused("read deadline elapsed before dispatch"));
             }
-            let mut attempt =
-                self.enter(bucket, Some(context.class))
-                    .map_err(|error| match error {
-                        ClientError::NotDispatched(message) if message.starts_with("provider") => {
-                            ClientError::RateLimited(message)
-                        }
-                        other => other,
-                    })?;
+            let mut attempt = self
+                .enter(bucket, Some(context.class), context.attempts.as_ref())
+                .map_err(|error| match error {
+                    ClientError::NotDispatched(message) if message.starts_with("provider") => {
+                        ClientError::RateLimited(message)
+                    }
+                    other => other,
+                })?;
             attempt._background = background;
             attempt._total = Some(total);
             Ok(attempt)
@@ -208,7 +263,7 @@ impl Admission {
             .map_err(|_| refused("read deadline elapsed before dispatch"))?
     }
     pub fn write(&self, bucket: Bucket) -> Result<Attempt<'_>, ClientError> {
-        self.enter(bucket, None)
+        self.enter(bucket, None, None)
     }
     pub fn remaining(&self, bucket: Bucket) -> Option<u64> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());

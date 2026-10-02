@@ -27,7 +27,7 @@ pub enum CachedList {
 }
 
 impl CachedList {
-    pub(super) fn id(self) -> i64 {
+    pub(crate) fn id(self) -> i64 {
         match self {
             CachedList::Authored => 1,
             CachedList::Reviewing => 2,

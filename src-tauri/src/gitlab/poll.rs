@@ -237,6 +237,9 @@ async fn preferences(app: &AppHandle) -> NotifyPrefs {
 }
 
 async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &FetchedList) {
+    if result.scan.is_some() {
+        return;
+    }
     let saved = match app.path().app_data_dir() {
         Ok(dir) => {
             let source = source.clone();
@@ -273,18 +276,35 @@ async fn fetch_and_persist(
     let attempt = source_poll::begin(app, source.clone(), list).await;
     // The accumulating loader enforces FETCH_TIMEOUT itself. Wrapping it in
     // timeout/select would throw away pages that already arrived.
-    match queues::fetch(source, list, |receipt| async {
-        if let Some(publication) = source_poll::success_publication(app, &attempt).await {
-            let receipt = source_poll::reconcile_gitlab(app, &publication, receipt).await;
-            persist(app, source, list, &receipt).await;
-            source_poll::complete_gitlab(app, publication, Ok(receipt));
-        }
-    })
+    match queues::fetch(
+        source,
+        list,
+        &crate::commands::db_path(app),
+        |receipt| async {
+            if let Some(publication) = source_poll::success_publication(app, &attempt).await {
+                match source_poll::reconcile_gitlab(app, &publication, receipt).await {
+                    Ok(receipt) => {
+                        persist(app, source, list, &receipt).await;
+                        source_poll::complete_gitlab(app, publication, Ok(receipt));
+                        return true;
+                    }
+                    Err(error) => source_poll::complete_gitlab(app, publication, Err(error)),
+                }
+            }
+            false
+        },
+    )
     .await
     {
         Ok(receipt) => {
             let publication = source_poll::success_publication(app, &attempt).await?;
-            let receipt = source_poll::reconcile_gitlab(app, &publication, receipt).await;
+            let receipt = match source_poll::reconcile_gitlab(app, &publication, receipt).await {
+                Ok(r) => r,
+                Err(error) => {
+                    source_poll::complete_gitlab(app, publication, Err(error));
+                    return None;
+                }
+            };
             persist(app, source, list, &receipt).await;
             Some((publication, receipt))
         }
@@ -423,6 +443,7 @@ mod tests {
 
     fn receipt(mrs: Vec<MergeRequest>, coverage: Coverage) -> FetchedList {
         FetchedList {
+            scan: None,
             viewer: Some("fixture-account".into()),
             total: matches!(coverage, Coverage::Complete).then_some(mrs.len() as u64),
             mrs,

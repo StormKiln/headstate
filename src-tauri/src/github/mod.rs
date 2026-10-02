@@ -15,3 +15,5 @@ pub mod stats;
 
 pub mod admission;
 mod read_transport;
+
+pub(crate) mod scan;

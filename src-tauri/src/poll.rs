@@ -802,6 +802,9 @@ pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
 }
 
 async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
+    if result.scan.is_some() {
+        return;
+    }
     let prs = &result.prs;
     let coverage = result.coverage.clone();
     let owner = result.viewer.clone();
@@ -834,48 +837,51 @@ async fn persist_and_emit(
     prs: &[PullRequest],
     coverage: Coverage,
     owner: Option<String>,
+    already_saved: bool,
 ) {
-    match app.path().app_data_dir() {
-        Ok(dir) => {
-            let owned: Vec<PullRequest> = prs.to_vec();
-            let written = tauri::async_runtime::spawn_blocking(move || {
-                let conn =
-                    open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
-                crate::store::source_cache::save_owned_source_snapshot(
-                    &conn,
-                    &Source::default(),
-                    CachedList::Authored,
-                    &owned,
-                    &coverage,
-                    owner.as_deref(),
-                )
-                .map_err(|e| (false, format!("{e}")))
-            })
-            .await;
-            match written {
-                Ok(Ok(())) => {}
-                Ok(Err((opening, e))) if opening => {
-                    log::error!("failed to open db: {e}");
-                    emit_store_error(app, format!("could not open the local database: {e}"));
-                }
-                Ok(Err((_, e))) => {
-                    log::error!("failed to save snapshot: {e}");
-                    emit_store_error(app, format!("could not save local snapshot: {e}"));
-                }
-                // A panic in the closure. Reported rather than swallowed:
-                // the snapshot not landing is exactly what `store-error`
-                // exists to say, and silence here would be the "offline
-                // readability is gone and nothing told you" failure the
-                // banner was added for.
-                Err(e) => {
-                    log::error!("the snapshot write task failed: {e}");
-                    emit_store_error(app, format!("could not save local snapshot: {e}"));
+    if !already_saved {
+        match app.path().app_data_dir() {
+            Ok(dir) => {
+                let owned: Vec<PullRequest> = prs.to_vec();
+                let written = tauri::async_runtime::spawn_blocking(move || {
+                    let conn =
+                        open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
+                    crate::store::source_cache::save_owned_source_snapshot(
+                        &conn,
+                        &Source::default(),
+                        CachedList::Authored,
+                        &owned,
+                        &coverage,
+                        owner.as_deref(),
+                    )
+                    .map_err(|e| (false, format!("{e}")))
+                })
+                .await;
+                match written {
+                    Ok(Ok(())) => {}
+                    Ok(Err((opening, e))) if opening => {
+                        log::error!("failed to open db: {e}");
+                        emit_store_error(app, format!("could not open the local database: {e}"));
+                    }
+                    Ok(Err((_, e))) => {
+                        log::error!("failed to save snapshot: {e}");
+                        emit_store_error(app, format!("could not save local snapshot: {e}"));
+                    }
+                    // A panic in the closure. Reported rather than swallowed:
+                    // the snapshot not landing is exactly what `store-error`
+                    // exists to say, and silence here would be the "offline
+                    // readability is gone and nothing told you" failure the
+                    // banner was added for.
+                    Err(e) => {
+                        log::error!("the snapshot write task failed: {e}");
+                        emit_store_error(app, format!("could not save local snapshot: {e}"));
+                    }
                 }
             }
-        }
-        Err(e) => {
-            log::error!("failed to resolve app data dir: {e}");
-            emit_store_error(app, format!("could not find the app data directory: {e}"));
+            Err(e) => {
+                log::error!("failed to resolve app data dir: {e}");
+                emit_store_error(app, format!("could not find the app data directory: {e}"));
+            }
         }
     }
     if let Err(e) = app.emit("prs-updated", prs) {
@@ -916,7 +922,9 @@ fn spawn_recheck(
             crate::github::admission::ReadClass::Background,
             FETCH_TIMEOUT,
         ));
-        match client.fetch_prs_snapshot().await {
+        match source_poll::fetch_github_step(&app, &client, CachedList::Authored, FETCH_TIMEOUT)
+            .await
+        {
             Ok(fresh) => {
                 if let Some(publication) = source_poll::publication(&app, &attempt).await {
                     let result =
@@ -932,6 +940,7 @@ fn spawn_recheck(
                         &result.prs,
                         result.coverage.clone(),
                         result.viewer.clone(),
+                        result.scan.is_some(),
                     )
                     .await;
                     source_poll::complete(&app, publication, Ok(result));
@@ -1217,7 +1226,9 @@ pub fn spawn(
                     crate::github::admission::ReadClass::Background,
                     budget,
                 ));
-                let fetched = scoped.fetch_prs_snapshot_with_budget(budget).await;
+                let fetched =
+                    source_poll::fetch_github_step(&app, &scoped, CachedList::Authored, budget)
+                        .await;
                 let fetch_ms = started.elapsed().as_millis() as u64;
                 // This report is readable from a paired phone; redact the
                 // failure while retaining its timeout as a separate measure.
@@ -1253,6 +1264,7 @@ pub fn spawn(
                                 };
                             let receipt = result.clone();
                             let FetchedList {
+                                scan,
                                 viewer,
                                 prs,
                                 total,
@@ -1330,7 +1342,8 @@ pub fn spawn(
                             }
 
                             consecutive_failures = 0;
-                            persist_and_emit(&app, &prs, coverage.clone(), viewer).await;
+                            persist_and_emit(&app, &prs, coverage.clone(), viewer, scan.is_some())
+                                .await;
                             let _ = app.emit("poll-state", tick_state(None));
                             source_poll::complete(&app, publication, Ok(receipt));
                             if has_checking(&prs) {
@@ -1382,10 +1395,10 @@ pub fn spawn(
                     crate::github::admission::ReadClass::Background,
                     budget,
                 ));
-                let reviewing_now = scoped
-                    .fetch_reviewing_snapshot_with_budget(budget)
-                    .await
-                    .map_err(|e| source_poll::Failure::from(&e));
+                let reviewing_now =
+                    source_poll::fetch_github_step(&app, &scoped, CachedList::Reviewing, budget)
+                        .await
+                        .map_err(|e| source_poll::Failure::from(&e));
                 let reviewing_outcome = if reviewing_now.is_ok() {
                     "ok"
                 } else {

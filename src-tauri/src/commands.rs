@@ -408,10 +408,8 @@ async fn refresh_source_request(
     }
     // The loader owns its deadline so completed pages survive a timeout.
     let client = client.0.as_ref().expect("checked above");
-    let result = match list {
-        CachedList::Authored => client.fetch_prs_snapshot().await,
-        CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
-    };
+    let result =
+        source_poll::fetch_github_step(&app, client, list, crate::poll::FETCH_TIMEOUT).await;
     let fetched = result.map_err(|error| Failure::from(&error));
     match fetched {
         Ok(result) => {
@@ -435,6 +433,7 @@ async fn refresh_source_request(
             };
             let receipt = result.clone();
             let crate::github::client::FetchedList {
+                scan,
                 viewer,
                 prs,
                 total,
@@ -444,19 +443,23 @@ async fn refresh_source_request(
             let owned = prs.clone();
             let owned_source = source.clone();
             let owned_coverage = coverage.clone();
-            let saved = tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_owned_source_snapshot(
-                    &conn,
-                    &owned_source,
-                    list,
-                    &owned,
-                    &owned_coverage,
-                    viewer.as_deref(),
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await;
+            let saved = if scan.is_some() {
+                Ok(Ok(()))
+            } else {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let conn = open_db(&path).map_err(|e| e.to_string())?;
+                    crate::store::source_cache::save_owned_source_snapshot(
+                        &conn,
+                        &owned_source,
+                        list,
+                        &owned,
+                        &owned_coverage,
+                        viewer.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+            };
             if !matches!(saved, Ok(Ok(()))) {
                 let _ = app.emit(
                     "store-error",
@@ -510,10 +513,17 @@ async fn refresh_gitlab_request(
     attempt: crate::source_poll::Attempt,
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
-    match crate::gitlab::queues::fetch(&source, list, |receipt| async {
+    match crate::gitlab::queues::fetch(&source, list, &db_path(&app), |receipt| async {
         if let Some(publication) = source_poll::success_publication(&app, &attempt).await {
-            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+            match source_poll::reconcile_gitlab(&app, &publication, receipt).await {
+                Ok(receipt) => {
+                    source_poll::complete_gitlab(&app, publication, Ok(receipt));
+                    return true;
+                }
+                Err(error) => source_poll::complete_gitlab(&app, publication, Err(error)),
+            }
         }
+        false
     })
     .await
     {
@@ -528,26 +538,37 @@ async fn refresh_gitlab_request(
                     coverage: winner.coverage,
                 });
             };
-            let result = source_poll::reconcile_gitlab(&app, &publication, result).await;
+            let result = match source_poll::reconcile_gitlab(&app, &publication, result).await {
+                Ok(r) => r,
+                Err(error) => {
+                    let message = error.message.clone();
+                    source_poll::complete_gitlab(&app, publication, Err(error));
+                    return Err(message);
+                }
+            };
             let receipt = result.clone();
             let path = db_path(&app);
             let owned_source = source.clone();
             let owned = result.mrs.clone();
             let owned_coverage = result.coverage.clone();
             let owner = result.viewer.clone();
-            let saved = tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&path).map_err(|e| e.to_string())?;
-                crate::store::source_cache::save_owned_gitlab_snapshot(
-                    &conn,
-                    &owned_source,
-                    list,
-                    &owned,
-                    &owned_coverage,
-                    owner.as_deref(),
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await;
+            let saved = if result.scan.is_some() {
+                Ok(Ok(()))
+            } else {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let conn = open_db(&path).map_err(|e| e.to_string())?;
+                    crate::store::source_cache::save_owned_gitlab_snapshot(
+                        &conn,
+                        &owned_source,
+                        list,
+                        &owned,
+                        &owned_coverage,
+                        owner.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+            };
             if !matches!(saved, Ok(Ok(()))) {
                 let _ = app.emit(
                     "store-error",

@@ -229,7 +229,7 @@ impl ReadTransport {
         context: ReadContext,
     ) -> Result<Value, ClientError> {
         for attempt in 1..=2 {
-            let mut permit = self.admission.read(read.bucket(), context).await?;
+            let mut permit = self.admission.read(read.bucket(), context.clone()).await?;
             let started = Instant::now();
             let response = match read {
                 Read::Graphql(body) => client._post("/graphql", Some(body)).await,

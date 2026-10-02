@@ -507,6 +507,51 @@ pub fn winner_gitlab(
     app.state::<SourcePolls>().winner_gitlab(attempt, fallback)
 }
 
+/// Load a durable checkpoint only after authenticating this immutable client.
+/// The operation allowance also covers a cold viewer lookup.
+pub async fn fetch_github_step(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+) -> Result<FetchedList, crate::github::client::ClientError> {
+    use crate::github::{admission::ReadContext, client::ClientError};
+    let client = client
+        .with_read_context(ReadContext::new(client.read_context().class, budget))
+        .with_attempt_limit(3);
+    let viewer = match client.known_viewer().filter(|v| !v.is_empty()) {
+        Some(v) => v.to_string(),
+        None => client.fetch_viewer().await?,
+    };
+    let owner = viewer.clone();
+    let path = crate::commands::db_path(app);
+    let (loaded, rows) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
+            let conn = crate::store::open_db(&path)?;
+            let conn = conn.unchecked_transaction()?;
+            let source = Source::default();
+            let checkpoint = crate::queue_scan::load(&conn, &source, list, &owner)?;
+            let rows = if crate::store::source_cache::snapshot_owner(&conn, &source, list)?
+                .as_deref()
+                == Some(&owner)
+            {
+                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)?.data {
+                    crate::store::source_cache::SnapshotData::Available { prs, .. } => prs,
+                    _ => vec![],
+                }
+            } else {
+                vec![]
+            };
+            Ok((checkpoint, rows))
+        })
+        .await
+        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
+        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
+    client
+        .advance_scan(list, loaded, &rows, chrono::Utc::now().timestamp())
+        .await
+}
+
 /// Called with the source publication permit held, before persistence and emission.
 /// The last committed receipt wins over disk; disk is only the restart baseline.
 pub async fn reconcile_github(
@@ -560,6 +605,24 @@ fn reconcile_github_snapshot(
                 "The account could not be confirmed. Showing the last known inventory.",
             )
         })?;
+    if let Some(scan) = &result.scan {
+        if crate::queue_scan::accepted(conn, source, list, owner, scan)
+            .map_err(|_| inventory_failure("The saved queue receipt could not be read."))?
+        {
+            if let crate::store::source_cache::SnapshotData::Available { prs, coverage, .. } =
+                crate::store::source_cache::load_source_snapshot(conn, source, list)
+                    .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+                    .data
+            {
+                result.prs = prs;
+                result.coverage = coverage;
+                return Ok(result);
+            }
+            return Err(inventory_failure(
+                "The accepted queue inventory is unavailable.",
+            ));
+        }
+    }
     let previous = if let Some(receipt) =
         previous.filter(|receipt| receipt.viewer.as_deref() == Some(owner))
     {
@@ -585,6 +648,27 @@ fn reconcile_github_snapshot(
         matches!(result.coverage, Coverage::Complete),
         chrono::Utc::now(),
     );
+    if let Some(scan) = &result.scan {
+        result
+            .prs
+            .retain(|row| !scan.removals.contains(&row.identity()));
+        let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            crate::store::source_cache::save_owned_source_snapshot(
+                tx,
+                source,
+                list,
+                &result.prs,
+                &result.coverage,
+                Some(owner),
+            )
+        })
+        .map_err(|_| inventory_failure("The queue progress could not be saved."))?;
+        if !committed {
+            return Err(inventory_failure(
+                "The queue changed during this step. Its newer progress was retained.",
+            ));
+        }
+    }
     Ok(result)
 }
 
@@ -592,9 +676,9 @@ fn reconcile_github_snapshot(
 pub async fn reconcile_gitlab(
     app: &AppHandle,
     publication: &Publication,
-    mut result: crate::gitlab::queues::FetchedList,
-) -> crate::gitlab::queues::FetchedList {
-    let source = &publication.attempt.source;
+    result: crate::gitlab::queues::FetchedList,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let source = publication.attempt.source.clone();
     let list = publication.attempt.list;
     let previous = app
         .state::<SourcePolls>()
@@ -602,52 +686,100 @@ pub async fn reconcile_gitlab(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(source.clone(), list))
-        .filter(|(_, receipt)| result.viewer.is_some() && receipt.viewer == result.viewer)
-        .map(|(_, receipt)| receipt.mrs.clone());
-    let previous = if let Some(rows) = previous {
-        rows
-    } else {
-        let path = crate::commands::db_path(app);
-        let owner = result.viewer.clone();
-        let source = source.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let conn = crate::store::open_db(&path).ok()?;
-            if owner.is_none()
-                || crate::store::source_cache::snapshot_owner(&conn, &source, list).ok()? != owner
-            {
-                return None;
-            }
-            match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
-                .ok()?
+        .map(|(_, r)| r.clone());
+    let path = crate::commands::db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::open_db(&path)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
+        reconcile_gitlab_snapshot(&conn, &source, list, result, previous)
+    })
+    .await
+    .map_err(|_| inventory_failure("The queue step could not be completed."))?
+}
+fn reconcile_gitlab_snapshot(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    mut result: crate::gitlab::queues::FetchedList,
+    previous: Option<crate::gitlab::queues::FetchedList>,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let owner = result
+        .viewer
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| inventory_failure("The GitLab account could not be confirmed."))?;
+    if let Some(scan) = &result.scan {
+        if crate::queue_scan::accepted(conn, source, list, owner, scan)
+            .map_err(|_| inventory_failure("The saved GitLab queue receipt could not be read."))?
+        {
+            if let crate::store::source_cache::SnapshotData::GitLabAvailable {
+                mrs, coverage, ..
+            } = crate::store::source_cache::load_source_snapshot(conn, source, list)
+                .map_err(|_| inventory_failure("The saved inventory could not be read."))?
                 .data
             {
-                crate::store::source_cache::SnapshotData::GitLabAvailable { mrs, .. } => Some(mrs),
-                _ => None,
+                result.mrs = mrs;
+                result.coverage = coverage;
+                return Ok(result);
             }
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+            return Err(inventory_failure(
+                "The accepted GitLab inventory is unavailable.",
+            ));
+        }
+    }
+    let previous = if let Some(old) = previous.filter(|r| r.viewer.as_deref() == Some(owner)) {
+        old.mrs
+    } else if crate::store::source_cache::snapshot_owner(conn, source, list)
+        .map_err(|_| inventory_failure("The saved owner could not be read."))?
+        .as_deref()
+        == Some(owner)
+    {
+        match crate::store::source_cache::load_source_snapshot(conn, source, list)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+            .data
+        {
+            crate::store::source_cache::SnapshotData::GitLabAvailable { mrs, .. } => mrs,
+            _ => vec![],
+        }
+    } else {
+        vec![]
     };
-    let previous = previous
-        .into_iter()
-        .filter(|row| result.viewer.is_some() && row.viewer == result.viewer)
-        .collect();
     for row in &mut result.mrs {
         row.observation = Some(crate::inventory::gitlab_observation(row));
     }
     result.mrs = crate::inventory::reconcile(
-        previous,
+        previous
+            .into_iter()
+            .filter(|r| r.viewer.as_deref() == Some(owner))
+            .collect(),
         result.mrs,
         matches!(result.coverage, Coverage::Complete),
         chrono::Utc::now(),
     );
-    result
+    if let Some(scan) = &result.scan {
+        result
+            .mrs
+            .retain(|r| !scan.removals.contains(&r.identity()));
+        let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            crate::store::source_cache::save_owned_gitlab_snapshot(
+                tx,
+                source,
+                list,
+                &result.mrs,
+                &result.coverage,
+                Some(owner),
+            )
+        })
+        .map_err(|_| inventory_failure("The GitLab queue progress could not be saved."))?;
+        if !committed {
+            return Err(inventory_failure(
+                "The GitLab queue changed during this step. Newer progress was retained.",
+            ));
+        }
+    }
+    Ok(result)
 }
 
-/// Verified, head-bound review evidence for the existing inventory. Task7 can
-/// consume this seam without replaying writes or trusting a cached head.
 enum GithubEffect {
     Review(crate::inventory::ConfirmedReview),
     Remove(crate::github::mutate::ConfirmedRemoval),
@@ -721,6 +853,7 @@ async fn record_github_effect(
                 continue;
             };
             FetchedList {
+                scan: None,
                 viewer: Some(viewer.into()),
                 prs,
                 total: None,
@@ -751,14 +884,23 @@ async fn record_github_effect(
         let saved_source = source.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
             let conn = crate::store::open_db(&path)?;
+            let tx = conn.unchecked_transaction()?;
             crate::store::source_cache::save_owned_source_snapshot(
-                &conn,
+                &tx,
                 &saved_source,
                 list,
                 &saved.prs,
                 &saved.coverage,
                 saved.viewer.as_deref(),
-            )
+            )?;
+            crate::queue_scan::taint(
+                &tx,
+                &saved_source,
+                list,
+                saved.viewer.as_deref().unwrap_or_default(),
+            )?;
+            tx.commit()?;
+            Ok::<_, crate::store::StoreError>(())
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
@@ -842,6 +984,7 @@ pub async fn record_gitlab_action(
                 continue;
             };
             crate::gitlab::queues::FetchedList {
+                scan: None,
                 viewer: Some(viewer.clone()),
                 mrs,
                 total: None,
@@ -857,14 +1000,23 @@ pub async fn record_gitlab_action(
         let saved = receipt.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
             let conn = crate::store::open_db(&path)?;
+            let tx = conn.unchecked_transaction()?;
             crate::store::source_cache::save_owned_gitlab_snapshot(
-                &conn,
+                &tx,
                 &saved_source,
                 list,
                 &saved.mrs,
                 &saved.coverage,
                 saved.viewer.as_deref(),
-            )
+            )?;
+            crate::queue_scan::taint(
+                &tx,
+                &saved_source,
+                list,
+                saved.viewer.as_deref().unwrap_or_default(),
+            )?;
+            tx.commit()?;
+            Ok::<_, crate::store::StoreError>(())
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
@@ -918,6 +1070,7 @@ mod tests {
         }))
         .unwrap();
         FetchedList {
+            scan: None,
             viewer: None,
             prs: vec![pr],
             total: Some(1),
@@ -972,6 +1125,7 @@ mod tests {
                     node["headRefOid"] = serde_json::json!("head-a");
                 }
                 let mut baseline = FetchedList {
+                    scan: None,
                     viewer: Some("fixture".into()),
                     prs: crate::github::map::map_list(&raw, "authored"),
                     total: Some(3),
@@ -1105,6 +1259,7 @@ mod tests {
         polls.complete_gitlab(
             published,
             Ok(crate::gitlab::queues::FetchedList {
+                scan: None,
                 viewer: None,
                 mrs: vec![gitlab_mr(&source)],
                 total: None,
@@ -1180,6 +1335,7 @@ mod tests {
             .winner_gitlab(
                 &authored,
                 Ok(crate::gitlab::queues::FetchedList {
+                    scan: None,
                     viewer: None,
                     mrs: vec![],
                     total: Some(0),
@@ -1214,6 +1370,7 @@ mod tests {
             .await;
         let (foreground, _) = polls.begin_attempt(source, CachedList::Authored).await;
         let receipt = crate::gitlab::queues::FetchedList {
+            scan: None,
             viewer: None,
             mrs: vec![],
             total: Some(0),
@@ -1243,6 +1400,7 @@ mod tests {
             .begin_attempt(source.clone(), CachedList::Authored)
             .await;
         let receipt = crate::gitlab::queues::FetchedList {
+            scan: None,
             viewer: None,
             mrs: vec![gitlab_mr(&source)],
             total: Some(2),
@@ -1551,5 +1709,204 @@ mod tests {
         assert_eq!(result.phase, Phase::NotAsked);
         assert_eq!(result.consecutive_failures, 0);
         assert_eq!(result.last_received_at, None);
+    }
+    #[test]
+    fn accepted_scan_persists_exact_inventory_and_only_this_steps_rows_are_fresh() {
+        use crate::{
+            inventory::ObservationState,
+            queue_scan::{Commit, State},
+            store::source_cache::{load_source_snapshot, SnapshotData},
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let scan = |revision, after: &str| {
+            Some(Commit {
+                expected_revision: revision,
+                state: State {
+                    after: Some(after.into()),
+                    ..State::default()
+                },
+                removals: vec![],
+            })
+        };
+        let mut first = receipt(1);
+        first.viewer = Some("fixture".into());
+        first.prs[0].head_oid = "head-1".into();
+        first.coverage = Coverage::Partial { total: Some(2) };
+        first.scan = scan(0, "tail-25");
+        let first = reconcile_github_snapshot(&conn, &source, list, first, None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let stamp = first.prs[0].observation.as_ref().unwrap().last_observed_at;
+        let mut second = receipt(2);
+        second.viewer = Some("fixture".into());
+        second.prs[0].head_oid = "head-2".into();
+        second.coverage = Coverage::Partial { total: Some(2) };
+        second.scan = scan(1, "tail-50");
+        let stale = second.clone();
+        let accepted = reconcile_github_snapshot(&conn, &source, list, second, None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let old = accepted
+            .prs
+            .iter()
+            .find(|r| r.number == 1)
+            .unwrap()
+            .observation
+            .as_ref()
+            .unwrap();
+        assert_eq!(old.state, ObservationState::Retained);
+        assert_eq!(old.last_observed_at, stamp);
+        assert_eq!(
+            accepted
+                .prs
+                .iter()
+                .find(|r| r.number == 2)
+                .unwrap()
+                .observation
+                .as_ref()
+                .unwrap()
+                .state,
+            ObservationState::Observed
+        );
+        let SnapshotData::Available { prs, .. } =
+            load_source_snapshot(&conn, &source, list).unwrap().data
+        else {
+            panic!("missing persisted rows")
+        };
+        assert_eq!(prs, accepted.prs);
+        assert!(reconcile_github_snapshot(&conn, &source, list, stale, None).is_err());
+        let checkpoint = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(checkpoint.revision, 2);
+        assert_eq!(checkpoint.state.after.as_deref(), Some("tail-50"));
+        // A confirmed action retires the pending publication but keeps traversal progress.
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        let mut before_action = accepted.clone();
+        before_action.scan = scan(2, "tail-75");
+        assert!(reconcile_github_snapshot(&conn, &source, list, before_action, None).is_err());
+        let after_action = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(after_action.state.after.as_deref(), Some("tail-50"));
+        assert!(after_action.state.tainted);
+    }
+    #[test]
+    fn duplicate_step_reuses_saved_rows_without_advancing_measurement_and_new_steps_retire_it() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Authored;
+        let mut fresh = receipt(7);
+        fresh.viewer = Some("fixture".into());
+        fresh.prs[0].head_oid = "head".into();
+        fresh.scan = Some(Commit {
+            expected_revision: 0,
+            state: State {
+                receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                ..State::default()
+            },
+            removals: vec![],
+        });
+        let accepted = reconcile_github_snapshot(&conn, &source, list, fresh.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let saved = crate::store::source_cache::load_source_snapshot(&conn, &source, list).unwrap();
+        let duplicate = reconcile_github_snapshot(&conn, &source, list, fresh.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(duplicate.prs, accepted.prs);
+        assert_eq!(
+            crate::queue_scan::load(&conn, &source, list, "fixture")
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(
+            crate::store::source_cache::load_source_snapshot(&conn, &source, list).unwrap(),
+            saved
+        );
+        let mut next = fresh.clone();
+        let scan = next.scan.as_mut().unwrap();
+        scan.expected_revision = 1;
+        scan.state.receipt_id = Some(crate::queue_scan::new_receipt_id());
+        reconcile_github_snapshot(&conn, &source, list, next.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert!(reconcile_github_snapshot(&conn, &source, list, fresh, None).is_err());
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        assert!(reconcile_github_snapshot(&conn, &source, list, next.clone(), None).is_err());
+        assert!(!crate::queue_scan::accepted(
+            &conn,
+            &source,
+            list,
+            "other",
+            next.scan.as_ref().unwrap()
+        )
+        .unwrap());
+        let mut wrong_query = next.scan.unwrap();
+        wrong_query.expected_revision = 2;
+        wrong_query.state.version += 1;
+        assert!(
+            !crate::queue_scan::accepted(&conn, &source, list, "fixture", &wrong_query).unwrap()
+        );
+    }
+    #[test]
+    fn gitlab_progress_and_enrichment_commit_separately_and_duplicates_reuse_exact_rows() {
+        use crate::queue_scan::{Commit, State};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source {
+            provider: crate::identity::Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let list = CachedList::Reviewing;
+        let mut mr = gitlab_mr(&source);
+        mr.viewer = Some("fixture".into());
+        mr.head_oid = Some("head".into());
+        let progress = crate::gitlab::queues::FetchedList {
+            viewer: Some("fixture".into()),
+            mrs: vec![mr],
+            total: Some(2),
+            coverage: Coverage::Partial { total: Some(2) },
+            scan: Some(Commit {
+                expected_revision: 0,
+                state: State {
+                    receipt_id: Some(crate::queue_scan::new_receipt_id()),
+                    after: Some("2".into()),
+                    tainted: true,
+                    ..State::default()
+                },
+                removals: vec![],
+            }),
+        };
+        let core = reconcile_gitlab_snapshot(&conn, &source, list, progress.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let duplicate = reconcile_gitlab_snapshot(&conn, &source, list, progress.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(core, duplicate);
+        let mut enriched = progress;
+        enriched.scan.as_mut().unwrap().expected_revision = 1;
+        enriched.mrs[0].ci = Some(crate::github::model::CiState::Success);
+        let final_rows =
+            reconcile_gitlab_snapshot(&conn, &source, list, enriched.clone(), Some(core))
+                .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(
+            final_rows.mrs[0].ci,
+            Some(crate::github::model::CiState::Success)
+        );
+        assert_eq!(
+            crate::queue_scan::load(&conn, &source, list, "fixture")
+                .unwrap()
+                .revision,
+            2
+        );
+        let duplicate = reconcile_gitlab_snapshot(&conn, &source, list, enriched.clone(), None)
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        assert_eq!(duplicate, final_rows);
+        // Even already-tainted progress cannot mistake an action's revision for
+        // an accepted enrichment phase: actions clear the receipt identity.
+        crate::queue_scan::taint(&conn, &source, list, "fixture").unwrap();
+        assert!(crate::queue_scan::load(&conn, &source, list, "fixture")
+            .unwrap()
+            .state
+            .receipt_id
+            .is_none());
+        assert!(reconcile_gitlab_snapshot(&conn, &source, list, enriched, None).is_err());
     }
 }

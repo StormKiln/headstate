@@ -1,5 +1,6 @@
 //! Bounded GitLab merge-request lists. `glab` owns credentials; neither
 //! the credential nor raw CLI diagnostics leave this module.
+mod scan;
 use crate::{
     github::model::{CiState, Label, ReviewState},
     identity::{PrIdentity, Provider, Source},
@@ -11,6 +12,7 @@ use serde_json::Value;
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 
 const PAGE_SIZE: usize = 100;
+#[cfg(test)]
 const MAX_PAGES: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,6 +80,7 @@ impl MergeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedList {
+    pub scan: Option<crate::queue_scan::Commit>,
     pub viewer: Option<String>,
     pub mrs: Vec<MergeRequest>,
     pub total: Option<u64>,
@@ -120,9 +123,10 @@ struct Page {
     terminal_known: bool,
 }
 
-pub async fn fetch<F: std::future::Future<Output = ()>>(
+pub async fn fetch<F: std::future::Future<Output = bool>>(
     source: &Source,
     list: CachedList,
+    db_path: &Path,
     progress: impl FnOnce(FetchedList) -> F,
 ) -> Result<FetchedList, QueueError> {
     if source.provider != Provider::Gitlab || super::host::validate(&source.host).is_err() {
@@ -131,8 +135,10 @@ pub async fn fetch<F: std::future::Future<Output = ()>>(
     let program = super::auth::find_glab().ok_or(QueueError::MissingCli)?;
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<FetchedList, QueueError>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
-    let viewer = super::auth::viewer(&program, &source.host)
+    let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
+    let viewer = tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
         .await
+        .map_err(|_| QueueError::Timeout)?
         .map_err(|_| QueueError::Unauthorized)?;
     let key = format!(
         "{}:{viewer}:{list:?}:{}",
@@ -141,15 +147,62 @@ pub async fn fetch<F: std::future::Future<Output = ()>>(
     );
     READS
         .run(key, async {
-            let started = tokio::time::Instant::now();
             let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
-            let mut result = fetch_with_program(&program, source, list, FETCH_TIMEOUT).await?;
+            let path = db_path.to_path_buf();
+            let owned_source = source.clone();
+            let owner = viewer.clone();
+            let (loaded, previous) = tauri::async_runtime::spawn_blocking(
+                move || -> Result<_, crate::store::StoreError> {
+                    let conn = crate::store::open_db(&path)?;
+                    let conn = conn.unchecked_transaction()?;
+                    let loaded = crate::queue_scan::load(&conn, &owned_source, list, &owner)?;
+                    let rows =
+                        if crate::store::source_cache::snapshot_owner(&conn, &owned_source, list)?
+                            .as_deref()
+                            == Some(&owner)
+                        {
+                            match crate::store::source_cache::load_source_snapshot(
+                                &conn,
+                                &owned_source,
+                                list,
+                            )?
+                            .data
+                            {
+                                crate::store::source_cache::SnapshotData::GitLabAvailable {
+                                    mrs,
+                                    ..
+                                } => mrs,
+                                _ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        };
+                    Ok((loaded, rows))
+                },
+            )
+            .await
+            .map_err(|_| QueueError::Request)?
+            .map_err(|_| QueueError::Request)?;
+            let mut result = scan::advance(
+                &program,
+                scan::Target {
+                    source,
+                    list,
+                    owner: &viewer,
+                },
+                loaded,
+                &previous,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                Utc::now().timestamp(),
+            )
+            .await?;
             result.viewer = Some(viewer.clone());
             for row in &mut result.mrs {
                 row.viewer = Some(viewer.clone());
             }
-            if super::auth::viewer(&program, &source.host)
+            if tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
                 .await
+                .map_err(|_| QueueError::Timeout)?
                 .map_err(|_| QueueError::Unauthorized)?
                 != viewer
             {
@@ -159,16 +212,21 @@ pub async fn fetch<F: std::future::Future<Output = ()>>(
                 return Err(QueueError::Request);
             }
             super::enrichment::fill_cached(&mut result.mrs, generation);
-            progress(result.clone()).await;
+            if progress(result.clone()).await {
+                if let Some(scan) = result.scan.as_mut() {
+                    scan.expected_revision += 1;
+                }
+            }
             super::enrichment::enrich(
                 &program,
                 &mut result.mrs,
-                FETCH_TIMEOUT.saturating_sub(started.elapsed()),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
                 generation,
             )
             .await;
-            if super::auth::viewer(&program, &source.host)
+            if tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
                 .await
+                .map_err(|_| QueueError::Timeout)?
                 .map_err(|_| QueueError::Unauthorized)?
                 != viewer
             {
@@ -182,6 +240,7 @@ pub async fn fetch<F: std::future::Future<Output = ()>>(
         .await
 }
 
+#[cfg(test)]
 async fn fetch_with_program(
     program: &Path,
     source: &Source,
@@ -280,6 +339,7 @@ async fn fetch_with_program(
         Coverage::Unknown
     };
     Ok(FetchedList {
+        scan: None,
         viewer: None,
         mrs,
         total,

@@ -35,6 +35,7 @@ query($q: String!, $first: Int!, $after: String) {
   viewer { login }
   authored: search(query: $q, type: ISSUE, first: $first, after: $after) {
     issueCount
+    pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
         id number title url isDraft createdAt updatedAt
@@ -942,6 +943,19 @@ pub fn merged_heads_query(n: usize) -> String {
     )
 }
 
+/// Small identity/membership probes; variables keep repository and search data out of the document.
+pub fn membership_confirmation_query(count: usize) -> String {
+    assert!((1..=4).contains(&count));
+    let vars = (0..count)
+        .map(|i| format!("$o{i}:String!,$r{i}:String!,$n{i}:Int!,$q{i}:String!"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fields = (0..count).map(|i| format!(r#"
+      p{i}:repository(owner:$o{i},name:$r{i}) {{ pullRequest(number:$n{i}) {{ id number state headRefOid createdAt repository {{ nameWithOwner }} }} }}
+      m{i}:search(query:$q{i},type:ISSUE,first:25) {{ issueCount pageInfo {{ hasNextPage endCursor }} nodes {{ ... on PullRequest {{ id number repository {{ nameWithOwner }} }} }} }}"#)).collect::<String>();
+    format!("query QueueConfirmation({vars}) {{ viewer {{ login }} rateLimit {{ cost remaining resetAt }} {fields} }}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1825,6 +1839,26 @@ mod tests {
     ///   field makes a write fail loudly rather than return a confident
     ///   partial answer, which is the property this whole family of guards
     ///   is about. Out of scope deliberately, not overlooked.
+    #[test]
+    fn membership_confirmation_query_has_identity_bucket_and_complete_evidence() {
+        let query = super::membership_confirmation_query(4);
+        for i in 0..4 {
+            assert!(query.contains(&format!("p{i}:repository(owner:$o{i},name:$r{i})")));
+            assert!(query.contains(&format!("m{i}:search(query:$q{i},type:ISSUE,first:25)")));
+        }
+        for field in [
+            "id number state headRefOid createdAt",
+            "repository { nameWithOwner }",
+            "issueCount pageInfo { hasNextPage endCursor }",
+            "viewer { login }",
+            "rateLimit { cost remaining resetAt }",
+        ] {
+            assert!(query.contains(field), "missing {field}");
+        }
+        assert!(!query.contains("mergeable"));
+        assert!(super::PRS_QUERY.contains("pageInfo { hasNextPage endCursor }"));
+    }
+
     #[test]
     fn every_graphql_document_has_a_shape_guard() {
         /// Documents with no shape guard, and why.

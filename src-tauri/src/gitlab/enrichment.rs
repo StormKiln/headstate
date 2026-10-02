@@ -34,7 +34,7 @@ impl Evidence {
 static CACHE: LazyLock<Mutex<HashMap<String, (tokio::time::Instant, Evidence)>>> =
     LazyLock::new(Mutex::default);
 const TTL: Duration = Duration::from_secs(60);
-const MAX_READS: usize = 20;
+const MAX_READS: usize = 4;
 
 fn evidence(raw: &serde_json::Value, head: Option<&str>) -> Evidence {
     if head.is_none() || raw["sha"].as_str() != head {
@@ -107,6 +107,7 @@ async fn measure(
     identity: &crate::identity::PrIdentity,
     head: Option<&str>,
     budget: Duration,
+    attempts: &std::sync::atomic::AtomicUsize,
 ) -> Option<Evidence> {
     let started = tokio::time::Instant::now();
     let host_key = format!("{program:?}:{}", identity.source.host);
@@ -128,6 +129,16 @@ async fn measure(
     for _ in 0..4 {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
+            return None;
+        }
+        if attempts
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_err()
+        {
             return None;
         }
         let input = serde_json::json!({"query":query,"variables":{"path":identity.repo,"iid":identity.number.to_string()}});
@@ -168,6 +179,18 @@ async fn measure(
     }
     let remaining = budget.saturating_sub(started.elapsed());
     if remaining.is_zero() {
+        return None;
+    }
+    // The legacy REST fallback is a real API process too; it shares the same
+    // per-step allowance instead of silently exceeding the whole-step bound.
+    if attempts
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| n.checked_sub(1),
+        )
+        .is_err()
+    {
         return None;
     }
     let endpoint = format!(
@@ -390,6 +413,8 @@ pub async fn enrich(program: &Path, rows: &mut [MergeRequest], budget: Duration,
     // TTL. Unvisited rows go first, then the oldest measured row.
     missing.sort_by_key(|(_, _, _, at)| *at);
     missing.truncate(MAX_READS);
+    let attempts = std::sync::atomic::AtomicUsize::new(4);
+    let attempts = &attempts;
     let reads = stream::iter(missing)
         .map(|(i, identity, head, _)| {
             let key = keys[i].clone();
@@ -401,7 +426,10 @@ pub async fn enrich(program: &Path, rows: &mut [MergeRequest], budget: Duration,
                 static READS: LazyLock<super::coalesce::Reads<Option<Evidence>>> =
                     LazyLock::new(super::coalesce::Reads::default);
                 let measured = READS
-                    .run(key, measure(program, &identity, head.as_deref(), remaining))
+                    .run(
+                        key,
+                        measure(program, &identity, head.as_deref(), remaining, attempts),
+                    )
                     .await;
                 (i, measured)
             }
@@ -540,5 +568,95 @@ mod tests {
         let mut wrong = identity;
         wrong.source.host = "other.example".into();
         assert!(graph_evidence(&value, &wrong, Some("head")).is_none());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_and_legacy_rest_fallbacks_share_four_actual_api_invocations() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(&program,"#!/bin/sh\ncat > /dev/null\necho request >> \"$0.calls\"\nprintf 'HTTP/2 200\\n\\n{}'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(&program, async {
+            let allowance = std::sync::atomic::AtomicUsize::new(4);
+            let identity = crate::identity::PrIdentity {
+                source: crate::identity::Source {
+                    provider: crate::identity::Provider::Gitlab,
+                    host: "gitlab.com".into(),
+                },
+                repo: "fixture/project".into(),
+                number: 7,
+            };
+            // Serial measurements ensure the legacy REST fallback is actually reached,
+            // rather than four simultaneous GraphQL calls consuming all permits first.
+            for _ in 0..4 {
+                assert!(measure(
+                    &program,
+                    &identity,
+                    Some("head"),
+                    Duration::from_secs(3),
+                    &allowance
+                )
+                .await
+                .is_none());
+            }
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                4
+            );
+            assert_eq!(allowance.load(std::sync::atomic::Ordering::Acquire), 0);
+        })
+        .await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successive_schema_fallbacks_cannot_add_a_fifth_api_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        let script = r#"#!/bin/sh
+input=$(cat)
+echo request >> "$0.calls"
+case "$input" in
+ *mergeTrainCar*) field=mergeTrainCar ;;
+ *availableAutoMergeStrategies*) field=availableAutoMergeStrategies ;;
+ *changeRequesters*) field=changeRequesters ;;
+ *) printf 'HTTP/2 200\n\n{}'; exit 0 ;;
+esac
+printf 'HTTP/2 200\n\n{"errors":[{"extensions":{"code":"undefinedField","fieldName":"%s"}}]}' "$field"
+"#;
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(&program, async {
+            let allowance = std::sync::atomic::AtomicUsize::new(4);
+            let identity = crate::identity::PrIdentity {
+                source: crate::identity::Source {
+                    provider: crate::identity::Provider::Gitlab,
+                    host: "gitlab.com".into(),
+                },
+                repo: "fixture/project".into(),
+                number: 7,
+            };
+            assert!(measure(
+                &program,
+                &identity,
+                Some("head"),
+                Duration::from_secs(3),
+                &allowance
+            )
+            .await
+            .is_none());
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                4
+            );
+        })
+        .await;
     }
 }
