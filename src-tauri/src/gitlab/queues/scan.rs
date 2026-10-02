@@ -65,7 +65,7 @@ pub(super) async fn advance(
         .await;
         match proof {
             Ok(page)
-                if page.terminal_known
+                if page.confirmation_terminal
                     && page.next.is_none()
                     && page.total == Some(page.rows.len() as u64)
                     && page.rows.len() <= 1 =>
@@ -405,6 +405,34 @@ mod tests {
             .unwrap();
             assert_eq!(second.removals.len(), 1);
             assert!(second.state.candidates.is_empty());
+
+            // Round1: a terminal-looking second response cannot remove through
+            // contradictory or malformed pagination. Each is one actual proof call.
+            for headers in [
+                "x-total: 0\nx-next-page:\nx-page: 2",
+                "x-total: 0\nx-next-page:\nLink: <https://gitlab.com/api/v4/projects/group%2Fproject/merge_requests?page=2>; rel=\"next\"",
+                "x-total: 0\nx-next-page:\nx-total: 1",
+                "x-total: 0\nx-next-page:\nx-next-page: 2",
+                "x-total: 0\nx-next-page:\nx-page: invalid",
+                "x-total: 0\nx-next-page:\nx-total-pages: 2",
+                "x-total: 0\nx-next-page:\nx-prev-page: 1",
+                "x-total: 0\nx-next-page:\nx-per-page: broken",
+                "x-total: 0\nx-next-page:\nLink: broken",
+                "x-total: 0\nx-next-page:\nLink: <https://gitlab.com/api/v4/merge_requests?page=1>; rel=\"first",
+                "x-total: 0\nx-next-page:\nx-page: 1\nx-page: 2",
+                "x-next-page:\nx-page: 1",
+            ] {
+                std::fs::write(&program,format!("#!/bin/sh\necho proof >> \"$0.proofs\"\nprintf '%s' 'HTTP/2 200\n{headers}\n\n[]'\n")).unwrap();
+                let before=std::fs::read_to_string(program.with_extension("proofs")).unwrap_or_default().lines().count();
+                let proof=advance(&program,Target{source:&source(),list:CachedList::Reviewing,owner:"fixture"},Loaded{revision:1,state:first.state.clone()},std::slice::from_ref(&mr),Duration::from_secs(2),1060).await.unwrap().scan.unwrap();
+                assert!(proof.removals.is_empty(),"contradictory proof: {headers}");assert_eq!(proof.state.candidates[0].negative_at,None);assert!(proof.state.candidates[0].eligible_at>1060);
+                assert_eq!(std::fs::read_to_string(program.with_extension("proofs")).unwrap().lines().count(),before+1);
+            }
+
+            std::fs::write(&program,"#!/bin/sh\necho proof >> \"$0.proofs\"\nprintf '%s' 'HTTP/2 200\nx-total: 0\nx-next-page:\nx-page: 1\nx-per-page: 25\nx-total-pages: 1\nLink: <https://gitlab.com/api/v4/merge_requests?page=1>; rel=\"first\", <https://gitlab.com/api/v4/merge_requests?page=1>; rel=\"last\"\n\n[]'\n").unwrap();
+            let before=std::fs::read_to_string(program.with_extension("proofs")).unwrap().lines().count();
+            let consistent=advance(&program,Target{source:&source(),list:CachedList::Reviewing,owner:"fixture"},Loaded{revision:1,state:first.state.clone()},std::slice::from_ref(&mr),Duration::from_secs(2),1060).await.unwrap().scan.unwrap();
+            assert_eq!(consistent.removals.len(),1);assert_eq!(std::fs::read_to_string(program.with_extension("proofs")).unwrap().lines().count(),before+1);
             // Reopening/re-requesting is positive membership, never a tombstone.
             std::fs::write(
                 &program,

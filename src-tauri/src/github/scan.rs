@@ -125,6 +125,13 @@ impl GitHubClient {
                         "queue account changed during traversal".into(),
                     ));
                 }
+                if state.after.is_some() && raw["__queue_cursor_invalid"] == true {
+                    let receipt_id = state.receipt_id.take();
+                    state.fresh_pass();
+                    state.receipt_id = receipt_id;
+                    state.failure(now);
+                    break;
+                }
                 let rows = map_list(&raw, "authored");
                 let page = &raw["authored"];
                 let total = page["issueCount"].as_u64();
@@ -318,12 +325,7 @@ impl GitHubClient {
 }
 fn explicit_invalid_cursor(error: &ClientError) -> bool {
     match error {
-        ClientError::Graphql(message) => {
-            let message = message.to_ascii_lowercase();
-            message.contains("invalid cursor")
-                || message.contains("cursor is invalid")
-                || message.contains("not a valid cursor")
-        }
+        ClientError::Graphql(message) => super::client::invalid_cursor_message(message),
         _ => false,
     }
 }
@@ -874,5 +876,75 @@ mod tests {
         assert!(state.tainted);
         assert!(state.receipt_id.is_some());
         assert!(state.eligible_at > 1000);
+    }
+    #[tokio::test]
+    async fn round1_partial_invalid_cursor_retires_only_matching_search_and_recovers() {
+        for (message, path, reset) in [
+            ("The cursor is invalid", "authored", true),
+            ("Temporary resolver failure", "authored", false),
+            ("The cursor is invalid", "unrelated", false),
+        ] {
+            let server = MockServer::start().await;
+            let client = client(&server);
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+                )
+                .mount(&server)
+                .await;
+            client.fetch_viewer().await.unwrap();
+            server.reset().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"rateLimit":{"cost":1},"authored":null},"errors":[{"path":[path],"message":message}]}))).mount(&server).await;
+            let mut pending = candidate(7);
+            pending.eligible_at = i64::MAX;
+            let state = State {
+                after: Some("expired".into()),
+                pages: 9,
+                candidates: [pending.clone()].into(),
+                ..State::default()
+            };
+            let previous = map_list(&json!({"authored":{"nodes":[node(7)]}}), "authored");
+            let result = client
+                .advance_scan(
+                    CachedList::Authored,
+                    Loaded { revision: 4, state },
+                    &previous,
+                    1000,
+                )
+                .await
+                .unwrap();
+            assert!(server.received_requests().await.unwrap().len() <= 3);
+            assert!(matches!(result.coverage, Coverage::Partial { .. }));
+            let retained =
+                crate::inventory::reconcile(previous, result.prs, false, chrono::Utc::now());
+            assert_eq!(retained.len(), 1);
+            assert_eq!(
+                retained[0].observation.as_ref().unwrap().state,
+                crate::inventory::ObservationState::Retained
+            );
+            let state = result.scan.unwrap().state;
+            assert_eq!(state.after.is_none(), reset, "{message} at {path}");
+            assert_eq!(state.candidates[0], pending);
+            assert!(state.receipt_id.is_some());
+            assert!(state.eligible_at > 1000);
+            if reset {
+                server.reset().await;
+                Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":1,"nodes":[node(8)],"pageInfo":{"hasNextPage":false,"endCursor":"new"}}}}))).mount(&server).await;
+                let recovered = client
+                    .advance_scan(
+                        CachedList::Authored,
+                        Loaded { revision: 5, state },
+                        &retained,
+                        1100,
+                    )
+                    .await
+                    .unwrap();
+                let requests = server.received_requests().await.unwrap();
+                assert!(requests.len() <= 3);
+                assert!(requests[0].body_json::<Value>().unwrap()["variables"]["after"].is_null());
+                assert_eq!(recovered.prs[0].number, 8);
+            }
+        }
     }
 }

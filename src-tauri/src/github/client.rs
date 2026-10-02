@@ -386,6 +386,31 @@ pub(super) fn refused_fields(v: &serde_json::Value) -> usize {
     v["__refused"].as_u64().unwrap_or(0) as usize
 }
 
+pub(super) fn invalid_cursor_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("invalid cursor")
+        || message.contains("cursor is invalid")
+        || message.contains("not a valid cursor")
+}
+
+// Internal classification for the bounded queue search alias only. Neither
+// provider prose nor error paths are stored or added to the wire model.
+fn mark_queue_cursor_error(data: &mut serde_json::Value, errors: &[serde_json::Value]) {
+    let invalid = errors.iter().any(|error| {
+        error["path"]
+            .as_array()
+            .is_some_and(|path| path.len() == 1 && path[0] == "authored")
+            && error["message"]
+                .as_str()
+                .is_some_and(invalid_cursor_message)
+    });
+    if invalid {
+        if let Some(data) = data.as_object_mut() {
+            data.insert("__queue_cursor_invalid".into(), true.into());
+        }
+    }
+}
+
 /// List evidence retained before legacy numeric wrappers apply defaults.
 #[derive(Clone)]
 pub struct FetchedList {
@@ -2081,6 +2106,7 @@ async fn graphql_with_transport(
                 // for the request it actually made.
                 let mut d = d.clone();
                 crate::inventory::mark_readiness_errors(&mut d, errs);
+                mark_queue_cursor_error(&mut d, errs);
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("__refused".into(), errs.len().into());
                 }
@@ -2093,6 +2119,7 @@ async fn graphql_with_transport(
             // permission-refusal count so other callers keep their messaging.
             let mut data = d.clone();
             crate::inventory::mark_readiness_errors(&mut data, errs);
+            mark_queue_cursor_error(&mut data, errs);
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("__partial_errors".into(), errs.len().into());
             }

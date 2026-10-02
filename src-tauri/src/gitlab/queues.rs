@@ -121,6 +121,7 @@ struct Page {
     total: Option<u64>,
     next: Option<usize>,
     terminal_known: bool,
+    confirmation_terminal: bool,
 }
 
 pub async fn fetch<F: std::future::Future<Output = bool>>(
@@ -434,7 +435,103 @@ fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
         total,
         next,
         terminal_known: next_seen,
+        confirmation_terminal: confirmation_terminal(headers),
     })
+}
+
+/// Stronger than normal traversal metadata: only an unambiguous first-page
+/// terminal envelope may support exact-IID absence. Missing totals remain unknown.
+fn confirmation_terminal(headers: &str) -> bool {
+    let mut evidence = std::collections::HashMap::new();
+    for line in headers.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        if key.trim() != key {
+            return false;
+        }
+        let key = key.to_ascii_lowercase();
+        if !matches!(
+            key.as_str(),
+            "x-total"
+                | "x-total-pages"
+                | "x-page"
+                | "x-next-page"
+                | "x-prev-page"
+                | "x-per-page"
+                | "link"
+        ) {
+            continue;
+        }
+        let value = value.trim();
+        if value.len() > 4096 {
+            return false;
+        }
+        if evidence.insert(key, value).is_some_and(|old| old != value) {
+            return false;
+        }
+    }
+    let number = |value: &str| -> Option<u64> {
+        (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| value.parse().ok())
+            .flatten()
+    };
+    let Some(total) = evidence.get("x-total").and_then(|s| number(s)) else {
+        return false;
+    };
+    if evidence.get("x-next-page") != Some(&"") {
+        return false;
+    }
+    for (key, value) in &evidence {
+        let valid = match key.as_str() {
+            "x-page" => number(value) == Some(1),
+            "x-total-pages" => number(value).is_some_and(|n| n == 1 || (n == 0 && total == 0)),
+            "x-prev-page" => value.is_empty(),
+            "x-per-page" => number(value).is_some_and(|n| (1..=25).contains(&n)),
+            "link" => value.split(',').all(|link| {
+                let Some((url, attributes)) = link.trim().split_once('>') else {
+                    return false;
+                };
+                let Some(url) = url
+                    .strip_prefix('<')
+                    .and_then(|s| reqwest::Url::parse(s).ok())
+                else {
+                    return false;
+                };
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return false;
+                }
+                let pages: Vec<_> = url.query_pairs().filter(|(key, _)| key == "page").collect();
+                if pages.len() != 1 || pages[0].1 != "1" {
+                    return false;
+                }
+                let Some(relation) = attributes
+                    .trim()
+                    .strip_prefix(';')
+                    .map(str::trim)
+                    .and_then(|s| s.strip_prefix("rel="))
+                else {
+                    return false;
+                };
+                let relation = if relation.starts_with('"') {
+                    let Some(relation) =
+                        relation.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                    else {
+                        return false;
+                    };
+                    relation
+                } else {
+                    relation
+                };
+                matches!(relation, "first" | "last" | "self")
+            }),
+            _ => true,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 fn map_row(v: &Value, source: &Source) -> Option<MergeRequest> {
