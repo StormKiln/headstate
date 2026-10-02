@@ -841,14 +841,23 @@ mod tests {
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"data":{"rateLimit":{"remaining":100}}})),
+                    .insert_header("x-ratelimit-remaining", "100")
+                    .insert_header(
+                        "x-ratelimit-reset",
+                        (chrono::Utc::now().timestamp() + 3600).to_string(),
+                    )
+                    .set_body_json(serde_json::json!({"data":{"viewer":{"login":"octocat"}}})),
             )
             .mount(&server)
             .await;
         client
-            .stats_graphql(&serde_json::json!({"query":"query { rateLimit { remaining } }"}))
+            .stats_graphql(&serde_json::json!({"query":"query { viewer { login } }"}))
             .await
             .unwrap();
+        assert_eq!(client.observed_remaining(), Some(100));
+        let healthy_client = client_for(&server).await;
+        assert_eq!(healthy_client.observed_remaining(), None);
+        assert!(healthy_client.request_budget().permits(COST_PER_CHUNK));
         server.reset().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
