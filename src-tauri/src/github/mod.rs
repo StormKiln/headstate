@@ -1,6 +1,7 @@
 //! GitHub data layer: the PR model, the GraphQL query documents, and the
 //! mapping from raw GraphQL JSON to typed Rust.
 
+mod advisory;
 pub mod client;
 pub mod gates;
 pub mod map;

@@ -2267,8 +2267,9 @@ export const gitLabAction = (request: import("../types/gitlabActions").GitLabAct
   call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });
 
 /// Bounded metadata-only stack lookups for Ready rows (#1602).
-export const getReadyStacks = (rows: PrIdentity[]) =>
-  call<(PrIdentity & { stack: PrStack })[]>("get_ready_stacks", { rows });
+export type StackAsk = PrIdentity & { head_oid?: string; base_ref?: string };
+export const getReadyStacks = (rows: StackAsk[]) =>
+  call<(PrIdentity & { stack: PrStack; head_oid?: string; base_ref?: string })[]>("get_ready_stacks", { rows });
 
 /** Desktop notification clicks wait here until the app shell mounts. */
 export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");

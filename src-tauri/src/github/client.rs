@@ -329,6 +329,7 @@ pub struct GitHubClient {
     octocrab: Octocrab,
     searches: Arc<Searches>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
+    pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
 }
@@ -466,6 +467,7 @@ impl GitHubClient {
             octocrab,
             searches: Arc::new(Searches::default()),
             viewer: Arc::default(),
+            advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
         }
@@ -1574,19 +1576,22 @@ impl GitHubClient {
     /// accumulator to report into and use this; everything in a stats load
     /// uses [`Self::fetch_viewer_metered`] instead.
     pub async fn fetch_viewer(&self) -> Result<String, ClientError> {
-        let v = self
-            .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
-            .await?;
-        // Fed to the stats GATE even from the unmetered callers: this is a
-        // real reading of the hour's remaining budget, and startup is exactly
-        // when the gate has nothing else to go on (#843).
-        if let Some((remaining, _)) = map_rate_limit(&v) {
-            crate::github::stats::budget::note_remaining(remaining);
-        }
-        let login = map_viewer(&v)
-            .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
-        let _ = self.viewer.set(login.clone());
-        Ok(login)
+        tokio::time::timeout_at(
+            self.read_context().deadline,
+            self.viewer.get_or_try_init(|| async {
+                let v = self
+                    .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
+                    .await?;
+                if let Some((remaining, _)) = map_rate_limit(&v) {
+                    crate::github::stats::budget::note_remaining(remaining);
+                }
+                map_viewer(&v)
+                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+            }),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
+        .cloned()
     }
 
     /// [`Self::fetch_viewer`], reported into a load's accumulator.
@@ -1624,10 +1629,14 @@ impl GitHubClient {
     ) -> Result<String, ClientError> {
         // The immutable client owns the token. Never reuse disk identity or
         // another client's login, and never cache a failed lookup.
-        self.viewer
-            .get_or_try_init(|| self.fetch_viewer_metered(budget))
-            .await
-            .cloned()
+        tokio::time::timeout_at(
+            self.read_context().deadline,
+            self.viewer
+                .get_or_try_init(|| self.fetch_viewer_metered(budget)),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
+        .cloned()
     }
 
     /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
@@ -2259,6 +2268,65 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn short_viewer_waiter_cannot_outlive_its_own_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(json!({"data":{"viewer":{"login":"octocat"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let leader_client = client.clone();
+        let leader = tokio::spawn(async move { leader_client.fetch_viewer().await });
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let short = client.with_read_context(super::super::admission::ReadContext::new(
+            super::super::admission::ReadClass::Background,
+            std::time::Duration::from_millis(10),
+        ));
+        assert!(
+            short.fetch_viewer().await.is_err(),
+            "queued identity wait shares the caller deadline"
+        );
+        assert_eq!(leader.await.unwrap().unwrap(), "octocat");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "octocat");
+    }
+
+    #[tokio::test]
+    async fn ordinary_viewer_coalesces_success_and_retries_failure() {
+        let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"message":"synthetic refusal"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(client.fetch_viewer().await.is_err());
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(30))
+                    .set_body_json(json!({"data":{"viewer":{"login":"octocat"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (a, b) = tokio::join!(client.fetch_viewer(), client.fetch_viewer());
+        assert_eq!(a.unwrap(), "octocat");
+        assert_eq!(b.unwrap(), "octocat");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "octocat");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

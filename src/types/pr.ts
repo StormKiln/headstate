@@ -4002,6 +4002,9 @@ export interface RowPusher {
   repo: string;
   number: number;
   head_oid: string;
+  base?: string;
+  head_ref?: string;
+  head_repo?: string | null;
   rules: BaseRules;
   last_pusher: LastPusher;
 }

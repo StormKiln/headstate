@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { observationLabel } from "@/lib/rowObservation";
 import { prKey } from "@/lib/prIdentity";
 import { CircleCheck, GitCommitHorizontal, MessageCircleWarning } from "lucide-react";
@@ -268,11 +269,33 @@ export function ReadyStrip({
   // `ready`; the bar under it says how many were hidden and how many
   // could not be decided.
   const all = sortReadyForReview(prs.filter(readyForReview), readySort);
-  const pushers = useReadyPushers(all);
+  const region = useRef<HTMLElement>(null);
+  const [intersections, setIntersections] = useState<Set<string> | null>(null);
+  // Bounded first-paint estimate until actual viewport observations arrive.
+  const priority = intersections ?? new Set(all.slice(0, 8).map(prKey));
+
+  const pushers = useReadyPushers(all, priority);
   const mode: MyPushesMode = readyMyPushes ?? "auto";
   const part = partitionReady(all, pushers.of, mode);
   const ready = part.shown;
-  const stacks = useReadyStacks(ready);
+  const stacks = useReadyStacks(ready, priority);
+  const rowIdentity = JSON.stringify(ready.map(prKey).sort());
+  useEffect(() => {
+    if (typeof IntersectionObserver === "undefined" || !region.current) return;
+    const observer = new IntersectionObserver(entries => {
+      setIntersections(previous => {
+        const next = new Set(previous ?? []);
+        for (const entry of entries) {
+          const key = (entry.target as HTMLElement).dataset.advisoryKey;
+          if (key) { if (entry.isIntersecting) next.add(key); else next.delete(key); }
+        }
+        return next;
+      });
+    });
+    for (const row of region.current.querySelectorAll("[data-advisory-key]")) observer.observe(row);
+    return () => observer.disconnect();
+  }, [rowIdentity]);
+
 
   // The rows as SHOWN -- after the last-push filter, in the sort. The
   // list below and "Copy as markdown" both read this, so the copy cannot
@@ -289,7 +312,7 @@ export function ReadyStrip({
   }
 
   return (
-    <section className="mb-4 rounded-md border border-[#3fb950]/40 bg-[#3fb950]/5">
+    <section ref={region} className="mb-4 rounded-md border border-[#3fb950]/40 bg-[#3fb950]/5">
       <h2 className="flex flex-wrap items-center gap-2 border-b border-[#3fb950]/30 px-4 py-2 text-sm font-semibold text-[#3fb950]">
         <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
           <CircleCheck className="h-4 w-4" aria-hidden="true" />
@@ -349,7 +372,7 @@ export function ReadyStrip({
       />
       <ul>
         {shown.map(({ pr }) => (
-          <li key={prKey(pr)} className="text-sm">
+          <li key={prKey(pr)} data-advisory-key={prKey(pr)} className="text-sm">
             {onOpen ? (
               <div
                 role="button"

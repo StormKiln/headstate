@@ -794,7 +794,7 @@ query PrStack($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     defaultBranchRef { name }
     pullRequest(number: $number) {
-      number headRefName baseRefName isCrossRepository
+      number headRefName headRefOid baseRefName isCrossRepository
       # `entries` is the native stack's whole membership, bottom first
       # (#1468): the stack-merge confirmation names every open pull
       # request a merge would land. 50 is past any stack `gh stack` makes;
@@ -2026,7 +2026,7 @@ mod tests {
         for f in [
             "rateLimit { cost remaining resetAt }",
             "defaultBranchRef { name }",
-            "number headRefName baseRefName isCrossRepository",
+            "number headRefName headRefOid baseRefName isCrossRepository",
             "stackEntry { position stack { number size",
             "entries(first: 50) { totalCount nodes { position pullRequest {",
             "number title state isDraft reviewDecision",

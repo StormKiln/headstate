@@ -1257,7 +1257,7 @@ const STRIP_PER_REQUEST: std::time::Duration = std::time::Duration::from_secs(10
 /// The strip's batched counterpart of `get_review_gates`, built from the
 /// same parts (`github::gates`): rules cached per (repository, base),
 /// pushers cached per (head repository, head commit), and at most
-/// `STRIP_LOOKUP_CAP` new activity reads per call, inside the REST
+/// a shared actual-attempt allowance across calls, inside the REST
 /// budget. A row past the cap or the budget comes back `Declined` -- not
 /// checked -- so the strip never mistakes "we did not ask" for "we could
 /// not tell" (#1050).
@@ -8071,7 +8071,7 @@ pub async fn claude_permission_ownership(
 #[tauri::command]
 pub async fn get_ready_stacks(
     client: State<'_, GhClient>,
-    rows: Vec<crate::identity::PrIdentity>,
+    rows: Vec<crate::github::ready_stacks::StackAsk>,
 ) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     crate::github::ready_stacks::ready_stacks(&client, rows).await
