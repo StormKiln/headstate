@@ -59,11 +59,12 @@ export function releaseCheckedReview(qc: QueryClient, repo: string, number: numb
 }
 export function reviewAccountGeneration(qc: QueryClient) { return store(qc).accountRevision; }
 export function reviewReadGeneration(qc: QueryClient) { return store(qc).revision; }
-// One fact belongs to the existing detail query, so query removal also removes
-// its evidence. There is no second collection of historical PRs or heads.
+// One latest receipt belongs to the existing detail query. An acknowledgement
+// is only an ordering floor until read-confirmed; expiry cannot revive older
+// affirmative evidence. Query removal removes it, with no second collection.
 const AUTHORITY_META = "headstateConfirmedReview";
 type ReviewFact = { id: string; author: string; state: string; commit_oid: string; submitted_at?: string };
-interface Authority { owner: string | undefined; accountRevision: number; prId: string; head: string; review: ReviewFact }
+interface Authority { owner: string | undefined; accountRevision: number; prId: string; head: string; review: ReviewFact; confirmed: boolean }
 const detailQuery = (qc: QueryClient, repo: string, number: number) =>
   qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
 function readAuthority(qc: QueryClient, repo: string, number: number): Authority | undefined {
@@ -71,7 +72,7 @@ function readAuthority(qc: QueryClient, repo: string, number: number): Authority
   const s = store(qc);
   return authority?.owner === s.owner && authority?.accountRevision === s.accountRevision ? authority : undefined;
 }
-function writeAuthority(qc: QueryClient, fresh: PrDetail, review?: ReviewFact) {
+function writeAuthority(qc: QueryClient, fresh: Pick<PrDetail, "repo" | "number" | "id" | "head_oid">, review?: ReviewFact, confirmed = true) {
   const query = detailQuery(qc, fresh.repo, fresh.number);
   if (!query) return;
   const s = store(qc);
@@ -79,7 +80,7 @@ function writeAuthority(qc: QueryClient, fresh: PrDetail, review?: ReviewFact) {
   // Replacing it lets an already-created observer restore an older empty object.
   const meta = query.meta ?? {};
   meta[AUTHORITY_META] = review
-    ? { owner: s.owner, accountRevision: s.accountRevision, prId: fresh.id, head: fresh.head_oid, review } satisfies Authority
+    ? { owner: s.owner, accountRevision: s.accountRevision, prId: fresh.id, head: fresh.head_oid, review, confirmed } satisfies Authority
     : undefined;
   if (!query.meta) query.setOptions({ ...query.options, meta });
 }
@@ -127,7 +128,8 @@ export function reconcileReviewDetail(qc: QueryClient, fresh: PrDetail, generati
     writeAuthority(qc, fresh, { ...observed });
     return fresh;
   }
-  return withReview(fresh, owner, authority.review);
+  return authority.confirmed ? withReview(fresh, owner, authority.review)
+    : { ...fresh, latest_reviews: fresh.latest_reviews.filter(r => r.author.toLowerCase() !== owner) };
 }
 export async function submitBoundReview(qc: QueryClient, request: BoundReviewRequest): Promise<BoundReviewOutcome> {
   const s = store(qc); const owner = account(qc, s); const id = key(request.repo, request.number, request.expected_head);
@@ -135,7 +137,7 @@ export async function submitBoundReview(qc: QueryClient, request: BoundReviewReq
     return { outcome: "not_dispatched", message: "A known account and viewed head are required before reviewing." };
   const authority = readAuthority(qc, request.repo, request.number);
   const requestedState = request.verdict === "approve" ? "APPROVED" : request.verdict === "request_changes" ? "CHANGES_REQUESTED" : "COMMENTED";
-  if (authority?.prId === request.id && authority.head === request.expected_head && authority.review.state === requestedState)
+  if (authority?.confirmed && authority.prId === request.id && authority.head === request.expected_head && authority.review.state === requestedState)
     return { outcome: "not_dispatched", message: "Your review is already confirmed for this head. Check GitHub before repeating it." };
   if (s.operations.has(id)) return { outcome: "not_dispatched", message: "This review is already recorded or unresolved. Check its state on GitHub before another submission." };
   if (s.operations.size >= REVIEW_OPERATION_CAP) return { outcome: "not_dispatched", message: "There are too many unresolved reviews. Check their state on GitHub before submitting another review." };
@@ -162,6 +164,24 @@ export async function submitBoundReview(qc: QueryClient, request: BoundReviewReq
   const next: ReviewOperation = outcome.outcome === "acknowledged"
     ? { ...op, state: "acknowledged", receipt: outcome.receipt, acknowledgedAt: Date.now() }
     : { ...op, state: "unresolved", message: outcome.message };
+  if (outcome.outcome === "acknowledged") {
+    const receipt = outcome.receipt;
+    const fact: ReviewFact = { id: receipt.review_id, author: receipt.actor, state: receipt.state,
+      commit_oid: receipt.commit_oid, ...(receipt.submitted_at ? { submitted_at: receipt.submitted_at } : {}) };
+    const current = readAuthority(qc, request.repo, request.number);
+    if (current && current !== authority && current.confirmed && current.prId === request.id
+      && current.head === request.expected_head && newerReview(current.review, fact)) {
+      s.operations.delete(id); changed(s);
+      return outcome;
+    }
+    // A semantic write supersedes the fact present when it started. If a newer
+    // read arrived meanwhile, require ordering evidence before replacing it.
+    if (receipt.pr_id === request.id && receipt.repo.toLowerCase() === request.repo.toLowerCase()
+      && receipt.number === request.number && usableReview(fact, owner, request.expected_head)
+      && (!current || current === authority || newerReview(fact, current.review))) {
+      writeAuthority(qc, { ...request, head_oid: request.expected_head }, fact, false);
+    }
+  }
   s.operations.set(id, next); changed(s);
   if (next.state === "acknowledged") setTimeout(() => {
     if (s.operations.get(id) !== next) return;

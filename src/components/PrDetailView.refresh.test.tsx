@@ -401,3 +401,41 @@ it.each([1200, 390])("preserves converged own approval through later lag and rem
   await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(2));
   expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")[1][1]?.request).toMatchObject({ expected_head: "new-head" });
 });
+
+it.each([1200, 390])("does not revive an older approval after an acknowledged different verdict expires at width %s", async width => {
+  vi.useFakeTimers({ shouldAdvanceTime: true }); stubViewport(width);
+  let current = detail(); let writes = 0;
+  const base = invoke.getMockImplementation()!;
+  const first = { author: "reviewer", state: "APPROVED", id: "R1", commit_oid: "head-7", submitted_at: "2026-10-01T12:01:00Z" };
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_pr_detail") return current;
+    if (name === "review_pr_at_head") {
+      writes++;
+      return { outcome: "acknowledged", receipt: { review_id: `R${writes}`, state: writes === 2 ? "CHANGES_REQUESTED" : "APPROVED", actor: "reviewer", commit_oid: "head-7", submitted_at: `2026-10-01T12:0${writes}:00Z`, pr_id: "PR_7", repo: "octocat/hello-world", number: 7 } };
+    }
+    return base(name, args);
+  });
+  let view = mount(); await loaded();
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(writes).toBe(1));
+  current = { ...detail(), latest_reviews: [first] };
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "A deliberate different verdict" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Request changes" }).matches(":disabled")).toBe(false));
+  current = detail();
+  fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+  await waitFor(() => expect(writes).toBe(2));
+  await act(async () => { await vi.advanceTimersByTimeAsync(16 * 60_000); });
+  for (const latest_reviews of [[], [first]]) {
+    current = { ...detail(), latest_reviews };
+    await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+    view.unmount(); view = mount(); await loaded();
+    await screen.findByRole("link", { name: "Check review on GitHub" });
+    expect(screen.queryAllByRole("button", { name: /^Approved$/ })).toHaveLength(0);
+    expect(writes).toBe(2);
+  }
+  fireEvent.click(screen.getByRole("button", { name: "I checked on GitHub; allow another review" }));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approve$/ }).every(button => !button.matches(":disabled"))).toBe(true));
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(writes).toBe(3));
+});

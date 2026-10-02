@@ -115,3 +115,43 @@ it("requires real head and ordered review evidence, and does not resurrect dismi
  qc.setQueryData(["viewer"], "other"); qc.setQueryData(["viewer"], "fixture");
  expect(reconcileReviewDetail(qc, detail)).toBe(detail);
 });
+
+it.each(["rejected", "not_dispatched", "uncertain"] as const)("preserves confirmed R1 when a different verdict is %s", async outcome => {
+ const qc = setup(); await submitBoundReview(qc, request);
+ const observed = { author: receipt.actor, state: receipt.state, id: receipt.review_id, commit_oid: receipt.commit_oid, submitted_at: receipt.submitted_at! };
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [observed] });
+ vi.mocked(reviewPrAtHead).mockResolvedValueOnce({ outcome, message: "Synthetic refusal or uncertainty" });
+ await submitBoundReview(qc, { ...request, verdict: "request_changes" });
+ expect(reconcileReviewDetail(qc, detail).latest_reviews).toEqual([observed]);
+});
+
+it("retains an acknowledged ordering floor after expiry and checked release until real read convergence", async () => {
+ vi.useFakeTimers(); const qc = setup(); await submitBoundReview(qc, request);
+ const old = { author: receipt.actor, state: receipt.state, id: receipt.review_id, commit_oid: receipt.commit_oid, submitted_at: receipt.submitted_at! };
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [old] });
+ const newer = { ...old, id: "R2", state: "CHANGES_REQUESTED", submitted_at: "2026-10-01T00:02:00Z" };
+ vi.mocked(reviewPrAtHead).mockResolvedValueOnce({ outcome: "acknowledged", receipt: { ...receipt, review_id: newer.id, state: newer.state, submitted_at: newer.submitted_at } });
+ await submitBoundReview(qc, { ...request, verdict: "request_changes" });
+ await vi.advanceTimersByTimeAsync(REVIEW_ACK_MS + 60_000);
+ for (const latest_reviews of [[], [old]]) expect(reconcileReviewDetail(qc, { ...detail, latest_reviews }).latest_reviews).toEqual([]);
+ releaseCheckedReview(qc, request.repo, 1, "head-1");
+ expect(reconcileReviewDetail(qc, { ...detail, latest_reviews: [old] }).latest_reviews).toEqual([]);
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [newer] });
+ expect(reconcileReviewDetail(qc, detail).latest_reviews).toEqual([newer]);
+ expect((await submitBoundReview(qc, { ...request, verdict: "request_changes" })).outcome).toBe("not_dispatched");
+});
+
+it("does not replace a newer confirmed read with a delayed older write receipt", async () => {
+ const qc = setup(); await submitBoundReview(qc, request);
+ const old = { author: receipt.actor, state: receipt.state, id: receipt.review_id, commit_oid: receipt.commit_oid, submitted_at: receipt.submitted_at! };
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [old] });
+ let resolve!: (value: Awaited<ReturnType<typeof reviewPrAtHead>>) => void;
+ vi.mocked(reviewPrAtHead).mockReturnValueOnce(new Promise(r => { resolve = r; }));
+ const pending = submitBoundReview(qc, { ...request, verdict: "request_changes" });
+ const newer = { ...old, id: "R3", state: "COMMENTED", submitted_at: "2026-10-01T00:03:00Z" };
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [newer] });
+ resolve({ outcome: "acknowledged", receipt: { ...receipt, review_id: "R2", state: "CHANGES_REQUESTED", submitted_at: "2026-10-01T00:02:00Z" } });
+ await pending;
+ expect(reconcileReviewDetail(qc, detail).latest_reviews).toEqual([newer]);
+ expect(reviewOperation(qc, request.repo, 1, "head-1")).toBeUndefined();
+});
