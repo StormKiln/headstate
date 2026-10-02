@@ -2175,3 +2175,7 @@ printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "source_poll_integration_tests.rs"]
+mod integration_tests;
