@@ -114,6 +114,7 @@ impl GitHubClient {
         if let Some(target) = v.pointer_mut(CONTEXTS) {
             target["nodes"] = json!(nodes);
         }
+        let mut page_has_rows = !nodes.is_empty();
         let mut count = nodes.len() as u64;
         if unavailable || !valid || total.is_none() || total.is_some_and(|t| t < count) {
             return coverage(ChecksState::Unknown, None);
@@ -122,7 +123,18 @@ impl GitHubClient {
         let mut cursors = HashSet::new();
         let client = self.with_attempt_limit(3);
         for page_index in 0..=3 {
-            match info["hasNextPage"].as_bool() {
+            let next = info["hasNextPage"].as_bool();
+            let cursor = info["endCursor"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 4096);
+            // Count equality cannot repair contradictory pagination evidence.
+            // A measured empty terminal connection legitimately has no cursor.
+            if (page_has_rows || next == Some(true))
+                && cursor.is_none_or(|cursor| !cursors.insert(cursor.to_string()))
+            {
+                return coverage(ChecksState::Unknown, None);
+            }
+            match next {
                 Some(false) if total == Some(count) => {
                     return coverage(ChecksState::Complete, total)
                 }
@@ -131,15 +143,6 @@ impl GitHubClient {
             }
             if page_index == 3 {
                 return coverage(ChecksState::Partial, total);
-            }
-            let Some(cursor) = info["endCursor"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 4096)
-            else {
-                return coverage(ChecksState::Unknown, None);
-            };
-            if !cursors.insert(cursor.to_string()) {
-                return coverage(ChecksState::Unknown, None);
             }
             let page = match client.graphql_partial_ok(&json!({"query":PR_CHECKS_PAGE_QUERY,"variables":{"owner":owner,"repo":name,"number":number,"after":cursor}})).await {
                 Ok(page) => page,
@@ -154,6 +157,7 @@ impl GitHubClient {
                 total = None;
             }
             let (more, valid) = read_nodes(fetched, &mut seen);
+            page_has_rows = !more.is_empty();
             count += more.len() as u64;
             if let Some(existing) = v
                 .pointer_mut(CONTEXTS)

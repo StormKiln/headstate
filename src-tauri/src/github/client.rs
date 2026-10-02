@@ -4048,7 +4048,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let mut page = progress_detail_fixture();
-            *page.pointer_mut(&context).unwrap() = json!({"totalCount":2,"nodes":[{"id":"check-b","name":"second check","conclusion":"FAILURE"}],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            *page.pointer_mut(&context).unwrap() = json!({"totalCount":2,"nodes":[{"id":"check-b","name":"second check","conclusion":"FAILURE"}],"pageInfo":{"hasNextPage":false,"endCursor":"second"}});
             match case {
                 "wrong-head" => page["repository"]["pullRequest"]["headRefOid"] = json!("head-b"),
                 "wrong-commit" => {
@@ -4118,6 +4118,74 @@ mod tests {
             assert!(
                 server.received_requests().await.unwrap().len() <= 2,
                 "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_progress_terminal_cursor_must_prove_a_coherent_chain() {
+        for case in [
+            "valid",
+            "repeated",
+            "missing",
+            "null",
+            "empty",
+            "oversized",
+            "cyclic",
+        ] {
+            let server = MockServer::start().await;
+            let context =
+                "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts";
+            let count = if case == "cyclic" { 3 } else { 2 };
+            let mut primary = progress_detail_fixture();
+            primary.pointer_mut(context).unwrap()["totalCount"] = json!(count);
+            Mock::given(method("POST"))
+                .and(body_string_contains("isMergeQueueEnabled"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": primary})))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("ChecksPage"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    let middle = case == "cyclic" && body["variables"]["after"] == "first";
+                    let cursor = match case {
+                        "repeated" => json!("first"),
+                        "cyclic" if !middle => json!("first"),
+                        "null" => serde_json::Value::Null,
+                        "empty" => json!(""),
+                        "oversized" => json!("x".repeat(4097)),
+                        _ => json!("second"),
+                    };
+                    let mut page = progress_detail_fixture();
+                    *page.pointer_mut(context).unwrap() = json!({"totalCount":count,
+                        "nodes":[{"id":if middle { "check-middle" } else { "check-terminal" },"name":"observed check","conclusion":"SUCCESS"}],
+                        "pageInfo":{"hasNextPage":middle,"endCursor":cursor}});
+                    if case == "missing" {
+                        page.pointer_mut(context).unwrap()["pageInfo"].as_object_mut().unwrap().remove("endCursor");
+                    }
+                    ResponseTemplate::new(200).set_body_json(json!({"data":page}))
+                }).mount(&server).await;
+            let d = client_for(&server)
+                .await
+                .fetch_pr_detail("acme/alpha", 42)
+                .await
+                .unwrap();
+            let coverage = serde_json::to_value(&d.checks_coverage).unwrap();
+            assert_eq!(d.number, 42, "{case}: primary retained");
+            assert_eq!(
+                d.checks.len(),
+                count,
+                "{case}: all valid observations retained"
+            );
+            assert_eq!(coverage["state"] == "complete", case == "valid", "{case}");
+            if case != "valid" {
+                assert!(coverage["total"].is_null(), "{case}");
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                count,
+                "{case}: no additional requests"
             );
         }
     }
@@ -4265,7 +4333,7 @@ mod tests {
                     "commits": {"nodes": [{"commit": {"oid":"head-a","statusCheckRollup": {
                         "contexts": {
                             "totalCount":2,
-                            "pageInfo": {"hasNextPage": false, "endCursor": null},
+                            "pageInfo": {"hasNextPage": false, "endCursor": "CUR1"},
                             "nodes": [{"id":"failing", "name": "failing-two", "conclusion": "FAILURE",
                                        "detailsUrl": "https://x/2"}]
                         }
