@@ -279,6 +279,7 @@ mod tests {
             discussion_id: None,
         };
         let mut receipt = Receipt {
+            session: None,
             identity: row.identity(),
             action: Action::Approve,
             outcome: Outcome::Unverified,

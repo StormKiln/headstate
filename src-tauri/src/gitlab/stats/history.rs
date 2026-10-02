@@ -103,8 +103,18 @@ pub async fn backfill(
     }
     let program =
         super::super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
-    let viewer = viewer(&program, host).await?;
-    backfill_with(
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let initial = ProcessContext::new(&program, host, Class::Foreground, deadline);
+    let (identity, context) = super::super::auth::verified_identity(&program, host, &initial)
+        .await
+        .map_err(|_| "GitLab account unavailable")?;
+    let viewer = identity["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("GitLab account unavailable")?
+        .to_string();
+    backfill_context(
+        &context,
         &program,
         source,
         viewer,
@@ -123,8 +133,29 @@ fn complete(r: &Report) -> bool {
             .is_some_and(|m| m.coverage.complete)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn backfill_with(
+    program: &Path,
+    source: Source,
+    viewer: String,
+    scope: Scope,
+    days: u32,
+    db: std::path::PathBuf,
+    today: chrono::NaiveDate,
+) -> Result<Backfill, String> {
+    let context = ProcessContext::new(
+        program,
+        &source.host,
+        Class::Foreground,
+        tokio::time::Instant::now() + BUDGET,
+    );
+    backfill_context(&context, program, source, viewer, scope, days, db, today).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn backfill_context(
+    context: &ProcessContext,
     program: &Path,
     source: Source,
     viewer: String,
@@ -192,7 +223,17 @@ async fn backfill_with(
             report: prior.as_ref().and_then(|r| r.report.clone()),
             error: None,
         };
-        match load_window(program, source.clone(), viewer.clone(), scope, start, end).await {
+        match load_window_context(
+            context,
+            program,
+            source.clone(),
+            viewer.clone(),
+            scope,
+            start,
+            end,
+        )
+        .await
+        {
             Ok(report) => {
                 receipt.report = Some(report);
             }
@@ -200,7 +241,10 @@ async fn backfill_with(
                 receipt.error = Some(error);
             }
         }
-        if super::viewer(program, &source.host).await? != viewer {
+        if !context.current()
+            || (tokio::time::Instant::now() < context.deadline
+                && viewer_context(program, &source.host, context).await? != viewer)
+        {
             return Err(
                 "GitLab account changed while loading history. Refresh to try again.".into(),
             );
@@ -213,10 +257,18 @@ async fn backfill_with(
         let key = partition.clone();
         let date = day.to_string();
         let saved = receipt.clone();
+        let owner = context.token();
         let saved_result = tokio::task::spawn_blocking(move || {
-            crate::store::gitlab_stats::history_put(&path, &key, &date, &saved)
+            owner
+                .with_current(|| {
+                    crate::store::gitlab_stats::history_put(&path, &key, &date, &saved)
+                })
+                .unwrap_or(Ok(saved))
         })
         .await;
+        if !context.current() {
+            return Err("GitLab account changed while saving history.".into());
+        }
         match saved_result {
             Ok(Ok(saved)) => {
                 receipt = saved;

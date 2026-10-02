@@ -6,7 +6,26 @@ pub(super) struct Target<'a> {
     pub list: CachedList,
     pub owner: &'a str,
 }
+#[cfg(test)]
 pub(super) async fn advance(
+    program: &Path,
+    target: Target<'_>,
+    loaded: Loaded,
+    previous: &[MergeRequest],
+    budget: Duration,
+    now: i64,
+) -> Result<FetchedList, QueueError> {
+    let context = super::super::transport::Context::new(
+        program,
+        &target.source.host,
+        super::super::transport::Class::Background,
+        tokio::time::Instant::now() + budget,
+    );
+    advance_context(&context, program, target, loaded, previous, budget, now).await
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn advance_context(
+    context: &super::super::transport::Context,
     program: &Path,
     target: Target<'_>,
     loaded: Loaded,
@@ -54,7 +73,8 @@ pub(super) async fn advance(
             filter,
             crate::gitlab::detail::encode_project(owner)
         );
-        let proof = request(
+        let proof = request_bounded(
+            context,
             program,
             &source.host,
             &endpoint,
@@ -115,7 +135,8 @@ pub(super) async fn advance(
             let endpoint = format!(
                 "merge_requests?scope={scope}&state=opened&per_page={PAGE_SIZE}&page={page_number}"
             );
-            let page = match request(
+            let page = match request_bounded(
+                context,
                 program,
                 &source.host,
                 &endpoint,
@@ -215,7 +236,8 @@ pub(super) async fn advance(
     {
         let endpoint =
             format!("merge_requests?scope={scope}&state=opened&per_page={PAGE_SIZE}&page=1");
-        if let Ok(page) = request(
+        if let Ok(page) = request_bounded(
+            context,
             program,
             &source.host,
             &endpoint,
@@ -243,6 +265,7 @@ pub(super) async fn advance(
     removals.retain(|id| !mrs.iter().any(|r| &r.identity() == id));
     let total = state.total;
     Ok(FetchedList {
+        session: None,
         viewer: Some(owner.into()),
         mrs,
         total,
@@ -520,4 +543,16 @@ mod tests {
         })
         .await;
     }
+}
+
+async fn request_bounded(
+    context: &super::super::transport::Context,
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    budget: Duration,
+) -> Result<Page, QueueError> {
+    let mut context = context.clone();
+    context.deadline = context.deadline.min(tokio::time::Instant::now() + budget);
+    super::request_context(program, host, endpoint, &context).await
 }

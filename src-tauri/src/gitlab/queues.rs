@@ -9,7 +9,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 const PAGE_SIZE: usize = 100;
 #[cfg(test)]
@@ -80,11 +80,34 @@ impl MergeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedList {
+    pub(crate) session: Option<super::process_session::Token>,
     pub scan: Option<crate::queue_scan::Commit>,
     pub viewer: Option<String>,
     pub mrs: Vec<MergeRequest>,
     pub total: Option<u64>,
     pub coverage: Coverage,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn verified_test_session(
+    program: &std::path::Path,
+    host: &str,
+) -> super::process_session::Token {
+    super::test_support::scripted(program, async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let context = super::transport::Context::new(
+            program,
+            host,
+            super::transport::Class::Foreground,
+            deadline,
+        );
+        super::transport::api(program, host, "user", "GET", None, &context)
+            .await
+            .unwrap();
+        super::transport::Context::new(program, host, super::transport::Class::Foreground, deadline)
+            .token()
+    })
+    .await
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -137,29 +160,46 @@ pub async fn fetch<F: std::future::Future<Output = bool>>(
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<FetchedList, QueueError>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
-    let viewer = tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
+    let initial = super::transport::Context::new(
+        &program,
+        &source.host,
+        super::transport::Class::Background,
+        deadline,
+    );
+    let (viewer, context) = super::auth::viewer_with_context(&program, &source.host, &initial)
         .await
-        .map_err(|_| QueueError::Timeout)?
-        .map_err(|_| QueueError::Unauthorized)?;
+        .map_err(|issue| {
+            if issue == super::detail::DetailIssue::Timeout {
+                QueueError::Timeout
+            } else {
+                QueueError::Unauthorized
+            }
+        })?;
     let key = format!(
-        "{}:{viewer}:{list:?}:{}",
+        "{program:?}:{}:{}:{viewer}:{list:?}:{}",
+        context.generation,
         source.host,
         GENERATION.load(std::sync::atomic::Ordering::Acquire)
     );
     READS
-        .run(key, async {
-            let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
-            let path = db_path.to_path_buf();
-            let owned_source = source.clone();
-            let owner = viewer.clone();
-            let (loaded, previous) = tauri::async_runtime::spawn_blocking(
-                move || -> Result<_, crate::store::StoreError> {
-                    let conn = crate::store::open_db(&path)?;
-                    let conn = conn.unchecked_transaction()?;
-                    let loaded = crate::queue_scan::load(&conn, &owned_source, list, &owner)?;
-                    let rows =
-                        if crate::store::source_cache::snapshot_owner(&conn, &owned_source, list)?
-                            .as_deref()
+        .run_until(
+            key,
+            async {
+                let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
+                let path = db_path.to_path_buf();
+                let owned_source = source.clone();
+                let owner = viewer.clone();
+                let (loaded, previous) = tauri::async_runtime::spawn_blocking(
+                    move || -> Result<_, crate::store::StoreError> {
+                        let conn = crate::store::open_db(&path)?;
+                        let conn = conn.unchecked_transaction()?;
+                        let loaded = crate::queue_scan::load(&conn, &owned_source, list, &owner)?;
+                        let rows = if crate::store::source_cache::snapshot_owner(
+                            &conn,
+                            &owned_source,
+                            list,
+                        )?
+                        .as_deref()
                             == Some(&owner)
                         {
                             match crate::store::source_cache::load_source_snapshot(
@@ -178,67 +218,84 @@ pub async fn fetch<F: std::future::Future<Output = bool>>(
                         } else {
                             vec![]
                         };
-                    Ok((loaded, rows))
-                },
-            )
-            .await
-            .map_err(|_| QueueError::Request)?
-            .map_err(|_| QueueError::Request)?;
-            let mut result = scan::advance(
-                &program,
-                scan::Target {
-                    source,
-                    list,
-                    owner: &viewer,
-                },
-                loaded,
-                &previous,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                Utc::now().timestamp(),
-            )
-            .await?;
-            result.viewer = Some(viewer.clone());
-            for row in &mut result.mrs {
-                row.viewer = Some(viewer.clone());
-            }
-            if tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
+                        Ok((loaded, rows))
+                    },
+                )
                 .await
-                .map_err(|_| QueueError::Timeout)?
-                .map_err(|_| QueueError::Unauthorized)?
-                != viewer
-            {
-                return Err(QueueError::Unauthorized);
-            }
-            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(QueueError::Request);
-            }
-            super::enrichment::fill_cached(&mut result.mrs, generation);
-            if progress(result.clone()).await {
-                if let Some(scan) = result.scan.as_mut() {
-                    scan.expected_revision += 1;
+                .map_err(|_| QueueError::Request)?
+                .map_err(|_| QueueError::Request)?;
+                let mut result = scan::advance_context(
+                    &context,
+                    &program,
+                    scan::Target {
+                        source,
+                        list,
+                        owner: &viewer,
+                    },
+                    loaded,
+                    &previous,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    Utc::now().timestamp(),
+                )
+                .await?;
+                result.session = Some(context.token());
+                result.viewer = Some(viewer.clone());
+                for row in &mut result.mrs {
+                    row.viewer = Some(viewer.clone());
                 }
-            }
-            super::enrichment::enrich(
-                &program,
-                &mut result.mrs,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                generation,
-            )
-            .await;
-            if tokio::time::timeout_at(deadline, super::auth::viewer(&program, &source.host))
+                if tokio::time::timeout_at(
+                    deadline,
+                    super::auth::viewer_context(&program, &source.host, &context),
+                )
                 .await
                 .map_err(|_| QueueError::Timeout)?
                 .map_err(|_| QueueError::Unauthorized)?
-                != viewer
-            {
-                return Err(QueueError::Unauthorized);
-            }
-            if generation != GENERATION.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(QueueError::Request);
-            }
-            Ok(result)
-        })
+                    != viewer
+                {
+                    return Err(QueueError::Unauthorized);
+                }
+                if !context.current()
+                    || generation != GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(QueueError::Request);
+                }
+                super::enrichment::fill_cached(&program, &mut result.mrs, generation);
+                if progress(result.clone()).await {
+                    if let Some(scan) = result.scan.as_mut() {
+                        scan.expected_revision += 1;
+                    }
+                }
+                super::enrichment::enrich_owned(
+                    &context,
+                    &program,
+                    &mut result.mrs,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    generation,
+                )
+                .await;
+                if tokio::time::timeout_at(
+                    deadline,
+                    super::auth::viewer_context(&program, &source.host, &context),
+                )
+                .await
+                .map_err(|_| QueueError::Timeout)?
+                .map_err(|_| QueueError::Unauthorized)?
+                    != viewer
+                {
+                    return Err(QueueError::Unauthorized);
+                }
+                if !context.current()
+                    || generation != GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(QueueError::Request);
+                }
+                Ok(result)
+            },
+            Result::is_ok,
+            deadline,
+        )
         .await
+        .map_err(|_| QueueError::Timeout)?
 }
 
 #[cfg(test)]
@@ -340,6 +397,7 @@ async fn fetch_with_program(
         Coverage::Unknown
     };
     Ok(FetchedList {
+        session: None,
         scan: None,
         viewer: None,
         mrs,
@@ -348,27 +406,35 @@ async fn fetch_with_program(
     })
 }
 
+#[cfg(test)]
 async fn request(
     program: &Path,
     host: &str,
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Page, QueueError> {
-    let mut command =
-        super::host::constrained_command(program, host).map_err(|_| QueueError::UnsupportedHost)?;
-    command
-        .args(["api", "--hostname", host, "-i", endpoint])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let (raw, status) = tokio::time::timeout(timeout, super::transport::output(&mut command))
+    let context = super::transport::Context::new(
+        program,
+        host,
+        super::transport::Class::Background,
+        tokio::time::Instant::now() + timeout,
+    );
+    request_context(program, host, endpoint, &context).await
+}
+async fn request_context(
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    context: &super::transport::Context,
+) -> Result<Page, QueueError> {
+    let response = super::transport::api(program, host, endpoint, "GET", None, context)
         .await
-        .map_err(|_| QueueError::Timeout)?
-        .map_err(|error| match error {
-            super::transport::Error::TooLarge => QueueError::InvalidPage,
-            super::transport::Error::Io => QueueError::Request,
+        .map_err(|failure| match failure.issue {
+            super::detail::DetailIssue::Timeout => QueueError::Timeout,
+            super::detail::DetailIssue::InvalidResponse => QueueError::InvalidPage,
+            _ => QueueError::Request,
         })?;
-    parse_page(&raw, status.success())
+    parse_page(&response.bytes(), true)
 }
 
 fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {

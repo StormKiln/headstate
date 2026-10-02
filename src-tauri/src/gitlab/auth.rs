@@ -3,7 +3,6 @@
 
 use serde::Serialize;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 pub const HOST: &str = super::host::DEFAULT;
@@ -104,40 +103,27 @@ pub async fn check_host(host: &str) -> AuthState {
     let Some(glab) = find_glab() else {
         return AuthState::failed(&host, AuthIssue::MissingCli);
     };
-    let mut state = check_with_program(&glab, &host, PROBE_TIMEOUT).await;
-    if state.ok {
-        match viewer(&glab, &host).await {
-            Ok(viewer) => state.viewer = Some(viewer),
-            Err(_) => return AuthState::failed(&host, AuthIssue::Unverified),
-        }
-    }
-    state
+    check_with_program(&glab, &host, PROBE_TIMEOUT).await
 }
 
 async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duration) -> AuthState {
-    let mut command =
-        super::host::constrained_command(glab, host).expect("host validated by check_host");
-    command
-        .args(["auth", "status", "--hostname", host])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(timeout, command.status()).await {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(_) => return AuthState::failed(host, AuthIssue::Unverified),
-        Err(_) => return AuthState::failed(host, AuthIssue::TimedOut),
-    }
-    let mut command =
-        super::host::constrained_command(glab, host).expect("host validated by check_host");
-    command
-        .args(["api", "--hostname", host, "version"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(timeout, command.status()).await {
-        Ok(Ok(status)) if status.success() => AuthState::ready(host),
-        Ok(_) => AuthState::failed(host, AuthIssue::ApiUnavailable),
-        Err(_) => AuthState::failed(host, AuthIssue::TimedOut),
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context =
+        super::transport::Context::new(glab, host, super::transport::Class::Foreground, deadline);
+    let (viewer, context) = match viewer_with_context(glab, host, &context).await {
+        Ok(identity) => identity,
+        Err(super::detail::DetailIssue::Timeout) => {
+            return AuthState::failed(host, AuthIssue::TimedOut)
+        }
+        Err(_) => return AuthState::failed(host, AuthIssue::Unverified),
+    };
+    match super::detail::request_json_context(glab, host, "version", "GET", None, &context).await {
+        Ok(_) => {
+            let mut state = AuthState::ready(host);
+            state.viewer = Some(viewer);
+            state
+        }
+        Err(_) => AuthState::failed(host, AuthIssue::ApiUnavailable),
     }
 }
 
@@ -147,26 +133,147 @@ pub async fn viewer(
     program: &std::path::Path,
     host: &str,
 ) -> Result<String, super::detail::DetailIssue> {
-    use std::sync::LazyLock;
-    static READS: LazyLock<super::coalesce::Reads<Result<String, super::detail::DetailIssue>>> =
-        LazyLock::new(super::coalesce::Reads::default);
-    READS
-        .run(format!("{program:?}:{host}"), async {
-            let response =
-                super::detail::request_json(program, host, "user", "GET", None, PROBE_TIMEOUT)
-                    .await?;
-            response.body["username"]
-                .as_str()
-                .filter(|name| !name.is_empty() && name.len() <= 255)
-                .map(str::to_owned)
-                .ok_or(super::detail::DetailIssue::InvalidResponse)
-        })
+    let context = super::transport::Context::new(
+        program,
+        host,
+        super::transport::Class::Foreground,
+        tokio::time::Instant::now() + PROBE_TIMEOUT,
+    );
+    viewer_context(program, host, &context).await
+}
+
+pub(super) async fn viewer_context(
+    program: &std::path::Path,
+    host: &str,
+    context: &super::transport::Context,
+) -> Result<String, super::detail::DetailIssue> {
+    let body = identity_context(program, host, context).await?;
+    body["username"]
+        .as_str()
+        .filter(|name| !name.is_empty() && name.len() <= 255)
+        .map(str::to_owned)
+        .ok_or(super::detail::DetailIssue::InvalidResponse)
+}
+
+pub(super) async fn identity_context(
+    program: &std::path::Path,
+    host: &str,
+    context: &super::transport::Context,
+) -> Result<serde_json::Value, super::detail::DetailIssue> {
+    verified_identity(program, host, context)
         .await
+        .map(|(body, _)| body)
+}
+pub(super) async fn viewer_with_context(
+    program: &std::path::Path,
+    host: &str,
+    context: &super::transport::Context,
+) -> Result<(String, super::transport::Context), super::detail::DetailIssue> {
+    let (body, context) = verified_identity(program, host, context).await?;
+    let viewer = body["username"]
+        .as_str()
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or(super::detail::DetailIssue::InvalidResponse)?
+        .to_owned();
+    Ok((viewer, context))
+}
+pub(super) async fn verified_identity(
+    program: &std::path::Path,
+    host: &str,
+    context: &super::transport::Context,
+) -> Result<(serde_json::Value, super::transport::Context), super::detail::DetailIssue> {
+    use std::sync::LazyLock;
+    type Identity = (serde_json::Value, super::process_session::Token);
+    static READS: LazyLock<super::coalesce::Reads<Result<Identity, super::detail::DetailIssue>>> =
+        LazyLock::new(super::coalesce::Reads::default);
+    let (body, token) = tokio::time::timeout_at(
+        context.deadline,
+        READS.run_checked(
+            format!("{program:?}:{host}:{}", context.generation),
+            async {
+                let response = super::transport::api(program, host, "user", "GET", None, context)
+                    .await
+                    .map_err(|e| e.issue)?;
+                if !(200..300).contains(&response.status) {
+                    return Err(match response.status {
+                        401 => super::detail::DetailIssue::Unauthorized,
+                        403 => super::detail::DetailIssue::Forbidden,
+                        429 => super::detail::DetailIssue::RateLimited,
+                        _ => super::detail::DetailIssue::Request,
+                    });
+                }
+                Ok((
+                    response.body,
+                    response
+                        .session
+                        .ok_or(super::detail::DetailIssue::InvalidResponse)?,
+                ))
+            },
+            Result::is_ok,
+        ),
+    )
+    .await
+    .map_err(|_| super::detail::DetailIssue::Timeout)??;
+    // A follower keeps its own class, deadline and allowance, never the leader's.
+    let captured = context.with_token(token);
+    if !captured.current() {
+        return Err(super::detail::DetailIssue::Unauthorized);
+    }
+    Ok((body, captured))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_handoff_keeps_response_generation_and_original_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+echo call >> "$0.calls"
+id=1; test ! -f "$0.other" || id=2
+printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::test_support::scripted(&program, async {
+            let host = "identity-fixture.example";
+            let initial = super::super::transport::Context::new(
+                &program,
+                host,
+                super::super::transport::Class::Background,
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            );
+            let (old_body, old) = verified_identity(&program, host, &initial).await.unwrap();
+            assert_eq!(old_body["id"], 1);
+            assert_eq!(old.deadline, initial.deadline);
+            assert_eq!(old.class, initial.class);
+            std::fs::write(program.with_extension("other"), "").unwrap();
+            let (new_body, new) = verified_identity(&program, host, &initial).await.unwrap();
+            assert_eq!(new_body["id"], 2);
+            assert_ne!(old.generation, new.generation);
+            assert_eq!(new.deadline, initial.deadline);
+            let refused =
+                super::super::transport::api(&program, host, "projects", "GET", None, &old)
+                    .await
+                    .unwrap_err();
+            assert!(!refused.dispatched);
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        })
+        .await;
+    }
 
     #[test]
     fn every_failure_is_static_and_contains_no_cli_output() {
@@ -207,9 +314,12 @@ mod tests {
     #[tokio::test]
     async fn host_is_explicit_and_cli_output_never_crosses_the_wire() {
         let state = fake_glab(
-            "case \"$1 $2 $3 $4\" in \"auth status --hostname gitlab.com\"|\"api --hostname gitlab.com version\") printf SENSITIVE; printf SENSITIVE >&2;; *) exit 2;; esac",
+            r#"test "$1 $2 $3 $4" = "api --hostname gitlab.com -i" || exit 2
+printf SENSITIVE >&2
+printf 'HTTP/2 200\n\n{"username":"octocat","diagnostic":"SENSITIVE"}'"#,
             Duration::from_secs(1),
-        ).await;
+        )
+        .await;
         assert!(state.ok);
         assert!(!serde_json::to_string(&state).unwrap().contains("SENSITIVE"));
     }
@@ -237,7 +347,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_auth_without_api_is_not_ready() {
-        let state = fake_glab("test \"$1\" = auth", Duration::from_secs(1)).await;
+        let state = fake_glab(
+            r#"test "$5" = user || exit 1; printf 'HTTP/2 200\n\n{"username":"octocat"}'"#,
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(state.issue, Some(AuthIssue::ApiUnavailable));
     }
 
@@ -245,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn configured_host_is_passed_to_both_probes() {
         let state = fake_glab_for(
-            "case \"$1 $2 $3 $4\" in \"auth status --hostname gitlab.example\"|\"api --hostname gitlab.example version\") exit 0;; *) exit 2;; esac",
+            r#"test "$1 $2 $3 $4" = "api --hostname gitlab.example -i" || exit 2; printf 'HTTP/2 200\n\n{"username":"octocat"}'"#,
             "gitlab.example",
             Duration::from_secs(1),
         ).await;

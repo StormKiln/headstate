@@ -10950,7 +10950,8 @@ pub async fn gitlab_action(
     app: AppHandle,
     request: crate::gitlab::actions::ActionRequest,
 ) -> Result<crate::gitlab::actions::Receipt, String> {
-    require_gitlab_host(&app, &request.identity.source.host)?;
+    require_gitlab_host(&app, &request.identity.source.host)
+        .map_err(|message| format!("{NOT_ASKED} {message}"))?;
     crate::gitlab::poll::after_mutation(
         async {
             let result = crate::gitlab::actions::execute(&request).await;

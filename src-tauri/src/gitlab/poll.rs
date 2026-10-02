@@ -246,14 +246,20 @@ async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &Fe
             let receipt = result.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let conn = open_db(&dir.join("headstate.db"))?;
-                crate::store::source_cache::save_owned_gitlab_snapshot(
-                    &conn,
-                    &source,
-                    list,
-                    &receipt.mrs,
-                    &receipt.coverage,
-                    receipt.viewer.as_deref(),
-                )
+                let save = || {
+                    crate::store::source_cache::save_owned_gitlab_snapshot(
+                        &conn,
+                        &source,
+                        list,
+                        &receipt.mrs,
+                        &receipt.coverage,
+                        receipt.viewer.as_deref(),
+                    )
+                };
+                match &receipt.session {
+                    Some(owner) => owner.with_current(save).unwrap_or(Ok(())),
+                    None => save(),
+                }
             })
             .await
             .is_ok_and(|result| result.is_ok())
@@ -352,10 +358,17 @@ async fn poll_queue(
     else {
         return;
     };
-    if control.is_current(selection) {
-        for notice in baseline.observe(source, list, &receipt) {
-            notify(app, notice, &prefs);
+    let mut publish_notices = || {
+        if control.is_current(selection) {
+            for notice in baseline.observe(source, list, &receipt) {
+                notify(app, notice, &prefs);
+            }
         }
+    };
+    if let Some(session) = &receipt.session {
+        session.with_current(publish_notices);
+    } else {
+        publish_notices();
     }
     // The permit holds until both the persisted receipt and terminal
     // event are published. Newer foreground successes win atomically.
@@ -443,6 +456,7 @@ mod tests {
 
     fn receipt(mrs: Vec<MergeRequest>, coverage: Coverage) -> FetchedList {
         FetchedList {
+            session: None,
             scan: None,
             viewer: Some("fixture-account".into()),
             total: matches!(coverage, Coverage::Complete).then_some(mrs.len() as u64),

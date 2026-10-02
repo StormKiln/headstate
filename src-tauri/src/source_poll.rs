@@ -244,20 +244,28 @@ impl SourcePolls {
         result: Result<crate::gitlab::queues::FetchedList, Failure>,
         emit: impl FnOnce(Status),
     ) {
-        let attempt = &publication.attempt;
-        let status_result = match result {
-            Ok(result) => {
-                let coverage = result.coverage.clone();
-                self.4.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    (attempt.source.clone(), attempt.list),
-                    (attempt.generation, result),
-                );
-                Ok(coverage)
+        let session = result.as_ref().ok().and_then(|r| r.session.clone());
+        let complete = || {
+            let attempt = &publication.attempt;
+            let status_result = match result {
+                Ok(result) => {
+                    let coverage = result.coverage.clone();
+                    self.4.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        (attempt.source.clone(), attempt.list),
+                        (attempt.generation, result),
+                    );
+                    Ok(coverage)
+                }
+                Err(error) => Err(error),
+            };
+            if let Some(status) = self.finish(attempt, status_result) {
+                emit(status);
             }
-            Err(error) => Err(error),
         };
-        if let Some(status) = self.finish(attempt, status_result) {
-            emit(status);
+        if let Some(session) = session {
+            session.with_current(complete);
+        } else {
+            complete();
         }
     }
     fn winner(
@@ -709,6 +717,24 @@ fn reconcile_gitlab_snapshot(
     conn: &rusqlite::Connection,
     source: &Source,
     list: CachedList,
+    result: crate::gitlab::queues::FetchedList,
+    previous: Option<crate::gitlab::queues::FetchedList>,
+) -> Result<crate::gitlab::queues::FetchedList, Failure> {
+    let session = result.session.clone();
+    let reconcile = || reconcile_gitlab_snapshot_current(conn, source, list, result, previous);
+    match session {
+        Some(owner) => owner.with_current(reconcile).unwrap_or_else(|| {
+            Err(inventory_failure(
+                "The GitLab account changed before publication.",
+            ))
+        }),
+        None => reconcile(),
+    }
+}
+fn reconcile_gitlab_snapshot_current(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
     mut result: crate::gitlab::queues::FetchedList,
     previous: Option<crate::gitlab::queues::FetchedList>,
 ) -> Result<crate::gitlab::queues::FetchedList, Failure> {
@@ -1026,6 +1052,9 @@ pub async fn record_gitlab_action(
     if action.outcome != crate::gitlab::actions::Outcome::Verified {
         return;
     }
+    let Some(session) = action.session.as_ref() else {
+        return;
+    };
     let Some(viewer) = request.expected_viewer.as_ref().filter(|v| !v.is_empty()) else {
         return;
     };
@@ -1074,6 +1103,7 @@ pub async fn record_gitlab_action(
                 continue;
             };
             crate::gitlab::queues::FetchedList {
+                session: None,
                 scan: None,
                 viewer: Some(viewer.clone()),
                 mrs,
@@ -1084,50 +1114,59 @@ pub async fn record_gitlab_action(
         if !crate::inventory::apply_gitlab_action(&mut receipt.mrs, request, action) {
             continue;
         }
-        let generation = polls.effect_generation(source, list);
+        receipt.session = Some(session.clone());
         let path = crate::commands::db_path(app);
         let saved_source = source.clone();
         let saved = receipt.clone();
+        let saved_session = session.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
-            let conn = crate::store::open_db(&path)?;
-            let tx = conn.unchecked_transaction()?;
-            crate::store::source_cache::save_owned_gitlab_snapshot(
-                &tx,
-                &saved_source,
-                list,
-                &saved.mrs,
-                &saved.coverage,
-                saved.viewer.as_deref(),
-            )?;
-            crate::queue_scan::taint(
-                &tx,
-                &saved_source,
-                list,
-                saved.viewer.as_deref().unwrap_or_default(),
-            )?;
-            tx.commit()?;
-            Ok::<_, crate::store::StoreError>(())
+            saved_session.with_current(|| {
+                let conn = crate::store::open_db(&path)?;
+                let tx = conn.unchecked_transaction()?;
+                crate::store::source_cache::save_owned_gitlab_snapshot(
+                    &tx,
+                    &saved_source,
+                    list,
+                    &saved.mrs,
+                    &saved.coverage,
+                    saved.viewer.as_deref(),
+                )?;
+                crate::queue_scan::taint(
+                    &tx,
+                    &saved_source,
+                    list,
+                    saved.viewer.as_deref().unwrap_or_default(),
+                )?;
+                tx.commit()?;
+                Ok::<_, crate::store::StoreError>(())
+            })
         })
         .await;
-        if !matches!(persisted, Ok(Ok(()))) {
+        if matches!(persisted, Ok(None)) {
+            continue;
+        }
+        if !matches!(persisted, Ok(Some(Ok(())))) {
             let _ = app.emit(
                 "store-error",
                 "The confirmed action could not be saved for offline use.",
             );
         }
-        polls
-            .4
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((source.clone(), list), (generation, receipt.clone()));
-        let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
-            status.revision += 1;
-            status.receipt_revision = Some(status.revision);
-            status.coverage = Some(receipt.coverage);
-            status.phase = Phase::Unknown;
-            let _ = app.emit("source-poll-status", polls.update(status.clone(), None));
-        }
+        session.with_current(|| {
+            let generation = polls.effect_generation(source, list);
+            polls
+                .4
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((source.clone(), list), (generation, receipt.clone()));
+            let mut entries = polls.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, status)) = entries.get_mut(&(source.clone(), list)) {
+                status.revision += 1;
+                status.receipt_revision = Some(status.revision);
+                status.coverage = Some(receipt.coverage);
+                status.phase = Phase::Unknown;
+                let _ = app.emit("source-poll-status", polls.update(status.clone(), None));
+            }
+        });
     }
 }
 
@@ -1352,6 +1391,7 @@ mod tests {
         polls.complete_gitlab(
             published,
             Ok(crate::gitlab::queues::FetchedList {
+                session: None,
                 scan: None,
                 viewer: None,
                 mrs: vec![gitlab_mr(&source)],
@@ -1432,6 +1472,7 @@ mod tests {
             .winner_gitlab(
                 &authored,
                 Ok(crate::gitlab::queues::FetchedList {
+                    session: None,
                     scan: None,
                     viewer: None,
                     mrs: vec![],
@@ -1467,6 +1508,7 @@ mod tests {
             .await;
         let (foreground, _) = polls.begin_attempt(source, CachedList::Authored).await;
         let receipt = crate::gitlab::queues::FetchedList {
+            session: None,
             scan: None,
             viewer: None,
             mrs: vec![],
@@ -1497,6 +1539,7 @@ mod tests {
             .begin_attempt(source.clone(), CachedList::Authored)
             .await;
         let receipt = crate::gitlab::queues::FetchedList {
+            session: None,
             scan: None,
             viewer: None,
             mrs: vec![gitlab_mr(&source)],
@@ -1943,6 +1986,58 @@ mod tests {
             !crate::queue_scan::accepted(&conn, &source, list, "fixture", &wrong_query).unwrap()
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitlab_owner_rotation_while_publication_waits_refuses_persist_and_emit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+id=1; test ! -f "$0.other" || id=2
+printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "publication-fixture.example".into(),
+        };
+        let list = CachedList::Reviewing;
+        let old = crate::gitlab::queues::verified_test_session(&program, &source.host).await;
+        let receipt = crate::gitlab::queues::FetchedList {
+            session: Some(old),
+            scan: None,
+            viewer: Some("fixture".into()),
+            mrs: vec![gitlab_mr(&source)],
+            total: Some(1),
+            coverage: Coverage::Complete,
+        };
+        let polls = SourcePolls::default();
+        let (attempt, _) = polls.begin_attempt(source.clone(), list).await;
+        let held = polls.gate(&source, list).lock_owned().await;
+        let waiting = polls.success_publication(&attempt);
+        tokio::pin!(waiting);
+        tokio::select! { biased; _ = &mut waiting => panic!("publication bypassed held gate"), _ = tokio::task::yield_now() => {} }
+        std::fs::write(program.with_extension("other"), "").unwrap();
+        crate::gitlab::queues::verified_test_session(&program, &source.host).await;
+        drop(held);
+        let publication = waiting.await.unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        assert!(reconcile_gitlab_snapshot(&conn, &source, list, receipt.clone(), None).is_err());
+        assert_eq!(
+            crate::store::source_cache::snapshot_owner(&conn, &source, list).unwrap(),
+            None
+        );
+        let mut emitted = false;
+        polls.complete_gitlab(publication, Ok(receipt), |_| emitted = true);
+        assert!(!emitted);
+        assert!(!polls.4.lock().unwrap().contains_key(&(source, list)));
+    }
+
     #[test]
     fn gitlab_progress_and_enrichment_commit_separately_and_duplicates_reuse_exact_rows() {
         use crate::queue_scan::{Commit, State};
@@ -1957,6 +2052,7 @@ mod tests {
         mr.viewer = Some("fixture".into());
         mr.head_oid = Some("head".into());
         let progress = crate::gitlab::queues::FetchedList {
+            session: None,
             viewer: Some("fixture".into()),
             mrs: vec![mr],
             total: Some(2),

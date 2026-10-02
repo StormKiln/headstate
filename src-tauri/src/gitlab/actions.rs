@@ -83,6 +83,8 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Receipt {
+    #[serde(skip)]
+    pub(crate) session: Option<super::process_session::Token>,
     pub identity: PrIdentity,
     pub action: Action,
     pub outcome: Outcome,
@@ -100,6 +102,7 @@ struct Session<'a> {
     program: &'a Path,
     identity: &'a PrIdentity,
     start: tokio::time::Instant,
+    context: super::transport::Context,
 }
 
 impl Session<'_> {
@@ -117,17 +120,34 @@ impl Session<'_> {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, DetailIssue> {
+        self.request_tracked(method, path, body)
+            .await
+            .map_err(|e| e.issue)
+    }
+    async fn request_tracked(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, super::transport::Failure> {
         let timeout = BUDGET
             .checked_sub(self.start.elapsed())
             .filter(|d| !d.is_zero())
-            .ok_or(DetailIssue::BudgetExhausted)?;
-        detail::request_json(
+            .ok_or(super::transport::Failure {
+                issue: DetailIssue::BudgetExhausted,
+                dispatched: false,
+            })?;
+        let mut context = self.context.clone();
+        context.deadline = context
+            .deadline
+            .min(tokio::time::Instant::now() + timeout.min(REQUEST_TIMEOUT));
+        detail::request_json_context(
             self.program,
             &self.identity.source.host,
             path,
             method,
             body,
-            timeout.min(REQUEST_TIMEOUT),
+            &context,
         )
         .await
         .map(|r| r.body)
@@ -430,27 +450,47 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
 pub async fn capabilities(identity: &PrIdentity) -> Result<Capabilities, String> {
     detail::validate_identity(identity).map_err(read_error)?;
     let program = super::auth::find_glab().ok_or_else(|| read_error(DetailIssue::MissingCli))?;
-    let session = Session {
+    let mut session = Session {
         program: &program,
         identity,
+        context: super::transport::Context::new(
+            &program,
+            &identity.source.host,
+            super::transport::Class::Foreground,
+            tokio::time::Instant::now() + BUDGET,
+        ),
         start: tokio::time::Instant::now(),
     };
-    let viewer = super::auth::viewer(&program, &identity.source.host)
-        .await
-        .map_err(read_error)?;
+    let (viewer, context) =
+        super::auth::viewer_with_context(&program, &identity.source.host, &session.context)
+            .await
+            .map_err(read_error)?;
+    session.context = context;
     static READS: std::sync::LazyLock<super::coalesce::Reads<Result<Capabilities, String>>> =
         std::sync::LazyLock::new(super::coalesce::Reads::default);
-    let key = serde_json::to_string(&(identity, &viewer, super::queues::generation()))
-        .expect("serializable identity");
+    let key = serde_json::to_string(&(
+        identity,
+        &viewer,
+        &program,
+        session.context.generation,
+        super::queues::generation(),
+    ))
+    .expect("serializable identity");
     READS
-        .run(key, async {
-            let capabilities = session.context().await.map_err(read_error)?.capabilities;
-            if capabilities.viewer.as_ref() != Some(&viewer) {
-                return Err("GitLab account changed while checking actions.".into());
-            }
-            Ok(capabilities)
-        })
+        .run_until(
+            key,
+            async {
+                let capabilities = session.context().await.map_err(read_error)?.capabilities;
+                if capabilities.viewer.as_ref() != Some(&viewer) || !session.context.current() {
+                    return Err("GitLab account changed while checking actions.".into());
+                }
+                Ok(capabilities)
+            },
+            Result::is_ok,
+            session.context.deadline,
+        )
         .await
+        .map_err(|_| read_error(DetailIssue::Timeout))?
 }
 
 fn read_error(issue: DetailIssue) -> String {
@@ -458,9 +498,14 @@ fn read_error(issue: DetailIssue) -> String {
 }
 
 pub async fn execute(request: &ActionRequest) -> Result<Receipt, String> {
-    detail::validate_identity(&request.identity).map_err(read_error)?;
-    let program = super::auth::find_glab().ok_or_else(|| read_error(DetailIssue::MissingCli))?;
-    execute_with_program(&program, request).await
+    async {
+        detail::validate_identity(&request.identity).map_err(read_error)?;
+        let program =
+            super::auth::find_glab().ok_or_else(|| read_error(DetailIssue::MissingCli))?;
+        execute_with_program(&program, request).await
+    }
+    .await
+    .map_err(|message| format!("{} {message}", crate::commands::NOT_ASKED))
 }
 
 async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result<Receipt, String> {
@@ -468,6 +513,12 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
     let session = Session {
         program,
         identity: &request.identity,
+        context: super::transport::Context::new(
+            program,
+            &request.identity.source.host,
+            super::transport::Class::Foreground,
+            tokio::time::Instant::now() + BUDGET,
+        ),
         start: tokio::time::Instant::now(),
     };
     let context = session.context().await.map_err(read_error)?;
@@ -504,7 +555,7 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
         }
     }
     let response = session
-        .request(write.method, &write.path, Some(write.body))
+        .request_tracked(write.method, &write.path, Some(write.body))
         .await;
     let verified = match response {
         Ok(response) => verify(
@@ -516,9 +567,10 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
         )
         .await
         .unwrap_or(false),
+        Err(failure) if !failure.dispatched => return Err("The GitLab action was not dispatched: admission, identity or its deadline prevented the request.".into()),
         Err(_) => false,
     };
-    Ok(Receipt { identity: request.identity.clone(), action: request.action,
+    Ok(Receipt { session: Some(session.context.token()), identity: request.identity.clone(), action: request.action,
         outcome: if verified { Outcome::Verified } else { Outcome::Unverified },
         message: if verified && request.action == Action::RetryCi {
             "At least one failed or canceled CI job has a new attempt. Refresh GitLab to check the other jobs."
@@ -1190,6 +1242,11 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             .await
             .unwrap();
         assert_eq!(receipt.outcome, outcome);
+        assert!(receipt.session.is_some());
+        assert!(serde_json::to_value(&receipt)
+            .unwrap()
+            .get("session")
+            .is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
             steps.len().to_string()
@@ -1372,6 +1429,12 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         let session = Session {
             program: Path::new("/program-must-not-run"),
             identity: &identity,
+            context: crate::gitlab::transport::Context::new(
+                Path::new("/program-must-not-run"),
+                &identity.source.host,
+                crate::gitlab::transport::Class::Foreground,
+                tokio::time::Instant::now() + BUDGET,
+            ),
             start: tokio::time::Instant::now() - BUDGET,
         };
         assert_eq!(
@@ -1565,6 +1628,12 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         let session = Session {
             program: &program,
             identity: &identity,
+            context: crate::gitlab::transport::Context::new(
+                &program,
+                &identity.source.host,
+                crate::gitlab::transport::Class::Foreground,
+                tokio::time::Instant::now() + BUDGET,
+            ),
             start: tokio::time::Instant::now(),
         };
         let context = session.context().await.unwrap();

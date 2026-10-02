@@ -56,7 +56,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     staleTime: 60_000,
     refetchInterval: selection === "github" ? false : 60_000,
     retry: false,
-    enabled: gitlabHost.isSuccess || gitlabHost.isError,
+    enabled: selection !== "github" && (gitlabHost.isSuccess || gitlabHost.isError),
   });
   const pollError = usePollError();
   // Classified ONCE (#1230). Three call sites used to ask `isNotAsked`
