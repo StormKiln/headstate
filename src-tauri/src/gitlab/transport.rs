@@ -1,15 +1,15 @@
 //! Shared streaming bound for credential-owning CLI reads. Diagnostics are
 //! discarded, so stderr cannot retain credentials or grow with a failed call.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::ExitStatus;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use tokio::process::Command;
 
 // Fixtures use distinct executables, so their semaphore state cannot interfere
 // across runtimes. Real callers share the resolved glab executable's budget.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn acquire_for(program: &std::ffi::OsStr) -> tokio::sync::OwnedSemaphorePermit {
     use std::sync::{Arc, LazyLock, Mutex, Weak};
     static LIMITS: LazyLock<
@@ -33,18 +33,15 @@ async fn acquire_for(program: &std::ffi::OsStr) -> tokio::sync::OwnedSemaphorePe
 }
 pub const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug)]
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub enum Error {
     Io,
     TooLarge,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub async fn output(command: &mut Command) -> Result<(Vec<u8>, ExitStatus), Error> {
-    #[cfg(all(test, unix))]
     let program = super::test_support::budget_program(command.as_std());
-    #[cfg(not(all(test, unix)))]
-    let program = command.as_std().get_program();
     let _permit = acquire_for(program).await;
     let mut child = command
         .stdout(Stdio::piped())

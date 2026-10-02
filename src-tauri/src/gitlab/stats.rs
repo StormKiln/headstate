@@ -309,7 +309,7 @@ fn parse(raw: &[u8], success: bool) -> Result<Response, RequestFailure> {
     }
     Ok(out)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn request(
     program: &Path,
     host: &str,
@@ -379,7 +379,7 @@ async fn pages_context(
 ) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     pages_limited_context(context, program, host, base, budget, MAX_PAGES).await
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn pages(
     program: &Path,
     host: &str,
@@ -388,7 +388,7 @@ async fn pages(
 ) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     pages_limited(program, host, base, budget, MAX_PAGES).await
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn pages_limited(
     program: &Path,
     host: &str,
@@ -553,7 +553,7 @@ async fn tree_with_program(program: &Path, host: &str) -> Result<Tree, String> {
     Ok(tree)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn discover_tree(
     program: &Path,
     source: Source,
@@ -943,7 +943,7 @@ async fn load_with_program(
     Ok(report)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn load_window(
     program: &Path,
     source: Source,

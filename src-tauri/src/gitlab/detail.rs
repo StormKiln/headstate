@@ -222,7 +222,7 @@ pub(super) fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn fetch_with_program(
     program: &Path,
     identity: &PrIdentity,
@@ -522,7 +522,7 @@ async fn request(
 
 /// Shared bounded transport. Request bodies go through stdin, never process
 /// arguments, and glab retains ownership of credentials and OAuth refresh.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn request_json(
     program: &Path,
     host: &str,

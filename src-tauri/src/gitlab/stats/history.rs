@@ -133,7 +133,7 @@ fn complete(r: &Report) -> bool {
             .is_some_and(|m| m.coverage.complete)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 async fn backfill_with(
     program: &Path,

@@ -6,7 +6,7 @@ pub(super) struct Target<'a> {
     pub list: CachedList,
     pub owner: &'a str,
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn advance(
     program: &Path,
     target: Target<'_>,

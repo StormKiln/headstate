@@ -102,7 +102,7 @@ async fn evidence_request(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> ReviewEvidence {
     let context = ProcessContext::new(
         program,

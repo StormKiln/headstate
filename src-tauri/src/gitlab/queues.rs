@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::{collections::HashSet, path::Path, time::Duration};
 
 const PAGE_SIZE: usize = 100;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const MAX_PAGES: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -298,7 +298,7 @@ pub async fn fetch<F: std::future::Future<Output = bool>>(
         .map_err(|_| QueueError::Timeout)?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn fetch_with_program(
     program: &Path,
     source: &Source,
@@ -406,7 +406,7 @@ async fn fetch_with_program(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn request(
     program: &Path,
     host: &str,

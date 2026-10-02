@@ -25,7 +25,7 @@ pub struct Participant {
     pub mrs: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> Activity {
     let context = ProcessContext::new(
         program,
