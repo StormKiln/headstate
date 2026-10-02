@@ -80,7 +80,7 @@ describe("useReviewPr", () => {
       if (cmd === "get_pr_detail") {
         return Promise.resolve({
           ...STALE_DETAIL,
-          latest_reviews: [{ author: "me", state: "CHANGES_REQUESTED", id: "newer", submitted_at: "2026-10-01T00:01:00Z" }],
+          latest_reviews: [{ author: "me", state: "CHANGES_REQUESTED", id: "newer", commit_oid: "head", submitted_at: "2026-10-01T00:01:00Z" }],
         } as unknown as PrDetail);
       }
       return Promise.resolve();

@@ -7,7 +7,7 @@ vi.mock("./tauri", () => ({ reviewPrAtHead: vi.fn() }));
 afterEach(() => { vi.clearAllMocks(); vi.useRealTimers(); });
 const request: BoundReviewRequest = { id: "PR-1", repo: "fixture/project", number: 1, verdict: "approve", body: "", expected_head: "head-1", expected_viewer: "fixture" };
 const receipt: SubmittedReview = { review_id: "REVIEW-1", pr_id: request.id, repo: request.repo, number: 1, state: "APPROVED", actor: "fixture", commit_oid: "head-1", submitted_at: "2026-10-01T00:00:00Z" };
-function setup() { const qc = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } }); qc.setQueryData(["viewer"], "fixture"); vi.mocked(reviewPrAtHead).mockResolvedValue({ outcome: "acknowledged", receipt }); return qc; }
+function setup() { const qc = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } }); qc.setQueryData(["viewer"], "fixture"); qc.setQueryData(["pr-detail", request.repo, 1], detail); vi.mocked(reviewPrAtHead).mockResolvedValue({ outcome: "acknowledged", receipt }); return qc; }
 const detail = { id: request.id, repo: request.repo, number: 1, head_oid: "head-1", latest_reviews: [] } as unknown as PrDetail;
 it("shares pending ownership and preserves acknowledgement through repeated lagging reads", async () => {
  const qc = setup(); let resolve!: (value: Awaited<ReturnType<typeof reviewPrAtHead>>) => void;
@@ -21,7 +21,7 @@ it("shares pending ownership and preserves acknowledgement through repeated lagg
 it("retires only identified dismissal or newer review, not aggregate or anonymous readback", async () => {
  const qc = setup(); await submitBoundReview(qc, request);
  expect(reconcileReviewDetail(qc, { ...detail, latest_reviews: [{ author: "fixture", state: "DISMISSED" }] }).latest_reviews[0].state).toBe("APPROVED");
- const dismissed = { ...detail, latest_reviews: [{ author: "fixture", state: "DISMISSED", id: receipt.review_id }] };
+ const dismissed = { ...detail, latest_reviews: [{ author: "fixture", state: "DISMISSED", id: receipt.review_id, commit_oid: "head-1" }] };
  expect(reconcileReviewDetail(qc, dismissed)).toBe(dismissed);
  expect(reviewOperation(qc, request.repo, 1, "head-1")).toBeUndefined();
 });
@@ -45,10 +45,13 @@ it("never publishes a late receipt after account retirement", async () => {
 it("does not fill capacity with hundreds of converged reviews", async () => {
  const qc = setup();
  for (let number = 1; number <= 600; number++) {
+  qc.setQueryData(["pr-detail", request.repo, number], { ...detail, number });
   const r = { ...receipt, number, review_id: `review-${number}` }; vi.mocked(reviewPrAtHead).mockResolvedValue({ outcome: "acknowledged", receipt: r });
   expect((await submitBoundReview(qc, { ...request, number })).outcome).toBe("acknowledged");
-  reconcileReviewDetail(qc, { ...detail, number, latest_reviews: [{ author: r.actor, state: r.state, id: r.review_id }] });
+  reconcileReviewDetail(qc, { ...detail, number, latest_reviews: [{ author: r.actor, state: r.state, id: r.review_id, commit_oid: r.commit_oid, submitted_at: r.submitted_at! }] });
  }
+ for (const number of [1, 600]) expect(reconcileReviewDetail(qc, { ...detail, number, latest_reviews: [] }).latest_reviews[0].state).toBe("APPROVED");
+ expect(qc.getQueryCache().getAll()).toHaveLength(601); // viewer + the 600 existing detail queries, no new storage queries
  expect(reviewPrAtHead).toHaveBeenCalledTimes(600);
 });
 it("refuses capacity before dispatch without silently evicting unresolved operations", async () => {
@@ -87,4 +90,28 @@ it("does not treat an unfamiliar read state as proof that a submitted review can
  const read = { ...detail, latest_reviews: [{ author: "fixture", state: "FUTURE_STATE", id: receipt.review_id }] };
  expect(reconcileReviewDetail(qc, read).latest_reviews[0].state).toBe("APPROVED");
  expect(reviewOperation(qc, request.repo, 1, "head-1")?.state).toBe("acknowledged");
+});
+
+it("keeps confirmed authority in its existing query without consuming active capacity or blocking a different verdict", async () => {
+ const qc = setup(); await submitBoundReview(qc, request);
+ const count = qc.getQueryCache().getAll().length;
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [{ author: receipt.actor, state: receipt.state, id: receipt.review_id, commit_oid: receipt.commit_oid, submitted_at: receipt.submitted_at! }] });
+ expect(reviewOperation(qc, request.repo, 1, "head-1")).toBeUndefined();
+ expect(qc.getQueryCache().getAll()).toHaveLength(count);
+ expect((await submitBoundReview(qc, request)).outcome).toBe("not_dispatched");
+ expect(reviewPrAtHead).toHaveBeenCalledTimes(1);
+ vi.mocked(reviewPrAtHead).mockResolvedValueOnce({ outcome: "acknowledged", receipt: { ...receipt, review_id: "review-2", state: "CHANGES_REQUESTED", submitted_at: "2026-10-01T00:01:00Z" } });
+ expect((await submitBoundReview(qc, { ...request, verdict: "request_changes", body: "Synthetic deliberate review" })).outcome).toBe("acknowledged");
+ expect(reviewPrAtHead).toHaveBeenCalledTimes(2);
+});
+
+it("requires real head and ordered review evidence, and does not resurrect dismissed approval from an older read", async () => {
+ const qc = setup(); await submitBoundReview(qc, request);
+ const observed = { author: receipt.actor, state: receipt.state, id: receipt.review_id, commit_oid: receipt.commit_oid, submitted_at: receipt.submitted_at! };
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [observed] });
+ expect(reconcileReviewDetail(qc, { ...detail, latest_reviews: [{ ...observed, id: "wrong-head-newer", commit_oid: "other", submitted_at: "2026-10-01T00:02:00Z", state: "CHANGES_REQUESTED" }] }).latest_reviews[0].state).toBe("APPROVED");
+ reconcileReviewDetail(qc, { ...detail, latest_reviews: [{ ...observed, state: "DISMISSED" }] });
+ expect(reconcileReviewDetail(qc, { ...detail, latest_reviews: [observed] }).latest_reviews[0].state).toBe("DISMISSED");
+ qc.setQueryData(["viewer"], "other"); qc.setQueryData(["viewer"], "fixture");
+ expect(reconcileReviewDetail(qc, detail)).toBe(detail);
 });

@@ -359,3 +359,45 @@ it.each([new Error("Synthetic response was lost"), "Synthetic string failure"])(
   for (const button of screen.queryAllByRole("button", { name: /^Approve$/ })) expect(button.matches(":disabled")).toBe(true);
   expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
 });
+
+it.each([1200, 390])("preserves converged own approval through later lag and remount at width %s", async width => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  stubViewport(width);
+  let current = detail();
+  const base = invoke.getMockImplementation()!;
+  const receipt = { review_id: "REVIEW-7", state: "APPROVED", actor: "reviewer", commit_oid: "head-7", submitted_at: "2026-10-01T12:00:00Z", pr_id: "PR_7", repo: "octocat/hello-world", number: 7 };
+  invoke.mockImplementation(async (name, args) => {
+    if (name === "get_pr_detail") return current;
+    if (name === "review_pr_at_head") {
+      const head = (args?.request as { expected_head: string }).expected_head;
+      return { outcome: "acknowledged", receipt: { ...receipt, commit_oid: head, review_id: head === "head-7" ? receipt.review_id : "REVIEW-NEW-HEAD" } };
+    }
+    return base(name, args);
+  });
+  let view = mount(); await loaded();
+  const sibling = mount();
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(0));
+  current = { ...detail(), latest_reviews: [{ author: "reviewer", state: "APPROVED", id: receipt.review_id, commit_oid: "head-7", submitted_at: receipt.submitted_at }] };
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(16 * 60_000); });
+  fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "A deliberate different verdict" } });
+  expect(screen.getAllByRole("button", { name: "Request changes" }).some(button => !button.matches(":disabled"))).toBe(true);
+  sibling.unmount();
+  for (const latest_reviews of [[], [{ author: "reviewer", state: "CHANGES_REQUESTED", id: "OLDER", commit_oid: "head-7", submitted_at: "2026-10-01T11:00:00Z" }]]) {
+    current = { ...detail(), latest_reviews };
+    await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+    view.unmount(); view = mount(); await loaded();
+    expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(1);
+    expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
+  }
+  current = { ...detail(), latest_reviews: [{ author: "reviewer", state: "DISMISSED", id: receipt.review_id, commit_oid: "head-7", submitted_at: receipt.submitted_at }] };
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approve$/ }).every(button => !button.matches(":disabled"))).toBe(true));
+  current = { ...detail(), head_oid: "new-head", latest_reviews: [] };
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(2));
+  expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")[1][1]?.request).toMatchObject({ expected_head: "new-head" });
+});

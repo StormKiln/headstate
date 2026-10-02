@@ -59,33 +59,84 @@ export function releaseCheckedReview(qc: QueryClient, repo: string, number: numb
 }
 export function reviewAccountGeneration(qc: QueryClient) { return store(qc).accountRevision; }
 export function reviewReadGeneration(qc: QueryClient) { return store(qc).revision; }
+// One fact belongs to the existing detail query, so query removal also removes
+// its evidence. There is no second collection of historical PRs or heads.
+const AUTHORITY_META = "headstateConfirmedReview";
+type ReviewFact = { id: string; author: string; state: string; commit_oid: string; submitted_at?: string };
+interface Authority { owner: string | undefined; accountRevision: number; prId: string; head: string; review: ReviewFact }
+const detailQuery = (qc: QueryClient, repo: string, number: number) =>
+  qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+function readAuthority(qc: QueryClient, repo: string, number: number): Authority | undefined {
+  const authority = detailQuery(qc, repo, number)?.meta?.[AUTHORITY_META] as Authority | undefined;
+  const s = store(qc);
+  return authority?.owner === s.owner && authority?.accountRevision === s.accountRevision ? authority : undefined;
+}
+function writeAuthority(qc: QueryClient, fresh: PrDetail, review?: ReviewFact) {
+  const query = detailQuery(qc, fresh.repo, fresh.number);
+  if (!query) return;
+  const s = store(qc);
+  // Preserve the shared metadata object referenced by every observer's options.
+  // Replacing it lets an already-created observer restore an older empty object.
+  const meta = query.meta ?? {};
+  meta[AUTHORITY_META] = review
+    ? { owner: s.owner, accountRevision: s.accountRevision, prId: fresh.id, head: fresh.head_oid, review } satisfies Authority
+    : undefined;
+  if (!query.meta) query.setOptions({ ...query.options, meta });
+}
+function usableReview(review: PrDetail["latest_reviews"][number] | undefined, owner: string | undefined, head: string): review is ReviewFact {
+  return !!review?.id && !!head && review.commit_oid === head && review.author.toLowerCase() === owner
+    && ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state);
+}
+function newerReview(read: ReviewFact, before: { id: string; state: string; submitted_at?: string | null }) {
+  if (read.id === before.id) return read.state === before.state || read.state === "DISMISSED";
+  return !!read.submitted_at && !!before.submitted_at && Date.parse(read.submitted_at) > Date.parse(before.submitted_at);
+}
+function withReview(fresh: PrDetail, owner: string, review: PrDetail["latest_reviews"][number]): PrDetail {
+  return { ...fresh, latest_reviews: [...fresh.latest_reviews.filter(r => r.author.toLowerCase() !== owner), review] };
+}
 export function reconcileReviewDetail(qc: QueryClient, fresh: PrDetail, generation?: number): PrDetail {
   const s = store(qc); const owner = account(qc, s);
+  const currentRead = generation === undefined || generation === s.revision;
+  const observed = fresh.latest_reviews.find(r => r.author.toLowerCase() === owner);
   for (const [id, op] of s.operations) {
     if (op.request.repo.toLowerCase() !== fresh.repo.toLowerCase() || op.request.number !== fresh.number) continue;
-    if ((generation === undefined || generation === s.revision) && fresh.head_oid && fresh.head_oid !== op.request.expected_head) {
+    if (currentRead && fresh.head_oid && fresh.head_oid !== op.request.expected_head) {
       s.operations.delete(id); changed(s); continue;
     }
     const receipt = op.receipt;
     if (!receipt || owner !== receipt.actor.toLowerCase()) continue;
-    const observed = fresh.latest_reviews.find(r => r.author.toLowerCase() === owner);
-    const authority = observed?.id === receipt.review_id
-      || (observed?.id && observed.submitted_at && receipt.submitted_at && Date.parse(observed.submitted_at) > Date.parse(receipt.submitted_at));
-    if ((generation === undefined || generation === s.revision) && authority && observed && ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(observed.state)) { s.operations.delete(id); changed(s); continue; }
+    if (currentRead && usableReview(observed, owner, fresh.head_oid)
+      && newerReview(observed, { id: receipt.review_id, state: receipt.state, submitted_at: receipt.submitted_at })) {
+      writeAuthority(qc, fresh, { ...observed });
+      s.operations.delete(id); changed(s);
+      continue;
+    }
     if (op.state === "acknowledged" && fresh.head_oid === receipt.commit_oid) {
-      return { ...fresh, latest_reviews: [
-        ...fresh.latest_reviews.filter(r => r.author.toLowerCase() !== owner),
-        { author: receipt.actor, state: receipt.state, id: receipt.review_id,
-          commit_oid: receipt.commit_oid, ...(receipt.submitted_at ? { submitted_at: receipt.submitted_at } : {}) },
-      ] };
+      return withReview(fresh, owner, { author: receipt.actor, state: receipt.state, id: receipt.review_id,
+        commit_oid: receipt.commit_oid, ...(receipt.submitted_at ? { submitted_at: receipt.submitted_at } : {}) });
     }
   }
-  return fresh;
+  const authority = readAuthority(qc, fresh.repo, fresh.number);
+  if (!authority || !owner || authority.prId !== fresh.id) return fresh;
+  if (fresh.head_oid && fresh.head_oid !== authority.head) {
+    if (currentRead) writeAuthority(qc, fresh);
+    return fresh;
+  }
+  if (fresh.head_oid !== authority.head) return fresh;
+  if (currentRead && usableReview(observed, owner, fresh.head_oid) && newerReview(observed, authority.review)) {
+    writeAuthority(qc, fresh, { ...observed });
+    return fresh;
+  }
+  return withReview(fresh, owner, authority.review);
 }
 export async function submitBoundReview(qc: QueryClient, request: BoundReviewRequest): Promise<BoundReviewOutcome> {
   const s = store(qc); const owner = account(qc, s); const id = key(request.repo, request.number, request.expected_head);
   if (!owner || owner !== request.expected_viewer.toLowerCase() || !request.expected_head)
     return { outcome: "not_dispatched", message: "A known account and viewed head are required before reviewing." };
+  const authority = readAuthority(qc, request.repo, request.number);
+  const requestedState = request.verdict === "approve" ? "APPROVED" : request.verdict === "request_changes" ? "CHANGES_REQUESTED" : "COMMENTED";
+  if (authority?.prId === request.id && authority.head === request.expected_head && authority.review.state === requestedState)
+    return { outcome: "not_dispatched", message: "Your review is already confirmed for this head. Check GitHub before repeating it." };
   if (s.operations.has(id)) return { outcome: "not_dispatched", message: "This review is already recorded or unresolved. Check its state on GitHub before another submission." };
   if (s.operations.size >= REVIEW_OPERATION_CAP) return { outcome: "not_dispatched", message: "There are too many unresolved reviews. Check their state on GitHub before submitting another review." };
   const op: ReviewOperation = { request: {

@@ -2541,6 +2541,8 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
   const polling = useMemo(() => new DetailPollBackoff(), [repo, number]);
   return useQuery({
     queryKey: ["pr-detail", repo, number],
+    // Observer option updates must preserve the query-owned confirmed review fact.
+    meta: qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true })?.meta ?? {},
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). `timeCall` rather
     // than `timed`, because the query function closes over per-render
     // arguments and so cannot be hoisted to module scope -- see
