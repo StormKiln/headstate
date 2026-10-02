@@ -70,7 +70,7 @@ pub async fn output(command: &mut Command) -> Result<(Vec<u8>, ExitStatus), Erro
 use super::detail::DetailIssue;
 pub(super) use super::process_session::{Class, Context};
 use serde_json::Value;
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 use tokio::io::AsyncWriteExt;
 #[derive(Debug)]
 pub(super) struct Failure {
@@ -81,14 +81,15 @@ pub(super) struct Failure {
 pub(super) struct Envelope {
     pub session: Option<super::process_session::Token>,
     pub status: u16,
-    pub headers: HashMap<String, String>,
+    raw_headers: Vec<String>,
     pub body: Value,
 }
 impl Envelope {
     pub fn bytes(&self) -> Vec<u8> {
         let mut raw = format!("HTTP/2 {}\n", self.status);
-        for (key, value) in &self.headers {
-            raw.push_str(&format!("{key}: {value}\n"));
+        for line in &self.raw_headers {
+            raw.push_str(line);
+            raw.push('\n');
         }
         raw.push('\n');
         raw.push_str(&self.body.to_string());
@@ -96,7 +97,7 @@ impl Envelope {
     }
 }
 /// Parse only leading framed header blocks, never HTTP-looking content in JSON.
-fn frame(raw: &[u8]) -> Result<(u16, HashMap<String, String>, String), DetailIssue> {
+fn frame(raw: &[u8]) -> Result<(u16, Vec<String>, String), DetailIssue> {
     let text = std::str::from_utf8(raw)
         .map_err(|_| DetailIssue::InvalidResponse)?
         .replace("\r\n", "\n");
@@ -115,10 +116,10 @@ fn frame(raw: &[u8]) -> Result<(u16, HashMap<String, String>, String), DetailIss
             .nth(1)
             .and_then(|s| s.parse().ok())
             .ok_or(DetailIssue::InvalidResponse)?;
-        let mut headers = HashMap::new();
+        let mut headers = Vec::new();
         for line in lines {
-            let (key, value) = line.split_once(':').ok_or(DetailIssue::InvalidResponse)?;
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().into());
+            line.split_once(':').ok_or(DetailIssue::InvalidResponse)?;
+            headers.push(line.to_owned());
         }
         if body.starts_with("HTTP/") {
             rest = body;
@@ -128,7 +129,8 @@ fn frame(raw: &[u8]) -> Result<(u16, HashMap<String, String>, String), DetailIss
     }
 }
 pub(super) fn envelope(raw: &[u8]) -> Result<Envelope, DetailIssue> {
-    let (status, headers, body) = frame(raw)?;
+    let (status, raw_headers, body) = frame(raw)?;
+
     let body = if status == 204 && body.trim().is_empty() {
         Value::Null
     } else {
@@ -145,7 +147,7 @@ pub(super) fn envelope(raw: &[u8]) -> Result<Envelope, DetailIssue> {
     Ok(Envelope {
         session: None,
         status,
-        headers,
+        raw_headers,
         body,
     })
 }
@@ -243,12 +245,32 @@ pub(super) async fn api(
         let exit = child.wait().await.map_err(|_| DetailIssue::Request)?;
         // Header evidence remains authoritative even when the required body is malformed.
         if let Ok((status, headers, _)) = frame(&raw) {
-            let number = |key: &str| headers.get(key).and_then(|v| v.parse::<u64>().ok());
+            let values: Vec<_> = headers
+                .iter()
+                .filter_map(|line| line.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim()))
+                .collect();
+            let numbers = |a: &str, b: &str| {
+                values
+                    .iter()
+                    .filter(|(key, _)| key == a || key == b)
+                    .filter_map(|(_, value)| value.parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            };
+            // Never let a later permissive duplicate erase restrictive quota evidence.
             permit.observe(
                 status,
-                number("ratelimit-remaining").or_else(|| number("x-ratelimit-remaining")),
-                number("ratelimit-reset").or_else(|| number("x-ratelimit-reset")),
-                headers.get("retry-after").and_then(|v| retry(v)),
+                numbers("ratelimit-remaining", "x-ratelimit-remaining")
+                    .into_iter()
+                    .min(),
+                numbers("ratelimit-reset", "x-ratelimit-reset")
+                    .into_iter()
+                    .max(),
+                values
+                    .iter()
+                    .filter(|(key, _)| key == "retry-after")
+                    .filter_map(|(_, value)| retry(value))
+                    .max(),
             );
         }
         let mut response = envelope(&raw).map_err(|issue| {
@@ -396,7 +418,7 @@ printf 'HTTP/2 200\n\n{}'"#,
     #[tokio::test]
     async fn malformed_success_body_keeps_zero_quota_and_expired_context_never_spawns() {
         let (_dir, program) = fixture(
-            r#"echo call >> "$0.calls"; printf 'HTTP/2 200\nRateLimit-Remaining: 0\nRetry-After: 300\n\n{'"#,
+            r#"echo call >> "$0.calls"; printf 'HTTP/2 200\nRateLimit-Remaining: 0\nRateLimit-Remaining: 100\nRetry-After: 300\nRetry-After: 1\n\n{'"#,
         );
         super::super::test_support::scripted(&program, async {
             let host = "gitlab.example";
@@ -408,6 +430,7 @@ printf 'HTTP/2 200\n\n{}'"#,
                     .issue,
                 DetailIssue::InvalidResponse
             );
+            tokio::time::advance(Duration::from_secs(2)).await;
             let fresh = context(&program, host, Class::Foreground);
             assert!(
                 !api(&program, host, "user", "GET", None, &fresh)
@@ -437,7 +460,7 @@ printf 'HTTP/2 200\n\n{}'"#,
     fn framed_headers_preserve_body_blank_lines_and_ignore_status_text_inside_json() {
         let r = envelope(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200\r\nX-Next-Page: \r\n\r\n{\n\n\"note\":\"HTTP/2 429\"}").unwrap();
         assert_eq!(r.status, 200);
-        assert_eq!(r.headers["x-next-page"], "");
+        assert!(r.raw_headers.iter().any(|line| line == "X-Next-Page: "));
         assert_eq!(r.body["note"], "HTTP/2 429");
         assert!(retry("Wed, 21 Oct 2099 07:28:00 GMT").is_some());
     }

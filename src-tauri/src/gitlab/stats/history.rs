@@ -241,10 +241,7 @@ async fn backfill_context(
                 receipt.error = Some(error);
             }
         }
-        if !context.current()
-            || (tokio::time::Instant::now() < context.deadline
-                && viewer_context(program, &source.host, context).await? != viewer)
-        {
+        if viewer_context(program, &source.host, context).await? != viewer || !context.current() {
             return Err(
                 "GitLab account changed while loading history. Refresh to try again.".into(),
             );
@@ -306,6 +303,60 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         program
     }
+    #[tokio::test]
+    async fn measured_history_without_final_identity_never_persists_or_spawns_overdue_probe() {
+        for limited in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("history.sqlite");
+            let cli = dir.path().join("glab");
+            let refusal = if limited {
+                "printf 'HTTP/2 429\\nRetry-After: 300\\n\\n{}'"
+            } else {
+                "touch \"$0.timeout\"; exec sleep 60"
+            };
+            std::fs::write(
+                &cli,
+                format!(
+                    r#"#!/bin/sh
+echo "$5" >> "$0.calls"
+if test -f "$0.measured"; then {refusal}; exit 0; fi
+touch "$0.measured"
+printf 'HTTP/2 200\nX-Next-Page: \nX-Total: 0\n\n[]'
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::gitlab::test_support::scripted(&cli, async {
+                let result = backfill_with(
+                    &cli,
+                    source("gitlab.example").unwrap(),
+                    "1".into(),
+                    Scope::Mine,
+                    1,
+                    db.clone(),
+                    "2026-09-04".parse().unwrap(),
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "unverified owner cannot authorize history persistence"
+                );
+                let calls = std::fs::read_to_string(cli.with_extension("calls")).unwrap();
+                assert_eq!(calls.lines().count(), 2);
+                assert!(!calls.lines().any(|line| line == "user"));
+                let conn = crate::store::open_db(&db).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM gitlab_stats_history", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            })
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn resume_skips_complete_days_and_partitions_accounts_hosts_and_scopes() {
         let dir = tempfile::tempdir().unwrap();

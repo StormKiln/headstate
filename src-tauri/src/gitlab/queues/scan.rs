@@ -432,6 +432,11 @@ mod tests {
             // Round1: a terminal-looking second response cannot remove through
             // contradictory or malformed pagination. Each is one actual proof call.
             for headers in [
+                "x-total: 1\nx-total: 0\nx-next-page:",
+                "x-total: 0\nx-next-page:\nx-page: 2\nx-page: 1",
+                "x-total: 0\nx-next-page: 2\nx-next-page:",
+                " x-total: 0\nx-next-page:",
+                "x-total : 0\nx-next-page:",
                 "x-total: 0\nx-next-page:\nx-page: 2",
                 "x-total: 0\nx-next-page:\nLink: <https://gitlab.com/api/v4/projects/group%2Fproject/merge_requests?page=2>; rel=\"next\"",
                 "x-total: 0\nx-next-page:\nx-total: 1",

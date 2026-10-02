@@ -508,12 +508,15 @@ async fn pages_limited_context(
 }
 
 pub async fn tree(host: &str) -> Result<Tree, String> {
-    let source = source(host)?;
     let program =
         super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
+    tree_with_program(&program, host).await
+}
+async fn tree_with_program(program: &Path, host: &str) -> Result<Tree, String> {
+    let source = source(host)?;
     let deadline = tokio::time::Instant::now() + BUDGET;
-    let initial = ProcessContext::new(&program, host, Class::Foreground, deadline);
-    let (identity, context) = super::auth::verified_identity(&program, host, &initial)
+    let initial = ProcessContext::new(program, host, Class::Foreground, deadline);
+    let (identity, context) = super::auth::verified_identity(program, host, &initial)
         .await
         .map_err(|_| "GitLab account unavailable")?;
     let viewer = identity["id"]
@@ -533,9 +536,9 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
             format!("{program:?}:{host}:{viewer}:{}", context.generation),
             discover_tree_context(
                 &context,
-                &program,
+                program,
                 source,
-                viewer,
+                viewer.clone(),
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             ),
             Result::is_ok,
@@ -543,7 +546,7 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
         )
         .await
         .map_err(|_| "GitLab statistics deadline exceeded")??;
-    if !context.current() {
+    if viewer_context(program, host, &context).await? != viewer || !context.current() {
         return Err("GitLab account changed while loading scopes. Refresh to try again.".into());
     }
     tree.account = Some(account);
@@ -846,17 +849,27 @@ pub async fn load(
     db: std::path::PathBuf,
     refresh: bool,
 ) -> Result<Report, String> {
+    let program =
+        super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
+    load_with_program(&program, host, scope, days, db, refresh).await
+}
+async fn load_with_program(
+    program: &Path,
+    host: &str,
+    scope: Scope,
+    days: u32,
+    db: std::path::PathBuf,
+    refresh: bool,
+) -> Result<Report, String> {
     let generation = CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let source = source(host)?;
     endpoint(&scope)?;
     if !(1..=90).contains(&days) {
         return Err("GitLab statistics window must be 1 to 90 days".into());
     }
-    let program =
-        super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
     let deadline = tokio::time::Instant::now() + BUDGET;
-    let initial = ProcessContext::new(&program, host, Class::Foreground, deadline);
-    let (identity, context) = super::auth::verified_identity(&program, host, &initial)
+    let initial = ProcessContext::new(program, host, Class::Foreground, deadline);
+    let (identity, context) = super::auth::verified_identity(program, host, &initial)
         .await
         .map_err(|_| "GitLab account unavailable")?;
     let viewer = identity["id"]
@@ -897,21 +910,13 @@ pub async fn load(
     let report = READS
         .run_until(
             format!("{program:?}:{key}:{generation}:{}", context.generation),
-            load_window_context(
-                &context,
-                &program,
-                source,
-                viewer.clone(),
-                scope,
-                start,
-                end,
-            ),
+            load_window_context(&context, program, source, viewer.clone(), scope, start, end),
             Result::is_ok,
             deadline,
         )
         .await
         .map_err(|_| "GitLab statistics deadline exceeded")??;
-    if !context.current() {
+    if viewer_context(program, host, &context).await? != viewer || !context.current() {
         return Err(
             "GitLab account changed while loading statistics. Refresh to try again.".into(),
         );
@@ -1145,6 +1150,74 @@ mod tests {
             rows,
             coverage(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_stats_reverify_external_account_before_publishing_and_recover_as_new_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        for tree in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let program = dir.path().join("glab");
+            let db = dir.path().join("stats.sqlite");
+            std::fs::write(&program, r#"#!/bin/sh
+echo "$5" >> "$0.calls"
+case "$5" in
+user) id=1; test ! -f "$0.switched" || id=2; printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture%s"}' "$id" "$id";;
+*) touch "$0.switched"; printf 'HTTP/2 200\nx-next-page: \nx-total: 0\n\n[]';;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::gitlab::test_support::scripted(&program, async {
+                if tree {
+                    assert!(tree_with_program(&program, "gitlab.example").await.is_err());
+                    assert_eq!(
+                        tree_with_program(&program, "gitlab.example")
+                            .await
+                            .unwrap()
+                            .account
+                            .as_deref(),
+                        Some("fixture2")
+                    );
+                } else {
+                    assert!(load_with_program(
+                        &program,
+                        "gitlab.example",
+                        Scope::Mine,
+                        1,
+                        db.clone(),
+                        true
+                    )
+                    .await
+                    .is_err());
+                    let conn = crate::store::open_db(&db).unwrap();
+                    assert_eq!(
+                        conn.query_row("SELECT count(*) FROM gitlab_stats_cache", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                    let report = load_with_program(
+                        &program,
+                        "gitlab.example",
+                        Scope::Mine,
+                        1,
+                        db.clone(),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(report.viewer, "2");
+                    assert_eq!(
+                        conn.query_row("SELECT count(*) FROM gitlab_stats_cache", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                }
+            })
+            .await;
+        }
     }
 
     #[cfg(unix)]
