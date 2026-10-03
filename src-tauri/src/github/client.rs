@@ -514,6 +514,9 @@ impl GitHubClient {
     pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
         if let Some(parent) = &self.read_context {
             context.deadline = context.deadline.min(parent.deadline);
+            if parent.first_attempt.is_some() {
+                context.first_attempt = parent.first_attempt.clone();
+            }
             if parent.attempts.is_some() {
                 context.attempts = parent.attempts.clone();
             }
@@ -2511,6 +2514,57 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn first_attempt_observer_survives_child_context_and_retries_without_leaking() {
+        use super::super::admission::{FirstAttempt, ReadClass, ReadContext};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let calls = requests.clone();
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                assert_eq!(count.load(Ordering::SeqCst), 1, "observation precedes HTTP");
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_json(json!({"message":"retry"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let mut context = ReadContext::new(ReadClass::Advisory, std::time::Duration::from_secs(5));
+        let count = observed.clone();
+        context.first_attempt = Some(FirstAttempt::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let operation = client.with_read_context(context);
+        let child = operation.with_read_context(ReadContext::new(
+            ReadClass::Advisory,
+            std::time::Duration::from_secs(5),
+        ));
+        child
+            .rest_get("/first-stage", &client.request_budget())
+            .await
+            .unwrap();
+        operation
+            .rest_get("/second-stage", &client.request_budget())
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "retry and second stage both dispatched"
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(
+            client.read_context().first_attempt.is_none(),
+            "managed client must not retain a row observer"
+        );
     }
 
     #[tokio::test]

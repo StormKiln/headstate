@@ -453,7 +453,14 @@ pub async fn strip_pushers(
                 let client = client.clone();
                 let budget = budget.clone();
                 let a = asks[i].clone();
+                let key = keys[i].clone();
                 async move {
+                    let mut context = client.read_context();
+                    let advisory = client.advisory.clone();
+                    context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
+                        advisory.offered(key);
+                    }));
+                    let client = client.with_read_context(context);
                     let rules = tokio::time::timeout(
                         per_request,
                         base_rules(&client, &budget, &a.repo, &a.base),
@@ -487,9 +494,6 @@ pub async fn strip_pushers(
     while let Ok(Some((i, rules, pusher))) =
         tokio::time::timeout_at(client.read_context().deadline, work.next()).await
     {
-        if !matches!(pusher, LastPusher::Declined { .. }) {
-            client.advisory.served(keys[i].clone());
-        }
         out[i].rules = rules;
         out[i].last_pusher = pusher;
     }
@@ -836,6 +840,207 @@ mod tests {
             "fresh selected native receipts must be reused"
         );
         println!("mixed: cycles=315 attempts={attempts} selected_downward_reads={detail_reads} pushers={} stacks={} selected_successes={detail_opportunities} longest_detail_gap={longest_detail_gap}", pushers_seen.len(), stacks_seen.len());
+    }
+
+    // A completion-only fairness ledger loses both opportunities when the
+    // deadline drops the slow prefix. Surviving identities must keep progress
+    // even when an unrelated head changes between concurrent refreshes.
+    #[tokio::test]
+    async fn canceled_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_canceled_slow_prefix_preserves_survivor_progress_after_churn() {
+        slow_prefix_progress(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_canceled_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn staggered_concurrent_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(true, false, true).await;
+    }
+
+    async fn slow_prefix_progress(concurrent: bool, churn: bool, staggered: bool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.url.path().contains("/slow-") {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_json(json!([]))
+                } else if request.url.path().ends_with("/activity") {
+                    ResponseTemplate::new(200).set_body_json(json!([push("push", HEAD, "octocat")]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let mut asks = vec![
+            ask("synthetic/slow-a", 1, HEAD),
+            ask("synthetic/slow-b", 2, HEAD),
+            ask("synthetic/healthy", 3, HEAD),
+        ];
+        if concurrent && !churn {
+            asks.push(ask("synthetic/slow-new", 10, HEAD));
+        }
+        let mut healthy = false;
+        for cycle in 0..4 {
+            let bounded = client.with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Advisory,
+                Duration::from_millis(150),
+            ));
+            let before = server.received_requests().await.unwrap().len();
+            let budget = client.request_budget();
+            let (a, b) = if staggered {
+                tokio::join!(strip_pushers(&bounded, &budget, &asks, T), async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let later =
+                        client.with_read_context(super::super::admission::ReadContext::new(
+                            super::super::admission::ReadClass::Advisory,
+                            Duration::from_millis(150),
+                        ));
+                    strip_pushers(&later, &budget, &asks, T).await
+                })
+            } else if concurrent {
+                tokio::join!(
+                    strip_pushers(&bounded, &budget, &asks, T),
+                    strip_pushers(&bounded, &budget, &asks, T)
+                )
+            } else {
+                (strip_pushers(&bounded, &budget, &asks, T).await, Vec::new())
+            };
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.len() - before <= 8, "shared actual-attempt cap");
+            healthy |= a.iter().chain(&b).any(|row| {
+                row.number == 3
+                    && matches!(row.last_pusher, LastPusher::Known { .. })
+                    && matches!(row.rules, BaseRules::Read { .. })
+            });
+            if cycle == 0 && !staggered {
+                assert!(!healthy, "both workers are occupied by slow leaders");
+                assert_eq!(requests.len(), 2, "same-key concurrent callers coalesce");
+                assert!(
+                    a.iter().chain(&b).all(
+                        |row| row.last_known_pusher.is_none() && row.last_known_rules.is_none()
+                    ),
+                    "scheduling cannot fabricate observations"
+                );
+            }
+            // Change an unrelated identity and membership without resetting the
+            // healthy survivor's place in the account-local ledger.
+            if churn && cycle == 0 {
+                asks[0].head_oid = "changed".into();
+                asks.push(ask("synthetic/slow-new", 10, HEAD));
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+        }
+        assert!(
+            healthy,
+            "healthy survivor never received a provider opportunity"
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/repos/synthetic/healthy/activity"));
+        println!("slow-prefix: concurrent={concurrent} churn={churn} staggered={staggered} cycles=4 actual_attempts={} healthy_observed={healthy}", server.received_requests().await.unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn cached_pushers_bypass_busy_workers_and_cancellation_releases_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.url.path().contains("/slow-") {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_json(json!([]))
+                } else if request.url.path().ends_with("/activity") {
+                    ResponseTemplate::new(200).set_body_json(json!([push("push", HEAD, "octocat")]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let cached_asks = [ask("synthetic/cached", 1, HEAD)];
+        let before = strip_pushers(&client, &client.request_budget(), &cached_asks, T).await;
+        assert!(matches!(before[0].last_pusher, LastPusher::Known { .. }));
+        let slow_client = client.clone();
+        let slow = tokio::spawn(async move {
+            strip_pushers(
+                &slow_client,
+                &slow_client.request_budget(),
+                &[
+                    ask("synthetic/slow-a", 2, HEAD),
+                    ask("synthetic/slow-b", 3, HEAD),
+                ],
+                T,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.received_requests().await.unwrap().len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both slow workers started");
+        let cached = tokio::time::timeout(
+            Duration::from_millis(100),
+            strip_pushers(&client, &client.request_budget(), &cached_asks, T),
+        )
+        .await
+        .expect("fully cached rows must not wait for workers");
+        assert!(matches!(cached[0].last_pusher, LastPusher::Known { .. }));
+        assert!(cached[0].pusher_valid_for_ms <= before[0].pusher_valid_for_ms);
+        assert!(cached[0].rules_valid_for_ms <= before[0].rules_valid_for_ms);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "cached call issues no HTTP"
+        );
+        let other = client_for(&server).await;
+        let independent = tokio::time::timeout(
+            Duration::from_millis(100),
+            strip_pushers(
+                &other,
+                &other.request_budget(),
+                &[ask("synthetic/other-account", 4, HEAD)],
+                T,
+            ),
+        )
+        .await
+        .expect("worker ownership must be account-local");
+        assert!(matches!(
+            independent[0].last_pusher,
+            LastPusher::Known { .. }
+        ));
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        let recovered = tokio::time::timeout(
+            Duration::from_millis(100),
+            strip_pushers(
+                &client,
+                &client.request_budget(),
+                &[ask("synthetic/recovered", 5, HEAD)],
+                T,
+            ),
+        )
+        .await
+        .expect("canceling leaders releases worker reservations");
+        assert!(matches!(recovered[0].last_pusher, LastPusher::Known { .. }));
     }
 
     #[tokio::test]

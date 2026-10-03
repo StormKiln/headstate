@@ -168,7 +168,9 @@ impl Advisory {
         indices.sort_by_key(|i| order.1.get(&keys[*i]).copied().unwrap_or(0));
         indices
     }
-    pub fn served(&self, key: String) {
+    // Record first admitted work, before its provider await. Admission is an
+    // opportunity, not a successful observation; cancellation keeps this mark.
+    pub fn offered(&self, key: String) {
         let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
         if order.1.len() >= CAPACITY && !order.1.contains_key(&key) {
             if let Some(oldest) = order

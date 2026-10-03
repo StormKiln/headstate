@@ -5,6 +5,7 @@ import { getReadyPushers } from "./tauri";
 import { useViewer } from "./hooks";
 import { useAdvisoryWindow } from "./useAdvisoryWindow";
 import { advisoryGcTime, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
+import { commandError } from "@/lib/errorKind";
 import { prKey } from "@/lib/prIdentity";
 import { readyPusher, type ReadyPusher } from "@/lib/readyPusher";
 import type { PusherAsk, RowPusher, PullRequest } from "@/types/pr";
@@ -29,13 +30,25 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   const queries = useQueries({ queries: selected.map((pr, i) => ({
     queryKey: keys[i], queryFn: async ({ signal }: { signal: AbortSignal }): Promise<Receipt> => {
       let answer: Answer;
+      let dispatchedAt: number | undefined;
+      const unreadable = (): RowPusher => ({ ...askOf(pr),
+        last_pusher: { state: "unknown", reason: "Pusher response unavailable" },
+        rules: { state: "unreadable", reason: "Policy response unavailable" },
+      });
       try { answer = await advisoryDispatch(qc, JSON.stringify(keys[i]), "pusher", signal, async () => {
         const started = performance.now();
+        dispatchedAt = started;
         const ask = askOf(pr);
         const answers = await getReadyPushers([ask]);
-        return { started, row: answers?.find(value => value.repo === ask.repo && value.number === ask.number && value.head_oid === ask.head_oid && value.base === ask.base && value.head_ref === ask.head_ref && value.head_repo === ask.head_repo) ?? null };
+        return { started, row: answers?.find(value => value.repo === ask.repo && value.number === ask.number && value.head_oid === ask.head_oid && value.base === ask.base && value.head_ref === ask.head_ref && value.head_repo === ask.head_repo) ?? unreadable() };
       }); }
-      catch { answer = { row: null, started: performance.now() }; }
+      catch (error) {
+        // Queue refusal and explicit native no-dispatch are still not checked.
+        // A settled command failure is unreadable; session/abort checks below
+        // prevent retired work from publishing even that outcome.
+        answer = { row: dispatchedAt !== undefined && commandError(error).kind !== "not-asked" ? unreadable() : null,
+          started: dispatchedAt ?? performance.now() };
+      }
       assertCurrent(signal, session.generation, session.current);
       const previous = qc.getQueryData<Receipt>(keys[i]);
       const row = answer.row;
