@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Behavior tests for the Linux release artifact verifier."""
 
+import json
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +11,17 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CHECK = ROOT / "scripts/verify-linux-appimage.py"
+TAURI_CONFIG = ROOT / "src-tauri/tauri.conf.json"
+
+
+def stage_appimage_files(config: pathlib.Path, host_root: pathlib.Path, appdir: pathlib.Path):
+    """Apply tauri-bundler's AppImage destination -> host source contract."""
+    files = json.loads(config.read_text())["bundle"]["linux"]["appimage"]["files"]
+    for destination, source in files.items():
+        host_source = host_root / source.lstrip("/")
+        bundle_destination = appdir / destination
+        bundle_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(host_source, bundle_destination)
 
 
 def appdir(root: pathlib.Path, complete: bool) -> pathlib.Path:
@@ -35,6 +48,19 @@ def appdir(root: pathlib.Path, complete: bool) -> pathlib.Path:
 
 
 class VerifyLinuxAppImage(unittest.TestCase):
+    def test_tauri_file_map_stages_the_gstreamer_license_in_the_appdir(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = pathlib.Path(temp.name)
+        copyright_file = root / "host/usr/share/doc/gstreamer1.0-plugins-base/copyright"
+        copyright_file.parent.mkdir(parents=True)
+        copyright_file.write_text("GStreamer Base Plug-ins: LGPL-2.1-or-later\n")
+
+        stage_appimage_files(TAURI_CONFIG, root / "host", root / "AppDir")
+
+        staged = root / "AppDir/usr/share/licenses/headstate/gstreamer1.0-plugins-base-copyright"
+        self.assertEqual(staged.read_bytes(), copyright_file.read_bytes())
+
     def run_check(self, complete: bool):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
