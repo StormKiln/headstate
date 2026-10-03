@@ -253,7 +253,10 @@ mod linux_native_tests {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.add(&container);
         menu.init_for_gtk_window(&window, Some(&container)).unwrap();
-        let menubar = menu.gtk_menubar_for_gtk_window(&window).unwrap();
+        // This Muda accessor takes `self` by value. Keep the original owner
+        // alive: dropping the last Menu immediately destroys its GTK items,
+        // which would make the native menubar look empty before inspection.
+        let menubar = menu.clone().gtk_menubar_for_gtk_window(&window).unwrap();
         let root = menubar
             .children()
             .remove(0)
