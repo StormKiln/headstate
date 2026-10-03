@@ -397,6 +397,7 @@ lint-deps:
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
+	python3 scripts/verify-linux-appimage.test.py
 	python3 scripts/check-native.test.py
 	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
