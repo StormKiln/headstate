@@ -41,6 +41,8 @@ pub struct Status {
     settled_generation: u64,
     #[serde(skip)]
     settled_scan_receipt: Option<String>,
+    #[serde(skip)]
+    github_receipt_epoch: u64,
     pub revision: u64,
     pub receipt_revision: Option<u64>,
     pub request_id: Option<String>,
@@ -62,6 +64,7 @@ impl Status {
             published_scan_generation: None,
             settled_generation: 0,
             settled_scan_receipt: None,
+            github_receipt_epoch: 0,
             revision: 0,
             receipt_revision: None,
             request_id: None,
@@ -117,7 +120,90 @@ pub struct Publication {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// Authority captured while the original successful publication gate is held.
+#[derive(Clone)]
+pub(crate) struct CheckingCapture {
+    pub targets: Vec<crate::github::client::CheckingTarget>,
+    pub owner: String,
+    attempt: Attempt,
+    receipt_revision: u64,
+    receipt_epoch: u64,
+    scan_revision: Option<i64>,
+}
+
 impl SourcePolls {
+    fn capture_checking(&self, attempt: &Attempt) -> Option<CheckingCapture> {
+        if attempt.source != Source::default() || attempt.list != CachedList::Authored {
+            return None;
+        }
+        let status = self.get(&attempt.source, attempt.list);
+        let receipts = self.2.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, receipt) = receipts.get(&(attempt.source.clone(), attempt.list))?;
+        if *generation != attempt.generation {
+            return None;
+        }
+        let owner = receipt.viewer.clone().filter(|v| !v.is_empty())?;
+        let targets = crate::github::client::checking_targets(&receipt.prs);
+        if targets.is_empty() {
+            return None;
+        }
+        Some(CheckingCapture {
+            targets,
+            owner,
+            attempt: attempt.clone(),
+            receipt_revision: status.receipt_revision?,
+            receipt_epoch: status.github_receipt_epoch,
+            scan_revision: receipt
+                .scan
+                .as_ref()
+                .map(|s| s.expected_revision + i64::from(!s.state.no_work)),
+        })
+    }
+
+    /// Caller holds this source/list's publication gate.
+    fn checking_receipt(&self, capture: &CheckingCapture) -> Option<FetchedList> {
+        let key = (capture.attempt.source.clone(), capture.attempt.list);
+        let entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, status) = entries.get(&key)?;
+        if *generation != capture.attempt.generation
+            || status.receipt_revision != Some(capture.receipt_revision)
+            || status.github_receipt_epoch != capture.receipt_epoch
+        {
+            return None;
+        }
+        let receipts = self.2.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, receipt) = receipts.get(&key)?;
+        (*generation == capture.attempt.generation
+            && receipt.viewer.as_deref() == Some(&capture.owner))
+        .then(|| receipt.clone())
+    }
+
+    /// Unlike `complete`, this does not settle traversal or clear its errors.
+    /// The dedicated row transaction must have succeeded before this is called.
+    fn complete_checking(
+        &self,
+        publication: Publication,
+        receipt: FetchedList,
+        emit: impl FnOnce(Status),
+    ) {
+        let attempt = &publication.attempt;
+        let key = (attempt.source.clone(), attempt.list);
+        self.2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), (attempt.generation, receipt));
+        let status = {
+            let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let (_, status) = entries.get_mut(&key).expect("published source status");
+            status.github_receipt_epoch += 1;
+            status.revision += 1;
+            status.receipt_revision = Some(status.revision);
+            status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+            status.clone()
+        };
+        emit(status);
+    }
+
     fn readback_is_current(&self, source: &Source, list: CachedList, generation: u64) -> bool {
         *self
             .5
@@ -244,6 +330,17 @@ impl SourcePolls {
         let status_result = match result {
             Ok(result) => {
                 let coverage = result.coverage.clone();
+                // Scan adoption can replace a receipt without advancing its
+                // public receipt revision. Retire captured observation work
+                // on every accepted replacement, including that case.
+                if let Some((_, status)) = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&(attempt.source.clone(), attempt.list))
+                {
+                    status.github_receipt_epoch += 1;
+                }
                 self.2.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     (attempt.source.clone(), attempt.list),
                     (attempt.generation, result),
@@ -599,6 +696,124 @@ pub fn complete(app: &AppHandle, publication: Publication, result: Result<Fetche
         .complete(publication, result, |status| {
             emit_status(app, status, completed_request);
         });
+}
+
+/// Capture the exact accepted receipt inside `complete`'s publication permit,
+/// before another publication can supersede it.
+pub(crate) fn complete_with_checking(
+    app: &AppHandle,
+    publication: Publication,
+    result: FetchedList,
+) -> Option<CheckingCapture> {
+    let attempt = publication.attempt.clone();
+    let polls = app.state::<SourcePolls>();
+    let mut capture = None;
+    polls.complete(publication, Ok(result), |status| {
+        capture = polls.capture_checking(&attempt);
+        emit_status(app, status, attempt.request_id.clone());
+    });
+    capture
+}
+
+pub(crate) async fn checking_publication(
+    app: &AppHandle,
+    capture: &CheckingCapture,
+) -> Option<Publication> {
+    let polls = app.state::<SourcePolls>();
+    let permit = polls.publication(&capture.attempt).await?;
+    polls.checking_receipt(capture)?;
+    Some(permit)
+}
+
+pub(crate) async fn apply_checking(
+    app: &AppHandle,
+    publication: &Publication,
+    capture: &CheckingCapture,
+    rows: Vec<crate::github::model::PullRequest>,
+) -> Result<Option<FetchedList>, Failure> {
+    if publication.attempt.source != capture.attempt.source
+        || publication.attempt.list != capture.attempt.list
+        || publication.attempt.generation != capture.attempt.generation
+    {
+        return Ok(None);
+    }
+    let Some(previous) = app.state::<SourcePolls>().checking_receipt(capture) else {
+        return Ok(None);
+    };
+    let capture = capture.clone();
+    let path = crate::commands::db_path(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::store::open_db(&path)
+            .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
+        apply_checking_snapshot(&conn, &capture, previous, rows)
+    })
+    .await
+    .map_err(|_| inventory_failure("The targeted observation could not be saved."))?
+}
+
+pub(crate) fn complete_checking(app: &AppHandle, publication: Publication, result: FetchedList) {
+    app.state::<SourcePolls>()
+        .complete_checking(publication, result, |status| emit_status(app, status, None));
+}
+
+/// A row-only transaction. Never invoke queue_scan::commit here: even an
+/// unchanged scan payload would advance its revision and operation authority.
+fn apply_checking_snapshot(
+    conn: &rusqlite::Connection,
+    capture: &CheckingCapture,
+    mut previous: FetchedList,
+    rows: Vec<crate::github::model::PullRequest>,
+) -> Result<Option<FetchedList>, Failure> {
+    let save = || -> Result<Option<FetchedList>, crate::store::StoreError> {
+        let tx = conn.unchecked_transaction()?;
+        let source = &capture.attempt.source;
+        let list = capture.attempt.list;
+        if previous.viewer.as_deref() != Some(&capture.owner)
+            || crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
+                != Some(&capture.owner)
+            || capture.scan_revision.is_some_and(|revision| {
+                crate::queue_scan::load(&tx, source, list, &capture.owner)
+                    .map_or(true, |s| s.revision != revision)
+            })
+        {
+            return Ok(None);
+        }
+        let mut changed = false;
+        // Preserve the exact order and qualification of every omitted row.
+        for old in &mut previous.prs {
+            let Some(target) = capture.targets.iter().find(|t| t.matches(old)) else {
+                continue;
+            };
+            if old.merge != crate::github::model::MergeState::Checking {
+                continue;
+            }
+            let Some(new) = rows.iter().find(|row| target.matches(row)) else {
+                continue;
+            };
+            *old = crate::inventory::reconcile_delta(
+                vec![old.clone()],
+                vec![new.clone()],
+                chrono::Utc::now(),
+            )
+            .pop()
+            .expect("one existing matched row");
+            changed = true;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        crate::store::source_cache::save_owned_source_snapshot(
+            &tx,
+            source,
+            list,
+            &previous.prs,
+            &previous.coverage,
+            Some(&capture.owner),
+        )?;
+        tx.commit()?;
+        Ok(Some(previous))
+    };
+    save().map_err(|_| inventory_failure("The targeted observation could not be saved."))
 }
 
 /// An accepted or uncertain write retires all reads that began before it.
@@ -1487,6 +1702,329 @@ mod tests {
             prs: vec![pr],
             total: Some(1),
             coverage: Coverage::Complete,
+        }
+    }
+
+    #[tokio::test]
+    async fn checking_recheck_reads_captured_row_after_completed_or_unfinished_scan() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        for done in [true, false] {
+            let server = MockServer::start().await;
+            let client = crate::github::client::GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(server.uri())
+                    .unwrap()
+                    .personal_token("synthetic")
+                    .build()
+                    .unwrap(),
+            );
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture"}}})),
+                )
+                .mount(&server)
+                .await;
+            client.fetch_viewer().await.unwrap();
+            server.reset().await;
+            let raw: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+            let mut node = raw["authored"]["nodes"][0].clone();
+            node["id"] = "target-id".into();
+            node["headRefOid"] = "head-a".into();
+            node["state"] = "OPEN".into();
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"data":{"viewer":{"login":"fixture"},"checking":node}}),
+                ))
+                .mount(&server)
+                .await;
+            let mut baseline = FetchedList {
+                scan: None,
+                viewer: Some("fixture".into()),
+                prs: crate::github::map::map_search(
+                    &serde_json::json!({"authored":{"nodes":[node]}}),
+                ),
+                total: Some(1),
+                coverage: Coverage::Complete,
+            };
+            baseline.prs[0].merge = crate::github::model::MergeState::Checking;
+            baseline.scan = Some(crate::queue_scan::Commit {
+                expected_revision: 0,
+                state: crate::queue_scan::State {
+                    done,
+                    coverage_valid: done,
+                    started_at: Some(1000),
+                    eligible_at: 1120,
+                    completed_at: done.then_some(1000),
+                    completed_total: done.then_some(1),
+                    total: Some(1),
+                    count_seen: true,
+                    seen: vec![baseline.prs[0].identity()],
+                    after: (!done).then(|| "tail".into()),
+                    ..Default::default()
+                },
+                removals: vec![],
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("checking.db");
+            let conn = crate::store::open_db(&path).unwrap();
+            let baseline = reconcile_github_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+                baseline,
+                None,
+            )
+            .unwrap_or_else(|f| panic!("{}", f.message));
+            let before =
+                crate::queue_scan::load(&conn, &Source::default(), CachedList::Authored, "fixture")
+                    .unwrap();
+            let fresh = client
+                .fetch_checking(
+                    &crate::github::client::checking_targets(&baseline.prs),
+                    "fixture",
+                    std::time::Duration::from_secs(2),
+                )
+                .await;
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "T+5 must read the captured Checking identity even when traversal is cadence-gated"
+            );
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(fresh[0].merge, crate::github::model::MergeState::Mergeable);
+            assert_eq!(fresh[0].id, baseline.prs[0].id);
+            let after =
+                crate::queue_scan::load(&conn, &Source::default(), CachedList::Authored, "fixture")
+                    .unwrap();
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.state, after.state);
+        }
+    }
+
+    async fn checking_seed(
+        conn: &rusqlite::Connection,
+        polls: &SourcePolls,
+    ) -> (CheckingCapture, FetchedList) {
+        let source = Source::default();
+        let list = CachedList::Authored;
+        let mut baseline = receipt(1);
+        baseline.viewer = Some("fixture".into());
+        baseline.prs[0].id = "id-1".into();
+        baseline.prs[0].head_oid = "head".into();
+        baseline.prs.push(receipt(2).prs.remove(0));
+        baseline.coverage = Coverage::Partial { total: Some(100) };
+        baseline.total = Some(100);
+        baseline.scan = Some(crate::queue_scan::Commit {
+            expected_revision: 0,
+            state: crate::queue_scan::State {
+                after: Some("tail-50".into()),
+                cursors: vec!["tail-25".into()],
+                github_partition: Some(Default::default()),
+                completed_at: Some(500),
+                completed_total: Some(100),
+                receipt_id: Some("receipt-proof".into()),
+                ..Default::default()
+            },
+            removals: vec![],
+        });
+        let baseline = reconcile_github_snapshot(conn, &source, list, baseline, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let (attempt, _) = polls.begin_attempt(source, list).await;
+        let mut capture = None;
+        polls.complete(
+            polls.publication(&attempt).await.unwrap(),
+            Ok(baseline.clone()),
+            |_| {
+                capture = polls.capture_checking(&attempt);
+            },
+        );
+        (capture.unwrap(), baseline)
+    }
+    fn raw_checkpoint(conn: &rusqlite::Connection) -> (i64, String) {
+        conn.query_row("SELECT revision,payload FROM queue_scan", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn checking_row_transaction_preserves_traversal_error_coverage_order_and_omitted_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let polls = SourcePolls::default();
+        let (capture, mut baseline) = checking_seed(&conn, &polls).await;
+        // Existing accepted memory wins over disk, including omitted row values.
+        baseline.prs[1].title = "newer accepted memory".into();
+        polls
+            .2
+            .lock()
+            .unwrap()
+            .get_mut(&(Source::default(), CachedList::Authored))
+            .unwrap()
+            .1 = baseline.clone();
+        {
+            let mut entries = polls.0.lock().unwrap();
+            let status = &mut entries
+                .get_mut(&(Source::default(), CachedList::Authored))
+                .unwrap()
+                .1;
+            status.error = Some("earlier traversal failure".into());
+            status.consecutive_failures = 2;
+        }
+        let checkpoint = raw_checkpoint(&conn);
+        let status = polls.get(&Source::default(), CachedList::Authored);
+        let unrequested = serde_json::to_value(&baseline.prs[1]).unwrap();
+        let mut incoming = baseline.prs[0].clone();
+        incoming.merge = crate::github::model::MergeState::Mergeable;
+        let permit = polls.publication(&capture.attempt).await.unwrap();
+        let current = polls.checking_receipt(&capture).unwrap();
+        let result = apply_checking_snapshot(&conn, &capture, current, vec![incoming])
+            .unwrap_or_else(|e| panic!("{}", e.message))
+            .unwrap();
+        assert_eq!(
+            result.prs[0].merge,
+            crate::github::model::MergeState::Mergeable
+        );
+        assert_eq!(serde_json::to_value(&result.prs[1]).unwrap(), unrequested);
+        assert_eq!(result.coverage, baseline.coverage);
+        assert_eq!(result.total, baseline.total);
+        assert_eq!(raw_checkpoint(&conn), checkpoint);
+        let mut emitted = false;
+        polls.complete_checking(permit, result, |updated| {
+            assert_eq!(updated.phase, status.phase);
+            assert_eq!(updated.error, status.error);
+            assert_eq!(updated.consecutive_failures, status.consecutive_failures);
+            assert_eq!(updated.coverage, status.coverage);
+            assert_eq!(
+                updated.published_scan_receipt,
+                status.published_scan_receipt
+            );
+            assert!(updated.receipt_revision > status.receipt_revision);
+            emitted = true;
+        });
+        assert!(emitted);
+        assert!(
+            polls.checking_receipt(&capture).is_none(),
+            "same-attempt receipt turnover retires original work"
+        );
+        assert_eq!(raw_checkpoint(&conn), checkpoint);
+    }
+    #[tokio::test]
+    async fn checking_authority_rejects_attempt_receipt_owner_and_confirmed_action_turnover() {
+        for change in ["attempt", "receipt", "owner", "action"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::migrate(&conn).unwrap();
+            let polls = SourcePolls::default();
+            let (capture, mut baseline) = checking_seed(&conn, &polls).await;
+            let source = Source::default();
+            let list = CachedList::Authored;
+            match change {
+                "attempt" => {
+                    polls.begin_attempt(source.clone(), list).await;
+                }
+                "action" => {
+                    let _permit = polls.publication(&capture.attempt).await.unwrap();
+                    polls.effect_generation(&source, list);
+                }
+                _ => {
+                    if change == "owner" {
+                        baseline.viewer = Some("new-owner".into());
+                    }
+                    polls.complete(
+                        polls.publication(&capture.attempt).await.unwrap(),
+                        Ok(baseline),
+                        |_| {},
+                    );
+                }
+            }
+            assert!(polls.checking_receipt(&capture).is_none(), "{change}");
+        }
+    }
+    #[tokio::test]
+    async fn checking_transaction_skips_replaced_removed_heads_and_rolls_back_save_failure() {
+        for change in [
+            "head",
+            "id",
+            "removed",
+            "owner",
+            "disk_owner",
+            "scan",
+            "empty",
+            "save",
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::migrate(&conn).unwrap();
+            let polls = SourcePolls::default();
+            let (capture, mut current) = checking_seed(&conn, &polls).await;
+            let mut incoming = current.prs[0].clone();
+            incoming.merge = crate::github::model::MergeState::Mergeable;
+            match change {
+                "head" => current.prs[0].head_oid = "new-head".into(),
+                "id" => current.prs[0].id = "replacement".into(),
+                "removed" => {
+                    current.prs.remove(0);
+                }
+                "owner" => current.viewer = Some("other".into()),
+                "disk_owner" => {
+                    conn.execute("UPDATE snapshot SET owner='other'", [])
+                        .unwrap();
+                }
+                "scan" => {
+                    crate::queue_scan::taint(
+                        &conn,
+                        &Source::default(),
+                        CachedList::Authored,
+                        "fixture",
+                    )
+                    .unwrap();
+                }
+                "save" => {
+                    conn.execute_batch("CREATE TRIGGER fail_checking BEFORE UPDATE ON snapshot BEGIN SELECT RAISE(FAIL, 'fixture save failed'); END;").unwrap();
+                }
+                _ => {}
+            }
+            let checkpoint = raw_checkpoint(&conn);
+            let before = serde_json::to_value(
+                crate::store::source_cache::load_source_snapshot(
+                    &conn,
+                    &Source::default(),
+                    CachedList::Authored,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let result = apply_checking_snapshot(
+                &conn,
+                &capture,
+                current,
+                if change == "empty" {
+                    vec![]
+                } else {
+                    vec![incoming]
+                },
+            );
+            if change == "save" {
+                assert!(result.is_err());
+            } else {
+                assert!(
+                    result.unwrap_or_else(|e| panic!("{}", e.message)).is_none(),
+                    "{change}"
+                );
+            }
+            assert_eq!(raw_checkpoint(&conn), checkpoint);
+            assert_eq!(
+                serde_json::to_value(
+                    crate::store::source_cache::load_source_snapshot(
+                        &conn,
+                        &Source::default(),
+                        CachedList::Authored
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
+                before
+            );
         }
     }
 

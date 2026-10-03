@@ -256,6 +256,48 @@ query($q: String!, $first: Int!, $after: String) {
 }
 "#;
 
+/// One captured identity, with the same rich row shape as the list query.
+/// This is observation work; it has no search cursor or traversal evidence.
+pub const CHECKING_QUERY: &str = r#"
+query CheckingObservation($id: ID!) {
+  rateLimit { cost remaining resetAt }
+  viewer { login }
+  checking: node(id: $id) {
+      ... on PullRequest {
+        id state number title url isDraft createdAt updatedAt
+        timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+          nodes { ... on ReadyForReviewEvent { createdAt } }
+        }
+        headRefName headRefOid baseRefName
+        headRef { id }
+        headRepository { nameWithOwner }
+        author { login }
+        repository { nameWithOwner }
+        mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
+        mergeQueueEntry { state }
+        assignees(first: 5) { totalCount nodes { login } }
+        reviewRequests(first: 5) {
+          totalCount
+          nodes { requestedReviewer { ... on User { login } } }
+        }
+        latestReviews(first: 20) { totalCount nodes { id state submittedAt commit { oid } author { login } } }
+        labels(first: 20) { totalCount nodes { name color } }
+        reviewThreads(first: 100) { nodes { isResolved isOutdated } }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+                contexts(first: 100) { nodes { ... on CheckRun { status } } }
+              }
+            }
+          }
+        }
+      }
+  }
+}
+"#;
+
 /// The dashboard counters, as one aliased query costing 1 point.
 /// `$week` and `$month` are ISO dates.
 ///

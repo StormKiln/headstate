@@ -849,63 +849,61 @@ async fn persist_and_emit(
     crate::tray::set_badge(app, needs_attention_count(prs));
 }
 
-/// #22: schedules exactly one targeted re-poll ~`RECHECK_DELAY` after a
-/// poll that left PRs in `MergeState::Checking`, so a mergeability check
-/// that GitHub hadn't finished computing yet gets a chance to resolve
-/// before the next regular tick (60s/300s) instead of always waiting for
-/// it.
-///
-/// "Exactly one" is enforced structurally, not by a retry counter: this
-/// function calls `client.fetch_prs()` a single time and then returns --
-/// there is no loop, no re-scheduling of itself, and no path back into this
-/// function from within it. Whatever happens (success, network error, or
-/// nothing left `Checking` by the time it fires), the task ends and the
-/// regular poll loop's own next tick is what runs after that. A failed
-/// recheck logs and returns without touching the snapshot, so the last good
-/// snapshot on disk is left exactly as the regular tick left it -- the UI
-/// is never blanked.
-fn spawn_recheck(
-    app: AppHandle,
-    client: Arc<GitHubClient>,
-    _last_known: Vec<PullRequest>,
-    attempt: source_poll::Attempt,
-) {
+fn same_active_client(active: Option<&Arc<GitHubClient>>, captured: &Arc<GitHubClient>) -> bool {
+    active.is_some_and(|active| Arc::ptr_eq(active, captured))
+}
+
+fn active_recheck_client(app: &AppHandle, captured: &Arc<GitHubClient>) -> bool {
+    same_active_client(
+        app.try_state::<crate::commands::GhClient>()
+            .as_ref()
+            .and_then(|state| state.0.as_ref()),
+        captured,
+    )
+}
+
+/// #22: one delayed supplemental refresh of at most three captured Checking
+/// identities. This task never schedules another recheck or advances a scan.
+fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, capture: source_poll::CheckingCapture) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
-
-        let client = client.with_read_context(crate::github::admission::ReadContext::new(
-            crate::github::admission::ReadClass::Background,
-            FETCH_TIMEOUT,
-        ));
-        match source_poll::fetch_github_step(&app, &client, CachedList::Authored, FETCH_TIMEOUT)
-            .await
+        // Keep the original managed Arc, not a newly wrapped read-context clone.
         {
-            Ok(fresh) => {
-                if let Some(publication) = source_poll::publication(&app, &attempt).await {
-                    let result =
-                        match source_poll::reconcile_github(&app, &publication, fresh).await {
-                            Ok(result) => result,
-                            Err(failure) => {
-                                source_poll::complete(&app, publication, Err(failure));
-                                return;
-                            }
-                        };
-                    persist_and_emit(
-                        &app,
-                        &result.prs,
-                        result.coverage.clone(),
-                        result.viewer.clone(),
-                        result.scan.is_some(),
-                    )
-                    .await;
-                    source_poll::complete(&app, publication, Ok(result));
-                }
+            let Some(_permit) = source_poll::checking_publication(&app, &capture).await else {
+                return;
+            };
+            if !active_recheck_client(&app, &client) {
+                return;
             }
-            Err(e) => {
-                // No retry: the regular 60s/300s cadence picks this back up
-                // on its own next tick. Logging only, snapshot untouched.
-                log::warn!("targeted recheck failed: {e}");
+        }
+        // No publication lock spans provider I/O. Completed earlier targets
+        // survive a later timeout; no generic scan fetch or recursive schedule.
+        let rows = client
+            .fetch_checking(&capture.targets, &capture.owner, FETCH_TIMEOUT)
+            .await;
+        if rows.is_empty() {
+            return;
+        }
+        let Some(publication) = source_poll::checking_publication(&app, &capture).await else {
+            return;
+        };
+        if !active_recheck_client(&app, &client) {
+            return;
+        }
+        match source_poll::apply_checking(&app, &publication, &capture, rows).await {
+            Ok(Some(result)) => {
+                persist_and_emit(
+                    &app,
+                    &result.prs,
+                    result.coverage.clone(),
+                    result.viewer.clone(),
+                    true,
+                )
+                .await;
+                source_poll::complete_checking(&app, publication, result);
             }
+            Ok(None) => {}
+            Err(error) => log::warn!("targeted recheck failed: {}", error.message),
         }
     });
 }
@@ -1428,9 +1426,10 @@ pub fn spawn(
                             persist_and_emit(&app, &prs, coverage.clone(), viewer, scan.is_some())
                                 .await;
                             let _ = app.emit("poll-state", tick_state(None));
-                            source_poll::complete(&app, publication, Ok(receipt));
-                            if has_checking(&prs) {
-                                spawn_recheck(app.clone(), client.clone(), prs, authored_attempt);
+                            let capture =
+                                source_poll::complete_with_checking(&app, publication, receipt);
+                            if let Some(capture) = capture.filter(|_| has_checking(&prs)) {
+                                spawn_recheck(app.clone(), client.clone(), capture);
                             }
                         }
                         // A failed poll leaves the last snapshot in place rather
@@ -1997,6 +1996,26 @@ async fn emit_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn checking_client_requires_original_managed_arc() {
+        let captured = Arc::new(GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .personal_token("synthetic")
+                .build()
+                .unwrap(),
+        ));
+        let same = captured.clone();
+        let derived = Arc::new(captured.with_read_context(
+            crate::github::admission::ReadContext::new(
+                crate::github::admission::ReadClass::Background,
+                FETCH_TIMEOUT,
+            ),
+        ));
+        assert!(same_active_client(Some(&same), &captured));
+        assert!(!same_active_client(Some(&derived), &captured));
+        assert!(!same_active_client(None, &captured));
+    }
+
     #[test]
     fn queue_continuations_only_advance_due_visible_existing_passes() {
         let mut state = crate::queue_scan::State {

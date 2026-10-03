@@ -420,6 +420,55 @@ pub struct FetchedList {
     pub coverage: crate::store::source_cache::Coverage,
 }
 
+/// Stable identity AND known head captured from an accepted Checking row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckingTarget {
+    pub identity: crate::identity::PrIdentity,
+    pub id: String,
+    pub head: String,
+}
+impl CheckingTarget {
+    pub(crate) fn matches(&self, row: &PullRequest) -> bool {
+        self.identity == row.identity()
+            && self.id == row.id
+            && self.head == row.head_oid
+            && !self.id.is_empty()
+            && !self.head.is_empty()
+    }
+}
+
+pub(crate) fn checking_targets(rows: &[PullRequest]) -> Vec<CheckingTarget> {
+    let mut targets: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.source == crate::identity::Source::default()
+                && row.merge == super::model::MergeState::Checking
+                && !row.id.is_empty()
+                && !row.head_oid.is_empty()
+                && row
+                    .observation
+                    .as_ref()
+                    .is_some_and(|o| o.state == crate::inventory::ObservationState::Observed)
+        })
+        .map(|row| CheckingTarget {
+            identity: row.identity(),
+            id: row.id.clone(),
+            head: row.head_oid.clone(),
+        })
+        .collect();
+    targets.sort_by(|a, b| {
+        (&a.identity.repo, a.identity.number, &a.id, &a.head).cmp(&(
+            &b.identity.repo,
+            b.identity.number,
+            &b.id,
+            &b.head,
+        ))
+    });
+    targets.dedup_by(|a, b| a.identity == b.identity);
+    targets.truncate(3);
+    targets
+}
+
 fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
     use crate::store::source_cache::Coverage;
     let total = (!v["headstate_paging"]["count_conflict"]
@@ -547,6 +596,64 @@ impl GitHubClient {
             self.read_context(),
         )
         .await
+    }
+
+    /// A one-shot supplemental read: at most three selected identities and
+    /// three actual attempts (retries included), sharing one background deadline.
+    /// Keep completed rows when later work fails or exhausts its deadline.
+    pub(crate) async fn fetch_checking(
+        &self,
+        targets: &[CheckingTarget],
+        owner: &str,
+        budget: std::time::Duration,
+    ) -> Vec<PullRequest> {
+        if owner.is_empty() || self.known_viewer() != Some(owner) {
+            return vec![];
+        }
+        let _active = ActiveRead::new(&self.searches.queue_reads);
+        let client = self
+            .with_read_context(super::admission::ReadContext::new(
+                super::admission::ReadClass::Background,
+                budget,
+            ))
+            .with_attempt_limit(3);
+        let mut rows = vec![];
+        for target in targets.iter().take(3) {
+            if client.attempts_remaining() == 0 {
+                break;
+            }
+            let value = match client
+                .graphql_partial_ok(&json!({
+                    "query": super::query::CHECKING_QUERY,
+                    "variables": {"id": target.id}
+                }))
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            // A response must prove the expected owner itself. Cached viewer
+            // identity is only an admission guard, never response evidence.
+            if value["viewer"]["login"].as_str() != Some(owner) {
+                break;
+            }
+            if value["checking"]["state"].as_str() != Some("OPEN") {
+                continue;
+            }
+            let mut normalized = json!({"authored":{"nodes":[value["checking"].clone()]}});
+            // Refused nullable fields must remain unknown even if the provider
+            // could not supply a usable error path. Direct paths are normalized
+            // in transport; malformed/null targets never supply an empty receipt.
+            if value["__readiness_unknown"] == true || refused_fields(&value) > 0 {
+                normalized["__readiness_unknown"] = true.into();
+            }
+            rows.extend(
+                map_search(&normalized)
+                    .into_iter()
+                    .filter(|row| target.matches(row)),
+            );
+        }
+        rows
     }
 
     /// Share overlapping equivalent searches, with a deadline that includes
@@ -1865,6 +1972,33 @@ pub fn server_gave_up_on(e: &ClientError) -> bool {
     server_gave_up(e)
 }
 
+/// Direct-node errors use [checking, field, ...]. Preserve their readiness
+/// qualification before the ordinary transport discards provider error paths.
+fn mark_list_readiness_errors(data: &mut serde_json::Value, errors: &[serde_json::Value]) {
+    crate::inventory::mark_readiness_errors(data, errors);
+    if data.get("checking").is_none() {
+        return;
+    }
+    let mut normalized = json!({"authored":{"nodes":[data["checking"].clone()]}});
+    let remapped: Vec<_> = errors
+        .iter()
+        .map(|error| {
+            let mut error = error.clone();
+            if let Some(path) = error["path"].as_array_mut() {
+                if path.first().and_then(|p| p.as_str()) == Some("checking") {
+                    path.splice(0..1, [json!("authored"), json!("nodes"), json!(0)]);
+                }
+            }
+            error
+        })
+        .collect();
+    crate::inventory::mark_readiness_errors(&mut normalized, &remapped);
+    data["checking"] = normalized["authored"]["nodes"][0].clone();
+    if normalized["__readiness_unknown"] == true {
+        data["__readiness_unknown"] = true.into();
+    }
+}
+
 /// See `GitHubClient::graphql_partial_ok`. A free function so the
 /// concurrent history chunks, which own a cloned `Octocrab` inside a
 /// spawned task, get the same partial-success handling.
@@ -1967,7 +2101,7 @@ async fn graphql_with_transport(
                 // Also on the response, so a caller can read the count
                 // for the request it actually made.
                 let mut d = d.clone();
-                crate::inventory::mark_readiness_errors(&mut d, errs);
+                mark_list_readiness_errors(&mut d, errs);
                 super::detail_checks::mark_errors(&mut d, errs);
                 mark_queue_cursor_error(&mut d, errs);
                 if let Some(obj) = d.as_object_mut() {
@@ -1981,7 +2115,7 @@ async fn graphql_with_transport(
             // fields look well formed (#1626). Separate from the existing
             // permission-refusal count so other callers keep their messaging.
             let mut data = d.clone();
-            crate::inventory::mark_readiness_errors(&mut data, errs);
+            mark_list_readiness_errors(&mut data, errs);
             super::detail_checks::mark_errors(&mut data, errs);
             mark_queue_cursor_error(&mut data, errs);
             if let Some(obj) = data.as_object_mut() {
@@ -2031,6 +2165,196 @@ async fn graphql_with_transport(
 
 #[cfg(test)]
 mod tests {
+    fn checking_node(number: u64) -> serde_json::Value {
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
+        let mut node = raw["authored"]["nodes"][0].clone();
+        node["id"] = format!("id-{number}").into();
+        node["number"] = number.into();
+        node["headRefOid"] = "head".into();
+        node["state"] = "OPEN".into();
+        node
+    }
+    fn checking_rows(numbers: &[u64]) -> Vec<PullRequest> {
+        let nodes: Vec<_> = numbers
+            .iter()
+            .map(|n| {
+                let mut node = checking_node(*n);
+                node["mergeable"] = "UNKNOWN".into();
+                node
+            })
+            .collect();
+        map_search(&json!({"authored":{"nodes":nodes}}))
+    }
+    async fn checking_client(server: &MockServer) -> GitHubClient {
+        // Match production auth::build_client: the metered transport owns retries.
+        let client = GitHubClient::new(
+            Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("synthetic")
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        );
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .mount(server)
+            .await;
+        client.fetch_viewer().await.unwrap();
+        server.reset().await;
+        client
+    }
+    #[tokio::test]
+    async fn checking_selection_caps_and_deduplicates_actual_direct_requests() {
+        let server = MockServer::start().await;
+        let client = checking_client(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let id = body["variables"]["id"].as_str().unwrap();
+                let number = id.strip_prefix("id-").unwrap().parse().unwrap();
+                assert!(!body["query"].as_str().unwrap().contains("search("));
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"viewer":{"login":"fixture"},"checking":checking_node(number)}}),
+                )
+            })
+            .mount(&server)
+            .await;
+        let mut rows = checking_rows(&[5, 3, 2, 1, 3, 4]);
+        rows[0].head_oid.clear();
+        let targets = checking_targets(&rows);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.identity.number)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let result = client
+            .fetch_checking(&targets, "fixture", std::time::Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            result.iter().map(|r| r.number).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn checking_partial_success_survives_timeout_and_retry_uses_shared_allowance() {
+        for timeout in [true, false] {
+            let server = MockServer::start().await;
+            let client = checking_client(&server).await;
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            Mock::given(method("POST")).respond_with(move |_: &wiremock::Request| {
+                let call = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if call == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"checking":checking_node(1)}}))
+                } else if timeout {
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2))
+                        .set_body_json(json!({"data":{"viewer":{"login":"fixture"},"checking":checking_node(2)}}))
+                } else { ResponseTemplate::new(502) }
+            }).mount(&server).await;
+            let budget = if timeout {
+                std::time::Duration::from_millis(150)
+            } else {
+                std::time::Duration::from_secs(3)
+            };
+            let result = client
+                .fetch_checking(
+                    &checking_targets(&checking_rows(&[1, 2, 3])),
+                    "fixture",
+                    budget,
+                )
+                .await;
+            assert_eq!(result.iter().map(|r| r.number).collect::<Vec<_>>(), [1]);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                if timeout { 2 } else { 3 }
+            );
+        }
+    }
+    #[tokio::test]
+    async fn checking_unreadable_wrong_owner_head_identity_and_terminal_rows_supply_no_observation()
+    {
+        for defect in [
+            "owner",
+            "head",
+            "id",
+            "number",
+            "repo",
+            "terminal",
+            "missing",
+            "malformed",
+        ] {
+            let server = MockServer::start().await;
+            let client = checking_client(&server).await;
+            let mut node = checking_node(1);
+            let owner = if defect == "owner" {
+                "other"
+            } else {
+                "fixture"
+            };
+            match defect {
+                "head" => node["headRefOid"] = "new-head".into(),
+                "id" => node["id"] = "replacement".into(),
+                "number" => node["number"] = 9.into(),
+                "repo" => node["repository"]["nameWithOwner"] = "different/repo".into(),
+                "terminal" => node["state"] = "MERGED".into(),
+                "missing" => node = serde_json::Value::Null,
+                "malformed" => node["title"] = serde_json::Value::Null,
+                _ => {}
+            }
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":{"viewer":{"login":owner},"checking":node}})),
+                )
+                .mount(&server)
+                .await;
+            let result = client
+                .fetch_checking(
+                    &checking_targets(&checking_rows(&[1])),
+                    "fixture",
+                    std::time::Duration::from_secs(2),
+                )
+                .await;
+            assert!(result.is_empty(), "{defect}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn checking_direct_resolver_error_preserves_unknown_readiness() {
+        let server = MockServer::start().await;
+        let client = checking_client(&server).await;
+        let mut node = checking_node(1);
+        node["reviewDecision"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data":{"viewer":{"login":"fixture"},"checking":node},
+                "errors":[{"path":["checking","reviewDecision"],"type":"FORBIDDEN"}]
+            })))
+            .mount(&server)
+            .await;
+        let result = client
+            .fetch_checking(
+                &checking_targets(&checking_rows(&[1])),
+                "fixture",
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(result.len(), 1);
+        assert!(result[0]
+            .observation
+            .as_ref()
+            .unwrap()
+            .unknown_fields
+            .contains(&crate::inventory::ReadinessField::Review));
+    }
 
     /// #744: a pull request returned by two pages must appear once.
     ///
