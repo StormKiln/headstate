@@ -143,6 +143,7 @@ it("lets retained conversations expand while their mutation controls stay paused
   qc.setQueryData(key, withThread);
   mount(); await loaded(); fail = true;
   await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await screen.findByRole("alert");
   const toggle = screen.getByRole("button", { name: /synthetic.ts/ });
   expect(toggle.matches(":disabled")).toBe(false);
   fireEvent.click(toggle);

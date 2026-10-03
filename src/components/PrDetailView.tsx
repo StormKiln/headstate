@@ -239,7 +239,7 @@ export function PrDetailView({
     refetch,
   } = usePrDetail(repo, number);
   const matchingFull = primary && !isPlaceholderData && primary.repo === repo && primary.number === number && !!primary.head_oid && !!primary.base_ref;
-  const ancestry = useReadyStacks(matchingFull ? [primary] : [], undefined, !!matchingFull);
+  const ancestry = useReadyStacks(matchingFull ? [primary] : [], undefined, !!matchingFull, "detail");
   const measuredStack = matchingFull ? ancestry.of(primary) : undefined;
   const pr = primary ? { ...primary, stack: measuredStack ?? { kind: "unknown" as const } } : undefined;
   const incompleteChecks = pr?.checks_coverage && pr.checks_coverage.state !== "complete";

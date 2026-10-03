@@ -135,9 +135,9 @@ function UnresolvedChip({
 /// fact, the colour only repeats it, and the accessible name says it, with
 /// the consequence when the base's rules were read as requiring someone
 /// else's approval of the last push.
-function PushedByYouChip({ pusher }: { pusher: ReadyPusher }) {
+function PushedByYouChip({ pusher, retained = false, observedAt }: { pusher: ReadyPusher; retained?: boolean; observedAt?: number }) {
   if (pusher.pusher.state !== "viewer") return null;
-  const label = approvalWontCount(pusher)
+  const label = retained ? `last known push by you${observedAt === undefined ? "" : `, observed ${new Date(observedAt).toLocaleString()}`}; current pusher and approval requirements are unconfirmed` : approvalWontCount(pusher)
     ? "you pushed the latest commit, so your approval won't count here"
     : "you pushed the latest commit";
   return (
@@ -149,7 +149,7 @@ function PushedByYouChip({ pusher }: { pusher: ReadyPusher }) {
         className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[#4493f8]/40 px-1.5 py-0.5 text-xs text-[#4493f8]"
       >
         <GitCommitHorizontal className="h-3 w-3" aria-hidden="true" />
-        your push
+        {retained ? "last known · your push" : "your push"}
       </span>
       <span className="sr-only">, {label}</span>
     </>
@@ -393,8 +393,8 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
-                <ReadyStackChip stack={stacks.of(pr)} />
-                <PushedByYouChip pusher={pushers.of(pr)} />
+                <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
+                <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>
@@ -409,8 +409,8 @@ export function ReadyStrip({
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
-                <ReadyStackChip stack={stacks.of(pr)} />
-                <PushedByYouChip pusher={pushers.of(pr)} />
+                <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
+                <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>

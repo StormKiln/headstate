@@ -51,7 +51,7 @@ beforeEach(() => {
   invoke.mockImplementation((cmd: string, args) => {
     if (cmd === "get_viewer") return viewerLogin;
     if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers.map(answer => ({ valid_for_ms: 60_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
-    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
+    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ pusher_valid_for_ms: 60_000, rules_valid_for_ms: 600_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
     return Promise.resolve(null);
   });
 });
@@ -733,16 +733,16 @@ describe("Ready stack context (#1602)", () => {
     expect(screen.queryByLabelText(/Stack position/)).toBeNull();
   });
 
-  it("batches visible rows and reuses cached facts across filtering and reorder", async () => {
+  it("coalesces visible rows and reuses cached facts across filtering and reorder", async () => {
     const other = { ...ready, id: "other", number: ready.number + 1, title: "Other" };
     stackAnswers = [ready, other].map((pr) => ({ repo: pr.repo, number: pr.number, stack: exactStack }));
     const view = render(<ReadyStrip prs={[ready, other]} />);
     await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
-    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
     view.rerender(<ReadyStrip prs={[other]} />);
     view.rerender(<ReadyStrip prs={[other, ready]} />);
     await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
-    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
   });
 
   it("renders rows immediately and limits each metadata batch", async () => {
@@ -755,13 +755,13 @@ describe("Ready stack context (#1602)", () => {
     let calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
     expect(calls).toHaveLength(1);
     expect((calls[0][1]?.rows as unknown[]).length).toBeLessThanOrEqual(8);
-    // Finishing one batch must not drain the rest of the invisible list.
-    for (let i = 0; i < 3; i++) {
+    // Finishing a row only drains the finite eight-row window.
+    for (let i = 0; i < 8; i++) {
       const resolve = resolveFirst!;
       await act(async () => { resolve([]); });
     }
     calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(8);
     view.unmount();
   });
 });
@@ -788,18 +788,18 @@ it("bounds two actual mounted 120-row owners and advances beyond the unreadable 
   expect(screen.getAllByText("Task4 row 119")).toHaveLength(2);
   for (const command of ["get_ready_stacks", "get_ready_pushers"]) {
     const calls = invoke.mock.calls.filter(([cmd]) => cmd === command);
-    expect(calls).toHaveLength(1);
-    expect(calls[0][1]?.rows).toHaveLength(8);
+    expect(calls).toHaveLength(8);
+    expect(calls.every(call => (call[1]?.rows as unknown[]).length === 1)).toBe(true);
   }
   await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
   await act(async () => { await vi.advanceTimersByTimeAsync(5); });
   const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-  expect(calls).toHaveLength(2);
-  const first = new Set((calls[0][1]?.rows as PullRequest[]).map(pr => pr.number));
-  expect((calls[1][1]?.rows as PullRequest[]).every(pr => !first.has(pr.number))).toBe(true);
+  expect(calls).toHaveLength(16);
+  const first = new Set(calls.slice(0, 8).flatMap(call => (call[1]?.rows as PullRequest[]).map(pr => pr.number)));
+  expect(calls.slice(8).flatMap(call => call[1]?.rows as PullRequest[]).some(pr => !first.has(pr.number))).toBe(true);
   view.unmount();
   await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
-  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(16);
   qc.clear();
   vi.useRealTimers();
 });
@@ -835,11 +835,42 @@ it("prioritizes actual observed rows in the next bounded viewport window", async
   const last = screen.getByText("Viewport row 19").closest("li")!;
   const rect = last.getBoundingClientRect();
   await act(async () => { observed!([{ target: last, isIntersecting: true, boundingClientRect: rect, intersectionRatio: 1, intersectionRect: rect, rootBounds: null, time: 0 }]); });
-  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(8);
   await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
   await act(async () => { await vi.advanceTimersByTimeAsync(5); });
   const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-  expect(calls).toHaveLength(2);
-  expect((calls[1][1]?.rows as PullRequest[]).map(pr => pr.number)).toContain(20);
+  expect(calls).toHaveLength(16);
+  expect(calls.slice(8).flatMap(call => (call[1]?.rows as PullRequest[]).map(pr => pr.number))).toContain(20);
   view.unmount(); qc.clear(); vi.unstubAllGlobals(); vi.useRealTimers();
+});
+
+it("keeps retained stack and pusher chips qualified without hiding rows or claiming approval consequences", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "me");
+  const pr = { ...ready, head_repo: ready.repo };
+  let failed = false;
+  invoke.mockImplementation(async (cmd, args) => {
+    if (cmd === "get_viewer") return "me";
+    const asks = args?.rows as PullRequest[];
+    if (cmd === "get_ready_stacks") return asks.map(ask => ({ ...ask, stack: failed ? { kind: "unknown" } : exactStack, valid_for_ms: failed ? undefined : 2_000 }));
+    if (cmd === "get_ready_pushers") return asks.map(ask => ({ ...ask, pusher_valid_for_ms: 2_000, rules_valid_for_ms: 2_000,
+      rules: failed ? { state: "declined", reason: "budget" } : { state: "read", require_last_push_approval: true, required_review_thread_resolution: false },
+      last_pusher: failed ? { state: "declined", reason: "budget" } : { state: "known", login: "me" } }));
+    return null;
+  });
+  // Show all initially so both native observations exist before expiry.
+  useFilters.setState({ filtersByView: { ...EMPTY, "to-review": { readyMyPushes: "show" } } });
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={[pr]} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  expect(screen.getByLabelText("Stack position 5 of 8")).toBeTruthy();
+  failed = true;
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  await act(async () => { useFilters.setState({ filtersByView: { ...EMPTY } }); });
+  expect(screen.getByText(pr.title)).toBeTruthy();
+  expect(screen.getByLabelText(/Last known stack position 5 of 8/).getAttribute("title")).toMatch(/observed/i);
+  expect(document.querySelector("[data-pushed-by-you]")?.textContent).toContain("last known");
+  expect(document.body.textContent).not.toContain("your approval won't count here");
+  view.unmount(); qc.clear(); vi.useRealTimers();
 });

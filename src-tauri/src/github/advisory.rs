@@ -15,7 +15,17 @@ use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 const CAPACITY: usize = 512;
 pub(super) const FAILURE_TTL: Duration = Duration::from_secs(5);
 pub(super) const SUCCESS_TTL: Duration = Duration::from_secs(60);
-type Slot<V> = Arc<AsyncMutex<Option<(Instant, V)>>>;
+#[derive(Debug)]
+struct Receipts<V> {
+    latest: Option<(Instant, V)>,
+    success: Option<(Instant, V)>,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LastKnown<V> {
+    pub value: V,
+    pub age_ms: u64,
+}
+type Slot<V> = Arc<AsyncMutex<Receipts<V>>>;
 #[derive(Debug)]
 pub(super) struct Cache<K, V> {
     slots: Mutex<HashMap<K, (Instant, Slot<V>)>>,
@@ -43,18 +53,40 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
                 .map(|(k, _)| k.clone())?;
             slots.remove(&victim);
         }
-        let slot = Arc::new(AsyncMutex::new(None));
+        let slot = Arc::new(AsyncMutex::new(Receipts {
+            latest: None,
+            success: None,
+        }));
         slots.insert(key, (Instant::now(), slot.clone()));
         Some(slot)
     }
     pub fn peek(&self, key: &K) -> Option<V> {
+        self.peek_receipt(key).map(|(value, _)| value)
+    }
+    pub fn peek_receipt(&self, key: &K) -> Option<(V, Duration)> {
         let slots = self.slots.try_lock().ok()?;
         let slot = &slots.get(key)?.1;
         let receipt = slot.try_lock().ok()?;
         receipt
+            .latest
             .as_ref()
             .filter(|(until, _)| *until > Instant::now())
-            .map(|(_, v)| v.clone())
+            .map(|(until, value)| {
+                (
+                    value.clone(),
+                    until.saturating_duration_since(Instant::now()),
+                )
+            })
+    }
+    /// Display only: never returned by load/peek to action consumers.
+    pub fn last_success(&self, key: &K) -> Option<LastKnown<V>> {
+        let slots = self.slots.try_lock().ok()?;
+        let slot = &slots.get(key)?.1;
+        let receipt = slot.try_lock().ok()?;
+        receipt.success.as_ref().map(|(at, value)| LastKnown {
+            value: value.clone(),
+            age_ms: at.elapsed().as_millis() as u64,
+        })
     }
     pub async fn load<F: Future<Output = V>>(
         &self,
@@ -78,7 +110,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         let slot = self.slot(key)?;
         tokio::time::timeout_at(deadline, async {
             let mut receipt = slot.lock().await;
-            if let Some((until, value)) = receipt.as_ref() {
+            if let Some((until, value)) = receipt.latest.as_ref() {
                 if *until > Instant::now() {
                     return (
                         value.clone(),
@@ -88,7 +120,12 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             }
             let value = work.await;
             let lifetime = ttl(&value);
-            *receipt = Some((Instant::now() + lifetime, value.clone()));
+            // Every cache in this module uses FAILURE_TTL for inconclusive
+            // attempts; longer receipts certify an actual successful read.
+            if lifetime > FAILURE_TTL {
+                receipt.success = Some((Instant::now(), value.clone()));
+            }
+            receipt.latest = Some((Instant::now() + lifetime, value.clone()));
             (value, lifetime)
         })
         .await
@@ -152,6 +189,37 @@ impl Advisory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempt_keeps_original_success_without_fresh_peek() {
+        let cache = Cache::<usize, usize>::default();
+        cache
+            .load(1, Instant::now() + SUCCESS_TTL, |_| SUCCESS_TTL, async {
+                42
+            })
+            .await;
+        tokio::time::advance(SUCCESS_TTL).await;
+        cache
+            .load(1, Instant::now() + SUCCESS_TTL, |_| FAILURE_TTL, async {
+                0
+            })
+            .await;
+        assert_eq!(
+            cache.peek(&1),
+            Some(0),
+            "action peek returns the failure, never the retained success"
+        );
+        assert_eq!(
+            cache.last_success(&1).map(|receipt| receipt.value),
+            Some(42)
+        );
+        tokio::time::advance(FAILURE_TTL).await;
+        assert_eq!(cache.peek(&1), None);
+        assert_eq!(
+            cache.last_success(&1).map(|receipt| receipt.value),
+            Some(42)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn incremental_eviction_keeps_recent_receipts_and_cancelled_leader_is_retryable() {
         let cache = Arc::new(Cache::<usize, usize>::default());
