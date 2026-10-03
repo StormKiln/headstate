@@ -300,7 +300,11 @@ impl SourcePolls {
                     } else {
                         Phase::Partial
                     };
-                    status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+                    status.error = state
+                        .step_failure
+                        .as_ref()
+                        .map(|f| f.message.clone())
+                        .or_else(|| state.partition_reason());
                 }
                 return Some(status.clone());
             }
@@ -345,7 +349,7 @@ impl SourcePolls {
                     Coverage::Partial { .. } => Phase::Partial,
                     Coverage::Unknown => Phase::Unknown,
                 };
-                status.error = None;
+                status.error = state.partition_reason();
                 status.consecutive_failures = 0;
             }
             status.settled_generation = attempt.generation;
@@ -2128,6 +2132,44 @@ mod tests {
         assert_eq!(result.phase, Phase::NotAsked);
         assert_eq!(result.consecutive_failures, 0);
         assert_eq!(result.last_received_at, None);
+    }
+    #[test]
+    fn partition_limit_is_partial_with_a_reason_not_a_provider_failure() {
+        use crate::queue_scan::{BlockReason, GithubPartition, PartitionPhase, State, Window};
+        let polls = SourcePolls::default();
+        let source = Source::default();
+        let a = attempt(&polls, &source, CachedList::Reviewing);
+        let mut state = State {
+            received: true,
+            done: true,
+            github_partition: Some(GithubPartition {
+                phase: PartitionPhase::FinalCheck,
+                lower: Some(0),
+                upper: Some(1),
+                windows_started: 1,
+                blocked: vec![(Window { lo: 0, hi: 1 }, BlockReason::TimestampResolution)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let status = polls
+            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .unwrap();
+        assert_eq!(status.phase, Phase::Partial);
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(status
+            .error
+            .as_deref()
+            .is_some_and(|s| s.contains("timestamp")));
+        state.no_work = true;
+        let restarted = SourcePolls::default();
+        let a = attempt(&restarted, &source, CachedList::Reviewing);
+        let status = restarted
+            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .unwrap();
+        assert_eq!(status.phase, Phase::Partial);
+        assert!(status.error.is_some());
+        assert!(status.last_received_at.is_none());
     }
     #[test]
     fn accepted_scan_persists_exact_inventory_without_downgrading_earlier_pages() {

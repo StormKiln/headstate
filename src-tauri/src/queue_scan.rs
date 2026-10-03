@@ -12,6 +12,145 @@ pub const VERSION: u32 = 1;
 pub const MEMBERS: usize = 10000;
 pub const CANDIDATES: usize = 1000;
 pub const CONFIRM_DELAY: i64 = 60;
+pub const PARTITION_WINDOWS: usize = 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    pub lo: i64,
+    pub hi: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leaf {
+    pub window: Window,
+    pub after: Option<String>,
+    pub cursors: Vec<String>,
+    pub seen: Vec<PrIdentity>,
+    pub total: Option<u64>,
+    pub pages: u32,
+}
+impl Leaf {
+    pub fn new(window: Window) -> Self {
+        Self {
+            window,
+            after: None,
+            cursors: vec![],
+            seen: vec![],
+            total: None,
+            pages: 0,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionPhase {
+    LowerBound,
+    UpperBound,
+    Leaves,
+    FinalCheck,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockReason {
+    TimestampResolution,
+    WindowLimit,
+    MembershipLimit,
+    InvalidMetadata,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPartition {
+    pub version: u32,
+    pub phase: PartitionPhase,
+    pub lower: Option<i64>,
+    pub upper: Option<i64>,
+    pub pending: VecDeque<Window>,
+    pub active: Option<Leaf>,
+    /// Includes retired parents, so splitting cannot create unbounded work.
+    pub windows_started: usize,
+    pub blocked: Vec<(Window, BlockReason)>,
+}
+impl Default for GithubPartition {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            phase: PartitionPhase::LowerBound,
+            lower: None,
+            upper: None,
+            pending: VecDeque::new(),
+            active: None,
+            windows_started: 0,
+            blocked: vec![],
+        }
+    }
+}
+impl GithubPartition {
+    fn valid(&self) -> bool {
+        let time = |t| DateTime::from_timestamp(t, 0).is_some();
+        let window = |w: &Window| {
+            w.lo <= w.hi
+                && time(w.lo)
+                && time(w.hi)
+                && self.lower.is_some_and(|lo| w.lo >= lo)
+                && self.upper.is_some_and(|hi| w.hi <= hi)
+        };
+        let cursor = |c: &String| !c.is_empty() && c.len() <= 4096;
+        self.version == 1
+            && self.windows_started <= PARTITION_WINDOWS
+            && self.pending.len() + self.blocked.len() + usize::from(self.active.is_some())
+                <= self.windows_started
+            && self.lower.is_none_or(time)
+            && self.upper.is_none_or(time)
+            && self.lower.zip(self.upper).is_none_or(|(lo, hi)| lo <= hi)
+            && self.pending.iter().all(window)
+            && self.blocked.iter().all(|(w, _)| window(w))
+            && self.active.as_ref().is_none_or(|l| {
+                window(&l.window)
+                    && l.pages < 40
+                    && l.seen.len() <= 1000
+                    && l.cursors.len() == l.pages as usize
+                    && l.after.as_ref().is_none_or(cursor)
+                    && l.cursors.iter().all(cursor)
+                    && l.cursors
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == l.cursors.len()
+                    && l.seen
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == l.seen.len()
+                    && l.after.as_ref() == l.cursors.last()
+            })
+            && match self.phase {
+                PartitionPhase::LowerBound => {
+                    self.lower.is_none() && self.upper.is_none() && self.windows_started == 0
+                }
+                PartitionPhase::UpperBound => {
+                    self.lower.is_some() && self.upper.is_none() && self.windows_started == 0
+                }
+                PartitionPhase::Leaves => {
+                    self.lower.is_some()
+                        && self.upper.is_some()
+                        && (self.active.is_some() || !self.pending.is_empty())
+                }
+                PartitionPhase::FinalCheck => {
+                    self.lower.is_some()
+                        && self.upper.is_some()
+                        && self.active.is_none()
+                        && self.pending.is_empty()
+                        && self.windows_started > 0
+                }
+            }
+    }
+}
+fn deserialize_partition<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<GithubPartition>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.map(|v| {
+        serde_json::from_value(v).unwrap_or_else(|_| GithubPartition {
+            version: 0,
+            ..Default::default()
+        })
+    }))
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub identity: PrIdentity,
@@ -24,6 +163,11 @@ pub struct Candidate {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default, deserialize_with = "deserialize_partition")]
+    pub github_partition: Option<GithubPartition>,
+    /// Next inventory position to consider for bounded proof admission.
+    #[serde(default)]
+    pub candidate_position: usize,
     #[serde(default)]
     pub coverage_valid: bool,
     #[serde(default = "default_pass_delay")]
@@ -67,6 +211,8 @@ fn default_pass_delay() -> i64 {
 impl Default for State {
     fn default() -> Self {
         Self {
+            github_partition: None,
+            candidate_position: 0,
             coverage_valid: false,
             pass_delay: default_pass_delay(),
             completed_at: None,
@@ -95,10 +241,29 @@ impl Default for State {
     }
 }
 impl State {
+    /// A local traversal bound is a partial answer, not a failed provider read.
+    pub fn partition_reason(&self) -> Option<String> {
+        let partition = self.github_partition.as_ref()?;
+        let reason = match partition.blocked.first().map(|(_, reason)| reason) {
+            Some(BlockReason::TimestampResolution) => "More than 1,000 matching pull requests share a timestamp window; saved rows are retained.",
+            Some(BlockReason::WindowLimit) => "The queue reached the bounded creation-window scan limit; saved rows are retained.",
+            Some(BlockReason::MembershipLimit) => "A creation window reached the bounded search-page limit; saved rows are retained.",
+            Some(BlockReason::InvalidMetadata) => "A creation window could not be validated; saved rows are retained and the next pass will retry.",
+            None if self.ceiling => "The queue reached the 10,000-identity traversal proof limit; saved rows are retained.",
+            None if self.failures > 0 => "The queue creation bounds could not be validated; saved rows are retained and traversal will retry.",
+            None => return None,
+        };
+        Some(reason.into())
+    }
     pub fn fresh_pass(&mut self) {
         let candidates = std::mem::take(&mut self.candidates);
         let isolate = self.isolate;
         *self = Self {
+            github_partition: self
+                .github_partition
+                .as_ref()
+                .map(|_| GithubPartition::default()),
+            candidate_position: self.candidate_position,
             candidates,
             isolate,
             coverage_valid: self.coverage_valid,
@@ -176,7 +341,7 @@ pub fn load(
             state: State::default(),
         });
     };
-    let state = if stored_owner == owner {
+    let mut state = if stored_owner == owner {
         serde_json::from_str::<State>(&payload)
             .ok()
             .filter(|state| {
@@ -189,6 +354,10 @@ pub fn load(
     } else {
         State::default()
     };
+    if state.github_partition.as_ref().is_some_and(|p| !p.valid()) {
+        state.fresh_pass();
+        state.taint_effect();
+    }
     Ok(Loaded { revision, state })
 }
 
@@ -262,6 +431,167 @@ pub fn taint(
 mod tests {
     use super::*;
     use crate::store::source_cache::{save_owned_source_snapshot, snapshot_owner, Coverage};
+    #[test]
+    fn malformed_partition_resets_only_traversal_not_candidate_or_inventory_ownership() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let mut state = State {
+            github_partition: Some(GithubPartition {
+                phase: PartitionPhase::Leaves,
+                lower: Some(0),
+                upper: Some(10),
+                ..Default::default()
+            }),
+            coverage_valid: true,
+            completed_at: Some(1),
+            completed_total: Some(1),
+            ..Default::default()
+        };
+        state.candidates.push_back(Candidate {
+            identity: PrIdentity {
+                source: source.clone(),
+                repo: "fixture/repo".into(),
+                number: 1,
+            },
+            id: "PR1".into(),
+            head: "head".into(),
+            created_at: Utc::now(),
+            negative_at: Some(1),
+            eligible_at: 2000,
+            failures: 2,
+        });
+        for partition in [
+            serde_json::to_value(state.github_partition.clone()).unwrap(),
+            serde_json::json!({"version":99}),
+            serde_json::json!({"phase":"FuturePhase"}),
+        ] {
+            let mut payload = serde_json::to_value(&state).unwrap();
+            payload["github_partition"] = partition;
+            conn.execute("INSERT OR REPLACE INTO queue_scan(provider,host,list,owner,revision,payload) VALUES('github',?1,?2,'fixture',1,?3)", params![source.host, CachedList::Reviewing.id(), payload.to_string()]).unwrap();
+            let recovered = load(&conn, &source, CachedList::Reviewing, "fixture")
+                .unwrap()
+                .state;
+            assert_eq!(
+                recovered.github_partition.unwrap().phase,
+                PartitionPhase::LowerBound
+            );
+            assert!(!recovered.coverage_valid);
+            assert_eq!(recovered.completed_at, Some(1));
+            assert_eq!(recovered.candidates.len(), 1);
+            assert_eq!(recovered.candidates[0].negative_at, None);
+            assert_eq!(recovered.candidates[0].eligible_at, 2000);
+        }
+    }
+    #[test]
+    fn persisted_exhausted_leaf_cannot_admit_a_forty_first_page() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let window = Window { lo: 0, hi: 100 };
+        let cursors = (1..=40).map(|n| format!("cursor-{n}")).collect::<Vec<_>>();
+        let state = State {
+            github_partition: Some(GithubPartition {
+                phase: PartitionPhase::Leaves,
+                lower: Some(0),
+                upper: Some(100),
+                windows_started: 1,
+                active: Some(Leaf {
+                    after: cursors.last().cloned(),
+                    cursors,
+                    pages: 40,
+                    ..Leaf::new(window)
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = Commit {
+            expected_revision: 0,
+            state,
+            removals: vec![],
+        };
+        assert!(commit(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            "fixture",
+            &next,
+            |_| Ok(())
+        )
+        .unwrap());
+        let loaded = load(&conn, &source, CachedList::Reviewing, "fixture").unwrap();
+        assert_eq!(
+            loaded.state.github_partition.unwrap().phase,
+            PartitionPhase::LowerBound
+        );
+        assert!(loaded.state.tainted);
+    }
+    #[test]
+    fn old_checkpoint_keeps_small_queue_coverage_and_has_no_partition_probes() {
+        let state = State {
+            coverage_valid: true,
+            completed_at: Some(1),
+            completed_total: Some(42),
+            ..Default::default()
+        };
+        let mut payload = serde_json::to_value(state).unwrap();
+        payload.as_object_mut().unwrap().remove("github_partition");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_position");
+        let state: State = serde_json::from_value(payload).unwrap();
+        assert!(state.coverage_valid && state.github_partition.is_none());
+        assert_eq!(state.completed_total, Some(42));
+    }
+    #[test]
+    fn partition_receipts_reject_overtaken_action_without_losing_pending_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let partition = GithubPartition {
+            phase: PartitionPhase::Leaves,
+            lower: Some(0),
+            upper: Some(2),
+            pending: [Window { lo: 0, hi: 1 }, Window { lo: 1, hi: 2 }].into(),
+            windows_started: 3,
+            ..Default::default()
+        };
+        let receipt = Commit {
+            expected_revision: 0,
+            state: State {
+                github_partition: Some(partition.clone()),
+                receipt_id: Some(new_receipt_id()),
+                coverage_valid: true,
+                ..Default::default()
+            },
+            removals: vec![],
+        };
+        assert!(commit(&conn, &source, list, "fixture", &receipt, |tx| {
+            save_owned_source_snapshot(tx, &source, list, &[], &Coverage::Complete, Some("fixture"))
+        })
+        .unwrap());
+        assert!(accepted(&conn, &source, list, "fixture", &receipt).unwrap());
+        let tx = conn.unchecked_transaction().unwrap();
+        taint(&tx, &source, list, "fixture").unwrap();
+        tx.commit().unwrap();
+        assert!(!accepted(&conn, &source, list, "fixture", &receipt).unwrap());
+        assert!(
+            !commit(&conn, &source, list, "fixture", &receipt, |_| panic!(
+                "overtaken rows cannot publish"
+            ))
+            .unwrap()
+        );
+        let loaded = load(&conn, &source, list, "fixture").unwrap();
+        assert_eq!(loaded.state.github_partition, Some(partition));
+        assert!(loaded.state.tainted && !loaded.state.coverage_valid);
+        assert_eq!(
+            snapshot_owner(&conn, &source, list).unwrap().as_deref(),
+            Some("fixture")
+        );
+    }
     #[test]
     fn new_pass_keeps_historical_coverage_but_changed_count_invalidates_it() {
         for count in [74, 76] {
