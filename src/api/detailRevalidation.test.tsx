@@ -7,19 +7,19 @@ import type { PrDetail, PullRequest } from "../types/pr";
 const boundary = vi.hoisted(() => ({ invoke: vi.fn(), detail: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: boundary.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, cb: (event: { payload: unknown }) => void) => { boundary.listeners.set(name, cb); return () => boundary.listeners.delete(name); } }));
-import { usePrDetail, useReviewPr } from "./hooks";
+import { usePrDetail, useReviewPr, useActOnPr } from "./hooks";
 import { useSourceRefresh, refreshWithState } from "./sourceRefreshHooks";
 const row: PullRequest = { ...PR_FIXTURES[0], repo: "synthetic/project", number: 1, head_oid: "h1", base_ref: "main", merge_status: "clean", review: "none", ci: "success", latest_reviews: [], comment_count: 0, unresolved_threads: 0,
   observation: { state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [] } };
 const detail: PrDetail = { ...row, state: "OPEN", body: "Full retained body", merge_queue_enabled: false, comments: [], review_threads: [], review_threads_total: 0, checks: [], checks_total: 0, additions: 1, deletions: 0, changed_files: 1 };
 const key = ["pr-detail", row.repo, 1];
 const clients: QueryClient[] = [];
-function setup() {
+function setup(observing = true) {
   boundary.invoke.mockImplementation((name: string) => name === "get_pr_detail" ? boundary.detail() : Promise.resolve());
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }); clients.push(qc);
   qc.setQueryData(["viewer"], "synthetic-viewer"); qc.setQueryData(key, detail);
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
-  renderHook(() => useSourceRefresh("reviewing"), { wrapper });
+  if (observing) renderHook(() => useSourceRefresh("reviewing"), { wrapper });
   return { qc, wrapper };
 }
 let revision = 0;
@@ -246,3 +246,60 @@ it("catches a source head received during a cold full-detail read without replac
   await waitFor(() => expect(hook.result.current.data?.head_oid).toBe("h2"));
   expect(boundary.detail).toHaveBeenCalledTimes(2);
 });
+
+it.each((["draft", "enqueue"] as const).flatMap(action => [true, false].map(observing => ({ action, observing }))))(
+  "keeps acknowledged $action patches out of provider targets (source observer: $observing)", async ({ action, observing }) => {
+    vi.useFakeTimers();
+    const { qc, wrapper } = setup(observing);
+    const patch = action === "draft" ? { is_draft: true } : { in_merge_queue: true };
+    let answer: { request_id: string; update: import("./sourceRefresh").SourceStatus } = { request_id: "fixture", update: {
+      source: { provider: "github", host: "github.com" }, list: "reviewing", phase: "ready", error: null,
+      session: "session", revision: 1, receipt_revision: 1, prs: [row], coverage: "complete",
+    } };
+    let failed = false;
+    boundary.invoke.mockImplementation((name: string) => {
+      if (name === "get_pr_detail") return boundary.detail();
+      if (name === "refresh_now") return Promise.resolve([]);
+      if (name === "get_reviewing") return failed ? Promise.reject(new Error("Synthetic rejected read")) : Promise.resolve(answer);
+      return Promise.resolve();
+    });
+    await act(async () => { await refreshWithState(qc, "reviewing"); });
+    const pending: ((value: PrDetail) => void)[] = [];
+    boundary.detail.mockImplementation(() => new Promise(resolve => { pending.push(resolve); }));
+    const hook = renderHook(() => ({ detail: usePrDetail(row.repo, 1), act: useActOnPr() }), { wrapper });
+    await act(async () => { await hook.result.current.act(row.id, row.repo, 1, action); });
+    expect(qc.getQueryData<PullRequest[]>(["reviewing"])?.[0]).toMatchObject(patch);
+    // Normal action invalidation owns exactly one held full read. A list patch
+    // must not launch a competing source read that action invalidation cancels.
+    expect(boundary.detail).toHaveBeenCalledTimes(1);
+    await act(async () => { pending.forEach(resolve => resolve(detail)); });
+    // Same receipt, older receipt and status-only replies return the preserved
+    // local patch for display, never as a new provider publication.
+    for (const update of [answer.update, { ...answer.update, revision: 0, receipt_revision: 0 }, { ...answer.update, revision: 2, receipt_revision: null, prs: null }]) {
+      answer = { ...answer, update };
+      await act(async () => { await refreshWithState(qc, "reviewing"); });
+      expect(qc.getQueryData<PullRequest[]>(["reviewing"])?.[0]).toMatchObject(patch);
+      expect(boundary.detail).toHaveBeenCalledTimes(1);
+    }
+    failed = true;
+    await act(async () => { await expect(refreshWithState(qc, "reviewing")).rejects.toThrow("Synthetic rejected read"); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+    expect(boundary.detail).toHaveBeenCalledTimes(1);
+    failed = false;
+    // A genuinely new receipt whose provider facts are unchanged also adds no
+    // detail work, even though it replaces the locally patched display row.
+    answer = { ...answer, update: { ...answer.update, revision: 3, receipt_revision: 2, prs: [row] } };
+    await act(async () => { await refreshWithState(qc, "reviewing"); });
+    expect(qc.getQueryData<PullRequest[]>(["reviewing"])?.[0]).toMatchObject({ is_draft: false, in_merge_queue: false });
+    expect(boundary.detail).toHaveBeenCalledTimes(1);
+    // Provider-confirmed evidence must still be compared to the last provider
+    // row, even when it happens to equal the earlier acknowledged local patch.
+    answer = { ...answer, update: { ...answer.update, revision: 4, receipt_revision: 3, prs: [{ ...row, ...patch }] } };
+    boundary.detail.mockResolvedValue({ ...detail, ...patch });
+    await act(async () => { await refreshWithState(qc, "reviewing"); });
+    expect(boundary.detail).toHaveBeenCalledTimes(2);
+    expect(qc.getQueryData<PrDetail>(key)).toMatchObject(patch);
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+    expect(boundary.detail).toHaveBeenCalledTimes(2);
+  },
+);

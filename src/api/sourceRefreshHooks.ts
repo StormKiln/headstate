@@ -19,7 +19,7 @@ const requestPrefix = crypto.randomUUID();
 function entry(qc: QueryClient, list: List): Entry {
   let lists = entries.get(qc);
   if (!lists) { lists = {}; entries.set(qc, lists); }
-  return lists[list] ??= { state: new SourceRefreshState(), users: 0 };
+  return lists[list] ??= { state: new SourceRefreshState((rows, session) => acceptDetailFacts(qc, rows, session)), users: 0 };
 }
 function observe(qc: QueryClient, list: List, value: Entry) {
   if (value.users++ > 0) return;
@@ -36,7 +36,6 @@ function observe(qc: QueryClient, list: List, value: Entry) {
     if (next !== undefined && next !== rows) {
       rows = next;
       qc.setQueryData([list === "authored" ? "prs" : "reviewing"], next);
-      acceptDetailFacts(qc, next, state.snapshot().session);
     }
   });
   register(listen<SourceStatus>("source-poll-status", ({ payload }) => {
@@ -84,7 +83,6 @@ export async function refreshWithState(qc: QueryClient, list: List): Promise<Pul
     throw new Error(state.snapshot().error ?? "No refreshed snapshot is available yet");
   }
   qc.setQueryData([list === "authored" ? "prs" : "reviewing"], rows);
-  acceptDetailFacts(qc, rows, state.snapshot().session);
   return rows;
 }
 
