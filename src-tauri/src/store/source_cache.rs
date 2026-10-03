@@ -87,6 +87,35 @@ pub fn save_owned_source_snapshot(
     }
     save_payload(conn, source, list, prs, coverage, owner)
 }
+/// Requalifying cached rows after a failed read must not make their receipt younger.
+/// The caller's checkpoint transaction covers this write as well.
+pub fn save_owned_source_failure(
+    conn: &Connection,
+    source: &Source,
+    list: CachedList,
+    prs: &[PullRequest],
+    coverage: &Coverage,
+    owner: &str,
+) -> Result<(), StoreError> {
+    let provider = serde_json::to_value(source.provider)?;
+    let old_time: Option<String> = conn
+        .query_row(
+            "SELECT fetched_at FROM snapshot WHERE provider=?1 AND host=?2 AND id=?3 AND owner=?4",
+            params![provider.as_str(), source.host, list.id(), owner],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(old_time) = old_time else {
+        return Ok(());
+    };
+    save_owned_source_snapshot(conn, source, list, prs, coverage, Some(owner))?;
+    conn.execute(
+        "UPDATE snapshot SET fetched_at=?1 WHERE provider=?2 AND host=?3 AND id=?4 AND owner=?5",
+        params![old_time, provider.as_str(), source.host, list.id(), owner],
+    )?;
+    Ok(())
+}
+
 pub fn save_owned_gitlab_snapshot(
     conn: &Connection,
     source: &Source,

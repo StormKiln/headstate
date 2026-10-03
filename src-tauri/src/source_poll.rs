@@ -31,6 +31,8 @@ pub struct Status {
     pub source: Source,
     pub list: CachedList,
     pub phase: Phase,
+    #[serde(skip)]
+    settled_phase: Option<Phase>,
     pub revision: u64,
     pub receipt_revision: Option<u64>,
     pub request_id: Option<String>,
@@ -47,6 +49,7 @@ impl Status {
             source,
             list,
             phase: Phase::NotRequested,
+            settled_phase: None,
             revision: 0,
             receipt_revision: None,
             request_id: None,
@@ -221,6 +224,11 @@ impl SourcePolls {
         emit: impl FnOnce(Status),
     ) {
         let attempt = &publication.attempt;
+        let scan_state = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.scan.as_ref())
+            .map(|s| s.state.clone());
         let status_result = match result {
             Ok(result) => {
                 let coverage = result.coverage.clone();
@@ -232,7 +240,98 @@ impl SourcePolls {
             }
             Err(error) => Err(error),
         };
-        if let Some(status) = self.finish(attempt, status_result) {
+        let scan_coverage = status_result.as_ref().ok().cloned();
+        let status = if let Some(state) = scan_state.as_ref().filter(|s| s.no_work) {
+            let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            entries
+                .get_mut(&(attempt.source.clone(), attempt.list))
+                .and_then(|(generation, status)| {
+                    if *generation != attempt.generation {
+                        return None;
+                    }
+                    status.revision += 1;
+                    status.phase = status.settled_phase.clone().unwrap_or(Phase::NotRequested);
+                    // A restart can load an owned receipt without fabricating receipt time.
+                    if let Ok(coverage) = status_result {
+                        if status.coverage.is_none() {
+                            status.coverage = Some(coverage);
+                        }
+                    }
+                    if status.phase == Phase::NotRequested {
+                        status.phase = if state.step_failure.is_some() {
+                            Phase::Failed
+                        } else if matches!(status.coverage, Some(Coverage::Complete)) {
+                            Phase::Ready
+                        } else {
+                            Phase::Partial
+                        };
+                        status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+                    }
+                    Some(status.clone())
+                })
+        } else if let Some(failure) = scan_state.as_ref().and_then(|s| s.step_failure.as_ref()) {
+            let current = self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(attempt.source.clone(), attempt.list))
+                .is_some_and(|(generation, _)| *generation == attempt.generation);
+            if !current {
+                // Earlier usable pages may advance rows, never the newer attempt's outcome.
+                if scan_state.as_ref().is_some_and(|s| s.received) {
+                    self.finish(attempt, status_result)
+                } else {
+                    None
+                }
+            } else {
+                let mut status = self.finish(
+                    attempt,
+                    Err(Failure {
+                        message: failure.message.clone(),
+                        transient: failure.transient,
+                        not_asked: failure.not_asked,
+                    }),
+                );
+                if scan_state.as_ref().is_some_and(|s| s.received) {
+                    if let Some(status) = status.as_mut() {
+                        status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                        if let Some((_, stored)) = self
+                            .0
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&(attempt.source.clone(), attempt.list))
+                        {
+                            stored.last_received_at = status.last_received_at.clone();
+                        }
+                    }
+                }
+                status
+            }
+        } else {
+            self.finish(attempt, status_result)
+        };
+        if let Some(mut status) = status {
+            if scan_state.is_some() {
+                if scan_state
+                    .as_ref()
+                    .is_some_and(|s| !s.no_work && s.step_failure.is_some())
+                {
+                    // A changed qualification is a row publication, not a new observation.
+                    status.receipt_revision = Some(status.revision);
+                }
+                if let Some(coverage) = scan_coverage {
+                    status.coverage = Some(coverage);
+                    if let Some((_, stored)) = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&(attempt.source.clone(), attempt.list))
+                    {
+                        stored.coverage = status.coverage.clone();
+                        stored.receipt_revision = status.receipt_revision;
+                    }
+                }
+            }
             emit(status);
         }
         // The publication permit remains held through both the status mutation
@@ -349,6 +448,9 @@ impl SourcePolls {
             .entry((source.clone(), list))
             .or_insert_with(|| (0, Status::new(source.clone(), list)));
         *generation += 1;
+        if status.phase != Phase::Fetching {
+            status.settled_phase = Some(status.phase.clone());
+        }
         status.phase = Phase::Fetching;
         status.revision += 1;
         status.request_id = request_id;
@@ -532,6 +634,25 @@ pub async fn fetch_github_step(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_mode(app, client, list, budget, false).await
+}
+
+pub(crate) async fn fetch_github_continuation(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_mode(app, client, list, budget, true).await
+}
+
+async fn fetch_github_step_mode(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    continuation: bool,
+) -> Result<FetchedList, crate::github::client::ClientError> {
     use crate::github::{admission::ReadContext, client::ClientError};
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
@@ -542,7 +663,7 @@ pub async fn fetch_github_step(
     };
     let owner = viewer.clone();
     let path = crate::commands::db_path(app);
-    let (loaded, rows) =
+    let (mut loaded, rows) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
             let conn = crate::store::open_db(&path)?;
             let conn = conn.unchecked_transaction()?;
@@ -564,9 +685,33 @@ pub async fn fetch_github_step(
         .await
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
-    client
-        .advance_scan(list, loaded, &rows, chrono::Utc::now().timestamp())
-        .await
+    let now = chrono::Utc::now().timestamp();
+    loaded.state.pass_delay = crate::poll::clamp_interval(
+        app.state::<crate::poll::PollInterval>()
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ) as i64;
+    if continuation && !crate::poll::queue_continuation_due(&loaded.state, now, true, true, true) {
+        loaded.state.no_work = true;
+        return Ok(FetchedList {
+            viewer: Some(viewer),
+            prs: vec![],
+            total: loaded.state.total,
+            coverage: if loaded.state.coverage_valid {
+                Coverage::Complete
+            } else {
+                Coverage::Partial {
+                    total: loaded.state.total,
+                }
+            },
+            scan: Some(crate::queue_scan::Commit {
+                expected_revision: loaded.revision,
+                state: loaded.state,
+                removals: vec![],
+            }),
+        });
+    }
+    client.advance_scan(list, loaded, &rows, now).await
 }
 
 /// Called with the source publication permit held, before persistence and emission.
@@ -633,6 +778,9 @@ fn reconcile_github_snapshot(
             {
                 result.prs = prs;
                 result.coverage = coverage;
+                if let Some(scan) = &mut result.scan {
+                    scan.state.no_work = true;
+                }
                 return Ok(result);
             }
             return Err(inventory_failure(
@@ -659,17 +807,64 @@ fn reconcile_github_snapshot(
     } else {
         vec![]
     };
-    result.prs = crate::inventory::reconcile(
-        previous,
-        result.prs,
-        matches!(result.coverage, Coverage::Complete),
-        chrono::Utc::now(),
-    );
+    if let Some(scan) = result.scan.as_ref().filter(|s| s.state.no_work) {
+        let loaded = crate::queue_scan::load(conn, source, list, owner)
+            .map_err(|_| inventory_failure("The queue checkpoint could not be read."))?;
+        if loaded.revision != scan.expected_revision {
+            return Err(inventory_failure(
+                "The queue changed during this step. Its newer progress was retained.",
+            ));
+        }
+        result.prs = previous;
+        if let crate::store::source_cache::SnapshotData::Available { coverage, .. } =
+            crate::store::source_cache::load_source_snapshot(conn, source, list)
+                .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+                .data
+        {
+            result.coverage = coverage;
+        }
+        return Ok(result);
+    }
+    result.prs = if result
+        .scan
+        .as_ref()
+        .is_some_and(|s| s.state.step_failure.is_some())
+    {
+        crate::inventory::reconcile(previous, result.prs, false, chrono::Utc::now())
+    } else if result.scan.is_some() {
+        crate::inventory::reconcile_delta(previous, result.prs, chrono::Utc::now())
+    } else {
+        crate::inventory::reconcile(
+            previous,
+            result.prs,
+            matches!(result.coverage, Coverage::Complete),
+            chrono::Utc::now(),
+        )
+    };
     if let Some(scan) = &result.scan {
         result
             .prs
             .retain(|row| !scan.removals.contains(&row.identity()));
+        if scan.state.done {
+            for row in &mut result.prs {
+                if !scan.state.seen.contains(&row.identity()) {
+                    if let Some(observation) = row.observation.as_mut() {
+                        observation.state = crate::inventory::ObservationState::Retained;
+                    }
+                }
+            }
+        }
         let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            if scan.state.step_failure.is_some() && !scan.state.received {
+                return crate::store::source_cache::save_owned_source_failure(
+                    tx,
+                    source,
+                    list,
+                    &result.prs,
+                    &result.coverage,
+                    owner,
+                );
+            }
             crate::store::source_cache::save_owned_source_snapshot(
                 tx,
                 source,
@@ -1851,7 +2046,7 @@ mod tests {
         assert_eq!(result.last_received_at, None);
     }
     #[test]
-    fn accepted_scan_persists_exact_inventory_and_only_this_steps_rows_are_fresh() {
+    fn accepted_scan_persists_exact_inventory_without_downgrading_earlier_pages() {
         use crate::{
             inventory::ObservationState,
             queue_scan::{Commit, State},
@@ -1895,7 +2090,7 @@ mod tests {
             .observation
             .as_ref()
             .unwrap();
-        assert_eq!(old.state, ObservationState::Retained);
+        assert_eq!(old.state, ObservationState::Observed);
         assert_eq!(old.last_observed_at, stamp);
         assert_eq!(
             accepted

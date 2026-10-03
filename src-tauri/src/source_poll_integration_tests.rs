@@ -189,7 +189,7 @@ async fn integrated_inventory_publications_retain_large_owned_progress_through_o
     let mut frames = serde_json::Map::new();
     let mut counts = vec![];
     let mut now = 1000;
-    // Real coherent Complete is the small baseline, never fabricated for 275 rows.
+    // Small atomic baseline; large completion later proves traversal coverage only.
     let first = client
         .advance_scan(
             CachedList::Reviewing,
@@ -253,7 +253,7 @@ async fn integrated_inventory_publications_retain_large_owned_progress_through_o
             .unwrap()
             .data,
         SnapshotData::Available {
-            coverage: Coverage::Partial { total: Some(275) },
+            coverage: Coverage::Complete,
             ..
         }
     ));
@@ -483,4 +483,419 @@ async fn integrated_inventory_publications_retain_large_owned_progress_through_o
     }
     let expected: Value = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
     assert_eq!(artifact, expected);
+}
+
+async fn stable_queue(total: usize) -> (MockServer, GitHubClient) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let start = body["variables"]["after"].as_str()
+                .and_then(|s| s.strip_prefix("cursor-"))
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let end = (start + 25).min(total);
+            ResponseTemplate::new(200).set_body_json(json!({"data":{
+                "viewer":{"login":"synthetic-viewer"},
+                "authored":{"issueCount":total,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),
+                "pageInfo":{"hasNextPage":end<total,"endCursor":format!("cursor-{end}")}}
+            }}))
+        }).mount(&server).await;
+    let client = github_client(&server);
+    client.fetch_viewer().await.unwrap();
+    (server, client)
+}
+
+async fn scan_and_publish(
+    polls: &SourcePolls,
+    conn: &rusqlite::Connection,
+    client: &GitHubClient,
+    now: i64,
+) {
+    let loaded = queue_scan::load(
+        conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        "synthetic-viewer",
+    )
+    .unwrap();
+    let previous =
+        match source_cache::load_source_snapshot(conn, &Source::default(), CachedList::Reviewing)
+            .unwrap()
+            .data
+        {
+            SnapshotData::Available { prs, .. } => prs,
+            _ => vec![],
+        };
+    let result = client
+        .advance_scan(CachedList::Reviewing, loaded, &previous, now)
+        .await
+        .unwrap();
+    publish(polls, conn, Ok(result)).await;
+}
+
+#[tokio::test]
+async fn healthy_terminal_delta_establishes_coverage_without_losing_prior_pages() {
+    let (_server, client) = stable_queue(75).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    let first = saved(&conn);
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    let rows = saved(&conn);
+    assert_eq!(
+        rows.len(),
+        75,
+        "terminal delta cannot replace earlier pages"
+    );
+    assert_eq!(
+        polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .coverage,
+        Some(Coverage::Complete)
+    );
+    for old in first {
+        let row = rows
+            .iter()
+            .find(|r| r.identity() == old.identity())
+            .unwrap();
+        assert_eq!(
+            row.observation, old.observation,
+            "unrelated tail page cannot restamp or downgrade evidence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooldown_no_work_preserves_receipt_and_observation_freshness() {
+    let (server, client) = stable_queue(20).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    let rows = saved(&conn);
+    let status = polls.get(&Source::default(), CachedList::Reviewing);
+    let before = server.received_requests().await.unwrap().len();
+    scan_and_publish(&polls, &conn, &client, 1001).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(saved(&conn), rows);
+    let after = polls.get(&Source::default(), CachedList::Reviewing);
+    assert_eq!(after.phase, Phase::Ready);
+    assert_eq!(after.last_received_at, status.last_received_at);
+    assert_eq!(after.receipt_revision, status.receipt_revision);
+}
+
+#[tokio::test]
+async fn first_step_does_not_repeat_the_head_page_it_just_observed() {
+    let (server, client) = stable_queue(75).await;
+    let before = server.received_requests().await.unwrap().len();
+    let result = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded {
+                revision: 0,
+                state: queue_scan::State::default(),
+            },
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.prs.len(), 50);
+    assert_eq!(
+        server.received_requests().await.unwrap().len() - before,
+        2,
+        "two unique pages, no redundant head refresh"
+    );
+}
+
+#[tokio::test]
+async fn failed_page_is_qualified_and_backoff_preserves_failure_receipt() {
+    let (server, client) = stable_queue(75).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    conn.execute("UPDATE snapshot SET fetched_at='2020-01-01 00:00:00'", [])
+        .unwrap();
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    let failed = polls.get(&Source::default(), CachedList::Reviewing);
+    let fetched_at: String = conn
+        .query_row("SELECT fetched_at FROM snapshot", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        fetched_at, "2020-01-01 00:00:00",
+        "a failed read cannot make the saved snapshot younger"
+    );
+    assert!(
+        matches!(failed.phase, Phase::Retrying | Phase::Failed),
+        "real page failure must not report successful Partial"
+    );
+    assert!(failed.error.is_some());
+    let before = server.received_requests().await.unwrap().len();
+    let rows = saved(&conn);
+    scan_and_publish(&polls, &conn, &client, 1016).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(saved(&conn), rows);
+    let after = polls.get(&Source::default(), CachedList::Reviewing);
+    assert_eq!(after.last_received_at, failed.last_received_at);
+    assert_eq!(after.consecutive_failures, failed.consecutive_failures);
+    assert_eq!(after.phase, failed.phase);
+}
+
+#[tokio::test]
+async fn configured_new_pass_cadence_is_measured_from_completion() {
+    let (server, client) = stable_queue(20).await;
+    let result = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded {
+                revision: 0,
+                state: queue_scan::State {
+                    pass_delay: 300,
+                    ..queue_scan::State::default()
+                },
+            },
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
+    let state = result.scan.unwrap().state;
+    let before = server.received_requests().await.unwrap().len();
+    let early = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded { revision: 1, state },
+            &result.prs,
+            1299,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before,
+        "300-second setting must not restart at60"
+    );
+    let ready = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded {
+                revision: 1,
+                state: early.scan.unwrap().state,
+            },
+            &result.prs,
+            1300,
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), before + 1);
+    assert_eq!(ready.coverage, Coverage::Complete);
+}
+
+#[tokio::test]
+async fn successive_large_traversals_keep_evidence_and_bound_requests() {
+    let (server, client) = stable_queue(275).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    for pass in 0..3 {
+        let before = server.received_requests().await.unwrap().len();
+        for step in 0..6 {
+            let rows_before = match source_cache::load_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Reviewing,
+            )
+            .unwrap()
+            .data
+            {
+                SnapshotData::Available { prs, .. } => prs,
+                _ => vec![],
+            };
+            scan_and_publish(&polls, &conn, &client, 1000 + pass * 195 + step * 15).await;
+            let rows = saved(&conn);
+            assert!(rows.iter().all(|r| r.observation.as_ref().unwrap().state
+                == crate::inventory::ObservationState::Observed));
+            for old in rows_before {
+                let next = rows
+                    .iter()
+                    .find(|r| r.identity() == old.identity())
+                    .unwrap();
+                assert!(
+                    next.observation.as_ref().unwrap().last_observed_at
+                        >= old.observation.as_ref().unwrap().last_observed_at
+                );
+            }
+            if pass > 0 {
+                assert_eq!(
+                    polls
+                        .get(&Source::default(), CachedList::Reviewing)
+                        .coverage,
+                    Some(Coverage::Complete)
+                );
+            }
+        }
+        assert_eq!(saved(&conn).len(), 275);
+        assert_eq!(
+            polls.get(&Source::default(), CachedList::Reviewing).phase,
+            Phase::Ready
+        );
+        assert!(server.received_requests().await.unwrap().len() - before <= 16);
+        let state = queue_scan::load(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "synthetic-viewer",
+        )
+        .unwrap()
+        .state;
+        assert!(state.done);
+        assert_eq!(state.pages, 11);
+    }
+}
+
+#[tokio::test]
+async fn increasing_configured_interval_delays_an_already_finished_pass() {
+    let (server, client) = stable_queue(20).await;
+    let result = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded {
+                revision: 0,
+                state: queue_scan::State {
+                    pass_delay: 120,
+                    ..Default::default()
+                },
+            },
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
+    let mut state = result.scan.unwrap().state;
+    state.pass_delay = 300;
+    let before = server.received_requests().await.unwrap().len();
+    let result = client
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::Loaded { revision: 1, state },
+            &result.prs,
+            1299,
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert!(result.scan.unwrap().state.no_work);
+}
+
+#[tokio::test]
+async fn changed_count_qualifies_coverage_and_missing_member_without_removing_it() {
+    let (_server, client) = stable_queue(75).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    let old = saved(&conn).into_iter().find(|r| r.number == 75).unwrap();
+    let (_server, changed) = stable_queue(74).await;
+    scan_and_publish(&polls, &conn, &changed, 1200).await;
+    assert_eq!(
+        polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .coverage,
+        Some(Coverage::Partial { total: Some(74) })
+    );
+    scan_and_publish(&polls, &conn, &changed, 1215).await;
+    let rows = saved(&conn);
+    assert_eq!(
+        rows.len(),
+        75,
+        "non-atomic absence is not authority to remove a member"
+    );
+    let omitted = rows
+        .iter()
+        .find(|r| r.number == 75)
+        .unwrap()
+        .observation
+        .as_ref()
+        .unwrap();
+    assert_eq!(omitted.state, crate::inventory::ObservationState::Retained);
+    assert_eq!(
+        omitted.last_observed_at,
+        old.observation.unwrap().last_observed_at
+    );
+    let state = queue_scan::load(
+        &conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        "synthetic-viewer",
+    )
+    .unwrap()
+    .state;
+    assert_eq!(state.candidates.len(), 1);
+    assert_eq!(state.candidates[0].identity.number, 75);
+}
+
+#[tokio::test]
+async fn provider_cooldown_refusal_does_not_downgrade_a_saved_receipt() {
+    let (server, client) = stable_queue(20).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    let rows = saved(&conn);
+    let status = polls.get(&Source::default(), CachedList::Reviewing);
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "60")
+                .set_body_json(json!({"message":"Synthetic provider cooldown"})),
+        )
+        .mount(&server)
+        .await;
+    assert!(client
+        .fetch_viewer_metered(&client.request_budget())
+        .await
+        .is_err());
+    let before = server.received_requests().await.unwrap().len();
+    scan_and_publish(&polls, &conn, &client, 1200).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(saved(&conn), rows);
+    let after = polls.get(&Source::default(), CachedList::Reviewing);
+    assert_eq!(after.phase, status.phase);
+    assert_eq!(after.coverage, status.coverage);
+    assert_eq!(after.last_received_at, status.last_received_at);
+    assert_eq!(after.receipt_revision, status.receipt_revision);
+}
+
+#[tokio::test]
+async fn head_refresh_failure_is_qualified_without_losing_successful_tail_pages() {
+    let (server, client) = stable_queue(275).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    server.reset().await;
+    Mock::given(method("POST")).respond_with(|request:&wiremock::Request| {
+        let body:Value=request.body_json().unwrap();
+        let Some(start)=body["variables"]["after"].as_str().and_then(|s|s.strip_prefix("cursor-")).and_then(|s|s.parse::<usize>().ok()) else {
+            return ResponseTemplate::new(503);
+        };
+        let end=start+25;
+        ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":275,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{end}")}}}}))
+    }).mount(&server).await;
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    assert_eq!(saved(&conn).len(), 100);
+    assert!(matches!(
+        polls.get(&Source::default(), CachedList::Reviewing).phase,
+        Phase::Retrying | Phase::Failed
+    ));
+    assert!(server.received_requests().await.unwrap().len() <= 3);
 }

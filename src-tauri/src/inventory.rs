@@ -120,6 +120,25 @@ pub fn reconcile<T: InventoryRow>(
     complete: bool,
     now: DateTime<Utc>,
 ) -> Vec<T> {
+    reconcile_rows(previous, incoming, complete, false, now)
+}
+
+/// A page delta says nothing about identities omitted from that page.
+pub fn reconcile_delta<T: InventoryRow>(
+    previous: Vec<T>,
+    incoming: Vec<T>,
+    now: DateTime<Utc>,
+) -> Vec<T> {
+    reconcile_rows(previous, incoming, false, true, now)
+}
+
+fn reconcile_rows<T: InventoryRow>(
+    previous: Vec<T>,
+    incoming: Vec<T>,
+    complete: bool,
+    delta: bool,
+    now: DateTime<Utc>,
+) -> Vec<T> {
     let mut prior: std::collections::HashMap<_, _> =
         previous.into_iter().map(|r| (r.identity(), r)).collect();
     let mut output = Vec::with_capacity(incoming.len() + prior.len());
@@ -193,7 +212,9 @@ pub fn reconcile<T: InventoryRow>(
                 retained_fields: vec![],
                 confirmed_review: None,
             });
-            observation.state = ObservationState::Retained;
+            if !delta {
+                observation.state = ObservationState::Retained;
+            }
             if let Some(effect) = &mut observation.confirmed_review {
                 qualify_review_effect(effect, now);
             }

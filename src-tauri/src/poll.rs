@@ -1161,6 +1161,106 @@ fn tick_state(failure: Option<bool>) -> &'static str {
     }
 }
 
+/// A separate timer advances existing visible queue traversals only. Hidden
+/// windows use the ordinary configured cadence; no second hidden poll exists.
+pub(crate) fn queue_continuation_due(
+    state: &crate::queue_scan::State,
+    now: i64,
+    focused: bool,
+    view_needs_github: bool,
+    enabled: bool,
+) -> bool {
+    focused
+        && view_needs_github
+        && enabled
+        && !state.done
+        && state.started_at.is_some()
+        && now >= state.eligible_at
+}
+
+async fn continue_queues(
+    app: AppHandle,
+    client: Arc<GitHubClient>,
+    focused: Arc<AtomicBool>,
+    view_needs_github: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) {
+    loop {
+        // Sleep after work: failed/paused/cooldown queues never busy-loop.
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let Some(owner) = client
+            .known_viewer()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let visible = focused.load(Ordering::Relaxed);
+            let needed = view_needs_github.load(Ordering::Relaxed);
+            let enabled = enabled.load(Ordering::Relaxed);
+            if !visible || !needed || !enabled {
+                break;
+            }
+            let path = crate::commands::db_path(&app);
+            let owner = owner.clone();
+            let due = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).ok()?;
+                let loaded =
+                    crate::queue_scan::load(&conn, &Source::default(), list, &owner).ok()?;
+                Some(queue_continuation_due(
+                    &loaded.state,
+                    chrono::Utc::now().timestamp(),
+                    visible,
+                    needed,
+                    enabled,
+                ))
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if !due {
+                continue;
+            }
+            let attempt = source_poll::begin(&app, Source::default(), list).await;
+            let scoped = client.with_read_context(crate::github::admission::ReadContext::new(
+                crate::github::admission::ReadClass::Background,
+                FETCH_TIMEOUT,
+            ));
+            let fetched =
+                source_poll::fetch_github_continuation(&app, &scoped, list, FETCH_TIMEOUT).await;
+            let publication = if fetched.is_ok() {
+                source_poll::success_publication(&app, &attempt).await
+            } else {
+                source_poll::publication(&app, &attempt).await
+            };
+            let Some(publication) = publication else {
+                continue;
+            };
+            let result = match fetched {
+                Ok(result) => source_poll::reconcile_github(&app, &publication, result).await,
+                Err(error) => Err(source_poll::Failure::from(&error)),
+            };
+            if let Ok(result) = &result {
+                if list == CachedList::Reviewing {
+                    emit_reviewing(&app, result);
+                } else {
+                    persist_and_emit(
+                        &app,
+                        &result.prs,
+                        result.coverage.clone(),
+                        result.viewer.clone(),
+                        true,
+                    )
+                    .await;
+                }
+            }
+            source_poll::complete(&app, publication, result);
+        }
+    }
+}
+
 pub fn spawn(
     app: AppHandle,
     client: Arc<GitHubClient>,
@@ -1170,6 +1270,13 @@ pub fn spawn(
     view_needs_github: Arc<AtomicBool>,
     github_source_enabled: Arc<AtomicBool>,
 ) {
+    tauri::async_runtime::spawn(continue_queues(
+        app.clone(),
+        client.clone(),
+        focused.clone(),
+        view_needs_github.clone(),
+        github_source_enabled.clone(),
+    ));
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
         // Whether a tick has ever completed, so `newly_appeared` has
@@ -1914,6 +2021,34 @@ async fn emit_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_continuations_only_advance_due_visible_existing_passes() {
+        let mut state = crate::queue_scan::State {
+            started_at: Some(1000),
+            eligible_at: 1015,
+            ..Default::default()
+        };
+        assert!(!queue_continuation_due(&state, 1014, true, true, true));
+        assert!(queue_continuation_due(&state, 1015, true, true, true));
+        for flags in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!queue_continuation_due(
+                &state, 2000, flags.0, flags.1, flags.2
+            ));
+        }
+        state.done = true;
+        assert!(!queue_continuation_due(&state, 2000, true, true, true));
+        state.done = false;
+        state.started_at = None;
+        assert!(!queue_continuation_due(&state, 2000, true, true, true));
+        // Configured full-poll cadence stays independent of queue progress.
+        assert_eq!(interval_for_secs(true, 300), Duration::from_secs(300));
+        assert_eq!(interval_for_secs(false, 300), Duration::from_secs(1500));
+    }
+
     #[test]
     fn backfill_dense_day_resumes_until_all_120_rows_are_stored() {
         use crate::github::stats::{backfill as bf, budget};
