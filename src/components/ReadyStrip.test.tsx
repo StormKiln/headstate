@@ -563,7 +563,7 @@ describe("ReadyStrip last pusher", () => {
     ];
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_ready_pushers", expect.anything()));
-    await waitFor(() => expect(status()).toBe("1 not checked yet"));
+    await waitFor(() => expect(status()).toBe("1 could not be decided"));
     expect(screen.getByText("Mine")).toBeTruthy();
     expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
   });
