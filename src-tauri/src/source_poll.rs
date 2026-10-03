@@ -651,6 +651,35 @@ async fn fetch_github_step_mode(
     budget: std::time::Duration,
     continuation: bool,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_at(
+        crate::commands::db_path(app),
+        client,
+        list,
+        budget,
+        continuation,
+        || {
+            (
+                app.state::<crate::poll::PollInterval>()
+                    .0
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                chrono::Utc::now().timestamp(),
+            )
+        },
+    )
+    .await
+}
+
+/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
+/// tests. The caller supplies the clock reading and configured interval; all
+/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+pub(crate) async fn fetch_github_step_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    continuation: bool,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, crate::github::client::ClientError> {
     use crate::github::{admission::ReadContext, client::ClientError};
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
@@ -660,7 +689,6 @@ async fn fetch_github_step_mode(
         None => client.fetch_viewer().await?,
     };
     let owner = viewer.clone();
-    let path = crate::commands::db_path(app);
     let (mut loaded, rows) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
             let conn = crate::store::open_db(&path)?;
@@ -683,12 +711,10 @@ async fn fetch_github_step_mode(
         .await
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
-    let now = chrono::Utc::now().timestamp();
-    loaded.state.pass_delay = crate::poll::clamp_interval(
-        app.state::<crate::poll::PollInterval>()
-            .0
-            .load(std::sync::atomic::Ordering::Relaxed),
-    ) as i64;
+    // Match the desktop path's timing: a blocked checkpoint load must not
+    // freeze an old clock reading or a superseded interval setting.
+    let (interval_secs, now) = timing();
+    loaded.state.pass_delay = crate::poll::clamp_interval(interval_secs) as i64;
     if continuation && !crate::poll::queue_continuation_due(&loaded.state, now, true, true, true) {
         loaded.state.no_work = true;
         return Ok(FetchedList {
@@ -719,16 +745,29 @@ pub async fn reconcile_github(
     publication: &Publication,
     result: FetchedList,
 ) -> Result<FetchedList, Failure> {
+    reconcile_github_at(
+        crate::commands::db_path(app),
+        &app.state::<SourcePolls>(),
+        publication,
+        result,
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_github_at(
+    path: std::path::PathBuf,
+    polls: &SourcePolls,
+    publication: &Publication,
+    result: FetchedList,
+) -> Result<FetchedList, Failure> {
     let list = publication.attempt.list;
     let source = publication.attempt.source.clone();
-    let previous = app
-        .state::<SourcePolls>()
+    let previous = polls
         .2
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(source.clone(), list))
         .map(|(_, receipt)| receipt.clone());
-    let path = crate::commands::db_path(app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = crate::store::open_db(&path)
             .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
@@ -1098,8 +1137,36 @@ async fn record_github_effect(
     viewer: &str,
     effect: GithubEffect,
 ) {
+    record_github_effect_at(
+        crate::commands::db_path(app),
+        &app.state::<SourcePolls>(),
+        repo,
+        number,
+        viewer,
+        effect,
+        |event| match event {
+            Ok(update) => {
+                let _ = app.emit("source-poll-status", update);
+            }
+            Err(message) => {
+                let _ = app.emit("store-error", message);
+            }
+        },
+    )
+    .await;
+}
+
+// Shared receipt transaction; the platform shell only delivers its events.
+async fn record_github_effect_at(
+    path: std::path::PathBuf,
+    polls: &SourcePolls,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: GithubEffect,
+    mut emit: impl FnMut(Result<Update, &'static str>),
+) {
     let source = Source::default();
-    let polls = app.state::<SourcePolls>();
     for list in [CachedList::Authored, CachedList::Reviewing] {
         let _guard = polls.gate(&source, list).lock_owned().await;
         let existing = polls
@@ -1112,7 +1179,7 @@ async fn record_github_effect(
         let mut receipt = if let Some(receipt) = existing {
             receipt
         } else {
-            let path = crate::commands::db_path(app);
+            let path = path.clone();
             let source = source.clone();
             let owner = viewer.to_string();
             let rows = tauri::async_runtime::spawn_blocking(move || {
@@ -1203,7 +1270,7 @@ async fn record_github_effect(
         }
         // The effect itself advances generation before any old request can publish.
         let generation = polls.effect_generation(&source, list);
-        let path = crate::commands::db_path(app);
+        let path = path.clone();
         let saved = receipt.clone();
         let saved_source = source.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
@@ -1212,10 +1279,9 @@ async fn record_github_effect(
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
-            let _ = app.emit(
-                "store-error",
+            emit(Err(
                 "The confirmed review could not be saved for offline use.",
-            );
+            ));
         }
         polls
             .2
@@ -1229,7 +1295,7 @@ async fn record_github_effect(
             status.coverage = Some(receipt.coverage);
             status.phase = Phase::Unknown;
             let update = polls.update(status.clone(), None);
-            let _ = app.emit("source-poll-status", update);
+            emit(Ok(update));
         }
     }
 }

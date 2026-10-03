@@ -50,8 +50,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
     const now = performance.now();
     if (consumer === "detail") prioritizeAdvisoryDetail(qc, (JSON.parse(signature) as unknown[][]).map(key => JSON.stringify(key)));
     for (const key of JSON.parse(signature) as string[][]) {
-      const query = qc.getQueryCache().find({ queryKey: key, exact: true });
-      const receipt = query?.state.data as Receipt | undefined;
+      const receipt = qc.getQueryData<Receipt>(key);
       if (receipt && receipt.expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick, consumer]);

@@ -1185,3 +1185,450 @@ async fn coalesced_adoption_cannot_settle_an_independent_newer_failure() {
         assert_eq!(after.receipt_revision, first.receipt_revision);
     }
 }
+
+/// This drives the same sleeping dispatcher and persisted fetch path used by
+/// poll::spawn, rather than calling advance_scan at a list of timestamps.
+#[tokio::test(start_paused = true)]
+async fn production_continuation_timer_respects_visibility_and_finishes_durable_passes() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    tokio::time::resume();
+    let (server, client) = stable_queue(275).await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("scheduler.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = Arc::new(SourcePolls::default());
+    let client = Arc::new(client);
+    let now = Arc::new(AtomicI64::new(1000));
+    let focused = Arc::new(AtomicBool::new(true));
+    let needed = Arc::new(AtomicBool::new(true));
+    let enabled = Arc::new(AtomicBool::new(true));
+    let mut pass_start = server.received_requests().await.unwrap().len();
+    let first = fetch_github_step_at(
+        path.clone(),
+        &client,
+        CachedList::Reviewing,
+        Duration::from_secs(30),
+        false,
+        || (120, 1000),
+    )
+    .await
+    .unwrap();
+    publish(&polls, &conn, Ok(first)).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = tokio::spawn(crate::poll::run_queue_continuations(
+        focused.clone(),
+        needed.clone(),
+        enabled.clone(),
+        {
+            let client = client.clone();
+            let polls = polls.clone();
+            let path = path.clone();
+            let now = now.clone();
+            move |list| {
+                let client = client.clone();
+                let polls = polls.clone();
+                let path = path.clone();
+                let now = now.clone();
+                let tx = tx.clone();
+                async move {
+                    // The production fetch adapter rechecks the durable owner,
+                    // continuation eligibility and attempt limit at dispatch.
+                    let scoped = client.with_read_context(ReadContext::new(
+                        ReadClass::Background,
+                        Duration::from_secs(30),
+                    ));
+                    let (attempt, _) = polls.begin_attempt(Source::default(), list).await;
+                    let result = fetch_github_step_at(
+                        path.clone(),
+                        &scoped,
+                        list,
+                        Duration::from_secs(30),
+                        true,
+                        || (120, now.load(Ordering::SeqCst)),
+                    )
+                    .await
+                    .unwrap();
+                    let permit = polls.success_publication(&attempt).await.unwrap();
+                    let result = reconcile_github_at(path, &polls, &permit, result).await;
+                    polls.complete(permit, result, |_| {});
+                    tx.send(list).unwrap();
+                }
+            }
+        },
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    for flag in [&focused, &needed, &enabled] {
+        flag.store(false, Ordering::SeqCst);
+        let before = server.received_requests().await.unwrap().len();
+        now.fetch_add(15, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+        flag.store(true, Ordering::SeqCst);
+    }
+    for pass in 0..3 {
+        if pass > 0 {
+            pass_start = server.received_requests().await.unwrap().len();
+            now.fetch_add(120, Ordering::SeqCst);
+            tokio::time::resume();
+            let first = fetch_github_step_at(
+                path.clone(),
+                &client,
+                CachedList::Reviewing,
+                Duration::from_secs(30),
+                false,
+                || (120, now.load(Ordering::SeqCst)),
+            )
+            .await
+            .unwrap();
+            publish(&polls, &conn, Ok(first)).await;
+            tokio::time::pause();
+        }
+        for _ in 0..5 {
+            let before = server.received_requests().await.unwrap().len();
+            now.fetch_add(15, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(15)).await;
+            // Real sockets and blocking SQLite are allowed to complete. Virtual
+            // time drives the timer; it does not stand in for provider completion.
+            tokio::time::resume();
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            tokio::time::pause();
+            assert!(server.received_requests().await.unwrap().len() - before <= 3);
+            if pass > 0 {
+                assert_eq!(saved(&conn).len(), 275);
+                assert_eq!(
+                    polls
+                        .get(&Source::default(), CachedList::Reviewing)
+                        .coverage,
+                    Some(Coverage::Complete)
+                );
+            }
+        }
+        assert!(server.received_requests().await.unwrap().len() - pass_start <= 16);
+        assert_eq!(saved(&conn).len(), 275);
+        assert_eq!(
+            polls
+                .get(&Source::default(), CachedList::Reviewing)
+                .coverage,
+            Some(Coverage::Complete)
+        );
+        assert_eq!(
+            saved(&conn)
+                .iter()
+                .map(|row| row.identity())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            275
+        );
+    }
+    let before = server.received_requests().await.unwrap().len();
+    let rows = saved(&conn);
+    let status_before = polls.get(&Source::default(), CachedList::Reviewing);
+    // Even well after the next-pass deadline, the continuation timer must
+    // not start a fresh scan. Only an ordinary/foreground refresh can do so.
+    now.fetch_add(3600, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(saved(&conn), rows);
+    assert_eq!(
+        polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .coverage,
+        Some(Coverage::Complete)
+    );
+    let status_after = polls.get(&Source::default(), CachedList::Reviewing);
+    assert_eq!(status_after.phase, Phase::Ready);
+    assert_eq!(
+        status_after.last_received_at,
+        status_before.last_received_at
+    );
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_continuation_allows_real_detail_and_review_and_cannot_erase_receipt() {
+    use crate::github::mutate::{BoundReviewOutcome, BoundReviewRequest};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    tokio::time::resume();
+    let hold = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let router = axum::Router::new().route("/graphql", axum::routing::post({
+        let hold = hold.clone(); let entered = entered.clone(); let release = release.clone();
+        let active = active.clone(); let peak = peak.clone(); let requests = requests.clone();
+        move |axum::Json(body): axum::Json<Value>| {
+            let hold = hold.clone(); let entered = entered.clone(); let release = release.clone();
+            let active = active.clone(); let peak = peak.clone(); let requests = requests.clone();
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                requests.lock().unwrap().push(body.clone());
+                let query = body["query"].as_str().unwrap();
+                let data = if query.contains("addPullRequestReview") {
+                    json!({"addPullRequestReview":{"pullRequestReview":{"id":"REVIEW-1","state":"APPROVED","submittedAt":"2026-10-01T12:00:00Z","author":{"login":"synthetic-viewer"},"commit":{"oid":"head-1"},"pullRequest":{"id":"PR_1","number":1,"repository":{"nameWithOwner":"octocat/repo-1"}}}}})
+                } else if query.contains("isMergeQueueEnabled") {
+                    json!({"repository":{"pullRequest":{"id":"PR_1","number":1,"title":"Synthetic review 1","body":"Read while continuation is pending","headRefOid":"head-1","baseRefName":"main","mergeStateStatus":"CLEAN","commits":{"nodes":[]},"comments":{"totalCount":1,"nodes":[{"id":"C1","body":"Synthetic comment","createdAt":"2026-10-01T12:00:00Z","author":{"login":"synthetic-author"}}]}}}})
+                } else if query.contains("search(") {
+                    if hold.swap(false, Ordering::SeqCst) { entered.notify_one(); release.notified().await; }
+                    let start = body["variables"]["after"].as_str().and_then(|s|s.strip_prefix("cursor-")).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
+                    let end = (start+25).min(275);
+                    json!({"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":275,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":end<275,"endCursor":format!("cursor-{end}")}}})
+                } else { json!({"viewer":{"login":"synthetic-viewer"}}) };
+                active.fetch_sub(1, Ordering::SeqCst);
+                axum::Json(json!({"data":data}))
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = Arc::new(GitHubClient::new(
+        octocrab::Octocrab::builder()
+            .base_uri(format!("http://{address}"))
+            .unwrap()
+            .personal_token("synthetic-token")
+            .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+            .build()
+            .unwrap(),
+    ));
+    client.fetch_viewer().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("overlap.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = Arc::new(SourcePolls::default());
+    for step in 0..6 {
+        let fetched = fetch_github_step_at(
+            path.clone(),
+            &client,
+            CachedList::Reviewing,
+            Duration::from_secs(30),
+            false,
+            || (120, 1000 + 15 * step),
+        )
+        .await
+        .unwrap();
+        publish(&polls, &conn, Ok(fetched)).await;
+    }
+    assert_eq!(saved(&conn).len(), 275);
+    let first = fetch_github_step_at(
+        path.clone(),
+        &client,
+        CachedList::Reviewing,
+        Duration::from_secs(30),
+        false,
+        || (120, 1195),
+    )
+    .await
+    .unwrap();
+    publish(&polls, &conn, Ok(first)).await;
+    let baseline = saved(&conn);
+    let before = requests.lock().unwrap().len();
+    hold.store(true, Ordering::SeqCst);
+    let now = Arc::new(AtomicI64::new(1210));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let visible = Arc::new(AtomicBool::new(true));
+    let worker = tokio::spawn(crate::poll::run_queue_continuations(
+        visible.clone(),
+        visible.clone(),
+        visible,
+        {
+            let client = client.clone();
+            let path = path.clone();
+            let polls = polls.clone();
+            move |list| {
+                let client = client.clone();
+                let path = path.clone();
+                let polls = polls.clone();
+                let now = now.clone();
+                let tx = tx.clone();
+                async move {
+                    if list == CachedList::Authored {
+                        return;
+                    }
+                    let (attempt, _) = polls.begin_attempt(Source::default(), list).await;
+                    let scoped = client.with_read_context(ReadContext::new(
+                        ReadClass::Background,
+                        Duration::from_secs(30),
+                    ));
+                    let fetched = fetch_github_step_at(
+                        path.clone(),
+                        &scoped,
+                        list,
+                        Duration::from_secs(30),
+                        true,
+                        || (120, now.load(Ordering::SeqCst)),
+                    )
+                    .await
+                    .unwrap();
+                    let published = if let Some(permit) = polls.success_publication(&attempt).await
+                    {
+                        let result = reconcile_github_at(path, &polls, &permit, fetched).await;
+                        polls.complete(permit, result, |_| {});
+                        true
+                    } else {
+                        false
+                    };
+                    tx.send(published).unwrap();
+                }
+            }
+        },
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    let foreground = client.with_read_context(ReadContext::new(
+        ReadClass::Foreground,
+        Duration::from_secs(3),
+    ));
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        foreground.fetch_pr_detail("octocat/repo-1", 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(detail.body, "Read while continuation is pending");
+    assert_eq!(detail.comments.len(), 1);
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        1,
+        "background response is still held"
+    );
+    let outcome = foreground
+        .add_review_at_head(&BoundReviewRequest {
+            id: detail.id,
+            repo: "octocat/repo-1".into(),
+            number: 1,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: detail.head_oid,
+            expected_viewer: "synthetic-viewer".into(),
+        })
+        .await;
+    let BoundReviewOutcome::Acknowledged { receipt } = outcome else {
+        panic!("review not acknowledged: {outcome:?}");
+    };
+    assert_eq!(receipt.commit_oid, "head-1");
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Review(crate::inventory::ConfirmedReview {
+            head_oid: receipt.commit_oid.clone(),
+            review: crate::github::model::ReviewState::Approved,
+            confirmed_at: chrono::Utc::now(),
+            receipt: Some(receipt),
+            unresolved: false,
+            confirmed_by_read: false,
+        }),
+        |event| {
+            assert!(event.is_ok());
+        },
+    )
+    .await;
+    let confirmed = saved(&conn);
+    assert!(confirmed[0]
+        .observation
+        .as_ref()
+        .unwrap()
+        .confirmed_review
+        .is_some());
+    assert_eq!(confirmed.len(), baseline.len());
+    assert_eq!(
+        confirmed[0].observation.as_ref().unwrap().last_observed_at,
+        baseline[0].observation.as_ref().unwrap().last_observed_at
+    );
+    let held_calls = requests.lock().unwrap().len();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        held_calls,
+        "no second timer dispatch while provider is pending"
+    );
+    tokio::time::resume();
+    release.notify_one();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "pre-review continuation must not publish over the receipt"
+    );
+    assert_eq!(saved(&conn), confirmed);
+    {
+        let calls = requests.lock().unwrap();
+        assert!(
+            calls.len() - before <= 5,
+            "three background attempts plus one detail and one write"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|b| b["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("addPullRequestReview"))
+                .count(),
+            1
+        );
+        let write = calls
+            .iter()
+            .find(|body| {
+                body["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("addPullRequestReview")
+            })
+            .unwrap();
+        assert_eq!(write["variables"]["head"], "head-1");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "actual simultaneous provider handlers"
+        );
+    }
+    let completed_calls = requests.lock().unwrap().len();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(14)).await;
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        completed_calls,
+        "sleep is measured after completion, not original dispatch"
+    );
+    tokio::time::resume();
+    worker.abort();
+    let _ = worker.await;
+    server.abort();
+    let _ = server.await;
+}

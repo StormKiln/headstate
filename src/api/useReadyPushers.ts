@@ -55,8 +55,8 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   useEffect(() => {
     const now = performance.now();
     for (const key of JSON.parse(signature) as string[][]) {
-      const query = qc.getQueryCache().find({ queryKey: key, exact: true });
-      if (query?.state.data !== undefined && (query.state.data as Receipt).expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+      const receipt = qc.getQueryData<Receipt>(key);
+      if (receipt !== undefined && receipt.expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick]);
   const read = (pr: PullRequest) => qc.getQueryData<Receipt>(["ready-pushers", owner, session.generation, keyOf(pr)]);

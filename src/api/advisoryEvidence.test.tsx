@@ -294,3 +294,22 @@ it("rearms the next rendered expiry when native-aged receipts expire between sha
   expect(view.result.current.hidden).toBe(14);
   expect(invoke.mock.calls).toHaveLength(calls);
 });
+
+// Exact expiry reads must not walk unrelated cache entries (#1660). Count real
+// key-hasher calls rather than asserting a machine-dependent duration.
+it("reads selected advisory expiry without hashing every unrelated cached query", async () => {
+  let unrelatedProbes = 0;
+  for (let i = 0; i < 512; i++) {
+    qc.setQueryDefaults(["unrelated", i], { queryKeyHashFn: key => {
+      if (key[0] !== "unrelated") unrelatedProbes++;
+      return JSON.stringify(key);
+    } });
+    qc.setQueryData(["unrelated", i], i);
+  }
+  unrelatedProbes = 0;
+  const view = renderHook(() => ({ stack: useReadyStacks(rows), pusher: useReadyPushers(rows) }), { wrapper });
+  await advance(5);
+  expect(view.result.current.stack.displayOf?.(rows[0])).toBeDefined();
+  expect(invoke.mock.calls.length).toBe(16);
+  expect(unrelatedProbes).toBe(0);
+});
