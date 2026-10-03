@@ -79,7 +79,7 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   expect(screen.getAllByRole("heading", { name: /Ready for review \(275\)/ })).toHaveLength(2);
   await emit("partial");
   expect(screen.queryByText("Synthetic review 276")).toBeNull();
-  expect(screen.getAllByText("Last known — not confirmed by latest refresh").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Last known").some(status => status.getAttribute("title") === "Last known — not confirmed by latest refresh")).toBe(true);
   const desktop = within(screen.getByTestId("desktop"));
   fireEvent.click(desktop.getByText("Synthetic review 1"));
   await desktop.findByText("Retained integrated description");

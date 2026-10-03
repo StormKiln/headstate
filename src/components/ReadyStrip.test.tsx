@@ -29,7 +29,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn((name: string, handler: 
   return Promise.resolve(() => eventHandlers.delete(name));
 }) }));
 
-import { ReadyStrip } from "./ReadyStrip";
+import { ReadyObservationStatus, ReadyStrip } from "./ReadyStrip";
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { remoteEventError } from "@/api/wireContract";
 import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
@@ -106,7 +106,7 @@ describe("ReadyStrip", () => {
       act(() => eventHandlers.get("source-poll-status")!({ payload }));
       if (stage === "changed_head" || stage === "retained_unread_without_effect") {
         await waitFor(() => expect(screen.getByText("Ready one")).toBeTruthy());
-        if (stage === "retained_unread_without_effect") expect(screen.getByText(/Last known — not confirmed/)).toBeTruthy();
+        if (stage === "retained_unread_without_effect") expect(screen.getByText("Last known").getAttribute("title")).toMatch(/not confirmed/);
       } else expect(screen.queryByText("Ready one")).toBeNull();
     }
   });
@@ -140,7 +140,10 @@ describe("ReadyStrip", () => {
   it("is keyboard reachable, like the attention strip", () => {
     const onOpen = vi.fn();
     render(<ReadyStrip prs={[ready]} onOpen={onOpen} />);
-    fireEvent.keyDown(screen.getByRole("button", { name: /ready one/i }), { key: "Enter" });
+    const button = screen.getByRole("button", { name: /ready one/i });
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    fireEvent.keyDown(button, { key: "Enter" });
     expect(onOpen).toHaveBeenCalledWith(ready);
   });
 
@@ -269,6 +272,7 @@ describe("ReadyStrip age", () => {
   const ageOf = (number: number) =>
     screen
       .getByRole("button", { name: new RegExp(`^PR ${number}(?!\\d)`) })
+      .closest("li")!
       .querySelector("[data-ready-age]") as HTMLElement;
 
   // Fake timers pin `Date` too, so no assertion depends on the machine
@@ -316,16 +320,13 @@ describe("ReadyStrip age", () => {
     const at = hoursAgo(3);
     const since = new Date(at).toLocaleString();
     render(<ReadyStrip prs={[row(1, at)]} onOpen={vi.fn()} />);
-    expect(
-      screen.getByRole("button", { name: new RegExp(`ready for review since ${since}`) }),
-    ).toBeTruthy();
     expect(ageOf(1).getAttribute("title")).toBe(`Ready for review since ${since}`);
     expect(ageOf(1).getAttribute("datetime")).toBe(at);
   });
 
   it("says in the accessible name when the ready time is unknown", () => {
     render(<ReadyStrip prs={[row(1, null)]} onOpen={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /ready-for-review time unknown/i })).toBeTruthy();
+    expect(ageOf(1).getAttribute("title")).toBe("Ready-for-review time unknown");
   });
 
   it("shows the age on a plain-link row too", () => {
@@ -359,8 +360,7 @@ describe("ReadyStrip unresolved conversations", () => {
     expect(chip?.textContent).toBe("3");
     expect(chip?.getAttribute("data-unresolved")).toBe("exact");
     expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
-    // The row's accessible name carries the count, not only the colour.
-    expect(screen.getByRole("button", { name: /3 unresolved conversations/ })).toBeTruthy();
+    expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
   });
 
   it("shows nothing for zero", () => {
@@ -374,9 +374,7 @@ describe("ReadyStrip unresolved conversations", () => {
     const chip = container.querySelector("[data-unresolved]");
     expect(chip?.textContent).toBe("3+");
     expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
-    expect(
-      screen.getByRole("button", { name: /at least 3 unresolved conversations/ }),
-    ).toBeTruthy();
+    expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
   });
 
   // A payload from an older desktop has no flag: qualified, not exact.
@@ -387,7 +385,7 @@ describe("ReadyStrip unresolved conversations", () => {
 
   it("singular for one", () => {
     render(<ReadyStrip prs={[withThreads(1, false)]} onOpen={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /\b1 unresolved conversation(?!s)/ })).toBeTruthy();
+    expect(document.querySelector("[data-unresolved]")?.getAttribute("title")).toBe("1 unresolved conversation");
   });
 
   it("tags a plain-link row too", () => {
@@ -534,11 +532,9 @@ describe("ReadyStrip last pusher", () => {
     render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
     await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).not.toBeNull());
     expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(1);
-    expect(
-      screen.getByRole("button", {
-        name: /^Mine.*you pushed the latest commit, so your approval won't count here/,
-      }),
-    ).toBeTruthy();
+    expect(document.querySelector("[data-pushed-by-you]")?.getAttribute("title")).toBe(
+      "You pushed the latest commit, so your approval won't count here",
+    );
     expect(screen.getByRole("button", { name: /^Theirs/ }).textContent).not.toMatch(/you pushed/);
     // Show hides nothing and says nothing.
     expect(status()).toBe("");
@@ -769,7 +765,77 @@ describe("Ready stack context (#1602)", () => {
 it("keeps an omitted last-known Ready row visibly qualified", async () => {
   render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
   expect(screen.getByText("Ready one")).toBeTruthy();
-  expect(screen.getByText("Last known — not confirmed by latest refresh")).toBeTruthy();
+  expect(screen.getByText("Last known")).toBeTruthy();
+});
+
+describe("Ready observation status", () => {
+  const longTitle = "A deliberately long pull request title that must keep its status compact without losing the complete explanation";
+  const cases = [
+    { name: "retained", visible: "Last known", explanation: "Last known — not confirmed by latest refresh", observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } },
+    { name: "unknown", visible: "Unconfirmed", explanation: "Readiness could not be confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: ["ci" as const], retained_fields: [] } },
+    { name: "confirmed", visible: "Confirmed", explanation: "Your review is confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z", confirmed_by_read: true } } },
+    { name: "pending", visible: "Pending", explanation: "Your submitted review is awaiting confirmation in the list", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z" } } },
+  ];
+
+  it.each(cases)("renders $name as a concise status with its full explanation", (item) => {
+    const pr = { ...ready, id: item.name, number: ready.number + cases.indexOf(item), observation: item.observation };
+    const view = render(<ReadyObservationStatus pr={pr} focusable />);
+    const status = screen.getByText(item.visible);
+    expect(status.textContent).toBe(item.visible);
+    expect(status.getAttribute("title")).toBe(item.explanation);
+    expect(document.getElementById(status.getAttribute("aria-describedby")!)?.textContent).toBe(item.explanation);
+    expect(status.getAttribute("tabindex")).toBe("0");
+    status.focus();
+    fireEvent.focus(status);
+    expect(document.activeElement).toBe(status);
+    expect(screen.getByRole("tooltip").textContent).toBe(item.explanation);
+    fireEvent.keyDown(status, { key: "Escape" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(document.activeElement).toBe(status);
+    fireEvent.click(status);
+    expect(screen.getByRole("tooltip").textContent).toBe(item.explanation);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    view.unmount();
+  });
+
+  it("keeps a near-top disclosure below through focus, click and explanation changes", () => {
+    const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.getAttribute("role") === "tooltip"
+        ? new DOMRect(0, 0, 288, 60)
+        : new DOMRect(350, 0, 32, 20);
+    });
+    const retained = { ...ready, observation: cases[0].observation };
+    const view = render(<ReadyObservationStatus pr={retained} focusable />);
+    const status = screen.getByRole("button", { name: "Last known" });
+    status.focus();
+    fireEvent.focus(status);
+    fireEvent.click(status);
+    expect(screen.getByRole("tooltip").style.top).toBe("24px");
+    expect(screen.getByRole("tooltip").style.transform).toBe("");
+    view.rerender(<ReadyObservationStatus pr={{ ...retained, observation: cases[3].observation }} focusable />);
+    expect(screen.getByRole("tooltip").textContent).toBe(cases[3].explanation);
+    expect(screen.getByRole("tooltip").style.top).toBe("24px");
+    expect(screen.getByRole("tooltip").style.transform).toBe("");
+    rect.mockRestore();
+  });
+
+  it.each([true, false])("keeps a long retained title compact and described in the interactive=%s row", (interactive) => {
+    const item = cases[0];
+    const pr = { ...ready, title: longTitle, observation: item.observation };
+    render(<ReadyStrip prs={[pr]} onOpen={interactive ? vi.fn() : undefined} />);
+    const status = screen.getByText("Last known");
+    const explanation = document.getElementById(status.getAttribute("aria-describedby")!);
+    if (interactive) {
+      expect(screen.getByRole("button", { name: new RegExp(longTitle) })).toBeTruthy();
+      expect(status.getAttribute("tabindex")).toBe("0");
+    } else {
+      expect(screen.getByRole("link", { name: longTitle })).toBeTruthy();
+      expect(status.getAttribute("tabindex")).toBe("0");
+    }
+    expect(screen.getByText(longTitle).closest("[data-ready-title]")?.className).toContain("min-w-0");
+    expect(explanation?.textContent).toBe(item.explanation);
+  });
 });
 
 it("bounds two actual mounted 120-row owners and advances beyond the unreadable prefix", async () => {
