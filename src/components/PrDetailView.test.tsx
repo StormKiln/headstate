@@ -1,4 +1,9 @@
-vi.mock("../api/reviewOperations", () => ({ useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
+vi.mock("@tanstack/react-query", async original => {
+  const actual = await original<typeof import("@tanstack/react-query")>();
+  const client = new actual.QueryClient();
+  return { ...actual, useQueryClient: () => client };
+});
+vi.mock("../api/reviewOperations", () => ({ reviewAccountGeneration: () => 0, useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
 vi.mock("@/api/useReadyStacks", () => ({ useReadyStacks: () => ({ of: (pr: PrDetail) => pr.stack }) }));
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

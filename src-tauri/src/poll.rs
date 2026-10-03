@@ -17,54 +17,16 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
-/// Default focused cadence, in seconds.
-///
-/// Two minutes rather than one: PR state rarely changes minute-to-minute,
-/// and a tick costs 4 rate-limit points, so halving the rate halves the
-/// spend for no practical loss of freshness.
-///
-/// At 120s that is 30 ticks/hour x 4 = **120 points/hour** of 5,000.
-///
-/// The cost figure is per TICK, which is two searches -- see
-/// `MIN_FOCUSED_SECS` for the measurement and for what the "6 points"
-/// these comments used to quote actually described.
+/// Default interval between completed queue passes. Continuations of an
+/// already-started visible pass have a separate 15-second clock.
 pub const DEFAULT_FOCUSED_SECS: u64 = 120;
 
-/// Floor on the configured interval.
-///
-/// # What a tick costs, measured
-///
-/// 4 rate-limit points, not the 6 these comments claimed (#842, #844).
-/// Both numbers were wrong in both directions and for the same reason: 6
-/// was measured on a document carrying TWO search aliases, which
-/// `PRS_QUERY`'s own doc records was split into one search per request --
-/// and nothing re-measured afterwards. Meanwhile the tick grew a SECOND
-/// request, so reasoning from one fetch understated it by half.
-///
-/// MEASURED live 2026-09-11, `gh api graphql -F first=25`, the document
-/// extracted verbatim from `PRS_QUERY` with its `#` comment lines
-/// stripped, 3 runs per row:
-///
-/// | Search (`poll.rs` line)                     | Cost | Wall clock  |
-/// |---------------------------------------------|------|-------------|
-/// | `is:pr is:open author:@me` (`:835`)         | 2    | 2.31-2.56s  |
-/// | `is:pr is:open review-requested:@me` (`:851`)| 2   | 0.84-0.99s  |
-///
-/// = **4 points per tick** when the ready-to-review notification is on,
-/// which is the default. The second search is skipped when it is off, so
-/// 2 is the floor and 4 is what to budget for.
-///
-/// # Why 60s and not 30
-///
-/// At 60s that is 60 ticks/hour x 4 = **240 points/hour**; at 30s it
-/// would be 480. Both survive a 5,000/hour budget, but the app should not
-/// be able to consume a tenth of the user's own `gh` allowance on a
-/// setting they picked without knowing the cost.
-///
-/// `both_cadences_stay_well_inside_the_rate_limit` asserts against THIS
-/// value rather than the default, so a user choosing the fastest allowed
-/// setting still cannot blow through the guard -- and it now reasons from
-/// the measured 4 rather than from a count of connection names.
+/// Minimum configured new-pass interval. Historical measurements on 2026-09-11
+/// charged 2 GraphQL points per PRS_QUERY document (25 rows), or 4 for the then
+/// two-search tick. They do not price today's incremental scans, retries,
+/// advisory/detail reads or foreground actions. HTTP attempt bounds are not
+/// GraphQL point bounds; current provider quota headers and admission reserves
+/// govern requests. Current aggregate GraphQL cost has not been measured.
 pub const MIN_FOCUSED_SECS: u64 = 60;
 pub const MAX_FOCUSED_SECS: u64 = 3600;
 
@@ -93,15 +55,8 @@ pub fn clamp_interval(secs: u64) -> u64 {
 /// waiting a full tick.
 pub const RECHECK_DELAY: Duration = Duration::from_secs(5);
 
-/// The cadence for the current window state, given a configured interval.
-///
-/// A tick costs 4 rate-limit points -- TWO sequential searches at a
-/// measured 2 each, see `MIN_FOCUSED_SECS` for the table -- so the default
-/// 120s focused cadence spends **120 points/hour** against a 5,000/hour
-/// budget, and the 60s floor spends 240.
-///
-/// `both_cadences_stay_well_inside_the_rate_limit` asserts the FLOOR, not
-/// the default, so no reachable setting can blow the budget.
+/// Ordinary poll cadence for the current window state. This does not include
+/// visible queue continuations or user-triggered traffic and is not a quota proof.
 pub fn interval_for_secs(focused: bool, configured_secs: u64) -> Duration {
     let secs = clamp_interval(configured_secs);
     Duration::from_secs(if focused {
@@ -1161,6 +1116,127 @@ fn tick_state(failure: Option<bool>) -> &'static str {
     }
 }
 
+/// A separate timer advances existing visible queue traversals only. Hidden
+/// windows use the ordinary configured cadence; no second hidden poll exists.
+pub(crate) fn queue_continuation_due(
+    state: &crate::queue_scan::State,
+    now: i64,
+    focused: bool,
+    view_needs_github: bool,
+    enabled: bool,
+) -> bool {
+    focused
+        && view_needs_github
+        && enabled
+        && !state.done
+        && state.started_at.is_some()
+        && now >= state.eligible_at
+}
+
+/// The production continuation clock and visibility dispatch boundary. The
+/// adapter owns checkpoint/provider/publication work; sleeping happens after
+/// both lists complete, so pending or refused work cannot create a busy loop.
+pub(crate) async fn run_queue_continuations<F, Fut>(
+    focused: Arc<AtomicBool>,
+    view_needs_github: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    mut dispatch: F,
+) where
+    F: FnMut(CachedList) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            if !focused.load(Ordering::Relaxed)
+                || !view_needs_github.load(Ordering::Relaxed)
+                || !enabled.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            dispatch(list).await;
+        }
+    }
+}
+
+async fn continue_queues(
+    app: AppHandle,
+    client: Arc<GitHubClient>,
+    focused: Arc<AtomicBool>,
+    view_needs_github: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) {
+    run_queue_continuations(focused, view_needs_github, enabled, move |list| {
+        let app = app.clone();
+        let client = client.clone();
+        async move {
+            let Some(owner) = client
+                .known_viewer()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+            else {
+                return;
+            };
+            let path = crate::commands::db_path(&app);
+            let owner = owner.clone();
+            let due = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).ok()?;
+                let loaded =
+                    crate::queue_scan::load(&conn, &Source::default(), list, &owner).ok()?;
+                Some(queue_continuation_due(
+                    &loaded.state,
+                    chrono::Utc::now().timestamp(),
+                    true,
+                    true,
+                    true,
+                ))
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if !due {
+                return;
+            }
+            let attempt = source_poll::begin(&app, Source::default(), list).await;
+            let scoped = client.with_read_context(crate::github::admission::ReadContext::new(
+                crate::github::admission::ReadClass::Background,
+                FETCH_TIMEOUT,
+            ));
+            let fetched =
+                source_poll::fetch_github_continuation(&app, &scoped, list, FETCH_TIMEOUT).await;
+            let publication = if fetched.is_ok() {
+                source_poll::success_publication(&app, &attempt).await
+            } else {
+                source_poll::publication(&app, &attempt).await
+            };
+            let Some(publication) = publication else {
+                return;
+            };
+            let result = match fetched {
+                Ok(result) => source_poll::reconcile_github(&app, &publication, result).await,
+                Err(error) => Err(source_poll::Failure::from(&error)),
+            };
+            if let Ok(result) = &result {
+                if list == CachedList::Reviewing {
+                    emit_reviewing(&app, result);
+                } else {
+                    persist_and_emit(
+                        &app,
+                        &result.prs,
+                        result.coverage.clone(),
+                        result.viewer.clone(),
+                        true,
+                    )
+                    .await;
+                }
+            }
+            source_poll::complete(&app, publication, result);
+        }
+    })
+    .await;
+}
+
 pub fn spawn(
     app: AppHandle,
     client: Arc<GitHubClient>,
@@ -1170,6 +1246,13 @@ pub fn spawn(
     view_needs_github: Arc<AtomicBool>,
     github_source_enabled: Arc<AtomicBool>,
 ) {
+    tauri::async_runtime::spawn(continue_queues(
+        app.clone(),
+        client.clone(),
+        focused.clone(),
+        view_needs_github.clone(),
+        github_source_enabled.clone(),
+    ));
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
         // Whether a tick has ever completed, so `newly_appeared` has
@@ -1914,6 +1997,34 @@ async fn emit_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_continuations_only_advance_due_visible_existing_passes() {
+        let mut state = crate::queue_scan::State {
+            started_at: Some(1000),
+            eligible_at: 1015,
+            ..Default::default()
+        };
+        assert!(!queue_continuation_due(&state, 1014, true, true, true));
+        assert!(queue_continuation_due(&state, 1015, true, true, true));
+        for flags in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!queue_continuation_due(
+                &state, 2000, flags.0, flags.1, flags.2
+            ));
+        }
+        state.done = true;
+        assert!(!queue_continuation_due(&state, 2000, true, true, true));
+        state.done = false;
+        state.started_at = None;
+        assert!(!queue_continuation_due(&state, 2000, true, true, true));
+        // Configured full-poll cadence stays independent of queue progress.
+        assert_eq!(interval_for_secs(true, 300), Duration::from_secs(300));
+        assert_eq!(interval_for_secs(false, 300), Duration::from_secs(1500));
+    }
+
     #[test]
     fn backfill_dense_day_resumes_until_all_120_rows_are_stored() {
         use crate::github::stats::{backfill as bf, budget};
@@ -2724,68 +2835,11 @@ mod tests {
         assert!(on_worktrees.as_secs() > 0, "must not stop");
     }
 
-    /// Budget guard for BOTH cadences, against the MEASURED cost of the
-    /// shipped query and a deny-list that refuses the connections nobody
-    /// has priced.
-    ///
-    /// # Why a deny-list replaced the count (#842)
-    ///
-    /// The previous version summed occurrences of eight connection names and
-    /// asserted the total was 7. Its own comment recorded the failure mode
-    /// twice -- "a NESTED connection is invisible to a substring count of its
-    /// parent, so a new connection has to be listed here BY NAME" -- and then
-    /// shipped a third instance of it: `commits(` was never on the list, and
-    /// `commits(last: 1)` is the connection that WRAPS the entire
-    /// check-status subtree in `query.rs`.
-    ///
-    /// So the logic is inverted, copying `stats/query.rs:604-620`: split at
-    /// the node selection and DENY every paged connection that has not been
-    /// explicitly approved. "Count the ones I remembered" cannot catch the
-    /// next addition; "refuse the ones I have not approved" can, because the
-    /// next addition is by definition not on the approved list.
-    ///
-    /// # The numbers, re-measured
-    ///
-    /// Both old numbers were stale: the assertion said `cost == 7` and the
-    /// failure message said "7 connections = 4 points", against a shipped
-    /// query that costs **2**.
-    ///
-    /// #842 records a disagreement about whether `commits(` is one of those
-    /// two points -- the auditor measured yes, the issue's own author could
-    /// not reproduce it from hand-built approximations. I settled it with the
-    /// auditor's method: the document extracted VERBATIM from `PRS_QUERY`
-    /// with its `#` comment lines stripped, `gh api graphql -F first=25`,
-    /// three runs per row, 2026-09-11, against `is:pr is:open author:@me`:
-    ///
-    /// | Document                            | Cost | Wall clock  |
-    /// |-------------------------------------|------|-------------|
-    /// | shipped, verbatim                   | **2**| 2.31-2.56s  |
-    /// | same, `commits(last: 1)` block gone | **1**| 2.04-2.26s  |
-    /// | same, `reviewThreads(` block gone   | 2    | 2.18-2.56s  |
-    /// | same, inner `contexts(` block gone  | 2    | 2.68-3.34s  |
-    ///
-    /// The auditor was right and the reproduction attempt was not: removing
-    /// `commits(` halves the cost, while removing either of the two sibling
-    /// paged connections leaves it at 2. So the marginal point is `commits(`
-    /// specifically, not "whichever connection is dropped last" -- which is
-    /// the hypothesis the hand-built approximations could not distinguish.
-    /// `commits(` is **1 of 2 points, 50% of per-poll spend**, and the old
-    /// guard could not see it.
-    ///
-    /// # Per TICK, not per query
-    ///
-    /// A tick issues TWO searches (`poll.rs:835` and `:851`), and each is its
-    /// own request at its own cost. Measured the same day, same method:
-    /// `is:pr is:open author:@me` cost 2 in 2.31-2.56s, `is:pr is:open
-    /// review-requested:@me` cost 2 in 0.84-0.99s. So a tick costs **4**
-    /// points with ready-to-review on, which is the default.
-    ///
-    /// The budget arithmetic below is therefore against 4, not 2. At the
-    /// FLOOR cadence that is 240/hr of 5,000 -- which is why this is an
-    /// accuracy defect rather than a budget risk, and why the old 7 was
-    /// never unsafe, only wrong.
+    /// Preserve the historically measured query shape. This guard prevents
+    /// unpriced connection expansion; it does not measure current GraphQL cost
+    /// or bound aggregate traffic from continuations/advisories/detail/actions.
     #[test]
-    fn both_cadences_stay_well_inside_the_rate_limit() {
+    fn queue_query_keeps_historically_measured_connection_shape() {
         let q = crate::github::query::PRS_QUERY;
         assert!(
             q.contains("search("),
@@ -2812,8 +2866,8 @@ mod tests {
             .1;
 
         // APPROVED paged connections: each one is in the shipped document,
-        // has been measured, and its cost is accounted for in MEASURED_COST
-        // below. Anything else nested here is REFUSED until somebody
+        // was included in the historical document measurement
+        // recorded beside PRS_QUERY. Anything else nested here is REFUSED until somebody
         // measures it -- which is the whole inversion #842 asks for.
         const APPROVED: [&str; 8] = [
             // #1407's ready-for-review time. Measured free: 2 before and
@@ -2862,78 +2916,19 @@ mod tests {
                  `first:`/`last:` ARGUMENT, so this may have changed what every \
                  poll costs. Measure the LIVE cost -- extract the document, \
                  strip the `#` comment lines, run it with `rateLimit {{ cost }}` \
-                 -- then update MEASURED_COST and add the name here. \
+                 -- then record the measurement and add the name here. \
                  (`commits(` was missing from the previous guard and is 1 of the \
                  2 points: measured 2 -> 1 with it removed, 2026-09-11.)"
             );
         }
         // And the approved connections must still BE there: a deny-list
         // refuses additions but cannot notice a removal, and removing one
-        // would make MEASURED_COST an overstatement.
+        // would change the historically measured shape.
         for c in APPROVED {
             assert!(
                 nodes.contains(c),
                 "`{c}` is approved and measured but no longer in the document; \
-                 re-measure before lowering MEASURED_COST"
-            );
-        }
-
-        /// MEASURED live 2026-09-11, `gh api graphql -F first=25`, the
-        /// document extracted verbatim from `PRS_QUERY` with `#` comment
-        /// lines stripped: **cost 2**, 3 runs (2.31s, 2.32s, 2.56s).
-        ///
-        /// RE-MEASURED 2026-09-16 for #1089, same method, after adding
-        /// `totalCount` to `assignees`, `reviewRequests`, `latestReviews`
-        /// and `labels` and raising `latestReviews` from 5 to 20: still
-        /// **cost 2**, 3 runs (2.47s, 2.63s, 2.68s), and 2 again against
-        /// `repo:kubernetes/kubernetes` before and after. So this figure
-        /// stands rather than being carried forward on faith.
-        ///
-        /// RE-MEASURED 2026-09-24 for #1407, same method, after adding
-        /// `timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1)`:
-        /// **cost 2** before and after, three runs each, on the authored
-        /// and review-requested searches and on four busy public
-        /// repositories.
-        ///
-        /// Why it did not move, which is the reusable part: GitHub prices
-        /// the `first:` ARGUMENT, not the field or the page size
-        /// (`stats/query.rs:694-720` measured `reviews { totalCount }` at
-        /// 1 point and `reviews(first: 1) { totalCount }` at 2). All four
-        /// connections were paged already, so `totalCount` rides along on
-        /// something being paid for either way, and widening a window
-        /// that already exists changes nothing.
-        ///
-        /// Not a count of anything. The previous guard's number was a count
-        /// of connection appearances asserted to be 7, which had drifted
-        /// three separate times from a live cost that was 2 -- so this is
-        /// the measurement itself, with the method recorded beside it so the
-        /// next reader can repeat it rather than trust it.
-        const MEASURED_COST: u64 = 2;
-        /// Searches per TICK. `poll.rs:835` fetches the authored list and
-        /// `:851` the review queue, sequentially, each its own request.
-        ///
-        /// Measured the same day and the same way: authored cost 2 in
-        /// 2.31-2.56s, review-requested cost 2 in 0.84-0.99s. The second is
-        /// issued only when the ready-to-review notification is on, which is
-        /// the DEFAULT -- so 2 is the cadence docs' real shape, and reasoning
-        /// from one fetch understated every figure by half.
-        const SEARCHES_PER_TICK: u64 = 2;
-        let cost = MEASURED_COST * SEARCHES_PER_TICK;
-
-        // The FLOOR, not the default: a user picking the fastest allowed
-        // setting must still be inside budget, or this guard only protects
-        // people who never touch the setting.
-        //
-        // At the floor that is 60 ticks/hr x 4 = 240 points of 5,000. The
-        // old assertion reasoned from 7 and passed for the wrong reason;
-        // this one reasons from 4 and passes for the right one.
-        for focused in [true, false] {
-            let per_hour = 3600 / interval_for_secs(focused, MIN_FOCUSED_SECS).as_secs();
-            let points = per_hour * cost;
-            assert!(
-                points < 500,
-                "{} polling would spend {points}/hr of a 5000 budget",
-                if focused { "focused" } else { "background" }
+                 record the changed query shape and re-measure its cost"
             );
         }
     }

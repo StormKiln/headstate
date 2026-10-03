@@ -328,7 +328,14 @@ impl ReadTransport {
             }
             drop(permit);
             match result {
-                Err(ref error) if attempt == 1 && error.is_transient() => {
+                Err(ref error)
+                    if attempt == 1
+                        && error.is_transient()
+                        && context
+                            .attempts
+                            .as_ref()
+                            .is_none_or(|allowance| allowance.remaining() > 0) =>
+                {
                     // The deadline includes the single bounded, jittered retry.
                     let delay = 250 + id % 251;
                     crate::diag!("[diag] provider read id={} operation={} attempt={} retry_delay_ms={} reason=transient", id, operation, attempt, delay);

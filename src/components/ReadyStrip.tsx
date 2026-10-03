@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { observationLabel } from "@/lib/rowObservation";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { observationStatus } from "@/lib/rowObservation";
 import { prKey } from "@/lib/prIdentity";
 import { CircleCheck, GitCommitHorizontal, MessageCircleWarning } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
@@ -135,9 +135,9 @@ function UnresolvedChip({
 /// fact, the colour only repeats it, and the accessible name says it, with
 /// the consequence when the base's rules were read as requiring someone
 /// else's approval of the last push.
-function PushedByYouChip({ pusher }: { pusher: ReadyPusher }) {
+function PushedByYouChip({ pusher, retained = false, observedAt }: { pusher: ReadyPusher; retained?: boolean; observedAt?: number }) {
   if (pusher.pusher.state !== "viewer") return null;
-  const label = approvalWontCount(pusher)
+  const label = retained ? `last known push by you${observedAt === undefined ? "" : `, observed ${new Date(observedAt).toLocaleString()}`}; current pusher and approval requirements are unconfirmed` : approvalWontCount(pusher)
     ? "you pushed the latest commit, so your approval won't count here"
     : "you pushed the latest commit";
   return (
@@ -149,10 +149,106 @@ function PushedByYouChip({ pusher }: { pusher: ReadyPusher }) {
         className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[#4493f8]/40 px-1.5 py-0.5 text-xs text-[#4493f8]"
       >
         <GitCommitHorizontal className="h-3 w-3" aria-hidden="true" />
-        your push
+        {retained ? "last known · your push" : "your push"}
       </span>
       <span className="sr-only">, {label}</span>
     </>
+  );
+}
+
+function observationDescriptionId(pr: PullRequest) {
+  return `ready-observation-${encodeURIComponent(prKey(pr))}`;
+}
+
+/// The visible status stays short enough to share a line with long titles.
+/// Its complete meaning remains available through a disclosure controlled by
+/// a sibling button, avoiding nested interactive controls in either row form.
+export function ReadyObservationStatus({ pr, focusable }: { pr: PullRequest; focusable: boolean }) {
+  const status = observationStatus(pr);
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ left: 8, top: 0, below: false });
+  const disclosure = useRef<HTMLSpanElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const tooltip = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!disclosure.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    const viewportChanged = () => setOpen(false);
+    window.addEventListener("resize", viewportChanged);
+    window.addEventListener("scroll", viewportChanged, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("resize", viewportChanged);
+      window.removeEventListener("scroll", viewportChanged, true);
+    };
+  }, [open]);
+  useLayoutEffect(() => {
+    if (!open || !trigger.current || !tooltip.current) return;
+    const triggerRect = trigger.current.getBoundingClientRect();
+    const tooltipRect = tooltip.current.getBoundingClientRect();
+    const below = triggerRect.top - tooltipRect.height - 4 < 8;
+    setPosition(current => ({ ...current, top: below ? triggerRect.bottom + 4 : triggerRect.top - 4, below }));
+  }, [open, status?.explanation]);
+  if (!status) return null;
+  const descriptionId = observationDescriptionId(pr);
+  const disclosureId = `${descriptionId}-disclosure`;
+  const openDisclosure = () => {
+    const rect = trigger.current?.getBoundingClientRect();
+    if (rect) {
+      const maxWidth = Math.min(288, window.innerWidth - 16);
+      setPosition(current => ({ ...current, left: Math.max(8, Math.min(rect.left, window.innerWidth - maxWidth - 8)) }));
+    }
+    setOpen(true);
+  };
+  return (
+    <span
+      ref={disclosure}
+      className="relative ml-2 inline-flex"
+      onMouseEnter={openDisclosure}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={openDisclosure}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+      }}
+    >
+      <button
+        ref={trigger}
+        type="button"
+        className="whitespace-nowrap rounded-sm text-xs text-amber-400 outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
+        title={status.explanation}
+        aria-describedby={descriptionId}
+        aria-controls={disclosureId}
+        aria-expanded={open}
+        tabIndex={focusable ? 0 : -1}
+        onClick={(event) => {
+          event.stopPropagation();
+          openDisclosure();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            setOpen(false);
+          }
+        }}
+      >
+        {status.label}
+      </button>
+      <span id={descriptionId} className="sr-only">{status.explanation}</span>
+      {open && (
+        <span
+          ref={tooltip}
+          id={disclosureId}
+          role="tooltip"
+          style={{ left: position.left, top: position.top, transform: position.below ? undefined : "translateY(-100%)", maxWidth: "min(18rem, calc(100vw - 1rem))" }}
+          className="fixed z-50 w-max whitespace-normal rounded border border-[#d29922]/40 bg-[#161b22] px-2 py-1.5 text-left text-xs font-normal text-[#e6edf3] shadow-lg"
+        >
+          {status.explanation}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -374,43 +470,47 @@ export function ReadyStrip({
         {shown.map(({ pr }) => (
           <li key={prKey(pr)} data-advisory-key={prKey(pr)} className="text-sm">
             {onOpen ? (
-              <div
-                role="button"
-                tabIndex={0}
-                onClick={() => onOpen(pr)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    onOpen(pr);
-                  }
-                }}
-                className="flex flex-wrap cursor-pointer items-baseline gap-3 px-4 py-2 hover:bg-[#3fb950]/10"
-              >
-                <span className="min-w-0 flex-1">
-                  <span className="text-[#e6edf3]">{pr.title}</span>
-                  {observationLabel(pr) && <span className="ml-2 text-xs text-amber-400">{observationLabel(pr)}</span>}
-                  <span className="ml-2 text-xs text-[#b1bac4]">
-                    {pr.repo}#{pr.number} · {pr.author}
+              <div className="flex flex-wrap items-baseline gap-3 px-4 py-2 hover:bg-[#3fb950]/10">
+                <span data-ready-title className="min-w-0 flex-1 break-words">
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => onOpen(pr)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onOpen(pr);
+                      }
+                    }}
+                    className="cursor-pointer text-left"
+                  >
+                    <span className="text-[#e6edf3]">{pr.title}</span>
+                    <span className="ml-2 text-xs text-[#b1bac4]">
+                      {pr.repo}#{pr.number} · {pr.author}
+                    </span>
                   </span>
+                  <ReadyObservationStatus pr={pr} focusable />
                 </span>
-                <ReadyStackChip stack={stacks.of(pr)} />
-                <PushedByYouChip pusher={pushers.of(pr)} />
-                <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
-                <ReadyAgeChip readyAt={pr.ready_at} now={now} />
+                <span className="contents">
+                  <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
+                  <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
+                  <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
+                  <ReadyAgeChip readyAt={pr.ready_at} now={now} />
+                </span>
               </div>
             ) : (
               <div className="flex flex-wrap items-baseline gap-3 px-4 py-2">
-                <span className="min-w-0 flex-1">
+                <span data-ready-title className="min-w-0 flex-1 break-words">
                   <ExternalLink href={pr.url} className="text-[#e6edf3] hover:text-[#4493f8]">
                     {pr.title}
                   </ExternalLink>
-                  {observationLabel(pr) && <span className="ml-2 text-xs text-amber-400">{observationLabel(pr)}</span>}
+                  <ReadyObservationStatus pr={pr} focusable />
                   <span className="ml-2 text-xs text-[#8b949e]">
                     {pr.repo}#{pr.number} · {pr.author}
                   </span>
                 </span>
-                <ReadyStackChip stack={stacks.of(pr)} />
-                <PushedByYouChip pusher={pushers.of(pr)} />
+                <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
+                <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
                 <ReadyAgeChip readyAt={pr.ready_at} now={now} />
               </div>

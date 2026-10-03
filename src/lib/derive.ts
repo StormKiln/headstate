@@ -1,5 +1,6 @@
 import type { PullRequest, Stats } from "../types/pr";
 import type { AdviceGrouping } from "./adviceGrouping";
+import { prKey } from "./prIdentity";
 import type { MyPushesMode } from "./readyPusher";
 
 export const STALE_DAYS = 3;
@@ -411,15 +412,21 @@ export function sortReadyForReview(
   // `new Date(null)` is the epoch, not NaN, so absent is mapped to NaN
   // explicitly rather than sorting as the oldest wait there is.
   const ready = (pr: PullRequest) => (pr.ready_at ? new Date(pr.ready_at).getTime() : NaN);
+  const identity = (a: PullRequest, b: PullRequest) => {
+    const ka = prKey(a);
+    const kb = prKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  };
   return [...prs].sort((a, b) => {
     const x = ready(a);
     const y = ready(b);
-    // Undated rows go last regardless of direction, and keep a stable
-    // order among themselves.
+    // Undated rows go last regardless of direction. Ties use full source
+    // identity so incremental page publications cannot reshuffle them.
     const xBad = Number.isNaN(x);
     const yBad = Number.isNaN(y);
-    if (xBad || yBad) return xBad && yBad ? 0 : xBad ? 1 : -1;
-    return sort === "newest-opened" ? y - x : x - y;
+    if (xBad || yBad) return xBad && yBad ? identity(a, b) : xBad ? 1 : -1;
+    const dateOrder = sort === "newest-opened" ? y - x : x - y;
+    return dateOrder || identity(a, b);
   });
 }
 

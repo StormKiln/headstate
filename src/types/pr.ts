@@ -608,6 +608,8 @@ export interface RepoFile {
 /// One comment, on the conversation or in a review thread. Mirrors
 /// `github::model::PrComment`.
 export interface PrComment {
+  /// Provider identity; absent in older desktop/companion snapshots.
+  id?: string | null;
   author: string;
   created_at: string;
   body: string;
@@ -4000,6 +4002,11 @@ export interface PusherAsk {
 /// and is never a verdict. `head_oid` is echoed so an answer about a head
 /// the row has since moved off is dropped rather than applied.
 export interface RowPusher {
+  /** Original native remaining lifetime. Absent on older desktops. */
+  last_known_pusher?: { value: LastPusher; age_ms: number };
+  last_known_rules?: { value: BaseRules; age_ms: number };
+  pusher_valid_for_ms?: number;
+  rules_valid_for_ms?: number;
   repo: string;
   number: number;
   head_oid: string;

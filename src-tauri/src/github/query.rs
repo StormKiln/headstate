@@ -556,7 +556,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # measured at cost 1 with it.
       comments(last: 100) {
         totalCount
-        nodes { author { login __typename } createdAt body }
+        nodes { id author { login __typename } createdAt body }
       }
       # The DETAIL query carries the whole thread; the list query above
       # keeps its two-field shape and only counts. MEASURED against the
@@ -636,7 +636,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # default standing in for an answer.
           comments(first: 10) {
             totalCount
-            nodes { author { login __typename } createdAt body }
+            nodes { id author { login __typename } createdAt body }
           }
         }
       }
@@ -1237,6 +1237,10 @@ mod tests {
             "the conversation and the review threads each select comments"
         );
         for s in selections {
+            assert!(
+                s.contains("nodes { id "),
+                "each comment needs its durable node id"
+            );
             assert!(
                 s.contains("author { login __typename }"),
                 "a comment selection must ask the author's __typename: {s}"

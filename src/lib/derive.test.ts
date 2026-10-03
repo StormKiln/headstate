@@ -188,10 +188,36 @@ describe("sortReadyForReview", () => {
     );
   });
 
-  it("leaves several undated rows in a stable order among themselves", () => {
-    const many = [at(8, ""), at(9, "nonsense"), ...NEWEST_FIRST];
-    expect(sortReadyForReview(many).map((pr) => pr.number)).toEqual([1, 2, 3, 8, 9]);
-  });
+  it.each(["oldest-opened", "newest-opened"] as const)(
+    "uses full provider identity for unknown-date ties under %s",
+    (direction) => {
+      const tied = [
+        { ...at(7, ""), repo: "team/z", source: { provider: "github" as const, host: "enterprise.example" } },
+        { ...at(7, "nonsense"), repo: "team/a", source: { provider: "gitlab" as const, host: "gitlab.example" } },
+        { ...at(7, null), repo: "team/a", source: { provider: "github" as const, host: "github.com" } },
+      ];
+      const expected = ["github:enterprise.example:team/z", "github:github.com:team/a", "gitlab:gitlab.example:team/a"];
+      const identity = (pr: PullRequest) => `${pr.source?.provider ?? "github"}:${pr.source?.host ?? "github.com"}:${pr.repo}`;
+      expect(sortReadyForReview([...tied, ...NEWEST_FIRST], direction).slice(-3).map(identity)).toEqual(expected);
+      expect(sortReadyForReview([...tied].reverse(), direction).map(identity)).toEqual(expected);
+    },
+  );
+
+  it.each(["oldest-opened", "newest-opened"] as const)(
+    "uses full provider identity for equal known-date ties under %s",
+    (direction) => {
+      const when = "2026-09-05T00:00:00Z";
+      const tied = [
+        { ...at(2, when), repo: "team/repo", source: { provider: "github" as const, host: "github.com" } },
+        { ...at(1, when), repo: "team/repo", source: { provider: "github" as const, host: "github.com" } },
+        { ...at(1, when), repo: "team/repo", source: { provider: "gitlab" as const, host: "gitlab.com" } },
+      ];
+      const expected = ["github:github.com:team/repo:1", "github:github.com:team/repo:2", "gitlab:gitlab.com:team/repo:1"];
+      const identity = (pr: PullRequest) => `${pr.source?.provider}:${pr.source?.host}:${pr.repo}:${pr.number}`;
+      expect(sortReadyForReview(tied, direction).map(identity)).toEqual(expected);
+      expect(sortReadyForReview([...tied].reverse(), direction).map(identity)).toEqual(expected);
+    },
+  );
 
   // Unknown -- a snapshot from before the field existed, or a time GitHub
   // did not return -- is undated, and goes last. It must NOT fall back to

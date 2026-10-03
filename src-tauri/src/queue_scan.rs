@@ -24,6 +24,25 @@ pub struct Candidate {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    pub coverage_valid: bool,
+    #[serde(default = "default_pass_delay")]
+    pub pass_delay: i64,
+    /// Last validated traversal, not an atomic membership snapshot.
+    #[serde(default)]
+    pub completed_at: Option<i64>,
+    #[serde(default)]
+    pub completed_total: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    #[serde(default)]
+    pub no_work: bool,
+    #[serde(default)]
+    pub step_failure: Option<ScanFailure>,
+    #[serde(default)]
+    pub received: bool,
     pub version: u32,
     #[serde(default)]
     pub receipt_id: Option<String>,
@@ -41,9 +60,22 @@ pub struct State {
     pub candidates: VecDeque<Candidate>,
     pub isolate: bool,
 }
+fn default_pass_delay() -> i64 {
+    CONFIRM_DELAY
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {
+            coverage_valid: false,
+            pass_delay: default_pass_delay(),
+            completed_at: None,
+            completed_total: None,
+            started_at: None,
+            finished_at: None,
+            no_work: false,
+            step_failure: None,
+            received: false,
             version: VERSION,
             receipt_id: None,
             after: None,
@@ -69,22 +101,31 @@ impl State {
         *self = Self {
             candidates,
             isolate,
+            coverage_valid: self.coverage_valid,
+            pass_delay: self.pass_delay,
+            completed_at: self.completed_at,
+            completed_total: self.completed_total,
             ..Self::default()
         };
     }
     pub fn taint_effect(&mut self) {
         self.receipt_id = None;
         self.tainted = true;
+        self.coverage_valid = false;
         for c in &mut self.candidates {
             c.negative_at = None;
         }
     }
     pub fn failure(&mut self, now: i64) {
         self.tainted = true;
+        self.coverage_valid = false;
         self.failures = self.failures.saturating_add(1);
         self.eligible_at = now + backoff(self.failures);
     }
     pub fn observe_count(&mut self, total: Option<u64>) {
+        if self.completed_at.is_some() && self.completed_total != total {
+            self.coverage_valid = false;
+        }
         if !self.count_seen {
             self.total = total;
             self.count_seen = true;
@@ -100,6 +141,13 @@ impl State {
 pub fn backoff(failures: u32) -> i64 {
     (30i64 * (1i64 << failures.min(5))).min(900)
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanFailure {
+    pub message: String,
+    pub transient: bool,
+    pub not_asked: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub expected_revision: i64,
@@ -214,6 +262,25 @@ pub fn taint(
 mod tests {
     use super::*;
     use crate::store::source_cache::{save_owned_source_snapshot, snapshot_owner, Coverage};
+    #[test]
+    fn new_pass_keeps_historical_coverage_but_changed_count_invalidates_it() {
+        for count in [74, 76] {
+            let mut state = State {
+                done: true,
+                completed_at: Some(1000),
+                completed_total: Some(75),
+                coverage_valid: true,
+                ..State::default()
+            };
+            state.fresh_pass();
+            assert!(state.coverage_valid);
+            state.observe_count(Some(count));
+            assert!(!state.coverage_valid);
+            assert_eq!(state.completed_at, Some(1000));
+            assert_eq!(state.total, Some(count));
+        }
+    }
+
     #[test]
     fn rows_checkpoint_and_owner_commit_or_rollback_together_and_cas_rejects_old_steps() {
         let conn = Connection::open_in_memory().unwrap();

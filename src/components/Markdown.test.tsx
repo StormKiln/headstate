@@ -376,3 +376,16 @@ describe("sanitising raw HTML", () => {
     expect(container.textContent).toContain("Visible.");
   });
 });
+
+it("preserves browser open and closed choices across body edits and defaults new disclosures closed", () => {
+  const body = '<details open><summary>Outer</summary><details open><summary>Inner</summary>Before</details></details>';
+  const view = render(<Markdown>{body}</Markdown>);
+  const nodes = [...view.container.querySelectorAll("details")];
+  nodes[0].open = true;
+  view.rerender(<Markdown>{body.replace("Before", "After") + '<details open><summary>New</summary>New body</details>'}</Markdown>);
+  const after = [...view.container.querySelectorAll("details")];
+  expect(after[0]).toBe(nodes[0]); expect(after[0].open).toBe(true);
+  expect(after[1]).toBe(nodes[1]); expect(after[1].open).toBe(false);
+  expect(after[2].open).toBe(false);
+  expect(view.container.textContent).toContain("After");
+});

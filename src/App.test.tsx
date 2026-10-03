@@ -1,5 +1,5 @@
 import { GitLabViewerProvider } from "./api/authAvailability";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest, StatsTree } from "./types/pr";
@@ -313,6 +313,22 @@ describe("App — priorities strip scoping", () => {
 
     // One pull request in scope, so the denominator is 1 -- not 3.
     expect(screen.getByText("of 1 open")).toBeTruthy();
+  });
+
+  it("scopes and restores a 275-row inventory across 44 repositories", async () => {
+    const population = Array.from({ length: 275 }, (_, i) => prWithState("failure", "mergeable", "none", {
+      id: `enterprise-${i}`, number: i + 1, repo: `synthetic/repo-${i % 44}`, title: `Enterprise row ${i + 1}`,
+    }));
+    mockPrs.mockReturnValue(population);
+    renderApp();
+    expect(screen.getByText("Needs your attention (275)")).toBeTruthy();
+    await act(() => useFilters.setState({ filtersByView: { ...useFilters.getState().filtersByView, "my-prs": { repo: "synthetic/repo-0" } } }));
+    const selected = screen.getByText("Needs your attention (7)").closest("section")!;
+    expect(selected.textContent).toContain("Enterprise row 265");
+    expect(within(selected).queryByText("Enterprise row 2", { exact: true })).toBeNull();
+    await act(() => useFilters.setState({ filtersByView: { ...useFilters.getState().filtersByView, "my-prs": {} } }));
+    expect(screen.getByText("Needs your attention (275)")).toBeTruthy();
+    expect(mockPrs()).toBe(population);
   });
 
   it("shows every repo in the strip when no repo is selected", () => {

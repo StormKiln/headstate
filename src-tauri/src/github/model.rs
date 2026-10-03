@@ -393,6 +393,9 @@ pub struct CheckRun {
 /// One comment on a pull request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrComment {
+    /// Provider node identity; older desktop/companion snapshots omit it.
+    #[serde(default)]
+    pub id: Option<String>,
     pub author: String,
     pub created_at: String,
     pub body: String,

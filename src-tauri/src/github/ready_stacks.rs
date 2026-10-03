@@ -20,6 +20,8 @@ pub struct StackAsk {
 }
 #[derive(Debug, Serialize)]
 pub struct RowStack {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_known_stack: Option<super::advisory::LastKnown<PrStack>>,
     #[serde(flatten)]
     pub identity: PrIdentity,
     pub stack: PrStack,
@@ -65,6 +67,7 @@ pub async fn ready_stacks(
     let mut out: Vec<_> = rows
         .iter()
         .map(|row| RowStack {
+            last_known_stack: None,
             identity: row.identity.clone(),
             stack: PrStack::Unknown,
             head_oid: None,
@@ -115,6 +118,22 @@ pub async fn ready_stacks(
             out[i].base_ref = rows[i].base_ref.clone();
         }
         out[i].stack = stack;
+    }
+    for (answer, row) in out.iter_mut().zip(&rows) {
+        if let Some((head, base)) = row.head_oid.as_ref().zip(row.base_ref.as_ref()) {
+            answer.last_known_stack = client.advisory.stacks.last_success(&(
+                row.identity.repo.clone(),
+                row.identity.number,
+                head.clone(),
+                base.clone(),
+            ));
+            // Matching identity qualifies the display receipt only. Unknown
+            // and no valid_for_ms can never become fresh action evidence.
+            if answer.last_known_stack.is_some() {
+                answer.head_oid = Some(head.clone());
+                answer.base_ref = Some(base.clone());
+            }
+        }
     }
     Ok(out)
 }

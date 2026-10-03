@@ -31,6 +31,16 @@ pub struct Status {
     pub source: Source,
     pub list: CachedList,
     pub phase: Phase,
+    #[serde(skip)]
+    settled_phase: Option<Phase>,
+    #[serde(skip)]
+    published_scan_receipt: Option<String>,
+    #[serde(skip)]
+    published_scan_generation: Option<u64>,
+    #[serde(skip)]
+    settled_generation: u64,
+    #[serde(skip)]
+    settled_scan_receipt: Option<String>,
     pub revision: u64,
     pub receipt_revision: Option<u64>,
     pub request_id: Option<String>,
@@ -47,6 +57,11 @@ impl Status {
             source,
             list,
             phase: Phase::NotRequested,
+            settled_phase: None,
+            published_scan_receipt: None,
+            published_scan_generation: None,
+            settled_generation: 0,
+            settled_scan_receipt: None,
             revision: 0,
             receipt_revision: None,
             request_id: None,
@@ -221,6 +236,11 @@ impl SourcePolls {
         emit: impl FnOnce(Status),
     ) {
         let attempt = &publication.attempt;
+        let scan_state = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.scan.as_ref())
+            .map(|s| s.state.clone());
         let status_result = match result {
             Ok(result) => {
                 let coverage = result.coverage.clone();
@@ -232,11 +252,107 @@ impl SourcePolls {
             }
             Err(error) => Err(error),
         };
-        if let Some(status) = self.finish(attempt, status_result) {
+        let status = match (scan_state, status_result) {
+            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage),
+            (_, result) => self.finish(attempt, result),
+        };
+        if let Some(status) = status {
             emit(status);
         }
-        // The publication permit remains held through both the status mutation
-        // and callback. A newer attempt cannot interleave a fetching event.
+        // The publication permit remains held through both status mutation and emission.
+    }
+
+    fn finish_scan(
+        &self,
+        attempt: &Attempt,
+        state: &crate::queue_scan::State,
+        coverage: Coverage,
+    ) -> Option<Status> {
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
+        let current = *generation == attempt.generation;
+        let published =
+            state.receipt_id.is_some() && status.published_scan_receipt == state.receipt_id;
+        if state.no_work {
+            if !current {
+                return None;
+            }
+            status.revision += 1;
+            status.phase = status.settled_phase.clone().unwrap_or(Phase::NotRequested);
+            if status.coverage.is_none() {
+                status.coverage = Some(coverage.clone());
+            }
+            // A later checkpoint read can discover an operation published by an
+            // older caller while this request was pending. Adopt that validated
+            // outcome once, but never over an independently newer settlement.
+            let unsettled_outcome = published
+                && status.settled_scan_receipt != state.receipt_id
+                && status
+                    .published_scan_generation
+                    .is_some_and(|published| published > status.settled_generation);
+            if !unsettled_outcome {
+                // Disk readback on restart carries no invented provider receipt time.
+                if status.phase == Phase::NotRequested {
+                    status.phase = if state.step_failure.is_some() {
+                        Phase::Failed
+                    } else if matches!(status.coverage, Some(Coverage::Complete)) {
+                        Phase::Ready
+                    } else {
+                        Phase::Partial
+                    };
+                    status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+                }
+                return Some(status.clone());
+            }
+        } else {
+            // Coalesced callers share the operation's data receipt, but only the
+            // current request may settle its outcome. A stale caller may publish
+            // useful rows (including changed qualification) beside newer work.
+            if !current && published {
+                return None;
+            }
+            status.revision += 1;
+            if !published {
+                status.receipt_revision = Some(status.revision);
+                status.coverage = Some(coverage.clone());
+                status.published_scan_receipt = state.receipt_id.clone();
+                status.published_scan_generation = Some(attempt.generation);
+                if state.received || state.step_failure.is_none() {
+                    status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+            }
+        }
+        if current {
+            let settled =
+                state.receipt_id.is_some() && status.settled_scan_receipt == state.receipt_id;
+            if let Some(failure) = &state.step_failure {
+                status.phase = if failure.not_asked {
+                    Phase::NotAsked
+                } else {
+                    if !settled {
+                        status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+                    }
+                    if failure.transient && status.consecutive_failures < 2 {
+                        Phase::Retrying
+                    } else {
+                        Phase::Failed
+                    }
+                };
+                status.error = Some(failure.message.clone());
+            } else {
+                status.phase = match coverage {
+                    Coverage::Complete => Phase::Ready,
+                    Coverage::Partial { .. } => Phase::Partial,
+                    Coverage::Unknown => Phase::Unknown,
+                };
+                status.error = None;
+                status.consecutive_failures = 0;
+            }
+            status.settled_generation = attempt.generation;
+            status.settled_scan_receipt = state.receipt_id.clone();
+            status.settled_phase = Some(status.phase.clone());
+        }
+        Some(status.clone())
     }
     fn complete_gitlab(
         &self,
@@ -349,6 +465,9 @@ impl SourcePolls {
             .entry((source.clone(), list))
             .or_insert_with(|| (0, Status::new(source.clone(), list)));
         *generation += 1;
+        if status.phase != Phase::Fetching {
+            status.settled_phase = Some(status.phase.clone());
+        }
         status.phase = Phase::Fetching;
         status.revision += 1;
         status.request_id = request_id;
@@ -399,6 +518,7 @@ impl SourcePolls {
                 // Keep the last receipt and its coverage on every failure.
             }
         }
+        status.settled_generation = attempt.generation;
         Some(status.clone())
     }
 }
@@ -532,6 +652,54 @@ pub async fn fetch_github_step(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_mode(app, client, list, budget, false).await
+}
+
+pub(crate) async fn fetch_github_continuation(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_mode(app, client, list, budget, true).await
+}
+
+async fn fetch_github_step_mode(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    continuation: bool,
+) -> Result<FetchedList, crate::github::client::ClientError> {
+    fetch_github_step_at(
+        crate::commands::db_path(app),
+        client,
+        list,
+        budget,
+        continuation,
+        || {
+            (
+                app.state::<crate::poll::PollInterval>()
+                    .0
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                chrono::Utc::now().timestamp(),
+            )
+        },
+    )
+    .await
+}
+
+/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
+/// tests. The caller supplies the clock reading and configured interval; all
+/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+pub(crate) async fn fetch_github_step_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    continuation: bool,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, crate::github::client::ClientError> {
     use crate::github::{admission::ReadContext, client::ClientError};
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
@@ -541,8 +709,7 @@ pub async fn fetch_github_step(
         None => client.fetch_viewer().await?,
     };
     let owner = viewer.clone();
-    let path = crate::commands::db_path(app);
-    let (loaded, rows) =
+    let (mut loaded, rows) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
             let conn = crate::store::open_db(&path)?;
             let conn = conn.unchecked_transaction()?;
@@ -564,9 +731,31 @@ pub async fn fetch_github_step(
         .await
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
         .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
-    client
-        .advance_scan(list, loaded, &rows, chrono::Utc::now().timestamp())
-        .await
+    // Match the desktop path's timing: a blocked checkpoint load must not
+    // freeze an old clock reading or a superseded interval setting.
+    let (interval_secs, now) = timing();
+    loaded.state.pass_delay = crate::poll::clamp_interval(interval_secs) as i64;
+    if continuation && !crate::poll::queue_continuation_due(&loaded.state, now, true, true, true) {
+        loaded.state.no_work = true;
+        return Ok(FetchedList {
+            viewer: Some(viewer),
+            prs: vec![],
+            total: loaded.state.total,
+            coverage: if loaded.state.coverage_valid {
+                Coverage::Complete
+            } else {
+                Coverage::Partial {
+                    total: loaded.state.total,
+                }
+            },
+            scan: Some(crate::queue_scan::Commit {
+                expected_revision: loaded.revision,
+                state: loaded.state,
+                removals: vec![],
+            }),
+        });
+    }
+    client.advance_scan(list, loaded, &rows, now).await
 }
 
 /// Called with the source publication permit held, before persistence and emission.
@@ -576,16 +765,29 @@ pub async fn reconcile_github(
     publication: &Publication,
     result: FetchedList,
 ) -> Result<FetchedList, Failure> {
+    reconcile_github_at(
+        crate::commands::db_path(app),
+        &app.state::<SourcePolls>(),
+        publication,
+        result,
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_github_at(
+    path: std::path::PathBuf,
+    polls: &SourcePolls,
+    publication: &Publication,
+    result: FetchedList,
+) -> Result<FetchedList, Failure> {
     let list = publication.attempt.list;
     let source = publication.attempt.source.clone();
-    let previous = app
-        .state::<SourcePolls>()
+    let previous = polls
         .2
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(source.clone(), list))
         .map(|(_, receipt)| receipt.clone());
-    let path = crate::commands::db_path(app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = crate::store::open_db(&path)
             .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
@@ -633,6 +835,8 @@ fn reconcile_github_snapshot(
             {
                 result.prs = prs;
                 result.coverage = coverage;
+                // This is adoption of an actual accepted operation, not a
+                // cooldown/no-work result. Its outcome still belongs to the caller.
                 return Ok(result);
             }
             return Err(inventory_failure(
@@ -659,17 +863,64 @@ fn reconcile_github_snapshot(
     } else {
         vec![]
     };
-    result.prs = crate::inventory::reconcile(
-        previous,
-        result.prs,
-        matches!(result.coverage, Coverage::Complete),
-        chrono::Utc::now(),
-    );
+    if let Some(scan) = result.scan.as_ref().filter(|s| s.state.no_work) {
+        let loaded = crate::queue_scan::load(conn, source, list, owner)
+            .map_err(|_| inventory_failure("The queue checkpoint could not be read."))?;
+        if loaded.revision != scan.expected_revision {
+            return Err(inventory_failure(
+                "The queue changed during this step. Its newer progress was retained.",
+            ));
+        }
+        result.prs = previous;
+        if let crate::store::source_cache::SnapshotData::Available { coverage, .. } =
+            crate::store::source_cache::load_source_snapshot(conn, source, list)
+                .map_err(|_| inventory_failure("The saved inventory could not be read."))?
+                .data
+        {
+            result.coverage = coverage;
+        }
+        return Ok(result);
+    }
+    result.prs = if result
+        .scan
+        .as_ref()
+        .is_some_and(|s| s.state.step_failure.is_some())
+    {
+        crate::inventory::reconcile(previous, result.prs, false, chrono::Utc::now())
+    } else if result.scan.is_some() {
+        crate::inventory::reconcile_delta(previous, result.prs, chrono::Utc::now())
+    } else {
+        crate::inventory::reconcile(
+            previous,
+            result.prs,
+            matches!(result.coverage, Coverage::Complete),
+            chrono::Utc::now(),
+        )
+    };
     if let Some(scan) = &result.scan {
         result
             .prs
             .retain(|row| !scan.removals.contains(&row.identity()));
+        if scan.state.done {
+            for row in &mut result.prs {
+                if !scan.state.seen.contains(&row.identity()) {
+                    if let Some(observation) = row.observation.as_mut() {
+                        observation.state = crate::inventory::ObservationState::Retained;
+                    }
+                }
+            }
+        }
         let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            if scan.state.step_failure.is_some() && !scan.state.received {
+                return crate::store::source_cache::save_owned_source_failure(
+                    tx,
+                    source,
+                    list,
+                    &result.prs,
+                    &result.coverage,
+                    owner,
+                );
+            }
             crate::store::source_cache::save_owned_source_snapshot(
                 tx,
                 source,
@@ -906,8 +1157,36 @@ async fn record_github_effect(
     viewer: &str,
     effect: GithubEffect,
 ) {
+    record_github_effect_at(
+        crate::commands::db_path(app),
+        &app.state::<SourcePolls>(),
+        repo,
+        number,
+        viewer,
+        effect,
+        |event| match event {
+            Ok(update) => {
+                let _ = app.emit("source-poll-status", update);
+            }
+            Err(message) => {
+                let _ = app.emit("store-error", message);
+            }
+        },
+    )
+    .await;
+}
+
+// Shared receipt transaction; the platform shell only delivers its events.
+async fn record_github_effect_at(
+    path: std::path::PathBuf,
+    polls: &SourcePolls,
+    repo: &str,
+    number: u64,
+    viewer: &str,
+    effect: GithubEffect,
+    mut emit: impl FnMut(Result<Update, &'static str>),
+) {
     let source = Source::default();
-    let polls = app.state::<SourcePolls>();
     for list in [CachedList::Authored, CachedList::Reviewing] {
         let _guard = polls.gate(&source, list).lock_owned().await;
         let existing = polls
@@ -920,7 +1199,7 @@ async fn record_github_effect(
         let mut receipt = if let Some(receipt) = existing {
             receipt
         } else {
-            let path = crate::commands::db_path(app);
+            let path = path.clone();
             let source = source.clone();
             let owner = viewer.to_string();
             let rows = tauri::async_runtime::spawn_blocking(move || {
@@ -1011,7 +1290,7 @@ async fn record_github_effect(
         }
         // The effect itself advances generation before any old request can publish.
         let generation = polls.effect_generation(&source, list);
-        let path = crate::commands::db_path(app);
+        let path = path.clone();
         let saved = receipt.clone();
         let saved_source = source.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
@@ -1020,10 +1299,9 @@ async fn record_github_effect(
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
-            let _ = app.emit(
-                "store-error",
+            emit(Err(
                 "The confirmed review could not be saved for offline use.",
-            );
+            ));
         }
         polls
             .2
@@ -1036,8 +1314,9 @@ async fn record_github_effect(
             status.receipt_revision = Some(status.revision);
             status.coverage = Some(receipt.coverage);
             status.phase = Phase::Unknown;
+            status.settled_generation = generation;
             let update = polls.update(status.clone(), None);
-            let _ = app.emit("source-poll-status", update);
+            emit(Ok(update));
         }
     }
 }
@@ -1851,7 +2130,7 @@ mod tests {
         assert_eq!(result.last_received_at, None);
     }
     #[test]
-    fn accepted_scan_persists_exact_inventory_and_only_this_steps_rows_are_fresh() {
+    fn accepted_scan_persists_exact_inventory_without_downgrading_earlier_pages() {
         use crate::{
             inventory::ObservationState,
             queue_scan::{Commit, State},
@@ -1895,7 +2174,7 @@ mod tests {
             .observation
             .as_ref()
             .unwrap();
-        assert_eq!(old.state, ObservationState::Retained);
+        assert_eq!(old.state, ObservationState::Observed);
         assert_eq!(old.last_observed_at, stamp);
         assert_eq!(
             accepted

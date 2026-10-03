@@ -1,3 +1,4 @@
+import { commentKeys } from "../lib/commentIdentity";
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { supersededLabel } from "@/lib/supersededComments";
@@ -24,6 +25,7 @@ export function SupersededGroup({
   truncated: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const keys = commentKeys(comments);
   const label = supersededLabel(comments.length, truncated);
 
   return (
@@ -45,7 +47,7 @@ export function SupersededGroup({
       {open
         ? comments.map((c, i) => (
             <CommentRow
-              key={`${c.author}-${c.created_at}-${i}`}
+              key={keys[i]}
               author={c.author}
               createdAt={c.created_at}
               body={c.body}

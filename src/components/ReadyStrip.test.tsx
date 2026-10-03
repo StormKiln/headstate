@@ -29,7 +29,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn((name: string, handler: 
   return Promise.resolve(() => eventHandlers.delete(name));
 }) }));
 
-import { ReadyStrip } from "./ReadyStrip";
+import { ReadyObservationStatus, ReadyStrip } from "./ReadyStrip";
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { remoteEventError } from "@/api/wireContract";
 import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
@@ -51,7 +51,7 @@ beforeEach(() => {
   invoke.mockImplementation((cmd: string, args) => {
     if (cmd === "get_viewer") return viewerLogin;
     if (cmd === "get_ready_stacks") return Promise.resolve(stackAnswers.map(answer => ({ valid_for_ms: 60_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
-    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
+    if (cmd === "get_ready_pushers") return Promise.resolve(pusherAnswers.map(answer => ({ pusher_valid_for_ms: 60_000, rules_valid_for_ms: 600_000, ...(args?.rows as { repo: string; number: number }[]).find(row => row.repo === answer.repo && row.number === answer.number), ...answer })));
     return Promise.resolve(null);
   });
 });
@@ -106,7 +106,7 @@ describe("ReadyStrip", () => {
       act(() => eventHandlers.get("source-poll-status")!({ payload }));
       if (stage === "changed_head" || stage === "retained_unread_without_effect") {
         await waitFor(() => expect(screen.getByText("Ready one")).toBeTruthy());
-        if (stage === "retained_unread_without_effect") expect(screen.getByText(/Last known — not confirmed/)).toBeTruthy();
+        if (stage === "retained_unread_without_effect") expect(screen.getByText("Last known").getAttribute("title")).toMatch(/not confirmed/);
       } else expect(screen.queryByText("Ready one")).toBeNull();
     }
   });
@@ -140,7 +140,10 @@ describe("ReadyStrip", () => {
   it("is keyboard reachable, like the attention strip", () => {
     const onOpen = vi.fn();
     render(<ReadyStrip prs={[ready]} onOpen={onOpen} />);
-    fireEvent.keyDown(screen.getByRole("button", { name: /ready one/i }), { key: "Enter" });
+    const button = screen.getByRole("button", { name: /ready one/i });
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    fireEvent.keyDown(button, { key: "Enter" });
     expect(onOpen).toHaveBeenCalledWith(ready);
   });
 
@@ -269,6 +272,7 @@ describe("ReadyStrip age", () => {
   const ageOf = (number: number) =>
     screen
       .getByRole("button", { name: new RegExp(`^PR ${number}(?!\\d)`) })
+      .closest("li")!
       .querySelector("[data-ready-age]") as HTMLElement;
 
   // Fake timers pin `Date` too, so no assertion depends on the machine
@@ -316,16 +320,13 @@ describe("ReadyStrip age", () => {
     const at = hoursAgo(3);
     const since = new Date(at).toLocaleString();
     render(<ReadyStrip prs={[row(1, at)]} onOpen={vi.fn()} />);
-    expect(
-      screen.getByRole("button", { name: new RegExp(`ready for review since ${since}`) }),
-    ).toBeTruthy();
     expect(ageOf(1).getAttribute("title")).toBe(`Ready for review since ${since}`);
     expect(ageOf(1).getAttribute("datetime")).toBe(at);
   });
 
   it("says in the accessible name when the ready time is unknown", () => {
     render(<ReadyStrip prs={[row(1, null)]} onOpen={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /ready-for-review time unknown/i })).toBeTruthy();
+    expect(ageOf(1).getAttribute("title")).toBe("Ready-for-review time unknown");
   });
 
   it("shows the age on a plain-link row too", () => {
@@ -359,8 +360,7 @@ describe("ReadyStrip unresolved conversations", () => {
     expect(chip?.textContent).toBe("3");
     expect(chip?.getAttribute("data-unresolved")).toBe("exact");
     expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
-    // The row's accessible name carries the count, not only the colour.
-    expect(screen.getByRole("button", { name: /3 unresolved conversations/ })).toBeTruthy();
+    expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
   });
 
   it("shows nothing for zero", () => {
@@ -374,9 +374,7 @@ describe("ReadyStrip unresolved conversations", () => {
     const chip = container.querySelector("[data-unresolved]");
     expect(chip?.textContent).toBe("3+");
     expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
-    expect(
-      screen.getByRole("button", { name: /at least 3 unresolved conversations/ }),
-    ).toBeTruthy();
+    expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
   });
 
   // A payload from an older desktop has no flag: qualified, not exact.
@@ -387,7 +385,7 @@ describe("ReadyStrip unresolved conversations", () => {
 
   it("singular for one", () => {
     render(<ReadyStrip prs={[withThreads(1, false)]} onOpen={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /\b1 unresolved conversation(?!s)/ })).toBeTruthy();
+    expect(document.querySelector("[data-unresolved]")?.getAttribute("title")).toBe("1 unresolved conversation");
   });
 
   it("tags a plain-link row too", () => {
@@ -534,11 +532,9 @@ describe("ReadyStrip last pusher", () => {
     render(<ReadyStrip prs={[mine, theirs]} onOpen={vi.fn()} />);
     await waitFor(() => expect(document.querySelector("[data-pushed-by-you]")).not.toBeNull());
     expect(document.querySelectorAll("[data-pushed-by-you]")).toHaveLength(1);
-    expect(
-      screen.getByRole("button", {
-        name: /^Mine.*you pushed the latest commit, so your approval won't count here/,
-      }),
-    ).toBeTruthy();
+    expect(document.querySelector("[data-pushed-by-you]")?.getAttribute("title")).toBe(
+      "You pushed the latest commit, so your approval won't count here",
+    );
     expect(screen.getByRole("button", { name: /^Theirs/ }).textContent).not.toMatch(/you pushed/);
     // Show hides nothing and says nothing.
     expect(status()).toBe("");
@@ -733,16 +729,16 @@ describe("Ready stack context (#1602)", () => {
     expect(screen.queryByLabelText(/Stack position/)).toBeNull();
   });
 
-  it("batches visible rows and reuses cached facts across filtering and reorder", async () => {
+  it("coalesces visible rows and reuses cached facts across filtering and reorder", async () => {
     const other = { ...ready, id: "other", number: ready.number + 1, title: "Other" };
     stackAnswers = [ready, other].map((pr) => ({ repo: pr.repo, number: pr.number, stack: exactStack }));
     const view = render(<ReadyStrip prs={[ready, other]} />);
     await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
-    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
     view.rerender(<ReadyStrip prs={[other]} />);
     view.rerender(<ReadyStrip prs={[other, ready]} />);
     await waitFor(() => expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(2));
-    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
   });
 
   it("renders rows immediately and limits each metadata batch", async () => {
@@ -755,13 +751,13 @@ describe("Ready stack context (#1602)", () => {
     let calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
     expect(calls).toHaveLength(1);
     expect((calls[0][1]?.rows as unknown[]).length).toBeLessThanOrEqual(8);
-    // Finishing one batch must not drain the rest of the invisible list.
-    for (let i = 0; i < 3; i++) {
+    // Finishing a row only drains the finite eight-row window.
+    for (let i = 0; i < 8; i++) {
       const resolve = resolveFirst!;
       await act(async () => { resolve([]); });
     }
     calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(8);
     view.unmount();
   });
 });
@@ -769,7 +765,77 @@ describe("Ready stack context (#1602)", () => {
 it("keeps an omitted last-known Ready row visibly qualified", async () => {
   render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
   expect(screen.getByText("Ready one")).toBeTruthy();
-  expect(screen.getByText("Last known — not confirmed by latest refresh")).toBeTruthy();
+  expect(screen.getByText("Last known")).toBeTruthy();
+});
+
+describe("Ready observation status", () => {
+  const longTitle = "A deliberately long pull request title that must keep its status compact without losing the complete explanation";
+  const cases = [
+    { name: "retained", visible: "Last known", explanation: "Last known — not confirmed by latest refresh", observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } },
+    { name: "unknown", visible: "Unconfirmed", explanation: "Readiness could not be confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: ["ci" as const], retained_fields: [] } },
+    { name: "confirmed", visible: "Confirmed", explanation: "Your review is confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z", confirmed_by_read: true } } },
+    { name: "pending", visible: "Pending", explanation: "Your submitted review is awaiting confirmation in the list", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z" } } },
+  ];
+
+  it.each(cases)("renders $name as a concise status with its full explanation", (item) => {
+    const pr = { ...ready, id: item.name, number: ready.number + cases.indexOf(item), observation: item.observation };
+    const view = render(<ReadyObservationStatus pr={pr} focusable />);
+    const status = screen.getByText(item.visible);
+    expect(status.textContent).toBe(item.visible);
+    expect(status.getAttribute("title")).toBe(item.explanation);
+    expect(document.getElementById(status.getAttribute("aria-describedby")!)?.textContent).toBe(item.explanation);
+    expect(status.getAttribute("tabindex")).toBe("0");
+    status.focus();
+    fireEvent.focus(status);
+    expect(document.activeElement).toBe(status);
+    expect(screen.getByRole("tooltip").textContent).toBe(item.explanation);
+    fireEvent.keyDown(status, { key: "Escape" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(document.activeElement).toBe(status);
+    fireEvent.click(status);
+    expect(screen.getByRole("tooltip").textContent).toBe(item.explanation);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    view.unmount();
+  });
+
+  it("keeps a near-top disclosure below through focus, click and explanation changes", () => {
+    const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.getAttribute("role") === "tooltip"
+        ? new DOMRect(0, 0, 288, 60)
+        : new DOMRect(350, 0, 32, 20);
+    });
+    const retained = { ...ready, observation: cases[0].observation };
+    const view = render(<ReadyObservationStatus pr={retained} focusable />);
+    const status = screen.getByRole("button", { name: "Last known" });
+    status.focus();
+    fireEvent.focus(status);
+    fireEvent.click(status);
+    expect(screen.getByRole("tooltip").style.top).toBe("24px");
+    expect(screen.getByRole("tooltip").style.transform).toBe("");
+    view.rerender(<ReadyObservationStatus pr={{ ...retained, observation: cases[3].observation }} focusable />);
+    expect(screen.getByRole("tooltip").textContent).toBe(cases[3].explanation);
+    expect(screen.getByRole("tooltip").style.top).toBe("24px");
+    expect(screen.getByRole("tooltip").style.transform).toBe("");
+    rect.mockRestore();
+  });
+
+  it.each([true, false])("keeps a long retained title compact and described in the interactive=%s row", (interactive) => {
+    const item = cases[0];
+    const pr = { ...ready, title: longTitle, observation: item.observation };
+    render(<ReadyStrip prs={[pr]} onOpen={interactive ? vi.fn() : undefined} />);
+    const status = screen.getByText("Last known");
+    const explanation = document.getElementById(status.getAttribute("aria-describedby")!);
+    if (interactive) {
+      expect(screen.getByRole("button", { name: new RegExp(longTitle) })).toBeTruthy();
+      expect(status.getAttribute("tabindex")).toBe("0");
+    } else {
+      expect(screen.getByRole("link", { name: longTitle })).toBeTruthy();
+      expect(status.getAttribute("tabindex")).toBe("0");
+    }
+    expect(screen.getByText(longTitle).closest("[data-ready-title]")?.className).toContain("min-w-0");
+    expect(explanation?.textContent).toBe(item.explanation);
+  });
 });
 
 it("bounds two actual mounted 120-row owners and advances beyond the unreadable prefix", async () => {
@@ -788,18 +854,18 @@ it("bounds two actual mounted 120-row owners and advances beyond the unreadable 
   expect(screen.getAllByText("Task4 row 119")).toHaveLength(2);
   for (const command of ["get_ready_stacks", "get_ready_pushers"]) {
     const calls = invoke.mock.calls.filter(([cmd]) => cmd === command);
-    expect(calls).toHaveLength(1);
-    expect(calls[0][1]?.rows).toHaveLength(8);
+    expect(calls).toHaveLength(8);
+    expect(calls.every(call => (call[1]?.rows as unknown[]).length === 1)).toBe(true);
   }
   await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
   await act(async () => { await vi.advanceTimersByTimeAsync(5); });
   const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-  expect(calls).toHaveLength(2);
-  const first = new Set((calls[0][1]?.rows as PullRequest[]).map(pr => pr.number));
-  expect((calls[1][1]?.rows as PullRequest[]).every(pr => !first.has(pr.number))).toBe(true);
+  expect(calls).toHaveLength(16);
+  const first = new Set(calls.slice(0, 8).flatMap(call => (call[1]?.rows as PullRequest[]).map(pr => pr.number)));
+  expect(calls.slice(8).flatMap(call => call[1]?.rows as PullRequest[]).some(pr => !first.has(pr.number))).toBe(true);
   view.unmount();
   await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
-  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(2);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(16);
   qc.clear();
   vi.useRealTimers();
 });
@@ -835,11 +901,77 @@ it("prioritizes actual observed rows in the next bounded viewport window", async
   const last = screen.getByText("Viewport row 19").closest("li")!;
   const rect = last.getBoundingClientRect();
   await act(async () => { observed!([{ target: last, isIntersecting: true, boundingClientRect: rect, intersectionRatio: 1, intersectionRect: rect, rootBounds: null, time: 0 }]); });
-  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(1);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks")).toHaveLength(8);
   await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
   await act(async () => { await vi.advanceTimersByTimeAsync(5); });
   const calls = invoke.mock.calls.filter(([cmd]) => cmd === "get_ready_stacks");
-  expect(calls).toHaveLength(2);
-  expect((calls[1][1]?.rows as PullRequest[]).map(pr => pr.number)).toContain(20);
+  expect(calls).toHaveLength(16);
+  expect(calls.slice(8).flatMap(call => (call[1]?.rows as PullRequest[]).map(pr => pr.number))).toContain(20);
+  view.unmount(); qc.clear(); vi.unstubAllGlobals(); vi.useRealTimers();
+});
+
+it("keeps retained stack and pusher chips qualified without hiding rows or claiming approval consequences", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "me");
+  const pr = { ...ready, head_repo: ready.repo };
+  let failed = false;
+  invoke.mockImplementation(async (cmd, args) => {
+    if (cmd === "get_viewer") return "me";
+    const asks = args?.rows as PullRequest[];
+    if (cmd === "get_ready_stacks") return asks.map(ask => ({ ...ask, stack: failed ? { kind: "unknown" } : exactStack, valid_for_ms: failed ? undefined : 2_000 }));
+    if (cmd === "get_ready_pushers") return asks.map(ask => ({ ...ask, pusher_valid_for_ms: 2_000, rules_valid_for_ms: 2_000,
+      rules: failed ? { state: "declined", reason: "budget" } : { state: "read", require_last_push_approval: true, required_review_thread_resolution: false },
+      last_pusher: failed ? { state: "declined", reason: "budget" } : { state: "known", login: "me" } }));
+    return null;
+  });
+  // Show all initially so both native observations exist before expiry.
+  useFilters.setState({ filtersByView: { ...EMPTY, "to-review": { readyMyPushes: "show" } } });
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={[pr]} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  expect(screen.getByLabelText("Stack position 5 of 8")).toBeTruthy();
+  failed = true;
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  await act(async () => { useFilters.setState({ filtersByView: { ...EMPTY } }); });
+  expect(screen.getByText(pr.title)).toBeTruthy();
+  expect(screen.getByLabelText(/Last known stack position 5 of 8/).getAttribute("title")).toMatch(/observed/i);
+  expect(document.querySelector("[data-pushed-by-you]")?.textContent).toContain("last known");
+  expect(document.body.textContent).not.toContain("your approval won't count here");
+  view.unmount(); qc.clear(); vi.useRealTimers();
+});
+
+it("qualifies off-window stack chips at their original deadline without another advisory request", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "me");
+  let intersections: ((entries: IntersectionObserverEntry[]) => void) | undefined;
+  vi.stubGlobal("IntersectionObserver", class {
+    constructor(callback: (entries: IntersectionObserverEntry[]) => void) { intersections = callback; }
+    observe() {} disconnect() {}
+  });
+  const rows = Array.from({ length: 20 }, (_, i) => ({ ...ready, id: `expiry-${i}`, number: i + 1, title: `Expiry row ${i}`, head_repo: ready.repo }));
+  invoke.mockImplementation(async (cmd, args) => {
+    if (cmd === "get_viewer") return "me";
+    const asks = args?.rows as PullRequest[];
+    if (cmd === "get_ready_stacks") return asks.map(row => ({ ...row, valid_for_ms: 45_000, stack: exactStack }));
+    if (cmd === "get_ready_pushers") return asks.map(row => ({ ...row, pusher_valid_for_ms: 60_000, rules_valid_for_ms: 600_000,
+      rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false },
+      last_pusher: { state: "known", login: "someone-else" } }));
+    return null;
+  });
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={rows} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(8);
+  await act(async () => { intersections!([]); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(16);
+  const calls = invoke.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  expect(screen.getAllByLabelText("Last known stack position 5 of 8")).toHaveLength(8);
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(8);
+  expect(invoke.mock.calls).toHaveLength(calls);
   view.unmount(); qc.clear(); vi.unstubAllGlobals(); vi.useRealTimers();
 });

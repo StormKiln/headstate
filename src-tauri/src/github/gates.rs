@@ -388,6 +388,14 @@ pub struct PusherAsk {
 /// an answer about a head the row has since moved off.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowPusher {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pusher_valid_for_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_valid_for_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_pusher: Option<super::advisory::LastKnown<LastPusher>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_rules: Option<super::advisory::LastKnown<BaseRules>>,
     pub repo: String,
     pub number: u64,
     pub head_oid: String,
@@ -420,6 +428,10 @@ pub async fn strip_pushers(
     let mut out: Vec<RowPusher> = asks
         .iter()
         .map(|a| RowPusher {
+            pusher_valid_for_ms: None,
+            rules_valid_for_ms: None,
+            last_known_pusher: None,
+            last_known_rules: None,
             repo: a.repo.clone(),
             number: a.number,
             head_oid: a.head_oid.clone(),
@@ -482,25 +494,19 @@ pub async fn strip_pushers(
         out[i].last_pusher = pusher;
     }
     for (row, ask) in out.iter_mut().zip(asks) {
-        if matches!(row.rules, BaseRules::Declined { .. }) {
-            if let Some(rules) = client
-                .advisory
-                .rules
-                .peek(&(ask.repo.clone(), ask.base.clone()))
-            {
-                row.rules = rules;
-            }
+        let rules_key = (ask.repo.clone(), ask.base.clone());
+        if let Some((rules, lifetime)) = client.advisory.rules.peek_receipt(&rules_key) {
+            row.rules = rules;
+            row.rules_valid_for_ms = Some(lifetime.as_millis() as u64);
         }
-        if matches!(row.last_pusher, LastPusher::Declined { .. }) {
-            if let Some(repo) = &ask.head_repo {
-                if let Some(pusher) = client.advisory.pushers.peek(&(
-                    repo.clone(),
-                    ask.head_ref.clone(),
-                    ask.head_oid.clone(),
-                )) {
-                    row.last_pusher = pusher;
-                }
+        row.last_known_rules = client.advisory.rules.last_success(&rules_key);
+        if let Some(repo) = &ask.head_repo {
+            let key = (repo.clone(), ask.head_ref.clone(), ask.head_oid.clone());
+            if let Some((pusher, lifetime)) = client.advisory.pushers.peek_receipt(&key) {
+                row.last_pusher = pusher;
+                row.pusher_valid_for_ms = Some(lifetime.as_millis() as u64);
             }
+            row.last_known_pusher = client.advisory.pushers.last_success(&key);
         }
     }
     out
@@ -521,6 +527,42 @@ mod tests {
             .build()
             .unwrap();
         GitHubClient::new(oc)
+    }
+
+    #[tokio::test]
+    async fn strip_receipt_preserves_native_remaining_pusher_and_policy_lifetime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.url.path().contains("/activity") {
+                    ResponseTemplate::new(200).set_body_json(
+                        json!([{"activity_type":"push","after":HEAD,"actor":{"login":"octocat"}}]),
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let asks = [ask("octocat/hello-world", 1, HEAD)];
+        let first = strip_pushers(&client, &client.request_budget(), &asks, T).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(55)).await;
+        let second = strip_pushers(&client, &client.request_budget(), &asks, T).await;
+        tokio::time::resume();
+        let first = serde_json::to_value(&first[0]).unwrap();
+        let second = serde_json::to_value(&second[0]).unwrap();
+        assert!(first["pusher_valid_for_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 59_000 && ms <= 60_000));
+        assert!(second["pusher_valid_for_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 4_000 && ms <= 5_000));
+        assert!(second["rules_valid_for_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 544_000 && ms <= 545_000));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -642,6 +684,158 @@ mod tests {
         assert_eq!(requests.len(), 8);
         assert!(requests.iter().any(|r| r.method == "POST"));
         assert!(requests.iter().any(|r| r.method == "GET"));
+    }
+
+    #[tokio::test]
+    async fn sustained_mixed_large_owner_and_selected_detail_share_actual_attempts() {
+        use super::super::model::PrStack;
+        use super::super::ready_stacks::{ready_stacks, StackAsk};
+        use std::collections::HashSet;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.url.path().contains("/activity") {
+                    ResponseTemplate::new(200).set_body_json(
+                        json!([{"activity_type":"push","after":HEAD,"actor":{"login":"octocat"}}]),
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([]))
+                }
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let number = body["variables"]["number"].as_u64();
+            if let Some(number) = number {
+                // Non-native membership needs a second real HTTP attempt.
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequest":{"number":number,"headRefOid":HEAD,"headRefName":"feature","baseRefName":"main","stackEntry":null}}}}))
+            } else { ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"pullRequests":{"nodes":[]}}}})) }
+        }).mount(&server).await;
+        let client = client_for(&server).await;
+        let population: Vec<_> = (1..=275)
+            .map(|number| ask(&format!("synthetic/repo-{}", number % 44), number, HEAD))
+            .collect();
+        let stack_ask = |a: &PusherAsk| StackAsk {
+            identity: crate::identity::PrIdentity {
+                source: crate::identity::Source::default(),
+                repo: a.repo.clone(),
+                number: a.number,
+            },
+            head_oid: Some(a.head_oid.clone()),
+            base_ref: Some(a.base.clone()),
+        };
+        let detail = ask("synthetic/selected", 999, HEAD);
+        // A late selected row cannot bypass an already exhausted native
+        // period. It receives an opportunity first in the following period.
+        let competing = client.with_read_context(super::super::admission::ReadContext::new(
+            super::super::admission::ReadClass::Advisory,
+            Duration::from_secs(10),
+        ));
+        for _ in 0..8 {
+            competing
+                .stats_graphql(&json!({"query":"synthetic competing advisory"}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ready_stacks(&client, vec![stack_ask(&detail)])
+                .await
+                .unwrap()[0]
+                .stack,
+            PrStack::Unknown
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 8);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        let mut pushers_seen = HashSet::new();
+        let mut stacks_seen = HashSet::new();
+        let mut attempts = 8;
+        let mut detail_opportunities = 0;
+        let mut longest_detail_gap = 0;
+        let mut detail_gap = 0;
+        for cycle in 0..315 {
+            let window: Vec<_> = (0..8)
+                .map(|offset| population[(cycle * 8 + offset) % population.len()].clone())
+                .collect();
+            let budget = client.request_budget();
+            // Replay the production shared queue: selected ancestry first,
+            // then alternate single-row pusher/strip-stack demand. Each command
+            // still executes real native fanout under the unchanged meter.
+            let selected = ready_stacks(&client, vec![stack_ask(&detail)])
+                .await
+                .unwrap();
+            if selected[0].stack != PrStack::Unknown {
+                detail_opportunities += 1;
+                detail_gap = 0;
+            } else {
+                detail_gap += 1;
+                longest_detail_gap = longest_detail_gap.max(detail_gap);
+            }
+            for row in &window {
+                for pusher_turn in [cycle % 2 == 0, cycle % 2 != 0] {
+                    if pusher_turn {
+                        let pushers =
+                            strip_pushers(&client, &budget, std::slice::from_ref(row), T).await;
+                        pushers_seen.extend(
+                            pushers
+                                .iter()
+                                .filter(|r| matches!(r.last_pusher, LastPusher::Known { .. }))
+                                .map(|r| r.number),
+                        );
+                    } else {
+                        let stacks = ready_stacks(&client, vec![stack_ask(row)]).await.unwrap();
+                        stacks_seen.extend(
+                            stacks
+                                .iter()
+                                .filter(|r| r.stack != PrStack::Unknown)
+                                .map(|r| r.identity.number),
+                        );
+                    }
+                }
+            }
+            let actual = server.received_requests().await.unwrap().len();
+            assert!(
+                actual - attempts <= 8,
+                "cycle {cycle}: actual native HTTP attempts, including fanout"
+            );
+            attempts = actual;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+        }
+        assert_eq!(
+            pushers_seen.len(),
+            275,
+            "every pusher gets an opportunity under sustained synthetic demand"
+        );
+        assert_eq!(
+            stacks_seen.len(),
+            275,
+            "every stack gets an opportunity under sustained synthetic demand"
+        );
+        assert!(
+            longest_detail_gap <= 1,
+            "selected detail waited {} cycles",
+            longest_detail_gap
+        );
+        let detail_reads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                body["variables"]["number"].as_u64() == Some(999)
+            })
+            .count();
+        assert!(
+            detail_reads <= 158,
+            "fresh selected native receipts must be reused"
+        );
+        println!("mixed: cycles=315 attempts={attempts} selected_downward_reads={detail_reads} pushers={} stacks={} selected_successes={detail_opportunities} longest_detail_gap={longest_detail_gap}", pushers_seen.len(), stacks_seen.len());
     }
 
     #[tokio::test]

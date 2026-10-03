@@ -40,7 +40,15 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "usr/share/licenses/headstate/gstreamer1.0-plugins-base-copyright": "/usr/share/doc/gstreamer1.0-plugins-base/copyright"
+        }
+      }
+    }
   },
   "plugins": {
     "updater": {

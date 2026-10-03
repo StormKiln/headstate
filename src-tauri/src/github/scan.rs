@@ -91,23 +91,37 @@ impl GitHubClient {
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ClientError::Graphql("no verified queue owner".into()))?;
+        let unchanged = state.clone();
+        let attempts_before = client.attempts_remaining();
+        if state.done {
+            if let Some(finished_at) = state.finished_at {
+                state.eligible_at = finished_at + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
+            }
+        }
         if state.done && now >= state.eligible_at {
             state.fresh_pass();
         }
+        let began_at_head = state.after.is_none();
+        state.no_work = true;
+        state.received = false;
+        let previous_failure = state.step_failure.take();
         state.receipt_id = Some(queue_scan::new_receipt_id());
         let due_confirmation = state.candidates.iter().any(|c| c.eligible_at <= now);
         if due_confirmation && client.attempts_remaining() > 0 {
+            state.no_work = false;
             removals = client
                 .with_attempt_limit(1)
                 .confirm(list, &mut state, owner, now)
                 .await;
         }
-        let mut full_single_page = false;
+
         if !state.done && now >= state.eligible_at {
+            state.started_at.get_or_insert(now);
             for _ in 0..2 {
                 if client.attempts_remaining() == 0 {
                     break;
                 }
+                state.no_work = false;
                 let raw = match client.scan_page(list, state.after.as_deref()).await {
                     Ok(raw) => raw,
                     Err(error) => {
@@ -117,6 +131,7 @@ impl GitHubClient {
                             state.receipt_id = receipt_id;
                         }
                         state.failure(now);
+                        state.step_failure = Some(scan_failure(&error));
                         break;
                     }
                 };
@@ -130,8 +145,15 @@ impl GitHubClient {
                     state.fresh_pass();
                     state.receipt_id = receipt_id;
                     state.failure(now);
+                    state.step_failure = Some(queue_scan::ScanFailure {
+                        message: "The queue cursor could not be validated; traversal will retry."
+                            .into(),
+                        transient: true,
+                        not_asked: false,
+                    });
                     break;
                 }
+                state.received = true;
                 let rows = map_list(&raw, "authored");
                 let page = &raw["authored"];
                 let total = page["issueCount"].as_u64();
@@ -149,6 +171,7 @@ impl GitHubClient {
                         == rows.len();
                 if !valid {
                     state.tainted = true;
+                    state.coverage_valid = false;
                 }
                 for row in rows {
                     let id = row.identity();
@@ -166,21 +189,27 @@ impl GitHubClient {
                     state.pages += 1;
                     state.failures = 0;
                     state.done = true;
+                    state.finished_at = Some(now);
                     state.ceiling = total.is_some_and(|n| n > 1000);
-                    full_single_page = state.pages == 1
-                        && valid
+                    let complete = valid
                         && !state.tainted
                         && total == Some(state.seen.len() as u64)
                         && !state.ceiling;
-                    state.eligible_at = now + queue_scan::CONFIRM_DELAY;
+                    state.coverage_valid = complete;
+                    if complete {
+                        state.completed_at = Some(now);
+                        state.completed_total = total;
+                    }
+                    state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
                     seed_candidates(&mut state, previous, now);
                     break;
                 }
                 if state.seen.len() >= 1000 || state.pages >= 39 {
                     state.done = true;
+                    state.finished_at = Some(now);
                     state.ceiling = true;
                     state.tainted = true;
-                    state.eligible_at = now + queue_scan::CONFIRM_DELAY;
+                    state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
                     seed_candidates(&mut state, previous, now);
                     break;
                 }
@@ -190,6 +219,12 @@ impl GitHubClient {
                     || cursor.is_some_and(|c| state.cursors.iter().any(|old| old == c))
                 {
                     state.failure(now);
+                    state.step_failure = Some(queue_scan::ScanFailure {
+                        message: "The queue cursor could not be validated; traversal will retry."
+                            .into(),
+                        transient: true,
+                        not_asked: false,
+                    });
                     break;
                 }
                 state.pages += 1;
@@ -203,26 +238,53 @@ impl GitHubClient {
         if !due_confirmation
             && now >= state.eligible_at
             && !state.done
+            && !began_at_head
             && state.after.is_some()
             && client.attempts_remaining() > 0
         {
-            if let Ok(raw) = client.with_attempt_limit(1).scan_page(list, None).await {
-                if raw["viewer"]["login"].as_str().is_some_and(|v| v != owner) {
-                    return Err(ClientError::Graphql(
-                        "queue account changed during head refresh".into(),
-                    ));
+            match client.with_attempt_limit(1).scan_page(list, None).await {
+                Ok(raw) => {
+                    if raw["viewer"]["login"].as_str().is_some_and(|v| v != owner) {
+                        return Err(ClientError::Graphql(
+                            "queue account changed during head refresh".into(),
+                        ));
+                    }
+                    state.observe_count(raw["authored"]["issueCount"].as_u64());
+                    if !clean(&raw) {
+                        state.tainted = true;
+                    }
+                    for row in map_list(&raw, "authored") {
+                        state.candidates.retain(|c| c.identity != row.identity());
+                        merge_observation(&mut prs, row);
+                    }
                 }
-                state.observe_count(raw["authored"]["issueCount"].as_u64());
-                for row in map_list(&raw, "authored") {
-                    state.candidates.retain(|c| c.identity != row.identity());
-                    merge_observation(&mut prs, row);
+                Err(error) => {
+                    state.failure(now);
+                    state.step_failure = Some(scan_failure(&error));
                 }
             }
+        }
+        // Admission refusal is not a provider observation or a failed response.
+        // Preserve the accepted receipt exactly when no HTTP attempt was admitted.
+        if client.attempts_remaining() == attempts_before {
+            state = unchanged;
+            state.no_work = true;
+            state.received = false;
+        }
+
+        if !state.no_work && !state.done && state.failures == 0 {
+            state.eligible_at = now + 15;
         }
         // A positive measurement in this step always beats a tentative negative.
         removals.retain(|id| !prs.iter().any(|r| &r.identity() == id));
         let total = state.total;
-        let coverage = if full_single_page {
+        if state.no_work && state.step_failure.is_none() {
+            state.step_failure = previous_failure;
+        }
+        if state.tainted {
+            state.coverage_valid = false;
+        }
+        let coverage = if state.coverage_valid {
             Coverage::Complete
         } else {
             Coverage::Partial { total }
@@ -285,6 +347,16 @@ impl GitHubClient {
             .is_ok_and(|v| clean(v) && v["viewer"]["login"].as_str() == Some(owner));
         if !healthy {
             state.isolate = true;
+            state.tainted = true;
+            state.step_failure = Some(match &raw {
+                Err(error) => scan_failure(error),
+                Ok(_) => queue_scan::ScanFailure {
+                    message: "Queue membership could not be confirmed; saved rows were retained."
+                        .into(),
+                    transient: true,
+                    not_asked: false,
+                },
+            });
         }
         let mut removed = vec![];
         for (i, mut c) in batch.into_iter().enumerate() {
@@ -323,6 +395,14 @@ impl GitHubClient {
         removed
     }
 }
+fn scan_failure(error: &ClientError) -> queue_scan::ScanFailure {
+    queue_scan::ScanFailure {
+        message: error.to_string(),
+        transient: error.is_transient(),
+        not_asked: matches!(error, ClientError::NotDispatched(_)),
+    }
+}
+
 fn explicit_invalid_cursor(error: &ClientError) -> bool {
     match error {
         ClientError::Graphql(message) => super::client::invalid_cursor_message(message),
@@ -508,6 +588,47 @@ mod tests {
         assert_eq!(inventory.len(), 275);
         assert!(state.done);
     }
+    #[tokio::test]
+    async fn confirmation_failure_is_qualified_without_authorizing_removal() {
+        let server = MockServer::start().await;
+        let client = client(&server);
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .mount(&server)
+            .await;
+        client.fetch_viewer().await.unwrap();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let result = client
+            .advance_scan(
+                CachedList::Reviewing,
+                Loaded {
+                    revision: 1,
+                    state: State {
+                        done: true,
+                        eligible_at: i64::MAX,
+                        candidates: [candidate(7)].into(),
+                        ..Default::default()
+                    },
+                },
+                &[],
+                1000,
+            )
+            .await
+            .unwrap();
+        let scan = result.scan.unwrap();
+        assert!(scan.removals.is_empty());
+        assert!(scan.state.step_failure.is_some());
+        assert_eq!(scan.state.candidates.len(), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
     fn candidate(number: usize) -> Candidate {
         let raw = node(number);
         Candidate {

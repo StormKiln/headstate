@@ -34,29 +34,29 @@ async function advance(ms: number) {
   await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 }
 
-it("refreshes mounted unknown and off-list membership without head changes, once per minute in a shared batch", async () => {
+it("refreshes mounted unknown and off-list membership without head changes, once per minute without duplicate row demand", async () => {
   let stack: PrStack = { kind: "unknown" };
   invoke.mockImplementation(async () => rows.map((pr) => ({ repo: pr.repo, number: pr.number, head_oid: pr.head_oid, base_ref: pr.base_ref, valid_for_ms: stack.kind === "unknown" ? 5_000 : 60_000, stack })));
   const view = renderHook(() => useReadyStacks(rows), { wrapper });
   await advance(1);
   expect(view.result.current.of(rows[0])).toEqual({ kind: "unknown" });
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(2);
   stack = exact;
   await advance(29_998);
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(2);
   await advance(2);
   await advance(2);
   expect(view.result.current.of(rows[0])).toEqual(exact);
-  expect(invoke).toHaveBeenCalledTimes(2);
-  expect(invoke.mock.calls[1][1]?.rows).toHaveLength(2);
+  expect(invoke).toHaveBeenCalledTimes(4);
+  expect(invoke.mock.calls[2][1]?.rows).toHaveLength(1);
   stack = { ...exact, position: 4, size: 7 };
   await advance(60_000);
   await advance(2);
   expect(view.result.current.of(rows[0])).toEqual(stack);
-  expect(invoke).toHaveBeenCalledTimes(3);
+  expect(invoke).toHaveBeenCalledTimes(6);
   view.unmount();
   await advance(120_000);
-  expect(invoke).toHaveBeenCalledTimes(3);
+  expect(invoke).toHaveBeenCalledTimes(6);
 });
 
 it("does not multiply pending metadata requests when refresh timers fire", async () => {
@@ -75,11 +75,11 @@ it("limits a large mounted owner to one finite demand window and stops hidden wo
   invoke.mockImplementation(async (_command, args) => (args?.rows as typeof many).map((pr) => ({ ...pr, valid_for_ms: 60_000, stack: { kind: "unknown" } })));
   const view = renderHook(() => useReadyStacks(many), { wrapper });
   await advance(10);
-  expect(invoke).toHaveBeenCalledTimes(1);
-  expect(invoke.mock.calls[0][1]?.rows).toHaveLength(8);
+  expect(invoke).toHaveBeenCalledTimes(8);
+  expect(invoke.mock.calls[0][1]?.rows).toHaveLength(1);
   view.unmount();
   await advance(120_000);
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(8);
 });
 
 it("rejects legacy and mismatched head/base evidence and isolates account receipts", async () => {
@@ -92,7 +92,7 @@ it("rejects legacy and mismatched head/base evidence and isolates account receip
   await act(async () => { qc.setQueryData(["viewer"], owner); });
   await advance(3);
   expect(view.result.current.of(rows[0])).toEqual(exact);
-  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(invoke).toHaveBeenCalledTimes(4);
 });
 
 it("shares two owners and removes hidden queued demand without canceling a live observer", async () => {
@@ -105,11 +105,11 @@ it("shares two owners and removes hidden queued demand without canceling a live 
   await act(async () => finish!(rows.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: exact }))));
   await advance(2);
   expect(b.result.current.of(rows[0])).toEqual(exact);
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(2);
   Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
   await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
   await advance(120_000);
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(2);
   Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
   b.unmount();
 });
@@ -125,6 +125,6 @@ it("drops a closed owner's waiting batch while another owner's native call finis
   closed.unmount();
   await act(async () => { finish!(rows.map(pr => ({ ...pr, valid_for_ms: 60_000, stack: exact }))); });
   await advance(2);
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledTimes(2);
   expect(live.result.current.of(rows[0])).toEqual(exact);
 });
