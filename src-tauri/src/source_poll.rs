@@ -33,6 +33,10 @@ pub struct Status {
     pub phase: Phase,
     #[serde(skip)]
     settled_phase: Option<Phase>,
+    #[serde(skip)]
+    published_scan_receipt: Option<String>,
+    #[serde(skip)]
+    settled_scan_receipt: Option<String>,
     pub revision: u64,
     pub receipt_revision: Option<u64>,
     pub request_id: Option<String>,
@@ -50,6 +54,8 @@ impl Status {
             list,
             phase: Phase::NotRequested,
             settled_phase: None,
+            published_scan_receipt: None,
+            settled_scan_receipt: None,
             revision: 0,
             receipt_revision: None,
             request_id: None,
@@ -240,102 +246,94 @@ impl SourcePolls {
             }
             Err(error) => Err(error),
         };
-        let scan_coverage = status_result.as_ref().ok().cloned();
-        let status = if let Some(state) = scan_state.as_ref().filter(|s| s.no_work) {
-            let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            entries
-                .get_mut(&(attempt.source.clone(), attempt.list))
-                .and_then(|(generation, status)| {
-                    if *generation != attempt.generation {
-                        return None;
-                    }
-                    status.revision += 1;
-                    status.phase = status.settled_phase.clone().unwrap_or(Phase::NotRequested);
-                    // A restart can load an owned receipt without fabricating receipt time.
-                    if let Ok(coverage) = status_result {
-                        if status.coverage.is_none() {
-                            status.coverage = Some(coverage);
-                        }
-                    }
-                    if status.phase == Phase::NotRequested {
-                        status.phase = if state.step_failure.is_some() {
-                            Phase::Failed
-                        } else if matches!(status.coverage, Some(Coverage::Complete)) {
-                            Phase::Ready
-                        } else {
-                            Phase::Partial
-                        };
-                        status.error = state.step_failure.as_ref().map(|f| f.message.clone());
-                    }
-                    Some(status.clone())
-                })
-        } else if let Some(failure) = scan_state.as_ref().and_then(|s| s.step_failure.as_ref()) {
-            let current = self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(attempt.source.clone(), attempt.list))
-                .is_some_and(|(generation, _)| *generation == attempt.generation);
-            if !current {
-                // Earlier usable pages may advance rows, never the newer attempt's outcome.
-                if scan_state.as_ref().is_some_and(|s| s.received) {
-                    self.finish(attempt, status_result)
-                } else {
-                    None
-                }
-            } else {
-                let mut status = self.finish(
-                    attempt,
-                    Err(Failure {
-                        message: failure.message.clone(),
-                        transient: failure.transient,
-                        not_asked: failure.not_asked,
-                    }),
-                );
-                if scan_state.as_ref().is_some_and(|s| s.received) {
-                    if let Some(status) = status.as_mut() {
-                        status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
-                        if let Some((_, stored)) = self
-                            .0
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_mut(&(attempt.source.clone(), attempt.list))
-                        {
-                            stored.last_received_at = status.last_received_at.clone();
-                        }
-                    }
-                }
-                status
-            }
-        } else {
-            self.finish(attempt, status_result)
+        let status = match (scan_state, status_result) {
+            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage),
+            (_, result) => self.finish(attempt, result),
         };
-        if let Some(mut status) = status {
-            if scan_state.is_some() {
-                if scan_state
-                    .as_ref()
-                    .is_some_and(|s| !s.no_work && s.step_failure.is_some())
-                {
-                    // A changed qualification is a row publication, not a new observation.
-                    status.receipt_revision = Some(status.revision);
-                }
-                if let Some(coverage) = scan_coverage {
-                    status.coverage = Some(coverage);
-                    if let Some((_, stored)) = self
-                        .0
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_mut(&(attempt.source.clone(), attempt.list))
-                    {
-                        stored.coverage = status.coverage.clone();
-                        stored.receipt_revision = status.receipt_revision;
-                    }
-                }
-            }
+        if let Some(status) = status {
             emit(status);
         }
-        // The publication permit remains held through both the status mutation
-        // and callback. A newer attempt cannot interleave a fetching event.
+        // The publication permit remains held through both status mutation and emission.
+    }
+
+    fn finish_scan(
+        &self,
+        attempt: &Attempt,
+        state: &crate::queue_scan::State,
+        coverage: Coverage,
+    ) -> Option<Status> {
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
+        let current = *generation == attempt.generation;
+        if state.no_work {
+            if !current {
+                return None;
+            }
+            status.revision += 1;
+            status.phase = status.settled_phase.clone().unwrap_or(Phase::NotRequested);
+            if status.coverage.is_none() {
+                status.coverage = Some(coverage);
+            }
+            // Disk readback on restart carries no invented provider receipt time.
+            if status.phase == Phase::NotRequested {
+                status.phase = if state.step_failure.is_some() {
+                    Phase::Failed
+                } else if matches!(status.coverage, Some(Coverage::Complete)) {
+                    Phase::Ready
+                } else {
+                    Phase::Partial
+                };
+                status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+            }
+            return Some(status.clone());
+        }
+        // Coalesced callers share the operation's data receipt, but only the
+        // current request may settle its outcome. A stale caller may publish
+        // useful rows (including changed qualification) beside newer work.
+        let published =
+            state.receipt_id.is_some() && status.published_scan_receipt == state.receipt_id;
+        if !current && published {
+            return None;
+        }
+        status.revision += 1;
+        if !published {
+            status.receipt_revision = Some(status.revision);
+            status.coverage = Some(coverage.clone());
+            status.published_scan_receipt = state.receipt_id.clone();
+            if state.received || state.step_failure.is_none() {
+                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+        if current {
+            let settled =
+                state.receipt_id.is_some() && status.settled_scan_receipt == state.receipt_id;
+            if let Some(failure) = &state.step_failure {
+                status.phase = if failure.not_asked {
+                    Phase::NotAsked
+                } else {
+                    if !settled {
+                        status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+                    }
+                    if failure.transient && status.consecutive_failures < 2 {
+                        Phase::Retrying
+                    } else {
+                        Phase::Failed
+                    }
+                };
+                status.error = Some(failure.message.clone());
+            } else {
+                status.phase = match coverage {
+                    Coverage::Complete => Phase::Ready,
+                    Coverage::Partial { .. } => Phase::Partial,
+                    Coverage::Unknown => Phase::Unknown,
+                };
+                status.error = None;
+                status.consecutive_failures = 0;
+            }
+            status.settled_scan_receipt = state.receipt_id.clone();
+            status.settled_phase = Some(status.phase.clone());
+        }
+        Some(status.clone())
     }
     fn complete_gitlab(
         &self,
@@ -778,9 +776,8 @@ fn reconcile_github_snapshot(
             {
                 result.prs = prs;
                 result.coverage = coverage;
-                if let Some(scan) = &mut result.scan {
-                    scan.state.no_work = true;
-                }
+                // This is adoption of an actual accepted operation, not a
+                // cooldown/no-work result. Its outcome still belongs to the caller.
                 return Ok(result);
             }
             return Err(inventory_failure(

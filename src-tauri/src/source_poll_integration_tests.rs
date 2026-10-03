@@ -899,3 +899,289 @@ async fn head_refresh_failure_is_qualified_without_losing_successful_tail_pages(
     ));
     assert!(server.received_requests().await.unwrap().len() <= 3);
 }
+
+async fn publish_scan_attempt(
+    polls: &SourcePolls,
+    conn: &rusqlite::Connection,
+    attempt: &Attempt,
+    result: FetchedList,
+) -> Option<Update> {
+    let permit = polls.success_publication(attempt).await.unwrap();
+    let result = reconcile_github_snapshot(
+        conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        result,
+        None,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    let mut frame = None;
+    polls.complete(permit, Ok(result), |status| {
+        frame = Some(polls.update(status, None))
+    });
+    frame
+}
+
+async fn coalesced_outcome_is_adopted_once(recovery: bool) {
+    let (server, client) = stable_queue(75).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    if recovery {
+        publish(
+            &polls,
+            &conn,
+            Err(Failure {
+                message: "Synthetic earlier failure".into(),
+                transient: false,
+                not_asked: false,
+            }),
+        )
+        .await;
+    } else {
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+    }
+    let baseline = polls.get(&source, list);
+    conn.execute_batch("CREATE TABLE snapshot_writes (id INTEGER); CREATE TRIGGER audit_snapshot AFTER UPDATE ON snapshot BEGIN INSERT INTO snapshot_writes VALUES(1); END;").unwrap();
+    let (a, _) = polls.begin_attempt(source.clone(), list).await;
+    let (b, _) = polls.begin_attempt(source.clone(), list).await;
+    let loaded = queue_scan::load(&conn, &source, list, "synthetic-viewer").unwrap();
+    let rows = saved(&conn);
+    let before = server.received_requests().await.unwrap().len();
+    let (first, second) = tokio::join!(
+        client.advance_scan(
+            list,
+            queue_scan::Loaded {
+                revision: loaded.revision,
+                state: loaded.state.clone()
+            },
+            &rows,
+            1015
+        ),
+        client.advance_scan(list, loaded, &rows, 1015),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(
+        first.scan, second.scan,
+        "actual overlapping reads share an operation"
+    );
+    assert!(server.received_requests().await.unwrap().len() - before <= 3);
+    publish_scan_attempt(&polls, &conn, &a, first).await;
+    let first_status = polls.get(&source, list);
+    let first_rows = saved(&conn);
+    let revision = queue_scan::load(&conn, &source, list, "synthetic-viewer")
+        .unwrap()
+        .revision;
+    let writes: i64 = conn
+        .query_row("SELECT count(*) FROM snapshot_writes", [], |r| r.get(0))
+        .unwrap();
+    let adopted = publish_scan_attempt(&polls, &conn, &b, second.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        adopted.status.phase,
+        if recovery {
+            Phase::Ready
+        } else {
+            Phase::Retrying
+        }
+    );
+    assert_eq!(
+        adopted.status.consecutive_failures,
+        if recovery { 0 } else { 1 }
+    );
+    assert_eq!(adopted.status.error.is_some(), !recovery);
+    assert!(
+        adopted.status.receipt_revision > baseline.receipt_revision,
+        "qualified rows must reach modern receipt-gated consumers"
+    );
+    assert_eq!(adopted.prs.as_ref().unwrap(), &first_rows);
+    assert_eq!(
+        adopted.status.last_received_at, first_status.last_received_at,
+        "adoption cannot restamp a shared operation"
+    );
+    if !recovery {
+        assert_eq!(adopted.status.last_received_at, baseline.last_received_at);
+    }
+    assert_eq!(
+        queue_scan::load(&conn, &source, list, "synthetic-viewer")
+            .unwrap()
+            .revision,
+        revision
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM snapshot_writes", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        writes
+    );
+    let (duplicate, _) = polls.begin_attempt(source.clone(), list).await;
+    let repeated = publish_scan_attempt(&polls, &conn, &duplicate, second)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.status.consecutive_failures,
+        adopted.status.consecutive_failures
+    );
+    assert_eq!(repeated.status.phase, adopted.status.phase);
+    assert_eq!(
+        repeated.status.receipt_revision,
+        adopted.status.receipt_revision
+    );
+    assert_eq!(
+        repeated.status.last_received_at,
+        adopted.status.last_received_at
+    );
+    assert_eq!(saved(&conn), first_rows);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM snapshot_writes", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        writes
+    );
+}
+
+#[tokio::test]
+async fn older_first_coalesced_failure_publishes_qualification_and_one_failure() {
+    coalesced_outcome_is_adopted_once(false).await;
+}
+
+#[tokio::test]
+async fn older_first_coalesced_recovery_clears_failure_without_restamping() {
+    coalesced_outcome_is_adopted_once(true).await;
+}
+
+#[tokio::test]
+async fn file_snapshot_age_survives_reopen_failure_no_work_and_recovers_on_observation() {
+    let (server, client) = stable_queue(75).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("age.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    // Age the fixture, then exercise only production snapshot reads/refreshes.
+    conn.execute("UPDATE snapshot SET fetched_at='2020-01-01 00:00:00'", [])
+        .unwrap();
+    drop(conn);
+    let read_age = |conn: &rusqlite::Connection| {
+        let SnapshotData::Available {
+            fetched_at,
+            stale_secs,
+            prs,
+            ..
+        } = source_cache::load_source_snapshot(conn, &Source::default(), CachedList::Reviewing)
+            .unwrap()
+            .data
+        else {
+            panic!("missing snapshot")
+        };
+        (fetched_at, stale_secs, prs)
+    };
+    let conn = crate::store::open_db(&path).unwrap();
+    let old = read_age(&conn);
+    assert!(old.1.is_some_and(|age| age > 86_400));
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    drop(conn);
+    let conn = crate::store::open_db(&path).unwrap();
+    let failed = read_age(&conn);
+    assert_eq!(failed.0, old.0);
+    assert!(failed.1 >= old.1);
+    assert_eq!(failed.2.len(), 50);
+    let before = server.received_requests().await.unwrap().len();
+    scan_and_publish(&polls, &conn, &client, 1016).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    drop(conn);
+    let conn = crate::store::open_db(&path).unwrap();
+    let deferred = read_age(&conn);
+    assert_eq!(deferred.0, old.0);
+    assert!(deferred.1 >= failed.1);
+    assert_eq!(deferred.2, failed.2);
+    let (_recovery_server, recovery) = stable_queue(75).await;
+    scan_and_publish(&polls, &conn, &recovery, 1100).await;
+    drop(conn);
+    let conn = crate::store::open_db(&path).unwrap();
+    let recovered = read_age(&conn);
+    assert_ne!(recovered.0, old.0);
+    assert_eq!(recovered.1, None);
+    assert_eq!(recovered.2.len(), 75);
+    for old in failed.2 {
+        assert_eq!(
+            recovered
+                .2
+                .iter()
+                .find(|r| r.identity() == old.identity())
+                .unwrap()
+                .observation,
+            old.observation
+        );
+    }
+}
+
+#[tokio::test]
+async fn coalesced_adoption_cannot_settle_an_independent_newer_failure() {
+    for scan_fails in [false, true] {
+        let (server, client) = stable_queue(75).await;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let polls = SourcePolls::default();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        scan_and_publish(&polls, &conn, &client, 1000).await;
+        if scan_fails {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+        }
+        let (a, _) = polls.begin_attempt(source.clone(), list).await;
+        let (b, _) = polls.begin_attempt(source.clone(), list).await;
+        let result = client
+            .advance_scan(
+                list,
+                queue_scan::load(&conn, &source, list, "synthetic-viewer").unwrap(),
+                &saved(&conn),
+                1015,
+            )
+            .await
+            .unwrap();
+        let (independent, _) = polls.begin_attempt(source.clone(), list).await;
+        let permit = polls.publication(&independent).await.unwrap();
+        polls.complete(
+            permit,
+            Err(Failure {
+                message: "Independent newer failure".into(),
+                transient: false,
+                not_asked: false,
+            }),
+            |_| {},
+        );
+        publish_scan_attempt(&polls, &conn, &a, result.clone()).await;
+        let first = polls.get(&source, list);
+        assert_eq!(first.phase, Phase::Failed);
+        assert_eq!(first.error.as_deref(), Some("Independent newer failure"));
+        assert_eq!(first.consecutive_failures, 1);
+        assert!(publish_scan_attempt(&polls, &conn, &b, result)
+            .await
+            .is_none());
+        let after = polls.get(&source, list);
+        assert_eq!(after.phase, first.phase);
+        assert_eq!(after.error, first.error);
+        assert_eq!(after.consecutive_failures, first.consecutive_failures);
+        assert_eq!(after.last_received_at, first.last_received_at);
+        assert_eq!(after.receipt_revision, first.receipt_revision);
+    }
+}
