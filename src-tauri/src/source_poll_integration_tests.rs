@@ -1632,3 +1632,281 @@ async fn pending_continuation_allows_real_detail_and_review_and_cannot_erase_rec
     server.abort();
     let _ = server.await;
 }
+
+/// B starts behind A but cannot load its checkpoint until A has committed.
+/// Unlike coalesced reads, B then sees a NEW revision and legitimately does no HTTP.
+async fn delayed_no_work_readback(
+    recovery: bool,
+    independent_failure: bool,
+    settle_before_a: bool,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = MockServer::start().await;
+    let fail = Arc::new(AtomicBool::new(false));
+    let served_fail = fail.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            if served_fail.load(Ordering::SeqCst) {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"data":{
+                    "viewer":{"login":"synthetic-viewer"},
+                    "authored":{"issueCount":20,"nodes":(1..=20).map(|n|node(n,false)).collect::<Vec<_>>(),
+                    "pageInfo":{"hasNextPage":false,"endCursor":"cursor-20"}}
+                }}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = Arc::new(github_client(&server));
+    client.fetch_viewer().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("delayed-readback.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    let first = fetch_github_step_at(
+        path.clone(),
+        &client,
+        list,
+        Duration::from_secs(30),
+        false,
+        || (120, 1000),
+    )
+    .await
+    .unwrap();
+    publish(&polls, &conn, Ok(first)).await;
+    if recovery {
+        fail.store(true, Ordering::SeqCst);
+        // Actual ownership-read failures settle Failed without tainting the
+        // previously completed durable traversal. A can then recover Complete.
+        let unverified = github_client(&server);
+        for now in [1200, 1400] {
+            let error = fetch_github_step_at(
+                path.clone(),
+                &unverified,
+                list,
+                Duration::from_secs(30),
+                false,
+                || (120, now),
+            )
+            .await
+            .err()
+            .expect("actual provider failure");
+            publish(&polls, &conn, Err(Failure::from(&error))).await;
+        }
+    }
+    let baseline = polls.get(&source, list);
+    assert_eq!(
+        baseline.phase,
+        if recovery {
+            Phase::Failed
+        } else {
+            Phase::Ready
+        }
+    );
+    fail.store(!recovery, Ordering::SeqCst);
+    conn.execute_batch("CREATE TABLE readback_writes (kind TEXT); CREATE TRIGGER audit_readback_snapshot AFTER UPDATE ON snapshot BEGIN INSERT INTO readback_writes VALUES('snapshot'); END; CREATE TRIGGER audit_readback_checkpoint AFTER UPDATE ON queue_scan BEGIN INSERT INTO readback_writes VALUES('checkpoint'); END;").unwrap();
+    let (a, _) = polls.begin_attempt(source.clone(), list).await;
+    let b = polls
+        .begin_and_emit(source.clone(), list, Some("delayed-B".into()), |_| {})
+        .await;
+    let (release, held) = tokio::sync::oneshot::channel();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let delayed = tokio::spawn({
+        let client = client.clone();
+        let path = path.clone();
+        async move {
+            entered.send(()).unwrap();
+            held.await.unwrap();
+            fetch_github_step_at(path, &client, list, Duration::from_secs(30), true, || {
+                (120, 2001)
+            })
+            .await
+            .unwrap()
+        }
+    });
+    waiting.await.unwrap();
+    let before_http = server.received_requests().await.unwrap().len();
+    let real = fetch_github_step_at(
+        path.clone(),
+        &client,
+        list,
+        Duration::from_secs(30),
+        false,
+        || (120, 2000),
+    )
+    .await
+    .unwrap();
+    assert!(!real.scan.as_ref().unwrap().state.no_work);
+    assert_eq!(
+        real.scan.as_ref().unwrap().state.step_failure.is_some(),
+        !recovery
+    );
+    let mut independent = None;
+    if independent_failure && settle_before_a {
+        independent = Some(settle_independent_readback_failure(&polls).await);
+    }
+    let permit = polls.success_publication(&a).await.unwrap();
+    let real = reconcile_github_at(path.clone(), &polls, &permit, real)
+        .await
+        .unwrap_or_else(|f| panic!("{}", f.message));
+    polls.complete(permit, Ok(real), |_| {});
+    let published = polls.get(&source, list);
+    assert_eq!(
+        published.phase,
+        if independent_failure && settle_before_a {
+            Phase::Failed
+        } else {
+            Phase::Fetching
+        },
+        "A publishes beside the newer pending or independently settled request"
+    );
+    assert!(published.receipt_revision > baseline.receipt_revision);
+    let checkpoint = queue_scan::load(&conn, &source, list, "synthetic-viewer").unwrap();
+    let rows = saved(&conn);
+    let snapshot = source_cache::load_source_snapshot(&conn, &source, list).unwrap();
+    let fetched_at = match &snapshot.data {
+        SnapshotData::Available { fetched_at, .. } => fetched_at.clone(),
+        _ => panic!("missing snapshot"),
+    };
+    let writes: i64 = conn
+        .query_row("SELECT count(*) FROM readback_writes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM readback_writes WHERE kind='checkpoint'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    // Pure failure saves qualified rows then restores the existing fetched_at.
+    assert_eq!(writes, if recovery { 2 } else { 3 });
+    let after_http = server.received_requests().await.unwrap().len();
+    assert!((1..=3).contains(&(after_http - before_http)));
+    if independent_failure && !settle_before_a {
+        independent = Some(settle_independent_readback_failure(&polls).await);
+    }
+    release.send(()).unwrap();
+    let readback = delayed.await.unwrap();
+    assert!(readback.scan.as_ref().unwrap().state.no_work);
+    assert_eq!(
+        readback.scan.as_ref().unwrap().expected_revision,
+        checkpoint.revision
+    );
+    assert_eq!(
+        readback.scan.as_ref().unwrap().state.receipt_id,
+        checkpoint.state.receipt_id
+    );
+    let permit = polls.success_publication(&b).await.unwrap();
+    let prepared = reconcile_github_at(path.clone(), &polls, &permit, readback)
+        .await
+        .unwrap_or_else(|f| panic!("{}", f.message));
+    let mut emitted = None;
+    polls.complete(permit, Ok(prepared), |status| emitted = Some(status));
+    assert_eq!(emitted.is_some(), !independent_failure);
+    let expected = if let Some(status) = independent {
+        status
+    } else {
+        let status = polls.get(&source, list);
+        assert_eq!(
+            status.phase,
+            if recovery {
+                Phase::Ready
+            } else {
+                Phase::Retrying
+            }
+        );
+        assert_eq!(status.error.is_some(), !recovery);
+        assert_eq!(status.consecutive_failures, if recovery { 0 } else { 1 });
+        assert_eq!(status.request_id.as_deref(), Some("delayed-B"));
+        status
+    };
+    // A fresh current no-work request must not double count A or displace a
+    // separately settled newer failure. Both publication orders retain age.
+    for _ in 0..2 {
+        let (next, _) = polls.begin_attempt(source.clone(), list).await;
+        let noop = fetch_github_step_at(
+            path.clone(),
+            &client,
+            list,
+            Duration::from_secs(30),
+            true,
+            || (120, 2001),
+        )
+        .await
+        .unwrap();
+        let permit = polls.success_publication(&next).await.unwrap();
+        let noop = reconcile_github_at(path.clone(), &polls, &permit, noop)
+            .await
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        polls.complete(permit, Ok(noop), |_| {});
+        let status = polls.get(&source, list);
+        assert_eq!(status.phase, expected.phase);
+        assert_eq!(status.error, expected.error);
+        assert_eq!(status.consecutive_failures, expected.consecutive_failures);
+        assert_eq!(status.receipt_revision, published.receipt_revision);
+        assert_eq!(status.last_received_at, published.last_received_at);
+    }
+    assert_eq!(saved(&conn), rows);
+    assert_eq!(
+        queue_scan::load(&conn, &source, list, "synthetic-viewer")
+            .unwrap()
+            .revision,
+        checkpoint.revision
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM readback_writes", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        writes
+    );
+    if let SnapshotData::Available {
+        fetched_at: after, ..
+    } = source_cache::load_source_snapshot(&conn, &source, list)
+        .unwrap()
+        .data
+    {
+        assert_eq!(after, fetched_at);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), after_http);
+    if !recovery {
+        assert_eq!(published.last_received_at, baseline.last_received_at);
+    }
+}
+
+#[tokio::test]
+async fn delayed_no_work_readback_adopts_failure_once() {
+    delayed_no_work_readback(false, false, false).await;
+}
+#[tokio::test]
+async fn delayed_no_work_readback_adopts_recovery_without_restamping() {
+    delayed_no_work_readback(true, false, false).await;
+}
+#[tokio::test]
+async fn delayed_no_work_readback_preserves_independent_newer_failure() {
+    for settle_before_a in [false, true] {
+        delayed_no_work_readback(false, true, settle_before_a).await;
+        delayed_no_work_readback(true, true, settle_before_a).await;
+    }
+}
+
+async fn settle_independent_readback_failure(polls: &SourcePolls) -> Status {
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    let (newer, _) = polls.begin_attempt(source.clone(), list).await;
+    let permit = polls.publication(&newer).await.unwrap();
+    polls.complete(
+        permit,
+        Err(Failure {
+            message: "Independent newer failure".into(),
+            transient: false,
+            not_asked: false,
+        }),
+        |_| {},
+    );
+    polls.get(&source, list)
+}

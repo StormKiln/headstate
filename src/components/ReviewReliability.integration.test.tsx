@@ -86,6 +86,10 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   const clients: QueryClient[] = [];
   const publish = (stage: keyof typeof publications.frames) => scope.step(() => emit(listeners, stage));
   let failedDetail = false;
+  let firstDetail = true;
+  let releaseDetail!: (value: PrDetail) => void;
+  const pendingDetail = new Promise<PrDetail>(resolve => { releaseDetail = resolve; });
+  let detailCalls = 0;
   let finishRefresh: (value: unknown) => void = () => { throw new Error("refresh not started"); };
   let refreshRequest: unknown;
   let refreshSettled = false;
@@ -98,7 +102,12 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
     if (name === "get_viewer") return "synthetic-viewer";
     if (name === "get_ready_stacks") return (args?.rows as object[]).map(row => ({ ...row, valid_for_ms: 60_000, stack: { kind: "none" } }));
     if (name === "get_ready_pushers") return (args?.rows as PusherAsk[]).map(row => ({ ...row, rules: { state: "unreadable", reason: "Synthetic rules unavailable" }, last_pusher: { state: "unknown", reason: "Synthetic pusher unavailable" } } satisfies RowPusher));
-    if (name === "get_pr_detail") { if (failedDetail) throw new Error("Synthetic read outage"); return detail(head); }
+    if (name === "get_pr_detail") {
+      detailCalls++;
+      if (firstDetail) { firstDetail = false; return pendingDetail; }
+      if (failedDetail) throw new Error("Synthetic read outage");
+      return detail(head);
+    }
     if (name === "review_pr_at_head") return { outcome: "acknowledged", receipt: { review_id: "REVIEW_1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "head-1", submitted_at: "2026-10-01T12:00:00Z", pr_id: "PR_1", repo: "octocat/repo-1", number: 1 } };
     if (name === "refresh_now") throw new Error("Synthetic read outage");
     throw new Error(`Unexpected IPC command ${name}`);
@@ -124,9 +133,25 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   expect(screen.getAllByText("Last known").some(status => status.getAttribute("title") === "Last known — not confirmed by latest refresh")).toBe(true);
   const desktop = within(screen.getByTestId("desktop"));
   fireEvent.click(desktop.getByText("Synthetic review 1"));
-  await scope.step(() => desktop.findByText("Retained integrated description"));
   const detailRoot = screen.getByTestId("desktop-detail");
   const selectedDetail = within(detailRoot);
+  const detailKey = ["pr-detail", "octocat/repo-1", 1];
+  expect(detailCalls).toBe(1);
+  expect(clients[0].getQueryState(detailKey)).toMatchObject({ status: "pending", fetchStatus: "fetching", data: undefined });
+  expect(selectedDetail.queryByText("Retained integrated description")).toBeNull();
+  // Own the real query completion rather than racing a broad DOM retry against
+  // its one-second deadline. The list refresh remains independently pending.
+  const queryCompletion = clients[0].getQueryCache().find({ queryKey: detailKey, exact: true })!.promise!;
+  await scope.step(() => act(async () => {
+    releaseDetail(detail(head));
+    await queryCompletion;
+  }));
+  const detailState = clients[0].getQueryState(detailKey);
+  const detailDiagnostic = JSON.stringify({ calls: detailCalls, status: detailState?.status, fetchStatus: detailState?.fetchStatus, error: detailState?.error });
+  expect(detailState, detailDiagnostic).toMatchObject({ status: "success", fetchStatus: "idle" });
+  await scope.step(() => selectedDetail.findByText("Retained integrated description", {}, {
+    onTimeout: error => new Error(`${detailDiagnostic}\n${error.message}`),
+  }));
   const comment = selectedDetail.getByText("synthetic-commenter-1").closest("button")!;
   const closedComment = selectedDetail.getByText("synthetic-commenter-2").closest("button")!;
   fireEvent.click(comment);
@@ -139,7 +164,7 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   await scope.step(() => act(async () => { await clients[0].refetchQueries({ queryKey: ["pr-detail", "octocat/repo-1", 1] }); }));
   await publish("cooldown");
   count(275);
-  expect(desktop.getByText("Retained integrated description")).toBeTruthy();
+  expect(selectedDetail.getByText("Retained integrated description")).toBeTruthy();
   expect(selectedDetail.getByRole("alert")).toBeTruthy();
   fireEvent.click(selectedDetail.getAllByRole("button", { name: "Approve" })[0]);
   await scope.step(() => waitFor(() => expect(boundary.invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1)));

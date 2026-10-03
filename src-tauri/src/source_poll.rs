@@ -36,6 +36,10 @@ pub struct Status {
     #[serde(skip)]
     published_scan_receipt: Option<String>,
     #[serde(skip)]
+    published_scan_generation: Option<u64>,
+    #[serde(skip)]
+    settled_generation: u64,
+    #[serde(skip)]
     settled_scan_receipt: Option<String>,
     pub revision: u64,
     pub receipt_revision: Option<u64>,
@@ -55,6 +59,8 @@ impl Status {
             phase: Phase::NotRequested,
             settled_phase: None,
             published_scan_receipt: None,
+            published_scan_generation: None,
+            settled_generation: 0,
             settled_scan_receipt: None,
             revision: 0,
             receipt_revision: None,
@@ -265,6 +271,8 @@ impl SourcePolls {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
         let current = *generation == attempt.generation;
+        let published =
+            state.receipt_id.is_some() && status.published_scan_receipt == state.receipt_id;
         if state.no_work {
             if !current {
                 return None;
@@ -272,36 +280,46 @@ impl SourcePolls {
             status.revision += 1;
             status.phase = status.settled_phase.clone().unwrap_or(Phase::NotRequested);
             if status.coverage.is_none() {
-                status.coverage = Some(coverage);
+                status.coverage = Some(coverage.clone());
             }
-            // Disk readback on restart carries no invented provider receipt time.
-            if status.phase == Phase::NotRequested {
-                status.phase = if state.step_failure.is_some() {
-                    Phase::Failed
-                } else if matches!(status.coverage, Some(Coverage::Complete)) {
-                    Phase::Ready
-                } else {
-                    Phase::Partial
-                };
-                status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+            // A later checkpoint read can discover an operation published by an
+            // older caller while this request was pending. Adopt that validated
+            // outcome once, but never over an independently newer settlement.
+            let unsettled_outcome = published
+                && status.settled_scan_receipt != state.receipt_id
+                && status
+                    .published_scan_generation
+                    .is_some_and(|published| published > status.settled_generation);
+            if !unsettled_outcome {
+                // Disk readback on restart carries no invented provider receipt time.
+                if status.phase == Phase::NotRequested {
+                    status.phase = if state.step_failure.is_some() {
+                        Phase::Failed
+                    } else if matches!(status.coverage, Some(Coverage::Complete)) {
+                        Phase::Ready
+                    } else {
+                        Phase::Partial
+                    };
+                    status.error = state.step_failure.as_ref().map(|f| f.message.clone());
+                }
+                return Some(status.clone());
             }
-            return Some(status.clone());
-        }
-        // Coalesced callers share the operation's data receipt, but only the
-        // current request may settle its outcome. A stale caller may publish
-        // useful rows (including changed qualification) beside newer work.
-        let published =
-            state.receipt_id.is_some() && status.published_scan_receipt == state.receipt_id;
-        if !current && published {
-            return None;
-        }
-        status.revision += 1;
-        if !published {
-            status.receipt_revision = Some(status.revision);
-            status.coverage = Some(coverage.clone());
-            status.published_scan_receipt = state.receipt_id.clone();
-            if state.received || state.step_failure.is_none() {
-                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            // Coalesced callers share the operation's data receipt, but only the
+            // current request may settle its outcome. A stale caller may publish
+            // useful rows (including changed qualification) beside newer work.
+            if !current && published {
+                return None;
+            }
+            status.revision += 1;
+            if !published {
+                status.receipt_revision = Some(status.revision);
+                status.coverage = Some(coverage.clone());
+                status.published_scan_receipt = state.receipt_id.clone();
+                status.published_scan_generation = Some(attempt.generation);
+                if state.received || state.step_failure.is_none() {
+                    status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                }
             }
         }
         if current {
@@ -330,6 +348,7 @@ impl SourcePolls {
                 status.error = None;
                 status.consecutive_failures = 0;
             }
+            status.settled_generation = attempt.generation;
             status.settled_scan_receipt = state.receipt_id.clone();
             status.settled_phase = Some(status.phase.clone());
         }
@@ -499,6 +518,7 @@ impl SourcePolls {
                 // Keep the last receipt and its coverage on every failure.
             }
         }
+        status.settled_generation = attempt.generation;
         Some(status.clone())
     }
 }
@@ -1294,6 +1314,7 @@ async fn record_github_effect_at(
             status.receipt_revision = Some(status.revision);
             status.coverage = Some(receipt.coverage);
             status.phase = Phase::Unknown;
+            status.settled_generation = generation;
             let update = polls.update(status.clone(), None);
             emit(Ok(update));
         }
