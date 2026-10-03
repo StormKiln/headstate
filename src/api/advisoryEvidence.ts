@@ -56,14 +56,16 @@ export function assertCurrent(signal: AbortSignal, generation: number, current: 
   if (signal.aborted || generation !== current()) throw new DOMException("Cancelled", "AbortError");
 }
 /** Expiry updates display and action eligibility, without issuing requests. */
-export function useEvidenceExpiry(expiries: number[], enabled: boolean) {
-  const [, expire] = useReducer(value => value + 1, 0);
-  const signature = JSON.stringify(expiries);
+export function useEvidenceExpiry(expiries: () => number[], enabled: boolean) {
+  const [revision, expire] = useReducer(value => value + 1, 0);
   useEffect(() => {
     if (!enabled) return;
-    const timers = (JSON.parse(signature) as number[]).filter(at => at >= performance.now()).map(at => setTimeout(expire, Math.max(0, at - performance.now()) + 1));
-    return () => { for (const timer of timers) clearTimeout(timer); };
-  }, [signature, enabled]);
+    const now = performance.now();
+    const next = Math.min(...expiries().filter(at => at >= now));
+    if (!Number.isFinite(next)) return;
+    const timer = setTimeout(expire, Math.max(0, next - now) + 1);
+    return () => clearTimeout(timer);
+  }, [expiries, enabled, revision]);
 }
 
 /** Native history is display-only, including a success retained after failure. */

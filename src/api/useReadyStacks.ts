@@ -24,7 +24,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });
   const keys = selected.map(pr => ["ready-stack", owner, session.generation, keyOf(pr)]);
-  const queries = useQueries({ queries: selected.map((pr, i) => ({
+  useQueries({ queries: selected.map((pr, i) => ({
     queryKey: keys[i],
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
       let answer: Receipt;
@@ -47,14 +47,19 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   })) });
   const signature = JSON.stringify(keys);
   useEffect(() => {
+    const now = performance.now();
     if (consumer === "detail") prioritizeAdvisoryDetail(qc, (JSON.parse(signature) as unknown[][]).map(key => JSON.stringify(key)));
     for (const key of JSON.parse(signature) as string[][]) {
       const query = qc.getQueryCache().find({ queryKey: key, exact: true });
       const receipt = query?.state.data as Receipt | undefined;
-      if (receipt && receipt.expiresAt <= performance.now()) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+      if (receipt && receipt.expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick, consumer]);
-  useEvidenceExpiry(queries.flatMap(query => query.data ? [query.data.expiresAt] : []), window.visible && enabled);
+  // Display qualification outlives the bounded network observer window.
+  useEvidenceExpiry(() => rows.flatMap(pr => {
+    const value = qc.getQueryData<Receipt>(["ready-stack", owner, session.generation, keyOf(pr)]);
+    return value ? [value.expiresAt] : [];
+  }), window.visible && enabled);
   return { of: (pr: StackSubject): PrStack | undefined => {
     const receipt = qc.getQueryData<Receipt>(["ready-stack", owner, session.generation, keyOf(pr)]);
     return receipt && receipt.expiresAt > performance.now() ? receipt.stack : undefined;

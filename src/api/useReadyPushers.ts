@@ -53,13 +53,19 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   })) });
   const signature = JSON.stringify(keys);
   useEffect(() => {
+    const now = performance.now();
     for (const key of JSON.parse(signature) as string[][]) {
       const query = qc.getQueryCache().find({ queryKey: key, exact: true });
-      if (query?.state.data !== undefined && (query.state.data as Receipt).expiresAt <= performance.now()) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+      if (query?.state.data !== undefined && (query.state.data as Receipt).expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick]);
-  useEvidenceExpiry(queries.flatMap(query => query.data ? [query.data.pusher?.expiresAt, query.data.rules?.expiresAt].filter((at): at is number => at !== undefined) : []), window.visible);
   const read = (pr: PullRequest) => qc.getQueryData<Receipt>(["ready-pushers", owner, session.generation, keyOf(pr)]);
+  // Every rendered row may still affect the filter after leaving the network
+  // window. Its original authority deadline must independently trigger render.
+  useEvidenceExpiry(() => rows.flatMap(pr => {
+    const value = read(pr);
+    return [value?.pusher?.expiresAt, value?.rules?.expiresAt].filter((at): at is number => at !== undefined);
+  }), window.visible);
   const of = (pr: PullRequest): ReadyPusher => {
     if (viewer.isError && !owner) return { pusher: { state: "unknown" }, rule: "unread" };
     const value = read(pr);

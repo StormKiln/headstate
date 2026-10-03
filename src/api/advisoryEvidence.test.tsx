@@ -220,11 +220,12 @@ it("stops all new hidden advisory demand and resumes one bounded shared window",
 });
 
 it("enforces the hard cap even with more live consumers than cache capacity", async () => {
-  const views = Array.from({ length: 65 }, (_, group) => {
+  const views = [];
+  for (let group = 0; group < 65; group++) {
     const population = Array.from({ length: 8 }, (_, i) => ({ ...rows[0], number: group * 8 + i + 1 }));
-    return renderHook(() => useReadyStacks(population), { wrapper });
-  });
-  await advance(5);
+    views.push(renderHook(() => useReadyStacks(population), { wrapper }));
+    await advance(5);
+  }
   expect(qc.getQueryCache().findAll({ queryKey: ["ready-stack"] })).toHaveLength(512);
   expect(views[64].result.current.of({ ...rows[0], number: 520 })).toEqual(stacked);
   for (const view of views.slice(0, -1)) view.unmount();
@@ -253,4 +254,43 @@ it("does not certify a legacy reply with the unexpired lifetime of a previous re
   await advance(5);
   expect(partitionReady([rows[0]], view.result.current.of, "auto").hidden).toBe(0);
   expect(view.result.current.displayOf(rows[0])?.freshness).toBe("retained");
+});
+
+it("updates a rendered auto partition at off-window evidence expiry without issuing reads", async () => {
+  lifetime = 45_000;
+  const population = rows.slice(0, 20);
+  const view = renderHook(() => {
+    const pushers = useReadyPushers(population);
+    return partitionReady(population, pushers.of, "auto");
+  }, { wrapper });
+  await advance(5);
+  expect(view.result.current.hidden).toBe(8);
+  await advance(30_000); await advance(5);
+  expect(view.result.current.hidden).toBe(16);
+  const calls = invoke.mock.calls.length;
+  await advance(15_000); await advance(5);
+  expect(view.result.current.hidden).toBe(8);
+  expect(invoke.mock.calls).toHaveLength(calls);
+});
+
+it("rearms the next rendered expiry when native-aged receipts expire between shared ticks", async () => {
+  let observations = 0;
+  const population = rows.slice(0, 20);
+  invoke.mockImplementation(async (_cmd, args) => (args?.rows as PullRequest[]).map(pr => ({ ...pr,
+    pusher_valid_for_ms: 40_000 + observations++ * 1000, rules_valid_for_ms: 600_000,
+    rules: { state: "read", require_last_push_approval: true, required_review_thread_resolution: false },
+    last_pusher: { state: "known", login: "octocat" } })));
+  const view = renderHook(() => {
+    const pushers = useReadyPushers(population);
+    return partitionReady(population, pushers.of, "auto");
+  }, { wrapper });
+  await advance(5);
+  await advance(30_000); await advance(5);
+  expect(view.result.current.hidden).toBe(16);
+  const calls = invoke.mock.calls.length;
+  await advance(10_000); await advance(5);
+  expect(view.result.current.hidden).toBe(15);
+  await advance(1_000); await advance(5);
+  expect(view.result.current.hidden).toBe(14);
+  expect(invoke.mock.calls).toHaveLength(calls);
 });

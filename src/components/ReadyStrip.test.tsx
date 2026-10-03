@@ -874,3 +874,38 @@ it("keeps retained stack and pusher chips qualified without hiding rows or claim
   expect(document.body.textContent).not.toContain("your approval won't count here");
   view.unmount(); qc.clear(); vi.useRealTimers();
 });
+
+it("qualifies off-window stack chips at their original deadline without another advisory request", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["viewer"], "me");
+  let intersections: ((entries: IntersectionObserverEntry[]) => void) | undefined;
+  vi.stubGlobal("IntersectionObserver", class {
+    constructor(callback: (entries: IntersectionObserverEntry[]) => void) { intersections = callback; }
+    observe() {} disconnect() {}
+  });
+  const rows = Array.from({ length: 20 }, (_, i) => ({ ...ready, id: `expiry-${i}`, number: i + 1, title: `Expiry row ${i}`, head_repo: ready.repo }));
+  invoke.mockImplementation(async (cmd, args) => {
+    if (cmd === "get_viewer") return "me";
+    const asks = args?.rows as PullRequest[];
+    if (cmd === "get_ready_stacks") return asks.map(row => ({ ...row, valid_for_ms: 45_000, stack: exactStack }));
+    if (cmd === "get_ready_pushers") return asks.map(row => ({ ...row, pusher_valid_for_ms: 60_000, rules_valid_for_ms: 600_000,
+      rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false },
+      last_pusher: { state: "known", login: "someone-else" } }));
+    return null;
+  });
+  const view = rtlRender(<QueryClientProvider client={qc}><ReadyStrip prs={rows} /></QueryClientProvider>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(8);
+  await act(async () => { intersections!([]); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(16);
+  const calls = invoke.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5); });
+  expect(screen.getAllByLabelText("Last known stack position 5 of 8")).toHaveLength(8);
+  expect(screen.getAllByLabelText("Stack position 5 of 8")).toHaveLength(8);
+  expect(invoke.mock.calls).toHaveLength(calls);
+  view.unmount(); qc.clear(); vi.unstubAllGlobals(); vi.useRealTimers();
+});
