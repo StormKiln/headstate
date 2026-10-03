@@ -17,7 +17,7 @@ export type SourceStatus = {
 };
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; coverage?: SourceCoverage | null };
+type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
@@ -57,7 +57,7 @@ export class SourceRefreshState {
     return () => { this.listeners.delete(listener); };
   };
   private publish(prs = this.value.prs) {
-    this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, coverage: this.coverage };
+    this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage };
     for (const listener of this.listeners) listener();
   }
   start(id: string): Request {

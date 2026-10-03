@@ -18,12 +18,25 @@ pub enum ObservationState {
     Observed,
     Retained,
 }
+/// Positive source facts used only to refresh selected full details. Older
+/// payloads default to no evidence; this does not grant action authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailField {
+    Base,
+    Comments,
+    Threads,
+    Reviewers,
+    Reviews,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowObservation {
     pub state: ObservationState,
     pub last_observed_at: Option<DateTime<Utc>>,
     pub unknown_fields: Vec<ReadinessField>,
     pub retained_fields: Vec<ReadinessField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detail_fields: Vec<DetailField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_review: Option<ConfirmedReview>,
 }
@@ -154,6 +167,7 @@ fn reconcile_rows<T: InventoryRow>(
                         last_observed_at: None,
                         unknown_fields: vec![],
                         retained_fields: vec![],
+                        detail_fields: vec![],
                         confirmed_review: None,
                     })
                     .state = ObservationState::Retained;
@@ -166,6 +180,7 @@ fn reconcile_rows<T: InventoryRow>(
             last_observed_at: Some(now),
             unknown_fields: vec![],
             retained_fields: vec![],
+            detail_fields: vec![],
             confirmed_review: None,
         });
         if row.head().is_none() && !observation.unknown_fields.contains(&ReadinessField::Head) {
@@ -210,6 +225,7 @@ fn reconcile_rows<T: InventoryRow>(
                 last_observed_at: None,
                 unknown_fields: vec![],
                 retained_fields: vec![],
+                detail_fields: vec![],
                 confirmed_review: None,
             });
             if !delta {
@@ -287,11 +303,54 @@ pub fn github_observation(node: &serde_json::Value, partial: bool) -> RowObserva
     if node["isInMergeQueue"].as_bool().is_none() {
         unknown.push(Queue);
     }
+    let mut detail_fields = vec![];
+    if !errored("base") && node["baseRefName"].as_str().is_some_and(|s| !s.is_empty()) {
+        detail_fields.push(DetailField::Base);
+    }
+    if !errored("comments") && node["totalCommentsCount"].as_u64().is_some() {
+        detail_fields.push(DetailField::Comments);
+    }
+    if !errored("threads")
+        && node["reviewThreads"]["nodes"]
+            .as_array()
+            .is_some_and(|nodes| {
+                nodes
+                    .iter()
+                    .all(|n| n["isResolved"].is_boolean() && n["isOutdated"].is_boolean())
+            })
+    {
+        detail_fields.push(DetailField::Threads);
+    }
+    for (field, name, group) in [
+        ("reviewRequests", "reviewers", DetailField::Reviewers),
+        ("latestReviews", "reviews", DetailField::Reviews),
+    ] {
+        if !errored(name)
+            && node[field]["totalCount"].as_u64().is_some()
+            && node[field]["nodes"].as_array().is_some_and(|nodes| {
+                nodes.iter().all(|n| match group {
+                    DetailField::Reviewers => n["requestedReviewer"]["login"].as_str().is_some(),
+                    DetailField::Reviews => {
+                        n["author"]["login"].as_str().is_some()
+                            && n["state"].as_str().is_some()
+                            && n["id"].as_str().is_some()
+                            && n.get("submittedAt").is_some()
+                            && n.get("commit")
+                                .is_some_and(|c| c.is_null() || c["oid"].as_str().is_some())
+                    }
+                    _ => false,
+                })
+            })
+        {
+            detail_fields.push(group);
+        }
+    }
     RowObservation {
         state: ObservationState::Observed,
         last_observed_at: None,
         unknown_fields: unknown,
         retained_fields: vec![],
+        detail_fields,
         confirmed_review: None,
     }
 }
@@ -412,6 +471,7 @@ pub fn apply_confirmed_review(
         last_observed_at: None,
         unknown_fields: vec![],
         retained_fields: vec![],
+        detail_fields: vec![],
         confirmed_review: None,
     });
     observation.confirmed_review = Some(effect.clone());
@@ -437,6 +497,11 @@ pub fn mark_readiness_errors(data: &mut serde_json::Value, errors: &[serde_json:
             continue;
         };
         let field = match path.get(3).and_then(|v| v.as_str()) {
+            Some("baseRefName") => "base",
+            Some("totalCommentsCount") => "comments",
+            Some("reviewThreads") => "threads",
+            Some("reviewRequests") => "reviewers",
+            Some("latestReviews") => "reviews",
             Some("isDraft") => "draft",
             Some("commits") => "ci",
             Some("mergeable") => "merge",
@@ -489,6 +554,7 @@ pub fn gitlab_observation(row: &crate::gitlab::queues::MergeRequest) -> RowObser
         last_observed_at: None,
         unknown_fields,
         retained_fields: vec![],
+        detail_fields: vec![],
         confirmed_review: None,
     }
 }
@@ -539,6 +605,7 @@ pub fn apply_gitlab_action(
             last_observed_at: None,
             unknown_fields: vec![],
             retained_fields: vec![],
+            detail_fields: vec![],
             confirmed_review: None,
         });
         observation.confirmed_review = Some(ConfirmedReview {
@@ -815,6 +882,65 @@ mod tests {
             .confirmed_review
             .is_none());
     }
+    #[test]
+    fn detail_fields_require_positive_non_refused_values_and_old_payloads_are_unknown() {
+        let node = serde_json::json!({
+            "baseRefName": "main", "totalCommentsCount": 0,
+            "reviewThreads": {"nodes": [], "totalCount": 0},
+            "reviewRequests": {"nodes": [], "totalCount": 0},
+            "latestReviews": {"nodes": [], "totalCount": 0}
+        });
+        let observed = serde_json::to_value(github_observation(&node, false)).unwrap();
+        assert_eq!(
+            observed["detail_fields"],
+            serde_json::json!(["base", "comments", "threads", "reviewers", "reviews"])
+        );
+        for (path, group) in [
+            ("baseRefName", "base"),
+            ("totalCommentsCount", "comments"),
+            ("reviewThreads", "threads"),
+            ("reviewRequests", "reviewers"),
+            ("latestReviews", "reviews"),
+        ] {
+            let mut response = serde_json::json!({"authored": {"nodes": [node.clone()]}});
+            mark_readiness_errors(
+                &mut response,
+                &[serde_json::json!({"path": ["authored", "nodes", 0, path]})],
+            );
+            let refused =
+                serde_json::to_value(github_observation(&response["authored"]["nodes"][0], false))
+                    .unwrap();
+            assert!(!refused["detail_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(group)));
+        }
+        for partial in [false, true] {
+            let missing =
+                serde_json::to_value(github_observation(&serde_json::json!({}), partial)).unwrap();
+            assert!(missing["detail_fields"]
+                .as_array()
+                .is_none_or(Vec::is_empty));
+        }
+        for (field, group) in [
+            ("reviewRequests", "reviewers"),
+            ("latestReviews", "reviews"),
+        ] {
+            let mut incomplete = node.clone();
+            incomplete[field]["nodes"] = serde_json::json!([{}]);
+            let observation = serde_json::to_value(github_observation(&incomplete, false)).unwrap();
+            assert!(!observation["detail_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(group)));
+        }
+        let mut old = observed;
+        old.as_object_mut().unwrap().remove("detail_fields");
+        let old: RowObservation = serde_json::from_value(old).unwrap();
+        let old = serde_json::to_value(old).unwrap();
+        assert!(old["detail_fields"].as_array().is_none_or(Vec::is_empty));
+    }
+
     #[test]
     fn readiness_errors_are_field_specific_and_no_checks_remains_valid() {
         let mut response: serde_json::Value =

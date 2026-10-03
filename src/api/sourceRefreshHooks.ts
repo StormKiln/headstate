@@ -1,3 +1,4 @@
+import { acceptDetailFacts } from "./detailRevalidation";
 import { useEffect, useSyncExternalStore } from "react";
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PullRequest } from "../types/pr";
@@ -35,6 +36,7 @@ function observe(qc: QueryClient, list: List, value: Entry) {
     if (next !== undefined && next !== rows) {
       rows = next;
       qc.setQueryData([list === "authored" ? "prs" : "reviewing"], next);
+      acceptDetailFacts(qc, next, state.snapshot().session);
     }
   });
   register(listen<SourceStatus>("source-poll-status", ({ payload }) => {
@@ -82,6 +84,7 @@ export async function refreshWithState(qc: QueryClient, list: List): Promise<Pul
     throw new Error(state.snapshot().error ?? "No refreshed snapshot is available yet");
   }
   qc.setQueryData([list === "authored" ? "prs" : "reviewing"], rows);
+  acceptDetailFacts(qc, rows, state.snapshot().session);
   return rows;
 }
 
