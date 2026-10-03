@@ -927,7 +927,7 @@ export const wireGraph: WireGraph = {
   {"t":"array","item":749},
   {"t":"object","props":[["author",10,false],["state",10,false],["id",54,true],["submitted_at",54,true],["commit_oid",54,true]]},
   {"t":"array","item":751},
-  {"t":"object","props":[["author",10,false],["created_at",10,false],["body",10,false],["author_is_bot",32,false]]},
+  {"t":"object","props":[["id",33,true],["author",10,false],["created_at",10,false],["body",10,false],["author_is_bot",32,false]]},
   {"t":"array","item":753},
   {"t":"object","props":[["id",10,false],["is_resolved",32,false],["is_outdated",32,false],["path",10,false],["line",81,false],["viewer_can_reply",32,false],["viewer_can_resolve",32,false],["viewer_can_unresolve",32,false],["comments",750,false],["comment_count",28,false]]},
   {"t":"array","item":755},

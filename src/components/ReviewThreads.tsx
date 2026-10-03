@@ -1,3 +1,4 @@
+import { commentKeys } from "../lib/commentIdentity";
 import { useState } from "react";
 import { ChevronRight, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
@@ -158,6 +159,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
     );
   };
 
+  const keys = commentKeys(thread.comments);
   return (
     <div className="overflow-hidden rounded-md border border-[#30363d]">
       <button
@@ -195,7 +197,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
         <div className="border-t border-[#30363d] p-3">
           <div className="flex flex-col gap-3">
             {thread.comments.map((c, i) => (
-              <div key={`${c.author}-${c.created_at}-${i}`}>
+              <div key={keys[i]}>
                 <p className="mb-1 text-xs text-[#8b949e]">
                   {c.author} · {relativeTime(c.created_at)}
                 </p>

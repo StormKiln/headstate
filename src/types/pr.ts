@@ -608,6 +608,8 @@ export interface RepoFile {
 /// One comment, on the conversation or in a review thread. Mirrors
 /// `github::model::PrComment`.
 export interface PrComment {
+  /// Provider identity; absent in older desktop/companion snapshots.
+  id?: string | null;
   author: string;
   created_at: string;
   body: string;

@@ -1,4 +1,6 @@
-import { useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
+import { useQueryClient } from "@tanstack/react-query";
+import { commentKeys } from "../lib/commentIdentity";
+import { reviewAccountGeneration, useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
 import { useReadyStacks } from "@/api/useReadyStacks";
 import { commandError } from "@/lib/errorKind";
 import { ExternalLink } from "./ExternalLink";
@@ -250,6 +252,7 @@ export function PrDetailView({
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
   const { data: viewer } = useViewer();
+  const queryClient = useQueryClient();
   // The base branch's review rules (#1451, #1454). Undefined while pending
   // and when unreadable alike -- both render nothing new -- so `gate` is
   // all-null until a rule is actually READ.
@@ -377,7 +380,18 @@ export function PrDetailView({
   /// Folds whatever arrived -- partial is not nothing -- and
   /// `commentsTruncated` is what qualifies the counts when that was not
   /// every comment.
+  const commentKeysForPr = commentKeys(pr.comments);
   const commentEntries = foldSuperseded(pr.comments);
+  const commentIds = new Map(pr.comments.map((c, i) => [c, commentKeysForPr[i]]));
+  // Only the actual reading boundary resets browser/local disclosure state.
+  // Viewer lookup resolving initially is not an account switch; the existing
+  // generation advances only when a previously known GitHub account changes.
+  let providerHost = "github.com";
+  try { providerHost = new URL(pr.url).host; } catch { /* Legacy fixtures may omit a usable URL. */ }
+  const readingIdentity = JSON.stringify([
+    "github", providerHost,
+    repo.toLowerCase(), number, reviewAccountGeneration(queryClient),
+  ]);
   const commentsTruncated = pr.comment_count > pr.comments.length;
 
   /// The pinned actions, built once so the phone and desktop headers
@@ -454,7 +468,7 @@ export function PrDetailView({
     // is both hard to read and what made every section feel crammed
     // against its neighbour. The sticky header opts out via `-mx-4` so
     // it still spans the panel.
-    <div className="mx-auto flex max-w-4xl flex-col gap-3">
+    <div key={readingIdentity} className="mx-auto flex max-w-4xl flex-col gap-3">
       {isError ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
         <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
@@ -803,8 +817,8 @@ export function PrDetailView({
               scan past, so collapsing it only adds a click. That counts
               what is SHOWN, so thirty folded copies of one report still
               open its newest. */}
-          {commentEntries.map(({ comment: c, superseded }, i) => (
-            <Fragment key={`${c.author}-${c.created_at}-${i}`}>
+          {commentEntries.map(({ comment: c, superseded }) => (
+            <Fragment key={commentIds.get(c)}>
               <CommentRow
                 author={c.author}
                 createdAt={c.created_at}

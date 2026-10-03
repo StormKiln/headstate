@@ -5,7 +5,7 @@ import { PROSE, clean } from "./markdownProse";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import type { Options as SanitizeSchema } from "rehype-sanitize";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 /// Inside a fenced block, `code` is the block's text, not a chip.
@@ -41,6 +41,45 @@ const SCHEMA: SanitizeSchema = {
   },
 };
 
+// Stable renderer types preserve browser-owned disclosure state on refresh.
+const COMPONENTS: Components = {
+  // `href` is optional in react-markdown's props but required
+  // by ExternalLink, and an anchor with no target is not a link
+  // -- render it as plain text rather than inventing a URL.
+  a: ({ href, children }) =>
+    href ? (
+      <ExternalLink href={href} className="text-[#4493f8] hover:underline">
+        {children}
+      </ExternalLink>
+    ) : (
+      <span>{children}</span>
+    ),
+  code: (props) => <Code {...clean(props)} />,
+  pre: (props) => (
+    <InPre value={true}>
+      <pre
+        {...clean(props)}
+        className="my-3 overflow-x-auto rounded border border-[#30363d] bg-[#161b22] p-3 text-xs"
+      />
+    </InPre>
+  ),
+  img: (props) => (
+    <img {...clean(props)} alt={props.alt ?? ""} className="max-w-full rounded" />
+  ),
+  ...PROSE,
+  // Collapsed by default: `open` is never passed, and the schema
+  // has already removed any the author wrote. The browser owns
+  // the toggle from there, so each level opens on its own.
+  details: ({ children }) => (
+    <details className="my-2 rounded border border-[#30363d] px-3 py-1">
+      {children}
+    </details>
+  ),
+  summary: ({ children }) => (
+    <summary className="cursor-pointer select-none py-1 font-semibold">{children}</summary>
+  ),
+};
+
 /// Renders untrusted Markdown from GitHub.
 ///
 /// Bodies and comments are written by other people, and this app holds a
@@ -67,43 +106,7 @@ export function Markdown({ children }: { children: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, SCHEMA]]}
-        components={{
-          // `href` is optional in react-markdown's props but required
-          // by ExternalLink, and an anchor with no target is not a link
-          // -- render it as plain text rather than inventing a URL.
-          a: ({ href, children }) =>
-            href ? (
-              <ExternalLink href={href} className="text-[#4493f8] hover:underline">
-                {children}
-              </ExternalLink>
-            ) : (
-              <span>{children}</span>
-            ),
-          code: (props) => <Code {...clean(props)} />,
-          pre: (props) => (
-            <InPre value={true}>
-              <pre
-                {...clean(props)}
-                className="my-3 overflow-x-auto rounded border border-[#30363d] bg-[#161b22] p-3 text-xs"
-              />
-            </InPre>
-          ),
-          img: (props) => (
-            <img {...clean(props)} alt={props.alt ?? ""} className="max-w-full rounded" />
-          ),
-          ...PROSE,
-          // Collapsed by default: `open` is never passed, and the schema
-          // has already removed any the author wrote. The browser owns
-          // the toggle from there, so each level opens on its own.
-          details: ({ children }) => (
-            <details className="my-2 rounded border border-[#30363d] px-3 py-1">
-              {children}
-            </details>
-          ),
-          summary: ({ children }) => (
-            <summary className="cursor-pointer select-none py-1 font-semibold">{children}</summary>
-          ),
-        }}
+        components={COMPONENTS}
       >
         {children}
       </ReactMarkdown>

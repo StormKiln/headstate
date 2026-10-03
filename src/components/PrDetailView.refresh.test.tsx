@@ -440,3 +440,112 @@ it.each([1200, 390])("does not revive an older approval after an acknowledged di
   fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
   await waitFor(() => expect(writes).toBe(3));
 });
+
+const disclosureBody = '<details><summary>Report</summary>Body<details><summary>Nested</summary>Inner</details></details>';
+const reportComment = { author: "report-bot", created_at: "2026-01-01T00:00:00Z", author_is_bot: true, body: "<!-- report -->\n" + disclosureBody };
+it.each([1200, 390])("preserves reader disclosures through controlled pending, error and recovery at width %s", async width => {
+  stubViewport(width);
+  const current = { ...detail(), body: disclosureBody, comments: [reportComment, { ...reportComment, created_at: "2026-01-02T00:00:00Z" }], comment_count: 2,
+    review_threads: [{ id: "RT_1", is_resolved: true, is_outdated: false, path: "src/synthetic.ts", line: 10, viewer_can_reply: true, viewer_can_resolve: false, viewer_can_unresolve: true, comments: [{ ...reportComment, author: "reviewer" }], comment_count: 1 }], review_threads_total: 1 };
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation((name, args) => name === "get_pr_detail" ? Promise.resolve(current) : base(name, args));
+  const view = mount(); await screen.findByText("Synthetic check 7");
+  const settled = screen.getByRole("button", { name: /src\/synthetic.ts/ });
+  const group = screen.getByRole("button", { name: /Superseded/ });
+  fireEvent.click(settled); fireEvent.click(group);
+  const rows = screen.getAllByRole("button", { name: /report-bot/ });
+  rows.filter(b => b.getAttribute("aria-expanded") === "false").forEach(b => fireEvent.click(b));
+  const nodes = [...view.container.querySelectorAll("details")];
+  expect(nodes).toHaveLength(8);
+  nodes.forEach((node, i) => { node.open = i % 2 === 0; });
+  const verify = () => {
+    const after = [...view.container.querySelectorAll("details")];
+    expect(after).toHaveLength(nodes.length);
+    after.forEach((node, i) => { expect(node).toBe(nodes[i]); expect(node.open).toBe(i % 2 === 0); });
+    for (const button of [settled, group, ...rows]) expect(button.getAttribute("aria-expanded")).toBe("true");
+  };
+  for (const failure of [false, true, false]) {
+    let resolve!: (value: unknown) => void; let reject!: (error: Error) => void;
+    invoke.mockImplementation((name, args) => name === "get_pr_detail" ? new Promise((yes, no) => { resolve = yes; reject = no; }) : base(name, args));
+    let pending!: Promise<void>;
+    act(() => { pending = qc.refetchQueries({ queryKey: key }); });
+    await waitFor(() => expect(resolve).toBeDefined());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    verify();
+    await act(async () => { if (failure) reject(new Error("Synthetic failure")); else resolve(current); await pending; });
+    await waitFor(() => expect(!!screen.queryByRole("alert")).toBe(failure));
+    verify();
+  }
+  expect(invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(4);
+  fireEvent.click(rows[0]); fireEvent.click(rows[0]);
+  expect([...view.container.querySelectorAll("details")].filter(node => node.open)).toHaveLength(3);
+});
+
+it.each([undefined, "COMMENT_ALICE"])("keeps an edited human row (%s) open when bot folding and bounded-window removal shift positions", async id => {
+  const base = invoke.getMockImplementation()!;
+  const human = { id, author: "alice", created_at: "2026-01-02T12:00:00Z", author_is_bot: false, body: disclosureBody };
+  let comments = [reportComment, human];
+  invoke.mockImplementation((name, args) => name === "get_pr_detail" ? Promise.resolve({ ...detail(), comments, comment_count: comments.length }) : base(name, args));
+  const view = mount(); await loaded();
+  const button = screen.getByRole("button", { name: /alice/ }); fireEvent.click(button);
+  const node = view.container.querySelector("details")!; node.open = true;
+  comments = [reportComment, { ...human, body: disclosureBody.replace("Body", "Edited body") }, { ...reportComment, created_at: "2026-01-03T00:00:00Z" }];
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  expect(screen.getByRole("button", { name: /alice/ })).toBe(button);
+  await waitFor(() => expect(view.container.textContent).toContain("Edited body"));
+  expect(screen.getByRole("button", { name: /alice/ })).toBe(button);
+  expect(node.isConnected && node.open).toBe(true);
+  const newBot = screen.getByRole("button", { name: /report-bot/ });
+  expect(newBot.getAttribute("aria-expanded")).toBe("false");
+  comments = comments.slice(1);
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  expect(screen.getByRole("button", { name: /alice/ })).toBe(button);
+  expect(node.isConnected && node.open).toBe(true);
+  fireEvent.click(button);
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  expect(button.getAttribute("aria-expanded")).toBe("false");
+  // Becoming the only visible row changes defaultOpen, not the reader's choice.
+  comments = [comments[0]];
+  await act(async () => { await qc.refetchQueries({ queryKey: key }); });
+  await waitFor(() => expect(screen.queryByRole("button", { name: /report-bot/ })).toBeNull());
+  expect(screen.getByRole("button", { name: /alice/ })).toBe(button);
+  expect(button.getAttribute("aria-expanded")).toBe("false");
+});
+
+it("resets disclosures when navigating to a different PR and returning", async () => {
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation((name, args) => name === "get_pr_detail" ? Promise.resolve({ ...detail(args?.number as number), body: disclosureBody }) : base(name, args));
+  qc.setQueryData(["pr-detail", "octocat/hello-world", 8], { ...detail(8), body: disclosureBody });
+  const view = mount(); await screen.findByText("Synthetic check 7");
+  view.container.querySelector("details")!.open = true;
+  for (const number of [8, 7]) {
+    view.rerender(<QueryClientProvider client={qc}><PrDetailView repo="octocat/hello-world" number={number} onBack={() => {}} /></QueryClientProvider>);
+    await screen.findByText(`Synthetic check ${number}`);
+    expect(view.container.querySelector("details")!.open).toBe(false);
+    view.container.querySelector("details")!.open = true;
+  }
+});
+
+it("preserves disclosures on initial viewer resolution but resets on a known account switch", async () => {
+  const base = invoke.getMockImplementation()!;
+  let viewer!: (value: string) => void;
+  invoke.mockImplementation((name, args) => name === "get_viewer" ? new Promise(resolve => { viewer = resolve; })
+    : name === "get_pr_detail" ? Promise.resolve({ ...detail(), body: disclosureBody }) : base(name, args));
+  const view = mount(); await screen.findByText("Synthetic check 7");
+  const node = view.container.querySelector("details")!; node.open = true;
+  await act(async () => { viewer("reviewer"); });
+  await waitFor(() => expect(qc.getQueryData(["viewer"])).toBe("reviewer"));
+  expect(view.container.querySelector("details")).toBe(node); expect(node.open).toBe(true);
+  await act(async () => { qc.setQueryData(["viewer"], "another-reviewer"); });
+  await waitFor(() => expect(view.container.querySelector("details")).not.toBe(node));
+  expect(view.container.querySelector("details")!.open).toBe(false);
+});
+
+it("validates comment IDs on current replies while accepting old ID-less desktop/companion payloads", async () => {
+  const { assertRemoteReply } = await import("@/api/wireContract");
+  const legacy = { ...detail(), comments: [reportComment] };
+  for (const id of [undefined, null, "COMMENT_1"]) {
+    expect(() => assertRemoteReply("get_pr_detail", { ...legacy, comments: [{ ...reportComment, id }] })).not.toThrow();
+  }
+  expect(() => assertRemoteReply("get_pr_detail", { ...legacy, comments: [{ ...reportComment, id: 123 }] })).toThrow(/id/);
+});

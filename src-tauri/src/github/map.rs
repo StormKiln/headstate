@@ -467,6 +467,7 @@ fn map_review_threads(node: &Value) -> Vec<ReviewThread> {
 /// view folds least on.
 fn map_comment(c: &Value) -> PrComment {
     PrComment {
+        id: c["id"].as_str().map(str::to_string),
         author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
         created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
         body: c["body"].as_str().unwrap_or_default().to_string(),
@@ -1203,7 +1204,7 @@ mod tests {
     /// as not-a-bot, which is the side the view folds least on.
     #[test]
     fn a_comment_author_is_a_bot_only_when_github_says_bot() {
-        let node = |author: Value| json!({"author": author, "createdAt": "2026-01-01T00:00:00Z", "body": "x"});
+        let node = |author: Value| json!({"id": "COMMENT_1", "author": author, "createdAt": "2026-01-01T00:00:00Z", "body": "x"});
         let v = json!({"repository": {"pullRequest": {
             "comments": {"totalCount": 4, "nodes": [
                 node(json!({"login": "coverage-bot", "__typename": "Bot"})),
@@ -1233,6 +1234,22 @@ mod tests {
             ]
         );
         assert!(d.review_threads[0].comments[0].author_is_bot);
+        assert_eq!(
+            serde_json::to_value(&d.comments[0]).unwrap()["id"],
+            "COMMENT_1"
+        );
+        assert_eq!(
+            serde_json::to_value(&d.review_threads[0].comments[0]).unwrap()["id"],
+            "COMMENT_1"
+        );
+        let legacy: PrComment = serde_json::from_value(
+            json!({"author": "alice", "created_at": "2026-01-01", "body": "legacy"}),
+        )
+        .unwrap();
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("id")
+            .is_none_or(Value::is_null));
     }
 
     /// A force-push strands a thread and GitHub sends `line: null`. Zero
