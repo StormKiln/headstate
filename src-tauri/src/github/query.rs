@@ -1913,6 +1913,74 @@ mod tests {
     }
 
     #[test]
+    fn checking_query_preserves_direct_identity_and_rich_observation_shape() {
+        let query = CHECKING_QUERY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for selection in [
+            "query CheckingObservation($id: ID!)",
+            "checking: node(id: $id) { ... on PullRequest {",
+            "viewer { login }",
+            "rateLimit { cost remaining resetAt }",
+            "id state number title url isDraft createdAt updatedAt",
+            "headRefName headRefOid baseRefName",
+            "headRef { id }",
+            "headRepository { nameWithOwner }",
+            "repository { nameWithOwner }",
+            "timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) { nodes { ... on ReadyForReviewEvent { createdAt } } }",
+            "reviewThreads(first: 100) { nodes { isResolved isOutdated } }",
+            "commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100)",
+            "nodes { id state submittedAt commit { oid } author { login } }",
+        ] {
+            assert!(query.contains(selection), "missing checking selection: {selection}");
+        }
+        for field in fields_read_by(&[
+            "map_node",
+            "ci_state",
+            "any_check_running",
+            "ready_at",
+            "merge_state",
+            "merge_status",
+            "review_state",
+            "in_merge_queue",
+            "requested_reviewers",
+            "latest_reviews",
+            "labels",
+            "logins",
+            "connection_total",
+            "unresolved_threads",
+        ]) {
+            assert!(
+                query.contains(&field),
+                "checking mapper reads unselected field: {field}"
+            );
+        }
+        for connection in [
+            "assignees(first: 5)",
+            "reviewRequests(first: 5)",
+            "latestReviews(first: 20)",
+            "labels(first: 20)",
+        ] {
+            let before_nodes = query
+                .split_once(connection)
+                .expect("rich row connection")
+                .1
+                .split_once("nodes")
+                .expect("connection nodes")
+                .0;
+            assert!(
+                before_nodes.contains("totalCount"),
+                "{connection} must qualify its own nodes"
+            );
+        }
+        assert!(
+            !query.contains("search("),
+            "targeted observations cannot advance traversal"
+        );
+    }
+
+    #[test]
     fn review_authority_fields_are_selected_in_list_and_detail() {
         for document in [PRS_QUERY, PR_DETAIL_QUERY] {
             let selection = document
