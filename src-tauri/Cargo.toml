@@ -28,6 +28,10 @@ tauri-plugin-fs = "=2.5.2"
 tempfile = "3.27"
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
+# ALREADY in Cargo.lock at 1.0.28 through Tauri. The updater compares the
+# running package version with a release tag, including prerelease precedence;
+# `cmp_precedence` also deliberately ignores build metadata.
+semver = "1.0.28"
 # `preserve_order` is load-bearing for `claude/install.rs`, which edits a
 # file Headstate does not own: `~/.claude/settings.json`.
 #
