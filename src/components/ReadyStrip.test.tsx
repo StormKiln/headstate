@@ -204,7 +204,7 @@ describe("ReadyStrip ordering", () => {
     expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
   });
 
-  it("keeps the provider-reconciled wire fixture ordered until positive evidence supersedes it", () => {
+  it("keeps the provider-reconciled wire fixture ordered until positive evidence supersedes it", async () => {
     const retained = readyDateReconcile.retained as PullRequest[];
     const recovered = readyDateReconcile.recovered as PullRequest[];
     expect(remoteEventError("reviewing-updated", retained)).toBeNull();
@@ -213,12 +213,16 @@ describe("ReadyStrip ordering", () => {
     expect(sortReadyForReview(recovered, "oldest-opened").map(pr => pr.number)).toEqual([2, 1]);
 
     const view = render(<ReadyStrip prs={retained} onOpen={vi.fn()} />);
+    await waitFor(() => {
+      expect(invoke.mock.calls.some(([cmd]) => cmd === "get_ready_pushers")).toBe(true);
+      expect(invoke.mock.calls.some(([cmd]) => cmd === "get_ready_stacks")).toBe(true);
+    });
     const fixtureTitles = () => Array.from(document.querySelectorAll("[data-ready-title]")).map(el =>
       el.textContent?.includes("Older ready") ? "older" : "newer",
     );
     expect(fixtureTitles()).toEqual(["older", "newer"]);
     expect(screen.getByText("Last known")).toBeTruthy();
-    view.rerender(<ReadyStrip prs={recovered} onOpen={vi.fn()} />);
+    await act(async () => view.rerender(<ReadyStrip prs={recovered} onOpen={vi.fn()} />));
     expect(fixtureTitles()).toEqual(["newer", "older"]);
     expect(screen.queryByText("Last known")).toBeNull();
   });
