@@ -4491,7 +4491,7 @@ pub async fn latest_release(app: AppHandle) -> Option<String> {
     // stamps the tag into the manifests at build time and never commits
     // them, so the compiled-in constant reads 0.1.0 in a dev build and
     // would report every release as an update.
-    let current = app.package_info().version.to_string();
+    let current = &app.package_info().version;
     // Through the authenticated client, which already exists -- rather
     // than adding an HTTP dependency for one request. The endpoint is
     // public, so this works whether or not the token has any scopes.
@@ -4503,14 +4503,65 @@ pub async fn latest_release(app: AppHandle) -> Option<String> {
         .get("/repos/StormKiln/headstate/releases/latest", None::<&()>)
         .await
         .ok()?;
-    let tag = json.get("tag_name")?.as_str()?.trim_start_matches('v');
+    let tag = json.get("tag_name")?.as_str()?;
 
-    // A plain inequality, not a semver comparison. The published tag is
-    // the only thing that ever appears here, and a wrong answer costs a
-    // spurious "update available" rather than anything harmful -- where
-    // pulling in a semver crate for one string compare would not repay
-    // itself.
-    (tag != current && !current.is_empty()).then(|| tag.to_string())
+    // Compare semantic precedence so an older or metadata-only release does
+    // not announce itself as an update. A malformed tag is an unusable
+    // response, handled as silently as the network and JSON failures above.
+    newer_release(current, tag)
+}
+
+fn newer_release(current: &semver::Version, remote_tag: &str) -> Option<String> {
+    let tag = remote_tag.strip_prefix('v').unwrap_or(remote_tag);
+    let remote = semver::Version::parse(tag).ok()?;
+    (remote.cmp_precedence(current) == std::cmp::Ordering::Greater).then(|| tag.to_string())
+}
+
+#[cfg(test)]
+mod latest_release_tests {
+    use super::newer_release;
+    use semver::Version;
+
+    fn installed(version: &str) -> Version {
+        Version::parse(version).expect("installed fixture is valid semver")
+    }
+
+    #[test]
+    fn only_a_strictly_newer_patch_is_available() {
+        let current = installed("8.2.3");
+        assert_eq!(newer_release(&current, "v8.2.2"), None);
+        assert_eq!(newer_release(&current, "8.2.3"), None);
+        assert_eq!(newer_release(&current, "v8.2.4"), Some("8.2.4".into()));
+    }
+
+    #[test]
+    fn prereleases_follow_semver_precedence() {
+        let current = installed("8.2.3-alpha.1");
+        assert_eq!(
+            newer_release(&current, "v8.2.3-alpha.2"),
+            Some("8.2.3-alpha.2".into())
+        );
+        assert_eq!(newer_release(&current, "v8.2.3-alpha.0"), None);
+        assert_eq!(newer_release(&current, "v8.2.3"), Some("8.2.3".into()));
+        assert_eq!(
+            newer_release(&installed("8.2.3"), "v8.2.4-alpha.1"),
+            Some("8.2.4-alpha.1".into())
+        );
+        assert_eq!(newer_release(&installed("8.2.3"), "v8.2.3-rc.1"), None);
+    }
+
+    #[test]
+    fn malformed_tags_are_ignored() {
+        let current = installed("8.2.3");
+        assert_eq!(newer_release(&current, "release-8.2.4"), None);
+        assert_eq!(newer_release(&current, "vnot-a-version"), None);
+    }
+
+    #[test]
+    fn build_metadata_alone_is_not_an_update() {
+        let current = installed("8.2.3+build.1");
+        assert_eq!(newer_release(&current, "v8.2.3+build.2"), None);
+    }
 }
 
 #[tauri::command]

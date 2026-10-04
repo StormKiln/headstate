@@ -779,6 +779,12 @@ export default function App() {
             {view === "to-review" ? (
               <ReadyStrip
                 prs={scopedForStrip}
+                availability={{
+                  status: reviewingQuery.data === undefined
+                    ? (reviewingError ? "failed" : "pending")
+                    : "available",
+                  coverage: githubReceipt.coverage ?? null,
+                }}
                 onOpen={(pr) => selectPr(prIdentity(pr))}
               />
             ) : null}

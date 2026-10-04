@@ -1,6 +1,6 @@
 import type { PullRequest } from "../types/pr";
 
-type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
+export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
 
 export type SourceStatus = {
   source: { provider: string; host: string };
@@ -17,7 +17,7 @@ export type SourceStatus = {
 };
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; coverage?: SourceCoverage | null };
+type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
@@ -50,15 +50,23 @@ export class SourceRefreshState {
   private order = 0;
   private requests = new Map<string, Request>();
   private listeners = new Set<() => void>();
+  private onProviderRows?: (rows: PullRequest[], session: string | undefined) => void;
+
+  constructor(onProviderRows?: (rows: PullRequest[], session: string | undefined) => void) {
+    this.onProviderRows = onProviderRows;
+  }
 
   readonly snapshot = () => this.value;
   readonly subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   };
-  private publish(prs = this.value.prs) {
-    this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, coverage: this.coverage };
+  private publish(prs = this.value.prs, fromProvider = false) {
+    this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage };
     for (const listener of this.listeners) listener();
+    // Display patches and status-only publications are not provider evidence.
+    // Deliver the accepted rows themselves, never a later patched snapshot.
+    if (fromProvider && prs !== undefined) this.onProviderRows?.(prs, this.session);
   }
   start(id: string): Request {
     const request = { id, order: ++this.order, rows: this.rowEpoch, status: this.statusEpoch, completed: false, session: this.session };
@@ -93,19 +101,21 @@ export class SourceRefreshState {
       this.statusEpoch++;
     }
     let rows = this.value.prs;
+    let fromProvider = false;
     if (update.prs != null && update.receipt_revision != null && update.receipt_revision > this.receiptRevision) {
       this.receiptRevision = update.receipt_revision;
       this.coverage = update.coverage ?? null;
       this.rowEpoch++;
       rows = update.prs;
+      fromProvider = true;
     }
-    this.publish(rows);
+    this.publish(rows, fromProvider);
   }
   legacyRows(prs: PullRequest[]) {
     if (this.session !== undefined) return;
     this.rowEpoch++;
     if (!this.legacyStatusError) this.backendError = null;
-    this.publish(prs);
+    this.publish(prs, true);
   }
   legacyError(error: string | null) {
     if (this.session !== undefined) return;

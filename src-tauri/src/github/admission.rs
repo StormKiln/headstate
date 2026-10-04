@@ -21,6 +21,7 @@ pub struct ReadContext {
     pub class: ReadClass,
     pub deadline: Instant,
     pub(crate) attempts: Option<AttemptAllowance>,
+    pub(crate) first_attempt: Option<FirstAttempt>,
 }
 impl ReadContext {
     pub fn new(class: ReadClass, budget: Duration) -> Self {
@@ -28,9 +29,43 @@ impl ReadContext {
             class,
             deadline: Instant::now() + budget,
             attempts: None,
+            first_attempt: None,
         }
     }
 }
+type FirstAttemptCallback = Box<dyn FnOnce() + Send>;
+
+/// An operation-local, once-only scheduling mark after admission, before HTTP.
+/// Clones share it across retries and child reads. It carries no receipt.
+#[derive(Clone)]
+pub(crate) struct FirstAttempt {
+    callback: Arc<Mutex<Option<FirstAttemptCallback>>>,
+}
+impl std::fmt::Debug for FirstAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirstAttempt").finish_non_exhaustive()
+    }
+}
+impl FirstAttempt {
+    pub(crate) fn new(callback: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            callback: Arc::new(Mutex::new(Some(Box::new(callback)))),
+        }
+    }
+    fn observe(&self) {
+        let callback = self
+            .callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // Release the observer lock before touching the scheduler. Admission's
+        // accounting lock was already released by enter().
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
 /// One operation's limits; child reservations share the same atomic ledger.
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptAllowance {
@@ -256,6 +291,9 @@ impl Admission {
                 })?;
             attempt._background = background;
             attempt._total = Some(total);
+            if let Some(observer) = &context.first_attempt {
+                observer.observe();
+            }
             Ok(attempt)
         };
         tokio::time::timeout_at(context.deadline, acquire)
@@ -367,6 +405,94 @@ mod tests {
     fn context(class: ReadClass) -> ReadContext {
         ReadContext::new(class, Duration::from_secs(30))
     }
+    #[tokio::test(start_paused = true)]
+    async fn first_attempt_observer_ignores_refusals_and_runs_once_outside_accounting_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = Arc::new(Admission::default());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let owner = admission.clone();
+        let mut read = context(ReadClass::Advisory);
+        read.first_attempt = Some(FirstAttempt::new(move || {
+            assert!(
+                owner.state.try_lock().is_ok(),
+                "observer cannot run under accounting lock"
+            );
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut expired = read.clone();
+        expired.deadline = Instant::now();
+        assert!(admission.read(Bucket::Rest, expired).await.is_err());
+        let mut exhausted = read.clone();
+        exhausted.attempts = Some(AttemptAllowance::new(0));
+        assert!(admission.read(Bucket::Rest, exhausted).await.is_err());
+        admission.limit(Bucket::Rest, 5, true);
+        assert!(admission.read(Bucket::Rest, read.clone()).await.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut attempt = admission.read(Bucket::Rest, read.clone()).await.unwrap();
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "mark precedes provider completion"
+        );
+        attempt.complete();
+        drop(attempt);
+        // Retry/stage clones share the same once-only callback.
+        admission.read(Bucket::Graphql, read).await.unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canceled_capacity_waiter_does_not_consume_first_attempt_observer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = Admission::default();
+        let a = admission
+            .read(Bucket::Rest, context(ReadClass::Background))
+            .await
+            .unwrap();
+        let b = admission
+            .read(Bucket::Rest, context(ReadClass::Background))
+            .await
+            .unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let mut read = ReadContext::new(ReadClass::Advisory, Duration::from_secs(1));
+        read.first_attempt = Some(FirstAttempt::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(admission.read(Bucket::Rest, read.clone()).await.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        drop((a, b));
+        read.deadline = Instant::now() + Duration::from_secs(1);
+        admission.read(Bucket::Rest, read).await.unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_advisory_exhaustion_preserves_unoffered_turn_for_next_cycle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = Admission::default();
+        for _ in 0..8 {
+            admission
+                .read(Bucket::Rest, context(ReadClass::Advisory))
+                .await
+                .unwrap();
+        }
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let mut read = context(ReadClass::Advisory);
+        read.first_attempt = Some(FirstAttempt::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(admission.read(Bucket::Rest, read.clone()).await.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        read.deadline = Instant::now() + Duration::from_secs(1);
+        admission.read(Bucket::Rest, read).await.unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn background_waiters_do_not_take_reserved_foreground_capacity_and_cancel_releases() {
         let admission = std::sync::Arc::new(Admission::default());

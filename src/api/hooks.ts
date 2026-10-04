@@ -1,3 +1,4 @@
+import { beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
@@ -661,8 +662,6 @@ export function withOwnReview(detail: PrDetail, viewer: string, state: string): 
 /// poll loop and `usePrDetail`'s own refetching still catch up.
 // A verified write completes independently of its read-back. Track the latest
 // reconciliation per cache/key so a late response cannot undo a newer review.
-const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
-const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
 
 async function mergeFieldsAfterReview(
   qc: QueryClient,
@@ -704,6 +703,7 @@ async function mergeFieldsAfterReview(
   } finally {
     if (pending.get(key) === generation) {
       pending.delete(key);
+      resumeDetailRevalidation(qc, repo, number);
       // Re-evaluate the detail poll even if the read failed: no new response
       // would otherwise notify its observer that reconciliation ended.
       qc.setQueryData<PrDetail>(["pr-detail", repo, number], prev => prev ? { ...prev } : prev);
@@ -2551,10 +2551,12 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // the fetch, and the gap between the two is React's (#790).
     queryFn: () =>
       timeCall(`pr-detail`, async () => {
+        const sourceGeneration = beginDetailRead(qc, repo as string, number as number);
         const generation = reviewReadGeneration(qc);
         const accountGeneration = reviewAccountGeneration(qc);
         const fresh = await getPrDetail(repo as string, number as number);
         if (reviewAccountGeneration(qc) !== accountGeneration) throw new Error("The GitHub account changed; reload this pull request.");
+        if (!detailReadIsCurrent(qc, sourceGeneration)) throw new Error("The GitHub connection changed; reload this pull request.");
         return reconcileReviewDetail(qc, fresh, generation);
       }),
     enabled: Boolean(repo && number),
@@ -2592,7 +2594,7 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
         ? false
         : polling.delay(
             query.state.data?.head_oid ?? "",
-            query.state.data?.merge_status === "unknown",
+            query.state.data?.merge_status === "unknown" || detailNeedsRevalidation(qc, repo as string, number as number),
             Math.max(query.state.dataUpdatedAt, query.state.errorUpdatedAt),
           ),
   });

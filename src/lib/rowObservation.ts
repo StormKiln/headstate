@@ -13,7 +13,7 @@ export function observationStatus(row: { observation?: RowObservation | null }):
     : { label: "Confirmed", explanation: "Your review is confirmed" };
   if (observation.confirmed_review?.unresolved) return { label: "Unconfirmed", explanation: "Review confirmation is unresolved — check GitHub before reviewing again" };
   if (observation.confirmed_review) return { label: "Pending", explanation: "Your submitted review is awaiting confirmation in the list" };
-  if (observation.state === "retained" || observation.retained_fields.length > 0) {
+  if (observation.state === "retained" || observation.retained_fields.length > 0 || observation.ready_at_state === "retained") {
     return { label: "Last known", explanation: "Last known — not confirmed by latest refresh" };
   }
   return observation.unknown_fields.length > 0

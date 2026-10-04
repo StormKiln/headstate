@@ -453,7 +453,14 @@ pub async fn strip_pushers(
                 let client = client.clone();
                 let budget = budget.clone();
                 let a = asks[i].clone();
+                let key = keys[i].clone();
                 async move {
+                    let mut context = client.read_context();
+                    let advisory = client.advisory.clone();
+                    context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
+                        advisory.offered(key);
+                    }));
+                    let client = client.with_read_context(context);
                     let rules = tokio::time::timeout(
                         per_request,
                         base_rules(&client, &budget, &a.repo, &a.base),
@@ -487,9 +494,6 @@ pub async fn strip_pushers(
     while let Ok(Some((i, rules, pusher))) =
         tokio::time::timeout_at(client.read_context().deadline, work.next()).await
     {
-        if !matches!(pusher, LastPusher::Declined { .. }) {
-            client.advisory.served(keys[i].clone());
-        }
         out[i].rules = rules;
         out[i].last_pusher = pusher;
     }
@@ -836,6 +840,319 @@ mod tests {
             "fresh selected native receipts must be reused"
         );
         println!("mixed: cycles=315 attempts={attempts} selected_downward_reads={detail_reads} pushers={} stacks={} selected_successes={detail_opportunities} longest_detail_gap={longest_detail_gap}", pushers_seen.len(), stacks_seen.len());
+    }
+
+    // A completion-only fairness ledger loses both opportunities when the
+    // deadline drops the slow prefix. Surviving identities must keep progress
+    // even when an unrelated head changes between concurrent refreshes.
+    #[tokio::test]
+    async fn canceled_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_canceled_slow_prefix_preserves_survivor_progress_after_churn() {
+        slow_prefix_progress(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_canceled_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn staggered_concurrent_slow_prefix_eventually_offers_healthy_survivor() {
+        slow_prefix_progress(true, false, true).await;
+    }
+
+    // Unlike a delayed wiremock response, these slow sockets remain blocked
+    // regardless of wall-clock scheduling. Dropping the fixture aborts the
+    // listener and its JoinSet, closing every held connection.
+    struct HeldPusherProvider {
+        uri: String,
+        paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl HeldPusherProvider {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let uri = format!("http://{}", listener.local_addr().unwrap());
+            let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let received = paths.clone();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted.unwrap();
+                            let received = received.clone();
+                            connections.spawn(async move {
+                                let mut header = Vec::new();
+                                let mut buf = [0; 1024];
+                                while !header.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                                    let count = socket.read(&mut buf).await.unwrap();
+                                    if count == 0 { return; }
+                                    header.extend_from_slice(&buf[..count]);
+                                }
+                                let request = String::from_utf8(header).unwrap();
+                                let path = request.split_whitespace().nth(1).unwrap()
+                                    .split('?').next().unwrap().to_owned();
+                                received.lock().unwrap().push(path.clone());
+                                if path.contains("/slow-") {
+                                    std::future::pending::<()>().await;
+                                }
+                                let body = if path.ends_with("/activity") {
+                                    json!([push("push", HEAD, "octocat")]).to_string()
+                                } else { "[]".to_owned() };
+                                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                // Cancellation is expected to close some client sockets.
+                                let _ = socket.write_all(reply.as_bytes()).await;
+                            });
+                        }
+                        Some(result) = connections.join_next(), if !connections.is_empty() => {
+                            result.unwrap();
+                        }
+                    }
+                }
+            });
+            Self { uri, paths, task }
+        }
+        fn client(&self) -> GitHubClient {
+            GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(&self.uri)
+                    .unwrap()
+                    .personal_token("test-token".to_owned())
+                    .build()
+                    .unwrap(),
+            )
+        }
+        fn paths(&self) -> Vec<String> {
+            self.paths.lock().unwrap().clone()
+        }
+        fn slow_count(&self) -> usize {
+            self.paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.contains("/slow-"))
+                .count()
+        }
+    }
+    impl Drop for HeldPusherProvider {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    // A runnable cooperative driver prevents paused Tokio time from auto-
+    // advancing while real loopback IO is pending. Wall time is used only as
+    // a generous hung-fixture watchdog, never to establish admission behavior.
+    async fn drive_advisory_until(mut ready: impl FnMut() -> bool) {
+        let watchdog = std::time::Instant::now();
+        while !ready() {
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(30),
+                "advisory fixture made no progress"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+    fn start_strip(
+        client: GitHubClient,
+        budget: Budget,
+        asks: Vec<PusherAsk>,
+    ) -> tokio::task::JoinHandle<Vec<RowPusher>> {
+        tokio::spawn(async move { strip_pushers(&client, &budget, &asks, T).await })
+    }
+    async fn finish_strip(task: tokio::task::JoinHandle<Vec<RowPusher>>) -> Vec<RowPusher> {
+        drive_advisory_until(|| task.is_finished()).await;
+        task.await.unwrap()
+    }
+
+    async fn slow_prefix_progress(concurrent: bool, churn: bool, staggered: bool) {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        tokio::time::pause();
+        let mut asks = vec![
+            ask("synthetic/slow-a", 1, HEAD),
+            ask("synthetic/slow-b", 2, HEAD),
+            ask("synthetic/healthy", 3, HEAD),
+        ];
+        if concurrent && !churn {
+            asks.push(ask("synthetic/slow-new", 10, HEAD));
+        }
+        let mut healthy = false;
+        for cycle in 0..4 {
+            let bounded = client.with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Advisory,
+                Duration::from_millis(150),
+            ));
+            let before = provider.paths().len();
+            let slow_before = provider.slow_count();
+            let budget = client.request_budget();
+            let first = start_strip(bounded.clone(), budget.clone(), asks.clone());
+            let second = if concurrent {
+                let later = if staggered {
+                    drive_advisory_until(|| provider.slow_count() >= slow_before + 2).await;
+                    tokio::time::advance(Duration::from_millis(20)).await;
+                    client.with_read_context(super::super::admission::ReadContext::new(
+                        super::super::admission::ReadClass::Advisory,
+                        Duration::from_millis(150),
+                    ))
+                } else {
+                    bounded
+                };
+                Some(start_strip(later, budget, asks.clone()))
+            } else {
+                None
+            };
+            drive_advisory_until(|| provider.slow_count() >= slow_before + 2).await;
+            // Both provider slots are demonstrably held before time expires.
+            // No wall-clock interval must accommodate a healthy HTTP exchange.
+            tokio::time::advance(Duration::from_millis(if staggered { 129 } else { 149 })).await;
+            assert!(
+                !first.is_finished(),
+                "held leaders cannot complete before the deadline"
+            );
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let a = finish_strip(first).await;
+            let b = if let Some(second) = second {
+                if staggered {
+                    // Singleflight and short declined receipts can leave just
+                    // one new slow request. Wait for either two held requests,
+                    // or one held request plus both settled healthy stages.
+                    drive_advisory_until(|| {
+                        let held = provider.slow_count() - slow_before;
+                        let healthy_settled = client
+                            .advisory
+                            .rules
+                            .peek(&("synthetic/healthy".into(), "main".into()))
+                            .is_some()
+                            && client
+                                .advisory
+                                .pushers
+                                .peek(&("synthetic/healthy".into(), "feat/3".into(), HEAD.into()))
+                                .is_some();
+                        second.is_finished() || held >= 4 || (held >= 3 && healthy_settled)
+                    })
+                    .await;
+                    tokio::time::advance(Duration::from_millis(18)).await;
+                    assert!(
+                        !second.is_finished(),
+                        "later caller remains held before its own deadline"
+                    );
+                    tokio::time::advance(Duration::from_millis(2)).await;
+                }
+                finish_strip(second).await
+            } else {
+                Vec::new()
+            };
+            let requests = provider.paths();
+            assert!(requests.len() - before <= 8, "shared actual-attempt cap");
+            healthy |= a.iter().chain(&b).any(|row| {
+                row.number == 3
+                    && matches!(row.last_pusher, LastPusher::Known { .. })
+                    && matches!(row.rules, BaseRules::Read { .. })
+            });
+            if cycle == 0 && !staggered {
+                assert!(!healthy, "both workers are occupied by slow leaders");
+                assert_eq!(requests.len(), 2, "same-key concurrent callers coalesce");
+                assert!(
+                    a.iter().chain(&b).all(
+                        |row| row.last_known_pusher.is_none() && row.last_known_rules.is_none()
+                    ),
+                    "scheduling cannot fabricate observations"
+                );
+            }
+            if churn && cycle == 0 {
+                asks[0].head_oid = "changed".into();
+                asks.push(ask("synthetic/slow-new", 10, HEAD));
+            }
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        tokio::time::resume();
+        assert!(
+            healthy,
+            "healthy survivor never received a provider opportunity"
+        );
+        assert!(provider
+            .paths()
+            .iter()
+            .any(|path| path == "/repos/synthetic/healthy/activity"));
+        println!("slow-prefix: concurrent={concurrent} churn={churn} staggered={staggered} cycles=4 actual_attempts={} healthy_observed={healthy}", provider.paths().len());
+    }
+
+    #[tokio::test]
+    async fn cached_pushers_bypass_busy_workers_and_cancellation_releases_them() {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        tokio::time::pause();
+        let cached_asks = vec![ask("synthetic/cached", 1, HEAD)];
+        let before = finish_strip(start_strip(
+            client.clone(),
+            client.request_budget(),
+            cached_asks.clone(),
+        ))
+        .await;
+        assert!(matches!(before[0].last_pusher, LastPusher::Known { .. }));
+        let slow = start_strip(
+            client.clone(),
+            client.request_budget(),
+            vec![
+                ask("synthetic/slow-a", 2, HEAD),
+                ask("synthetic/slow-b", 3, HEAD),
+            ],
+        );
+        drive_advisory_until(|| provider.slow_count() == 2).await;
+        let cached = finish_strip(start_strip(
+            client.clone(),
+            client.request_budget(),
+            cached_asks,
+        ))
+        .await;
+        assert!(matches!(cached[0].last_pusher, LastPusher::Known { .. }));
+        assert!(cached[0].pusher_valid_for_ms <= before[0].pusher_valid_for_ms);
+        assert!(cached[0].rules_valid_for_ms <= before[0].rules_valid_for_ms);
+        assert_eq!(provider.paths().len(), 4, "cached call issues no HTTP");
+        assert!(
+            !slow.is_finished(),
+            "cached caller completed while leaders remain held"
+        );
+        let other = provider.client();
+        let independent = finish_strip(start_strip(
+            other.clone(),
+            other.request_budget(),
+            vec![ask("synthetic/other-account", 4, HEAD)],
+        ))
+        .await;
+        assert!(provider
+            .paths()
+            .iter()
+            .any(|path| path == "/repos/synthetic/other-account/activity"));
+        assert!(matches!(
+            independent[0].last_pusher,
+            LastPusher::Known { .. }
+        ));
+        assert!(
+            !slow.is_finished(),
+            "other account completed while leaders remain held"
+        );
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        let recovered = finish_strip(start_strip(
+            client.clone(),
+            client.request_budget(),
+            vec![ask("synthetic/recovered", 5, HEAD)],
+        ))
+        .await;
+        assert!(provider
+            .paths()
+            .iter()
+            .any(|path| path == "/repos/synthetic/recovered/activity"));
+        assert!(matches!(recovered[0].last_pusher, LastPusher::Known { .. }));
+        tokio::time::resume();
     }
 
     #[tokio::test]

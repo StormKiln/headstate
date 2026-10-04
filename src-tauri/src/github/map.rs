@@ -2057,6 +2057,10 @@ mod tests {
             Some(ts(&json!({"t": "2026-08-19T15:30:00Z"}), "t").unwrap())
         );
         assert_ne!(pr.ready_at, Some(pr.created_at));
+        assert_eq!(
+            pr.observation.as_ref().unwrap().ready_at_state,
+            Some(crate::inventory::ObservationState::Observed)
+        );
     }
 
     /// No event means it was never a draft, so it became reviewable the
@@ -2066,6 +2070,10 @@ mod tests {
         let v = with_timeline(false, json!({"nodes": []}));
         let pr = &map_list(&v, "search")[0];
         assert_eq!(pr.ready_at, Some(pr.created_at));
+        assert_eq!(
+            pr.observation.as_ref().unwrap().ready_at_state,
+            Some(crate::inventory::ObservationState::Observed)
+        );
     }
 
     /// Present but unreadable is UNKNOWN, never "now" and never the
@@ -2074,7 +2082,9 @@ mod tests {
     fn an_unparseable_ready_time_is_unknown() {
         for bad in [json!("yesterday"), json!(""), json!(null), json!(7)] {
             let v = with_timeline(false, json!({"nodes": [{"createdAt": bad}]}));
-            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{bad}");
+            let pr = &map_list(&v, "search")[0];
+            assert_eq!(pr.ready_at, None, "{bad}");
+            assert_eq!(pr.observation.as_ref().unwrap().ready_at_state, None);
         }
     }
 
@@ -2085,7 +2095,9 @@ mod tests {
     fn a_missing_timeline_is_unknown_not_never_drafted() {
         for missing in [json!(null), json!({}), json!({"nodes": null})] {
             let v = with_timeline(false, missing.clone());
-            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{missing}");
+            let pr = &map_list(&v, "search")[0];
+            assert_eq!(pr.ready_at, None, "{missing}");
+            assert_eq!(pr.observation.as_ref().unwrap().ready_at_state, None);
         }
         // And a node shaped without the field at all, as a cached or
         // partial response would be.

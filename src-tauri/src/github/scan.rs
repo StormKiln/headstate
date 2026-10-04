@@ -14,6 +14,8 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
 };
+mod partition;
+
 type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
 #[derive(Default)]
 pub(super) struct Reads(Mutex<HashMap<(bool, i64), Weak<ScanSlot>>>);
@@ -122,6 +124,35 @@ impl GitHubClient {
                     break;
                 }
                 state.no_work = false;
+                if state.github_partition.is_some() {
+                    let (q, first, after) = partition::request(&mut state, list);
+                    match client.scan_query(&q, first, after.as_deref()).await {
+                        Ok(raw) => {
+                            if raw["viewer"]["login"].as_str().is_some_and(|v| v != owner) {
+                                return Err(ClientError::Graphql(
+                                    "queue account changed during traversal".into(),
+                                ));
+                            }
+                            partition::accept(&mut state, &raw, &mut prs, now);
+                            if state.done {
+                                seed_candidates(&mut state, previous, now);
+                                break;
+                            }
+                            if state.failures > 0 {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            if after.is_some() && explicit_invalid_cursor(&error) {
+                                partition::reset_leaf(&mut state);
+                            }
+                            state.failure(now);
+                            state.step_failure = Some(scan_failure(&error));
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 let raw = match client.scan_page(list, state.after.as_deref()).await {
                     Ok(raw) => raw,
                     Err(error) => {
@@ -181,6 +212,17 @@ impl GitHubClient {
                     }
                     merge_observation(&mut prs, row);
                 }
+                if total.is_some_and(|n| n > 1000) {
+                    state.github_partition = Some(queue_scan::GithubPartition::default());
+                    state.after = None;
+                    state.cursors.clear();
+                    state.pages = 0;
+                    state.coverage_valid = false;
+                    for candidate in &mut state.candidates {
+                        candidate.negative_at = None;
+                    }
+                    continue;
+                }
                 let next = page["pageInfo"]["hasNextPage"].as_bool();
                 let cursor = page["pageInfo"]["endCursor"]
                     .as_str()
@@ -235,7 +277,8 @@ impl GitHubClient {
             }
         }
         // Optional head freshness never changes the pending tail or pass membership.
-        if !due_confirmation
+        if state.github_partition.is_none()
+            && !due_confirmation
             && now >= state.eligible_at
             && !state.done
             && !began_at_head
@@ -302,7 +345,15 @@ impl GitHubClient {
         })
     }
     async fn scan_page(&self, list: CachedList, after: Option<&str>) -> Result<Value, ClientError> {
-        self.graphql_partial_ok(&json!({"query":super::query::PRS_QUERY,"variables":{"q":predicate(list),"first":25,"after":after}})).await
+        self.scan_query(predicate(list), 25, after).await
+    }
+    async fn scan_query(
+        &self,
+        q: &str,
+        first: u64,
+        after: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        self.graphql_partial_ok(&json!({"query":super::query::PRS_QUERY,"variables":{"q":q,"first":first,"after":after}})).await
     }
     async fn confirm(
         &self,
@@ -417,29 +468,48 @@ fn merge_observation(rows: &mut Vec<PullRequest>, row: PullRequest) {
     }
 }
 fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
-    for row in previous {
-        if state.candidates.len() >= queue_scan::CANDIDATES {
-            break;
-        }
-        if !state.seen.contains(&row.identity())
-            && !state
+    if previous.is_empty() {
+        return;
+    }
+    let start = state.candidate_position % previous.len();
+    for offset in 0..previous.len() {
+        let index = (start + offset) % previous.len();
+        let row = &previous[index];
+        state.candidate_position = (index + 1) % previous.len();
+        if state.seen.contains(&row.identity())
+            || row.id.is_empty()
+            || state
                 .candidates
                 .iter()
                 .any(|c| c.identity == row.identity())
-            && !row.id.is_empty()
         {
-            state.candidates.push_back(Candidate {
-                identity: row.identity(),
-                id: row.id.clone(),
-                head: row.head_oid.clone(),
-                created_at: row.created_at,
-                negative_at: None,
-                eligible_at: now,
-                failures: 0,
-            });
+            continue;
         }
+        if state.candidates.len() >= queue_scan::CANDIDATES {
+            // Only recycle candidates already given an inconclusive opportunity.
+            // Untested and first-negative entries retain their turn/proof spacing.
+            let Some(evict) = state
+                .candidates
+                .iter()
+                .position(|c| c.failures > 0 && c.negative_at.is_none() && c.eligible_at <= now)
+            else {
+                state.candidate_position = index;
+                break;
+            };
+            state.candidates.remove(evict);
+        }
+        state.candidates.push_back(Candidate {
+            identity: row.identity(),
+            id: row.id.clone(),
+            head: row.head_oid.clone(),
+            created_at: row.created_at,
+            negative_at: None,
+            eligible_at: now,
+            failures: 0,
+        });
     }
 }
+
 enum Verdict {
     Present,
     Absent,
@@ -523,6 +593,525 @@ mod tests {
         node["headRefOid"] = json!(format!("head-{number}"));
         node
     }
+    // External search enforces GitHub's per-query ceiling, including on ranged queries.
+    fn search_response(body: &Value, members: &[Value]) -> ResponseTemplate {
+        let q = body["variables"]["q"].as_str().unwrap_or("");
+        let mut selected = members.iter().collect::<Vec<_>>();
+        if let Some(range) = q
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("created:"))
+        {
+            let (lo, hi) = range.split_once("..").expect("documented inclusive range");
+            let lo = lo.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+            let hi = hi.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+            selected.retain(|n| {
+                let t = n["createdAt"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap();
+                t >= lo && t <= hi
+            });
+        }
+        selected.sort_by_key(|n| n["createdAt"].as_str().unwrap());
+        if q.contains("sort:created-desc") {
+            selected.reverse();
+        }
+        let total = selected.len();
+        let first = body["variables"]["first"].as_u64().unwrap_or(25) as usize;
+        let start = body["variables"]["after"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("cursor-"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let end = (start + first).min(total.min(1000));
+        let nodes = selected
+            .into_iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .cloned()
+            .collect::<Vec<_>>();
+        ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{
+            "issueCount":total,"nodes":nodes,"pageInfo":{"hasNextPage":end<total.min(1000),"endCursor":format!("cursor-{end}")}
+        }}}))
+    }
+    fn dated_members(count: usize) -> Vec<Value> {
+        (1..=count)
+            .map(|i| {
+                let mut n = node(i);
+                n["createdAt"] = json!(chrono::DateTime::from_timestamp(
+                    1_600_000_000 + i as i64 * 60,
+                    500_000_000
+                )
+                .unwrap()
+                .to_rfc3339());
+                n
+            })
+            .collect()
+    }
+    fn persist_step(
+        path: &std::path::Path,
+        result: FetchedList,
+        inventory: &mut Vec<PullRequest>,
+    ) -> State {
+        let commit = result.scan.unwrap();
+        inventory.retain(|r| !commit.removals.contains(&r.identity()));
+        *inventory = crate::inventory::reconcile(
+            std::mem::take(inventory),
+            result.prs,
+            false,
+            chrono::Utc::now(),
+        );
+        let conn = crate::store::open_db(path).unwrap();
+        assert!(queue_scan::commit(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "fixture",
+            &commit,
+            |tx| {
+                crate::store::source_cache::save_owned_source_snapshot(
+                    tx,
+                    &Source::default(),
+                    CachedList::Reviewing,
+                    inventory,
+                    &result.coverage,
+                    Some("fixture"),
+                )
+            }
+        )
+        .unwrap());
+        assert!(queue_scan::accepted(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "fixture",
+            &commit
+        )
+        .unwrap());
+        drop(conn);
+        let conn = crate::store::open_db(path).unwrap();
+        let saved = crate::store::source_cache::load_source_snapshot(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+        )
+        .unwrap();
+        let crate::store::source_cache::SnapshotData::Available { prs, .. } = saved.data else {
+            panic!("saved inventory must survive restart")
+        };
+        *inventory = prs;
+        commit.state
+    }
+    async fn oversized_inventory(count: usize) {
+        let server = MockServer::start().await;
+        let mut members = dated_members(count);
+        if count == 1025 {
+            // Exact endpoints/midpoint, plus a fractional row just beyond midpoint.
+            for i in [1, 513, 1025] {
+                members[i - 1]["createdAt"] = json!(chrono::DateTime::from_timestamp(
+                    1_600_000_000 + i as i64 * 60,
+                    0
+                )
+                .unwrap()
+                .to_rfc3339());
+            }
+            members[513]["createdAt"] = json!(chrono::DateTime::from_timestamp(
+                1_600_000_000 + 513 * 60,
+                500_000_000
+            )
+            .unwrap()
+            .to_rfc3339());
+        }
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                search_response(&request.body_json().unwrap(), &members)
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partition.sqlite");
+        let mut inventory = vec![];
+        let mut state = State::default();
+        let mut phases = HashSet::new();
+        for step in 0..150 {
+            let conn = crate::store::open_db(&path).unwrap();
+            let loaded =
+                queue_scan::load(&conn, &Source::default(), CachedList::Reviewing, "fixture")
+                    .unwrap();
+            drop(conn);
+            let before = server.received_requests().await.unwrap().len();
+            let step_client = client.with_attempt_limit(if count == 1025 { 1 } else { 3 });
+            // Verify ownership separately so a single admitted discovery can checkpoint each phase.
+            if step == 0 {
+                client.fetch_viewer().await.unwrap();
+            }
+            let result = step_client
+                .advance_scan(CachedList::Reviewing, loaded, &inventory, 1000 + step * 60)
+                .await
+                .unwrap();
+            assert!(server.received_requests().await.unwrap().len() - before <= 3);
+            state = persist_step(&path, result, &mut inventory);
+            if let Some(p) = &state.github_partition {
+                phases.insert(format!("{:?}", p.phase));
+            }
+            if state.done {
+                break;
+            }
+        }
+        assert_eq!(
+            inventory.len(),
+            count,
+            "all provider identities, beyond the first 1,000"
+        );
+        assert_eq!(
+            inventory.iter().map(|r| r.number).collect::<HashSet<_>>(),
+            (1..=count as u64).collect()
+        );
+        assert!(state.done && state.coverage_valid);
+        if count == 1025 {
+            for phase in ["LowerBound", "UpperBound", "Leaves", "FinalCheck"] {
+                assert!(phases.contains(phase), "restart at {phase}");
+            }
+        }
+        assert_eq!(state.completed_total, Some(count as u64));
+    }
+    #[tokio::test]
+    async fn oversized_1025_members_converge_across_sqlite_restart() {
+        oversized_inventory(1025).await;
+    }
+    #[tokio::test]
+    async fn oversized_2750_members_converge_across_sqlite_restart() {
+        oversized_inventory(2750).await;
+    }
+    #[tokio::test]
+    async fn overflow_terminal_gets_a_fair_proof_without_removing_unknown_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let mut data = json!({"viewer":{"login":"fixture"},"authored":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}});
+            for i in 0..4 {
+                if body["variables"][format!("n{i}")].as_u64() == Some(1001) {
+                    let mut direct = node(1001); direct["state"] = json!("CLOSED");
+                    data[format!("p{i}")] = json!({"pullRequest":direct});
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+        }).mount(&server).await;
+        let client = client(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fair.sqlite");
+        let mut inventory = map_list(
+            &json!({"authored":{"nodes":(1..=1001).map(node).collect::<Vec<_>>()}}),
+            "authored",
+        );
+        for step in 0..260 {
+            let conn = crate::store::open_db(&path).unwrap();
+            let loaded =
+                queue_scan::load(&conn, &Source::default(), CachedList::Reviewing, "fixture")
+                    .unwrap();
+            drop(conn);
+            let before = server.received_requests().await.unwrap().len();
+            let result = client
+                .advance_scan(CachedList::Reviewing, loaded, &inventory, 1000 + step * 60)
+                .await
+                .unwrap();
+            assert!(server.received_requests().await.unwrap().len() - before <= 3);
+            persist_step(&path, result, &mut inventory);
+            assert!(inventory
+                .iter()
+                .filter(|r| r.number <= 1000)
+                .all(|r| r.head_oid == format!("head-{}", r.number)));
+            if inventory.len() == 1000 {
+                break;
+            }
+        }
+        assert_eq!(
+            inventory.len(),
+            1000,
+            "overflow terminal must eventually be confirmed"
+        );
+        assert!(inventory.iter().all(|r| r.number <= 1000));
+    }
+    #[tokio::test]
+    async fn partition_second_request_failure_preserves_success_and_recovers_leaf_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let server = MockServer::start().await;
+        let failing = Arc::new(AtomicBool::new(true));
+        let fail = failing.clone();
+        let members = dated_members(75);
+        Mock::given(method("POST"))
+            .respond_with(move |r: &wiremock::Request| {
+                let body: Value = r.body_json().unwrap();
+                if body["variables"]["after"] == "cursor-25" && fail.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(503);
+                }
+                search_response(&body, &members)
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        client.fetch_viewer().await.unwrap();
+        let window = queue_scan::Window {
+            lo: 1_600_000_000,
+            hi: 1_600_010_000,
+        };
+        let state = State {
+            total: Some(75),
+            count_seen: true,
+            github_partition: Some(queue_scan::GithubPartition {
+                phase: queue_scan::PartitionPhase::Leaves,
+                lower: Some(window.lo),
+                upper: Some(window.hi),
+                active: Some(queue_scan::Leaf::new(window)),
+                windows_started: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = client
+            .advance_scan(
+                CachedList::Reviewing,
+                Loaded { revision: 0, state },
+                &[],
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.prs.len(), 25);
+        let state = result.scan.unwrap().state;
+        assert_eq!(
+            state
+                .github_partition
+                .as_ref()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .after
+                .as_deref(),
+            Some("cursor-25")
+        );
+        assert!(state.step_failure.is_some() && state.tainted);
+        failing.store(false, Ordering::SeqCst);
+        let before = server.received_requests().await.unwrap().len();
+        let recovered = client
+            .advance_scan(
+                CachedList::Reviewing,
+                Loaded { revision: 1, state },
+                &result.prs,
+                1200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len() - before, 2);
+        assert_eq!(
+            recovered.prs.len(),
+            50,
+            "both successful discovery slots resume after backoff"
+        );
+        assert_eq!(
+            recovered
+                .scan
+                .unwrap()
+                .state
+                .github_partition
+                .unwrap()
+                .phase,
+            queue_scan::PartitionPhase::FinalCheck
+        );
+    }
+    #[tokio::test]
+    async fn partition_expired_cursor_restarts_only_its_leaf_and_keeps_siblings() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":null},"errors":[{"path":["authored"],"message":"The cursor is invalid"}]}))).mount(&server).await;
+        let client = client(&server);
+        client.fetch_viewer().await.unwrap();
+        let window = queue_scan::Window { lo: 0, hi: 100 };
+        let sibling = queue_scan::Window { lo: 100, hi: 200 };
+        let mut leaf = queue_scan::Leaf::new(window);
+        leaf.after = Some("expired".into());
+        leaf.cursors.push("expired".into());
+        leaf.pages = 1;
+        let state = State {
+            seen: vec![candidate(1).identity],
+            github_partition: Some(queue_scan::GithubPartition {
+                phase: queue_scan::PartitionPhase::Leaves,
+                lower: Some(0),
+                upper: Some(200),
+                active: Some(leaf),
+                pending: [sibling].into(),
+                windows_started: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = client
+            .advance_scan(
+                CachedList::Reviewing,
+                Loaded { revision: 1, state },
+                &[],
+                1000,
+            )
+            .await
+            .unwrap();
+        let state = result.scan.unwrap().state;
+        let p = state.github_partition.unwrap();
+        assert_eq!(p.active.unwrap(), queue_scan::Leaf::new(window));
+        assert_eq!(p.pending, [sibling]);
+        assert_eq!(state.seen.len(), 1);
+        assert!(state.tainted && state.eligible_at > 1000 && !state.coverage_valid);
+    }
+    #[tokio::test]
+    async fn recurring_partition_discovers_old_pr_requested_after_its_leaf_was_visited() {
+        let server = MockServer::start().await;
+        let members = Arc::new(Mutex::new(dated_members(1025)));
+        let mock_members = members.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |r: &wiremock::Request| {
+                search_response(&r.body_json().unwrap(), &mock_members.lock().unwrap())
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        client.fetch_viewer().await.unwrap();
+        let mut state = State::default();
+        let mut inventory = vec![];
+        let mut introduced = false;
+        let mut passes = 0;
+        for step in 0..150 {
+            let result = client
+                .with_attempt_limit(1)
+                .advance_scan(
+                    CachedList::Reviewing,
+                    Loaded {
+                        revision: step,
+                        state,
+                    },
+                    &inventory,
+                    1000 + step * 60,
+                )
+                .await
+                .unwrap();
+            state =
+                serde_json::from_value(serde_json::to_value(result.scan.unwrap().state).unwrap())
+                    .unwrap();
+            inventory =
+                crate::inventory::reconcile(inventory, result.prs, false, chrono::Utc::now());
+            if !introduced
+                && state.github_partition.as_ref().is_some_and(|p| {
+                    p.active.is_none() && p.pending.front().is_some_and(|w| Some(w.lo) > p.lower)
+                })
+            {
+                let mut old = node(2000);
+                old["createdAt"] = json!(chrono::DateTime::from_timestamp(1_600_000_080, 0)
+                    .unwrap()
+                    .to_rfc3339());
+                members.lock().unwrap().push(old);
+                introduced = true;
+            }
+            if state.done {
+                passes += 1;
+                if passes == 1 {
+                    assert!(
+                        !state.coverage_valid,
+                        "final count detects changed membership"
+                    );
+                }
+                if passes == 2 {
+                    break;
+                }
+            }
+        }
+        assert!(introduced && state.done && state.coverage_valid);
+        assert_eq!(passes, 2);
+        assert_eq!(inventory.len(), 1026);
+        assert!(inventory.iter().any(|r| r.number == 2000));
+    }
+    #[tokio::test]
+    async fn dense_leaf_remains_partial_while_healthy_siblings_are_discovered() {
+        let server = MockServer::start().await;
+        let mut members = (1..=1001).map(node).collect::<Vec<_>>();
+        for n in &mut members {
+            n["createdAt"] = json!("2020-01-01T00:00:00Z");
+        }
+        let mut sibling = node(1002);
+        sibling["createdAt"] = json!("2020-01-01T00:00:08Z");
+        members.push(sibling);
+        Mock::given(method("POST"))
+            .respond_with(move |r: &wiremock::Request| {
+                search_response(&r.body_json().unwrap(), &members)
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let mut state = State::default();
+        let mut inventory = vec![];
+        for step in 0..30 {
+            let result = client
+                .advance_scan(
+                    CachedList::Reviewing,
+                    Loaded {
+                        revision: step,
+                        state,
+                    },
+                    &inventory,
+                    1000 + step * 60,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(result.coverage, Coverage::Partial { .. }));
+            state =
+                serde_json::from_value(serde_json::to_value(result.scan.unwrap().state).unwrap())
+                    .unwrap();
+            inventory =
+                crate::inventory::reconcile(inventory, result.prs, false, chrono::Utc::now());
+            if state.done {
+                break;
+            }
+        }
+        assert!(state.done && state.ceiling);
+        assert!(inventory.iter().any(|r| r.number == 1002));
+        assert!(state
+            .github_partition
+            .unwrap()
+            .blocked
+            .iter()
+            .any(|(_, reason)| *reason == queue_scan::BlockReason::TimestampResolution));
+    }
+    #[test]
+    fn candidate_rotation_keeps_untested_and_spaced_proofs_but_restarts_discarded_evidence() {
+        let mut state = State {
+            candidates: (1..=1000).map(candidate).collect(),
+            ..Default::default()
+        };
+        let previous = map_list(
+            &json!({"authored":{"nodes":(1..=1001).map(node).collect::<Vec<_>>()}}),
+            "authored",
+        );
+        state.candidates[0].negative_at = Some(1000);
+        state.candidates[1].failures = 1;
+        seed_candidates(&mut state, &previous, 1010);
+        assert_eq!(state.candidates.len(), 1000);
+        assert!(state
+            .candidates
+            .iter()
+            .any(|c| c.identity.number == 1 && c.negative_at == Some(1000)));
+        assert!(state
+            .candidates
+            .iter()
+            .any(|c| c.identity.number == 1001 && c.negative_at.is_none()));
+        assert!(!state.candidates.iter().any(|c| c.identity.number == 2));
+        state.candidates[2].failures = 1;
+        state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        state.fresh_pass();
+        seed_candidates(&mut state, &previous, 1100);
+        assert!(state
+            .candidates
+            .iter()
+            .any(|c| c.identity.number == 2 && c.negative_at.is_none()));
+    }
     #[tokio::test]
     async fn reachable_275_rows_advance_with_three_actual_attempts_per_step() {
         let server = MockServer::start().await;
@@ -587,6 +1176,14 @@ mod tests {
         );
         assert_eq!(inventory.len(), 275);
         assert!(state.done);
+        assert!(state.github_partition.is_none());
+        for request in server.received_requests().await.unwrap() {
+            let body: Value = request.body_json().unwrap();
+            if body["variables"]["q"].is_string() {
+                assert_eq!(body["variables"]["first"], 25);
+                assert_eq!(body["variables"]["q"], "is:pr is:open author:@me");
+            }
+        }
     }
     #[tokio::test]
     async fn confirmation_failure_is_qualified_without_authorizing_removal() {
@@ -901,10 +1498,13 @@ mod tests {
     #[tokio::test]
     async fn search_ceiling_stays_partial_and_bad_cursor_never_claims_a_terminal_pass() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(|request:&wiremock::Request| {
-            let body:Value=request.body_json().unwrap();let start=body["variables"]["after"].as_str().and_then(|s|s.strip_prefix("cursor-")).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);let end=(start+25).min(1000);
-            ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":1001,"nodes":(start..end).map(node).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{end}")}}}}))
-        }).mount(&server).await;
+        let members = (1..=1001).map(node).collect::<Vec<_>>();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                search_response(&request.body_json().unwrap(), &members)
+            })
+            .mount(&server)
+            .await;
         let client = client(&server);
         let mut state = State::default();
         for step in 0..20 {
@@ -925,9 +1525,16 @@ mod tests {
                 Coverage::Partial { total: Some(1001) }
             ));
             state = result.scan.unwrap().state;
+            if state.done {
+                break;
+            }
         }
         assert!(state.done && state.ceiling);
-        assert_eq!(state.seen.len(), 1000);
+        assert!(!state.coverage_valid);
+        assert!(
+            !state.seen.is_empty(),
+            "retain useful rows from a dense window"
+        );
         server.reset().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":50,"nodes":[node(26)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-25"}}}}))).mount(&server).await;
         let state = State {

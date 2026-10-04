@@ -33,9 +33,11 @@ import { ReadyObservationStatus, ReadyStrip } from "./ReadyStrip";
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { remoteEventError } from "@/api/wireContract";
 import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
+import readyDateReconcile from "../../src-tauri/tests/fixtures/ready-date-reconcile.json";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
 import type { PullRequest, RowPusher } from "@/types/pr";
+import { sortReadyForReview } from "@/lib/derive";
 
 /// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
 let pusherAnswers: RowPusher[] = [];
@@ -188,6 +190,41 @@ describe("ReadyStrip ordering", () => {
     // what the default should be.
     const s = useFilters.getState();
     expect(s.filtersByView["to-review"].readySort).toBeUndefined();
+  });
+
+  it("keeps a retained qualified date in order and labels it last known", () => {
+    const older = at(1, "2026-09-01T00:00:00Z");
+    older.observation = {
+      state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [],
+      detail_fields: ["base"], ready_at_state: "retained",
+    };
+    render(<ReadyStrip prs={[at(2, "2026-09-02T00:00:00Z"), older]} onOpen={vi.fn()} />);
+    expect(titlesInOrder()).toEqual(["PR 1", "PR 2"]);
+    expect(screen.getByText("Last known")).toBeTruthy();
+    expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
+  });
+
+  it("keeps the provider-reconciled wire fixture ordered until positive evidence supersedes it", async () => {
+    const retained = readyDateReconcile.retained as PullRequest[];
+    const recovered = readyDateReconcile.recovered as PullRequest[];
+    expect(remoteEventError("reviewing-updated", retained)).toBeNull();
+    expect(remoteEventError("reviewing-updated", recovered)).toBeNull();
+    expect(sortReadyForReview(retained, "oldest-opened").map(pr => pr.number)).toEqual([1, 2]);
+    expect(sortReadyForReview(recovered, "oldest-opened").map(pr => pr.number)).toEqual([2, 1]);
+
+    const view = render(<ReadyStrip prs={retained} onOpen={vi.fn()} />);
+    await waitFor(() => {
+      expect(invoke.mock.calls.some(([cmd]) => cmd === "get_ready_pushers")).toBe(true);
+      expect(invoke.mock.calls.some(([cmd]) => cmd === "get_ready_stacks")).toBe(true);
+    });
+    const fixtureTitles = () => Array.from(document.querySelectorAll("[data-ready-title]")).map(el =>
+      el.textContent?.includes("Older ready") ? "older" : "newer",
+    );
+    expect(fixtureTitles()).toEqual(["older", "newer"]);
+    expect(screen.getByText("Last known")).toBeTruthy();
+    await act(async () => view.rerender(<ReadyStrip prs={recovered} onOpen={vi.fn()} />));
+    expect(fixtureTitles()).toEqual(["newer", "older"]);
+    expect(screen.queryByText("Last known")).toBeNull();
   });
 
   // A default nobody can see is one nobody can trust, and this list
@@ -563,7 +600,7 @@ describe("ReadyStrip last pusher", () => {
     ];
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_ready_pushers", expect.anything()));
-    await waitFor(() => expect(status()).toBe("1 not checked yet"));
+    await waitFor(() => expect(status()).toBe("1 could not be decided"));
     expect(screen.getByText("Mine")).toBeTruthy();
     expect(document.querySelector("[data-pushed-by-you]")).toBeNull();
   });

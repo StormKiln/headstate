@@ -114,3 +114,12 @@ it("accepts legacy and qualified inventory events but rejects invented readiness
   expect(remoteEventError("reviewing-updated", [row])).toBeNull();
   expect(remoteEventError("reviewing-updated", [{ ...row, observation: { ...row.observation, unknown_fields: ["invented"] } }])).not.toBeNull();
 });
+
+it("accepts legacy absent detail qualification and validates positive detail groups", () => {
+  const row = { ...PR_FIXTURES[0], observation: { state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [] } };
+  expect(remoteEventError("reviewing-updated", [row])).toBeNull();
+  const qualified = { ...row, observation: { ...row.observation, detail_fields: ["base", "comments", "threads", "reviewers", "reviews"] } };
+  expect(remoteEventError("reviewing-updated", [qualified])).toBeNull();
+  expect(() => assertRemoteReply("get_reviewing", [qualified])).not.toThrow();
+  expect(remoteEventError("reviewing-updated", [{ ...qualified, observation: { ...qualified.observation, detail_fields: ["invented"] } }])).not.toBeNull();
+});

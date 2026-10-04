@@ -14,7 +14,11 @@
         "unknown_fields": [
           "head"
         ],
-        "retained_fields": []
+        "retained_fields": [],
+        "detail_fields": [
+          "base",
+          "comments"
+        ]
       }
     },
     "retained_unread": {
@@ -33,7 +37,11 @@
           "head_oid": "head-a",
           "review": "approved",
           "confirmed_at": "2026-10-01T00:00:00Z"
-        }
+        },
+        "detail_fields": [
+          "base",
+          "comments"
+        ]
       }
     },
     "same_head": {
@@ -52,7 +60,11 @@
           "head_oid": "head-a",
           "review": "approved",
           "confirmed_at": "2026-10-01T00:00:00Z"
-        }
+        },
+        "detail_fields": [
+          "base",
+          "comments"
+        ]
       }
     },
     "changed_head": {
@@ -66,7 +78,11 @@
         "state": "observed",
         "last_observed_at": "2026-10-01T00:00:00Z",
         "unknown_fields": [],
-        "retained_fields": []
+        "retained_fields": [],
+        "detail_fields": [
+          "base",
+          "comments"
+        ]
       }
     },
     "retained_unread_without_effect": {
@@ -80,7 +96,11 @@
         "state": "retained",
         "last_observed_at": null,
         "unknown_fields": [],
-        "retained_fields": []
+        "retained_fields": [],
+        "detail_fields": [
+          "base",
+          "comments"
+        ]
       }
     }
   }
