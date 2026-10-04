@@ -37,6 +37,10 @@ pub struct RowObservation {
     pub retained_fields: Vec<ReadinessField>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detail_fields: Vec<DetailField>,
+    /// Evidence for the separate ready-for-review timestamp. Absence is
+    /// unknown for old snapshots and partial provider responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at_state: Option<ObservationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_review: Option<ConfirmedReview>,
 }
@@ -47,6 +51,9 @@ pub trait InventoryRow: Clone {
     fn observation_mut(&mut self) -> &mut Option<RowObservation>;
     fn head(&self) -> Option<&str>;
     fn copy_field(&mut self, old: &Self, field: ReadinessField);
+    fn retain_ready_at(&mut self, _old: &Self) -> bool {
+        false
+    }
     fn carry_effect(&mut self, _old: &Self) {}
 }
 impl InventoryRow for crate::github::model::PullRequest {
@@ -84,6 +91,33 @@ impl InventoryRow for crate::github::model::PullRequest {
             ReadinessField::Review => self.review = old.review,
             ReadinessField::Queue => self.in_merge_queue = old.in_merge_queue,
         }
+    }
+    fn retain_ready_at(&mut self, old: &Self) -> bool {
+        let observed = |row: &Self| {
+            row.observation.as_ref().is_some_and(|o| {
+                !o.unknown_fields.contains(&ReadinessField::Head)
+                    && !o.unknown_fields.contains(&ReadinessField::Draft)
+                    && o.detail_fields.contains(&DetailField::Base)
+            })
+        };
+        if self.ready_at.is_none()
+            && old.ready_at.is_some()
+            && !self.is_draft
+            && !old.is_draft
+            && !self.base_ref.is_empty()
+            && self.base_ref == old.base_ref
+            && observed(self)
+            && observed(old)
+            && old
+                .observation
+                .as_ref()
+                .and_then(|o| o.ready_at_state)
+                .is_some()
+        {
+            self.ready_at = old.ready_at;
+            return true;
+        }
+        false
     }
 }
 impl InventoryRow for crate::gitlab::queues::MergeRequest {
@@ -168,6 +202,7 @@ fn reconcile_rows<T: InventoryRow>(
                         unknown_fields: vec![],
                         retained_fields: vec![],
                         detail_fields: vec![],
+                        ready_at_state: None,
                         confirmed_review: None,
                     })
                     .state = ObservationState::Retained;
@@ -181,6 +216,7 @@ fn reconcile_rows<T: InventoryRow>(
             unknown_fields: vec![],
             retained_fields: vec![],
             detail_fields: vec![],
+            ready_at_state: None,
             confirmed_review: None,
         });
         if row.head().is_none() && !observation.unknown_fields.contains(&ReadinessField::Head) {
@@ -193,6 +229,8 @@ fn reconcile_rows<T: InventoryRow>(
             .as_ref()
             .filter(|old| row.head().is_some() && row.head() == old.head())
         {
+            let retained_ready_at =
+                observation.ready_at_state.is_none() && row.retain_ready_at(old);
             observation.unknown_fields.retain(|field| {
                 if old
                     .observation()
@@ -205,6 +243,9 @@ fn reconcile_rows<T: InventoryRow>(
                 observation.retained_fields.push(*field);
                 false
             });
+            if retained_ready_at {
+                observation.ready_at_state = Some(ObservationState::Retained);
+            }
         }
         *row.observation_mut() = Some(observation);
         if let Some(old) = old.as_ref() {
@@ -226,6 +267,7 @@ fn reconcile_rows<T: InventoryRow>(
                 unknown_fields: vec![],
                 retained_fields: vec![],
                 detail_fields: vec![],
+                ready_at_state: None,
                 confirmed_review: None,
             });
             if !delta {
@@ -345,12 +387,25 @@ pub fn github_observation(node: &serde_json::Value, partial: bool) -> RowObserva
             detail_fields.push(group);
         }
     }
+    let ready_at_state = (!errored("ready_at") && !node["isDraft"].as_bool().unwrap_or(true))
+        .then(|| node["timelineItems"]["nodes"].as_array())
+        .flatten()
+        .filter(|nodes| {
+            nodes.last().is_none_or(|event| {
+                event["createdAt"]
+                    .as_str()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .is_some()
+            })
+        })
+        .map(|_| ObservationState::Observed);
     RowObservation {
         state: ObservationState::Observed,
         last_observed_at: None,
         unknown_fields: unknown,
         retained_fields: vec![],
         detail_fields,
+        ready_at_state,
         confirmed_review: None,
     }
 }
@@ -472,6 +527,7 @@ pub fn apply_confirmed_review(
         unknown_fields: vec![],
         retained_fields: vec![],
         detail_fields: vec![],
+        ready_at_state: None,
         confirmed_review: None,
     });
     observation.confirmed_review = Some(effect.clone());
@@ -502,6 +558,7 @@ pub fn mark_readiness_errors(data: &mut serde_json::Value, errors: &[serde_json:
             Some("reviewThreads") => "threads",
             Some("reviewRequests") => "reviewers",
             Some("latestReviews") => "reviews",
+            Some("timelineItems") => "ready_at",
             Some("isDraft") => "draft",
             Some("commits") => "ci",
             Some("mergeable") => "merge",
@@ -555,6 +612,7 @@ pub fn gitlab_observation(row: &crate::gitlab::queues::MergeRequest) -> RowObser
         unknown_fields,
         retained_fields: vec![],
         detail_fields: vec![],
+        ready_at_state: None,
         confirmed_review: None,
     }
 }
@@ -606,6 +664,7 @@ pub fn apply_gitlab_action(
             unknown_fields: vec![],
             retained_fields: vec![],
             detail_fields: vec![],
+            ready_at_state: None,
             confirmed_review: None,
         });
         observation.confirmed_review = Some(ConfirmedReview {
@@ -823,6 +882,91 @@ mod tests {
         assert_eq!(changed[0].ci, crate::github::model::CiState::None);
     }
     #[test]
+    fn ready_date_retains_only_across_positive_compatible_facts() {
+        let date = "2026-08-19T15:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let qualified = |row: &mut crate::github::model::PullRequest| {
+            row.head_oid = "head-a".into();
+            row.base_ref = "main".into();
+            row.is_draft = false;
+            let observation = row.observation.as_mut().unwrap();
+            observation.unknown_fields.clear();
+            if !observation.detail_fields.contains(&DetailField::Base) {
+                observation.detail_fields.push(DetailField::Base);
+            }
+        };
+        let mut old = rows().remove(0);
+        qualified(&mut old);
+        old.ready_at = Some(date);
+        old.observation.as_mut().unwrap().ready_at_state = Some(ObservationState::Observed);
+
+        let mut refused = old.clone();
+        refused.ready_at = None;
+        refused.observation.as_mut().unwrap().ready_at_state = None;
+        let retained = reconcile(vec![old.clone()], vec![refused.clone()], true, Utc::now());
+        assert_eq!(retained[0].ready_at, Some(date));
+        assert_eq!(
+            retained[0].observation.as_ref().unwrap().ready_at_state,
+            Some(ObservationState::Retained)
+        );
+
+        for mutate in [
+            |row: &mut crate::github::model::PullRequest| row.head_oid = "head-b".into(),
+            |row: &mut crate::github::model::PullRequest| row.base_ref = "release".into(),
+            |row: &mut crate::github::model::PullRequest| row.is_draft = true,
+        ] as [fn(&mut crate::github::model::PullRequest); 3]
+        {
+            let mut changed = refused.clone();
+            mutate(&mut changed);
+            let result = reconcile(vec![old.clone()], vec![changed], true, Utc::now());
+            assert_eq!(result[0].ready_at, None);
+            assert_eq!(result[0].observation.as_ref().unwrap().ready_at_state, None);
+        }
+
+        let mut first_seen = refused.clone();
+        first_seen.observation.as_mut().unwrap().ready_at_state = None;
+        assert_eq!(
+            reconcile(vec![], vec![first_seen], true, Utc::now())[0].ready_at,
+            None
+        );
+
+        let mut prior_draft = old.clone();
+        prior_draft.is_draft = true;
+        let mut newly_ready_without_timeline = refused.clone();
+        newly_ready_without_timeline.is_draft = false;
+        let after_draft = reconcile(
+            vec![prior_draft],
+            vec![newly_ready_without_timeline],
+            true,
+            Utc::now(),
+        );
+        assert_eq!(after_draft[0].ready_at, None);
+        assert_eq!(
+            after_draft[0].observation.as_ref().unwrap().ready_at_state,
+            None
+        );
+
+        let mut unknown_draft = refused.clone();
+        unknown_draft
+            .observation
+            .as_mut()
+            .unwrap()
+            .unknown_fields
+            .push(ReadinessField::Draft);
+        let unknown_draft = reconcile(vec![old.clone()], vec![unknown_draft], true, Utc::now());
+        assert_eq!(unknown_draft[0].ready_at, None);
+
+        let newer = "2026-09-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut observed = refused;
+        observed.ready_at = Some(newer);
+        observed.observation.as_mut().unwrap().ready_at_state = Some(ObservationState::Observed);
+        let observed = reconcile(retained, vec![observed], true, Utc::now());
+        assert_eq!(observed[0].ready_at, Some(newer));
+        assert_eq!(
+            observed[0].observation.as_ref().unwrap().ready_at_state,
+            Some(ObservationState::Observed)
+        );
+    }
+    #[test]
     fn confirmed_review_survives_omission_restart_and_lag_but_not_new_head() {
         let mut old = rows().remove(0);
         old.head_oid = "head-a".into();
@@ -922,6 +1066,15 @@ mod tests {
                 .as_array()
                 .is_none_or(Vec::is_empty));
         }
+        let mut timeline = serde_json::json!({"authored": {"nodes": [{
+            "isDraft": false, "timelineItems": {"nodes": []}
+        }]}});
+        mark_readiness_errors(
+            &mut timeline,
+            &[serde_json::json!({"path": ["authored", "nodes", 0, "timelineItems"]})],
+        );
+        let refused = github_observation(&timeline["authored"]["nodes"][0], false);
+        assert_eq!(refused.ready_at_state, None);
         for (field, group) in [
             ("reviewRequests", "reviewers"),
             ("latestReviews", "reviews"),
@@ -939,6 +1092,20 @@ mod tests {
         let old: RowObservation = serde_json::from_value(old).unwrap();
         let old = serde_json::to_value(old).unwrap();
         assert!(old["detail_fields"].as_array().is_none_or(Vec::is_empty));
+        assert!(old.get("ready_at_state").is_none());
+
+        let states = [
+            Some(ObservationState::Observed),
+            Some(ObservationState::Retained),
+            None,
+        ];
+        for state in states {
+            let mut value = github_observation(&node, false);
+            value.ready_at_state = state;
+            let round_trip: RowObservation =
+                serde_json::from_value(serde_json::to_value(&value).unwrap()).unwrap();
+            assert_eq!(round_trip.ready_at_state, state);
+        }
     }
 
     #[test]

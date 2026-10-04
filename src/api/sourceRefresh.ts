@@ -1,6 +1,6 @@
 import type { PullRequest } from "../types/pr";
 
-type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
+export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
 
 export type SourceStatus = {
   source: { provider: string; host: string };

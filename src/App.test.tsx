@@ -13,12 +13,19 @@ import { AuthGate } from "./components/AuthGate";
 // exercise the wiring, not the backend.
 const mockStatsTree = vi.fn<() => StatsTree | undefined>(() => undefined);
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
-const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
+const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
 const mockReviewError = vi.fn<() => Error | null>(() => null);
+const mockReviewLoading = vi.fn<() => boolean>(() => false);
+const mockReviewCoverage = vi.fn<() => "complete" | "unknown" | { partial: { total: number | null } } | null>(() => "complete");
 const mockRefused = vi.fn<() => number>(() => 0);
 const mockShortfall = vi.fn<() => number | null>(() => 0);
 const mockTruncation = vi.fn<() => number | null | undefined>(() => undefined);
 const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
+
+vi.mock("./api/sourceRefreshHooks", () => ({
+  usePhoneGitHubRefresh: () => undefined,
+  useSourceRefresh: () => ({ prs: mockReviewing(), error: mockReviewError()?.message ?? null, coverage: mockReviewCoverage() }),
+}));
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
 /// of this file can turn `claude_integrations_enabled` on and off without
@@ -54,7 +61,7 @@ vi.mock("./api/hooks", () => ({
     now: 0,
     rescan: () => Promise.resolve(),
   }),
-  useWorktrees: () => ({ data: [], isLoading: false, isError: false, refetch: () => {} }),
+  useWorktrees: () => ({ data: [], unreadable: [], isLoading: false, isError: false, error: null, refetch: () => {} }),
   // A `Scan`, not a bare array (#972).
   useClaudeMdEffective: () => ({
     data: {
@@ -105,9 +112,9 @@ vi.mock("./api/hooks", () => ({
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
   useStatsTree: () => ({ data: mockStatsTree(), isPending: false, error: null }),
-  useReviewing: () => ({ data: mockReviewing(), isLoading: false, isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
+  useReviewing: () => ({ data: mockReviewing(), isLoading: mockReviewLoading(), isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
-  useReviewingCount: () => ({ data: mockReviewing().length }),
+  useReviewingCount: () => ({ data: mockReviewing()?.length ?? 0 }),
   // PrDetailView's hooks: App's mock replaces the whole module, so
   // rendering the detail branch needs every hook it calls.
   usePrDetail: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
@@ -120,6 +127,7 @@ vi.mock("./api/hooks", () => ({
   // #1576: nothing checked yet, which hides nothing.
   useReadyPushers: () => ({
     of: () => ({ pusher: { state: "pending" }, rule: "unread" }),
+    displayOf: () => undefined,
     isPending: false,
   }),
   // StatsPage owns these; this suite only asserts the shell's layout, so
@@ -545,6 +553,56 @@ describe("opening a pull request from To review", () => {
     useFilters.setState({ selectedPr: { repo: "someone/else", number: 71 } });
     renderApp();
     expect(screen.getByRole("button", { name: /back to list/i })).toBeTruthy();
+  });
+});
+
+describe("Ready inventory availability", () => {
+  beforeEach(() => {
+    mockReviewing.mockReturnValue([]);
+    mockReviewError.mockReturnValue(null);
+    mockReviewLoading.mockReturnValue(false);
+    mockReviewCoverage.mockReturnValue("complete");
+    useFilters.setState({
+      view: "to-review",
+      selectedPr: null,
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
+    });
+  });
+
+  it("does not claim an empty Ready queue before the first receipt", () => {
+    mockReviewing.mockReturnValue(undefined);
+    mockReviewLoading.mockReturnValue(true);
+    mockReviewCoverage.mockReturnValue(null);
+    renderApp();
+    expect(screen.getByRole("status").textContent).toContain("Checking which pull requests are ready");
+    expect(screen.queryByText("Nothing ready to review.")).toBeNull();
+  });
+
+  it("defers to the load failure when no receipt exists", () => {
+    mockReviewing.mockReturnValue(undefined);
+    mockReviewError.mockReturnValue(new Error("no receipt"));
+    mockReviewCoverage.mockReturnValue(null);
+    renderApp();
+    expect(screen.getByText("no receipt")).toBeTruthy();
+    expect(screen.queryByText(/Nothing ready|No ready pull requests|Checking which/)).toBeNull();
+  });
+
+  it.each([
+    ["complete", "Nothing ready to review."],
+    [{ partial: { total: null } }, "No ready pull requests in the partial results."],
+    ["unknown", "completeness is unknown"],
+  ] as const)("qualifies an empty %j receipt", (coverage, copy) => {
+    mockReviewCoverage.mockReturnValue(coverage);
+    renderApp();
+    expect(screen.getByText(new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))).toBeTruthy();
+  });
+
+  it.each(["held refresh", "refresh error"])("keeps accepted Ready rows during %s", (state) => {
+    mockReviewing.mockReturnValue([{ ...PR_FIXTURES[0], title: "Accepted Ready row", is_draft: false, ci: "success", merge: "mergeable", review: "none", in_merge_queue: false }]);
+    if (state === "held refresh") mockReviewLoading.mockReturnValue(true);
+    else mockReviewError.mockReturnValue(new Error("newer refresh failed"));
+    renderApp();
+    expect(screen.getAllByText("Accepted Ready row").length).toBeGreaterThan(0);
   });
 });
 

@@ -3,6 +3,7 @@ import { observationStatus } from "@/lib/rowObservation";
 import { prKey } from "@/lib/prIdentity";
 import { CircleCheck, GitCommitHorizontal, MessageCircleWarning } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
+import type { SourceCoverage } from "@/api/sourceRefresh";
 import { type Filters, readyForReview, sortReadyForReview } from "@/lib/derive";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { Button } from "@/components/ui/button";
@@ -58,7 +59,7 @@ const AGE_TICK_MS = 60_000;
 ///
 /// Unknown renders as a neutral "age unknown" -- never green, never a
 /// number. Absent is not zero.
-function ReadyAgeChip({ readyAt, now }: { readyAt: PullRequest["ready_at"]; now: Date }) {
+function ReadyAgeChip({ readyAt, now, retained = false }: { readyAt: PullRequest["ready_at"]; now: Date; retained?: boolean }) {
   const age = readyAge(readyAt, now);
   const chip = `shrink-0 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-xs tabular-nums ${READY_TONE_CLASS[age.tone]}`;
   if (age.since === null) {
@@ -77,12 +78,12 @@ function ReadyAgeChip({ readyAt, now }: { readyAt: PullRequest["ready_at"]; now:
       <time
         data-ready-age={age.tone}
         dateTime={readyAt ?? undefined}
-        title={`Ready for review since ${since}`}
+        title={`${retained ? "Last known ready for review since" : "Ready for review since"} ${since}`}
         className={chip}
       >
         {age.text}
       </time>
-      <span className="sr-only">, ready for review since {since}</span>
+      <span className="sr-only">, {retained ? "last known " : ""}ready for review since {since}</span>
     </>
   );
 }
@@ -345,9 +346,11 @@ function MyPushesBar({
 /// because this strip only renders on To Review.
 export function ReadyStrip({
   prs,
+  availability = { status: "available", coverage: "complete" },
   onOpen,
 }: {
   prs: PullRequest[];
+  availability?: { status: "pending" | "failed" | "available"; coverage: SourceCoverage | null };
   /// Open a pull request's detail view. Optional so a caller with
   /// nowhere to send the user does not get a row that LOOKS clickable
   /// and is not -- the entry falls back to a plain link.
@@ -404,7 +407,15 @@ export function ReadyStrip({
   }));
 
   if (all.length === 0) {
-    return <p className="px-4 py-2 text-xs text-[#8b949e]">Nothing ready to review.</p>;
+    if (availability.status === "failed" && prs.length === 0) return null;
+    const text = availability.status === "pending"
+      ? "Checking which pull requests are ready…"
+      : availability.coverage === "complete"
+        ? "Nothing ready to review."
+        : typeof availability.coverage === "object" && availability.coverage?.partial
+          ? "No ready pull requests in the partial results."
+          : "No ready pull requests in the available results; completeness is unknown.";
+    return <p role="status" className="px-4 py-2 text-xs text-[#8b949e]">{text}</p>;
   }
 
   return (
@@ -495,7 +506,7 @@ export function ReadyStrip({
                   <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
                   <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
                   <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
-                  <ReadyAgeChip readyAt={pr.ready_at} now={now} />
+                  <ReadyAgeChip readyAt={pr.ready_at} now={now} retained={pr.observation?.ready_at_state === "retained"} />
                 </span>
               </div>
             ) : (
@@ -512,7 +523,7 @@ export function ReadyStrip({
                 <ReadyStackChip stack={stacks.displayOf(pr)?.value} retained={stacks.displayOf(pr)?.freshness === "retained"} observedAt={stacks.displayOf(pr)?.observedAt} />
                 <PushedByYouChip pusher={pushers.displayOf(pr)?.value ?? pushers.of(pr)} retained={pushers.displayOf(pr)?.freshness === "retained"} observedAt={pushers.displayOf(pr)?.observedAt} />
                 <UnresolvedChip count={pr.unresolved_threads} floor={pr.unresolved_threads_floor} />
-                <ReadyAgeChip readyAt={pr.ready_at} now={now} />
+                <ReadyAgeChip readyAt={pr.ready_at} now={now} retained={pr.observation?.ready_at_state === "retained"} />
               </div>
             )}
           </li>

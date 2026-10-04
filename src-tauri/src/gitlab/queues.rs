@@ -717,6 +717,7 @@ mod tests {
         raw["sha"] = json!("head-a");
         let mut old = map_row(&raw, &source).unwrap();
         old.observation = Some(gitlab_observation(&old));
+        assert_eq!(old.observation.as_ref().unwrap().ready_at_state, None);
         old.needs_my_review = Some(false);
         old.observation.as_mut().unwrap().confirmed_review = Some(ConfirmedReview {
             head_oid: "head-a".into(),

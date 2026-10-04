@@ -190,6 +190,18 @@ describe("ReadyStrip ordering", () => {
     expect(s.filtersByView["to-review"].readySort).toBeUndefined();
   });
 
+  it("keeps a retained qualified date in order and labels it last known", () => {
+    const older = at(1, "2026-09-01T00:00:00Z");
+    older.observation = {
+      state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [],
+      detail_fields: ["base"], ready_at_state: "retained",
+    };
+    render(<ReadyStrip prs={[at(2, "2026-09-02T00:00:00Z"), older]} onOpen={vi.fn()} />);
+    expect(titlesInOrder()).toEqual(["PR 1", "PR 2"]);
+    expect(screen.getByText("Last known")).toBeTruthy();
+    expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
+  });
+
   // A default nobody can see is one nobody can trust, and this list
   // having a non-obvious default is the point of the issue.
   it("names the field it sorts on, not just the direction", () => {

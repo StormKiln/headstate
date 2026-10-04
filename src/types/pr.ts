@@ -24,6 +24,8 @@ export interface RowObservation {
   retained_fields: ReadinessField[];
   /// Positively observed detail groups; absent on older payloads means unknown.
   detail_fields?: ("base" | "comments" | "threads" | "reviewers" | "reviews")[];
+  /// Qualification for `ready_at`; absent on older payloads means unknown.
+  ready_at_state?: "observed" | "retained";
   confirmed_review?: { head_oid: string; review: ReviewState; confirmed_at: string; receipt?: import("../api/tauri").SubmittedReview; unresolved?: boolean; confirmed_by_read?: boolean } | null;
 }
 
