@@ -20,8 +20,8 @@ Implemented #1667/#1672 without changing readiness enum meaning, action prefligh
 
 - `VITE_TARGET=desktop yarn vitest run src/App.test.tsx src/components/ReadyStrip.test.tsx src/lib/derive.test.ts --reporter=dot`: 179 passed, 0 failed.
 - Focused availability rerun: 7 passed, 31 filtered.
-- `cargo test ... --lib inventory::`: 11 passed, 0 failed (before the final focused mutation/green; final new regression separately passed 1/1).
-- `cargo test ... --lib github::map::tests::`: 62 passed, 0 failed.
+- Inventory Rust family (exact command below): 11 passed, 0 failed (before the final focused mutation/green; final new regression separately passed 1/1).
+- GitHub mapping Rust family (exact command below): 62 passed, 0 failed.
 - GitLab parity and old-cache defaults: 1/1 each passed.
 - `make check-wire-contract`: 12 Node contract tests passed and generated schema fresh.
 - `yarn tsc --noEmit`: passed.
@@ -38,3 +38,47 @@ One attempted Cargo command supplied two test filters and was rejected by Cargo'
 `RowObservation.ready_at_state?: "observed" | "retained"` is additive and omitted when unknown. Task 4's source fingerprint remains unchanged and ignores it.
 
 A draft-to-ready-to-draft cycle entirely hidden between polls cannot be proven. Same head alone does not certify lifecycle continuity; the retained date is visibly last-known until a positive timeline event supersedes it. Browser/native-provider integration belongs to Task 7/controller evidence.
+
+## Fix round 1: traceability and integrated chronology
+
+The original Task 5 runs were returned only in the tool transcript; no standalone log files were created at that time. Their raw output therefore cannot truthfully be linked as files. The exact commands recovered from that transcript are:
+
+```text
+VITE_TARGET=desktop yarn vitest run src/App.test.tsx src/components/ReadyStrip.test.tsx src/lib/derive.test.ts --reporter=dot
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib inventory:: --no-fail-fast
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib github::map::tests:: --no-fail-fast
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib gitlab::queues::tests::unread_mr_head_preserves_confirmed_review_until_a_real_change
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib store::cache::tests::missing_fields_default_to_the_safe_value
+make check-wire-contract
+yarn tsc --noEmit
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-mobile/target make test-mobile
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target make lint
+cargo fmt --manifest-path src-tauri/Cargo.toml
+git diff --check
+```
+
+The two Rust one-test filters were initially passed together once; Cargo rejected the second positional filter. They were then run separately with the exact commands above and both passed 1/1.
+
+Fix round 1 adds `src-tauri/tests/fixtures/ready-date-reconcile.json`. The Rust regression builds two rows through the actual GitHub mapper, classifies a `timelineItems` GraphQL error, reconciles the same positive identity/head/base/non-draft facts, serializes the retained and recovered rows, and verifies the fixture. The frontend imports that same fixture, validates both snapshots through the actual `reviewing-updated` wire validator, sorts them through `sortReadyForReview`, and renders `ReadyStrip`. It proves `[older, newer]` plus visible `Last known` while refused, then `[newer, older]` with no retained label after a newer positive event.
+
+Preserved fix-round evidence:
+
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/integrated-retention-mutation-red.log`: disabling production ready-date retention made the integrated Rust fixture test fail 0/1 because the older row serialized with `ready_at: null` and no retained qualifier.
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/integrated-rust-green.log`: exact Rust command above passed 1/1 after restoration.
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/integrated-frontend-green.log`: `VITE_TARGET=desktop yarn vitest run src/components/ReadyStrip.test.tsx -t 'provider-reconciled wire fixture' --reporter=dot` passed 1/1 (64 filtered).
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/mobile-frontend.log`: `make mobile-frontend` transformed 3,336 modules and completed the production mobile build in 1.37 seconds; Vite emitted its existing chunk-size advisory.
+
+Final restored-code verification used these exact commands:
+
+```text
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/private/tmp/headstate-pr1596-review/src-tauri/target cargo test --manifest-path src-tauri/Cargo.toml --lib inventory:: --no-fail-fast
+VITE_TARGET=desktop yarn vitest run src/components/ReadyStrip.test.tsx --reporter=dot
+yarn tsc --noEmit
+git diff --check
+```
+
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/inventory-final-green.log`: 12 passed, 0 failed, including the integrated fixture.
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/ready-strip-final-green.log`: 65 passed, 0 failed; existing React `act(...)` warnings remain.
+- `.superpowers/sdd/2026-10-03-release-8.2.3/task-5-logs/fix-round-tsc.log`: zero output and exit 0.
+- Formatting and `git diff --check` both exited 0; these zero-output checks were retained in the final tool transcript rather than represented by invented log content.

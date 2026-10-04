@@ -350,6 +350,8 @@ export function ReadyStrip({
   onOpen,
 }: {
   prs: PullRequest[];
+  /// Accepted source evidence. Every production caller must pass this;
+  /// the default exists only for older isolated component callers.
   availability?: { status: "pending" | "failed" | "available"; coverage: SourceCoverage | null };
   /// Open a pull request's detail view. Optional so a caller with
   /// nowhere to send the user does not get a row that LOOKS clickable

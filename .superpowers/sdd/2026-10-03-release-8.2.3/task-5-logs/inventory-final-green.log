@@ -1,0 +1,20 @@
+   Compiling headstate v0.1.0 (/private/tmp/headstate-8-release-gate/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.42s
+     Running unittests src/lib.rs (/private/tmp/headstate-pr1596-review/src-tauri/target/debug/deps/headstate_lib-9360daad13a286fc)
+
+running 12 tests
+test inventory::tests::readiness_errors_are_field_specific_and_no_checks_remains_valid ... ok
+test inventory::tests::identity_merge_keeps_unseen_repository_and_updates_only_matching_row ... ok
+test inventory::tests::verified_removal_cannot_return_through_partial_omission ... ok
+test inventory::tests::same_head_reuses_known_fields_but_new_head_never_does ... ok
+test inventory::tests::ready_date_retains_only_across_positive_compatible_facts ... ok
+test inventory::tests::converged_own_review_survives_partial_omission_without_claiming_aggregate_approval ... ok
+test inventory::tests::ready_date_provider_reconcile_fixture_matches_frontend_contract ... ok
+test inventory::tests::partial_omission_retains_qualified_rows_but_complete_removes_them ... ok
+test inventory::tests::review_receipt_authority_survives_restart_lag_and_expires_to_qualification ... ok
+test inventory::tests::confirmed_review_survives_omission_restart_and_lag_but_not_new_head ... ok
+test inventory::tests::detail_fields_require_positive_non_refused_values_and_old_payloads_are_unknown ... ok
+test inventory::tests::unread_head_keeps_effect_until_positive_head_evidence ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 3243 filtered out; finished in 0.01s
+

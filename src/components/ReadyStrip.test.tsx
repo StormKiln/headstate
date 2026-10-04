@@ -33,9 +33,11 @@ import { ReadyObservationStatus, ReadyStrip } from "./ReadyStrip";
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { remoteEventError } from "@/api/wireContract";
 import headTransitions from "../../src-tauri/tests/fixtures/inventory-head-transitions.json";
+import readyDateReconcile from "../../src-tauri/tests/fixtures/ready-date-reconcile.json";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
 import type { PullRequest, RowPusher } from "@/types/pr";
+import { sortReadyForReview } from "@/lib/derive";
 
 /// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
 let pusherAnswers: RowPusher[] = [];
@@ -200,6 +202,25 @@ describe("ReadyStrip ordering", () => {
     expect(titlesInOrder()).toEqual(["PR 1", "PR 2"]);
     expect(screen.getByText("Last known")).toBeTruthy();
     expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
+  });
+
+  it("keeps the provider-reconciled wire fixture ordered until positive evidence supersedes it", () => {
+    const retained = readyDateReconcile.retained as PullRequest[];
+    const recovered = readyDateReconcile.recovered as PullRequest[];
+    expect(remoteEventError("reviewing-updated", retained)).toBeNull();
+    expect(remoteEventError("reviewing-updated", recovered)).toBeNull();
+    expect(sortReadyForReview(retained, "oldest-opened").map(pr => pr.number)).toEqual([1, 2]);
+    expect(sortReadyForReview(recovered, "oldest-opened").map(pr => pr.number)).toEqual([2, 1]);
+
+    const view = render(<ReadyStrip prs={retained} onOpen={vi.fn()} />);
+    const fixtureTitles = () => Array.from(document.querySelectorAll("[data-ready-title]")).map(el =>
+      el.textContent?.includes("Older ready") ? "older" : "newer",
+    );
+    expect(fixtureTitles()).toEqual(["older", "newer"]);
+    expect(screen.getByText("Last known")).toBeTruthy();
+    view.rerender(<ReadyStrip prs={recovered} onOpen={vi.fn()} />);
+    expect(fixtureTitles()).toEqual(["newer", "older"]);
+    expect(screen.queryByText("Last known")).toBeNull();
   });
 
   // A default nobody can see is one nobody can trust, and this list

@@ -967,6 +967,65 @@ mod tests {
         );
     }
     #[test]
+    fn ready_date_provider_reconcile_fixture_matches_frontend_contract() {
+        let now = "2026-10-03T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+        let template = response["authored"]["nodes"][0].clone();
+        let node = |number: u64, title: &str, ready_at: &str| {
+            let mut node = template.clone();
+            node["number"] = number.into();
+            node["id"] = format!("PR-{number}").into();
+            node["title"] = title.into();
+            node["headRefOid"] = format!("head-{number}").into();
+            node["baseRefName"] = "main".into();
+            node["isDraft"] = false.into();
+            node["mergeable"] = "MERGEABLE".into();
+            node["reviewDecision"] = "REVIEW_REQUIRED".into();
+            node["isInMergeQueue"] = false.into();
+            node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
+                serde_json::json!({"state": "SUCCESS"});
+            node["timelineItems"] = serde_json::json!({"nodes": [{"createdAt": ready_at}]});
+            node
+        };
+        response["authored"]["nodes"] = serde_json::json!([
+            node(1, "Older ready", "2026-09-01T00:00:00Z"),
+            node(2, "Newer ready", "2026-09-02T00:00:00Z")
+        ]);
+        let initial = crate::github::map::map_list(&response, "authored");
+
+        let mut refused = response.clone();
+        refused["authored"]["nodes"][0]["timelineItems"] = serde_json::Value::Null;
+        mark_readiness_errors(
+            &mut refused,
+            &[serde_json::json!({"path": ["authored", "nodes", 0, "timelineItems"]})],
+        );
+        let retained = reconcile(
+            initial,
+            crate::github::map::map_list(&refused, "authored"),
+            true,
+            now,
+        );
+
+        let mut recovered = response;
+        recovered["authored"]["nodes"][0]["timelineItems"] =
+            serde_json::json!({"nodes": [{"createdAt": "2026-09-03T00:00:00Z"}]});
+        let recovered = reconcile(
+            retained.clone(),
+            crate::github::map::map_list(&recovered, "authored"),
+            true,
+            now,
+        );
+        let actual = serde_json::json!({"retained": retained, "recovered": recovered});
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ready-date-reconcile.json"))
+                .unwrap();
+        assert_eq!(
+            actual, expected,
+            "fixture must be regenerated from this provider path"
+        );
+    }
+    #[test]
     fn confirmed_review_survives_omission_restart_and_lag_but_not_new_head() {
         let mut old = rows().remove(0);
         old.head_oid = "head-a".into();
