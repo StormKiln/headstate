@@ -69,8 +69,8 @@ function ownedCase() {
 }
 const ownedCases: ReturnType<typeof ownedCase>[] = [];
 
-async function emit(listeners: typeof boundary.listeners, stage: keyof typeof publications.frames) {
-  const payload = publications.frames[stage];
+async function emit(listeners: typeof boundary.listeners, stage: keyof typeof publications.frames, revision?: number) {
+  const payload = { ...publications.frames[stage], ...(revision === undefined ? {} : { revision, receipt_revision: revision }) };
   expect(remoteEventError("source-poll-status", payload)).toBeNull();
   await act(async () => { for (const callback of listeners.get("source-poll-status") ?? []) callback({ payload }); });
 }
@@ -84,12 +84,15 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   const listeners: typeof boundary.listeners = new Map();
   boundary.listeners = listeners;
   const clients: QueryClient[] = [];
-  const publish = (stage: keyof typeof publications.frames) => scope.step(() => emit(listeners, stage));
+  const publish = (stage: keyof typeof publications.frames, revision?: number) => scope.step(() => emit(listeners, stage, revision));
   let failedDetail = false;
   let firstDetail = true;
   let releaseDetail!: (value: PrDetail) => void;
   const pendingDetail = new Promise<PrDetail>(resolve => { releaseDetail = resolve; });
   let detailCalls = 0;
+  let holdChangedDetail = false;
+  let releaseChangedDetail!: (value: PrDetail) => void;
+  const changedDetail = new Promise<PrDetail>(resolve => { releaseChangedDetail = resolve; });
   let finishRefresh: (value: unknown) => void = () => { throw new Error("refresh not started"); };
   let refreshRequest: unknown;
   let refreshSettled = false;
@@ -106,6 +109,7 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
       detailCalls++;
       if (firstDetail) { firstDetail = false; return pendingDetail; }
       if (failedDetail) throw new Error("Synthetic read outage");
+      if (holdChangedDetail) return changedDetail;
       return detail(head);
     }
     if (name === "review_pr_at_head") return { outcome: "acknowledged", receipt: { review_id: "REVIEW_1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "head-1", submitted_at: "2026-10-01T12:00:00Z", pr_id: "PR_1", repo: "octocat/repo-1", number: 1 } };
@@ -185,8 +189,27 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   await scope.step(() => act(async () => { await clients[0].refetchQueries({ queryKey: ["pr-detail", "octocat/repo-1", 1] }); }));
   expect(selectedDetail.getAllByRole("button", { name: "Approved" }).length).toBeGreaterThan(0);
   head = "head-1-new";
+  holdChangedDetail = true;
+  const beforeChangedHead = detailCalls;
   await publish("changed_head");
-  await scope.step(() => act(async () => { await clients[0].refetchQueries({ queryKey: ["pr-detail", "octocat/repo-1", 1] }); }));
+  // The accepted provider receipt itself must start this read. A manual
+  // refetch here would conceal a disconnected source-to-detail callback.
+  await scope.step(() => waitFor(() => expect(detailCalls).toBe(beforeChangedHead + 1)));
+  expect(clients[0].getQueryState(detailKey)).toMatchObject({ fetchStatus: "fetching", data: { head_oid: "head-1" } });
+  expect(selectedDetail.getByText("Retained integrated description")).toBeTruthy();
+  expect(disclosures.map(node => node.open)).toEqual([true, false]);
+  const changedCompletion = clients[0].getQueryCache().find({ queryKey: detailKey, exact: true })!.promise!;
+  // New receipts with unchanged provider facts are accepted but cause no work.
+  await publish("changed_head", 27);
+  expect(detailCalls).toBe(beforeChangedHead + 1);
+  await scope.step(() => act(async () => {
+    releaseChangedDetail(detail(head));
+    await changedCompletion;
+  }));
+  expect(clients[0].getQueryState(detailKey)).toMatchObject({ status: "success", fetchStatus: "idle", data: { head_oid: "head-1-new" } });
+  await scope.step(() => waitFor(() => expect(disclosures[0].textContent).toContain("head-1-new open content")));
+  await publish("changed_head", 28);
+  expect(detailCalls).toBe(beforeChangedHead + 1);
   count(275);
   const after = [...detailRoot.querySelectorAll("details")];
   expect(after[0]).toBe(disclosures[0]); expect(after[1]).toBe(disclosures[1]);
@@ -204,6 +227,7 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   expect(remoteEventError("source-poll-status", foreign)).toBeNull();
   await scope.step(() => act(async () => { for (const callback of listeners.get("source-poll-status") ?? []) callback({ payload: foreign }); }));
   count(275);
+  expect(detailCalls).toBe(beforeChangedHead + 1);
   const advisory = boundary.invoke.mock.calls.filter(([name]) => name === "get_ready_stacks" || name === "get_ready_pushers");
   expect(advisory.length).toBeGreaterThan(0);
   expect(advisory.every(([, args]) => (args?.rows as object[]).length <= 8)).toBe(true);
