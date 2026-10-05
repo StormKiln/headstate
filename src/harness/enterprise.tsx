@@ -20,7 +20,10 @@ if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())bou
 let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
 const probe={inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
- return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:query.meta?.advisorySchedule,
+ const schedule=query.meta?.advisorySchedule as {claims?:Map<string,boolean>;lastAdmittedAt?:number;hasContinuation?:boolean;resumeBoostSpent?:boolean}|undefined;
+ const freshness=(field:string)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
+ return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:schedule?{lastAdmittedAt:schedule.lastAdmittedAt,hasContinuation:schedule.hasContinuation,resumeBoostSpent:schedule.resumeBoostSpent,preferred:[...(schedule.claims?.values()??[])].some(Boolean)}:undefined,
+  evidence:{pusher:freshness('pusher'),rules:freshness('rules'),stack:freshness('lastKnown')},
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
   ...(query.queryKey[0]==='stats-board'?{days:query.queryKey[3],total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
@@ -37,11 +40,14 @@ export function Workload(){
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;
   if(authored.data?.length===50&&reviewing.data?.length===150&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
  },[authored.data,reviewing.data]);
- const [selected,select]=useState<PullRequest|null>(null);const [view,setView]=useState('reviewing');
+ const completionProbe=new URL(location.href).searchParams.get('scenario')==='ready-completion';
+ const first=new URL(location.href).searchParams.get('role')==='paired'?76:51;
+ const readyRows=completionProbe?(reviewing.data??[]).filter(row=>row.number>=first&&row.number<first+16):(reviewing.data??[]);
+ const [selected,select]=useState<PullRequest|null>(null);const [view,setView]=useState(completionProbe?'idle':'reviewing');
  return <main className="min-h-screen bg-[#0d1117] p-5 text-[#c9d1d9]">
   <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button><button onClick={()=>setView('stats')}>Statistics</button></nav>
   <output data-testid="counts">Authored {authored.data?.length??'unknown'} / Reviewing {reviewing.data?.length??'unknown'}</output>
-  {view==='stats'?<StatsPage/>:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={reviewing.data??[]} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
+  {view==='idle'?null:view==='stats'?<StatsPage/>:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
  </main>;
 }
 function ReadyProgressRows({rows}:{rows:PullRequest[]}) {

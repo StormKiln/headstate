@@ -182,6 +182,8 @@ impl AdvisoryShares {
         new_cycle: bool,
     ) -> Result<(), ClientError> {
         let principal = context.principal();
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::metrics::record(principal, "demand", "advisory-share", 0);
         if new_cycle {
             self.participants
                 .retain(|p| now.duration_since(p.demanded_at) < ADVISORY_INTEREST);
@@ -203,12 +205,21 @@ impl AdvisoryShares {
         // Even a refused newcomer can be the first request at a boundary.
         // Allocate existing participants before returning the capacity error.
         if new_cycle || !self.initialized {
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::metrics::record(0, "reset", "advisory-cycle", 0);
             let count = self.participants.len();
             let base = 8 / count;
             let remainder = 8 % count;
             for (index, participant) in self.participants.iter_mut().enumerate() {
                 participant.allocated = (base + usize::from(index < remainder)) as u8;
                 participant.spent = 0;
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::metrics::record(
+                    participant.context.principal(),
+                    "allocated",
+                    "advisory-share",
+                    u64::from(participant.allocated),
+                );
             }
             self.participants.rotate_left(remainder);
             self.initialized = true;
@@ -229,6 +240,8 @@ impl AdvisoryShares {
             .find(|p| p.context.principal() == principal)
             .expect("share checked before atomic debit")
             .spent += 1;
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::metrics::record(principal, "debit", "advisory-share", 1);
     }
 }
 

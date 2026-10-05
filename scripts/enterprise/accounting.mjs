@@ -7,7 +7,7 @@ export function reconcile(events, provider, {interrupted=false}={}) {
  for(const e of events){
   assert.ok(!seq.has(e.seq),'unique recorder sequence');seq.add(e.seq);
   counts[`${e.operation}:${e.stage}`]=(counts[`${e.operation}:${e.stage}`]??0)+1;
-  if(e.id){const rows=byId.get(e.id)??[];rows.push(e);byId.set(e.id,rows);}
+  if(e.id&&e.operation!=='advisory-share'){const rows=byId.get(e.id)??[];rows.push(e);byId.set(e.id,rows);}
   if(e.operation==='admitted'){
    if(e.stage==='begin'){admitted.set(e.id,e.code);if(e.code===3)writes++;else{reads++;if(e.code>0)background++;}}
    if(e.stage==='released'){const code=admitted.get(e.id);assert.notEqual(code,undefined);admitted.delete(e.id);if(code===3)writes--;else{reads--;if(code>0)background--;}}
