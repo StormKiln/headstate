@@ -314,7 +314,7 @@ async fn integrated_inventory_publications_retain_large_owned_progress_through_o
             .as_ref()
             .unwrap()
             .state
-            == crate::inventory::ObservationState::Retained
+            == crate::inventory::ObservationState::Observed
     );
     *mode.lock().unwrap() = "throttle";
     let error = client

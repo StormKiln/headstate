@@ -134,7 +134,7 @@ it.each([1200, 390])("stitches publication payloads into independent Ready/detai
   expect(refreshSettled).toBe(false);
   await publish("partial");
   expect(screen.queryByText("Synthetic review 276")).toBeNull();
-  expect(screen.getAllByText("Membership unconfirmed").some(status => status.getAttribute("title")?.startsWith("List membership is last known"))).toBe(true);
+  expect(screen.queryByText("Membership unconfirmed")).toBeNull(); // The failed finite step did not recheck every other row.
   const desktop = within(screen.getByTestId("desktop"));
   fireEvent.click(desktop.getByText("Synthetic review 1"));
   const detailRoot = screen.getByTestId("desktop-detail");
