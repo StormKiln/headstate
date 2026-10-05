@@ -9,7 +9,7 @@ import type { PrDetail, PullRequest } from "../types/pr";
 const boundary = vi.hoisted(() => ({ invoke: vi.fn(), detail: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: boundary.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, cb: (event: { payload: unknown }) => void) => { boundary.listeners.set(name, cb); return () => boundary.listeners.delete(name); } }));
-import { detailNeedsRevalidation } from "./detailRevalidation";
+import { acceptDetailFacts, detailNeedsRevalidation } from "./detailRevalidation";
 import { usePrDetail, useReviewPr, useActOnPr } from "./hooks";
 import { useSourceRefresh, refreshWithState, readRetained, retireSourceOwnership } from "./sourceRefreshHooks";
 const row: PullRequest = { ...PR_FIXTURES[0], repo: "synthetic/project", number: 1, head_oid: "h1", base_ref: "main", merge_status: "clean", review: "none", ci: "success", latest_reviews: [], comment_count: 0, unresolved_threads: 0,
@@ -506,6 +506,62 @@ it.each(targetedPublications.terminal_details.map(detail => [detail.state, detai
   await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
   expect(boundary.detail).toHaveBeenCalledTimes(1);
   expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(targetedPublications.terminal_details.map(detail => [detail.state, detail] as const))("consumes native removal delivered after the %s detail reply without another read", async (_state, nativeDetail) => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...nativeDetail, repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid } as PrDetail;
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(qc.getQueryData<PrDetail>(key)?.state).toBe(actual.state);
+  await inventory([]);
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(["positive-membership", "different-node", "different-head", "manual-cache", "new-session"])("does not suppress absence read after %s", async mode => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...targetedPublications.terminal_details[0], repo: row.repo, number: row.number, id: mode === "different-node" ? "OTHER_NODE" : row.id, head_oid: mode === "different-head" ? "other-head" : row.head_oid } as PrDetail;
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  if (mode === "manual-cache") qc.setQueryData(key, actual);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  if (mode === "positive-membership") await inventory([row]);
+  const source = mode === "new-session" ? { session: "new-session" } : {};
+  if (mode === "new-session") await inventory([row], "complete", source);
+  const before = boundary.detail.mock.calls.length;
+  await inventory([], "complete", source);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(boundary.detail).toHaveBeenCalledTimes(before + 1);
+});
+
+it("retires the successful terminal witness with its old account query", async () => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...targetedPublications.terminal_details[0], repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid } as PrDetail;
+  await inventory([row]); qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  const mounted = renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  await inventory([row], "complete", { owner: "other-viewer" });
+  expect(qc.getQueryData(key)).toBeUndefined();
+  mounted.unmount();
+  qc.setQueryData(["viewer"], "other-viewer");
+  qc.setQueryData(key, actual); // Display-only cache is not a successful read witness.
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => acceptDetailFacts(qc, { rows: [row], coverage: "complete", list: "reviewing", session: "new-owner-session" }));
+  const before = boundary.detail.mock.calls.length;
+  await act(async () => acceptDetailFacts(qc, { rows: [], coverage: "complete", list: "reviewing", session: "new-owner-session" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(boundary.detail).toHaveBeenCalledTimes(before + 1);
 });
 
 it.each([{ in_merge_queue: true }, { is_draft: true }, { review: "approved" as const }])("consumes its own fresh scalar publication before detail returns: %j", async patch => {

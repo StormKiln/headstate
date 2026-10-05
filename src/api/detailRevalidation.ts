@@ -7,10 +7,13 @@ import { reviewAccountGeneration } from "./reviewOperations";
 type Facts = Record<string, string>;
 interface Target { revision: number; facts: Facts; probe?: boolean; scalarReadback?: { id: string; head: string } }
 interface State { facts: Facts; observed: Facts; initial: boolean; revision: number; required?: Target; reading?: number; account: number; session: number }
-type Member = Pick<PullRequest, "repo" | "number">;
+type Member = Pick<PullRequest, "repo" | "number" | "id" | "head_oid">;
 interface Source { listeners: Set<() => void>; session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
 const memberKey = (row: Member) => JSON.stringify([row.repo.toLowerCase(), row.number]);
 const states = new WeakMap<Query, State>();
+// A successful terminal read can arrive before its native removal event.
+// Positive membership received later retires this witness, even if unchanged.
+const terminalReads = new WeakMap<Query, { id: string; head: string; account: number; session: number }>();
 const sources = new WeakMap<QueryClient, Source>();
 export const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
 export const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
@@ -57,9 +60,13 @@ function source(qc: QueryClient): Source {
   qc.getQueryCache().subscribe(event => {
     if (event.type !== "updated" || event.action.type !== "success" || event.action.manual) return;
     const query = event.query;
+    if (query.queryKey[0] !== "pr-detail" || query.queryKey.length !== 3) return;
+    const data = query.state.data as PrDetail | undefined;
+    if (data?.state === "closed" || data?.state === "merged") {
+      terminalReads.set(query, { id: data.id, head: data.head_oid, account: reviewAccountGeneration(qc), session: value.generation });
+    } else terminalReads.delete(query);
     const state = current(qc, query);
     if (!state) return;
-    const data = query.state.data as PrDetail | undefined;
     // Only scalars with identical source/detail semantics can prove readback.
     // Counts, capped lists and CI aggregates are source-to-source signals; a
     // full post-target read acknowledges them without comparing unlike data.
@@ -111,11 +118,12 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
   const account = reviewAccountGeneration(qc);
   if (src.account !== account) { src.membership = {}; src.account = account; }
   const previous = src.membership[list] ?? new Map<string, Member>();
-  const observed = new Map(rows.filter(row => row.observation?.state !== "retained").map(row => [memberKey(row), { repo: row.repo, number: row.number }]));
+  const observed = new Map(rows.filter(row => row.observation?.state !== "retained").map(row => [memberKey(row), { repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid }]));
   const present = new Set(rows.map(memberKey));
   const missing = coverage === "complete" ? [...previous].filter(([id]) => !present.has(id)).map(([, row]) => row) : [];
   src.membership[list] = coverage === "complete" ? new Map([...previous].filter(([id]) => present.has(id)).concat([...observed])) : new Map([...previous, ...observed]);
   for (const row of rows) for (const query of detailAliases(qc, row.repo, row.number)) {
+    if (row.observation?.state !== "retained") terminalReads.delete(query);
     let state = current(qc, query);
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: query.state.data === undefined, revision: 0, account: reviewAccountGeneration(qc), session: src.generation };
@@ -142,6 +150,9 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
   }
   for (const row of missing) for (const query of detailAliases(qc, row.repo, row.number)) {
     let state = current(qc, query);
+    const terminal = terminalReads.get(query);
+    if (!state?.required && terminal?.account === account && terminal.session === src.generation
+      && terminal.id === row.id && terminal.head === row.head_oid) continue;
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: false, revision: 0, account, session: src.generation };
       states.set(query, state);
