@@ -84,6 +84,7 @@ fn supported(command: &str) -> bool {
     matches!(
         command,
         "get_auth_state"
+            | "act_on_pr"
             | "diag_log"
             | "get_reviewing"
             | "get_viewer"

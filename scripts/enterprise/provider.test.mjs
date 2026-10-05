@@ -19,3 +19,43 @@ test('synthetic advisory ledger attributes actual production-shaped downward/upw
   {stage:'pusher-activity',subjects:[{repo:'synthetic-lab/repo-1',number:51}]},
  ]);
 }));
+
+test('opt-in convergence fixture declares independent 236 reviewing and 130 Ready identities',()=>{
+ const data=fixture({convergence:true});
+ const reviewing=searchRows(data.rows,'is:pr is:open review-requested:@me');
+ assert.deepEqual(reviewing.map(row=>row.number),Array.from({length:236},(_,i)=>51+i));
+ assert.deepEqual(reviewing.filter(row=>!row.isDraft).map(row=>row.number),Array.from({length:130},(_,i)=>51+i));
+ assert.equal(searchRows(data.rows,'is:pr is:open author:@me').length,50);
+ assert.ok(new Set(reviewing.map(row=>row.repository.nameWithOwner)).size>=50);
+ assert.ok(data.members.length>=50);
+ assert.equal(fixture().rows.filter(row=>row.state==='OPEN').length,200,'ordinary fixture remains unchanged');
+});
+
+test('targeted held search materializes stale values while detail and mutations continue',async()=>{
+ const p=await startProvider({convergence:true});
+ const query=async q=>(await (await fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})})).json()).data;
+ try{
+  p.fault.holdSearch={list:'reviewing',after:null,remaining:1};
+  const held=query('{search(query:"is:pr is:open review-requested:@me",first:25){nodes{id isDraft}}}');
+  for(let i=0;i<100&&!p.heldCount;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(p.heldCount,1);
+  const mutation=await query('mutation {convertPullRequestToDraft(input:{pullRequestId:"PR_51"}){pullRequest{id isDraft updatedAt}}}');
+  assert.equal(mutation.convertPullRequestToDraft.pullRequest.isDraft,true);
+  const fresh=await query('{node(id:"PR_51"){id isDraft}}');assert.equal(fresh.node.isDraft,true);
+  p.release();
+  assert.equal((await held).search.nodes.find(row=>row.id==='PR_51').isDraft,false,'held reply must preserve pre-mutation provider facts');
+ }finally{p.release();await p.close();}
+});
+
+test('one-shot failed continuation leaves head and detail queries available',async()=>{
+ const p=await startProvider({convergence:true});
+ const query=q=>fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})});
+ try{
+  p.fault.failSearch={list:'reviewing',after:'cursor-50',remaining:1};
+  const q='{search(query:"is:pr is:open review-requested:@me",first:25,after:"cursor-50"){nodes{id}}}';
+  assert.equal((await query('{node(id:"PR_51"){id}}')).status,200);
+  assert.equal((await query(q)).status,503);
+  assert.equal((await query(q)).status,200);
+  assert.equal(p.ledger.filter(e=>e.targetedFailure).length,1);
+ }finally{p.release();await p.close();}
+});

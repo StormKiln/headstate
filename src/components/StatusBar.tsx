@@ -25,6 +25,7 @@ import type { GitHubAuthAvailability } from "@/api/authAvailability";
 import type { SourceSelection } from "../store/sourceSelection";
 import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
 import { githubQueueSummary, type GitHubQueueStatus } from "../lib/githubQueueSummary";
+import { GitHubQueueFreshness } from "./GitHubQueueFreshness";
 import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
 
 const CHOICES = [60, 120, 300, 900];
@@ -59,8 +60,7 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   selection?: SourceSelection; gitlab?: GitLabQueueSnapshot; github?: GitHubQueueStatus;
 }) {
   const gitlabSummary = gitlabQueueSummary(gitlab);
-  const githubSummary = github ? githubQueueSummary(github) : undefined;
-  const receivedAt = githubSummary ? githubSummary.updatedAt : updatedAt;
+  const receivedAt = github ? githubQueueSummary(github).updatedAt : updatedAt;
   const legacyState = usePollState();
   const state = github ? github.receipt.phase : legacyState;
   const legacyError = usePollError();
@@ -148,9 +148,7 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
     stale: "Could not refresh PRs",
     failed: "Could not load PRs",
   } as const;
-  const showReceipt = githubSummary && !["panicked", "authUnavailable", "authUnknown"].includes(status);
-  const statusText = showReceipt ? githubSummary.text : TEXT[status];
-  const statusDot = showReceipt ? (githubSummary.warning ? DOT.stale : DOT.ok) : DOT[status];
+  const showReceipt = !["panicked", "authUnavailable", "authUnknown"].includes(status);
   const { seconds, set } = usePollInterval();
   const [settingsOpen, setSettingsOpen] = useState(false);
   // The poll cadence is the desktop's setting, and Settings > General
@@ -269,12 +267,12 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
           Only this pair moves. The progress counter, its cancel button,
           the version and the settings entry point below have no second
           home and stay on both. */}
-      {isMobile || selection === "gitlab" ? null : (
+      {isMobile || selection === "gitlab" ? null : showReceipt && github ? <GitHubQueueFreshness github={github} selection={selection} /> : (
         <>
           <span className="flex items-center gap-1.5">
-            <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} aria-hidden="true" />
-            <span title={showReceipt ? githubSummary.explanation : undefined} aria-label={showReceipt ? githubSummary.explanation : undefined} className={status === "failed" ? "text-[#f85149]" : undefined}>
-              {selection === "both" && !statusText.includes("GitHub") ? "GitHub · " : ""}{statusText}
+            <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
+            <span className={status === "failed" ? "text-[#f85149]" : undefined}>
+              {selection === "both" && !TEXT[status].includes("GitHub") ? "GitHub · " : ""}{TEXT[status]}
             </span>
           </span>
 
