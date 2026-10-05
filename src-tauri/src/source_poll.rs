@@ -1121,13 +1121,10 @@ fn reconcile_github_snapshot(
         }
         return Ok(result);
     }
-    result.prs = if result
-        .scan
-        .as_ref()
-        .is_some_and(|s| s.state.step_failure.is_some())
-    {
-        crate::inventory::reconcile(previous, result.prs, false, chrono::Utc::now())
-    } else if result.scan.is_some() {
+    // A finite step observes only its returned rows. A failed page (including
+    // the optional head probe) does not invalidate other accepted observations.
+    // The scan failure remains on the list status and durable checkpoint.
+    result.prs = if result.scan.is_some() {
         crate::inventory::reconcile_delta(previous, result.prs, chrono::Utc::now())
     } else {
         crate::inventory::reconcile(
@@ -3059,3 +3056,7 @@ printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
 #[cfg(test)]
 #[path = "source_poll_integration_tests.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+#[path = "source_poll_freshness_tests.rs"]
+mod freshness_tests;
