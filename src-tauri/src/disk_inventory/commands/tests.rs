@@ -59,9 +59,11 @@ async fn canceled_settings_caller_keeps_configuration_exclusion_until_actual_wri
     release_tx.send(()).unwrap();
     assert!(start.await.unwrap().unwrap().running);
     let status = finished(&controller).await;
-    assert!(status.observations[0]
-        .configuration
-        .contains(&value.external_roots[0]));
+    // Configuration is structured JSON, not an unescaped path string.
+    let (recorded_roots, recorded_settings): (Vec<String>, Settings) =
+        serde_json::from_str(&status.observations[0].configuration).unwrap();
+    assert!(recorded_roots.is_empty());
+    assert_eq!(recorded_settings, value);
     assert_eq!(
         status.observations[0].locations[0].logical.as_deref(),
         Some("8")

@@ -627,7 +627,9 @@ fn partial_history_byte_pressure_preserves_complete_baseline_and_refuses_unsaved
 fn linked_worktrees_require_cross_volume_selection_and_enumerate_common_directory_once() {
     use std::process::Command;
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    // Use ordinary paths for Git: Windows canonical paths have a verbatim prefix.
+    // Resolve afterward for the production discovery identity comparisons.
+    let root = dir.path();
     let repo = root.join("repo");
     std::fs::create_dir(&repo).unwrap();
     let linked1 = root.join("foreign-one");
@@ -660,6 +662,9 @@ fn linked_worktrees_require_cross_volume_selection_and_enumerate_common_director
     for linked in [&linked1, &linked2] {
         git(&["worktree", "add", "--detach", linked.to_str().unwrap()]);
     }
+    let repo = repo.canonicalize().unwrap();
+    let linked1 = linked1.canonicalize().unwrap();
+    let linked2 = linked2.canonicalize().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     for explicit in [false, true] {
         let mut roots = vec![repo.display().to_string()];
