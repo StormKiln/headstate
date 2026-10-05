@@ -2892,7 +2892,7 @@ export interface StatsOwner {
 
 /// A registered scope payload. Mirrors `BackfillRegistered` in `src-tauri/src/commands.rs`.
 export interface BackfillRegistered {
-  owner: StatsOwner;
+  owner?: StatsOwner;
   /// The last frame the collector emitted for this scope, or `null` when it
   /// has emitted none since the app started. `null` is PENDING -- a frame
   /// will come -- and never a zeroed frame, which would read as measured.
@@ -2926,7 +2926,7 @@ export type BackfillRegistration =
 /// frame while the page was closed -- renders correctly from the next one
 /// instead of accumulating from a start it never saw.
 export interface StatsBackfillFrame {
-  owner: StatsOwner;
+  owner?: StatsOwner;
   /// The scope this describes, as the Rust side keys it. Compared before
   /// anything is rendered: the event is app-global while the work is
   /// per-scope, so a page that changed scope mid-walk would otherwise

@@ -15,3 +15,10 @@ it("matches scope and captured owner generation after a late old-account frame",
  act(()=>handlers[1]({payload:frame})); expect(result.current).toBeNull();
  act(()=>handlers[1]({payload:{...frame,owner:current,collected:33}})); expect(result.current?.collected).toBe(33);
 });
+it("does not accept an old unqualified progress frame as a present owner",async()=>{
+ const owner={viewer:"alice",generation:1};
+ const {result}=renderHook(()=>useStatsBackfill("scope",owner));
+ await waitFor(()=>expect(handlers).toHaveLength(1));
+ const frame={scopeKey:"scope",daysCovered:2,daysTotal:30,collected:17,total:20,phase:{kind:"working" as const},nextTickAtMs:null};
+ act(()=>handlers[0]({payload:frame}));expect(result.current).toBeNull();
+});

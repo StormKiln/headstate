@@ -21,6 +21,7 @@ import type {
   BranchScanFrame,
   StatsBackfillFrame,
   StatsOwner,
+  StatsReviewers,
   ClaudeImported,
   ClaudeOverview,
   ClaudeCoverage,
@@ -4170,22 +4171,74 @@ export function useStatsReviewers(
   days: number,
   logins: string[],
   enabled: boolean,
+  owner?: StatsOwner,
 ) {
+  const client = useQueryClient();
   const loadable = scopeIsLoadable(scope);
+  const key = loadable ? scopeKey(scope) : "none";
   const roster = [...new Set(logins.map(login => login.trim().toLowerCase()).filter(Boolean))].sort();
+  const windowDate = new Date().toISOString().slice(0, 10);
   const refresh = useRef(false);
   const query = useQuery({
-    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days, roster],
-    queryFn: () =>
-      timeCall(
-        `stats-reviewers[${scopeKey(scope!)} ${days}d n=${logins.length}]`,
-        () => { const force = refresh.current; refresh.current = false; return statsReviewers(scope!.kind, scope!.value, days, roster, force || undefined); },
-      ),
-    enabled: enabled && loadable && logins.length > 0,
+    queryKey: ["stats-reviewers", key, days, windowDate, roster, owner],
+    queryFn: () => timeCall(
+      `stats-reviewers[${key} ${days}d n=${roster.length}]`,
+      () => {
+        const force = refresh.current;
+        refresh.current = false;
+        return statsReviewers(scope!.kind, scope!.value, days, roster, force || undefined);
+      },
+    ),
+    enabled: enabled && loadable && roster.length > 0,
     staleTime: 5 * 60 * 1000,
     retry: false,
   });
-  return { ...query, refetch: (options?: Parameters<typeof query.refetch>[0]) => { refresh.current = true; return query.refetch(options); } };
+  const matchesOwner = (value: StatsReviewers) => owner !== undefined &&
+    value.receipt?.owner.viewer === owner.viewer && value.receipt.owner.generation === owner.generation;
+  let data = query.data;
+  // Fallback lives only in the current QueryClient: backend/pairing cache
+  // retirement also retires these rows. Never infer identity from missing metadata.
+  if (enabled && loadable && owner && roster.length > 0) {
+    const compatible = client.getQueriesData<StatsReviewers>({ queryKey: ["stats-reviewers", key, days, windowDate] })
+      .map(([, value]) => value)
+      .filter((value): value is StatsReviewers => value !== undefined && value !== data && matchesOwner(value))
+      .sort((a, b) => Date.parse(b.receipt!.fetchedAt) - Date.parse(a.receipt!.fetchedAt));
+    const fresh = data && matchesOwner(data) ? data : undefined;
+    const rows = new Map(fresh?.rows.map(row => [row.login, row]));
+    let age = fresh?.receipt?.fetchedAt;
+    let retained = false;
+    for (const previous of compatible) {
+      for (const row of previous.rows) {
+        if (roster.includes(row.login) && !rows.has(row.login)) {
+          rows.set(row.login, row);
+          retained = true;
+          if (!age || Date.parse(previous.receipt!.fetchedAt) < Date.parse(age)) age = previous.receipt!.fetchedAt;
+        }
+      }
+    }
+    if (retained && age) {
+      data = {
+        rows: [...rows.values()].filter(row => roster.includes(row.login))
+          .sort((a, b) => b.reviews - a.reviews || a.login.localeCompare(b.login)),
+        unmeasured: roster.filter(login => !rows.has(login)),
+        refusedFields: fresh?.refusedFields ?? 0,
+        spend: fresh?.spend ?? { points: 0, requests: 0, unmetered: 0, remaining: null, resetAt: null },
+        stopReason: fresh?.stopReason ?? (query.isError ? { kind: "unavailable", reason: "Reviewer revalidation failed." } : undefined),
+        receipt: { owner, fetchedAt: age, reused: true, retained: true,
+          qualification: query.isError
+            ? "Saved measurements for current members are shown; roster revalidation failed. Retry to continue."
+            : query.isFetching
+              ? "Saved measurements for current members are shown while this roster is revalidated."
+              : "Saved measurements for current members are shown because the latest response did not measure everyone." },
+      };
+    } else if (data && !matchesOwner(data)) {
+      data = undefined;
+    }
+  }
+  return { ...query, data, refetch: (options?: Parameters<typeof query.refetch>[0]) => {
+    refresh.current = true;
+    return query.refetch(options);
+  } };
 }
 
 /// The period comparisons behind the unscoped page's delta cards.

@@ -11,6 +11,7 @@ struct Provider {
     calls: Arc<AtomicUsize>,
     partial: Arc<AtomicBool>,
     only: Arc<AtomicUsize>,
+    second: Arc<AtomicUsize>,
     remaining: Arc<AtomicUsize>,
     blocked: Arc<AtomicBool>,
     tail: Arc<AtomicBool>,
@@ -30,13 +31,14 @@ async fn provider(viewer: &str, value: u64) -> Provider {
     let calls = Arc::new(AtomicUsize::new(0));
     let partial = Arc::new(AtomicBool::new(false));
     let only = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(usize::MAX));
     let remaining = Arc::new(AtomicUsize::new(5000));
     let blocked = Arc::new(AtomicBool::new(false));
     let tail = Arc::new(AtomicBool::new(false));
     let hang_index = Arc::new(AtomicUsize::new(100));
     let arrived = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let (c, p, b, a, r, v, t, o, left, hang) = (
+    let (c, p, b, a, r, v, t, o, left, hang, o2) = (
         calls.clone(),
         partial.clone(),
         blocked.clone(),
@@ -47,9 +49,10 @@ async fn provider(viewer: &str, value: u64) -> Provider {
         only.clone(),
         remaining.clone(),
         hang_index.clone(),
+        second.clone(),
     );
     let app = axum::Router::new().route("/graphql", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
-        let (c,p,b,a,r,v,t,o,left,hang) = (c.clone(),p.clone(),b.clone(),a.clone(),r.clone(),v.clone(),t.clone(),o.clone(),left.clone(),hang.clone());
+        let (c,p,b,a,r,v,t,o,left,hang,o2) = (c.clone(),p.clone(),b.clone(),a.clone(),r.clone(),v.clone(),t.clone(),o.clone(),left.clone(),hang.clone(),o2.clone());
         async move {
             c.fetch_add(1,Ordering::SeqCst);
             let query = body["query"].as_str().unwrap_or_default();
@@ -58,7 +61,7 @@ async fn provider(viewer: &str, value: u64) -> Provider {
             let yesterday = (chrono::Utc::now()-chrono::Duration::days(1)).format("%Y-%m-%dT12:00:00Z").to_string();
             for i in 0..100 {
                 data[format!("s{i}")] = json!({"issueCount":if p.load(Ordering::SeqCst) {1500} else {value},"nodes":[{"number":value,"title":"synthetic","url":"https://example.test/pr","repository":{"nameWithOwner":"fixture/repo"},"author":{"login":v},"createdAt":"2026-01-01T00:00:00Z","mergedAt":yesterday,"additions":value,"deletions":1,"changedFiles":1,"reviews":{"totalCount":1}}]});
-                if !p.load(Ordering::SeqCst) || i == o.load(Ordering::SeqCst) {
+                if !p.load(Ordering::SeqCst) || i == o.load(Ordering::SeqCst) || i == o2.load(Ordering::SeqCst) {
                     data[format!("m{i}")] = json!({"issueCount":value});
                     data[format!("o{i}")] = json!({"issueCount":value+1});
                     data[format!("v{i}")] = json!({"issueCount":value});
@@ -86,6 +89,7 @@ async fn provider(viewer: &str, value: u64) -> Provider {
         calls,
         partial,
         only,
+        second,
         remaining,
         blocked,
         tail,
@@ -172,7 +176,7 @@ async fn board_owner_aba_rejects_old_generation_with_nonempty_data() {
     assert_eq!(br.viewer, "bob");
     assert_eq!(br.owner.as_ref().unwrap().generation(), 2);
     assert!(
-        matches!(&br.backfill, BackfillRegistration::Registered(registered) if Some(&registered.owner) == br.owner.as_ref())
+        matches!(&br.backfill, BackfillRegistration::Registered(registered) if registered.owner == br.owner)
     );
     assert!(!br.board.rows.is_empty());
     let ar = load(anew.client.clone(), db.clone()).await;
@@ -292,6 +296,7 @@ async fn answer_writes_reclaim_unreachable_daily_keys() {
             "{}".into(),
             now,
             now,
+            None,
         )
         .await
         .unwrap();
@@ -668,7 +673,7 @@ async fn stale_background_page_and_frame_cannot_cross_owner_aba() {
     assert_eq!(crate::store::pr_slice::total_rows(&tx).unwrap(), 0);
     tx.commit().unwrap();
     remember_backfill_frame(&StatsBackfillFrame {
-        owner: old,
+        owner: Some(old),
         scope_key: "key".into(),
         days_covered: 9,
         days_total: 30,
@@ -856,6 +861,7 @@ async fn derived_answer_cardinality_does_not_evict_history_or_refresh_age() {
             "{}".into(),
             now,
             now,
+            None,
         )
         .await
         .unwrap();
@@ -882,6 +888,7 @@ async fn derived_answer_cardinality_does_not_evict_history_or_refresh_age() {
         "{}".into(),
         original_age,
         now,
+        None,
     )
     .await
     .unwrap();
@@ -1301,4 +1308,346 @@ async fn overall_deadline_precedes_the_live_tail_document_deadline() {
         ));
         assert_eq!(p.calls.load(Ordering::SeqCst), 9);
     }
+}
+
+#[tokio::test]
+async fn same_owner_late_partial_cannot_downgrade_complete_command_receipts() {
+    for is_series in [false, true] {
+        let slow = provider("alice", 11).await;
+        let fast = provider("alice", 22).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stats.db");
+        slow.partial.store(true, Ordering::SeqCst);
+        slow.blocked.store(true, Ordering::SeqCst);
+        let client = slow.client.clone();
+        let path = db.clone();
+        let task = tokio::spawn(async move {
+            if is_series {
+                stats_series_for_client(
+                    &client,
+                    path,
+                    None,
+                    "org".into(),
+                    Some("fixture-org".into()),
+                    7,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                stats_count_for_client(
+                    &client,
+                    path,
+                    Some("named-subject".into()),
+                    "org".into(),
+                    Some("fixture-org".into()),
+                    "merged".into(),
+                    7,
+                )
+                .await
+                .map(|_| ())
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), slow.arrived.notified())
+            .await
+            .unwrap();
+        let age = if is_series {
+            series(&fast, db.clone()).await.receipt.unwrap().fetched_at
+        } else {
+            count(&fast, db.clone()).await.receipt.unwrap().fetched_at
+        };
+        slow.blocked.store(false, Ordering::SeqCst);
+        slow.release.notify_waiters();
+        task.await.unwrap().unwrap();
+        fast.server.abort();
+        let before = fast.calls.load(Ordering::SeqCst);
+        if is_series {
+            let result = series(&fast, db).await;
+            assert_eq!(result.points.len(), 7);
+            assert!(result.is_complete());
+            assert_eq!(result.receipt.unwrap().fetched_at, age);
+        } else {
+            let result = count(&fast, db).await;
+            assert_eq!(result.total, 22);
+            assert!(result.is_complete());
+            assert_eq!(result.receipt.unwrap().fetched_at, age);
+        }
+        assert_eq!(fast.calls.load(Ordering::SeqCst), before);
+    }
+}
+
+#[tokio::test]
+async fn same_owner_complementary_series_publications_merge_inside_transaction() {
+    let slow = provider("alice", 11).await;
+    let fast = provider("alice", 22).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    slow.partial.store(true, Ordering::SeqCst);
+    slow.blocked.store(true, Ordering::SeqCst);
+    fast.partial.store(true, Ordering::SeqCst);
+    fast.only.store(1, Ordering::SeqCst);
+    let client = slow.client.clone();
+    let path = db.clone();
+    let task = tokio::spawn(async move {
+        stats_series_for_client(
+            &client,
+            path,
+            None,
+            "org".into(),
+            Some("fixture-org".into()),
+            7,
+        )
+        .await
+        .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), slow.arrived.notified())
+        .await
+        .unwrap();
+    let early = series(&fast, db.clone()).await;
+    assert_eq!(early.points.len(), 1);
+    slow.blocked.store(false, Ordering::SeqCst);
+    slow.release.notify_waiters();
+    let late = task.await.unwrap();
+    assert_eq!(
+        late.points.len(),
+        2,
+        "publication must include compatible measurements that arrived during HTTP"
+    );
+    assert_eq!(
+        late.points
+            .iter()
+            .map(|point| point.merged)
+            .collect::<Vec<_>>(),
+        vec![11, 22]
+    );
+    fast.server.abort();
+    let offline = series(&fast, db).await;
+    assert_eq!(offline.points, late.points);
+    assert_eq!(
+        offline.receipt.unwrap().fetched_at,
+        late.receipt.unwrap().fetched_at
+    );
+}
+
+fn stats_store_snapshot(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "stats_cache",
+        "pr_history",
+        "pr_slice",
+        "pr_backfill_scope",
+        "pr_backfill_page",
+        "settings",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get(i))
+                    .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn owner_retirement_failure_after_generation_write_rolls_back_all_five_stores_on_reopen() {
+    let a = provider("alice", 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    let board = stats_board_for_client(
+        &a.client,
+        db.clone(),
+        &tokio::sync::Notify::new(),
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    let owner = board.owner.unwrap();
+    let mut conn = open_db(&db).unwrap();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    crate::store::pr_backfill_page::select_in(
+        &tx,
+        &owner,
+        &board.scope_key,
+        &["2026-09-01".into()],
+        1,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let before = stats_store_snapshot(&conn);
+    assert!(before[..5].iter().all(|rows| !rows.is_empty()));
+    conn.execute_batch("CREATE TRIGGER reject_retired_owner AFTER UPDATE ON settings WHEN NEW.key='stats_generation' BEGIN
+      SELECT CASE WHEN NEW.value='2' AND (SELECT value FROM settings WHERE key='stats_viewer')='\"bob\"'
+       AND (SELECT count(*) FROM stats_cache)=0 AND (SELECT count(*) FROM pr_history)=0
+       AND (SELECT count(*) FROM pr_slice)=0 AND (SELECT count(*) FROM pr_backfill_scope)=0
+       AND (SELECT count(*) FROM pr_backfill_page)=0
+      THEN RAISE(ABORT,'injected after generation and all clears') ELSE RAISE(ABORT,'wrong injection stage') END; END;").unwrap();
+    let error = stats_owner::capture_verified(&conn, "bob").unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected after generation and all clears"));
+    assert_eq!(stats_store_snapshot(&conn), before);
+    drop(conn);
+    let reopened = open_db(&db).unwrap();
+    assert_eq!(stats_store_snapshot(&reopened), before);
+    assert_eq!(
+        stats_owner::current_for_verified(&reopened, "alice").unwrap(),
+        Some(owner)
+    );
+    reopened
+        .execute_batch("DROP TRIGGER reject_retired_owner;")
+        .unwrap();
+    let next = stats_owner::capture_verified(&reopened, "bob").unwrap();
+    assert_eq!(next.generation(), 2);
+    assert!(stats_store_snapshot(&reopened)[..5]
+        .iter()
+        .all(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn retirement_after_owned_board_snapshot_refuses_late_registration_and_publication() {
+    let a = provider("alice", 1).await;
+    let b = provider("bob", 22).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    let first = stats_board_for_client(
+        &a.client,
+        db.clone(),
+        &tokio::sync::Notify::new(),
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    let owner = first.owner.clone().unwrap();
+    let now = chrono::Utc::now();
+    let end = (now - chrono::Duration::days(1)).date_naive().to_string();
+    let start = (now - chrono::Duration::days(7)).date_naive().to_string();
+    let snapshot = stored_stats_board(
+        db.clone(),
+        owner.clone(),
+        first.scope_key.clone(),
+        start.clone(),
+        end.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!snapshot.rows.is_empty());
+    let current = series(&b, db.clone()).await;
+    let registration = crate::store::pr_backfill_scope::BackfillScope {
+        scope_key: first.scope_key.clone(),
+        scope_kind: "org".into(),
+        scope_value: "fixture-org".into(),
+        measure: "merged".into(),
+        horizon_days: 90,
+    };
+    assert!(
+        note_scope_seen(db.clone(), owner.clone(), registration, now)
+            .await
+            .unwrap_err()
+            .contains("account changed")
+    );
+    assert!(stored_stats_board(
+        db.clone(),
+        owner.clone(),
+        first.scope_key.clone(),
+        start.clone(),
+        end.clone()
+    )
+    .await
+    .unwrap_err()
+    .contains("account changed"));
+    assert!(matches!(
+        stats_cache_put(
+            db.clone(),
+            owner,
+            format!("board|{}", first.scope_key),
+            start,
+            end,
+            11,
+            false,
+            serde_json::to_string(&first).unwrap(),
+            now,
+            now,
+            None,
+        )
+        .await,
+        Err(OwnedError::Superseded)
+    ));
+    let calls = b.calls.load(Ordering::SeqCst);
+    b.server.abort();
+    let again = series(&b, db).await;
+    assert_eq!(again.points, current.points);
+    assert_eq!(
+        again.receipt.unwrap().fetched_at,
+        current.receipt.unwrap().fetched_at
+    );
+    assert_eq!(b.calls.load(Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
+async fn publication_does_not_replay_pre_http_fallback_over_a_concurrent_measured_zero() {
+    let seed = provider("alice", 11).await;
+    let slow = provider("alice", 33).await;
+    let fast = provider("alice", 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    seed.partial.store(true, Ordering::SeqCst);
+    seed.second.store(1, Ordering::SeqCst);
+    let first = series(&seed, db.clone()).await;
+    assert_eq!(first.points.len(), 2);
+    slow.partial.store(true, Ordering::SeqCst);
+    slow.only.store(1, Ordering::SeqCst);
+    slow.second.store(3, Ordering::SeqCst);
+    slow.blocked.store(true, Ordering::SeqCst);
+    fast.partial.store(true, Ordering::SeqCst);
+    fast.second.store(2, Ordering::SeqCst);
+    let client = slow.client.clone();
+    let path = db.clone();
+    let task = tokio::spawn(async move {
+        stats_series_for_client(
+            &client,
+            path,
+            None,
+            "org".into(),
+            Some("fixture-org".into()),
+            7,
+        )
+        .await
+        .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), slow.arrived.notified())
+        .await
+        .unwrap();
+    let current = series(&fast, db.clone()).await;
+    assert_eq!(current.points[0].merged, 0);
+    slow.blocked.store(false, Ordering::SeqCst);
+    slow.release.notify_waiters();
+    let result = task.await.unwrap();
+    assert_eq!(
+        result
+            .points
+            .iter()
+            .map(|point| point.merged)
+            .collect::<Vec<_>>(),
+        vec![0, 33, 0, 33]
+    );
+    fast.server.abort();
+    let saved = series(&fast, db).await;
+    assert_eq!(saved.points, result.points);
 }

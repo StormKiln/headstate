@@ -5071,8 +5071,38 @@ async fn stats_count_for_client(
                 payload,
                 o.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now),
                 now,
+                pure.as_ref().ok().and_then(|fresh| {
+                    crate::github::stats::receipt::fresh_candidate(
+                        fresh,
+                        fresh.total,
+                        fresh.is_complete(),
+                        owner.clone(),
+                        now,
+                    )
+                }),
             )
             .await;
+            if let Ok(Some(saved)) = &wrote {
+                if let Ok(mut published) =
+                    serde_json::from_str::<crate::github::stats::Outcome>(&saved.payload)
+                {
+                    published.spend = o.spend.clone();
+                    let receipt = published.receipt.get_or_insert_with(|| {
+                        crate::github::stats::receipt::StatsReceipt::measured(
+                            saved.fetched_at,
+                            owner.clone(),
+                        )
+                    });
+                    receipt.reused = true;
+                    receipt.retained = !saved.complete;
+                    receipt.fetched_at = saved.fetched_at;
+                    receipt.qualification = Some(
+                        "Compatible measurements published by an overlapping load are shown."
+                            .into(),
+                    );
+                    *o = published;
+                }
+            }
             if let Err(OwnedError::Superseded) = wrote {
                 let mut fetched = pure.map_err(|_| OwnedError::Superseded.to_string())?;
                 if !(fetched.total > 0 || fetched.is_complete()) {
@@ -5319,15 +5349,40 @@ async fn stats_cache_put(
     payload: String,
     now: chrono::DateTime<chrono::Utc>,
     maintenance_now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), OwnedError> {
+    fresh: Option<crate::store::stats::Cached>,
+) -> Result<Option<crate::store::stats::Cached>, OwnedError> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         stats_owner::require_current(&tx, &owner)?;
-        crate::store::stats::put(&tx, &key, &from, &to, total, complete, &payload, now)?;
+        let incoming = crate::store::stats::Cached {
+            total,
+            complete,
+            payload,
+            fetched_at: now,
+        };
+        let published = match crate::store::stats::get(&tx, &key, &from, &to, maintenance_now)? {
+            Some(current) => crate::github::stats::receipt::reconcile_publication(
+                &key,
+                incoming.clone(),
+                current,
+                fresh,
+            ),
+            None => incoming.clone(),
+        };
+        crate::store::stats::put(
+            &tx,
+            &key,
+            &from,
+            &to,
+            published.total,
+            published.complete,
+            &published.payload,
+            published.fetched_at,
+        )?;
         crate::store::stats::prune_answers(&tx, maintenance_now, (&key, &from, &to))?;
         tx.commit()?;
-        Ok(())
+        Ok((published != incoming).then_some(published))
     })
     .await
     .map_err(|e| OwnedError::Task(e.to_string()))?
@@ -5455,7 +5510,7 @@ fn backfill_registration(
 ) -> BackfillRegistration {
     match outcome {
         Ok(()) => BackfillRegistration::Registered(BackfillRegistered {
-            owner: owner.clone(),
+            owner: Some(owner.clone()),
             last_frame: last_backfill_frame(owner, scope_key),
         }),
         Err(reason) => BackfillRegistration::Failed(BackfillRegistrationFailed { reason }),
@@ -5814,6 +5869,7 @@ async fn stats_board_for_client(
                 payload,
                 now,
                 now,
+                None,
             )
             .await;
             if let Err(OwnedError::Superseded) = wrote {
@@ -6091,7 +6147,8 @@ impl Default for BackfillRegistration {
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BackfillRegistered {
-    pub owner: StatsOwner,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StatsOwner>,
     /// `None` until the worker has emitted a frame for this scope since the
     /// app started. Never a zeroed frame: "0 of 30 days" is a measurement,
     /// and nothing has measured this scope yet.
@@ -6355,8 +6412,38 @@ async fn stats_series_for_client(
                 payload,
                 series.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now),
                 now,
+                pure.as_ref().ok().and_then(|fresh| {
+                    crate::github::stats::receipt::fresh_candidate(
+                        fresh,
+                        fresh.points.iter().map(|point| point.merged).sum(),
+                        fresh.is_complete(),
+                        owner.clone(),
+                        now,
+                    )
+                }),
             )
             .await;
+            if let Ok(Some(saved)) = &wrote {
+                if let Ok(mut published) =
+                    serde_json::from_str::<crate::github::stats::Series>(&saved.payload)
+                {
+                    published.spend = series.spend.clone();
+                    let receipt = published.receipt.get_or_insert_with(|| {
+                        crate::github::stats::receipt::StatsReceipt::measured(
+                            saved.fetched_at,
+                            owner.clone(),
+                        )
+                    });
+                    receipt.reused = true;
+                    receipt.retained = !saved.complete;
+                    receipt.fetched_at = saved.fetched_at;
+                    receipt.qualification = Some(
+                        "Compatible measurements published by an overlapping load are shown."
+                            .into(),
+                    );
+                    *series = published;
+                }
+            }
             if let Err(OwnedError::Superseded) = wrote {
                 let mut fetched = pure.map_err(|_| OwnedError::Superseded.to_string())?;
                 if !(!fetched.points.is_empty()) {
@@ -9227,7 +9314,7 @@ mod tests {
     }
     fn frame_for(scope_key: &str, days_covered: usize) -> super::StatsBackfillFrame {
         super::StatsBackfillFrame {
-            owner: frame_owner(),
+            owner: Some(frame_owner()),
             scope_key: scope_key.to_string(),
             days_covered,
             days_total: 30,
@@ -10989,7 +11076,8 @@ pub const STATS_BACKFILL_PROGRESS: &str = "stats-backfill-progress";
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBackfillFrame {
-    pub owner: StatsOwner,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StatsOwner>,
     pub scope_key: String,
     pub days_covered: usize,
     pub days_total: usize,
@@ -11015,7 +11103,7 @@ pub struct StatsBackfillFrame {
 /// listening.
 pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
     let frame = StatsBackfillFrame {
-        owner: report.owner.clone(),
+        owner: Some(report.owner.clone()),
         scope_key: report.scope_key.clone(),
         days_covered: report.days_covered,
         days_total: report.days_total,
@@ -11050,14 +11138,14 @@ fn backfill_frames(
 }
 
 fn remember_backfill_frame(frame: &StatsBackfillFrame) {
+    let Some(owner) = &frame.owner else {
+        return;
+    };
     if let Ok(mut frames) = backfill_frames().lock() {
         if frames.len() >= 256 {
             frames.clear();
         }
-        frames.insert(
-            (frame.owner.clone(), frame.scope_key.clone()),
-            frame.clone(),
-        );
+        frames.insert((owner.clone(), frame.scope_key.clone()), frame.clone());
     }
 }
 

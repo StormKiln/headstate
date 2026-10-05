@@ -1299,3 +1299,12 @@ describe("partialityCaveat", () => {
     expect(out).toContain("40 of 100 pull requests could not be retrieved");
   });
 });
+
+it.each([undefined,{viewer:"octocat",generation:2}])("renders older boards but suppresses absent or mismatched seeded owner %j",owner=>{
+ vi.mocked(useStatsBoard).mockReturnValue(settled(board({complete:false,total:500,retrieved:120,accumulating:true,daysCovered:6,daysTotal:30,backfill:{state:"registered",owner,lastFrame:{scopeKey:"board|merged|*|org:acme",owner:owner?{viewer:"octocat",generation:1}:undefined,daysCovered:24,daysTotal:30,collected:450,total:500,phase:{kind:"working"},nextTickAtMs:null}}})));
+ vi.mocked(useStatsBackfill).mockReturnValue(null);
+ render(<StatsPage/>);fireEvent.click(screen.getByRole("tab",{name:/others/i}));
+ expect(screen.queryByText(/24 of 30 days measured/)).toBeNull();
+ expect(screen.queryByText(/450 of 500 pull requests collected/)).toBeNull();
+ expect(screen.getByText(/remaining days are queued for collection/)).toBeTruthy();
+});

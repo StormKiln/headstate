@@ -166,6 +166,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // never put another scope's coverage under this heading.
   const seedFrame =
     registration?.state === "registered" &&
+    registration.owner !== undefined &&
+    registration.lastFrame?.owner !== undefined &&
     registration.lastFrame?.scopeKey === boardQ.data?.scopeKey &&
     registration.lastFrame?.owner?.viewer === registration.owner?.viewer &&
     registration.lastFrame?.owner?.generation === registration.owner?.generation
@@ -208,7 +210,7 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // strings cannot say whether a 101st existed.
   const reviewersTruncated =
     !!scopeOrg && scopeOrg.members.length < scopeOrg.membersTotal;
-  const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable);
+  const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable, boardQ.data?.owner ?? (registration?.state === "registered" ? registration.owner : undefined));
 
   const board = boardQ.data;
   const series = seriesQ.data;
@@ -434,6 +436,9 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
               stops holding for a wall: past `NAMED_DAYS` the rest are
               counted, so the sentence still says how much is missing
               without becoming a paragraph nobody reads. */}
+          {(failedDays.kind === "partial" || series.receipt?.retained) && (
+            <button type="button" disabled={seriesQ.isFetching} onClick={() => void seriesQ.refetch()}>Retry activity measurements</button>
+          )}
           {failedDays.kind === "partial" && (
             <p className="text-xs text-[#d29922]">
               {failedDays.count} day{failedDays.count === 1 ? "" : "s"} could
@@ -611,8 +616,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                 // account's real data makes TRUE -- so a reader could not tell
                 // the transient from the answer.
                 reviewers={reviewersQ.data}
-                reviewersPending={reviewersQ.isPending && reviewerLogins.length > 0}
-                reviewersError={reviewersQ.isError}
+                reviewersPending={reviewersQ.isPending && !reviewersQ.data && reviewerLogins.length > 0}
+                reviewersError={reviewersQ.isError && !reviewersQ.data}
                 // Absent, not empty, when nothing enumerated a roster. Only an
                 // org scope has members; on a repository or Personal scope
                 // there is nobody to ask about, and an empty chart there would

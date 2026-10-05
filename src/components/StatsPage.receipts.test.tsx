@@ -79,3 +79,48 @@ it("the real reviewer hook clears empty rosters and rejects late old-roster repl
  await screen.findByText("bob");
  client.clear();
 });
+
+it.each([false, true])("mounted useful %s-retained activity has a targeted Retry", async retained => {
+ let attempts=0;
+ const owner={viewer:"alice",generation:1};
+ call.mockImplementation((command:string)=>{
+  if(command==="stats_tree") return Promise.resolve(tree([]));
+  if(command==="stats_series") { attempts++;return Promise.resolve({points:[{date:"2026-09-01",merged:17,opened:18}],failedDays:attempts===1&&!retained?["2026-09-02"]:[],refusedFields:0,spend,receipt:{owner,fetchedAt:"2026-09-01T12:00:00Z",reused:retained,retained:attempts===1&&retained,qualification:null}}); }
+  return new Promise(()=>{});
+ });
+ const client=mount();
+ const retry=await screen.findByRole("button",{name:/retry activity measurements/i});
+ const siblingCalls=call.mock.calls.filter(c=>c[0]==="stats_count"||c[0]==="stats_board").length;
+ fireEvent.click(retry);
+ await waitFor(()=>expect(attempts).toBe(2));
+ await waitFor(()=>expect(screen.queryByRole("button",{name:/retry activity measurements/i})).toBeNull());
+ expect(call.mock.calls.filter(c=>c[0]==="stats_count"||c[0]==="stats_board")).toHaveLength(siblingCalls);
+ client.clear();
+});
+
+it("mounted roster revalidation failure keeps current members visible with their original age",async()=>{
+ const owner={viewer:"alice",generation:1}; let reject:((reason:Error)=>void)|undefined;
+ let attempts=0;
+ call.mockImplementation((command:string,args:{logins:string[]})=>{
+  if(command==="stats_tree")return Promise.resolve(tree(["alice","bob"]));
+  if(command==="stats_board")return Promise.resolve({viewer:"alice",owner,scopeKey:"scope",backfill:{state:"registered",owner,lastFrame:null},rows:[],total:0,retrieved:0,complete:true,truncatedSlices:[],refusedFields:0,slices:0,rounds:0,spend,slowest:[],largest:[],repoCounts:[],accumulated:0,accumulating:false,daysCovered:30,daysTotal:30});
+  if(command==="stats_reviewers"){
+   attempts++;if(args.logins.includes("charlie"))return new Promise((_,fail)=>{reject=fail;});
+   return Promise.resolve({rows:args.logins.map(login=>({login,reviews:17})),unmeasured:[],refusedFields:0,spend,receipt:{owner,fetchedAt:"2026-09-01T12:00:00Z",reused:false,retained:false,qualification:null}});
+  }
+  return new Promise(()=>{});
+ });
+ const client=mount();
+ await screen.findByRole("tab",{name:/others/i});fireEvent.click(screen.getByRole("tab",{name:/others/i}));
+ await screen.findByText("bob");
+ const before=attempts;
+ await act(async()=>client.setQueryData(["stats-tree"],tree(["bob","charlie"])));
+ await waitFor(()=>expect(attempts).toBeGreaterThan(before));
+ expect(screen.getByText("bob")).toBeTruthy();expect(screen.queryByText("alice")).toBeNull();
+ await act(async()=>reject?.(new Error("synthetic refusal")));
+ await screen.findByText(/roster revalidation failed/i);
+ expect(screen.getByText("bob")).toBeTruthy();
+ expect(document.querySelector('time[datetime="2026-09-01T12:00:00Z"]')).toBeTruthy();
+ expect(screen.getByRole("button",{name:/retry reviewer measurements/i})).toBeTruthy();
+ client.clear();
+});

@@ -740,3 +740,11 @@ describe("transport selection", () => {
     await expect(import("./transport")).rejects.toThrow(/VITE_TARGET/);
   });
 });
+
+it("keeps additive Stats owner metadata optional while rejecting malformed present owners", async () => {
+  const { remoteEventError } = await import("./wireContract");
+  const frame={scopeKey:"scope",daysCovered:1,daysTotal:30,collected:11,total:22,phase:{kind:"working"},nextTickAtMs:null};
+  expect(remoteEventError("stats-backfill-progress",frame)).toBeNull();
+  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:1}})).toBeNull();
+  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:"wrong"}})).not.toBeNull();
+});
