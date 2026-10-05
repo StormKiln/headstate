@@ -223,15 +223,12 @@ impl GitHubClient {
                                 tokio::pin!(step);
                                 loop {
                                     if dispatched.load(std::sync::atomic::Ordering::Acquire) {
-                                        let deadline = shared
-                                            .state
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .dispatch_deadline
-                                            .expect("dispatch publishes its execution cap");
-                                        return tokio::time::timeout_at(deadline, &mut step)
-                                            .await
-                                            .unwrap_or(Err(ClientError::Timeout(30)));
+                                        // Every admission, full response body and
+                                        // retry wait observes the execution cap.
+                                        // Let those errors return through the scan
+                                        // so received rows/checkpoints survive;
+                                        // an outer timeout would drop that progress.
+                                        return step.await;
                                     }
                                     tokio::select! {
                                         biased;

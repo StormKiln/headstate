@@ -238,85 +238,98 @@ impl ReadTransport {
             let request_deadline = permit
                 .deadline
                 .unwrap_or(context.deadline)
+                // First admission publishes the shared execution cap. Include
+                // it in the first request as well as all subsequent documents.
+                .min(
+                    context
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.borrow().map(|d| d.deadline))
+                        .unwrap_or(context.deadline),
+                )
                 .min(Instant::now() + READ_BUDGET);
-            let response = tokio::time::timeout_at(request_deadline, async {
-                match read {
+            let request = async {
+                let response = match read {
                     Read::Graphql(body) => client._post("/graphql", Some(body)).await,
                     Read::Rest { path, .. } => client._get(path).await,
-                }
-            })
-            .await
-            .map_err(|_| ClientError::Timeout(READ_BUDGET.as_secs()))?;
-            let result = match response {
-                Err(error) => Err(map_error(error)),
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    crate::diag!("[diag] provider read id={} operation={} attempt={} status={} headers_ms={}", id, operation, attempt, status, started.elapsed().as_millis());
-                    let header_number = |name| {
-                        response
+                };
+                // Headers, refused-body decoding and successful-body decoding
+                // are one admitted request, with one frozen deadline/permit.
+                match response {
+                    Err(error) => Err(map_error(error)),
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        crate::diag!("[diag] provider read id={} operation={} attempt={} status={} headers_ms={}", id, operation, attempt, status, started.elapsed().as_millis());
+                        let header_number = |name| {
+                            response
+                                .headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                        };
+                        let remaining = header_number("x-ratelimit-remaining");
+                        if let Read::Rest { budget, .. } = read {
+                            // A refused request spent quota too. Record its headers
+                            // before any status mapping, rate-limit return or retry.
+                            budget.record_rest_local(remaining);
+                        }
+                        let retry_after = response
                             .headers()
-                            .get(name)
+                            .get("retry-after")
                             .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                    };
-                    let remaining = header_number("x-ratelimit-remaining");
-                    if let Read::Rest { budget, .. } = read {
-                        // A refused request spent quota too. Record its headers
-                        // before any status mapping, rate-limit return or retry.
-                        budget.record_rest_local(remaining);
-                    }
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| retry_seconds(v, chrono::Utc::now()));
-                    self.observe_headers(read.bucket(), status, response.headers());
-                    let exhausted = remaining == Some(0);
-                    let refused =
-                        status == 429 || (status == 403 && (retry_after.is_some() || exhausted));
-                    // Still decode refused bodies: they may carry independent
-                    // secondary evidence alongside primary header exhaustion.
-                    if status >= 500 {
-                        Err(ClientError::NotJson(format!("HTTP {status} response")))
-                    } else {
-                        match octocrab::map_github_error(response).await {
-                            Ok(response) => {
-                                match Value::from_response(response).await.map_err(map_error) {
-                                    Ok(value) => {
-                                        if matches!(read, Read::Graphql(_)) {
-                                            self.observe_graphql(&value, retry_after);
-                                            if graphql_exhausted(&value)
-                                                && value.get("data").is_none_or(Value::is_null)
-                                            {
-                                                return Err(ClientError::RateLimited(
-                                                    "provider retry deadline is active".into(),
-                                                ));
+                            .and_then(|v| retry_seconds(v, chrono::Utc::now()));
+                        self.observe_headers(read.bucket(), status, response.headers());
+                        let exhausted = remaining == Some(0);
+                        let refused = status == 429
+                            || (status == 403 && (retry_after.is_some() || exhausted));
+                        // Still decode refused bodies: they may carry independent
+                        // secondary evidence alongside primary header exhaustion.
+                        if status >= 500 {
+                            Err(ClientError::NotJson(format!("HTTP {status} response")))
+                        } else {
+                            match octocrab::map_github_error(response).await {
+                                Ok(response) => {
+                                    match Value::from_response(response).await.map_err(map_error) {
+                                        Ok(value) => {
+                                            if matches!(read, Read::Graphql(_)) {
+                                                self.observe_graphql(&value, retry_after);
+                                                if graphql_exhausted(&value)
+                                                    && value.get("data").is_none_or(Value::is_null)
+                                                {
+                                                    return Err(ClientError::RateLimited(
+                                                        "provider retry deadline is active".into(),
+                                                    ));
+                                                }
                                             }
+                                            Ok(value)
                                         }
-                                        Ok(value)
+                                        Err(error) => Err(error),
                                     }
-                                    Err(error) => Err(error),
                                 }
-                            }
-                            Err(error) => {
-                                if self.observe_error(read.bucket(), &error, retry_after) || refused
-                                {
-                                    Err(ClientError::RateLimited(if refused {
-                                        format!(
-                                            "retry in {} seconds",
-                                            self.admission.retry_wait(read.bucket())
-                                        )
+                                Err(error) => {
+                                    if self.observe_error(read.bucket(), &error, retry_after)
+                                        || refused
+                                    {
+                                        Err(ClientError::RateLimited(if refused {
+                                            format!(
+                                                "retry in {} seconds",
+                                                self.admission.retry_wait(read.bucket())
+                                            )
+                                        } else {
+                                            "provider retry deadline is active".into()
+                                        }))
                                     } else {
-                                        "provider retry deadline is active".into()
-                                    }))
-                                } else {
-                                    Err(map_error(error))
+                                        Err(map_error(error))
+                                    }
                                 }
                             }
                         }
                     }
                 }
             };
+            let result = tokio::time::timeout_at(request_deadline, request)
+                .await
+                .unwrap_or(Err(ClientError::Timeout(READ_BUDGET.as_secs())));
             if result.is_ok() {
                 permit.complete();
             }
@@ -333,7 +346,15 @@ impl ReadTransport {
                     // The deadline includes the single bounded, jittered retry.
                     let delay = 250 + id % 251;
                     crate::diag!("[diag] provider read id={} operation={} attempt={} retry_delay_ms={} reason=transient", id, operation, attempt, delay);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    if tokio::time::timeout_at(
+                        request_deadline,
+                        tokio::time::sleep(Duration::from_millis(delay)),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return result;
+                    }
                 }
                 other => return other,
             }

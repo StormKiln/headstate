@@ -2649,3 +2649,177 @@ async fn queued_continuation_promotes_foreground_refresh_and_publishes_checkpoin
     blockers.abort_all();
     while blockers.join_next().await.is_some() {}
 }
+
+#[tokio::test]
+async fn stalled_success_body_retains_shared_receipt_and_durable_continuation() {
+    stalled_body_retains_shared_receipt_and_durable_continuation("200 OK").await;
+}
+
+#[tokio::test]
+async fn stalled_error_body_retains_shared_receipt_and_durable_continuation() {
+    stalled_body_retains_shared_receipt_and_durable_continuation("403 Forbidden").await;
+}
+
+async fn stalled_body_retains_shared_receipt_and_durable_continuation(status: &'static str) {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let signal = stalled.clone();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut held_bodies = vec![];
+        for n in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            let body_start = loop {
+                let mut buf = [0; 4096];
+                let got = stream.read(&mut buf).await.unwrap();
+                assert!(got > 0);
+                request.extend_from_slice(&buf[..got]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break end + 4;
+                    }
+                }
+            };
+            observed
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&request[body_start..]).unwrap());
+            if n == 2 {
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
+                held_bodies.push(stream);
+                signal.notify_one();
+                continue;
+            }
+            let body = if n == 0 {
+                json!({"data":{"viewer":{"login":"synthetic-viewer"}}})
+            } else {
+                let numbers = if n == 1 { 1..=25 } else { 26..=50 };
+                let nodes: Vec<_> = numbers.map(|n| node(n, false)).collect();
+                json!({"data":{"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":50,"nodes":nodes,"pageInfo":{"hasNextPage":n == 1,"endCursor": if n == 1 {Some("next-page")} else {None}}}}})
+            }.to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        }
+    });
+    let client = GitHubClient::new(
+        octocrab::Octocrab::builder()
+            .base_uri(format!("http://{addr}"))
+            .unwrap()
+            .personal_token("synthetic")
+            .build()
+            .unwrap(),
+    );
+    client.fetch_viewer().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("body-stall.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let spawn = || {
+        let path = path.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            fetch_github_step_at(path, &client, list, Duration::from_secs(60), false, || {
+                (120, 1000)
+            })
+            .await
+        })
+    };
+    let first = spawn();
+    stalled.notified().await;
+    // Join after headers have arrived, while the second response is incomplete.
+    let loaded = Arc::new(tokio::sync::Notify::new());
+    let entered = loaded.clone();
+    let joined_client = client.clone();
+    let joined_path = path.clone();
+    let joined = tokio::spawn(async move {
+        fetch_github_step_at(
+            joined_path,
+            &joined_client,
+            list,
+            Duration::from_secs(60),
+            false,
+            || {
+                entered.notify_one();
+                (120, 1000)
+            },
+        )
+        .await
+    });
+    loaded.notified().await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let completed_at_cap = first.is_finished() && joined.is_finished();
+    tokio::time::resume();
+    assert!(
+        completed_at_cap,
+        "whole-body timeout must finish within the execution cap"
+    );
+    let first = first
+        .await
+        .unwrap()
+        .expect("body timeout must retain the received first page");
+    let joined = joined.await.unwrap().unwrap();
+    assert_eq!(first.prs.len(), 25);
+    assert_eq!(first.scan, joined.scan);
+    let receipt = first.scan.as_ref().unwrap();
+    assert_eq!(receipt.state.after.as_deref(), Some("next-page"));
+    assert!(receipt.state.received);
+    assert!(!receipt.state.done);
+    assert!(receipt.state.step_failure.as_ref().unwrap().transient);
+    assert!(!receipt.state.step_failure.as_ref().unwrap().not_asked);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "viewer plus two scan attempts; no retry after cap"
+    );
+    let polls = SourcePolls::default();
+    let (a, _) = polls.begin_attempt(Source::default(), list).await;
+    let (b, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &a, first).await;
+    publish_scan_attempt(&polls, &conn, &b, joined).await;
+    let checkpoint = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(checkpoint.revision, 1, "one accepted shared receipt");
+    assert_eq!(checkpoint.state.after.as_deref(), Some("next-page"));
+    assert_eq!(saved(&conn).len(), 25);
+    let continued =
+        fetch_github_step_at(path, &client, list, Duration::from_secs(60), true, || {
+            (120, 2000)
+        })
+        .await
+        .unwrap();
+    assert_eq!(continued.prs.len(), 25);
+    assert!(continued.scan.as_ref().unwrap().state.done);
+    let (next, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &next, continued).await;
+    assert_eq!(saved(&conn).len(), 50);
+    let checkpoint = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(checkpoint.revision, 2);
+    assert_eq!(checkpoint.state.total, Some(50));
+    assert!(
+        !checkpoint.state.coverage_valid,
+        "the interrupted pass cannot claim complete coverage"
+    );
+    assert_eq!(checkpoint.state.completed_total, None);
+    assert_eq!(
+        requests.lock().unwrap()[3]["variables"]["after"],
+        "next-page"
+    );
+    server.await.unwrap();
+}
