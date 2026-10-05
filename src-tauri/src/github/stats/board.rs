@@ -316,6 +316,9 @@ pub struct Board {
     /// dangerous rather than harmless -- the shortest window would be the
     /// most confidently wrong one.
     pub total: Option<u64>,
+    /// Explicit whole-window count proof; legacy serialized totals are unproven.
+    #[serde(default)]
+    pub total_verified: bool,
     /// Pull requests actually aggregated into the rows.
     pub retrieved: u64,
     /// Whether every PR in the window made it into a row.
@@ -701,6 +704,7 @@ impl Board {
             // `None` case belongs to a board assembled from storage whose
             // window nothing has probed -- see `from_stored`.
             total: Some(total),
+            total_verified: false,
             retrieved,
             // All three channels, not just the node count. A refusal can
             // leave the node list the right LENGTH while blanking fields
@@ -894,11 +898,10 @@ impl Board {
     /// fraction of the window -- or, for a board served entirely from
     /// accumulated rows, none of it.
     ///
-    /// A `Coverage::total` of `None` passes straight through to
-    /// `Board::total`. That is the case the whole `Option` exists for:
-    /// rows on disk and nothing that ever measured how many there should
-    /// be. Defaulting it to the fetched total would look right and be
-    /// wrong whenever the fetch covered less than the window.
+    /// Only a whole-window daily count proof or an explicitly verified
+    /// whole-window foreground plan supplies the denominator. The ledger's
+    /// covered-subset total remains distinct. Missing or contradictory
+    /// evidence is unknown, never a guessed zero or a clamped total.
     pub fn from_stored(
         stored: &[StoredPr],
         fetched: &Board,
@@ -960,7 +963,10 @@ impl Board {
         // which is exact for the window the fetch actually planned. Both
         // can be `None`, and a `None` survives to the UI rather than being
         // filled in here.
-        let total = coverage.total.or(fetched.total);
+        let total = coverage
+            .window_total
+            .or_else(|| fetched.total.filter(|_| fetched.total_verified))
+            .filter(|total| *total >= accumulated);
         // The ledger is authoritative where it HAS rows. Where it has
         // none, its silence is not a measurement of zero
         // (`caches/mod.rs:550`), and this fetch's own planned span is a
@@ -982,6 +988,7 @@ impl Board {
         Self {
             rows,
             total,
+            total_verified: total.is_some(),
             // What THIS load retrieved is kept as it was. It is a fact
             // about the fetch, and overwriting it with the accumulated
             // figure would erase the distinction the caveat needs.
@@ -1239,6 +1246,7 @@ struct BoardProgress(std::sync::Arc<std::sync::Mutex<Option<PlannedSlices>>>);
 struct PlannedSlices {
     slices: Vec<Slice>,
     rounds: u32,
+    exact_total: Option<u64>,
 }
 
 impl BoardProgress {
@@ -1333,6 +1341,10 @@ fn partial_on_timeout(
     // naming the ranges it did not read, and there is no second mapper to
     // keep in step with the first.
     let mut board = Board::from_alias_map(&map, &planned.slices, planned.rounds, budget.snapshot());
+    board.total = planned
+        .exact_total
+        .filter(|total| *total >= board.retrieved);
+    board.total_verified = board.total.is_some();
     // Unconditional, and NOT `&&`-ed with anything. A load that ran out of
     // wall clock is incomplete even if every alias it did reach came back
     // whole, because the aliases it never reached are the ones missing --
@@ -1391,10 +1403,19 @@ async fn board_inner(
     progress.publish(PlannedSlices {
         slices: slices.clone(),
         rounds: plan.rounds,
+        exact_total: plan.is_complete().then(|| plan.total()),
     });
     let map = super::fetch::load_detail_into(client, &q, &slices, budget, BOARD_ALIAS_CHUNK, sink)
         .await?;
     let mut board = Board::from_alias_map(&map, &slices, plan.rounds, budget.snapshot());
+    board.total = plan
+        .is_complete()
+        .then(|| plan.total())
+        .filter(|total| *total >= board.retrieved);
+    board.total_verified = board.total.is_some();
+    if !board.total_verified {
+        board.complete = false;
+    }
     // An irreducible slice cannot be divided further, so its nodes are a
     // sample BY CONSTRUCTION -- before any request was made. Folded in here
     // rather than left to the node-count comparison in the mapper, which
@@ -2307,6 +2328,63 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn staged_dense_day_does_not_borrow_the_covered_empty_subset_denominator() {
+        use crate::store::pr_slice::{coverage_from, SliceRow, SliceState};
+        let mut rows = vec![
+            SliceRow {
+                from: "2026-08-01".into(),
+                to: "2026-08-01".into(),
+                state: SliceState::Complete,
+                issue_count: 0,
+                retrieved: 0,
+                refused_fields: 0,
+            },
+            SliceRow {
+                from: "2026-08-02".into(),
+                to: "2026-08-02".into(),
+                state: SliceState::Refused,
+                issue_count: 250,
+                retrieved: 50,
+                refused_fields: 1,
+            },
+        ];
+        let stored: Vec<_> = (1..=50)
+            .map(|n| {
+                let mut row = stored("synthetic-lab/repo", n, "synthetic-viewer", 1.0, 10);
+                row.merged_at = "2026-08-02".into();
+                row
+            })
+            .collect();
+        let mut fetched = Board::from_alias_map(&json!({}), &[], 0, unmeasured());
+        fetched.total = None;
+        let coverage = coverage_from(&rows, "2026-08-01", "2026-08-02");
+        assert_eq!(
+            coverage.total,
+            Some(0),
+            "existing covered-subset meaning stays distinct"
+        );
+        let board = Board::from_stored(&stored, &fetched, &coverage, 2);
+        assert_eq!(
+            board.total,
+            Some(250),
+            "counted refused day proves denominator without complete retrieval"
+        );
+        assert_eq!(board.accumulated, 50);
+        assert!(!board.complete);
+        rows.pop();
+        let unknown = Board::from_stored(
+            &stored,
+            &fetched,
+            &coverage_from(&rows, "2026-08-01", "2026-08-02"),
+            2,
+        );
+        assert_eq!(
+            unknown.total, None,
+            "uncounted dense day leaves whole denominator unknown"
+        );
+    }
+
     /// The ledger's verdict on a window, for the `from_stored` tests.
     ///
     /// `whole` means every day measured with nothing outstanding, which is
@@ -2314,6 +2392,7 @@ mod tests {
     /// build their own.
     fn whole_coverage(total: u64, retrieved: u64) -> crate::store::pr_slice::Coverage {
         crate::store::pr_slice::Coverage {
+            window_total: Some(total),
             days: vec!["2026-08-01".to_string()],
             total: Some(total),
             retrieved,
@@ -2326,6 +2405,7 @@ mod tests {
         Board {
             rows: Vec::new(),
             total: Some(total),
+            total_verified: true,
             retrieved,
             complete: retrieved == total && refused == 0,
             truncated_slices: Vec::new(),
@@ -2520,6 +2600,7 @@ mod tests {
         fetched.days_total = 30;
         // The worker has never walked this scope, so the ledger is empty.
         let empty = crate::store::pr_slice::Coverage {
+            window_total: None,
             days: Vec::new(),
             total: None,
             retrieved: 0,
@@ -2570,6 +2651,7 @@ mod tests {
         fetched.days_covered = 30;
         fetched.days_total = 30;
         let empty = crate::store::pr_slice::Coverage {
+            window_total: None,
             days: Vec::new(),
             // The fetch's own total carries when the ledger has none.
             total: None,
@@ -2877,6 +2959,7 @@ mod tests {
         progress.publish(PlannedSlices {
             slices: planned.clone(),
             rounds: 1,
+            exact_total: Some(planned.len() as u64),
         });
 
         let sink = super::super::fetch::PartialDetail::new();
@@ -2927,6 +3010,7 @@ mod tests {
         progress.publish(PlannedSlices {
             slices: planned.clone(),
             rounds: 1,
+            exact_total: Some(planned.len() as u64),
         });
 
         let sink = super::super::fetch::PartialDetail::new();
@@ -2944,6 +3028,12 @@ mod tests {
         .expect("one slice answered, so there is something to render");
 
         assert_eq!(loaded.prs.len(), 1);
+        assert_eq!(
+            loaded.board.total,
+            Some(3),
+            "the completed count plan survives a detail timeout"
+        );
+        assert!(loaded.board.total_verified);
         assert!(!loaded.board.complete);
         let named: Vec<&str> = loaded
             .board
@@ -2964,6 +3054,34 @@ mod tests {
             .truncated_slices
             .iter()
             .all(|s| s.issue_count == 0 && s.retrieved == 0));
+    }
+
+    #[test]
+    fn timeout_never_promotes_an_unprobed_or_contradictory_count_plan() {
+        let _g = super::super::budget::observed_test_lock();
+        let _restore = super::super::budget::RestoreObserved::capture();
+        let sink = super::super::fetch::PartialDetail::new();
+        let map = json!({"s0":{"issueCount":1,"nodes":[node("alice",10,5,2,1)]}});
+        sink.record(map.as_object().unwrap(), 0, 1);
+        for exact_total in [None, Some(0)] {
+            let progress = BoardProgress::default();
+            progress.publish(PlannedSlices {
+                slices: slices(2),
+                rounds: 1,
+                exact_total,
+            });
+            let loaded = partial_on_timeout(
+                &progress,
+                &sink,
+                &Budget::new(),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(loaded.board.total, None);
+            assert!(!loaded.board.total_verified);
+            assert!(!loaded.board.complete);
+        }
     }
 
     /// A ceiling that expires while PLANNING is an error, not an empty board.

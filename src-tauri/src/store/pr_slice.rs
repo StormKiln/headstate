@@ -337,6 +337,9 @@ pub struct Coverage {
     /// "400 of 0" or, worse, complete. This is the `Option` #1094 requires
     /// and the reason `Board::total` became one.
     pub total: Option<u64>,
+    /// Exact requested-window count, only when every date has one measured daily count.
+    /// Counted Refused days qualify here without claiming retrieval coverage.
+    pub window_total: Option<u64>,
     /// How many pull requests are held across the covered ranges.
     pub retrieved: u64,
     /// Whether any covered range came back short or refused fields.
@@ -359,10 +362,10 @@ impl Coverage {
 /// partial day as a whole one, which is the silent wrongness this whole
 /// design is against.
 ///
-/// `issue_count` is summed over settled rows only, for the same reason and
-/// with a second one: a refused range's count is exact but its rows are
-/// not, so adding it to the denominator without adding its pull requests
-/// to the numerator would make the shortfall look larger than it is.
+/// `total` retains its settled-subset meaning. `window_total` is separate:
+/// every requested date must have an exact measured count, including Refused
+/// days whose rows have not all arrived. It can prove the whole denominator
+/// without making a retrieval-completeness claim.
 pub fn coverage(
     conn: &Connection,
     scope_key: &str,
@@ -371,6 +374,27 @@ pub fn coverage(
 ) -> Result<Coverage, StoreError> {
     let rows = rows_overlapping(conn, scope_key, from, to)?;
     Ok(coverage_from(&rows, from, to))
+}
+
+/// Count proof is independent of retrieval completeness. Reject missing dates,
+/// duplicates and overlapping/wide legacy rows instead of guessing a tiling.
+pub fn whole_window_total(rows: &[SliceRow], from: &str, to: &str) -> Option<u64> {
+    let dates = clamped_days(from, to, from, to);
+    if dates.is_empty() {
+        return None;
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for row in rows {
+        if row.to.as_str() < from || row.from.as_str() > to {
+            continue;
+        }
+        if row.from != row.to || counts.insert(row.from.as_str(), row.issue_count).is_some() {
+            return None;
+        }
+    }
+    dates.iter().try_fold(0u64, |total, date| {
+        total.checked_add(*counts.get(date.as_str())?)
+    })
 }
 
 /// [`coverage`] over rows already in hand.
@@ -406,6 +430,7 @@ pub fn coverage_from(rows: &[SliceRow], from: &str, to: &str) -> Coverage {
         // the feature: a board with rows and an unknown denominator must
         // say so rather than print a total it has not measured.
         total: any.then_some(total),
+        window_total: whole_window_total(rows, from, to),
         retrieved,
         partial,
     }
@@ -504,6 +529,34 @@ mod tests {
             retrieved,
             refused_fields: 0,
         }
+    }
+
+    #[test]
+    fn window_count_requires_unique_daily_counts_even_when_retrieval_is_refused() {
+        let a = row("2026-08-01", "2026-08-01", SliceState::Complete, 0, 0);
+        let b = row("2026-08-02", "2026-08-02", SliceState::Refused, 250, 50);
+        let proof = vec![a.clone(), b.clone()];
+        assert_eq!(whole_window_total(&proof, &a.from, &b.to), Some(250));
+        assert_eq!(whole_window_total(&proof, &b.from, &b.to), Some(250));
+        assert_eq!(whole_window_total(&proof[..1], &a.from, &b.to), None);
+        assert_eq!(
+            whole_window_total(&[a.clone(), b.clone(), b.clone()], &a.from, &b.to),
+            None
+        );
+        let wide = row(&a.from, &b.to, SliceState::Complete, 250, 250);
+        assert_eq!(whole_window_total(&[wide], &a.from, &b.to), None);
+        assert_eq!(whole_window_total(&[], &a.from, &b.to), None);
+        assert_eq!(whole_window_total(&proof, "bad-date", &b.to), None);
+        let overflow = row(&a.from, &a.to, SliceState::Complete, u64::MAX, 0);
+        assert_eq!(
+            whole_window_total(&[overflow, b.clone()], &a.from, &b.to),
+            None
+        );
+        assert_eq!(
+            coverage_from(&proof, &a.from, &b.to).total,
+            Some(0),
+            "subset semantics remain unchanged"
+        );
     }
 
     fn pr(repo: &str, number: u64, day: &str) -> StoredPr {

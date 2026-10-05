@@ -1,3 +1,4 @@
+import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
 import { useStatsDemand } from "./useStatsDemand";
 import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { useDetailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
@@ -3986,28 +3987,18 @@ function scopeKey(scope: StatsScope): string {
 /// a failed board is an expensive thing to repeat silently, and the view has
 /// an explicit retry that tells the user it is trying again.
 export function useStatsBoard(
-  scope: StatsScope | undefined,
-  measure: "merged" | "opened",
-  days: number,
-  enabled: boolean,
+  scope: StatsScope | undefined, measure: "merged" | "opened", days: number, enabled: boolean,
 ) {
+  const qc = useQueryClient();
   const loadable = scopeIsLoadable(scope);
   useStatsDemand(scope?.kind,scope?.value,measure,days,enabled && loadable);
-  return useQuery({
-    queryKey: [
-      "stats-board",
-      loadable ? scopeKey(scope) : "none",
-      measure,
-      days,
-    ],
-    queryFn: () =>
-      timeCall(`stats-board[${scopeKey(scope!)} ${measure} ${days}d]`, () =>
-        statsBoard(scope!.kind, scope!.value, measure, days),
-      ),
-    enabled: enabled && loadable,
-    staleTime: 5 * 60 * 1000,
-    retry: false,
+  const key = ["stats-board", loadable ? scopeKey(scope) : "none", measure, days];
+  const query = useQuery({ queryKey:key,
+    queryFn: () => readStatsBoard(qc,key,()=>timeCall(`stats-board[${scopeKey(scope!)} ${measure} ${days}d]`,()=>statsBoard(scope!.kind,scope!.value,measure,days))),
+    enabled:enabled && loadable, staleTime:5*60*1000, retry:false,
   });
+  const refresh = useStatsBoardRefresh(qc,key,{scopeKind:scope?.kind??"all",scopeValue:scope?.value,measure,days},enabled&&loadable);
+  return {...query,refresh};
 }
 
 /// The scoped daily activity series (#826).
@@ -5335,11 +5326,12 @@ export type StatsBackfillState = StatsBackfillFrame | null;
 /// A direct import works on the desktop and silently never fires on the
 /// phone, which is the failure `POLL_EVENTS` in `transport.test.ts` exists
 /// to make impossible.
-export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwner): StatsBackfillState {
+export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwner, stream?: string): StatsBackfillState {
+  const qc = useQueryClient();
   const [held, setState] = useState<{ scopeKey?: string; frame: StatsBackfillFrame | null }>({
     frame: null,
   });
-  const state = held.scopeKey === scopeKey && held.frame?.owner?.viewer === owner?.viewer && held.frame?.owner?.generation === owner?.generation ? held.frame : null;
+  const state = held.scopeKey === scopeKey && held.frame?.owner?.viewer === owner?.viewer && held.frame?.owner?.generation === owner?.generation && (!held.frame?.observation || held.frame.observation.stream === stream) ? held.frame : null;
 
   const viewer = owner?.viewer;
   const generation = owner?.generation;
@@ -5348,10 +5340,15 @@ export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwne
 
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
+    const epoch = statsOwnership(qc);
+    let sequence = -1;
     listen<StatsBackfillFrame>("stats-backfill-progress", (e) => {
+      if (cancelled || epoch !== statsOwnership(qc)) return;
       const f = e.payload;
-      // Another scope's progress is not this page's news.
+      // Unrelated frames do not advance this scope's observation watermark.
       if (f.scopeKey !== scopeKey || f.owner?.viewer !== viewer || f.owner?.generation !== generation) return;
+      if (f.observation && (f.observation.stream !== stream || f.observation.sequence <= sequence)) return;
+      if (f.observation) sequence = f.observation.sequence;
       setState({ scopeKey, frame: f });
     }).then(
       (fn) => {
@@ -5365,7 +5362,7 @@ export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwne
       safeUnlisten(unlisten);
       unlisten = undefined;
     };
-  }, [scopeKey, viewer, generation]);
+  }, [scopeKey, viewer, generation, stream, qc]);
 
   return state;
 }

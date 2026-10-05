@@ -482,6 +482,7 @@ pub fn run() {
             commands::gitlab_stats_load,
             commands::gitlab_stats_backfill,
             commands::stats_board,
+            commands::stats_board_cached,
             commands::stats_demand,
             commands::stats_series,
             commands::stats_reviewers,

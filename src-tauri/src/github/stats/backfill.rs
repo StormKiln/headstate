@@ -309,6 +309,11 @@ pub trait Progress: Send + Sync {
 /// What the worker knows after a tick, in the shape the UI renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub from: String,
+    pub to: String,
+    pub covered_days: Vec<String>,
+    /// The actual data/ledger transaction committed, even if coverage remained partial.
+    pub cache_changed: bool,
     pub owner: crate::store::stats_owner::StatsOwner,
     /// The scope this is about, as `StatsQuery::cache_key` spells it.
     pub scope_key: String,
@@ -316,10 +321,10 @@ pub struct Report {
     pub days_covered: usize,
     /// Days in the horizon.
     pub days_total: usize,
-    /// Pull requests held across the covered days.
+    /// Pull requests held across the actual report window, including staged days.
     pub collected: u64,
-    /// GitHub's exact total for the covered days, or `None` when nothing
-    /// has been measured yet.
+    /// Exact whole-window daily count proof, or `None` when any date is
+    /// uncounted or the measured count contradicts the held population.
     ///
     /// **Never defaulted to 0.** See [`Progress::tick`].
     pub total: Option<u64>,

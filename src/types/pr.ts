@@ -2917,6 +2917,27 @@ export type BackfillRegistration =
   | ({ state: "registered" } & BackfillRegistered)
   | ({ state: "failed" } & BackfillRegistrationFailed);
 
+/// Exact UTC closed-day window represented by a stored measurement.
+export interface StatsWindow {
+  from: string;
+  to: string;
+}
+/// Process-local observation ordering, not a SQLite revision or freshness grant.
+export interface StatsObservation extends StatsWindow {
+  stream: string;
+  sequence: number;
+  cacheChange: number;
+}
+/// A local read reports measurements, never a demand registration.
+export interface StatsBoardReadback {
+  owner: StatsOwner;
+  viewer: string;
+  scopeKey: string;
+  window: StatsWindow;
+  stream: string;
+  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill">;
+}
+
 /// One frame of PR Stats backfill progress (#1093). Mirrors
 /// `StatsBackfillFrame` in `src-tauri/src/commands.rs`.
 ///
@@ -2926,6 +2947,7 @@ export type BackfillRegistration =
 /// frame while the page was closed -- renders correctly from the next one
 /// instead of accumulating from a start it never saw.
 export interface StatsBackfillFrame {
+  observation?: StatsObservation;
   owner?: StatsOwner;
   /// The scope this describes, as the Rust side keys it. Compared before
   /// anything is rendered: the event is app-global while the work is
@@ -3699,6 +3721,9 @@ export interface ShortSlice {
 /// Rust `Subject::cache_key` doc records as a real case -- would put the
 /// viewer's own work under "Others" and show "no activity" for Mine.
 export interface StatsBoard {
+  window?: StatsWindow;
+  stream?: string;
+  totalVerified?: boolean;
   /** Captured durable owner; absent on older peers and saved payloads. */
   owner?: StatsOwner;
   /// The authenticated login. What splits the board into Mine and Others.

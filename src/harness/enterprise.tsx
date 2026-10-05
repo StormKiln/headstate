@@ -22,7 +22,7 @@ const probe={inventory:()=>renderedInventory,querySummary:()=>client.getQueryCac
  const value=query.state.data as Record<string,unknown>|undefined;
  return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:query.meta?.advisorySchedule,
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
-  ...(query.queryKey[0]==='stats-board'?{days:query.queryKey[3],total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,backfill:value?.backfill}:{}),
+  ...(query.queryKey[0]==='stats-board'?{days:query.queryKey[3],total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
 }),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
 declare global {interface Window {__enterprise:typeof probe}}

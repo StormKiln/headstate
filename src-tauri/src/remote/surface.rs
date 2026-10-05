@@ -130,6 +130,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the property that makes exposing the expensive path safe rather
     // than a second set of limits to keep in sync.
     ("stats_board", Class::Read),
+    ("stats_board_cached", Class::Read),
     // Ephemeral bounded read interest, including mobile read recovery.
     ("stats_demand", Class::Read),
     // The scoped daily activity series (#826). A Read, and the cheap half
@@ -1158,6 +1159,16 @@ async fn call(
             app.clone(),
             a.get("request")?,
             context.clone(),
+        )
+        .await),
+        "stats_board_cached" => res(commands::stats_board_cached(
+            app.clone(),
+            app.state(),
+            a.get("expectedOwner")?,
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            a.get("measure")?,
+            a.get("days")?,
         )
         .await),
         "stats_board" => res(commands::stats_board_with_context(

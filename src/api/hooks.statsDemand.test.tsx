@@ -8,7 +8,7 @@ import { useStatsBoard } from "./hooks";
 afterEach(()=>{cleanup();vi.useRealTimers();vi.restoreAllMocks();call.mockReset();});
 it("coalesces visible observers, renews locally and releases on hide without reloading boards",async()=>{
  vi.useFakeTimers();let handle=0;
- call.mockImplementation((name:string)=>Promise.resolve(name==="stats_demand"?{handle:`lease-${++handle}`,owner:{viewer:"fixture",generation:1}}:{}));
+ call.mockImplementation((name:string)=>Promise.resolve(name==="stats_demand"?{handle:`lease-${++handle}`,owner:{viewer:"fixture",generation:1}}:{backfill:{state:"failed",reason:"synthetic no registration"}}));
  const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
  const wrapper=({children}:{children:ReactNode})=><QueryClientProvider client={client}>{children}</QueryClientProvider>;
  const useBoard= ()=>useStatsBoard({kind:"org",value:"fixture",subject:undefined},"merged",30,true);
@@ -34,7 +34,7 @@ it("coalesces visible observers, renews locally and releases on hide without rel
 
 it("releases acquisition arriving after unmount and reacquires after renewal refusal",async()=>{
  vi.useFakeTimers();let finish:((value:unknown)=>void)|undefined;
- call.mockImplementation((name:string)=>name==="stats_demand"?new Promise(resolve=>{finish=resolve;}):Promise.resolve({}));
+ call.mockImplementation((name:string)=>name==="stats_demand"?new Promise(resolve=>{finish=resolve;}):Promise.resolve({backfill:{state:"failed",reason:"synthetic no registration"}}));
  const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
  const wrapper=({children}:{children:ReactNode})=><QueryClientProvider client={client}>{children}</QueryClientProvider>;
  const useBoard= ()=>useStatsBoard({kind:"org",value:"fixture",subject:undefined},"merged",7,true);

@@ -673,6 +673,7 @@ async fn stale_background_page_and_frame_cannot_cross_owner_aba() {
     assert_eq!(crate::store::pr_slice::total_rows(&tx).unwrap(), 0);
     tx.commit().unwrap();
     remember_backfill_frame(&StatsBackfillFrame {
+        observation: None,
         owner: Some(old),
         scope_key: "key".into(),
         days_covered: 9,
@@ -1774,4 +1775,189 @@ fn latest_attempt_metadata_does_not_downgrade_complete_measurements_or_replay_sp
         result.receipt.unwrap().qualification.is_none(),
         "an old failure must not label a later attempt"
     );
+}
+
+#[tokio::test]
+async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_owner() {
+    use crate::store::{pr_history, pr_slice};
+    let p = provider("synthetic-cache-viewer", 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    let mut conn = open_db(&db).unwrap();
+    let owner = stats_owner::capture_verified(&conn, "synthetic-cache-viewer").unwrap();
+    let read = |owner: StatsOwner, days| {
+        stats_board_cached_for_client(
+            &p.client,
+            db.clone(),
+            owner,
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            days,
+        )
+    };
+    assert!(read(owner.clone(), 1)
+        .await
+        .unwrap_err()
+        .contains("not verified"));
+    assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+    p.client
+        .stats_viewer_metered(&p.client.request_budget())
+        .await
+        .unwrap();
+    let calls = p.calls.load(Ordering::SeqCst);
+    let empty = read(owner.clone(), 1).await.unwrap();
+    assert!(empty.measurement.rows.is_empty());
+    assert_eq!(empty.measurement.total, None);
+    assert!(!empty.measurement.complete);
+    let day = empty.window.to.clone();
+    let row = pr_history::StoredPr {
+        repo: "fixture/repo".into(),
+        number: 1,
+        merged_at: day.clone(),
+        title: "synthetic".into(),
+        url: "https://example.test/pr/1".into(),
+        author: "synthetic-cache-viewer".into(),
+        cycle_time_hours: 1.0,
+        size: 3,
+        additions: 2,
+        deletions: 1,
+        changed_files: 1,
+        reviews_received: 1,
+    };
+    pr_history::put_many(
+        &mut conn,
+        &empty.scope_key,
+        &day,
+        &day,
+        &[row],
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    pr_slice::put(
+        &conn,
+        &empty.scope_key,
+        &pr_slice::SliceRow {
+            from: day.clone(),
+            to: day.clone(),
+            state: pr_slice::SliceState::Refused,
+            issue_count: 250,
+            retrieved: 1,
+            refused_fields: 0,
+        },
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let before = stats_store_snapshot(&conn);
+    let staged = read(owner.clone(), 1).await.unwrap();
+    assert_eq!(staged.measurement.accumulated, 1);
+    assert_eq!(staged.measurement.days_covered, 0);
+    assert_eq!(staged.measurement.total, Some(250));
+    assert!(!staged.measurement.complete);
+    let wider = read(owner.clone(), 7).await.unwrap();
+    assert_eq!(wider.measurement.accumulated, 1);
+    assert_eq!(
+        wider.measurement.total, None,
+        "one counted date cannot count the wider window"
+    );
+    assert_eq!(
+        stats_store_snapshot(&conn),
+        before,
+        "readback must not register, reserve, or mutate"
+    );
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        calls,
+        "readback must not query even the viewer"
+    );
+    let mut pure = staged.measurement.clone();
+    pure.accumulating = false;
+    pure.accumulated = 0;
+    pure.retrieved = 5;
+    pure.rows[0].prs = 5;
+    pure.repo_counts[0].merged = 5;
+    pure.refused_fields = 1;
+    let materialized = StatsBoard {
+        owner: Some(owner.clone()),
+        viewer: owner.viewer().into(),
+        scope_key: empty.scope_key.clone(),
+        window: Some(empty.window.clone()),
+        stream: Some(empty.stream.clone()),
+        board: pure,
+        backfill: BackfillRegistration::default(),
+    };
+    let cache_key = crate::store::stats::key(crate::store::stats::Kind::Board, &empty.scope_key);
+    let payload = serde_json::to_value(&materialized).unwrap();
+    crate::store::stats::put(
+        &conn,
+        &cache_key,
+        &day,
+        &day,
+        250,
+        false,
+        &payload.to_string(),
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let retained = read(owner.clone(), 1).await.unwrap();
+    assert_eq!(
+        retained.measurement.retrieved, 5,
+        "weaker SQLite population must retain materialized foreground-only rows"
+    );
+    assert!(!retained.measurement.accumulating);
+    assert!(
+        serde_json::to_value(&retained)
+            .unwrap()
+            .get("backfill")
+            .is_none(),
+        "measurement reply cannot invent registration status"
+    );
+    let mut legacy = payload;
+    legacy.as_object_mut().unwrap().remove("totalVerified");
+    conn.execute("DELETE FROM pr_slice", []).unwrap();
+    crate::store::stats::put(
+        &conn,
+        &cache_key,
+        &day,
+        &day,
+        250,
+        false,
+        &legacy.to_string(),
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    assert_eq!(
+        read(owner.clone(), 1).await.unwrap().measurement.total,
+        None,
+        "old unqualified serialized totals are not whole-window proof"
+    );
+    pr_slice::put(
+        &conn,
+        &empty.scope_key,
+        &pr_slice::SliceRow {
+            from: day.clone(),
+            to: day.clone(),
+            state: pr_slice::SliceState::Complete,
+            issue_count: 1,
+            retrieved: 1,
+            refused_fields: 0,
+        },
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let complete = read(owner.clone(), 1).await.unwrap();
+    assert!(
+        complete.measurement.complete,
+        "current full durable evidence replaces a prior foreground refusal"
+    );
+    assert_eq!(complete.measurement.accumulated, 1);
+    assert_eq!(complete.measurement.total, Some(1));
+    assert_eq!(p.calls.load(Ordering::SeqCst), calls);
+    let bob = stats_owner::capture_verified(&conn, "synthetic-other-viewer").unwrap();
+    assert!(read(owner, 1)
+        .await
+        .unwrap_err()
+        .contains("account changed"));
+    assert!(read(bob, 1).await.unwrap_err().contains("owner changed"));
+    assert_eq!(p.calls.load(Ordering::SeqCst), calls);
 }

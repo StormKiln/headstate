@@ -412,6 +412,10 @@ export const statsBoard = (
   days: number,
 ) => call<StatsBoard>("stats_board", { scopeKind, scopeValue, measure, days });
 
+/** Never falls back to the provider-loading command on an older backend. */
+export const statsBoardCached = (scopeKind: string, scopeValue: string | undefined, measure: "merged" | "opened", days: number, expectedOwner: import("../types/pr").StatsOwner) =>
+  call<import("../types/pr").StatsBoardReadback>("stats_board_cached", { scopeKind, scopeValue, measure, days, expectedOwner });
+
 /// The scoped daily opened/merged series (#826).
 ///
 /// The cheap half of a scope page: count-only searches, no per-PR nodes, so

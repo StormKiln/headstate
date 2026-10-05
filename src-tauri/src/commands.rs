@@ -5809,6 +5809,11 @@ async fn stats_board_with_demand(
     .await?
     {
         return Ok(StatsBoard {
+            window: Some(StatsWindow {
+                from: req.window.from.clone(),
+                to: req.window.to.clone(),
+            }),
+            stream: Some(stats_progress_stream().into()),
             owner: Some(owner.clone()),
             scope_key: q.cache_key(&viewer),
             viewer,
@@ -5829,6 +5834,12 @@ async fn stats_board_with_demand(
             // an answer about a window, while registration is about now.
             // The field is not deserialised at all (`skip_deserializing`),
             // so a stale row cannot carry an old "registered" through.
+            sanitize_board_total(&mut cached.board);
+            cached.window = Some(StatsWindow {
+                from: req.window.from.clone(),
+                to: req.window.to.clone(),
+            });
+            cached.stream = Some(stats_progress_stream().into());
             cached.backfill = backfill;
             cached.owner = Some(owner.clone());
             return Ok(cached);
@@ -5921,6 +5932,11 @@ async fn stats_board_with_demand(
             )
             .await;
             Ok(StatsBoard {
+                window: Some(StatsWindow {
+                    from: req.window.from.clone(),
+                    to: req.window.to.clone(),
+                }),
+                stream: Some(stats_progress_stream().into()),
                 owner: Some(owner.clone()),
                 viewer: viewer.clone(),
                 scope_key: scope_key.clone(),
@@ -6023,24 +6039,185 @@ async fn stored_stats_board(
         if coverage.days_covered() == 0 {
             return Ok(None);
         }
-        let stored = crate::store::pr_history::load(&tx, &scope_key, &from, &to)
-            .map_err(|e| e.to_string())?;
-        let mut empty = crate::github::stats::Board::from_alias_map(
-            &serde_json::json!({}),
-            &[],
-            0,
-            crate::github::stats::Budget::new().snapshot(),
-        );
-        empty.total = None;
-        Ok(Some(crate::github::stats::Board::from_stored(
-            &stored,
-            &empty,
-            &coverage,
-            crate::github::stats::backfill::days_between(&from, &to),
-        )))
+        stored_board_snapshot(&tx, &owner, &scope_key, &from, &to, chrono::Utc::now()).map(Some)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Shared local assembly; never reserves evidence, registers demand or calls a provider.
+fn stored_board_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &StatsOwner,
+    scope_key: &str,
+    from: &str,
+    to: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::github::stats::Board, String> {
+    use crate::github::stats::Board;
+    stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
+    let coverage =
+        crate::store::pr_slice::coverage(tx, scope_key, from, to).map_err(|e| e.to_string())?;
+    let stored =
+        crate::store::pr_history::load(tx, scope_key, from, to).map_err(|e| e.to_string())?;
+    let key = crate::store::stats::key(crate::store::stats::Kind::Board, scope_key);
+    let cached = crate::store::stats::get(tx, &key, from, to, now)
+        .map_err(|e| e.to_string())?
+        .and_then(|hit| serde_json::from_str::<StatsBoard>(&hit.payload).ok())
+        .filter(|b| b.owner.as_ref() == Some(owner) && b.scope_key == scope_key)
+        .map(|mut b| {
+            sanitize_board_total(&mut b.board);
+            b.board
+        });
+    let mut empty = Board::from_alias_map(
+        &serde_json::json!({}),
+        &[],
+        0,
+        crate::github::stats::Budget::new().snapshot(),
+    );
+    empty.total = None;
+    let days_total = crate::github::stats::backfill::days_between(from, to);
+    // A prior foreground refusal describes that load, not newly committed,
+    // fully covered history. Keep its exact count proof when useful without
+    // making its transient refusal permanently poison a later local result.
+    let mut fetched = cached.as_ref().unwrap_or(&empty).clone();
+    if coverage.days_covered() >= days_total && !coverage.partial {
+        fetched.refused_fields = 0;
+        fetched.truncated_slices.clear();
+    }
+    let assembled = Board::from_stored(&stored, &fetched, &coverage, days_total);
+    // A successful weak history read is not authority to erase a useful
+    // foreground-only measurement whose accumulation failed or was superseded.
+    // No row union or count-based claim of newer evidence is invented.
+    if !assembled.complete {
+        if let Some(mut cached) = cached {
+            let population = if cached.accumulating {
+                cached.accumulated
+            } else {
+                cached.retrieved
+            };
+            if (!cached.accumulating && population > 0) || population > assembled.accumulated {
+                if let Some(total) = coverage.window_total {
+                    cached.total = (total >= population).then_some(total);
+                    cached.total_verified = cached.total.is_some();
+                    cached.complete = false;
+                }
+                return Ok(cached);
+            }
+        }
+    }
+    Ok(assembled)
+}
+fn sanitize_board_total(board: &mut crate::github::stats::Board) {
+    let population = if board.accumulating {
+        board.accumulated
+    } else {
+        board.retrieved
+    };
+    if !board.total_verified || board.total.is_some_and(|total| total < population) {
+        board.total = None;
+        board.total_verified = false;
+        board.complete = false;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsWindow {
+    pub from: String,
+    pub to: String,
+}
+
+/// Measurement only: a local read cannot fabricate a demand registration.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsBoardReadback {
+    pub owner: StatsOwner,
+    pub viewer: String,
+    pub scope_key: String,
+    pub window: StatsWindow,
+    pub stream: String,
+    pub measurement: crate::github::stats::Board,
+}
+
+#[tauri::command]
+pub async fn stats_board_cached(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    expected_owner: StatsOwner,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoardReadback, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    stats_board_cached_for_client(
+        &client,
+        db_path(&app),
+        expected_owner,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await
+}
+async fn stats_board_cached_for_client(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    expected_owner: StatsOwner,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoardReadback, String> {
+    let viewer = client
+        .known_viewer()
+        .ok_or("Stats cache identity is not verified")?
+        .to_owned();
+    if !viewer.eq_ignore_ascii_case(expected_owner.viewer()) {
+        return Err("Stats cache owner changed".into());
+    }
+    let measure = match measure.as_str() {
+        "merged" => crate::github::stats::Measure::Merged,
+        "opened" => crate::github::stats::Measure::Opened,
+        _ => return Err("unknown measure".into()),
+    };
+    let now = chrono::Utc::now();
+    let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
+    let query = crate::github::stats::StatsQuery::new(None, req.scope, measure);
+    let scope_key = query.cache_key(&viewer);
+    let window = StatsWindow {
+        from: req.window.from,
+        to: req.window.to,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let measurement = stored_board_snapshot(
+            &tx,
+            &expected_owner,
+            &scope_key,
+            &window.from,
+            &window.to,
+            now,
+        )?;
+        Ok(StatsBoardReadback {
+            owner: expected_owner,
+            viewer,
+            scope_key,
+            window,
+            stream: stats_progress_stream().into(),
+            measurement,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn stats_progress_stream() -> &'static str {
+    static STREAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STREAM.get_or_init(|| format!("{}:{}", std::process::id(), chrono::Utc::now().to_rfc3339()))
 }
 
 /// Write a load's pull requests down and re-assemble the board from
@@ -6220,6 +6397,10 @@ fn accumulate_board_blocking(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<StatsWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StatsOwner>,
     pub viewer: String,
@@ -9447,9 +9628,8 @@ mod tests {
         assert_eq!(board.days_covered, 1);
         assert_eq!(board.days_total, 7);
         assert_eq!(
-            board.total,
-            Some(2000),
-            "the ledger preserves the measured range while missing days remain uncovered"
+            board.total, None,
+            "a counted subset is not the total of a wider window with missing dates"
         );
         assert!(!board.complete);
         let whole_day = super::stored_stats_board(
@@ -9475,6 +9655,7 @@ mod tests {
     }
     fn frame_for(scope_key: &str, days_covered: usize) -> super::StatsBackfillFrame {
         super::StatsBackfillFrame {
+            observation: None,
             owner: Some(frame_owner()),
             scope_key: scope_key.to_string(),
             days_covered,
@@ -9484,6 +9665,56 @@ mod tests {
             phase: crate::github::stats::backfill::BackfillPhase::Working,
             next_tick_at_ms: None,
         }
+    }
+
+    #[test]
+    fn stats_observation_changes_only_for_durable_or_material_window_progress() {
+        use crate::github::stats::backfill::{BackfillPhase, Report};
+        let mut frame = frame_for("task11-observation", 1);
+        let mut report = Report {
+            owner: frame.owner.clone().unwrap(),
+            scope_key: frame.scope_key.clone(),
+            from: "2026-09-01".into(),
+            to: "2026-09-30".into(),
+            covered_days: vec!["2026-09-01".into()],
+            cache_changed: false,
+            days_covered: 1,
+            days_total: 30,
+            collected: 400,
+            total: Some(500),
+            phase: BackfillPhase::Working,
+            next_tick_at_ms: None,
+        };
+        super::observe_backfill_frame(&mut frame, &report);
+        let first = frame.observation.clone().unwrap();
+        frame.next_tick_at_ms = Some(1234);
+        super::observe_backfill_frame(&mut frame, &report);
+        let heartbeat = frame.observation.clone().unwrap();
+        assert!(heartbeat.sequence > first.sequence);
+        assert_eq!(heartbeat.cache_change, first.cache_change);
+        report.cache_changed = true; // A committed correction can leave all counts unchanged.
+        super::observe_backfill_frame(&mut frame, &report);
+        let correction = frame.observation.clone().unwrap();
+        assert!(correction.cache_change > heartbeat.cache_change);
+        report.cache_changed = false;
+        report.covered_days = vec!["2026-09-02".into()]; // Equal count, different covered date.
+        super::observe_backfill_frame(&mut frame, &report);
+        let coverage = frame.observation.clone().unwrap();
+        assert!(coverage.cache_change > correction.cache_change);
+        report.from = "2026-09-02".into();
+        report.to = "2026-10-01".into();
+        super::observe_backfill_frame(&mut frame, &report);
+        let rollover = frame.observation.clone().unwrap();
+        assert!(rollover.cache_change > coverage.cache_change);
+        // Eviction loses comparison state, never the process-wide ordering identity.
+        super::backfill_frames()
+            .lock()
+            .unwrap()
+            .remove(&(report.owner.clone(), report.scope_key.clone()));
+        super::observe_backfill_frame(&mut frame, &report);
+        let after = frame.observation.unwrap();
+        assert!(after.sequence > rollover.sequence);
+        assert_eq!(after.stream, first.stream);
     }
 
     /// A failed registration reaches the page AS a failure, with its
@@ -11238,6 +11469,8 @@ pub const STATS_BACKFILL_PROGRESS: &str = "stats-backfill-progress";
 #[serde(rename_all = "camelCase")]
 pub struct StatsBackfillFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Box<StatsObservation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<StatsOwner>,
     pub scope_key: String,
     pub days_covered: usize,
@@ -11256,6 +11489,18 @@ pub struct StatsBackfillFrame {
     pub next_tick_at_ms: Option<i64>,
 }
 
+/// Ephemeral observation order and conservative backfill invalidation token.
+/// Neither sequence nor cache_change is a durable SQLite revision.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsObservation {
+    pub stream: String,
+    pub sequence: u64,
+    pub cache_change: u64,
+    pub from: String,
+    pub to: String,
+}
+
 /// Emit one backfill progress frame.
 ///
 /// Failures are discarded the way every other emitter here discards them:
@@ -11263,7 +11508,8 @@ pub struct StatsBackfillFrame {
 /// down, and a background walk must not fail because nothing was
 /// listening.
 pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
-    let frame = StatsBackfillFrame {
+    let mut frame = StatsBackfillFrame {
+        observation: None,
         owner: Some(report.owner.clone()),
         scope_key: report.scope_key.clone(),
         days_covered: report.days_covered,
@@ -11273,7 +11519,7 @@ pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backf
         phase: report.phase.clone(),
         next_tick_at_ms: report.next_tick_at_ms,
     };
-    remember_backfill_frame(&frame);
+    observe_backfill_frame(&mut frame, report);
     let _ = app.emit(STATS_BACKFILL_PROGRESS, frame);
 }
 
@@ -11290,14 +11536,71 @@ pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backf
 /// Bounded by the registered scopes, which are the only keys the worker
 /// emits for, and cleared with them on an identity change.
 fn backfill_frames(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), StatsBackfillFrame>>
-{
+) -> &'static std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), BackfillMemory>> {
     static FRAMES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), StatsBackfillFrame>>,
+        std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), BackfillMemory>>,
     > = std::sync::OnceLock::new();
     FRAMES.get_or_init(Default::default)
 }
 
+#[derive(Clone)]
+struct BackfillMemory {
+    frame: StatsBackfillFrame,
+    covered_days: Vec<String>,
+}
+fn observe_backfill_frame(
+    frame: &mut StatsBackfillFrame,
+    report: &crate::github::stats::backfill::Report,
+) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut frames = backfill_frames().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (report.owner.clone(), report.scope_key.clone());
+    let previous = frames.get(&key);
+    let changed = report.cache_changed
+        || previous.is_none_or(|old| {
+            old.covered_days != report.covered_days
+                || old.frame.collected != frame.collected
+                || old.frame.total != frame.total
+                || old
+                    .frame
+                    .observation
+                    .as_ref()
+                    .is_none_or(|o| o.from != report.from || o.to != report.to)
+        });
+    let sequence = SEQUENCE
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| n.checked_add(1),
+        )
+        .expect("stats observation exhausted")
+        + 1;
+    let cache_change = if changed {
+        sequence
+    } else {
+        previous
+            .and_then(|old| old.frame.observation.as_ref())
+            .map_or(sequence, |o| o.cache_change)
+    };
+    frame.observation = Some(Box::new(StatsObservation {
+        stream: stats_progress_stream().into(),
+        sequence,
+        cache_change,
+        from: report.from.clone(),
+        to: report.to.clone(),
+    }));
+    if frames.len() >= 256 && !frames.contains_key(&key) {
+        frames.clear();
+    }
+    frames.insert(
+        key,
+        BackfillMemory {
+            frame: frame.clone(),
+            covered_days: report.covered_days.clone(),
+        },
+    );
+}
+#[cfg(test)]
 fn remember_backfill_frame(frame: &StatsBackfillFrame) {
     let Some(owner) = &frame.owner else {
         return;
@@ -11306,7 +11609,13 @@ fn remember_backfill_frame(frame: &StatsBackfillFrame) {
         if frames.len() >= 256 {
             frames.clear();
         }
-        frames.insert((owner.clone(), frame.scope_key.clone()), frame.clone());
+        frames.insert(
+            (owner.clone(), frame.scope_key.clone()),
+            BackfillMemory {
+                frame: frame.clone(),
+                covered_days: Vec::new(),
+            },
+        );
     }
 }
 
@@ -11316,7 +11625,7 @@ fn last_backfill_frame(owner: &StatsOwner, scope_key: &str) -> Option<StatsBackf
         .lock()
         .ok()?
         .get(&(owner.clone(), scope_key.to_string()))
-        .cloned()
+        .map(|memory| memory.frame.clone())
 }
 
 /// Drop every remembered frame. The identity change clears the tables

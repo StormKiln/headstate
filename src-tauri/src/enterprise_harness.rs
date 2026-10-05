@@ -106,6 +106,7 @@ fn supported(command: &str) -> bool {
             | "get_pr_reviews"
             | "get_review_threads"
             | "stats_board"
+            | "stats_board_cached"
             | "stats_tree"
             | "stats_backfill"
             | "stats_demand"

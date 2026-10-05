@@ -63,6 +63,7 @@ impl Rig {
                     "cursor-number" => page["pageInfo"]["endCursor"] = json!(120),
                     "duplicate" if after>0 => page["nodes"][0]["number"] = json!(base+1),
                     "short-terminal" => page["pageInfo"]["hasNextPage"] = json!(false),
+                    "corrected-short-terminal" => { page["pageInfo"]["hasNextPage"] = json!(false); page["nodes"][0]["additions"] = json!(9); },
                     "bad-node" => {page["nodes"][0].as_object_mut().unwrap().remove("number");},
                     _ => {},
                 }
@@ -563,5 +564,77 @@ fn a_page_dispatched_before_pruning_cannot_restore_coverage_after_reopen() {
             r.tick().await;
             assert_eq!(r.count(), expected);
         }
+    });
+}
+
+#[test]
+fn committed_partial_tick_invalidates_stored_measurements_but_refused_admission_does_not() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("bad-node");
+        let partial = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(partial.outcome, bf::TickOutcome::Failed(_)));
+        assert!(
+            r.count() > 0,
+            "usable members of a refused page were committed"
+        );
+        assert!(
+            partial.cache_changed,
+            "failed outcome must not hide committed usable rows"
+        );
+        let idle = backfill_tick(
+            r.db.clone(),
+            &r.client,
+            Arc::new(crate::stats_demand::Registry::default()),
+        )
+        .await;
+        assert!(
+            !idle.cache_changed,
+            "no-demand admission cannot claim durable progress"
+        );
+    });
+}
+
+#[test]
+fn an_unusable_page_only_resets_continuation_and_does_not_dirty_board_data() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("missing-alias");
+        let tick = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(tick.outcome, bf::TickOutcome::Failed(_)));
+        assert_eq!(r.count(), 0);
+        assert!(
+            !tick.cache_changed,
+            "continuation bookkeeping is not a materialized board change"
+        );
+    });
+}
+
+#[test]
+fn same_population_correction_commits_and_invalidates_even_with_failed_coverage() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("short-terminal");
+        r.tick().await;
+        assert_eq!(r.count(), 50);
+        r.fault("corrected-short-terminal");
+        let tick = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(tick.outcome, bf::TickOutcome::Failed(_)));
+        assert!(tick.cache_changed);
+        assert_eq!(r.count(), 50, "count alone cannot detect a corrected row");
+        let rows = crate::store::pr_history::load(
+            &crate::store::open_db(&r.db).unwrap(),
+            "merged|*|org:fixture",
+            &r.from,
+            &r.to,
+        )
+        .unwrap();
+        assert!(rows.iter().any(|row| row.additions == 9));
     });
 }

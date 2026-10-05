@@ -1699,6 +1699,7 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
                     &scope.to,
                     tick.outcome.phase(),
                     Some(next.timestamp_millis()),
+                    tick.cache_changed,
                 )
                 .await;
             }
@@ -1731,6 +1732,7 @@ async fn wait_backfill_tick(waker: &Notify, last_started: Option<tokio::time::In
 /// there is then no scope to report about, and the page keeps its last
 /// frame.
 struct Tick {
+    cache_changed: bool,
     outcome: crate::github::stats::backfill::TickOutcome,
     scope: Option<TickScope>,
 }
@@ -1749,6 +1751,7 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
     fn from(outcome: crate::github::stats::backfill::TickOutcome) -> Self {
         Self {
             outcome,
+            cache_changed: false,
             scope: None,
         }
     }
@@ -1854,6 +1857,7 @@ async fn backfill_tick(
     // Everything past this point knows its scope, so every exit can report
     // one.
     let here = |outcome| Tick {
+        cache_changed: false,
         outcome,
         scope: Some(TickScope {
             owner: owner.clone(),
@@ -1940,7 +1944,11 @@ async fn backfill_tick(
         .await
     };
     mark_worked(&db, &owner, &scope.scope_key, now).await;
-    match written {
+    // Useful row upserts include same-count corrections and partial failures.
+    // Empty-day/coverage/count changes are compared in the emitted frame;
+    // continuation bookkeeping alone is not a board invalidation.
+    let committed = matches!(&written, Ok(Ok((rows, _, _, _))) if *rows > 0);
+    let mut tick = match written {
         Ok(Ok((_, true, coverage, true))) if !coverage.partial => here(TickOutcome::Complete),
         Ok(Ok((rows, true, coverage, false))) => here(TickOutcome::Advanced {
             days: coverage.days_covered().saturating_sub(covered_before),
@@ -1953,7 +1961,9 @@ async fn backfill_tick(
         Err(_) => here(TickOutcome::Failed(
             "background page storage task failed".into(),
         )),
-    }
+    };
+    tick.cache_changed = committed;
+    tick
 }
 
 /// Note that a scope was advanced, so the rotation moves on.
@@ -1998,6 +2008,7 @@ async fn emit_backfill(
     to: &str,
     phase: crate::github::stats::backfill::BackfillPhase,
     next_tick_at_ms: Option<i64>,
+    cache_changed: bool,
 ) {
     let owner = owner.clone();
     let db = db.to_path_buf();
@@ -2008,9 +2019,13 @@ async fn emit_backfill(
         let tx = conn.transaction().ok()?;
         crate::store::stats_owner::require_current(&tx, &owner).ok()?;
         let cov = crate::store::pr_slice::coverage(&tx, &key, &from, &to).ok()?;
-        let held = crate::store::pr_history::count(&tx, &key, &from, &to).unwrap_or(0);
+        let held = crate::store::pr_history::count(&tx, &key, &from, &to).ok()?;
         let days_total = crate::github::stats::backfill::days_between(&from, &to);
         Some(crate::github::stats::backfill::Report {
+            from,
+            to,
+            cache_changed,
+            covered_days: cov.days.clone(),
             owner,
             scope_key: key,
             days_covered: cov.days_covered(),
@@ -2019,7 +2034,7 @@ async fn emit_backfill(
             // Straight through, `None` and all. Defaulting it here would
             // be the "400 of 0" the design forbids, introduced at the one
             // layer nobody would look at.
-            total: cov.total,
+            total: cov.window_total.filter(|total| *total >= held),
             phase,
             next_tick_at_ms,
         })
