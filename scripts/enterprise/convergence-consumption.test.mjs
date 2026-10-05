@@ -18,3 +18,26 @@ test('real lineage rejects unrelated slot, HTTP, and incomplete native scope',as
  for(const index of [0,1,2,3,4])assert.throws(()=>consumptionLineage(events.filter((_,i)=>i!==index),10,1));
  const wrong=structuredClone(events);wrong[1].code=21;assert.throws(()=>consumptionLineage(wrong,10,1));
 });
+test('browser recovery projection deduplicates metadata without changing positive or negative authority',async()=>{
+ const {recoveryPublications,selectedRecoveryPublication}=await import('./convergence.mjs');
+ const original=globalThis.window;
+ try{
+  for(const mutate of [()=>{},f=>f.events=[],f=>f.clients[1].publications[0].phase='fetching',f=>f.clients[1].publications[0].session='other',f=>f.provider[0].at=999,f=>f.elapsedMs=180001]){
+   const f=recoveryFixture();mutate(f);
+   for(const client of f.clients)client.publications[0].prs=Array.from({length:236},(_,number)=>({number,body:'synthetic full row'}));
+   let originalPass=true;try{assertRecovery(f);}catch{originalPass=false;}
+   const projected=structuredClone(f);
+   for(let i=0;i<f.clients.length;i++){
+    const receipt=f.clients[i].publications[0];
+    globalThis.window={__enterprise:{telemetry:[{kind:'event',name:'source-poll-status',reply:{...receipt,receipt_revision:7}},{kind:'event',name:'source-poll-status',reply:receipt},{kind:'event',name:'source-poll-status',reply:receipt}]}};
+    const metadata=recoveryPublications(f.consumed);
+    assert.ok(metadata.length<=1);assert.ok(metadata.every(p=>!('prs' in p)));
+    projected.clients[i].publications=metadata;
+    if(metadata.length)assert.deepEqual(selectedRecoveryPublication(metadata[0]),receipt);
+    assert.throws(()=>selectedRecoveryPublication({...receipt,receipt_revision:999}));
+   }
+   let projectedPass=true;try{assertRecovery(projected);}catch{projectedPass=false;}
+   assert.equal(projectedPass,originalPass);
+  }
+ }finally{globalThis.window=original;}
+});

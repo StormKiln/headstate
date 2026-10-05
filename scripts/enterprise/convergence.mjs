@@ -15,7 +15,7 @@ export function changeExpected(expected,number,{member,ready},reason){
 }
 export function assertConverged(observed,expected){assert.deepEqual(observed.inventory.authored,expected.authored);assert.deepEqual(observed.inventory.reviewing,expected.reviewing);assert.deepEqual(observed.ready,expected.ready);}
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
-const snapshot=page=>page.evaluate(()=>({at:performance.now(),wallTime:Date.now(),inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),footer:document.querySelector('[data-testid="inventory-footer"]')?.textContent,commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&['get_pr_detail','act_on_pr'].includes(e.name))}));
+const snapshot=page=>page.evaluate(()=>({at:performance.now(),wallTime:Date.now(),inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),footer:document.querySelector('[data-testid="inventory-footer"]')?.textContent}));
 
 export async function releaseWithPublication({pages,provider,profile,expected,requestId,joined,ceilingMs=convergencePolicy.localPropagationMs}){
  const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.equal(held.length,1);
@@ -38,15 +38,36 @@ export async function releaseWithPublication({pages,provider,profile,expected,re
  }
  throw Error(`Exact held native completion not proved within local ceiling: ${lastError?.message??'completion withheld'}`);
 }
+// Runs inside the browser: never transport historical row payloads while polling.
+export function recoveryPublications(consumed){
+ const unique=new Map();
+ for(const e of window.__enterprise.telemetry){
+  const p=e.reply;
+  if(e.kind!=='event'||e.name!=='source-poll-status'||!p||p.session!==consumed.session||p.list!=='reviewing'||p.receipt_revision<=consumed.receipt_revision)continue;
+  const value={session:p.session,list:p.list,receipt_revision:p.receipt_revision,phase:p.phase,coverage:p.coverage,last_received_at:p.last_received_at};
+  unique.set(JSON.stringify(value),value);
+ }
+ return [...unique.values()];
+}
+export function selectedRecoveryPublication(selected){
+ const receipt=window.__enterprise.telemetry.find(e=>e.kind==='event'&&e.name==='source-poll-status'&&e.reply&&Object.entries(selected).every(([key,value])=>e.reply[key]===value))?.reply;
+ if(!receipt)throw Error('Selected accepted publication disappeared');
+ return receipt;
+}
+const sourceStatus=page=>page.evaluate(()=>{const source=window.__enterprise.sourceEvidence();return {phase:source?.phase,coverage:source?.coverage};});
+
 export async function waitForFreshTraversal({pages,provider,profile,consumption,expected}){
  while(performance.now()-consumption.releasedMono<=convergencePolicy.inventoryMs){
-  const clients=await Promise.all(pages.map(async page=>({...await snapshot(page),publications:await page.evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='event'&&e.name==='source-poll-status').map(e=>e.reply))})));
+  const clients=await Promise.all(pages.map(async page=>({...await snapshot(page),publications:await page.evaluate(recoveryPublications,consumption.completion.reply.update)})));
   const events=(await readFile(resolve(profile,'native.ndjson'),'utf8')).split('\n').filter(Boolean).map(JSON.parse);
   const providerReads=provider.ledger.filter(entry=>entry.at>consumption.releasedMono&&entry.searches?.some(search=>search.query.includes('review-requested:@me')));
   try{
    for(const client of clients)assertConverged(client,expected);
    const proof=assertRecovery({releasedAt:consumption.releasedAt,releasedMono:consumption.releasedMono,elapsedMs:performance.now()-consumption.releasedMono,ceilingMs:convergencePolicy.inventoryMs,provider:providerReads,clients,events,consumed:consumption.completion.reply.update});
-   return {elapsedMs:performance.now()-consumption.releasedMono,provider:providerReads,clients,proof};
+   // Full selected receipts are retained exactly once; all raw events remain in ui-N.json/traces.
+   proof.publications=await Promise.all(pages.map((page,i)=>page.evaluate(selectedRecoveryPublication,proof.publications[i])));
+   assert.ok(performance.now()-consumption.releasedMono<=convergencePolicy.inventoryMs,'selected proof retrieval exceeded original recovery ceiling');
+   return {elapsedMs:performance.now()-consumption.releasedMono,provider:providerReads,clients:clients.map(({publications,...client})=>client),proof};
   }catch{}
   await delay(100);
  }
@@ -135,7 +156,7 @@ export async function runConvergence({pages,provider,result,out,profile,control}
    provider.fault.failSearch=cycle===0?{list:'reviewing',after:'cursor-50',remaining:3}:{list:'reviewing',after:null,remaining:1,waitForTail:true};
    await control('wake');
    await waitUntil(()=>provider.ledger.slice(ledgerStart).some(entry=>entry.targetedFailure),convergencePolicy.failureCycleMs,'finite failure was not exercised');
-   await waitUntil(async()=>{const current=await snapshot(pages[0]);return ['failed','retrying'].includes(current.source?.phase);},convergencePolicy.localPropagationMs,'finite failure was not published to active reviewing list');
+   await waitUntil(async()=>{const current=await sourceStatus(pages[0]);return ['failed','retrying'].includes(current.phase);},convergencePolicy.localPropagationMs,'finite failure was not published to active reviewing list');
    const failed=await capture(`finite-failure-${cycle}`);
    const returned=new Set(provider.ledger.slice(ledgerStart).filter(entry=>entry.status===200).flatMap(entry=>(entry.searches??[]).flatMap(search=>search.ids)));
    let unchanged=0;
@@ -146,7 +167,7 @@ export async function runConvergence({pages,provider,result,out,profile,control}
    const continuity=await pages[0].evaluate(()=>{const n=window.__convergenceDraft;return {connected:n?.isConnected,focused:document.activeElement===n,value:n?.value,start:n?.selectionStart,end:n?.selectionEnd,direction:n?.selectionDirection,disclosure:[...document.querySelectorAll('details')].some(d=>d.open&&d.querySelector('summary')?.textContent==='Open report')};});
    assert.deepEqual(continuity,{connected:true,focused:true,value:'Retained convergence backward draft',start:3,end:17,direction:'backward',disclosure:true});
    provider.fault.failSearch=undefined;
-   await waitUntil(async()=>{const current=await snapshot(pages[0]);return current.source?.phase==='ready'&&current.source?.coverage==='complete';},convergencePolicy.failureCycleMs,'finite failed pass did not recover');
+   await waitUntil(async()=>{const current=await sourceStatus(pages[0]);return current.phase==='ready'&&current.coverage==='complete';},convergencePolicy.failureCycleMs,'finite failed pass did not recover');
    await population();evidence.phases.push({name:`failure-recovery-${cycle}`,unchanged,continuity,provider:provider.ledger.slice(ledgerStart)});await capture(`recovered-${cycle}`);
   }
   evidence.expected=structuredClone(expected);evidence.pass=true;result.convergence={pass:true,reviewing:expected.reviewing.length,ready:expected.ready.length};
