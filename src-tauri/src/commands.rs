@@ -5135,7 +5135,17 @@ fn parse_scope_request(
 /// cache, history, ledger and registrations change atomically. Failure stops
 /// the read: a board's all-authors key does not itself isolate accounts.
 fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let previous: Option<String> =
+        crate::store::settings::get(conn, crate::store::settings::keys::STATS_VIEWER)
+            .map_err(|e| e.to_string())?;
+    if previous.as_deref() == Some(viewer) {
+        return Ok(());
+    }
+    // A transition reserves the writer before rereading identity. Deferred
+    // read-to-write upgrades return BUSY immediately under concurrent loads,
+    // even with busy_timeout; unchanged-viewer reads need no reservation.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     let previous: Option<String> =
         crate::store::settings::get(&tx, crate::store::settings::keys::STATS_VIEWER)
             .map_err(|e| e.to_string())?;
@@ -8389,6 +8399,115 @@ mod tests {
     /// ones that read one back. Keys keep the others apart; a clear is the
     /// one operation a key cannot scope.
     static FRAMES_CLEAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn stats_first_readers_wait_for_a_snapshot_writer() {
+        parallel_stats_readers(None);
+    }
+
+    #[test]
+    fn stats_account_change_readers_wait_for_a_snapshot_writer() {
+        parallel_stats_readers(Some("fixture-old-viewer"));
+    }
+
+    fn parallel_stats_readers(previous: Option<&str>) {
+        let _frames = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats-first.db");
+        let writer = crate::store::open_db(&path).unwrap();
+        if let Some(previous) = previous {
+            super::note_stats_viewer(&writer, previous).unwrap();
+        }
+        use crate::store::stats::{self, Kind};
+        let keys =
+            [Kind::Count, Kind::Series, Kind::Board].map(|kind| stats::key(kind, "fixture-scope"));
+        for key in &keys {
+            stats::put(
+                &writer,
+                key,
+                "2026-09-01",
+                "2026-09-01",
+                99,
+                true,
+                "[]",
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        }
+        // Open before the writer starts: exercise the identity boundary,
+        // independently of migration serialization in open_db.
+        let readers: Vec<_> = (0..3)
+            .map(|_| crate::store::open_db(&path).unwrap())
+            .collect();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        tx.execute("INSERT INTO snapshot(id,payload,fetched_at) VALUES(1,'synthetic-snapshot','fixture-time')", []).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let (send, recv) = std::sync::mpsc::channel();
+        let handles: Vec<_> = readers
+            .into_iter()
+            .zip(keys)
+            .map(|(conn, key)| {
+                let barrier = barrier.clone();
+                let send = send.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = super::note_stats_viewer(&conn, "fixture-viewer").and_then(|()| {
+                        stats::get(&conn, &key, "2026-09-01", "2026-09-01", chrono::Utc::now())
+                            .map(|cached| {
+                                assert!(
+                                    cached.is_none(),
+                                    "old account cache must be cleared before read"
+                                )
+                            })
+                            .map_err(|e| e.to_string())
+                    });
+                    send.send(result).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        // The deferred reader used to return SQLITE_BUSY immediately,
+        // ignoring the busy timeout when upgrading its read transaction.
+        let early = recv.recv_timeout(std::time::Duration::from_millis(150));
+        tx.commit().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            early.is_err(),
+            "identity transition must wait for the writer: {early:?}"
+        );
+        for _ in 0..3 {
+            recv.recv().unwrap().unwrap();
+        }
+        let viewer: Option<String> =
+            crate::store::settings::get(&writer, crate::store::settings::keys::STATS_VIEWER)
+                .unwrap();
+        assert_eq!(viewer.as_deref(), Some("fixture-viewer"));
+        let payload: String = writer
+            .query_row("SELECT payload FROM snapshot WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(payload, "synthetic-snapshot");
+    }
+
+    #[test]
+    fn stats_unchanged_viewer_reads_do_not_wait_or_write() {
+        let _frames = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unchanged.db");
+        let writer = crate::store::open_db(&path).unwrap();
+        super::note_stats_viewer(&writer, "fixture-viewer").unwrap();
+        let reader = crate::store::open_db(&path).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let _tx =
+            rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let before = reader.total_changes();
+        super::note_stats_viewer(&reader, "fixture-viewer").unwrap();
+        assert_eq!(reader.total_changes(), before);
+    }
 
     #[test]
     fn stats_identity_clear_failure_rolls_back_and_refuses_the_read() {

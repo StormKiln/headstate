@@ -1243,8 +1243,7 @@ const MIGRATIONS: &[&str] = &[
      DELETE FROM claude_index_ledger;",
     // 32: partition PR snapshots by provider/host/list. Legacy rows retain
     // their original payload and timestamp and explicitly belong to GitHub.
-    "BEGIN;
-     CREATE TABLE snapshot_sources (
+    "CREATE TABLE snapshot_sources (
         provider TEXT NOT NULL DEFAULT 'github',
         host TEXT NOT NULL DEFAULT 'github.com',
         id INTEGER NOT NULL,
@@ -1256,8 +1255,7 @@ const MIGRATIONS: &[&str] = &[
      INSERT INTO snapshot_sources (id, payload, fetched_at)
         SELECT id, payload, fetched_at FROM snapshot;
      DROP TABLE snapshot;
-     ALTER TABLE snapshot_sources RENAME TO snapshot;
-     COMMIT;",
+     ALTER TABLE snapshot_sources RENAME TO snapshot;",
     // GitLab receipts retain coverage and history without relabelling GitHub tables.
     "CREATE TABLE gitlab_stats_cache (
         key TEXT PRIMARY KEY,
@@ -1291,27 +1289,62 @@ const MIGRATIONS: &[&str] = &[
     );",
 ];
 
+/// The only legacy repairs supported here are scripts that were already
+/// atomic (32 had its own transaction; 36-38 are single statements). A
+/// complete schema match distinguishes their committed effects from a
+/// similarly named column/table in an unknown or partially changed schema.
+fn known_interrupted_migration(conn: &Connection, version: i64) -> Result<bool, StoreError> {
+    if !matches!(version, 31 | 35 | 36 | 37) {
+        return Ok(false);
+    }
+    let expected = Connection::open_in_memory()?;
+    for sql in MIGRATIONS.iter().take(version as usize + 1) {
+        expected.execute_batch(sql)?;
+    }
+    Ok(schema_definition(conn)? == schema_definition(&expected)?)
+}
+
+type SchemaDefinition = Vec<(String, String, String, Option<String>)>;
+
+fn schema_definition(conn: &Connection) -> Result<SchemaDefinition, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    // A version ABOVE the known list is not "nothing to do" (#1143).
-    //
-    // `.skip(n)` with `n > len` yields an empty iterator, so this
-    // function returned `Ok(())` for a database written by a newer
-    // build -- the one case where proceeding is least safe. Checked
-    // before the loop rather than inside it, because the loop's whole
-    // shape is "apply what is missing" and there is nothing missing
-    // here; there is something extra.
     let known = MIGRATIONS.len() as i64;
-    if version > known {
-        return Err(StoreError::SchemaFromTheFuture {
-            found: version,
-            known,
-        });
+    let check_version = |version| {
+        if version > known {
+            Err(StoreError::SchemaFromTheFuture {
+                found: version,
+                known,
+            })
+        } else {
+            Ok(version)
+        }
+    };
+    // An up-to-date database remains readable while a WAL writer is busy.
+    let observed = check_version(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)?;
+    if observed == known {
+        return Ok(());
     }
+    // Reserve the writer BEFORE deciding which migrations remain. Another
+    // opener may finish the upgrade while this connection is waiting.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let version = check_version(tx.query_row("PRAGMA user_version", [], |r| r.get(0))?)?;
+    let interrupted = known_interrupted_migration(&tx, version)?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-        conn.execute_batch(sql)?;
-        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+        if !(interrupted && i == version as usize) {
+            tx.execute_batch(sql)?;
+        }
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
     }
+    // SQL, legacy repair and version advancement share one commit. Errors
+    // (including a failed COMMIT) roll back through Transaction's drop.
+    tx.commit()?;
     Ok(())
 }
 
@@ -1358,6 +1391,265 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn historical_db(path: &Path, version: usize) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        for sql in &MIGRATIONS[..version] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", version as i64)
+            .unwrap();
+        if version > 0 {
+            conn.execute("INSERT INTO snapshot(id,payload,fetched_at) VALUES(1,'synthetic-saved-data','fixture-time')", []).unwrap();
+        }
+        conn
+    }
+
+    fn schema_signature(conn: &Connection) -> Vec<(String, Option<String>)> {
+        conn.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_version_write_failure_preserves_every_previous_schema() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for next in 1..=MIGRATIONS.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("atomic.db");
+            let conn = historical_db(&path, next - 1);
+            let before = schema_signature(&conn);
+            conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Pragma {
+                    pragma_name: "user_version",
+                    pragma_value: Some(_),
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+            assert!(
+                migrate(&conn).is_err(),
+                "migration {next} must hit injected version failure"
+            );
+            drop(conn);
+            let reopened = Connection::open(&path).unwrap();
+            let version: i64 = reopened
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, (next - 1) as i64);
+            assert_eq!(
+                schema_signature(&reopened),
+                before,
+                "migration {next} committed its schema without its version"
+            );
+            if next > 1 {
+                let payload: String = reopened
+                    .query_row("SELECT payload FROM snapshot WHERE id=1", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(payload, "synthetic-saved-data");
+            }
+            migrate(&reopened).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_migration_37_repairs_only_the_known_owner_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interrupted.db");
+        let conn = historical_db(&path, 36);
+        conn.execute_batch(MIGRATIONS[36]).unwrap();
+        drop(conn);
+        let conn = open_db(&path).expect("known interrupted owner migration must be repairable");
+        let (payload, owner): (String, Option<String>) = conn
+            .query_row("SELECT payload,owner FROM snapshot WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(payload, "synthetic-saved-data");
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn interrupted_known_atomic_scripts_are_repaired_without_losing_snapshots() {
+        for next in [32, 36, 37, 38] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("interrupted.db");
+            let conn = historical_db(&path, next - 1);
+            conn.execute_batch(MIGRATIONS[next - 1]).unwrap();
+            // Replaying migration32 would silently reset this useful field.
+            conn.execute("UPDATE snapshot SET coverage=?1", ["\"complete\""])
+                .unwrap();
+            drop(conn);
+            let conn = open_db(&path).unwrap_or_else(|e| panic!("repair migration {next}: {e}"));
+            let payload: String = conn
+                .query_row("SELECT payload FROM snapshot WHERE id=1", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(payload, "synthetic-saved-data");
+            let coverage: String = conn
+                .query_row("SELECT coverage FROM snapshot WHERE id=1", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(coverage, "\"complete\"");
+        }
+    }
+
+    #[test]
+    fn interrupted_owner_repair_refuses_an_unrecognized_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unrecognized.db");
+        let conn = historical_db(&path, 36);
+        conn.execute_batch("ALTER TABLE snapshot ADD COLUMN owner INTEGER;")
+            .unwrap();
+        let before = schema_signature(&conn);
+        assert!(migrate(&conn).is_err());
+        assert_eq!(schema_signature(&conn), before);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 36);
+    }
+
+    #[test]
+    fn migration_commit_failure_preserves_every_previous_schema() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for next in 1..=MIGRATIONS.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("commit.db");
+            let conn = historical_db(&path, next - 1);
+            let before = schema_signature(&conn);
+            let advancing = Arc::new(AtomicBool::new(false));
+            let advancing_in_hook = advancing.clone();
+            conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    AuthAction::Pragma {
+                        pragma_name: "user_version",
+                        pragma_value: Some(_)
+                    }
+                ) {
+                    advancing_in_hook.store(true, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+            conn.commit_hook(Some(move || advancing.load(Ordering::SeqCst)))
+                .unwrap();
+            assert!(migrate(&conn).is_err());
+            drop(conn);
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                schema_signature(&conn),
+                before,
+                "migration {next} survived failed commit"
+            );
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, (next - 1) as i64);
+            migrate(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_waits_and_rereads_version_after_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let writer = historical_db(&path, 36);
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        tx.execute_batch(MIGRATIONS[36]).unwrap();
+        tx.pragma_update(None, "user_version", 37).unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || send.send(migrate(&reader)).unwrap());
+        let early = recv.recv_timeout(std::time::Duration::from_millis(150));
+        tx.commit().unwrap();
+        worker.join().unwrap();
+        assert!(
+            early.is_err(),
+            "migration must wait before reading its starting version: {early:?}"
+        );
+        recv.recv().unwrap().unwrap();
+        let conn = open_db(&path).unwrap();
+        let payload: String = conn
+            .query_row("SELECT payload FROM snapshot WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(payload, "synthetic-saved-data");
+    }
+
+    #[test]
+    fn concurrent_first_database_opens_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first-open.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let conn = open_db(&path)?;
+                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                        .map_err(StoreError::from)
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), MIGRATIONS.len() as i64);
+        }
+    }
+
+    #[test]
+    fn current_schema_remains_readable_while_a_wal_writer_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let writer = open_db(&path).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let _tx =
+            rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let before = reader.total_changes();
+        migrate(&reader).unwrap();
+        assert_eq!(reader.total_changes(), before);
+        open_db(&path).unwrap();
+    }
+
+    #[test]
+    fn failure_midway_through_snapshot_rebuild_preserves_the_original_table() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebuild.db");
+        let conn = historical_db(&path, 31);
+        let before = schema_signature(&conn);
+        conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::DropTable {
+                table_name: "snapshot",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        assert!(migrate(&conn).is_err());
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(schema_signature(&conn), before);
+        let payload: String = conn
+            .query_row("SELECT payload FROM snapshot WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(payload, "synthetic-saved-data");
+        migrate(&conn).unwrap();
+    }
 
     fn has_table(conn: &Connection, name: &str) -> bool {
         conn.query_row(

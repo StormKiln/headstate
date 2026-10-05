@@ -365,6 +365,8 @@ sysinfo = { version = "0.39", default-features = false, features = ["system", "d
 libc = "0.2"
 
 [dev-dependencies]
+# SQLite authorizer/commit fault injection for migration atomicity regressions.
+rusqlite = { version = "0.40", features = ["hooks"] }
 tokio = { version = "1.53", features = ["test-util"] }
 # Decodes the listener's gzip bodies in the loopback tests (#1478), which
 # read raw HTTP rather than go through a client that would decode them
