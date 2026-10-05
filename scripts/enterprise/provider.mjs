@@ -26,6 +26,7 @@ export async function startProvider({convergence=false}={}) {
  const held=[];const data=fixture({convergence}),ledger=[],fault={mode:'healthy',delay:0,thread:false,outdated:false,closed:[]};let active=0,next=0,lost=false;const quota=Object.fromEntries(['graphql','rest'].map(bucket=>[bucket,{remaining:5000,reset:Math.floor(Date.now()/1000)+120}]));
  const server=createServer(async(req,res)=>{
   const id=++next,started=performance.now();active++;let entry={id,at:started,operation:'unknown',fault:fault.mode,aliases:0,status:0,active,terminal:null};if(ledger.length<100000)ledger.push(entry);else lost=true;res.once('close',()=>{entry.responseDelivered=res.writableFinished;});
+  if(convergence)res.setHeader('x-headstate-synthetic-ledger',String(id));
   let raw='';for await(const c of req)raw+=c;
   const bucket=req.url==='/graphql'?'graphql':'rest';
   const window=quota[bucket];if(Math.floor(Date.now()/1000)>=window.reset){window.remaining=5000;window.reset=Math.floor(Date.now()/1000)+120;}

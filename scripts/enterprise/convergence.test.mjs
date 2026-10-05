@@ -16,14 +16,6 @@ test('explicit external transitions have the declared 234/126 result and inverse
  assert.throws(()=>changeExpected(expected,53,{member:false,ready:true},'invalid oracle'));
 });
 
-test('correct visible cache cannot satisfy withheld native stale-page completion',async()=>{
- const {releaseWithPublication}=await import('./convergence.mjs');const telemetry=[];
- const page={evaluate:async(fn,args)=>{globalThis.window={__enterprise:{telemetry}};return fn(args);},waitForFunction:async(fn,args)=>{globalThis.window={__enterprise:{telemetry}};if(!fn(args))throw Error('native completion withheld');}};
- const entry={held:true,released:false,responseDelivered:false};const provider={ledger:[entry],release(){entry.released=true;entry.responseDelivered=true;}};
- await assert.rejects(releaseWithPublication({pages:[page],provider,ceilingMs:1}),/completion withheld/);
- entry.released=false;provider.release=()=>{entry.released=true;entry.responseDelivered=true;telemetry.push({kind:'event',name:'source-poll-status',reply:{list:'reviewing',prs:[],receipt_revision:2,last_received_at:new Date(Date.now()+1).toISOString()}});};
- assert.equal((await releaseWithPublication({pages:[page],provider})).publications.length,1);delete globalThis.window;
-});
 test('detail acquisition guard ignores explicit continuations but rejects same-identity loops',async()=>{
  const {assertPrimaryDetailCount}=await import('./convergence.mjs');const primary={primaryDetails:[{repo:'synthetic-lab/repo-1',number:51}]};
  assert.equal(assertPrimaryDetailCount([primary,{queryName:'ChecksContinuation'},{operation:'search'}],51,1).length,1);

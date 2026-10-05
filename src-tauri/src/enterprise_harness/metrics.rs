@@ -205,3 +205,9 @@ mod tests {
         );
     }
 }
+
+// Opaque observer IDs only; this module is absent from ordinary builds.
+tokio::task_local! {
+    pub static COMMAND: u64;
+    pub static SCAN_SLOT: u64;
+}

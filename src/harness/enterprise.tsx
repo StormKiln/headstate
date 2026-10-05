@@ -34,7 +34,7 @@ const probe={sourceEvidence:()=>renderedSource,advisoryPublications,readyEligibi
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
   ...(query.queryKey[0]==='stats-board'?{owner:value?.owner,viewer:value?.viewer,scopeKey:value?.scopeKey,days:query.queryKey[3],daysCovered:value?.daysCovered,daysTotal:value?.daysTotal,total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
-}),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
+}),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshReviewing:()=>refreshWithState(client,'reviewing'),refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
 declare global {interface Window {__enterprise:typeof probe}}
 window.__enterprise=probe;
 const client=new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false}}});

@@ -169,6 +169,16 @@ impl GitHubClient {
                     "scan-slot",
                     state.callers.len() as u64,
                 );
+                #[cfg(feature = "enterprise-harness")]
+                if let Ok(command) = crate::enterprise_harness::metrics::COMMAND.try_with(|id| *id)
+                {
+                    crate::enterprise_harness::metrics::record(
+                        command,
+                        "slot",
+                        "command-scan",
+                        slot.metric.id(),
+                    );
+                }
                 state.callers.insert(id, (context.clone(), mode));
                 slot.publish_demand(&state);
                 if state.task.is_none() && state.receipt.is_none() {
@@ -236,6 +246,9 @@ impl GitHubClient {
                                     now,
                                     mode,
                                 );
+                                #[cfg(feature = "enterprise-harness")]
+                                let step = crate::enterprise_harness::metrics::SCAN_SLOT
+                                    .scope(shared.metric.id(), step);
                                 tokio::pin!(step);
                                 loop {
                                     if dispatched.load(std::sync::atomic::Ordering::Acquire) {

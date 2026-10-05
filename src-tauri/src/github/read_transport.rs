@@ -286,6 +286,10 @@ impl ReadTransport {
                 metric.mark("logical", id);
                 #[cfg(feature = "enterprise-harness")]
                 metric.mark("attempt", attempt);
+                #[cfg(feature = "enterprise-harness")]
+                if let Ok(slot) = crate::enterprise_harness::metrics::SCAN_SLOT.try_with(|id| *id) {
+                    metric.mark("scan-slot", slot);
+                }
                 let response = match read {
                     Read::Graphql(body) => client._post("/graphql", Some(body)).await,
                     Read::Rest { path, .. } => client._get(path).await,
@@ -299,6 +303,15 @@ impl ReadTransport {
                         Err(map_error(error))
                     }
                     Ok(response) => {
+                        #[cfg(feature = "enterprise-harness")]
+                        if let Some(id) = response
+                            .headers()
+                            .get("x-headstate-synthetic-ledger")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            metric.mark("synthetic-ledger", id);
+                        }
                         let status = response.status().as_u16();
                         #[cfg(feature = "enterprise-harness")]
                         metric.mark("headers", u64::from(status));

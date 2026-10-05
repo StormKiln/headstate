@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import {writeFile} from 'node:fs/promises';
+import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {assertConsumption,assertRecovery,consumptionLineage} from './convergence-consumption.mjs';
 
 export const convergencePolicy=Object.freeze({inventoryMs:180000,localPropagationMs:10000,failureCycleMs:180000,meaning:'Synthetic diagnostic ceilings, not a field SLA; optional advisory freshness is excluded'});
 const key=number=>`synthetic-lab/repo-${(number-1)%50+1}/${number}`;
@@ -14,16 +15,38 @@ export function assertConverged(observed,expected){assert.deepEqual(observed.inv
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const snapshot=page=>page.evaluate(()=>({at:performance.now(),wallTime:Date.now(),inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),footer:document.querySelector('[data-testid="inventory-footer"]')?.textContent,commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&['get_pr_detail','act_on_pr'].includes(e.name))}));
 
-export async function releaseWithPublication({pages,provider,ceilingMs=convergencePolicy.localPropagationMs}){
- const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length);
- const offsets=await Promise.all(pages.map(page=>page.evaluate(()=>window.__enterprise.telemetry.length)));
- const releasedAt=Date.now();provider.release();
- const publications=await Promise.all(pages.map(async(page,index)=>{
-  await page.waitForFunction(({offset,releasedAt})=>window.__enterprise.telemetry.slice(offset).some(entry=>entry.kind==='event'&&entry.name==='source-poll-status'&&entry.reply?.list==='reviewing'&&entry.reply.prs&&entry.reply.receipt_revision!=null&&Date.parse(entry.reply.last_received_at)>releasedAt),{offset:offsets[index],releasedAt},{timeout:ceilingMs});
-  return page.evaluate(({offset,releasedAt})=>window.__enterprise.telemetry.slice(offset).find(entry=>entry.kind==='event'&&entry.name==='source-poll-status'&&entry.reply?.list==='reviewing'&&entry.reply.prs&&entry.reply.receipt_revision!=null&&Date.parse(entry.reply.last_received_at)>releasedAt),{offset:offsets[index],releasedAt});
- }));
- assert.ok(held.every(entry=>entry.released&&entry.responseDelivered===true),'held stale page must reach its original caller');
- return {releasedAt,publications,held};
+export async function releaseWithPublication({pages,provider,profile,expected,requestId,ceilingMs=convergencePolicy.localPropagationMs}){
+ const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.equal(held.length,1);
+ const releasedAt=Date.now(),releasedMono=performance.now();provider.release();
+ let lastError;
+ while(performance.now()-releasedMono<=ceilingMs){
+  try{
+   const events=(await readFile(resolve(profile,'native.ndjson'),'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+   const calls=await pages[0].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.args?.requestId&&e.reply?.update?.list==='reviewing'));
+   for(const completion of calls){
+    if(requestId&&completion.args.requestId!==requestId)continue;
+    let lineage;try{lineage=consumptionLineage(events,completion.callId,held[0].id);}catch{continue;}
+    const clients=await Promise.all(pages.map(snapshot));
+    const proof=assertConsumption({requestId:completion.args.requestId,commandId:completion.callId,held:held[0],lineage,completion,expected,clients,releasedAt,elapsedMs:performance.now()-releasedMono,ceilingMs});
+    return {releasedAt,releasedMono,elapsedMs:performance.now()-releasedMono,held,clients,...proof};
+   }
+  }catch(error){lastError=error;}
+  await delay(50);
+ }
+ throw Error(`Exact held native completion not proved within local ceiling: ${lastError?.message??'completion withheld'}`);
+}
+export async function waitForFreshTraversal({pages,provider,consumption,expected}){
+ while(performance.now()-consumption.releasedMono<=convergencePolicy.inventoryMs){
+  const clients=await Promise.all(pages.map(snapshot));
+  const providerReads=provider.ledger.filter(entry=>entry.at>consumption.releasedMono&&entry.searches?.some(search=>search.query.includes('review-requested:@me')));
+  try{
+   for(const client of clients)assertConverged(client,expected);
+   assertRecovery({releasedAt:consumption.releasedAt,elapsedMs:performance.now()-consumption.releasedMono,ceilingMs:convergencePolicy.inventoryMs,provider:providerReads.map(entry=>({...entry,at:consumption.releasedAt+(entry.at-consumption.releasedMono)})),clients});
+   return {elapsedMs:performance.now()-consumption.releasedMono,provider:providerReads,clients};
+  }catch{}
+  await delay(100);
+ }
+ throw Error('No subsequent genuine complete reviewing traversal within original180s recovery ceiling');
 }
 
 export function assertPrimaryDetailCount(ledger,number,count){
@@ -32,7 +55,7 @@ export function assertPrimaryDetailCount(ledger,number,count){
 }
 
 /** Actual provider → native publication → independent mounted clients. */
-export async function runConvergence({pages,provider,result,out,control}){
+export async function runConvergence({pages,provider,result,out,profile,control}){
  const expected=initialConvergenceExpected();
  const evidence={policy:convergencePolicy,expected:structuredClone(expected),phases:[],checkpoints:[],exclusions:['Updater/settings controls: mounted fragment is the same production GitHub inventory footer','Restart requires convergence-restart with this successful run profile; account replacement and newer-head/reopen authority require complementary native full-path tests']};
  const save=()=>writeFile(resolve(out,'convergence.json'),JSON.stringify(evidence,null,2));
@@ -58,10 +81,12 @@ export async function runConvergence({pages,provider,result,out,control}){
   evidence.phases.push({name:reason,number,clickAt,receipt,settlementMs:2000,primaryAcquisitions,propagationMs:await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration),provider:provider.ledger.slice(before)});
   await capture(reason);
  };
- const releaseOldSearch=async()=>{evidence.phases.push({name:'held-page-processed',...await releaseWithPublication({pages,provider})});};
+ let heldRequestId;
+ const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldRequestId});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,consumption,expected})});};
  const holdOldSearch=async()=>{
   provider.fault.holdSearch={list:'reviewing',after:null,remaining:1};
-  await pages[0].evaluate(()=>{void window.__enterprise.refreshQueues();});await control('wake');
+  heldRequestId=await pages[0].evaluate(()=>{const offset=window.__enterprise.telemetry.length;void window.__enterprise.refreshReviewing().catch(()=>{});const started=window.__enterprise.telemetry.slice(offset).filter(e=>e.kind==='call-start'&&e.name==='get_reviewing');if(started.length!==1)throw Error('one actual reviewing invocation required');return started[0].args.requestId;});
+  assert.equal(typeof heldRequestId,'string');
   await waitUntil(()=>provider.heldCount>0,convergencePolicy.inventoryMs,'no real materialized reviewing search was held');
   assert.ok(provider.ledger.some(entry=>entry.held&&!entry.released&&entry.searches?.some(search=>search.query.includes('review-requested:@me'))));
  };

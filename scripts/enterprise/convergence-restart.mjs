@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile,readdir} from 'node:fs/promises';
 import {resolve,dirname} from 'node:path';
 import {createHash} from 'node:crypto';
-import {assertConverged,convergencePolicy,releaseWithPublication} from './convergence.mjs';
+import {assertConverged,convergencePolicy,releaseWithPublication,waitForFreshTraversal} from './convergence.mjs';
 const fields=['number','id','updatedAt','headRefOid','state','isDraft','isInMergeQueue','mergeQueueEntry','reviewDecision','closedAt','mergedAt'];
 export const baselineRows=data=>data.rows.filter(row=>row.number<=286).map(row=>Object.fromEntries(fields.map(field=>[field,row[field]])));
 export function restoreBaseline(data,baseline){
@@ -33,7 +33,7 @@ export async function captureRestartCache({nativeCall,provider,state,out}){
  assert.equal(provider.ledger.length,evidence.providerBefore,'cache commands perform no provider IO');evidence.providerAfter=provider.ledger.length;
  await writeFile(resolve(out,'convergence-restart-cache.json'),JSON.stringify(evidence,null,2));return evidence;
 }
-export async function runConvergenceRestart({pages,provider,result,out,state,control}){
+export async function runConvergenceRestart({pages,provider,result,out,profile,state,control}){
  const evidence={policy:convergencePolicy,expected:state.expected,checkpoints:[],cacheEvidence:'convergence-restart-cache.json'};
  const capture=async name=>{const clients=await Promise.all(pages.map(page=>page.evaluate(()=>({inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence()}))));for(const client of clients)assertConverged(client,state.expected);evidence.checkpoints.push({name,clients,providerCount:provider.ledger.length});};
  const delay=ms=>new Promise(r=>setTimeout(r,ms));
@@ -41,9 +41,8 @@ export async function runConvergenceRestart({pages,provider,result,out,state,con
   const started=performance.now();let matched=false;while(performance.now()-started<convergencePolicy.localPropagationMs){try{await capture('mounted-persisted-cache');matched=true;break;}catch{await delay(100);}}assert.ok(matched,'both real clients render converged retained cache');
   await control('start');const holdStart=performance.now();while(!provider.heldCount&&performance.now()-holdStart<convergencePolicy.inventoryMs)await delay(100);
   const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length,'restart must materialize an actual stale provider page');
-  await capture('stale-page-held');evidence.stalePublication=await releaseWithPublication({pages,provider});
-  // Observe an entire real finite traversal, not only the first response.
-  const recovered=performance.now();let complete=false;while(performance.now()-recovered<convergencePolicy.inventoryMs){await capture('after-stale-receipt');if(evidence.checkpoints.at(-1).clients.every(client=>client.source.phase==='ready'&&client.source.coverage==='complete')){complete=true;break;}await delay(1000);}assert.ok(complete,'stale finite traversal completes without resurrection');
+  await capture('stale-page-held');evidence.stalePublication=await releaseWithPublication({pages,provider,profile,expected:state.expected});
+  evidence.freshTraversal=await waitForFreshTraversal({pages,provider,consumption:evidence.stalePublication,expected:state.expected});
   evidence.pass=true;result.samples.push({role:'desktop'},{role:'paired'});result.convergenceRestart={pass:true};
  }finally{provider.release();await writeFile(resolve(out,'convergence-restart.json'),JSON.stringify(evidence,null,2));}
 }
