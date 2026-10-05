@@ -11,6 +11,10 @@ use std::path::Path;
 pub enum StoreError {
     #[error("snapshot rows do not belong to the requested source")]
     SnapshotSourceMismatch,
+    #[error(
+        "schema {version} does not match its known migration state; refusing an unsafe repair"
+    )]
+    UnrecognizedMigrationSchema { version: i64 },
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("serialisation error: {0}")]
@@ -49,7 +53,10 @@ impl StoreError {
     /// something we must not touch. Collapsing them is how an old build
     /// would go on writing to a schema it does not understand.
     pub fn forbids_writing(&self) -> bool {
-        matches!(self, Self::SchemaFromTheFuture { .. })
+        matches!(
+            self,
+            Self::SchemaFromTheFuture { .. } | Self::UnrecognizedMigrationSchema { .. }
+        )
     }
 }
 
@@ -1298,10 +1305,21 @@ fn known_interrupted_migration(conn: &Connection, version: i64) -> Result<bool, 
         return Ok(false);
     }
     let expected = Connection::open_in_memory()?;
-    for sql in MIGRATIONS.iter().take(version as usize + 1) {
+    for sql in MIGRATIONS.iter().take(version as usize) {
         expected.execute_batch(sql)?;
     }
-    Ok(schema_definition(conn)? == schema_definition(&expected)?)
+    let actual = schema_definition(conn)?;
+    if actual == schema_definition(&expected)? {
+        return Ok(false);
+    }
+    expected.execute_batch(MIGRATIONS[version as usize])?;
+    if actual == schema_definition(&expected)? {
+        return Ok(true);
+    }
+    // In particular, replaying32 can succeed on a post32 snapshot while
+    // resetting provider/host/coverage and dropping its indexes/triggers.
+    // A failed repair match is not evidence that the script is unapplied.
+    Err(StoreError::UnrecognizedMigrationSchema { version })
 }
 
 type SchemaDefinition = Vec<(String, String, String, Option<String>)>;
@@ -1492,6 +1510,66 @@ mod tests {
                 .query_row("SELECT coverage FROM snapshot WHERE id=1", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(coverage, "\"complete\"");
+        }
+    }
+
+    #[test]
+    fn interrupted_snapshot_repair_refuses_extra_schema_without_replaying() {
+        for extra in [
+            "CREATE INDEX fixture_snapshot_payload ON snapshot(payload)",
+            "CREATE TABLE fixture_extra(value TEXT)",
+            "CREATE TRIGGER fixture_snapshot_update AFTER UPDATE ON snapshot BEGIN SELECT 1; END",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ambiguous-snapshot.db");
+            let conn = historical_db(&path, 31);
+            conn.execute_batch(MIGRATIONS[31]).unwrap();
+            conn.execute(
+                "UPDATE snapshot SET provider='gitlab',host='synthetic.invalid',coverage=?1",
+                ["\"complete\""],
+            )
+            .unwrap();
+            conn.execute_batch(extra).unwrap();
+            let before = schema_signature(&conn);
+            let err = migrate(&conn).expect_err("ambiguous completed migration32 must be refused");
+            assert!(
+                err.forbids_writing(),
+                "unknown schema must fail closed: {extra}"
+            );
+            drop(conn);
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(schema_signature(&conn), before);
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 31);
+            let row: (String, String, i64, String, String, String) = conn
+                .query_row(
+                    "SELECT provider,host,id,payload,fetched_at,coverage FROM snapshot",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "gitlab".into(),
+                    "synthetic.invalid".into(),
+                    1,
+                    "synthetic-saved-data".into(),
+                    "fixture-time".into(),
+                    "\"complete\"".into()
+                )
+            );
         }
     }
 
@@ -3216,12 +3294,13 @@ mod tests {
     /// The error must be distinguishable from an ordinary failure, or
     /// the opportunistic callers cannot treat it differently.
     #[test]
-    fn only_a_future_schema_forbids_writing() {
+    fn unrecognized_schemas_forbid_writing() {
         let future = StoreError::SchemaFromTheFuture {
             found: 99,
             known: 18,
         };
         assert!(future.forbids_writing());
+        assert!(StoreError::UnrecognizedMigrationSchema { version: 31 }.forbids_writing());
 
         let ordinary = StoreError::Db(rusqlite::Error::QueryReturnedNoRows);
         assert!(
