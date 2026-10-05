@@ -9,7 +9,7 @@ export async function runStatsConvergence({pages,provider,result,out,control}) {
  for(const page of pages)await page.getByRole('button',{name:'Statistics',exact:true}).click();
  for(const page of pages){await page.getByRole('button',{name:'7d',exact:true}).click();await page.waitForFunction(()=>window.__enterprise.querySummary().some(q=>q.kind==='stats-board'&&q.days===7&&q.observers>0&&q.status==='success'),null,{timeout:90000});}
  const snapshot=()=>Promise.all(pages.map(page=>page.evaluate(()=>window.__enterprise.querySummary().find(q=>q.kind==='stats-board'&&q.days===7&&q.observers>0))));
- const initial=await snapshot();for(const board of initial){assert.equal(board.complete,false);assert.equal(board.accumulated,50);assert.equal(board.total,250);}
+ const initial=await snapshot();result.statsInitial=initial;await writeFile(resolve(out,'stats-initial.json'),JSON.stringify(initial,null,2));for(const board of initial){assert.equal(board.complete,false);assert.equal(board.accumulated,50);assert.ok(board.total===null||board.total===250,'initial denominator is unknown until the exact window is counted');}
  for(const [i,page]of pages.entries())await page.screenshot({path:resolve(out,`stats-initial-${i}.png`),fullPage:true});
  const normalCalls=await Promise.all(pages.map(page=>page.evaluate(()=>window.__enterprise.telemetry.filter(e=>e.name==='stats_board'&&e.kind==='call').length)));
  const started=Date.now(),ceilingMs=12*60000;const checkpoints=[];
