@@ -357,7 +357,7 @@ impl GitHubClient {
         }
         if state.done
             && now >= state.eligible_at
-            && (mode == ScanMode::Refresh || state.local_repair_due(now))
+            && (mode == ScanMode::Refresh || state.repair_due(now))
         {
             state.fresh_pass();
         }
@@ -409,7 +409,11 @@ impl GitHubClient {
                             if after.is_some() && explicit_invalid_cursor(&error) {
                                 partition::reset_leaf(&mut state);
                             }
-                            state.failure(now);
+                            if provider_repair_error(&error) {
+                                state.provider_failure(now);
+                            } else {
+                                state.failure(now);
+                            }
                             state.step_failure = Some(scan_failure(&error));
                             break;
                         }
@@ -424,7 +428,11 @@ impl GitHubClient {
                             state.fresh_pass();
                             state.receipt_id = receipt_id;
                         }
-                        state.failure(now);
+                        if provider_repair_error(&error) {
+                            state.provider_failure(now);
+                        } else {
+                            state.failure(now);
+                        }
                         state.step_failure = Some(scan_failure(&error));
                         break;
                     }
@@ -575,7 +583,11 @@ impl GitHubClient {
                     }
                 }
                 Err(error) => {
-                    state.failure(now);
+                    if provider_repair_error(&error) {
+                        state.provider_failure(now);
+                    } else {
+                        state.failure(now);
+                    }
                     state.step_failure = Some(scan_failure(&error));
                 }
             }
@@ -591,10 +603,11 @@ impl GitHubClient {
         if !state.no_work && !state.done && state.failures == 0 {
             state.eligible_at = now + 15;
         }
-        // Local effects invalidate this pass's proof but not its useful rows.
+        // Local effects and recovered provider failures invalidate this pass's
+        // proof but not its useful rows.
         // After terminal discovery, repair once on the normal visible clock.
         // Partition metadata has been restored before evaluating its bounds.
-        if !state.no_work && state.local_repair_ready() {
+        if !state.no_work && state.repair_ready() {
             if let Some(finished) = state.finished_at {
                 state.eligible_at = finished + state.completed_pass_delay();
             }
@@ -743,6 +756,16 @@ fn scan_failure(error: &ClientError) -> queue_scan::ScanFailure {
         message: error.to_string(),
         transient: error.is_transient(),
         not_asked: matches!(error, ClientError::NotDispatched(_)),
+    }
+}
+
+// Refused admission and structural cursor errors do not earn a provider
+// recovery pass, including when an acquisition shares its error with callers.
+fn provider_repair_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Shared(inner) => provider_repair_error(inner),
+        ClientError::NotDispatched(_) => false,
+        _ => !explicit_invalid_cursor(error),
     }
 }
 
@@ -1939,6 +1962,23 @@ mod tests {
         assert_eq!(result.state.after.as_deref(), Some("cursor-25"));
         assert!(result.state.eligible_at > 3000);
     }
+    #[test]
+    fn provider_repair_excludes_refused_and_invalid_cursor_errors() {
+        for error in [
+            ClientError::NotDispatched("synthetic admission".into()),
+            ClientError::Graphql("The cursor is invalid".into()),
+        ] {
+            assert!(!provider_repair_error(&error));
+            assert!(!provider_repair_error(&ClientError::Shared(
+                std::sync::Arc::new(error)
+            )));
+        }
+        assert!(provider_repair_error(&ClientError::Graphql(
+            "Synthetic provider failure".into()
+        )));
+        assert!(provider_repair_error(&ClientError::Timeout(30)));
+    }
+
     #[tokio::test]
     async fn local_taint_terminal_pass_repairs_on_visible_continuation_after_restart() {
         let server = MockServer::start().await;
@@ -2288,6 +2328,10 @@ mod tests {
             assert!(state.receipt_id.is_some());
             assert!(state.eligible_at > 1000);
             if reset {
+                assert!(
+                    !state.provider_failure_pending,
+                    "invalid cursor is structural, not provider recovery"
+                );
                 server.reset().await;
                 Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":1,"nodes":[node(8)],"pageInfo":{"hasNextPage":false,"endCursor":"new"}}}}))).mount(&server).await;
                 let recovered = client

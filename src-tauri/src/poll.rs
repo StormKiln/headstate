@@ -1127,7 +1127,7 @@ pub(crate) fn queue_continuation_due(
         && view_needs_github
         && enabled
         && ((!state.done && state.started_at.is_some() && now >= state.eligible_at)
-            || state.local_repair_due(now)
+            || state.repair_due(now)
             || state.candidates.iter().any(|c| c.eligible_at <= now))
 }
 

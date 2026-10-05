@@ -176,6 +176,9 @@ pub struct State {
     /// One bounded repair traversal after a local authoritative effect.
     #[serde(default)]
     pub local_repair_pending: bool,
+    /// A provider-error pass needs one clean traversal after successful retry.
+    #[serde(default)]
+    pub provider_failure_pending: bool,
     #[serde(default = "default_pass_delay")]
     pub pass_delay: i64,
     /// Last validated traversal, not an atomic membership snapshot.
@@ -221,6 +224,7 @@ impl Default for State {
             candidate_position: 0,
             coverage_valid: false,
             local_repair_pending: false,
+            provider_failure_pending: false,
             pass_delay: default_pass_delay(),
             completed_at: None,
             completed_total: None,
@@ -281,7 +285,7 @@ impl State {
     pub fn taint_effect(&mut self) {
         self.invalidate_proof();
         self.local_repair_pending = true;
-        if self.local_repair_ready() {
+        if self.repair_ready() {
             if let Some(finished) = self.finished_at {
                 self.eligible_at = finished + self.completed_pass_delay();
             }
@@ -295,8 +299,8 @@ impl State {
             c.negative_at = None;
         }
     }
-    pub(crate) fn local_repair_ready(&self) -> bool {
-        self.local_repair_pending
+    pub(crate) fn repair_ready(&self) -> bool {
+        (self.local_repair_pending || self.provider_failure_pending)
             && self.done
             && !self.coverage_valid
             && !self.ceiling
@@ -307,16 +311,21 @@ impl State {
                 .as_ref()
                 .is_none_or(|p| p.blocked.is_empty())
     }
-    pub fn local_repair_due(&self, now: i64) -> bool {
-        self.local_repair_ready() && now >= self.eligible_at
+    pub fn repair_due(&self, now: i64) -> bool {
+        self.repair_ready() && now >= self.eligible_at
     }
     pub fn completed_pass_delay(&self) -> i64 {
-        if self.local_repair_ready() {
+        if self.repair_ready() {
             15
         } else {
             self.pass_delay.max(CONFIRM_DELAY)
         }
     }
+    pub fn provider_failure(&mut self, now: i64) {
+        self.failure(now);
+        self.provider_failure_pending = true;
+    }
+    // Structural invalidity uses the same backoff without earning a repair.
     pub fn failure(&mut self, now: i64) {
         self.tainted = true;
         self.coverage_valid = false;
@@ -482,6 +491,55 @@ mod tests {
     use super::*;
     use crate::store::source_cache::{save_owned_source_snapshot, snapshot_owner, Coverage};
     #[test]
+    fn provider_repair_reason_is_durable_coalesced_and_excludes_structural_failures() {
+        let mut state = State::default();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_failure_pending");
+        assert!(
+            !serde_json::from_value::<State>(legacy)
+                .unwrap()
+                .provider_failure_pending
+        );
+        state.failure(1000);
+        assert!(!state.provider_failure_pending && !state.repair_due(2000));
+        state.provider_failure(1060);
+        assert!(state.provider_failure_pending && !state.local_repair_pending);
+        assert_eq!(state.eligible_at, 1180);
+        assert!(!state.repair_due(2000));
+        state.done = true;
+        state.finished_at = Some(1180);
+        state.failures = 0;
+        state.eligible_at = 1195;
+        assert!(state.repair_due(1195));
+        state.ceiling = true;
+        assert!(!state.repair_due(1195));
+        state.ceiling = false;
+        state.github_partition = Some(GithubPartition {
+            blocked: vec![(Window { lo: 1, hi: 1 }, BlockReason::TimestampResolution)],
+            ..Default::default()
+        });
+        assert!(!state.repair_due(1195));
+        state.github_partition = None;
+        state.step_failure = Some(ScanFailure {
+            message: "synthetic pending error".into(),
+            transient: true,
+            not_asked: false,
+        });
+        assert!(!state.repair_due(1195));
+        state.step_failure = None;
+        state.taint_effect();
+        let mut restored: State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(restored.provider_failure_pending && restored.local_repair_pending);
+        restored.fresh_pass();
+        assert!(!restored.provider_failure_pending && !restored.local_repair_pending);
+        assert!(!restored.repair_due(2000));
+    }
+
+    #[test]
     fn local_repair_is_defaulted_durable_and_consumed_once() {
         let mut state = State {
             done: true,
@@ -506,7 +564,7 @@ mod tests {
         assert_eq!(state.eligible_at, 1015);
         let mut restored: State =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        assert!(restored.local_repair_pending && restored.local_repair_due(1015));
+        assert!(restored.local_repair_pending && restored.repair_due(1015));
         restored.fresh_pass();
         assert!(!restored.local_repair_pending && !restored.done && !restored.coverage_valid);
         assert_eq!(restored.pass_delay, 300);
