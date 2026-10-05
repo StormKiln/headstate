@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
-import {prepareActionThenHold} from './convergence-action.mjs';
+import {prepareActionThenHold,holdReadiness} from './convergence-action.mjs';
 import {joinHeldReviewing} from './convergence-join.mjs';
 import {assertConsumption,assertRecovery,consumptionLineage} from './convergence-consumption.mjs';
 
@@ -87,8 +87,8 @@ export async function runConvergence({pages,provider,result,out,profile,control}
  };
  let heldJoin;
  const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldJoin.requestId,joined:heldJoin});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,profile,consumption,expected})});};
- const holdOldSearch=async()=>{
-  provider.fault.holdSearch={list:'reviewing',after:null,remaining:1};
+ const holdOldSearch=async(observeReady)=>{
+  provider.fault.holdSearch={observeReady,list:'reviewing',after:null,remaining:1};
   heldJoin=await joinHeldReviewing({page:pages[0],provider,profile,inventoryMs:convergencePolicy.inventoryMs,joinMs:convergencePolicy.localPropagationMs});
   evidence.phases.push({name:'manual-refresh-joined-held-scan',...heldJoin});await save();
  };
@@ -116,7 +116,7 @@ export async function runConvergence({pages,provider,result,out,profile,control}
   assert.equal(expected.reviewing.length,234);assert.equal(expected.ready.length,126);
   await prepareActionThenHold({
    prepare:async()=>{const started=performance.now();await open(55);const detailOpenedAt=performance.now();const button=pages[0].getByRole('button',{name:'Add to merge queue',exact:true}).first();await waitUntil(()=>button.isEnabled(),Math.max(1,convergencePolicy.inventoryMs-(performance.now()-started)),'queue action prerequisites did not become enabled before hold');assert.ok(performance.now()-started<=convergencePolicy.inventoryMs,'prerequisite bound includes opening detail');const preparation={name:'queue-action-prerequisite',number:55,elapsedMs:performance.now()-started,guidanceMs:performance.now()-detailOpenedAt,boundMs:convergencePolicy.inventoryMs,meaning:'Actual enabled control before hold; cold advisory wait is separate from write and propagation latency'};evidence.phases.push(preparation);await save();return preparation;},
-   hold:holdOldSearch,
+   hold:()=>holdOldSearch(async()=>holdReadiness(await pages[0].getByRole('button',{name:'Add to merge queue',exact:true}).first().evaluate(button=>({at:performance.now(),enabled:!button.disabled,stacks:window.__enterprise.querySummary().filter(q=>q.kind==='ready-stack'&&q.syntheticNumber===55).map(q=>q.evidence.stack).filter(Boolean)})))),
    verify:async()=>assert.equal(await pages[0].getByRole('button',{name:'Add to merge queue',exact:true}).first().isEnabled(),true,'queue readiness expired while waiting for natural held acquisition'),
   });
   await action(55,'Add to merge queue',{member:true,ready:false},'acknowledged-enqueue',{alreadyOpen:true});

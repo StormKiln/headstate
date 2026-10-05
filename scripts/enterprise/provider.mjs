@@ -1,3 +1,4 @@
+import {observeHoldReadiness} from './convergence-action.mjs';
 import {createServer} from 'node:http';import {parseDocument,project} from './graphql.mjs';
 export const manifest={schema:1,seed:9001,repositories:50,members:50,openPrs:200,authored:50,reviewing:150,overlap:0,historicalMerged:250};
 const date=new Date(Date.now()-86400000).toISOString().slice(0,10)+'T12:00:00Z';
@@ -38,7 +39,7 @@ export async function startProvider({convergence=false}={}) {
    const input=req.url==='/graphql'?JSON.parse(raw):null,doc=input?parseDocument(input.query,input.variables):null;
    const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];entry.queryName=queryName;
    const targeted=rule=>rule&&rule.remaining>0&&doc?.selection.some(f=>{if(f.name!=='search'||(rule.list&&!String(f.args.query).includes(rule.list==='reviewing'?'review-requested:@me':'author:@me')))return false;if(rule.waitForTail&&!rule.tailSeen){if(f.args.after)rule.tailSeen=true;return false;}return !Object.hasOwn(rule,'after')||(f.args.after??null)===rule.after;});
-   const holdSearch=targeted(fault.holdSearch);if(holdSearch)fault.holdSearch.remaining--;
+   const holdRule=fault.holdSearch;let holdSearch=targeted(holdRule);
    const failSearch=targeted(fault.failSearch);if(failSearch)fault.failSearch.remaining--;
    if(queryName==='PrStack'||queryName==='PrStackUp'){
     entry.stage=queryName==='PrStack'?'stack-down':'stack-up';
@@ -114,6 +115,8 @@ export async function startProvider({convergence=false}={}) {
    const root={};const response=project(doc.selection,root,resolve);
    if(pageRefusal){entry.status=503;res.writeHead(503).end();return;}
    entry.materializedAt=performance.now();
+   if(holdSearch&&holdRule.observeReady){entry.holdEligibility=await observeHoldReadiness(holdRule.observeReady);holdSearch=entry.holdEligibility.eligible===true;}
+   if(holdSearch){holdSearch=fault.holdSearch===holdRule&&holdRule.remaining>0;if(holdSearch)holdRule.remaining--;}
    if(fault.hold||holdSearch||(fault.holdHistory&&historyRead)){entry.held=true;await new Promise(resolve=>held.push(resolve));entry.released=true;}
    if(responseDelay)await new Promise(r=>setTimeout(r,responseDelay));
    entry.status=200;res.writeHead(200,{'content-type':'application/json','x-ratelimit-remaining':String(entry.remaining)});res.end(JSON.stringify({data:response}));

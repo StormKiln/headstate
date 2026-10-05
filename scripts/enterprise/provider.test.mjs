@@ -83,3 +83,10 @@ test('actual native PR_DETAIL_QUERY is one primary acquisition with exact identi
  assert.equal(response.status,200);const body=await response.json();assert.equal(body.data.repository.pullRequest.number,51);
  assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);
 }));
+test('conditional hold skips ineligible natural candidate without spending armed hold',()=>usingProvider(async(p,query)=>{
+ const observations=[{eligible:false,reason:'expired'},{eligible:true,observation:{enabled:true}}];
+ p.fault.holdSearch={list:'reviewing',after:null,remaining:1,observeReady:async()=>observations.shift()};
+ const document='{search(query:"is:pr is:open review-requested:@me",first:25){nodes{id}}}';
+ await query(document);assert.equal(p.heldCount,0);assert.equal(p.fault.holdSearch.remaining,1);assert.equal(p.ledger[0].holdEligibility.eligible,false);
+ const pending=query(document);for(let i=0;i<100&&!p.heldCount;i++)await new Promise(r=>setTimeout(r,1));assert.equal(p.heldCount,1);assert.equal(p.fault.holdSearch.remaining,0);assert.equal(p.ledger[1].holdEligibility.eligible,true);p.release();await pending;
+}));
