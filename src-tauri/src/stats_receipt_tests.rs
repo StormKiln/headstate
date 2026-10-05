@@ -1720,7 +1720,7 @@ fn latest_attempt_metadata_does_not_downgrade_complete_measurements_or_replay_sp
     let owner = stats_owner::capture_verified(&conn, "alice").unwrap();
     let now = "2026-10-04T12:00:00Z".parse().unwrap();
     let prior_budget = Budget::new();
-    prior_budget.record(&json!({"rateLimit":{"cost":7,"remaining":4900}}));
+    prior_budget.record(&json!({"rateLimit":{"cost":7}}));
     let measured = Outcome {
         receipt: None,
         total: 17,
