@@ -69,9 +69,9 @@ pub struct Companion {
 /// than a silent `None` that would read as "not paired". The effect is
 /// bounded (the banner loses its timestamp), but on a phone there is no
 /// console, so a corrupt cache was undiagnosable.
-fn last_poll_from_cache(store: &dyn Store) -> Option<DateTime<Utc>> {
-    match events::cached_snapshot(store) {
-        Ok(snapshot) => snapshot.and_then(|s| s.received_at()),
+fn last_poll_from_cache(store: &dyn Store, desktop: &str) -> Option<DateTime<Utc>> {
+    match events::saved_provider_time(store, desktop) {
+        Ok(at) => at,
         Err(e) => {
             log::warn!("companion: the cached snapshot could not be read: {e}");
             None
@@ -106,7 +106,7 @@ impl Companion {
         let Some(desktop) = list.into_iter().next() else {
             return Ok(());
         };
-        let last_poll = last_poll_from_cache(self.store.as_ref());
+        let last_poll = last_poll_from_cache(self.store.as_ref(), &desktop.fp);
         self.conn.set_desktop(Some(desktop.name.clone()), last_poll);
         let identity = match self.keys.session_identity() {
             Ok(id) => id,
@@ -217,6 +217,13 @@ impl Companion {
     /// Best effort throughout: a failure here costs one slow start, and
     /// is not worth failing the user's command over.
     fn remember_address(&self, client: &Client) {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if !live
+            .as_ref()
+            .is_some_and(|l| std::ptr::eq(l.client.as_ref(), client))
+        {
+            return;
+        }
         let Some(best) = client.best_address() else {
             return;
         };
@@ -365,35 +372,29 @@ impl Companion {
             None
         };
         let response = client.call(command, &args, signature.as_deref()).await;
+        // Check and publish under the same pairing lock. Otherwise an old
+        // error could revoke/clear a newly attached pairing after the check.
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if !live
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
         {
-            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            if !live
-                .as_ref()
-                .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
-            {
-                return Err("The paired desktop changed during this request.".into());
-            }
+            return Err("The paired desktop changed during this request.".into());
         }
         match response {
             Ok(value) => {
-                {
-                    let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-                    if !live
-                        .as_ref()
-                        .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
-                    {
-                        return Err("The paired desktop changed during this request.".into());
-                    }
-                    if command == "get_source_snapshot" {
-                        events::save_owned_receipt(self.store.as_ref(), &desktop_fp, &value)
-                            .map_err(|e| e.to_string())?;
-                    }
+                if command == "get_source_snapshot" {
+                    events::save_owned_receipt(self.store.as_ref(), &desktop_fp, &value)
+                        .map_err(|e| e.to_string())?;
+                    self.conn
+                        .mark_poll(last_poll_from_cache(self.store.as_ref(), &desktop_fp));
                 }
                 if self.conn.state() == State::Unreachable {
                     // Back, evidently; let the subscriber confirm and
                     // fill in the protocol version.
                     events.resume();
                 }
+                drop(live);
                 self.remember_address(&client);
                 Ok(value)
             }
@@ -413,13 +414,6 @@ impl Companion {
                     && args["source"]["provider"] == "github"
                     && args["source"]["host"] == "github.com"
                 {
-                    let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-                    if !live
-                        .as_ref()
-                        .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
-                    {
-                        return Err("The paired desktop changed during this request.".into());
-                    }
                     if let Some(receipt) = events::offline_receipt(
                         self.store.as_ref(),
                         &desktop_fp,
@@ -452,9 +446,10 @@ impl Companion {
     }
 
     fn attach(&self, desktop: Desktop, client: Arc<Client>) {
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         self.conn.set_desktop(
             Some(desktop.name.clone()),
-            last_poll_from_cache(self.store.as_ref()),
+            last_poll_from_cache(self.store.as_ref(), &desktop.fp),
         );
         self.conn.set_state(State::Connecting);
         let live = Live {
@@ -463,7 +458,7 @@ impl Companion {
             events: events::Handle::new(),
         };
         self.start_events(&live);
-        *self.live.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
+        *slot = Some(live);
     }
 
     fn start_events(&self, live: &Live) {
@@ -509,9 +504,8 @@ impl Companion {
         ))
     }
 
-    /// Keep a list the background window fetched, exactly as the
-    /// subscriber keeps a `prs-updated` frame: the snapshot, and the
-    /// poll time the banner shows.
+    /// Keep the background receipt and its original provider time,
+    /// scoped to the pairing generation that requested it.
     pub(crate) fn record_snapshot(&self, prs_json: &str) -> Result<(), String> {
         let value: Value = serde_json::from_str(prs_json).map_err(|e| e.to_string())?;
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
@@ -524,6 +518,10 @@ impl Companion {
         }
         events::save_owned_receipt(self.store.as_ref(), &current.desktop.fp, &value["receipt"])
             .map_err(|e| e.to_string())?;
+        self.conn.mark_poll(last_poll_from_cache(
+            self.store.as_ref(),
+            &current.desktop.fp,
+        ));
         Ok(())
     }
 
@@ -944,7 +942,7 @@ mod tests {
         server.open_window(true);
         server.reply(
             "/v1/events",
-            Reply::sse(&[("prs-updated", r#"[{"number":1347}]"#)], true),
+            Reply::sse(&[("prs-updated", r#"[{"number":1347}]"#), ("source-poll-status", r#"{"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored","owner":"alice","receipt_revision":1,"prs":[{"number":1347}],"last_received_at":"2025-12-31T00:00:00Z","coverage":"complete"}"#)], true),
         );
         let qr = server.qr(&token(), Utc::now().timestamp() + 120);
         assert_eq!(c.pair(&qr, None).await.unwrap(), "octocat's laptop");
@@ -1107,6 +1105,54 @@ mod tests {
         // Other reads are attempted and fail honestly.
         let err = c.call("get_stats", json!({})).await.unwrap_err();
         assert!(err.starts_with("octocat's laptop is unreachable:"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn call_error_keeps_pairing_ownership_through_snapshot_removal() {
+        struct CheckedStore {
+            inner: Arc<MemoryStore>,
+            companion: Mutex<std::sync::Weak<Companion>>,
+            checked: AtomicBool,
+        }
+        impl Store for CheckedStore {
+            fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &str, value: &[u8]) -> Result<(), crate::store::StoreError> {
+                self.inner.put(key, value)
+            }
+            fn remove(&self, key: &str) -> Result<(), crate::store::StoreError> {
+                let c = self.companion.lock().unwrap().upgrade().unwrap();
+                // This is the destructive publication seam. A replacement
+                // attach must not acquire ownership between check and clear.
+                assert!(
+                    c.live.try_lock().is_err(),
+                    "pairing replacement could interleave with old error publication"
+                );
+                self.checked.store(true, Ordering::SeqCst);
+                self.inner.remove(key)
+            }
+        }
+        let (server, store, _, mut c) = paired().await;
+        c.live.lock().unwrap().as_ref().unwrap().events.stop();
+        let checked = Arc::new(CheckedStore {
+            inner: store,
+            companion: Mutex::new(std::sync::Weak::new()),
+            checked: AtomicBool::new(false),
+        });
+        c.store = checked.clone();
+        let c = Arc::new(c);
+        *checked.companion.lock().unwrap() = Arc::downgrade(&c);
+        server.revoke(&server.requests()[0].peer_fp);
+        server.end_streams();
+        loop {
+            if c.call("get_stats", json!({})).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(checked.checked.load(Ordering::SeqCst));
+        assert_eq!(c.connection_state().state, State::Revoked);
     }
 
     #[tokio::test]
@@ -1323,9 +1369,10 @@ mod tests {
             again.connection_state().desktop.as_deref(),
             Some("octocat's laptop")
         );
-        assert!(
-            again.connection_state().last_poll.is_some(),
-            "from the snapshot"
+        assert_eq!(
+            again.connection_state().last_poll.as_deref(),
+            Some("2025-12-31T00:00:00Z"),
+            "restart preserves original provider evidence"
         );
         // Wait for the RESUBSCRIBE itself, not merely for the state to
         // read Connected. Those are different moments: the restarted

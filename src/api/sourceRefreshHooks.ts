@@ -22,10 +22,11 @@ const requestPrefix = crypto.randomUUID();
 /** Pairing/account retirement, never an ordinary reconnect. Old closures keep a
  * retired state so late command completions cannot repopulate query data. */
 export function retireSourceOwnership(qc: QueryClient, preserveSession = false) {
-  const session = sessions.get(qc);
-  if (session?.current && !preserveSession) { session.retired.add(session.current); session.current = undefined; }
+  // Backend UUIDs are scoped to a pairing generation. Old closures/requests
+  // retain retired entries; a new pairing may use the same running backend.
+  if (!preserveSession) sessions.delete(qc);
   owners.delete(qc);
-  retireDetailOwnership(qc);
+  retireDetailOwnership(qc, !preserveSession);
   retireReviewOwnership(qc);
   const lists = entries.get(qc);
   entries.delete(qc);

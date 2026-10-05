@@ -5,9 +5,9 @@
 //! The states are the spec's five. `protocol_version` is what
 //! `/v1/hello` reported on the last successful connect and is `None`
 //! whenever the state is not `connected`, so a "desktop too old" banner
-//! never reads a stale number. `last_poll` is when the desktop last
-//! delivered a `prs-updated` (the snapshot on connect, or a poll result),
-//! persisted with the snapshot so it survives a restart.
+//! never reads a stale number. `last_poll` is when the provider last
+//! observed the oldest owned saved list upstream. Its original receipt time
+//! survives reconnect and restart without being replaced by arrival time.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -42,7 +42,7 @@ pub struct Report {
     pub state: State,
     /// The paired desktop's name from the QR; `None` while unpaired.
     pub desktop: Option<String>,
-    /// ISO 8601, or `None` before the first `prs-updated`.
+    /// Original owned provider time, or `None` without qualified evidence.
     pub last_poll: Option<String>,
     /// From `/v1/hello`; `None` unless `state` is `connected`.
     pub protocol_version: Option<u32>,
@@ -134,9 +134,9 @@ impl Connection {
         });
     }
 
-    pub fn mark_poll(&self, at: DateTime<Utc>) {
+    pub fn mark_poll(&self, at: Option<DateTime<Utc>>) {
         self.update(|i| {
-            i.last_poll = Some(at);
+            i.last_poll = at;
             true
         });
     }
@@ -299,7 +299,7 @@ pub(crate) mod tests {
         );
         c.set_desktop(Some("octocat's laptop".into()), None);
         c.connected(PROTOCOL_VERSION);
-        c.mark_poll("2026-09-05T12:00:00Z".parse().unwrap());
+        c.mark_poll(Some("2026-09-05T12:00:00Z".parse().unwrap()));
         assert_eq!(
             serde_json::to_value(c.report()).unwrap(),
             serde_json::json!({

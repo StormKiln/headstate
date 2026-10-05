@@ -192,6 +192,13 @@ export class SourceRefreshState {
       this.publish();
       return;
     }
+    if (receipt.session && receipt.session !== this.session) {
+      if (this.retiredSessions.has(receipt.session)) return;
+      if (this.session) this.retiredSessions.add(this.session);
+      this.session = receipt.session;
+      this.revision = -1;
+      this.receiptRevision = -1;
+    }
     this.coverage = receipt.data.coverage;
     this.retained = { staleSecs: receipt.data.stale_secs, fetchedAt: receipt.data.fetched_at,
       savedOwner: ownership.state === "saved_desktop" ? ownership.owner : undefined };

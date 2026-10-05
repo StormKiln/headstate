@@ -22,7 +22,7 @@
 //! [`Desktop`] and [`SnapshotSink`] are implemented by [`Companion`]:
 //! `hello` is `Client::hello`, `get_cached` is
 //! `Client::call("get_cached", {}, None)` on the live client, `save` is
-//! `events::save_snapshot` plus `Connection::mark_poll`. A window does
+//! `events::save_owned_receipt` with its original provider time. A window does
 //! not move the connection state: the subscriber owns that, and a
 //! desktop that is away is the expected case for a phone in a pocket.
 //!
@@ -1295,7 +1295,7 @@ mod tests {
         server.open_window(true);
         server.reply(
             "/v1/events",
-            Reply::sse(&[("prs-updated", r#"[{"number":1}]"#)], true),
+            Reply::sse(&[("prs-updated", r#"[{"number":1347}]"#), ("source-poll-status", r#"{"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored","owner":"alice","receipt_revision":1,"prs":[{"number":1347}],"last_received_at":"2025-12-31T00:00:00Z","coverage":"complete"}"#)], true),
         );
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]);
         let qr = server.qr(&token, Utc::now().timestamp() + 120);
@@ -1312,9 +1312,9 @@ mod tests {
     }
 
     /// The wired refresher, end to end: one window against the loopback
-    /// server makes exactly `GET /v1/hello` and `POST /v1/call/get_cached`
-    /// on the real client, stores what came back as the snapshot with a
-    /// fresh poll time, and opens no second stream.
+    /// server makes exactly `GET /v1/hello` and `POST /v1/call/get_source_snapshot`
+    /// on the real client, stores the receipt with its original provider
+    /// time, and opens no second stream.
     #[tokio::test]
     async fn the_wired_refresher_goes_through_the_seam_and_never_opens_the_stream() {
         let (server, store, _rec, c) = paired().await;
@@ -1330,7 +1330,10 @@ mod tests {
                 .count()
         };
         assert_eq!(streams(&server), 1, "the subscriber's stream, held open");
-        let stale = c.connection_state().last_poll.unwrap();
+        assert_eq!(
+            c.connection_state().last_poll.as_deref(),
+            Some("2025-12-31T00:00:00Z")
+        );
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
         let refresh = BackgroundRefresh::new(c.clone(), c.clone());
@@ -1362,8 +1365,8 @@ mod tests {
         assert_eq!(snap["ownership"]["state"], "saved_desktop");
         assert_eq!(
             c.connection_state().last_poll.unwrap(),
-            stale,
-            "a disk read is not a provider poll"
+            "2026-01-01T00:00:00Z",
+            "a disk read keeps the original provider time, never arrival time"
         );
         assert_eq!(c.connection_state().state, State::Connected);
     }

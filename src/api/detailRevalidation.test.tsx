@@ -24,7 +24,7 @@ function setup(observing = true) {
 }
 let revision = 0;
 async function publish(patch: Partial<PullRequest> = {}, session = "session") {
-  await act(async () => boundary.listeners.get("source-poll-status")?.({ payload: { source: { provider: "github", host: "github.com" }, list: "reviewing", phase: "ready", error: null, session, revision: ++revision, receipt_revision: revision, coverage: "complete", prs: [{ ...row, ...patch }] } }));
+  await act(async () => boundary.listeners.get("source-poll-status")?.({ payload: { source: { provider: "github", host: "github.com" }, list: "reviewing", owner: "synthetic-viewer", phase: "ready", error: null, session, revision: ++revision, receipt_revision: revision, coverage: "complete", prs: [{ ...row, ...patch }] } }));
 }
 afterEach(() => { cleanup(); clients.splice(0).forEach(qc => qc.clear()); boundary.listeners.clear(); boundary.invoke.mockReset(); boundary.detail.mockReset(); vi.useRealTimers(); revision = 0; });
 it("revalidates the first accepted changed head behind full data and coalesces observers and receipts", async () => {
@@ -170,7 +170,7 @@ it("defers to the head-bound review readback and preserves its confirmed authori
   expect(boundary.invoke.mock.calls.find(([name]) => name === "review_pr_at_head")?.[1]).toMatchObject({ request: { expected_head: "h1", expected_viewer: "synthetic-viewer" } });
   await publish({ ci: "failure" }); expect(boundary.detail).toHaveBeenCalledTimes(2);
 });
-it("ignores an old session accepted independently by the other source list", async () => {
+it("rejects an old session from the other source list before detail acceptance", async () => {
   const { qc, wrapper } = setup();
   boundary.detail.mockResolvedValueOnce({ ...detail, head_oid: "h2" }).mockResolvedValue({ ...detail, head_oid: "h3" });
   renderHook(() => usePrDetail(row.repo, 1), { wrapper });
@@ -183,7 +183,7 @@ it("ignores an old session accepted independently by the other source list", asy
     if (name === "refresh_now") return Promise.resolve({ request_id: "unused", update: { source: { provider: "github", host: "github.com" }, list: "authored", phase: "ready", error: null, session: "old", revision: 1, receipt_revision: 1, prs: [{ ...row, head_oid: "retired" }] } });
     return Promise.resolve();
   });
-  await act(async () => { await refreshWithState(qc, "authored"); });
+  await act(async () => { await expect(refreshWithState(qc, "authored")).rejects.toThrow("The desktop session changed"); });
   expect(boundary.detail).toHaveBeenCalledTimes(2);
 });
 it("does not treat an unknown merge-status default as a positive change", async () => {

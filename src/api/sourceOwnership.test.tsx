@@ -129,3 +129,52 @@ it("same-owner new process status preserves the qualified retained receipt", asy
   act(() => callback({ payload: { source, list: "authored", session: "new-process", owner: "alice", revision: 0, receipt_revision: null, prs: null, phase: "not_requested", error: null } } as never));
   expect(hook.result.current.prs).toEqual(PR_FIXTURES);
 });
+it.each((["authored", "reviewing"] as const).flatMap(list => [undefined, "alice"].map(owner => ({ list, owner }))))("retained $list receipt qualifies new process owner $owner", async ({ list, owner }) => {
+  const { getSourceSnapshot } = await import("./tauri");
+  const qc = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  const hook = renderHook(() => hooks.useSourceRefresh(list), { wrapper });
+  await act(async () => {});
+  vi.mocked(getSourceSnapshot).mockResolvedValueOnce({ source: { provider: "github", host: "github.com" }, list, session: "alice-process", ownership: { state: "live_verified", owner: "alice" }, data: { state: "available", prs: PR_FIXTURES, fetched_at: "2026-01-01T00:00:00Z", stale_secs: 86400, coverage: "complete" } } as never);
+  await act(async () => { await hooks.readRetained(qc, list); });
+  expect(hook.result.current.prs).toHaveLength(PR_FIXTURES.length);
+  const callback = vi.mocked(listen).mock.calls.find(c => c[0] === "source-poll-status")![1];
+  act(() => callback({ payload: { source: { provider: "github", host: "github.com" }, list, owner, session: "new-process", revision: 0, receipt_revision: null, prs: null, phase: "not_requested", error: null } } as never));
+  if (owner) {
+    expect(hook.result.current.prs).toHaveLength(PR_FIXTURES.length);
+    expect(hook.result.current.fetchedAt).toBe("2026-01-01T00:00:00Z");
+    expect(hook.result.current.prs?.every(row => row.observation?.state === "retained")).toBe(true);
+  } else {
+    expect(hook.result.current.prs).toBeUndefined();
+    expect(hook.result.current.coverage).toBeUndefined();
+  }
+});
+it("same-running-desktop re-pair recovers rows and detail facts while old reads stay retired", async () => {
+  const { beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation } = await import("./detailRevalidation");
+  const qc = new QueryClient();
+  const row = PR_FIXTURES[0];
+  qc.setQueryData(["pr-detail", row.repo, row.number], { ...row, head_oid: "before" });
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  const hook = renderHook(() => hooks.useSourceRefresh("authored"), { wrapper });
+  await act(async () => {});
+  const frame = (revision: number) => ({ source: { provider: "github", host: "github.com" }, list: "authored", owner: "alice", session: "same-running-desktop", revision, receipt_revision: revision, prs: [{ ...row, head_oid: `head-${revision}` }], phase: "ready", error: null });
+  const oldCallback = vi.mocked(listen).mock.calls.find(c => c[0] === "source-poll-status")![1];
+  act(() => oldCallback({ payload: frame(1) } as never));
+  const oldRead = beginDetailRead(qc, row.repo, row.number);
+  await act(async () => { hooks.retireSourceOwnership(qc); await qc.resetQueries(); });
+  expect(hook.result.current.prs).toBeUndefined();
+  expect(detailReadIsCurrent(qc, oldRead)).toBe(false);
+  const { getSourceSnapshot } = await import("./tauri");
+  vi.mocked(getSourceSnapshot).mockResolvedValueOnce({ source: { provider: "github", host: "github.com" }, list: "authored", session: "same-running-desktop", ownership: { state: "live_verified", owner: "alice" }, data: { state: "available", prs: [row], fetched_at: "2026-01-01T00:00:00Z", stale_secs: 86400, coverage: "complete" } } as never);
+  await act(async () => { await hooks.readRetained(qc, "authored"); });
+  expect(hook.result.current.prs).toHaveLength(1);
+  expect(hook.result.current.fetchedAt).toBe("2026-01-01T00:00:00Z");
+  expect(detailNeedsRevalidation(qc, row.repo, row.number)).toBe(false);
+  qc.setQueryData(["pr-detail", row.repo, row.number], { ...row, head_oid: "before" });
+  const callback = vi.mocked(listen).mock.calls.filter(c => c[0] === "source-poll-status").at(-1)![1];
+  act(() => callback({ payload: frame(2) } as never));
+  expect(hook.result.current.prs?.[0].head_oid).toBe("head-2");
+  expect(detailNeedsRevalidation(qc, row.repo, row.number)).toBe(true);
+  act(() => oldCallback({ payload: frame(3) } as never));
+  expect(hook.result.current.prs?.[0].head_oid).toBe("head-2");
+});

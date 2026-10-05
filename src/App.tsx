@@ -32,6 +32,7 @@ import { PrioritiesStrip } from "./components/PrioritiesStrip";
 import { ReadyStrip } from "./components/ReadyStrip";
 import { CourtStrip } from "./components/CourtStrip";
 import { PrDetailView } from "./components/PrDetailView";
+import { PrDetailNavigation } from "./components/PrDetailNavigation";
 import { BulkBar } from "./components/BulkBar";
 import { PrList } from "./components/PrList";
 import { ReviewChips } from "./components/ReviewChips";
@@ -1037,9 +1038,10 @@ export default function App() {
               identity={selectedPr}
               mr={[...(gitlabAuthored.rows ?? []), ...(gitlabReviewing.rows ?? [])].find((mr) => prKey(mr) === prKey(selectedPr))}
               onBack={() => selectPr(null)}
-            /> : (authoredSavedOwner || reviewingSavedOwner) ? <div>
-              <button type="button" onClick={() => selectPr(null)}>Back to saved list</button>
-              <p>Saved snapshot for {authoredSavedOwner ?? reviewingSavedOwner}. Refresh from the paired desktop to verify the current account before opening details or taking actions.</p>
+            /> : (view === "to-review" ? reviewingSavedOwner : authoredSavedOwner) ? <div>
+              <PrDetailNavigation provider="GitHub" repo={selectedPr.repo} number={selectedPr.number}
+                href={`https://github.com/${selectedPr.repo}/pull/${selectedPr.number}`} onBack={() => selectPr(null)} />
+              <p>Saved snapshot for {view === "to-review" ? reviewingSavedOwner : authoredSavedOwner}. Refresh from the paired desktop to verify the current account before opening details or taking actions.</p>
             </div> : <PrDetailView
               repo={selectedPr.repo}
               number={selectedPr.number}

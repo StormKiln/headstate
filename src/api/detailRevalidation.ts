@@ -131,9 +131,10 @@ export function resumeDetailRevalidation(qc: QueryClient, repo: string, number: 
   if (query && current(qc, query)?.required) request(qc, query);
 }
 
-export function retireDetailOwnership(qc: QueryClient) {
+export function retireDetailOwnership(qc: QueryClient, resetSessions = false) {
   const src = source(qc);
-  if (src.session) src.retired.add(src.session);
+  if (resetSessions) src.retired.clear();
+  else if (src.session) src.retired.add(src.session);
   src.session = undefined;
   src.generation++;
   reviewReconciliations.delete(qc);

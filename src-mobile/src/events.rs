@@ -292,6 +292,27 @@ pub fn save_owned_receipt(
     saved["receipts"][list] = receipt.clone();
     put_json(store, OWNED_SNAPSHOT_KEY, &saved)
 }
+/// The ribbon describes saved provider evidence, never transport arrival. Use
+/// the oldest retained list so a newer queue cannot rejuvenate another queue.
+pub fn saved_provider_time(
+    store: &dyn Store,
+    desktop: &str,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(saved): Option<serde_json::Value> = get_json(store, OWNED_SNAPSHOT_KEY)? else {
+        return Ok(None);
+    };
+    if saved["v"] != 2 || saved["desktop"] != desktop || saved["owner"].as_str().is_none() {
+        return Ok(None);
+    }
+    Ok(["authored", "reviewing"]
+        .iter()
+        .filter_map(|list| {
+            saved["receipts"][list]["data"]["fetched_at"]
+                .as_str()
+                .and_then(provider_time)
+        })
+        .min())
+}
 fn provider_time(at: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(at)
         .ok()
@@ -676,14 +697,19 @@ fn deliver(sub: &Subscriber, frame: Frame) {
                     "ownership":{"state":"live_verified","owner":update["owner"]},
                     "data":{"state":"available","prs":update["prs"],"fetched_at":update["last_received_at"],
                     "stale_secs":null,"coverage":update["coverage"]}});
-                let _ = save_owned_receipt(sub.store.as_ref(), &sub.desktop_fp, &receipt);
+                if let Err(e) = save_owned_receipt(sub.store.as_ref(), &sub.desktop_fp, &receipt) {
+                    log::warn!("companion: could not cache the owned receipt: {e}");
+                }
+                if let Ok(at) = saved_provider_time(sub.store.as_ref(), &sub.desktop_fp) {
+                    sub.conn.mark_poll(at);
+                }
             }
         }
     }
     if frame.name == SNAPSHOT_EVENT {
         let now = Utc::now();
         match save_snapshot(sub.store.as_ref(), &frame.data, now) {
-            Ok(()) => sub.conn.mark_poll(now),
+            Ok(()) => {}
             Err(e) => log::warn!("companion: could not cache the snapshot: {e}"),
         }
     }
@@ -994,6 +1020,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saved_provider_age_is_scoped_and_never_uses_legacy_arrival() {
+        let store = MemoryStore::default();
+        save_snapshot(&store, "[]", Utc::now()).unwrap();
+        assert_eq!(saved_provider_time(&store, "desktop").unwrap(), None);
+        let receipt = serde_json::json!({"session":"desktop-session","source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":[],"fetched_at":"2026-01-01 00:00:00","coverage":"complete"}});
+        save_owned_receipt(&store, "desktop", &receipt).unwrap();
+        assert_eq!(saved_provider_time(&store, "other-desktop").unwrap(), None);
+        let mut newer_list = receipt.clone();
+        newer_list["list"] = "reviewing".into();
+        newer_list["data"]["fetched_at"] = "2026-01-02T00:00:00Z".into();
+        save_owned_receipt(&store, "desktop", &newer_list).unwrap();
+        assert_eq!(
+            saved_provider_time(&store, "desktop").unwrap(),
+            Some("2026-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_arrays_never_rejuvenate_owned_provider_age() {
+        let yesterday = (Utc::now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let update = serde_json::json!({"session":"desktop", "source":{"provider":"github","host":"github.com"},
+            "list":"authored","owner":"alice","receipt_revision":1,"prs":[],
+            "last_received_at":yesterday,"coverage":"complete"}).to_string();
+        let r = rig(&[("source-poll-status", &update), ("prs-updated", "[]")]).await;
+        until(|| r.rec.last("prs-updated").is_some()).await;
+        assert_eq!(r.conn.report().last_poll, Some(yesterday.parse().unwrap()));
+        r.handle.stop();
+    }
+
     /// Poll until `cond` holds, or give up.
     ///
     /// The budget is deliberately far larger than the ~10ms these
@@ -1056,7 +1114,10 @@ mod tests {
         let report = r.conn.report();
         assert_eq!(report.state, State::Connected);
         assert_eq!(report.protocol_version, Some(PROTOCOL_VERSION));
-        assert!(report.last_poll.is_some());
+        assert!(
+            report.last_poll.is_none(),
+            "ownerless opening arrays have no provider time"
+        );
         // The hello was filed with the desktop record it belongs to.
         pairing::save_desktops(
             r.store.as_ref(),
