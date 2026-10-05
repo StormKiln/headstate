@@ -333,6 +333,7 @@ pub struct GitHubClient {
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
+    read_class: super::admission::ReadClass,
 }
 
 // Client-local: separate accounts never share a result. Only callers which
@@ -526,14 +527,38 @@ impl GitHubClient {
         view.read_context = Some(context);
         view
     }
-    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
-        self.read_context.clone().unwrap_or_else(|| {
-            super::admission::ReadContext::new(
-                super::admission::ReadClass::Foreground,
-                SEARCH_BUDGET,
-            )
-        })
+    /// Bulk loads may finish warming their shared cache after navigation, but
+    /// cannot occupy the two slots reserved for visible foreground reads.
+    pub(crate) fn with_bulk_reads(&self) -> Self {
+        let mut view = self.clone();
+        view.read_class = super::admission::ReadClass::Background;
+        if let Some(context) = &mut view.read_context {
+            context.class = super::admission::ReadClass::Background;
+        }
+        // Class-only: preserve parent bounds and the load's existing overall
+        // timeout; default per-request deadlines still begin at each read.
+        view
     }
+
+    pub(super) fn with_scan_context(&self, context: super::admission::ReadContext) -> Self {
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+
+    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
+        let mut context = self
+            .read_context
+            .clone()
+            .unwrap_or_else(|| super::admission::ReadContext::new(self.read_class, SEARCH_BUDGET));
+        if let Some(live) = &context.live {
+            if let Some(demand) = *live.borrow() {
+                context.deadline = demand.deadline;
+            }
+        }
+        context
+    }
+
     pub(crate) fn with_attempt_limit(&self, limit: usize) -> Self {
         let mut view = self.clone();
         let mut context = self.read_context();
@@ -572,6 +597,7 @@ impl GitHubClient {
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
+            read_class: super::admission::ReadClass::Foreground,
         }
     }
 
@@ -1218,7 +1244,7 @@ impl GitHubClient {
                 .map_err(write_error)?;
             let status = response.status().as_u16();
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1226,13 +1252,11 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .map_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Rest,
-                            &error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Rest,
+                        &error,
+                        retry,
+                    );
                     if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
@@ -1272,7 +1296,7 @@ impl GitHubClient {
                 .map_err(write_error)?;
             let status = response.status().as_u16();
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1280,13 +1304,11 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .map_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Rest,
-                            &error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Rest,
+                        &error,
+                        retry,
+                    );
                     if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
@@ -1368,7 +1390,7 @@ impl GitHubClient {
                 .map_err(write_error)?;
             let status = response.status().as_u16();
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1390,9 +1412,7 @@ impl GitHubClient {
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
             // PUT's non-success JSON is a semantic answer consumed by its caller.
-            if current_window {
-                self.read_transport.observe_rest_body(&value, retry);
-            }
+            self.read_transport.observe_rest_body(&value, retry);
             admission.complete();
             Ok((status, value))
         })
@@ -1434,7 +1454,7 @@ impl GitHubClient {
             let response = self.octocrab._post("/graphql", Some(body)).await?;
             let status = response.status().as_u16();
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Graphql,
                 response.status().as_u16(),
                 response.headers(),
@@ -1442,22 +1462,18 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .inspect_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Graphql,
-                            error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Graphql,
+                        error,
+                        retry,
+                    );
                     if status < 500 && matches!(error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
                 })?;
             let value =
                 <serde_json::Value as octocrab::FromResponse>::from_response(response).await?;
-            if current_window {
-                self.read_transport.observe_graphql(&value, retry);
-            }
+            self.read_transport.observe_graphql(&value, retry);
             admission.complete();
             Ok(value)
         })

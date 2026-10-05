@@ -648,6 +648,7 @@ pub async fn get_stats(client: State<'_, GhClient>) -> Result<Stats, String> {
 #[tauri::command]
 pub async fn get_cycle_trend(client: State<'_, GhClient>) -> Result<CycleTrend, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     client
         .fetch_cycle_trend(chrono::Utc::now())
         .await
@@ -4777,6 +4778,7 @@ pub async fn get_reviewing(
 #[tauri::command]
 pub async fn get_periods(client: State<'_, GhClient>) -> Result<Periods, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     client
         .fetch_periods(chrono::Utc::now())
         .await
@@ -4786,6 +4788,7 @@ pub async fn get_periods(client: State<'_, GhClient>) -> Result<Periods, String>
 #[tauri::command]
 pub async fn get_history(client: State<'_, GhClient>, days: i64) -> Result<History, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     let days = clamp_days(days);
     client
         .fetch_history(chrono::Utc::now(), days)
@@ -4796,6 +4799,7 @@ pub async fn get_history(client: State<'_, GhClient>, days: i64) -> Result<Histo
 #[tauri::command]
 pub async fn get_merged_detail(client: State<'_, GhClient>) -> Result<MergedDetail, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     client
         .fetch_merged_detail()
         .await
@@ -4850,6 +4854,7 @@ pub async fn stats_count(
     use crate::github::stats::{Measure, Scope, Slice, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     let days = clamp_days(days);
 
     let subject = match subject {
@@ -5053,6 +5058,7 @@ pub async fn stats_count(
 #[tauri::command]
 pub async fn stats_tree(client: State<'_, GhClient>) -> Result<crate::github::stats::Tree, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
 
     crate::diag!("[diag] cmd stats_tree start");
     let started = std::time::Instant::now();
@@ -5482,6 +5488,8 @@ async fn stats_board_for_client(
     days: i64,
 ) -> Result<StatsBoard, String> {
     use crate::github::stats::Measure;
+    let bulk = client.with_bulk_reads();
+    let client = &bulk;
 
     let measure = match measure.as_str() {
         "merged" => Measure::Merged,
@@ -6059,6 +6067,7 @@ pub async fn stats_series(
     use crate::github::stats::{Measure, StatsQuery, Subject};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     let subject = match subject {
         // An empty string is a caller mistake, not a request for everyone:
         // treating it as `None` would silently widen a chart about one
@@ -6284,6 +6293,7 @@ pub async fn stats_reviewers(
     use crate::github::stats::{Measure, StatsQuery};
 
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client.with_bulk_reads();
     let now = chrono::Utc::now();
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
@@ -8566,6 +8576,151 @@ mod tests {
             Some("fixture-before")
         );
         assert_eq!(crate::store::pr_slice::total_rows(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn every_bulk_stats_command_uses_the_shared_background_policy() {
+        let source = include_str!("commands.rs");
+        for name in [
+            "get_periods",
+            "get_history",
+            "get_merged_detail",
+            "get_cycle_trend",
+            "stats_count",
+            "stats_tree",
+            "stats_series",
+            "stats_reviewers",
+        ] {
+            let body = source
+                .split(&format!("pub async fn {name}("))
+                .nth(1)
+                .unwrap()
+                .split("#[tauri::command]")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("let client = client.with_bulk_reads();"),
+                "{name}"
+            );
+        }
+        let board = source
+            .split("async fn stats_board_for_client(")
+            .nth(1)
+            .unwrap()
+            .split("let measure =")
+            .next()
+            .unwrap();
+        assert!(board.contains("client.with_bulk_reads()"));
+        let remote = include_str!("remote/surface.rs");
+        for name in [
+            "get_periods",
+            "get_history",
+            "get_merged_detail",
+            "get_cycle_trend",
+            "stats_count",
+            "stats_tree",
+            "stats_board",
+            "stats_series",
+            "stats_reviewers",
+            "get_pr_detail",
+        ] {
+            let arm = remote
+                .split(&format!("\"{name}\" =>"))
+                .nth(1)
+                .unwrap()
+                .split("\n        \"")
+                .next()
+                .unwrap();
+            assert!(
+                arm.contains(&format!("commands::{name}(")),
+                "remote {name} must use the tested command boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_stats_commands_reserve_foreground_detail_capacity() {
+        use std::time::Duration;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"}}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = crate::github::client::GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("fixture-token")
+                .build()
+                .unwrap(),
+        );
+        client
+            .stats_viewer_metered(&client.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"data":{}})),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut workers = tokio::task::JoinSet::new();
+        for n in 0..4 {
+            let client = client.clone();
+            let db = dir.path().join(format!("stats-{n}.db"));
+            workers.spawn(async move {
+                super::stats_board_for_client(
+                    &client,
+                    db,
+                    &tokio::sync::Notify::new(),
+                    "org".into(),
+                    Some(format!("fixture-org-{n}")),
+                    "merged".into(),
+                    7,
+                )
+                .await
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.received_requests().await.unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bulk HTTP reaches both background slots");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "bulk command waves must use only the two non-foreground slots"
+        );
+        let detail_client = client.clone();
+        let detail =
+            tokio::spawn(async move { detail_client.fetch_pr_detail("fixture/repo", 1).await });
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while server.received_requests().await.unwrap().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("selected detail dispatches before bulk HTTP completes");
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.body_json::<serde_json::Value>().unwrap()["query"]
+                == crate::github::query::PR_DETAIL_QUERY));
+        detail.abort();
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
     }
 
     #[test]

@@ -367,6 +367,8 @@ export function usePollState(): "idle" | "fetching" | "retrying" {
 /// is not being watched is the reason polling lives in Rust.
 export function useViewCadence(view: string): void {
   useEffect(() => {
+    // Phone demand uses explicit minute/resume refreshes; cadence belongs to the desktop.
+    if (IS_MOBILE_BUILD) return;
     // Tolerate a host without the command, as the other listeners do:
     // cadence is an optimisation, and failing to set it must not break
     // the page.

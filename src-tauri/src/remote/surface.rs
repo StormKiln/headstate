@@ -1020,6 +1020,14 @@ impl<'a> Args<'a> {
     }
 }
 
+// Keep old phones wire-compatible without granting them ownership of the
+// desktop poll cadence. Phone reads still use refresh_now/get_reviewing.
+fn legacy_phone_cadence(args: &Args<'_>) -> Result<Value, RemoteError> {
+    let _: bool = args.get("needs")?;
+    let _: Option<bool> = args.get("reviewing")?;
+    ok(())
+}
+
 /// A command's plain return value, as the webview would receive it.
 fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
     serde_json::to_value(value)
@@ -1496,16 +1504,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // engine start does not stall the listener for everyone else.
         "docker_start" => res(blocking(commands::docker_start).await?),
         "docker_restart" => res(blocking(commands::docker_restart).await?),
-        "set_view_needs_github" => {
-            commands::set_view_needs_github(
-                a.get("needs")?,
-                app.state(),
-                app.state(),
-                app.state(),
-                a.get("reviewing")?,
-            );
-            ok(())
-        }
+        "set_view_needs_github" => legacy_phone_cadence(&a),
         "set_poll_interval" => ok(commands::set_poll_interval(
             app.clone(),
             a.get("secs")?,
@@ -1633,6 +1632,39 @@ mod tests {
             .filter_map(|tok| tok.rsplit("::").next())
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn legacy_phone_cadence_validates_wire_args_without_host_state() {
+        for needs in [false, true] {
+            for reviewing in [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                Value::Null,
+            ] {
+                let args = Args::new(
+                    "set_view_needs_github",
+                    serde_json::json!({"needs":needs,"reviewing":reviewing}),
+                )
+                .unwrap();
+                assert_eq!(legacy_phone_cadence(&args).unwrap(), Value::Null);
+            }
+        }
+        assert!(legacy_phone_cadence(
+            &Args::new("set_view_needs_github", serde_json::json!({})).unwrap()
+        )
+        .is_err());
+        assert_eq!(class_of("set_view_needs_github"), Some(Class::Write));
+        let source = include_str!("surface.rs");
+        let arm = source
+            .split("\"set_view_needs_github\" =>")
+            .nth(1)
+            .unwrap()
+            .split("\"set_poll_interval\"")
+            .next()
+            .unwrap();
+        assert!(arm.contains("legacy_phone_cadence(&a)"));
+        assert!(!arm.contains("app.state()"));
     }
 
     #[test]

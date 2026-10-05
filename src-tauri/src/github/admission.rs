@@ -22,6 +22,7 @@ pub struct ReadContext {
     pub deadline: Instant,
     pub(crate) attempts: Option<AttemptAllowance>,
     pub(crate) first_attempt: Option<FirstAttempt>,
+    pub(super) live: Option<tokio::sync::watch::Receiver<Option<LiveRead>>>,
 }
 impl ReadContext {
     pub fn new(class: ReadClass, budget: Duration) -> Self {
@@ -30,9 +31,17 @@ impl ReadContext {
             deadline: Instant::now() + budget,
             attempts: None,
             first_attempt: None,
+            live: None,
         }
     }
 }
+/// Only queued shared scans carry live demand; dispatched requests freeze it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LiveRead {
+    pub class: ReadClass,
+    pub deadline: Instant,
+}
+
 type FirstAttemptCallback = Box<dyn FnOnce() + Send>;
 
 /// An operation-local, once-only scheduling mark after admission, before HTTP.
@@ -52,7 +61,7 @@ impl FirstAttempt {
             callback: Arc::new(Mutex::new(Some(Box::new(callback)))),
         }
     }
-    fn observe(&self) {
+    pub(super) fn observe(&self) {
         let callback = self
             .callback
             .lock()
@@ -128,6 +137,7 @@ struct Quota {
 struct State {
     quotas: [Quota; 2],
     secondary: Option<Instant>,
+    secondary_revision: u64,
     cycle: Instant,
     spent: u8,
 }
@@ -145,6 +155,7 @@ impl Default for Admission {
             state: Mutex::new(State {
                 quotas: Default::default(),
                 secondary: None,
+                secondary_revision: 0,
                 cycle: Instant::now(),
                 spent: 0,
             }),
@@ -157,8 +168,9 @@ fn refused(message: &str) -> ClientError {
 pub(super) struct Attempt<'a> {
     admission: &'a Admission,
     bucket: Bucket,
-    probe: Option<u64>,
+    probe: Option<(u64, Option<u64>, bool)>,
     done: bool,
+    pub(super) deadline: Option<Instant>,
     _total: Option<SemaphorePermit<'a>>,
     _background: Option<SemaphorePermit<'a>>,
 }
@@ -169,7 +181,7 @@ impl Attempt<'_> {
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
-        if let Some(revision) = self.probe {
+        if let Some((revision, secondary_revision, primary_recovery)) = self.probe {
             let mut state = self
                 .admission
                 .state
@@ -177,18 +189,23 @@ impl Drop for Attempt<'_> {
                 .unwrap_or_else(|e| e.into_inner());
             let quota = &mut state.quotas[self.bucket as usize];
             quota.probing = false;
-            if quota.revision == revision {
+            if primary_recovery && quota.revision == revision {
                 if self.done {
                     quota.blocked = None;
                     quota.reserve_until = None;
+                } else {
+                    let retry = Instant::now() + Duration::from_secs(1);
+                    quota.blocked = Some(quota.blocked.map_or(retry, |old| old.max(retry)));
+                }
+            }
+            if secondary_revision == Some(state.secondary_revision) {
+                if self.done {
                     if state.secondary.is_some_and(|until| until <= Instant::now()) {
                         state.secondary = None;
                     }
                 } else {
-                    quota.blocked = Some(Instant::now() + Duration::from_secs(1));
-                    if state.secondary.is_some() {
-                        state.secondary = Some(Instant::now() + Duration::from_secs(1));
-                    }
+                    let retry = Instant::now() + Duration::from_secs(1);
+                    state.secondary = Some(state.secondary.map_or(retry, |old| old.max(retry)));
                 }
             }
         }
@@ -241,7 +258,11 @@ impl Admission {
         let probe = if deadline.is_some() || secondary_recovery {
             let quota = &mut state.quotas[bucket as usize];
             quota.probing = true;
-            Some(quota.revision)
+            Some((
+                quota.revision,
+                secondary_recovery.then_some(state.secondary_revision),
+                deadline.is_some(),
+            ))
         } else {
             None
         };
@@ -253,6 +274,7 @@ impl Admission {
             bucket,
             probe,
             done: false,
+            deadline: None,
             _total: None,
             _background: None,
         })
@@ -262,46 +284,88 @@ impl Admission {
         bucket: Bucket,
         context: ReadContext,
     ) -> Result<Attempt<'_>, ClientError> {
-        let acquire = async {
-            let background = if context.class != ReadClass::Foreground {
-                Some(
-                    self.background
-                        .acquire()
-                        .await
-                        .map_err(|_| refused("read admission closed"))?,
-                )
-            } else {
-                None
+        let mut live = context.live.clone();
+        loop {
+            let demand = match &mut live {
+                Some(receiver) => (*receiver.borrow_and_update())
+                    .ok_or_else(|| refused("shared read has no live consumers"))?,
+                None => LiveRead {
+                    class: context.class,
+                    deadline: context.deadline,
+                },
             };
-            let total = self
-                .total
-                .acquire()
-                .await
-                .map_err(|_| refused("read admission closed"))?;
-            if Instant::now() >= context.deadline {
-                return Err(refused("read deadline elapsed before dispatch"));
-            }
-            let mut attempt = self
-                .enter(bucket, Some(context.class), context.attempts.as_ref())
-                .map_err(|error| match error {
-                    ClientError::NotDispatched(message) if message.starts_with("provider") => {
-                        ClientError::RateLimited(message)
+            let deadline = demand.deadline;
+            let acquire = async {
+                let background = if demand.class != ReadClass::Foreground {
+                    Some(
+                        self.background
+                            .acquire()
+                            .await
+                            .map_err(|_| refused("read admission closed"))?,
+                    )
+                } else {
+                    None
+                };
+                let total = self
+                    .total
+                    .acquire()
+                    .await
+                    .map_err(|_| refused("read admission closed"))?;
+                if Instant::now() >= deadline {
+                    return Err(refused("read deadline elapsed before dispatch"));
+                }
+                let mut attempt = self
+                    .enter(bucket, Some(demand.class), context.attempts.as_ref())
+                    .map_err(|error| match error {
+                        ClientError::NotDispatched(message) if message.starts_with("provider") => {
+                            ClientError::RateLimited(message)
+                        }
+                        other => other,
+                    })?;
+                attempt._background = background;
+                attempt._total = Some(total);
+                attempt.deadline = Some(deadline);
+                if let Some(observer) = &context.first_attempt {
+                    observer.observe();
+                }
+                Ok(attempt)
+            };
+            let wait = tokio::time::timeout_at(deadline, acquire);
+            if let Some(receiver) = &mut live {
+                tokio::select! {
+                    biased;
+                    changed = receiver.changed() => {
+                        if changed.is_err() { return Err(refused("shared read demand closed")); }
+                        // Dropping only this pre-dispatch acquisition releases
+                        // any partial permits; attempts have not been debited.
+                        continue;
                     }
-                    other => other,
-                })?;
-            attempt._background = background;
-            attempt._total = Some(total);
-            if let Some(observer) = &context.first_attempt {
-                observer.observe();
+                    result = wait => return result.map_err(|_| refused("read deadline elapsed before dispatch"))?,
+                }
+            } else {
+                return wait
+                    .await
+                    .map_err(|_| refused("read deadline elapsed before dispatch"))?;
             }
-            Ok(attempt)
-        };
-        tokio::time::timeout_at(context.deadline, acquire)
-            .await
-            .map_err(|_| refused("read deadline elapsed before dispatch"))?
+        }
     }
+
     pub fn write(&self, bucket: Bucket) -> Result<Attempt<'_>, ClientError> {
         self.enter(bucket, None, None)
+    }
+    pub(super) fn retry_wait(&self, bucket: Bucket) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.quotas[bucket as usize]
+            .blocked
+            .into_iter()
+            .chain(state.secondary)
+            .map(|until| {
+                let wait = until.saturating_duration_since(Instant::now());
+                wait.as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() > 0))
+            })
+            .max()
+            .unwrap_or(0)
     }
     pub fn remaining(&self, bucket: Bucket) -> Option<u64> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -360,11 +424,13 @@ impl Admission {
         let seconds = seconds.max(1);
         let until = provider_deadline(seconds);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let quota = &mut state.quotas[bucket as usize];
-        quota.blocked = Some(quota.blocked.map_or(until, |old| old.max(until)));
-        quota.revision += 1;
         if secondary {
             state.secondary = Some(state.secondary.map_or(until, |old| old.max(until)));
+            state.secondary_revision += 1;
+        } else {
+            let quota = &mut state.quotas[bucket as usize];
+            quota.blocked = Some(quota.blocked.map_or(until, |old| old.max(until)));
+            quota.revision += 1;
         }
         seconds
     }
@@ -402,6 +468,54 @@ pub(super) fn retry_seconds(value: &str, now: chrono::DateTime<chrono::Utc>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn newer_cross_protocol_cooldown_survives_old_probe_cleanup() {
+        for (first, other) in [
+            (Bucket::Graphql, Bucket::Rest),
+            (Bucket::Rest, Bucket::Graphql),
+        ] {
+            for completed in [false, true] {
+                let admission = Admission::default();
+                admission.limit(first, 1, true);
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let mut probe = admission.write(first).unwrap();
+                admission.limit(other, 60, true);
+                if completed {
+                    probe.complete();
+                }
+                drop(probe);
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert!(
+                    admission.write(first).is_err(),
+                    "old probe shortened newer shared refusal"
+                );
+                tokio::time::advance(Duration::from_secs(58)).await;
+                let mut recovery = admission.write(first).unwrap();
+                assert!(admission.write(other).is_err());
+                recovery.complete();
+                drop(recovery);
+                assert!(admission.write(other).is_ok());
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn secondary_recovery_in_other_bucket_cannot_clear_primary_exhaustion() {
+        let admission = Admission::default();
+        admission.limit(Bucket::Graphql, 1800, false);
+        admission.limit(Bucket::Rest, 1, true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(admission.write(Bucket::Graphql).is_err());
+        let mut recovery = admission.write(Bucket::Rest).unwrap();
+        recovery.complete();
+        drop(recovery);
+        assert!(admission.write(Bucket::Rest).is_ok());
+        assert!(admission.write(Bucket::Graphql).is_err());
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        let mut recovery = admission.write(Bucket::Graphql).unwrap();
+        recovery.complete();
+        drop(recovery);
+        assert!(admission.write(Bucket::Graphql).is_ok());
+    }
     fn context(class: ReadClass) -> ReadContext {
         ReadContext::new(class, Duration::from_secs(30))
     }

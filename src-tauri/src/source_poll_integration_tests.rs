@@ -2550,3 +2550,102 @@ async fn healthy_isolated_absence_recovers_batching_without_shortening_negative_
         vec![1, 1, 1, 1, 4]
     );
 }
+
+#[tokio::test]
+async fn queued_continuation_promotes_foreground_refresh_and_publishes_checkpoint_once() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("promoted.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    seed_terminal_inventory(&conn, list, 8, true);
+    let baseline = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+        .unwrap()
+        .revision;
+    conn.execute_batch("CREATE TABLE checkpoint_writes (id INTEGER); CREATE TRIGGER audit_checkpoint AFTER UPDATE ON queue_scan BEGIN INSERT INTO checkpoint_writes VALUES(1); END;").unwrap();
+    Mock::given(wiremock::matchers::body_partial_json(
+        json!({"query":"blocker"}),
+    ))
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_secs(30))
+            .set_body_json(json!({"data":{}})),
+    )
+    .with_priority(1)
+    .mount(&server)
+    .await;
+    let before = server.received_requests().await.unwrap().len();
+    let mut blockers = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let scoped = client.with_read_context(ReadContext::new(
+            ReadClass::Background,
+            Duration::from_secs(30),
+        ));
+        blockers.spawn(async move { scoped.stats_graphql(&json!({"query":"blocker"})).await });
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.received_requests().await.unwrap().len() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let loaded = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered = loaded.clone();
+    let background = client.with_read_context(ReadContext::new(
+        ReadClass::Background,
+        Duration::from_secs(3),
+    ));
+    let background_path = path.clone();
+    let leader = tokio::spawn(async move {
+        fetch_github_step_at(
+            background_path,
+            &background,
+            list,
+            Duration::from_secs(3),
+            true,
+            || {
+                entered.notify_one();
+                (120, 2000)
+            },
+        )
+        .await
+    });
+    // This current-thread runtime observes the notification after the source
+    // future has synchronously registered its shared scan and yielded.
+    loaded.notified().await;
+    let foreground = tokio::time::timeout(
+        Duration::from_secs(1),
+        fetch_github_step_at(path, &client, list, Duration::from_secs(3), false, || {
+            (120, 2000)
+        }),
+    )
+    .await
+    .expect("foreground source refresh must progress with Background HTTP still held")
+    .unwrap();
+    let background = leader.await.unwrap().unwrap();
+    assert_eq!(foreground.scan, background.scan);
+    assert_eq!(
+        server.received_requests().await.unwrap().len() - before,
+        4,
+        "two blockers, one terminal proof and one promoted discovery"
+    );
+    let polls = SourcePolls::default();
+    let (a, _) = polls.begin_attempt(Source::default(), list).await;
+    let (b, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &a, foreground).await;
+    publish_scan_attempt(&polls, &conn, &b, background).await;
+    let accepted = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(accepted.revision, baseline + 1);
+    assert_eq!(accepted.state.completed_at, Some(2000));
+    assert_eq!(terminal_inventory(&conn, list).len(), 4);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM checkpoint_writes", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "shared receipt can publish only one durable checkpoint advancement"
+    );
+    blockers.abort_all();
+    while blockers.join_next().await.is_some() {}
+}

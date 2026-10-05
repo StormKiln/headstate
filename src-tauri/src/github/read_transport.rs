@@ -116,12 +116,7 @@ impl ReadTransport {
         self.read(client, Read::Rest { path, budget }, "rest-read", context)
             .await
     }
-    pub(super) fn observe_headers(
-        &self,
-        bucket: Bucket,
-        status: u16,
-        headers: &hyper::HeaderMap,
-    ) -> bool {
+    pub(super) fn observe_headers(&self, bucket: Bucket, status: u16, headers: &hyper::HeaderMap) {
         let number = |key| {
             headers
                 .get(key)
@@ -130,47 +125,48 @@ impl ReadTransport {
         };
         let remaining = number("x-ratelimit-remaining");
         let reset = number("x-ratelimit-reset");
-        if !self.admission.observe(bucket, remaining, reset) {
-            return false;
-        }
+        let current_window = self.admission.observe(bucket, remaining, reset);
         let retry = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| retry_seconds(v, chrono::Utc::now()));
         let exhausted = remaining == Some(0);
         let refused = status == 429 || (status == 403 && (retry.is_some() || exhausted));
-        if refused || exhausted {
-            self.admission.limit(
-                bucket,
-                retry.or(reset.map(seconds_until)).unwrap_or(60),
-                refused && !exhausted,
-            );
+        if exhausted && current_window {
+            self.admission
+                .limit(bucket, reset.map(seconds_until).unwrap_or(60), false);
         }
-        true
+        if (refused && !exhausted) || (refused && retry.is_some()) {
+            self.admission.limit(bucket, retry.unwrap_or(60), true);
+        }
     }
+
     pub(super) fn observe_graphql(&self, value: &Value, retry: Option<u64>) {
         let quota = &value["data"]["rateLimit"];
         let reset = quota["resetAt"]
             .as_str()
             .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
             .map(|v| v.timestamp().max(0) as u64);
-        if self
-            .admission
-            .observe(Bucket::Graphql, quota["remaining"].as_u64(), reset)
-            && graphql_exhausted(value)
-        {
+        let remaining = quota["remaining"].as_u64();
+        let current_window = self.admission.observe(Bucket::Graphql, remaining, reset);
+        if remaining == Some(0) && current_window {
             self.admission.limit(
                 Bucket::Graphql,
-                retry.or(reset.map(seconds_until)).unwrap_or(60),
-                value
-                    .get("errors")
-                    .and_then(Value::as_array)
-                    .is_some_and(|errors| {
-                        errors.iter().any(|error| {
-                            secondary_message(error["message"].as_str().unwrap_or_default())
-                        })
-                    }),
+                reset.map(seconds_until).unwrap_or(60),
+                false,
             );
+        }
+        let secondary = value
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|error| secondary_message(error["message"].as_str().unwrap_or_default()))
+            });
+        if secondary || (graphql_exhausted(value) && (remaining != Some(0) || retry.is_some())) {
+            self.admission
+                .limit(Bucket::Graphql, retry.unwrap_or(60), true);
         }
     }
 
@@ -209,13 +205,21 @@ impl ReadTransport {
             started: Instant::now(),
             outcome: "cancelled",
         };
-        context.deadline = context.deadline.min(Instant::now() + READ_BUDGET);
-        let result = tokio::time::timeout_at(
-            context.deadline,
-            self.attempts(client, read, id, operation, context),
-        )
-        .await
-        .unwrap_or(Err(ClientError::Timeout(READ_BUDGET.as_secs())));
+        if context.live.is_none() {
+            context.deadline = context.deadline.min(Instant::now() + READ_BUDGET);
+        }
+        let result = if context.live.is_some() {
+            // Live queued consumers own admission lifetime. The admitted
+            // request freezes a bounded deadline inside attempts().
+            self.attempts(client, read, id, operation, context).await
+        } else {
+            tokio::time::timeout_at(
+                context.deadline,
+                self.attempts(client, read, id, operation, context),
+            )
+            .await
+            .unwrap_or(Err(ClientError::Timeout(READ_BUDGET.as_secs())))
+        };
         log.outcome = if result.is_ok() { "ok" } else { "failed" };
         result
     }
@@ -231,10 +235,18 @@ impl ReadTransport {
         for attempt in 1..=2 {
             let mut permit = self.admission.read(read.bucket(), context.clone()).await?;
             let started = Instant::now();
-            let response = match read {
-                Read::Graphql(body) => client._post("/graphql", Some(body)).await,
-                Read::Rest { path, .. } => client._get(path).await,
-            };
+            let request_deadline = permit
+                .deadline
+                .unwrap_or(context.deadline)
+                .min(Instant::now() + READ_BUDGET);
+            let response = tokio::time::timeout_at(request_deadline, async {
+                match read {
+                    Read::Graphql(body) => client._post("/graphql", Some(body)).await,
+                    Read::Rest { path, .. } => client._get(path).await,
+                }
+            })
+            .await
+            .map_err(|_| ClientError::Timeout(READ_BUDGET.as_secs()))?;
             let result = match response {
                 Err(error) => Err(map_error(error)),
                 Ok(response) => {
@@ -258,34 +270,12 @@ impl ReadTransport {
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| retry_seconds(v, chrono::Utc::now()));
-                    let reset_epoch = header_number("x-ratelimit-reset");
-                    let current_window =
-                        self.admission
-                            .observe(read.bucket(), remaining, reset_epoch);
-                    let reset = reset_epoch.map(seconds_until);
+                    self.observe_headers(read.bucket(), status, response.headers());
                     let exhausted = remaining == Some(0);
                     let refused =
                         status == 429 || (status == 403 && (retry_after.is_some() || exhausted));
-                    if (refused || exhausted) && current_window {
-                        let seconds = self.admission.limit(
-                            read.bucket(),
-                            retry_after.or(reset).unwrap_or(60),
-                            refused && !exhausted,
-                        );
-                        crate::diag!(
-                            "[diag] provider read id={} operation={} rate_limit_wait_seconds={}",
-                            id,
-                            operation,
-                            seconds
-                        );
-                        if refused {
-                            return Err(ClientError::RateLimited(format!(
-                                "retry in {seconds} seconds"
-                            )));
-                        }
-                        // A successful final-quota response is still an answer.
-                        // Keep its data, but refuse the NEXT read until reset.
-                    }
+                    // Still decode refused bodies: they may carry independent
+                    // secondary evidence alongside primary header exhaustion.
                     if status >= 500 {
                         Err(ClientError::NotJson(format!("HTTP {status} response")))
                     } else {
@@ -293,7 +283,7 @@ impl ReadTransport {
                             Ok(response) => {
                                 match Value::from_response(response).await.map_err(map_error) {
                                     Ok(value) => {
-                                        if matches!(read, Read::Graphql(_)) && current_window {
+                                        if matches!(read, Read::Graphql(_)) {
                                             self.observe_graphql(&value, retry_after);
                                             if graphql_exhausted(&value)
                                                 && value.get("data").is_none_or(Value::is_null)
@@ -309,12 +299,16 @@ impl ReadTransport {
                                 }
                             }
                             Err(error) => {
-                                if current_window
-                                    && self.observe_error(read.bucket(), &error, retry_after)
+                                if self.observe_error(read.bucket(), &error, retry_after) || refused
                                 {
-                                    Err(ClientError::RateLimited(
-                                        "provider retry deadline is active".into(),
-                                    ))
+                                    Err(ClientError::RateLimited(if refused {
+                                        format!(
+                                            "retry in {} seconds",
+                                            self.admission.retry_wait(read.bucket())
+                                        )
+                                    } else {
+                                        "provider retry deadline is active".into()
+                                    }))
                                 } else {
                                     Err(map_error(error))
                                 }
@@ -398,6 +392,107 @@ mod admission_tests {
             .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_primary_write_headers_do_not_hide_fresh_secondary_body_evidence() {
+        use super::super::client::GitHubClient;
+        let server = MockServer::start().await;
+        let base = GitHubClient::new(client(&server).await);
+        let reset = chrono::Utc::now().timestamp() + 1800;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-reset", reset.to_string())
+                    .insert_header("x-ratelimit-remaining", "1000")
+                    .set_body_json(serde_json::json!({"ok":true})),
+            )
+            .mount(&server)
+            .await;
+        base.rest_put("/synthetic", &serde_json::json!({}), &base.request_budget())
+            .await
+            .unwrap();
+        server.reset().await;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-reset", (reset - 3600).to_string())
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(
+                        serde_json::json!({"message":"You have exceeded a secondary rate limit"}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        base.rest_put("/synthetic", &serde_json::json!({}), &base.request_budget())
+            .await
+            .unwrap();
+        let _ = base
+            .stats_graphql(&serde_json::json!({"query":"synthetic"}))
+            .await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "new secondary body must suppress other-protocol HTTP despite stale primary window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn independent_primary_secondary_header_deadlines() {
+        for bucket in [Bucket::Graphql, Bucket::Rest] {
+            for (remaining, retry, after, allowed) in [
+                (1000, None, 61, true),
+                (0, Some("1"), 2, false),
+                (0, Some("3600"), 1801, false),
+            ] {
+                let transport = ReadTransport::default();
+                let mut headers = hyper::HeaderMap::new();
+                headers.insert(
+                    "x-ratelimit-remaining",
+                    remaining.to_string().parse().unwrap(),
+                );
+                headers.insert(
+                    "x-ratelimit-reset",
+                    (chrono::Utc::now().timestamp() + 1800)
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                );
+                if let Some(retry) = retry {
+                    headers.insert("retry-after", retry.parse().unwrap());
+                }
+                transport.observe_headers(bucket, 429, &headers);
+                tokio::time::advance(Duration::from_secs(after)).await;
+                assert_eq!(
+                    transport.admission.write(bucket).is_ok(),
+                    allowed,
+                    "remaining={remaining} retry={retry:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_past_and_extreme_primary_hints_remain_bounded_or_saturating() {
+        for (reset, after, allowed) in [
+            ("malformed".to_string(), 2, false),
+            ("malformed".to_string(), 61, true),
+            ("0".to_string(), 2, true),
+            (u64::MAX.to_string(), 3600, false),
+        ] {
+            let transport = ReadTransport::default();
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("x-ratelimit-reset", reset.parse().unwrap());
+            headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+            headers.insert("retry-after", "1".parse().unwrap());
+            transport.observe_headers(Bucket::Graphql, 429, &headers);
+            tokio::time::advance(Duration::from_secs(after)).await;
+            assert_eq!(
+                transport.admission.write(Bucket::Graphql).is_ok(),
+                allowed,
+                "reset={reset}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -645,3 +740,7 @@ mod admission_tests {
         while tasks.join_next().await.is_some() {}
     }
 }
+
+#[cfg(test)]
+#[path = "read_transport_deadline_tests.rs"]
+mod deadline_tests;
