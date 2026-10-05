@@ -47,6 +47,7 @@ export async function startProvider({convergence=false}={}) {
      return fields.map(field=>({repo:repo?.nameWithOwner,number:queryName==='PrStack'?field.args.number:data.rows.find(r=>r.repository===repo&&r.headRefName===field.args.baseRefName)?.number}));
     });
    }
+   if(doc?.kind!=='mutation')entry.primaryDetails=doc?.selection.filter(field=>field.name==='repository').flatMap(repo=>repo.selection.filter(field=>field.name==='pullRequest'&&['body','reviews','reviewThreads'].every(name=>field.selection.some(child=>child.name===name))).map(field=>({repo:`${repo.args.owner}/${repo.args.name}`,number:field.args.number})))??[];
    if(doc){entry.aliases=doc.aliases;const names=doc.selection.map(f=>f.name);entry.operation=doc.kind==='mutation'?'review-write':names.includes('search')?'search':names.includes('node')||names.includes('nodes')?'node':names.includes('repository')?'repository':names.includes('viewer')||names.includes('organization')?'viewer':'unknown';}
    else entry.operation=req.method==='GET'?'rest-read':'rest-write';
    const historyRead=doc?.selection.some(f=>f.name==='search'&&String(f.args.query).includes('is:merged')&&f.selection.some(s=>s.name==='nodes'));if(historyRead)entry.operation='history-search';
@@ -85,7 +86,7 @@ export async function startProvider({convergence=false}={}) {
       return {...connection(rows.slice(start,end)),issueCount:rows.length,pageInfo:{hasNextPage:end<rows.length,endCursor:`cursor-${end}`}};
      }
      if(['enqueuePullRequest','dequeuePullRequest','convertPullRequestToDraft','markPullRequestReadyForReview','closePullRequest','mergePullRequest'].includes(f.name)){
-      const pr=data.rows.find(row=>row.id===f.args.input.pullRequestId);if(!pr)throw Error('unknown mutation identity');
+      const pr=data.rows.find(row=>row.id===(f.name==='dequeuePullRequest'?f.args.input.id:f.args.input.pullRequestId));if(!pr)throw Error('unknown mutation identity');
       entry.stage=f.name;entry.subjects=[{repo:pr.repository.nameWithOwner,number:pr.number}];
       pr.updatedAt=new Date(Math.max(Date.now(),Date.parse(pr.updatedAt)+1)).toISOString();
       if(f.name==='enqueuePullRequest'){pr.isInMergeQueue=true;pr.mergeQueueEntry={state:'QUEUED'};return {mergeQueueEntry:{state:'QUEUED',pullRequest:pr}};}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile,readdir} from 'node:fs/promises';
 import {resolve,dirname} from 'node:path';
 import {createHash} from 'node:crypto';
-import {assertConverged,convergencePolicy} from './convergence.mjs';
+import {assertConverged,convergencePolicy,releaseWithPublication} from './convergence.mjs';
 const fields=['number','id','updatedAt','headRefOid','state','isDraft','isInMergeQueue','mergeQueueEntry','reviewDecision','closedAt','mergedAt'];
 export const baselineRows=data=>data.rows.filter(row=>row.number<=286).map(row=>Object.fromEntries(fields.map(field=>[field,row[field]])));
 export function restoreBaseline(data,baseline){
@@ -41,7 +41,7 @@ export async function runConvergenceRestart({pages,provider,result,out,state,con
   const started=performance.now();let matched=false;while(performance.now()-started<convergencePolicy.localPropagationMs){try{await capture('mounted-persisted-cache');matched=true;break;}catch{await delay(100);}}assert.ok(matched,'both real clients render converged retained cache');
   await control('start');const holdStart=performance.now();while(!provider.heldCount&&performance.now()-holdStart<convergencePolicy.inventoryMs)await delay(100);
   const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length,'restart must materialize an actual stale provider page');
-  await capture('stale-page-held');provider.release();await delay(500);assert.ok(held.every(entry=>entry.released&&entry.responseDelivered===true),'stale page must reach original native caller');
+  await capture('stale-page-held');evidence.stalePublication=await releaseWithPublication({pages,provider});
   // Observe an entire real finite traversal, not only the first response.
   const recovered=performance.now();let complete=false;while(performance.now()-recovered<convergencePolicy.inventoryMs){await capture('after-stale-receipt');if(evidence.checkpoints.at(-1).clients.every(client=>client.source.phase==='ready'&&client.source.coverage==='complete')){complete=true;break;}await delay(1000);}assert.ok(complete,'stale finite traversal completes without resurrection');
   evidence.pass=true;result.samples.push({role:'desktop'},{role:'paired'});result.convergenceRestart={pass:true};

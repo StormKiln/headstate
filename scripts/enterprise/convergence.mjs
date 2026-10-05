@@ -14,6 +14,23 @@ export function assertConverged(observed,expected){assert.deepEqual(observed.inv
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const snapshot=page=>page.evaluate(()=>({at:performance.now(),wallTime:Date.now(),inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),footer:document.querySelector('[data-testid="inventory-footer"]')?.textContent,commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&['get_pr_detail','act_on_pr'].includes(e.name))}));
 
+export async function releaseWithPublication({pages,provider,ceilingMs=convergencePolicy.localPropagationMs}){
+ const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length);
+ const offsets=await Promise.all(pages.map(page=>page.evaluate(()=>window.__enterprise.telemetry.length)));
+ const releasedAt=Date.now();provider.release();
+ const publications=await Promise.all(pages.map(async(page,index)=>{
+  await page.waitForFunction(({offset,releasedAt})=>window.__enterprise.telemetry.slice(offset).some(entry=>entry.kind==='event'&&entry.name==='source-poll-status'&&entry.reply?.list==='reviewing'&&entry.reply.prs&&entry.reply.receipt_revision!=null&&Date.parse(entry.reply.last_received_at)>releasedAt),{offset:offsets[index],releasedAt},{timeout:ceilingMs});
+  return page.evaluate(({offset,releasedAt})=>window.__enterprise.telemetry.slice(offset).find(entry=>entry.kind==='event'&&entry.name==='source-poll-status'&&entry.reply?.list==='reviewing'&&entry.reply.prs&&entry.reply.receipt_revision!=null&&Date.parse(entry.reply.last_received_at)>releasedAt),{offset:offsets[index],releasedAt});
+ }));
+ assert.ok(held.every(entry=>entry.released&&entry.responseDelivered===true),'held stale page must reach its original caller');
+ return {releasedAt,publications,held};
+}
+
+export function assertPrimaryDetailCount(ledger,number,count){
+ const acquisitions=ledger.filter(entry=>entry.primaryDetails?.some(identity=>identity.number===number&&identity.repo===key(number).slice(0,key(number).lastIndexOf('/'))));
+ assert.equal(acquisitions.length,count,`primary detail acquisitions for PR ${number}; checks/thread continuations and inventory cadence excluded by parsed primary fields`);return acquisitions;
+}
+
 /** Actual provider → native publication → independent mounted clients. */
 export async function runConvergence({pages,provider,result,out,control}){
  const expected=initialConvergenceExpected();
@@ -33,12 +50,15 @@ export async function runConvergence({pages,provider,result,out,control}){
   const receipt=await pages[0].evaluate(({number,offset})=>window.__enterprise.telemetry.slice(offset).find(e=>e.name==='get_pr_detail'&&e.ok&&e.args?.number===number),{number,offset});
   // The clock anchor is successful receipt completion, not the click or request start.
   await population(Math.max(1,convergencePolicy.localPropagationMs-(await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration))));
+  await delay(2000); // Settled observation interval, within the unchanged ten-second local ceiling.
+  assert.ok(await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration)<=convergencePolicy.localPropagationMs,'propagation and post-publication settlement remain within declared local ceiling');
+  const primaryAcquisitions=assertPrimaryDetailCount(provider.ledger.slice(before),number,1);
   const redundant=await pages[0].evaluate(offset=>window.__enterprise.telemetry.slice(offset).filter(e=>e.kind==='call'&&['refresh_source','refresh_now','get_reviewing'].includes(e.name)),offset);
   assert.deepEqual(redundant,[],'propagating accepted detail must not issue a new inventory request');
-  evidence.phases.push({name:reason,number,clickAt,receipt,propagationMs:await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration),provider:provider.ledger.slice(before)});
+  evidence.phases.push({name:reason,number,clickAt,receipt,settlementMs:2000,primaryAcquisitions,propagationMs:await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration),provider:provider.ledger.slice(before)});
   await capture(reason);
  };
- const releaseOldSearch=async()=>{const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length);provider.release();await delay(500);assert.ok(held.every(entry=>entry.released&&entry.responseDelivered===true),'held old provider response must actually reach its original caller');};
+ const releaseOldSearch=async()=>{evidence.phases.push({name:'held-page-processed',...await releaseWithPublication({pages,provider})});};
  const holdOldSearch=async()=>{
   provider.fault.holdSearch={list:'reviewing',after:null,remaining:1};
   await pages[0].evaluate(()=>{void window.__enterprise.refreshQueues();});await control('wake');
@@ -71,7 +91,9 @@ export async function runConvergence({pages,provider,result,out,control}){
   await releaseOldSearch();await population();await capture('old-search-after-actions-did-not-requalify');
   await action(55,'Remove from merge queue',{member:true,ready:true},'acknowledged-dequeue');
   await action(56,'Mark ready for review',{member:true,ready:true},'acknowledged-ready');
-  await open(60);
+  const reuseStart=provider.ledger.length;await open(60);await delay(2000);assertPrimaryDetailCount(provider.ledger.slice(reuseStart),60,1);
+  await open(60);await delay(2000);assertPrimaryDetailCount(provider.ledger.slice(reuseStart),60,1);
+  evidence.phases.push({name:'ordinary-back-open-cache-reuse',number:60,settlementMs:2000,provider:provider.ledger.slice(reuseStart)});
   await pages[0].getByText('Open report',{exact:true}).click();
   const draft=pages[0].getByPlaceholder('Reply…').first();await draft.fill('Retained convergence backward draft');
   await draft.evaluate(node=>{node.focus();node.setSelectionRange(3,17,'backward');window.__convergenceDraft=node;});

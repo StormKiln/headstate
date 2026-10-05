@@ -59,3 +59,18 @@ test('one-shot failed continuation leaves head and detail queries available',asy
   assert.equal(p.ledger.filter(e=>e.targetedFailure).length,1);
  }finally{p.release();await p.close();}
 });
+
+test('dequeue consumes schema id and rejects enqueue-style pullRequestId',async()=>{
+ const p=await startProvider({convergence:true});const query=q=>fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})});
+ try{
+  const invalid=await query('mutation {dequeuePullRequest(input:{pullRequestId:"PR_51"}){mergeQueueEntry{state}}}');assert.equal(invalid.status,500);
+  const response=await query('mutation {dequeuePullRequest(input:{id:"PR_51"}){mergeQueueEntry{state pullRequest{id isInMergeQueue mergeQueueEntry{state} updatedAt}}}}');assert.equal(response.status,200);
+  const receipt=(await response.json()).data.dequeuePullRequest;assert.equal(receipt.mergeQueueEntry.pullRequest.id,'PR_51');assert.equal(receipt.mergeQueueEntry.pullRequest.isInMergeQueue,false);assert.equal(receipt.mergeQueueEntry.pullRequest.mergeQueueEntry,null);
+ }finally{await p.close();}
+});
+
+test('ledger distinguishes primary detail identity from check continuations and stack reads',()=>usingProvider(async(p,query)=>{
+ await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id body reviews(first:1){nodes{id}} reviewThreads(first:1){nodes{id}}}}}');
+ await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id reviews(first:1){nodes{id}}}}}');
+ assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);assert.deepEqual(p.ledger[1].primaryDetails,[]);
+}));
