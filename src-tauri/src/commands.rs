@@ -5096,10 +5096,9 @@ async fn stats_count_for_client(
                     receipt.reused = true;
                     receipt.retained = !saved.complete;
                     receipt.fetched_at = saved.fetched_at;
-                    receipt.qualification = Some(
-                        "Compatible measurements published by an overlapping load are shown."
-                            .into(),
-                    );
+                    receipt
+                        .qualification
+                        .get_or_insert_with(|| "Compatible saved measurements are shown.".into());
                     *o = published;
                 }
             }
@@ -6383,6 +6382,14 @@ async fn stats_series_for_client(
                     receipt.qualification = Some("Some saved measurements are shown because the retry did not measure everything.".into());
                 }
             }
+            if receipt.retained {
+                if let Some(crate::github::stats::fetch::Unmeasured::Unavailable { reason }) =
+                    &fresh.unmeasured
+                {
+                    receipt.qualification =
+                        Some(format!("Saved measurements shown; retry failed: {reason}"));
+                }
+            }
             fresh.receipt = Some(receipt);
         }
         (Err(error), Some(mut old)) => {
@@ -6437,10 +6444,9 @@ async fn stats_series_for_client(
                     receipt.reused = true;
                     receipt.retained = !saved.complete;
                     receipt.fetched_at = saved.fetched_at;
-                    receipt.qualification = Some(
-                        "Compatible measurements published by an overlapping load are shown."
-                            .into(),
-                    );
+                    receipt
+                        .qualification
+                        .get_or_insert_with(|| "Compatible saved measurements are shown.".into());
                     *series = published;
                 }
             }

@@ -90,7 +90,7 @@ fn reconcile_current(
                 if let Some(receipt) = &mut base.receipt {
                     receipt.fetched_at = selected.fetched_at;
                     receipt.retained = true;
-                    receipt.qualification = Some("Compatible saved measurements from an overlapping load are included; retry to refresh missing measurements.".into());
+                    receipt.qualification = Some("Compatible saved measurements are included; retry to refresh missing measurements.".into());
                 }
                 selected.total = base.points.iter().map(|point| point.merged).sum();
                 if let Ok(payload) = serde_json::to_string(base) {
@@ -119,7 +119,7 @@ fn reconcile_current(
 /// Keep the current call's actual measurements separate from its pre-HTTP
 /// fallback. Only measured values may replace a concurrent measurement;
 /// held fallback may fill holes but must not overwrite a measured zero.
-pub fn reconcile_publication(
+fn select_measurements(
     key: &str,
     incoming: crate::store::stats::Cached,
     current: crate::store::stats::Cached,
@@ -159,6 +159,41 @@ pub fn reconcile_publication(
     } else {
         reconcile_current(key, published, incoming)
     }
+}
+
+/// Latest-attempt metadata describes this caller, independently of which
+/// compatible measurements win publication. It must not change completeness,
+/// acquisition age, or owner identity chosen by arbitration.
+pub fn reconcile_publication(
+    key: &str,
+    incoming: crate::store::stats::Cached,
+    current: crate::store::stats::Cached,
+    fresh: Option<crate::store::stats::Cached>,
+) -> crate::store::stats::Cached {
+    if !key.starts_with("series|") && !key.starts_with("count|") {
+        return incoming;
+    }
+    let attempt = serde_json::from_str::<serde_json::Value>(&incoming.payload).ok();
+    let mut published = select_measurements(key, incoming, current, fresh);
+    if let (Some(attempt), Ok(mut payload)) = (
+        attempt,
+        serde_json::from_str::<serde_json::Value>(&published.payload),
+    ) {
+        for field in ["spend", "unmeasured"] {
+            if let Some(value) = attempt.get(field) {
+                payload[field] = value.clone();
+            }
+        }
+        if let Some(qualification) = attempt.pointer("/receipt/qualification") {
+            if let Some(receipt) = payload.get_mut("receipt").and_then(|r| r.as_object_mut()) {
+                receipt.insert("qualification".into(), qualification.clone());
+            }
+        }
+        if let Ok(payload) = serde_json::to_string(&payload) {
+            published.payload = payload;
+        }
+    }
+    published
 }
 
 pub fn fresh_candidate<T: serde::Serialize>(

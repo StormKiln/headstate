@@ -1651,3 +1651,120 @@ async fn publication_does_not_replay_pre_http_fallback_over_a_concurrent_measure
     let saved = series(&fast, db).await;
     assert_eq!(saved.points, result.points);
 }
+
+#[tokio::test]
+async fn ordinary_failed_count_retry_preserves_latest_reason_age_and_spend() {
+    let p = provider("alice", 17).await;
+    p.partial.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    let first = count(&p, db.clone()).await;
+    assert!(!first.is_complete());
+    assert!(first.total > 0);
+    assert!(first.spend.points > 0);
+    p.server.abort();
+    tokio::task::yield_now().await;
+    let retry = count(&p, db).await;
+    assert_eq!(retry.total, first.total);
+    assert_eq!(retry.spend.points, 0);
+    assert_eq!(retry.spend.requests, 0); // No response arrived to meter.
+    assert_eq!(retry.spend.unmetered, 0);
+    let receipt = retry.receipt.unwrap();
+    assert_eq!(receipt.fetched_at, first.receipt.unwrap().fetched_at);
+    assert!(receipt.retained);
+    let reason = receipt.qualification.unwrap();
+    assert!(reason.contains("retry failed:"), "{reason}");
+    assert!(
+        reason.contains("request") || reason.contains("connect"),
+        "{reason}"
+    );
+    assert!(!reason.contains("overlapping"), "{reason}");
+}
+
+#[tokio::test]
+async fn ordinary_failed_series_retry_preserves_latest_reason_age_and_spend() {
+    let p = provider("alice", 17).await;
+    p.partial.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    let first = series(&p, db.clone()).await;
+    assert_eq!(first.points.len(), 1);
+    assert!(first.spend.points > 0);
+    assert!(first.unmeasured.is_none());
+    p.server.abort();
+    tokio::task::yield_now().await;
+    let retry = series(&p, db).await;
+    assert_eq!(retry.points, first.points);
+    assert_eq!(retry.spend.points, 0);
+    assert_eq!(retry.spend.requests, 0); // No response arrived to meter.
+    assert_eq!(retry.spend.unmetered, 0);
+    let receipt = retry.receipt.unwrap();
+    assert_eq!(receipt.fetched_at, first.receipt.unwrap().fetched_at);
+    assert!(receipt.retained);
+    let reason = receipt.qualification.unwrap();
+    assert!(reason.contains("retry failed:"), "{reason}");
+    let Some(crate::github::stats::fetch::Unmeasured::Unavailable { reason: failure }) =
+        retry.unmeasured
+    else {
+        panic!("retry must retain latest transport failure");
+    };
+    assert!(reason.contains(&failure), "{reason}");
+    assert!(!reason.contains("overlapping"), "{reason}");
+}
+
+#[test]
+fn latest_attempt_metadata_does_not_downgrade_complete_measurements_or_replay_spend() {
+    use crate::github::stats::{receipt, Budget, Outcome};
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_db(&dir.path().join("stats.db")).unwrap();
+    let owner = stats_owner::capture_verified(&conn, "alice").unwrap();
+    let now = "2026-10-04T12:00:00Z".parse().unwrap();
+    let prior_budget = Budget::new();
+    prior_budget.record(&json!({"rateLimit":{"cost":7,"remaining":4900}}));
+    let measured = Outcome {
+        receipt: None,
+        total: 17,
+        retrievable: true,
+        unretrievable: 0,
+        slices: 1,
+        rounds: 1,
+        via_connection: false,
+        spend: prior_budget.snapshot(),
+        refused_fields: 0,
+    };
+    let current = receipt::fresh_candidate(&measured, 17, true, owner, now).unwrap();
+    let mut incoming = current.clone();
+    incoming.complete = false;
+    let mut latest: Value = serde_json::from_str(&incoming.payload).unwrap();
+    latest["spend"] = serde_json::to_value(Budget::new().snapshot()).unwrap();
+    latest["receipt"]["qualification"] =
+        json!("Saved measurements shown; retry failed: synthetic offline");
+    incoming.payload = latest.to_string();
+    let published =
+        receipt::reconcile_publication("count|fixture", incoming.clone(), current, None);
+    assert!(
+        published.complete,
+        "metadata must not revoke cache eligibility"
+    );
+    assert_eq!(published.fetched_at, now);
+    assert_eq!(published.total, 17);
+    let result: Outcome = serde_json::from_str(&published.payload).unwrap();
+    assert!(result.is_complete());
+    assert_eq!(result.spend.points, 0);
+    assert_eq!(result.spend.requests, 0);
+    assert!(result
+        .receipt
+        .unwrap()
+        .qualification
+        .unwrap()
+        .contains("retry failed: synthetic offline"));
+    latest["receipt"]["qualification"] = Value::Null;
+    incoming.payload = latest.to_string();
+    let next = receipt::reconcile_publication("count|fixture", incoming, published, None);
+    assert!(next.complete);
+    let result: Outcome = serde_json::from_str(&next.payload).unwrap();
+    assert!(
+        result.receipt.unwrap().qualification.is_none(),
+        "an old failure must not label a later attempt"
+    );
+}
