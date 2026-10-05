@@ -159,7 +159,6 @@ pub struct Snapshot {
 
 const SNAPSHOT_VERSION: u32 = 1;
 
-#[cfg(test)]
 impl Snapshot {
     pub fn received_at(&self) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(&self.received_at)
@@ -168,7 +167,6 @@ impl Snapshot {
     }
 }
 
-#[cfg(test)]
 pub fn cached_snapshot(store: &dyn Store) -> Result<Option<Snapshot>, StoreError> {
     get_json(store, SNAPSHOT_KEY)
 }
