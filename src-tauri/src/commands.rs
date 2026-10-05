@@ -687,6 +687,7 @@ impl PrActionOutcome {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Existing IPC arguments plus optional old-phone reply compatibility.
 pub async fn act_on_pr(
     app: AppHandle,
     client: State<'_, GhClient>,

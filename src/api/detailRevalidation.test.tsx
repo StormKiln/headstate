@@ -3,6 +3,8 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 import { PR_FIXTURES } from "../fixtures/prs";
+import targetedPublications from "../../src-tauri/tests/fixtures/targeted-fact-publications.json";
+import { assertRemoteReply } from "./wireContract";
 import type { PrDetail, PullRequest } from "../types/pr";
 const boundary = vi.hoisted(() => ({ invoke: vi.fn(), detail: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: boundary.invoke }));
@@ -489,7 +491,7 @@ it("marks all inactive aliases stale without transport and consumes only the rev
   expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
 });
 
-it.each(["CLOSED", "MERGED"])("consumes native removal emitted before the %s detail command returns without another read", async state => {
+it.each(targetedPublications.terminal_details.map(detail => [detail.state, detail] as const))("consumes native removal emitted before the %s detail command returns without another read", async (_state, nativeDetail) => {
   vi.useFakeTimers();
   const { qc, wrapper } = setup();
   await inventory([row]);
@@ -499,8 +501,50 @@ it.each(["CLOSED", "MERGED"])("consumes native removal emitted before the %s det
   renderHook(() => usePrDetail(row.repo, 1), { wrapper });
   expect(boundary.detail).toHaveBeenCalledTimes(1);
   await inventory([]);
-  await act(async () => finish({ ...detail, state }));
+  assertRemoteReply("get_pr_detail", nativeDetail);
+  await act(async () => finish(nativeDetail as PrDetail));
   await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
   expect(boundary.detail).toHaveBeenCalledTimes(1);
   expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each([{ in_merge_queue: true }, { is_draft: true }, { review: "approved" as const }])("consumes its own fresh scalar publication before detail returns: %j", async patch => {
+  vi.useFakeTimers(); const { qc, wrapper } = setup();
+  await inventory([row]);
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  void qc.invalidateQueries({ queryKey: key, exact: true });
+  await act(async () => {});
+  await inventory([{ ...row, ...patch }]);
+  await act(async () => finish({ ...detail, ...patch }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(["identity", "checks", "comments"])("does not let a matching scalar readback consume an overtaken %s target", async reason => {
+  const { qc, wrapper } = setup(); await inventory([{ ...row, observation: { ...row.observation!, detail_fields: ["comments"] } }]);
+  let finish!: (value: PrDetail) => void;
+  const next = { ...detail, in_merge_queue: true, ...(reason === "identity" ? { id: "replacement-node" } : {}) };
+  boundary.detail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue(next);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  void qc.invalidateQueries({ queryKey: key, exact: true }); await act(async () => {});
+  const patch = reason === "identity" ? { id: "replacement-node" } : reason === "checks" ? { ci: "failure" as const } : { comment_count: 2, observation: { ...row.observation!, detail_fields: ["comments" as const] } };
+  await inventory([{ ...row, ...patch, in_merge_queue: true }]);
+  await act(async () => finish({ ...detail, in_merge_queue: true }));
+  await waitFor(() => expect(boundary.detail).toHaveBeenCalledTimes(2));
+  expect(qc.getQueryData<PrDetail>(key)?.id).toBe(next.id);
+});
+
+it("still revalidates a terminal detail when a positive source observes a reopened new head", async () => {
+  const { qc, wrapper } = setup();
+  const terminal = targetedPublications.terminal_details[0] as PrDetail;
+  qc.setQueryData(key, terminal);
+  boundary.detail.mockResolvedValue({ ...detail, state: "open", head_oid: "reopened-head" });
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  expect(boundary.detail).not.toHaveBeenCalled();
+  await inventory([{ ...row, head_oid: "reopened-head" }]);
+  await waitFor(() => expect(qc.getQueryData<PrDetail>(key)?.state).toBe("open"));
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
 });

@@ -2626,7 +2626,9 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
         ? false
         : polling.delay(
             query.state.data?.head_oid ?? "",
-            query.state.data?.merge_status === "unknown" || detailNeedsRevalidation(qc, repo as string, number as number),
+            // Terminal PRs no longer need mergeability computation. Positive
+            // source revalidation (including a reopen) remains independent.
+            (query.state.data?.state !== "closed" && query.state.data?.state !== "merged" && query.state.data?.merge_status === "unknown") || detailNeedsRevalidation(qc, repo as string, number as number),
             Math.max(query.state.dataUpdatedAt, query.state.errorUpdatedAt),
           ),
   });

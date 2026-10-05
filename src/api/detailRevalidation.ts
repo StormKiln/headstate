@@ -5,7 +5,7 @@ import type { ProviderReceipt } from "./sourceRefresh";
 import { reviewAccountGeneration } from "./reviewOperations";
 
 type Facts = Record<string, string>;
-interface Target { revision: number; facts: Facts; probe?: boolean }
+interface Target { revision: number; facts: Facts; probe?: boolean; scalarReadback?: { id: string; head: string } }
 interface State { facts: Facts; observed: Facts; initial: boolean; revision: number; required?: Target; reading?: number; account: number; session: number }
 type Member = Pick<PullRequest, "repo" | "number">;
 interface Source { listeners: Set<() => void>; session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
@@ -78,8 +78,9 @@ function source(qc: QueryClient): Source {
     const overtaken = target.revision > (state.reading ?? -1);
     // Native detail reconciliation may remove the row before this same command
     // returns. Its positive terminal response already answers the absence probe.
-    const terminalReadback = target.probe && (data?.state === "CLOSED" || data?.state === "MERGED");
-    if (terminalReadback || (!overtaken && data && matches(target.facts))) {
+    const terminalReadback = target.probe && (data?.state === "closed" || data?.state === "merged");
+    const ownScalarReadback = target.scalarReadback && data?.id === target.scalarReadback.id && data.head_oid === target.scalarReadback.head && matches(target.facts);
+    if (terminalReadback || ownScalarReadback || (!overtaken && data && matches(target.facts))) {
       state.required = undefined;
     } else if (overtaken) {
       // Let TanStack finish the current retryer before asking for the single
@@ -121,14 +122,20 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
       states.set(query, state);
     }
     const next = facts(row);
-    const changed = Object.entries(next).some(([key, value]) => state.facts[key] !== undefined && state.facts[key] !== value);
+    const changedFields = Object.entries(next).filter(([key, value]) => state.facts[key] !== undefined && state.facts[key] !== value).map(([key]) => key);
+    const changed = changedFields.length > 0;
     // Do not transplant head-dependent requirements across a positively new
     // head when that receipt could not observe the new head's scalar values.
     if (next.head && next.head !== state.facts.head) state.observed = {};
     state.observed = { ...state.observed, ...next };
     state.facts = { ...state.facts, ...next };
     if (!changed) continue;
-    state.required = { revision: ++state.revision, facts: { ...state.observed } };
+    // These three normalized scalar fields can acknowledge their own native
+    // pre-return publication. Head/check/count/thread changes still require a
+    // post-target read; never let a scalar receipt consume such an older target.
+    const scalarReadback = changedFields.every(field => ["draft", "review", "queue"].includes(field)) && (!state.required || state.required.scalarReadback)
+      ? { id: row.id, head: row.head_oid } : undefined;
+    state.required = { revision: ++state.revision, facts: { ...state.observed }, scalarReadback };
     // Inactive details need a stale marker, but no provider command.
     void qc.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
     request(qc, query);

@@ -3464,3 +3464,231 @@ async fn terminal_detail_then_newer_positive_list_reopens_without_stale_resurrec
     );
     assert_eq!(saved(&conn), late.prs);
 }
+
+#[tokio::test]
+async fn targeted_fact_publications_keep_field_freshness_and_membership() {
+    use crate::inventory::{ObservationState, ReadinessField};
+    let mut frames = serde_json::Map::new();
+    for case in ["clean", "unrelated", "new_head"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh-target.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let polls = SourcePolls::default();
+        let mut raw = node(1, false);
+        raw["state"] = json!("OPEN");
+        raw["mergeStateStatus"] = json!("CLEAN");
+        raw["updatedAt"] = json!("2026-10-01T10:00:00Z");
+        let mut rows =
+            crate::github::map::map_list(&json!({"authored":{"nodes":[raw.clone()]}}), "authored");
+        let observation = rows[0].observation.as_mut().unwrap();
+        observation.unknown_fields.clear();
+        observation.retained_fields.clear();
+        observation.ready_at_state = None;
+        observation.last_observed_at = Some("2026-10-01T12:00:00Z".parse().unwrap());
+        if case == "unrelated" {
+            observation.state = ObservationState::Retained;
+            observation.retained_fields = vec![ReadinessField::Ci, ReadinessField::Draft];
+            observation.unknown_fields = vec![ReadinessField::Merge, ReadinessField::Draft];
+        }
+        let before_observation = rows[0].observation.clone().unwrap();
+        publish(
+            &polls,
+            &conn,
+            Ok(FetchedList {
+                scan: None,
+                viewer: Some("synthetic-viewer".into()),
+                prs: rows,
+                total: Some(1),
+                coverage: Coverage::Complete,
+            }),
+        )
+        .await;
+        let received = polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .last_received_at;
+        let snapshot_before =
+            source_cache::load_source_snapshot(&conn, &Source::default(), CachedList::Reviewing)
+                .unwrap();
+        raw["updatedAt"] = json!("2026-10-01T11:00:00Z");
+        if case == "new_head" {
+            raw["headRefOid"] = json!("head-1-new");
+        }
+        let detail = crate::github::map::map_detail(
+            &json!({"repository":{"pullRequest":raw.clone()}}),
+            "octocat/repo-1",
+        );
+        let mut proof = detail.inventory_facts.clone().unwrap();
+        if case == "unrelated" {
+            proof
+                .facts
+                .retain(|f| matches!(f.value, crate::store::github_facts::Value::Draft(_)));
+        }
+        let mut published = None;
+        record_github_effect_at(
+            path,
+            &polls,
+            "octocat/repo-1",
+            1,
+            "synthetic-viewer",
+            GithubEffect::Facts(proof),
+            |event| published = Some(event.unwrap()),
+        )
+        .await;
+        let update = published.unwrap();
+        assert_eq!(update.status.last_received_at, received);
+        let row = &update.prs.as_ref().unwrap()[0];
+        let observation = row.observation.as_ref().unwrap();
+        assert_eq!(observation.state, before_observation.state);
+        assert_eq!(
+            observation.last_observed_at,
+            before_observation.last_observed_at
+        );
+        assert!(
+            !observation.retained_fields.contains(&ReadinessField::Draft),
+            "fresh accepted draft fact is not last-known"
+        );
+        assert!(!observation.unknown_fields.contains(&ReadinessField::Draft));
+        if case == "clean" {
+            assert!(observation.retained_fields.is_empty());
+            assert!(observation.unknown_fields.is_empty());
+        }
+        if case == "unrelated" {
+            assert_eq!(observation.retained_fields, vec![ReadinessField::Ci]);
+            assert_eq!(observation.unknown_fields, vec![ReadinessField::Merge]);
+        }
+        if case == "new_head" {
+            assert!(observation.unknown_fields.contains(&ReadinessField::Ci));
+            assert!(observation.unknown_fields.contains(&ReadinessField::Merge));
+        }
+        let snapshot_after =
+            source_cache::load_source_snapshot(&conn, &Source::default(), CachedList::Reviewing)
+                .unwrap();
+        if let (
+            SnapshotData::Available {
+                fetched_at: before, ..
+            },
+            SnapshotData::Available {
+                fetched_at: after, ..
+            },
+        ) = (snapshot_before.data, snapshot_after.data)
+        {
+            assert_eq!(before, after);
+        }
+        let mut frame = serde_json::to_value(update).unwrap();
+        canonical(&mut frame);
+        frames.insert(case.into(), frame);
+    }
+    let terminal_details: Vec<_> = ["CLOSED", "MERGED"]
+        .into_iter()
+        .map(|state| {
+            let mut raw = node(1, false);
+            raw["state"] = json!(state);
+            crate::github::map::map_detail(
+                &json!({"repository":{"pullRequest":raw}}),
+                "octocat/repo-1",
+            )
+        })
+        .collect();
+    let artifact = json!({"frames":frames,"terminal_details":terminal_details});
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/targeted-fact-publications.json");
+    if std::env::var_os("UPDATE_TARGETED_FACT_FIXTURE").is_some() {
+        std::fs::write(&fixture, serde_json::to_string(&artifact).unwrap() + "\n").unwrap();
+    }
+    let expected: Value = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+    assert_eq!(artifact, expected);
+}
+
+#[tokio::test]
+async fn equal_version_later_target_head_wins_but_earlier_started_head_cannot_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("equal-head.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let mut raw = node(1, false);
+    raw["state"] = json!("OPEN");
+    let rows =
+        crate::github::map::map_list(&json!({"authored":{"nodes":[raw.clone()]}}), "authored");
+    publish(
+        &polls,
+        &conn,
+        Ok(FetchedList {
+            scan: None,
+            viewer: Some("synthetic-viewer".into()),
+            prs: rows,
+            total: Some(1),
+            coverage: Coverage::Complete,
+        }),
+    )
+    .await;
+    let earlier = polls.fact_operation();
+    let mut newer = raw.clone();
+    newer["headRefOid"] = json!("equal-version-new-head");
+    let mut proof =
+        crate::store::github_facts::Observation::from_node(&newer, chrono::Utc::now()).unwrap();
+    proof
+        .facts
+        .retain(|f| matches!(f.value, crate::store::github_facts::Value::Queue(_)));
+    for fact in &mut proof.facts {
+        fact.operation = Some(polls.fact_operation());
+    }
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Facts(proof),
+        |event| assert!(event.is_ok()),
+    )
+    .await;
+    let fresh = saved(&conn);
+    assert_eq!(fresh[0].head_oid, "equal-version-new-head");
+    assert!(fresh[0]
+        .observation
+        .as_ref()
+        .unwrap()
+        .unknown_fields
+        .contains(&crate::inventory::ReadinessField::Ci));
+    // The earlier-started response completes last, even with a later wall acquisition.
+    let mut old =
+        crate::store::github_facts::Observation::from_node(&raw, chrono::Utc::now()).unwrap();
+    for fact in &mut old.facts {
+        fact.operation = Some(earlier.clone());
+    }
+    let mut emitted = 0;
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Facts(old),
+        |_| emitted += 1,
+    )
+    .await;
+    assert_eq!(emitted, 0);
+    assert_eq!(saved(&conn), fresh);
+    drop(conn);
+    let restarted = crate::store::open_db(&path).unwrap();
+    assert_eq!(saved(&restarted), fresh);
+    let replay = FetchedList {
+        scan: None,
+        viewer: Some("synthetic-viewer".into()),
+        prs: crate::github::map::map_list(&json!({"authored":{"nodes":[raw]}}), "authored"),
+        total: Some(1),
+        coverage: Coverage::Complete,
+    };
+    let replayed = reconcile_github_snapshot(
+        &restarted,
+        &Source::default(),
+        CachedList::Reviewing,
+        replay,
+        None,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    assert_eq!(
+        replayed.prs[0].head_oid, "equal-version-new-head",
+        "equal-version lagging list cannot undo the targeted head after restart"
+    );
+}

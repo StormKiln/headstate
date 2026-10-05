@@ -1572,7 +1572,14 @@ async fn record_github_effect_at(
                     && row.id == observation.id
                     && observation.facts.iter().all(|f| {
                         (f.head_oid == row.head_oid
-                            || f.updated_at.is_some_and(|version| version > row.updated_at))
+                            || f.updated_at.is_some_and(|version| version > row.updated_at)
+                            || (f.operation.is_some()
+                                && f.updated_at == Some(row.updated_at)
+                                && row
+                                    .observation
+                                    .as_ref()
+                                    .and_then(|o| o.last_observed_at)
+                                    .is_none_or(|time| f.observed_at >= time)))
                             && f.updated_at.is_none_or(|version| version >= row.updated_at)
                     })
             });
@@ -1610,7 +1617,13 @@ async fn record_github_effect_at(
                     if !changed {
                         return Ok(None);
                     }
-                    crate::store::github_facts::apply(&tx, list, &owner, &mut next.prs)?;
+                    crate::store::github_facts::apply_targeted(
+                        &tx,
+                        list,
+                        &owner,
+                        &mut next.prs,
+                        &observation,
+                    )?;
                     crate::store::source_cache::save_owned_source_failure(
                         &tx,
                         &Source::default(),

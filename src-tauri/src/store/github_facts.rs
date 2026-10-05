@@ -161,6 +161,13 @@ pub fn accept(
         facts: vec![],
     });
     for fact in &incoming.facts {
+        // A partial newer-head acknowledgment also fences older requests whose
+        // fields were never journaled. Per-field ordering alone cannot do that.
+        if next.facts.iter().any(|previous| previous.head_oid != fact.head_oid &&
+            (matches!((&fact.operation, &previous.operation), (Some(a), Some(b)) if a.session == b.session && a.sequence < b.sequence)
+             || fact.observed_at < previous.observed_at)) {
+            continue;
+        }
         if let Some(previous) = next
             .facts
             .iter_mut()
@@ -204,6 +211,27 @@ pub fn apply(
     owner: &str,
     rows: &mut Vec<PullRequest>,
 ) -> Result<(), StoreError> {
+    apply_inner(conn, list, owner, rows, None)
+}
+
+/// A just-accepted targeted field resolves its own qualifier, not list age or
+/// unrelated fields. Replayed conflicting evidence remains explicitly retained.
+pub fn apply_targeted(
+    conn: &Connection,
+    list: CachedList,
+    owner: &str,
+    rows: &mut Vec<PullRequest>,
+    targeted: &Observation,
+) -> Result<(), StoreError> {
+    apply_inner(conn, list, owner, rows, Some(targeted))
+}
+fn apply_inner(
+    conn: &Connection,
+    list: CachedList,
+    owner: &str,
+    rows: &mut Vec<PullRequest>,
+    targeted: Option<&Observation>,
+) -> Result<(), StoreError> {
     let mut keep = Vec::with_capacity(rows.len());
     for mut row in rows.drain(..) {
         let Some(mut evidence) = load(conn, list, owner, &row.repo, row.number, &row.id)? else {
@@ -215,8 +243,18 @@ pub fn apply(
         if let Some(head) = evidence
             .facts
             .iter()
-            .filter(|f| f.updated_at.is_some_and(|t| t > row.updated_at))
-            .max_by_key(|f| f.updated_at)
+            .filter(|f| {
+                f.updated_at.is_some_and(|t| {
+                    t > row.updated_at || (t == row.updated_at && f.operation.is_some())
+                })
+            })
+            .max_by_key(|f| {
+                (
+                    f.updated_at,
+                    f.observed_at,
+                    f.operation.as_ref().map(|o| o.sequence),
+                )
+            })
             .map(|f| &f.head_oid)
         {
             if row.head_oid != *head {
@@ -289,6 +327,15 @@ pub fn apply(
                 }
                 return true;
             }
+            let targeted_now = targeted
+                .is_some_and(|incoming| incoming.id == row.id && incoming.facts.contains(fact));
+            let agrees_with_observed = observed
+                && match fact.value {
+                    Value::State(ref state) => state == "open",
+                    Value::Draft(value) => row.is_draft == value,
+                    Value::Queue(value) => row.in_merge_queue == value,
+                    Value::Review(value) => row.review == value,
+                };
             match &fact.value {
                 Value::State(state) => terminal = state == "closed" || state == "merged",
                 Value::Draft(value) => row.is_draft = *value,
@@ -298,8 +345,9 @@ pub fn apply(
             if let (Some(field), Some(observation)) = (fact.value.field(), row.observation.as_mut())
             {
                 observation.unknown_fields.retain(|f| *f != field);
-                // Do not call unrelated fields freshly observed or extend authority.
-                if !observation.retained_fields.contains(&field) {
+                if targeted_now || agrees_with_observed {
+                    observation.retained_fields.retain(|f| *f != field);
+                } else if !observation.retained_fields.contains(&field) {
                     observation.retained_fields.push(field);
                 }
             }
