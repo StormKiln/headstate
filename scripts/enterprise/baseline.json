@@ -1,0 +1,1123 @@
+{
+  "schema": 1,
+  "environment": {
+    "seed": 9001,
+    "engine": "chromium",
+    "mode": "baseline",
+    "warm": false,
+    "build": "debug native + React profiling production browser",
+    "strictMode": false,
+    "commit": "c0aab38adc8663d65698fd80bfa4ea99f99e74f9",
+    "dirty": false,
+    "patchHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sourceTree": "8d37c5dbe2ea33ce7853b704c32fcf38769aaee9",
+    "nativeBinarySha256": "5605f373273fccdd7a6b5d1cbe9781deddc4a80203fa2f7407df0f69150b6746",
+    "platform": "darwin",
+    "architecture": "arm64",
+    "osRelease": "25.6.0",
+    "cpu": "Apple M2 Max",
+    "cores": 12,
+    "memoryBytes": 68719476736,
+    "cadenceSeconds": 60,
+    "excluded": [
+      "packaged Tauri IPC/WKWebView",
+      "installed mobile Rust proxy and lifecycle",
+      "real GitHub cost and enterprise SLA"
+    ],
+    "startedAt": "2026-10-05T01:10:43.045Z"
+  },
+  "engines": {
+    "chromium": "153.0.8010.12",
+    "webkit": "26.6"
+  },
+  "measuredCommits": [
+    "c0aab38adc8663d65698fd80bfa4ea99f99e74f9"
+  ],
+  "scope": "synthetic native-connected startup and detail regression baseline; no live enterprise SLA",
+  "sampleDesign": "five independent cold profiles and one warm restart of each per engine; both roles present; no robust p95 claim",
+  "timingEnvelope": "2 * observed maximum + 500ms for durations; 2 * maximum + 5 for commit/long-task counts; initial conservative same-host/build regression threshold, not a responsiveness SLA",
+  "documentEnvelope": "ceil(1.25 * observed maximum) + 4 documents; tolerates bounded advisory scheduling variation only with correct accepted inventories",
+  "summaries": [
+    {
+      "engine": "chromium",
+      "warm": false,
+      "role": "desktop",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 133.70000004768372,
+          "max": 141.30000019073486,
+          "median": 138,
+          "samples": [
+            133.70000004768372,
+            140,
+            141.30000019073486,
+            138,
+            137.40000009536743
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 30538.89999985695,
+          "max": 30572.400000095367,
+          "median": 30557.10000014305,
+          "samples": [
+            30538.89999985695,
+            30543.299999952316,
+            30568.200000047684,
+            30557.10000014305,
+            30572.400000095367
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 75,
+          "max": 109.60000014305115,
+          "median": 103.80000019073486,
+          "samples": [
+            75,
+            94.20000004768372,
+            109.60000014305115,
+            107.30000019073486,
+            103.80000019073486
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 78,
+          "max": 113.20000004768372,
+          "median": 106.80000019073486,
+          "samples": [
+            78,
+            97.20000004768372,
+            113.20000004768372,
+            110.60000014305115,
+            106.80000019073486
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 88.40000009536743,
+          "max": 123.40000009536743,
+          "median": 117.20000004768372,
+          "samples": [
+            88.40000009536743,
+            107.40000009536743,
+            123.40000009536743,
+            120.20000004768372,
+            117.20000004768372
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 66,
+          "max": 69,
+          "median": 67,
+          "samples": [
+            69,
+            66,
+            67,
+            66,
+            68
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 211.8999993801117,
+          "max": 244.49999952316284,
+          "median": 240.900000333786,
+          "samples": [
+            211.8999993801117,
+            239.49999952316284,
+            243.59999918937683,
+            240.900000333786,
+            244.49999952316284
+          ]
+        },
+        "longTaskCount": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "longTaskMs": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 28,
+        "max": 28,
+        "median": 28,
+        "samples": [
+          28,
+          28,
+          28,
+          28,
+          28
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 783,
+        "fullQueue": 61645,
+        "firstUsefulDetail": 720,
+        "draftReadyMs": 727,
+        "freshActionReadyMs": 747,
+        "uiCommits": 143,
+        "uiCommitMs": 989,
+        "longTaskCount": 5,
+        "longTaskMs": 500
+      },
+      "documentBudget": 39
+    },
+    {
+      "engine": "chromium",
+      "warm": false,
+      "role": "paired",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 117.5,
+          "max": 122,
+          "median": 120,
+          "samples": [
+            117.5,
+            121.20000004768372,
+            120,
+            119.79999995231628,
+            122
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 30314,
+          "max": 30347.900000095367,
+          "median": 30339.200000047684,
+          "samples": [
+            30347.900000095367,
+            30314,
+            30339,
+            30339.200000047684,
+            30343.299999952316
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 70.89999985694885,
+          "max": 90,
+          "median": 90,
+          "samples": [
+            90,
+            90,
+            90,
+            70.89999985694885,
+            72.20000004768372
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 73.39999985694885,
+          "max": 92.80000019073486,
+          "median": 92.59999990463257,
+          "samples": [
+            92.60000014305115,
+            92.59999990463257,
+            92.80000019073486,
+            73.39999985694885,
+            74.79999995231628
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 82.59999990463257,
+          "max": 102.20000004768372,
+          "median": 102,
+          "samples": [
+            102.20000004768372,
+            102.09999990463257,
+            102,
+            82.59999990463257,
+            84
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 64,
+          "max": 66,
+          "median": 66,
+          "samples": [
+            64,
+            66,
+            65,
+            66,
+            66
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 230.89999842643738,
+          "max": 239.5,
+          "median": 237.60000109672546,
+          "samples": [
+            237.60000109672546,
+            239.5,
+            230.89999842643738,
+            236.79999995231628,
+            238.10000157356262
+          ]
+        },
+        "longTaskCount": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "longTaskMs": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 28,
+        "max": 28,
+        "median": 28,
+        "samples": [
+          28,
+          28,
+          28,
+          28,
+          28
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 744,
+        "fullQueue": 61196,
+        "firstUsefulDetail": 680,
+        "draftReadyMs": 686,
+        "freshActionReadyMs": 705,
+        "uiCommits": 137,
+        "uiCommitMs": 979,
+        "longTaskCount": 5,
+        "longTaskMs": 500
+      },
+      "documentBudget": 39
+    },
+    {
+      "engine": "chromium",
+      "warm": true,
+      "role": "desktop",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 140.40000009536743,
+          "max": 144.69999980926514,
+          "median": 142.80000019073486,
+          "samples": [
+            142.60000014305115,
+            143,
+            144.69999980926514,
+            140.40000009536743,
+            142.80000019073486
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 140.40000009536743,
+          "max": 144.69999980926514,
+          "median": 142.80000019073486,
+          "samples": [
+            142.60000014305115,
+            143,
+            144.69999980926514,
+            140.40000009536743,
+            142.80000019073486
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 95.5,
+          "max": 109.5,
+          "median": 101.69999980926514,
+          "samples": [
+            105.70000004768372,
+            101.69999980926514,
+            95.5,
+            97.40000009536743,
+            109.5
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 99.79999995231628,
+          "max": 112.39999985694885,
+          "median": 105.59999990463257,
+          "samples": [
+            110.40000009536743,
+            105.59999990463257,
+            99.79999995231628,
+            101.40000009536743,
+            112.39999985694885
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 109,
+          "max": 121.70000004768372,
+          "median": 115.79999995231628,
+          "samples": [
+            119.79999995231628,
+            115.79999995231628,
+            109,
+            112.40000009536743,
+            121.70000004768372
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 37,
+          "max": 38,
+          "median": 37,
+          "samples": [
+            38,
+            37,
+            37,
+            37,
+            37
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 191.8999993801117,
+          "max": 200.30000162124634,
+          "median": 193.20000052452087,
+          "samples": [
+            200.30000162124634,
+            192.19999957084656,
+            191.8999993801117,
+            193.20000052452087,
+            194.10000228881836
+          ]
+        },
+        "longTaskCount": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "longTaskMs": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 11,
+        "max": 11,
+        "median": 11,
+        "samples": [
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 790,
+        "fullQueue": 790,
+        "firstUsefulDetail": 719,
+        "draftReadyMs": 725,
+        "freshActionReadyMs": 744,
+        "uiCommits": 81,
+        "uiCommitMs": 901,
+        "longTaskCount": 5,
+        "longTaskMs": 500
+      },
+      "documentBudget": 18
+    },
+    {
+      "engine": "chromium",
+      "warm": true,
+      "role": "paired",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 154.80000019073486,
+          "max": 162.90000009536743,
+          "median": 159.70000004768372,
+          "samples": [
+            162.90000009536743,
+            154.80000019073486,
+            155.70000004768372,
+            159.70000004768372,
+            160.20000004768372
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 154.80000019073486,
+          "max": 162.90000009536743,
+          "median": 159.70000004768372,
+          "samples": [
+            162.90000009536743,
+            154.80000019073486,
+            155.70000004768372,
+            159.70000004768372,
+            160.20000004768372
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 92.89999985694885,
+          "max": 125.59999990463257,
+          "median": 123.29999995231628,
+          "samples": [
+            92.89999985694885,
+            125.59999990463257,
+            123.29999995231628,
+            95.29999995231628,
+            124.40000009536743
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 96.79999995231628,
+          "max": 128.09999990463257,
+          "median": 126.20000004768372,
+          "samples": [
+            96.79999995231628,
+            128.09999990463257,
+            126.20000004768372,
+            98,
+            128
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 106,
+          "max": 137.39999985694885,
+          "median": 135.29999995231628,
+          "samples": [
+            106,
+            137.39999985694885,
+            135.29999995231628,
+            107.20000004768372,
+            137.10000014305115
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 34,
+          "max": 36,
+          "median": 35,
+          "samples": [
+            35,
+            34,
+            35,
+            36,
+            35
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 176.40000104904175,
+          "max": 189.99999976158142,
+          "median": 183.20000100135803,
+          "samples": [
+            183.10000324249268,
+            176.40000104904175,
+            183.20000100135803,
+            189.99999976158142,
+            187.29999947547913
+          ]
+        },
+        "longTaskCount": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "longTaskMs": {
+          "n": 5,
+          "min": 0,
+          "max": 0,
+          "median": 0,
+          "samples": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 11,
+        "max": 11,
+        "median": 11,
+        "samples": [
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 826,
+        "fullQueue": 826,
+        "firstUsefulDetail": 752,
+        "draftReadyMs": 757,
+        "freshActionReadyMs": 775,
+        "uiCommits": 77,
+        "uiCommitMs": 880,
+        "longTaskCount": 5,
+        "longTaskMs": 500
+      },
+      "documentBudget": 18
+    },
+    {
+      "engine": "webkit",
+      "warm": false,
+      "role": "desktop",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 93,
+          "max": 398,
+          "median": 111,
+          "samples": [
+            133,
+            398,
+            111,
+            93,
+            103
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 30505,
+          "max": 30570,
+          "median": 30525,
+          "samples": [
+            30539,
+            30505,
+            30525,
+            30570,
+            30509
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 65,
+          "max": 112,
+          "median": 75,
+          "samples": [
+            75,
+            111,
+            65,
+            112,
+            65
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 69,
+          "max": 116,
+          "median": 80,
+          "samples": [
+            80,
+            115,
+            69,
+            116,
+            69
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 81,
+          "max": 127,
+          "median": 111,
+          "samples": [
+            111,
+            125,
+            81,
+            127,
+            81
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 68,
+          "max": 72,
+          "median": 69,
+          "samples": [
+            69,
+            72,
+            70,
+            69,
+            68
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 187,
+          "max": 215,
+          "median": 194,
+          "samples": [
+            215,
+            187,
+            194,
+            209,
+            190
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 28,
+        "max": 30,
+        "median": 28,
+        "samples": [
+          28,
+          30,
+          28,
+          28,
+          30
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 1296,
+        "fullQueue": 61640,
+        "firstUsefulDetail": 724,
+        "draftReadyMs": 732,
+        "freshActionReadyMs": 754,
+        "uiCommits": 149,
+        "uiCommitMs": 930
+      },
+      "documentBudget": 42
+    },
+    {
+      "engine": "webkit",
+      "warm": false,
+      "role": "paired",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 80,
+          "max": 104,
+          "median": 81,
+          "samples": [
+            90,
+            104,
+            81,
+            80,
+            81
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 30222,
+          "max": 30244,
+          "median": 30227,
+          "samples": [
+            30227,
+            30227,
+            30228,
+            30222,
+            30244
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 94,
+          "max": 108,
+          "median": 97,
+          "samples": [
+            94,
+            94,
+            108,
+            97,
+            100
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 97,
+          "max": 112,
+          "median": 100,
+          "samples": [
+            97,
+            97,
+            112,
+            100,
+            103
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 107,
+          "max": 122,
+          "median": 110,
+          "samples": [
+            107,
+            108,
+            122,
+            110,
+            113
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 62,
+          "max": 67,
+          "median": 66,
+          "samples": [
+            66,
+            67,
+            66,
+            62,
+            66
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 191,
+          "max": 199,
+          "median": 196,
+          "samples": [
+            199,
+            192,
+            197,
+            196,
+            191
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 28,
+        "max": 30,
+        "median": 28,
+        "samples": [
+          28,
+          30,
+          28,
+          28,
+          30
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 708,
+        "fullQueue": 60988,
+        "firstUsefulDetail": 716,
+        "draftReadyMs": 724,
+        "freshActionReadyMs": 744,
+        "uiCommits": 139,
+        "uiCommitMs": 898
+      },
+      "documentBudget": 42
+    },
+    {
+      "engine": "webkit",
+      "warm": true,
+      "role": "desktop",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 84,
+          "max": 105,
+          "median": 95,
+          "samples": [
+            96,
+            84,
+            94,
+            105,
+            95
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 84,
+          "max": 105,
+          "median": 95,
+          "samples": [
+            96,
+            84,
+            94,
+            105,
+            95
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 100,
+          "max": 116,
+          "median": 111,
+          "samples": [
+            111,
+            116,
+            109,
+            115,
+            100
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 103,
+          "max": 120,
+          "median": 114,
+          "samples": [
+            114,
+            120,
+            113,
+            118,
+            103
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 115,
+          "max": 150,
+          "median": 129,
+          "samples": [
+            142,
+            150,
+            125,
+            129,
+            115
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 32,
+          "max": 35,
+          "median": 35,
+          "samples": [
+            35,
+            32,
+            35,
+            35,
+            35
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 165,
+          "max": 183,
+          "median": 178,
+          "samples": [
+            183,
+            165,
+            180,
+            175,
+            178
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 11,
+        "max": 11,
+        "median": 11,
+        "samples": [
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 710,
+        "fullQueue": 710,
+        "firstUsefulDetail": 732,
+        "draftReadyMs": 740,
+        "freshActionReadyMs": 800,
+        "uiCommits": 75,
+        "uiCommitMs": 866
+      },
+      "documentBudget": 18
+    },
+    {
+      "engine": "webkit",
+      "warm": true,
+      "role": "paired",
+      "metrics": {
+        "firstUsefulQueue": {
+          "n": 5,
+          "min": 111,
+          "max": 116,
+          "median": 111,
+          "samples": [
+            111,
+            116,
+            112,
+            111,
+            111
+          ]
+        },
+        "fullQueue": {
+          "n": 5,
+          "min": 111,
+          "max": 116,
+          "median": 111,
+          "samples": [
+            111,
+            116,
+            112,
+            111,
+            111
+          ]
+        },
+        "firstUsefulDetail": {
+          "n": 5,
+          "min": 103,
+          "max": 108,
+          "median": 105,
+          "samples": [
+            104,
+            107,
+            105,
+            108,
+            103
+          ]
+        },
+        "draftReadyMs": {
+          "n": 5,
+          "min": 107,
+          "max": 131,
+          "median": 110,
+          "samples": [
+            110,
+            112,
+            108,
+            131,
+            107
+          ]
+        },
+        "freshActionReadyMs": {
+          "n": 5,
+          "min": 118,
+          "max": 142,
+          "median": 120,
+          "samples": [
+            120,
+            123,
+            119,
+            142,
+            118
+          ]
+        },
+        "uiCommits": {
+          "n": 5,
+          "min": 31,
+          "max": 32,
+          "median": 31,
+          "samples": [
+            32,
+            31,
+            31,
+            31,
+            31
+          ]
+        },
+        "uiCommitMs": {
+          "n": 5,
+          "min": 155,
+          "max": 167,
+          "median": 161,
+          "samples": [
+            163,
+            161,
+            155,
+            158,
+            167
+          ]
+        }
+      },
+      "providerDocuments": {
+        "n": 5,
+        "min": 11,
+        "max": 11,
+        "median": 11,
+        "samples": [
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      },
+      "budgets": {
+        "firstUsefulQueue": 732,
+        "fullQueue": 732,
+        "firstUsefulDetail": 716,
+        "draftReadyMs": 762,
+        "freshActionReadyMs": 784,
+        "uiCommits": 69,
+        "uiCommitMs": 834
+      },
+      "documentBudget": 18
+    }
+  ],
+  "comparisonSemantics": "Measured startup mode baseline at c0aab38. Subsequent authored-list navigation is conditional on non-baseline modes and does not execute in this population. Both roles share each run-level document count; do not sum duplicate role entries. Native debug binary and profiling browser assets unchanged by this controller-only authored phase. No packaged-release or live enterprise SLA."
+}

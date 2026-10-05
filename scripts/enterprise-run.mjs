@@ -39,6 +39,25 @@ try {
   await page.waitForFunction(()=>[...document.querySelectorAll('button')].some(b=>b.textContent==='Approve'&&!b.disabled),null,{timeout:30000});result.samples[i].freshActionReadyMs=await page.evaluate(start=>performance.now()-start,detailStart);
   await page.screenshot({path:resolve(out,`detail-${i}.png`),fullPage:false});
  }
+ if(['authored','gate','fault','soak','load'].includes(mode)){
+  const expected=provider.data.rows.filter(r=>r.state==='OPEN'&&r.author.login==='synthetic-viewer').map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+  for(const [i,page] of pages.entries()){
+   await page.getByRole('button',{name:'Back to list',exact:true}).click();
+   await page.getByRole('button',{name:'My PRs',exact:true}).click();
+   const rows=page.locator('div[role="button"]').filter({hasText:/Synthetic review [0-9]+/});
+   await rows.first().waitFor();
+   const identities=await rows.evaluateAll(nodes=>nodes.map(node=>{const text=node.textContent??'';return `${text.match(/synthetic-lab\/repo-[0-9]+/)?.[0]}/${text.match(/Synthetic review ([0-9]+)/)?.[1]}`;}).sort());
+   assert.deepEqual(identities,expected,'actual mounted PrList identities');
+   await page.screenshot({path:resolve(out,`authored-${i}.png`),fullPage:false});
+   await page.getByRole('button',{name:/Synthetic review 1(?:\D|$)/}).first().click();
+   await page.getByText('Synthetic description 1',{exact:false}).waitFor();
+   await page.getByRole('button',{name:'Back to list',exact:true}).click();
+   await page.getByRole('button',{name:'To Review',exact:true}).click();
+   await page.getByRole('button',{name:/Synthetic review 51(?:\D|$)/}).first().click();
+   await page.getByText('Synthetic description 51',{exact:false}).waitFor();
+  }
+  result.phases.push({name:'mounted-authored-PrList-and-detail-both-roles',applied:true,exercised:true,converged:true,rowsPerRole:50});
+ }
  if(mode==='crash'){
   await control('hold-commit');await control('wake');let held=false;
   for(let n=0;n<180&&!held;n++){await delay(1000);held=(await control('status')).commitHeld;}
@@ -49,7 +68,7 @@ try {
   const reopened=JSON.parse(execFileSync('python3',['scripts/enterprise/inspect-profile.py',profile],{encoding:'utf8'}));assert.equal(reopened.integrity,'ok');assert.deepEqual(reopened.queues,before.queues,'interrupted outer commit does not advance durable authority');
   result.phases.push({name:'actual-outer-transaction-interruption-reopen',applied:true,exercised:true,converged:true});
  }
- if(!['baseline','crash','offline'].includes(mode)){
+ if(!['baseline','crash','offline','authored'].includes(mode)){
  if(!['retirement','contention'].includes(mode)){
  // Real mounted multi-thread moves: invalidate through the actual QueryClient,
  // which reaches native get_pr_detail; never publish a canned receipt.

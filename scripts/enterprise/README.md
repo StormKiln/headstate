@@ -29,7 +29,7 @@ ENTERPRISE_DRIVER="$PWD/src-tauri/target/debug/enterprise-driver" \
 ```
 
 `ENTERPRISE_DRIVER` overrides the local binary path; set it when using a shared
-Cargo target. Modes: `gate` (mounted actions and continuity), `fault` (rate,
+Cargo target. Modes: `authored` (actual PrList and authored detail in both roles), `gate` (mounted actions and continuity), `fault` (rate,
 partial/offline recovery, outer-write abort, pairing/owner retirement and reply
 ordering), `retirement`, `contention` (real SQLite writer), `crash` (SIGKILL inside
 outer transaction), `offline` (retained restart), `load` (approval during held
