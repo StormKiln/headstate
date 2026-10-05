@@ -456,6 +456,20 @@ impl SourcePolls {
             status.settled_scan_receipt = state.receipt_id.clone();
             status.settled_phase = Some(status.phase.clone());
         }
+        #[cfg(feature = "enterprise-harness")]
+        if current
+            && !state.no_work
+            && !published
+            && attempt.list == CachedList::Reviewing
+            && matches!(status.phase, Phase::Ready)
+            && status.error.is_none()
+        {
+            if let (Some(receipt), Some(revision)) =
+                (state.receipt_id.as_deref(), status.receipt_revision)
+            {
+                crate::enterprise_harness::metrics::accepted_scan(receipt, revision);
+            }
+        }
         Some(status.clone())
     }
     fn complete_gitlab(

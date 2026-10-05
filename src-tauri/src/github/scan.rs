@@ -274,6 +274,18 @@ impl GitHubClient {
                         };
                         let result = run.await.map_err(Arc::new);
                         #[cfg(feature = "enterprise-harness")]
+                        if let Some(receipt) = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|r| r.scan.as_ref())
+                            .and_then(|scan| scan.state.receipt_id.as_deref())
+                        {
+                            crate::enterprise_harness::metrics::scan_receipt(
+                                receipt,
+                                shared.metric.id(),
+                            );
+                        }
+                        #[cfg(feature = "enterprise-harness")]
                         metric.finish(if result.is_ok() { "receipt" } else { "failed" });
                         shared
                             .state

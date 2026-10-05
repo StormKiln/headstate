@@ -35,14 +35,15 @@ export async function releaseWithPublication({pages,provider,profile,expected,re
  }
  throw Error(`Exact held native completion not proved within local ceiling: ${lastError?.message??'completion withheld'}`);
 }
-export async function waitForFreshTraversal({pages,provider,consumption,expected}){
+export async function waitForFreshTraversal({pages,provider,profile,consumption,expected}){
  while(performance.now()-consumption.releasedMono<=convergencePolicy.inventoryMs){
-  const clients=await Promise.all(pages.map(snapshot));
+  const clients=await Promise.all(pages.map(async page=>({...await snapshot(page),publications:await page.evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='event'&&e.name==='source-poll-status').map(e=>e.reply))})));
+  const events=(await readFile(resolve(profile,'native.ndjson'),'utf8')).split('\n').filter(Boolean).map(JSON.parse);
   const providerReads=provider.ledger.filter(entry=>entry.at>consumption.releasedMono&&entry.searches?.some(search=>search.query.includes('review-requested:@me')));
   try{
    for(const client of clients)assertConverged(client,expected);
-   assertRecovery({releasedAt:consumption.releasedAt,elapsedMs:performance.now()-consumption.releasedMono,ceilingMs:convergencePolicy.inventoryMs,provider:providerReads.map(entry=>({...entry,at:consumption.releasedAt+(entry.at-consumption.releasedMono)})),clients});
-   return {elapsedMs:performance.now()-consumption.releasedMono,provider:providerReads,clients};
+   const proof=assertRecovery({releasedAt:consumption.releasedAt,releasedMono:consumption.releasedMono,elapsedMs:performance.now()-consumption.releasedMono,ceilingMs:convergencePolicy.inventoryMs,provider:providerReads,clients,events,consumed:consumption.completion.reply.update});
+   return {elapsedMs:performance.now()-consumption.releasedMono,provider:providerReads,clients,proof};
   }catch{}
   await delay(100);
  }
@@ -82,7 +83,7 @@ export async function runConvergence({pages,provider,result,out,profile,control}
   await capture(reason);
  };
  let heldRequestId;
- const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldRequestId});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,consumption,expected})});};
+ const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldRequestId});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,profile,consumption,expected})});};
  const holdOldSearch=async()=>{
   provider.fault.holdSearch={list:'reviewing',after:null,remaining:1};
   heldRequestId=await pages[0].evaluate(()=>{const offset=window.__enterprise.telemetry.length;void window.__enterprise.refreshReviewing().catch(()=>{});const started=window.__enterprise.telemetry.slice(offset).filter(e=>e.kind==='call-start'&&e.name==='get_reviewing');if(started.length!==1)throw Error('one actual reviewing invocation required');return started[0].args.requestId;});

@@ -14,10 +14,16 @@ export function assertConsumption({requestId,commandId,held,lineage,completion,e
  for(const client of clients)assertConverged(client,expected);
  return {classification:update.error===cas?'matched-cas-refusal':'matched-row-bearing-completion',completion,lineage};
 }
-export function assertRecovery({releasedAt,elapsedMs,ceilingMs,provider,clients}){
+export function assertRecovery({releasedAt,releasedMono,elapsedMs,ceilingMs,provider,clients,events,consumed}){
  assert.ok(elapsedMs<=ceilingMs,'fresh traversal exceeded original recovery ceiling');
- assert.ok(provider.some(entry=>entry.at>releasedAt&&entry.status===200),'no new successful provider work');
- for(const {source} of clients){assert.equal(source.phase,'ready');assert.equal(source.coverage,'complete');assert.ok(Date.parse(source.lastReceivedAt)>releasedAt,'preexisting winner is not recovery');}
+ const candidates=events.filter(e=>e.operation==='scan-slot'&&e.stage==='accepted-reviewing'&&e.code>consumed.receipt_revision);
+ for(const accepted of candidates){
+  const read=events.find(e=>e.operation==='read-submitted'&&e.stage==='scan-slot'&&e.code===accepted.id&&events.some(body=>body.id===e.id&&body.operation==='read-submitted'&&body.stage==='body-complete'&&body.ns<=accepted.ns)&&events.some(link=>link.id===e.id&&link.stage==='synthetic-ledger'&&provider.some(p=>p.id===link.code&&p.at>releasedMono&&p.status===200&&p.responseDelivered)));
+  if(!read)continue;
+  const publications=clients.map(client=>client.publications.find(p=>p.session===consumed.session&&p.list==='reviewing'&&p.receipt_revision===accepted.code&&p.phase==='ready'&&p.coverage==='complete'&&Date.parse(p.last_received_at)>Math.max(releasedAt,Date.parse(consumed.last_received_at))&&client.source.phase==='ready'&&client.source.coverage==='complete'&&client.source.lastReceivedAt===p.last_received_at));
+  if(publications.every(Boolean))return {accepted,read,publications};
+ }
+ assert.fail('no later accepted traversal with exact post-release body and both client receipts');
 }
 // Each edge is emitted at the actual caller registration / producer request / response boundary.
 export function consumptionLineage(events,commandId,providerId){

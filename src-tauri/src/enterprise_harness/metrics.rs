@@ -211,3 +211,30 @@ tokio::task_local! {
     pub static COMMAND: u64;
     pub static SCAN_SLOT: u64;
 }
+
+static SCAN_RECEIPTS: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
+pub fn scan_receipt(receipt: &str, slot: u64) {
+    let mut receipts = SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if receipts.len() >= 100000 {
+        LOST.store(true, Ordering::SeqCst);
+        return;
+    }
+    if receipts
+        .insert(receipt.to_owned(), slot)
+        .is_some_and(|old| old != slot)
+    {
+        LOST.store(true, Ordering::SeqCst);
+    }
+}
+pub fn accepted_scan(receipt: &str, revision: u64) {
+    let receipts = SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = receipts.get(receipt) {
+        record(*slot, "accepted-reviewing", "scan-slot", revision);
+    }
+}

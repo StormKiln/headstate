@@ -42,7 +42,7 @@ export async function runConvergenceRestart({pages,provider,result,out,profile,s
   await control('start');const holdStart=performance.now();while(!provider.heldCount&&performance.now()-holdStart<convergencePolicy.inventoryMs)await delay(100);
   const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length,'restart must materialize an actual stale provider page');
   await capture('stale-page-held');evidence.stalePublication=await releaseWithPublication({pages,provider,profile,expected:state.expected});
-  evidence.freshTraversal=await waitForFreshTraversal({pages,provider,consumption:evidence.stalePublication,expected:state.expected});
+  evidence.freshTraversal=await waitForFreshTraversal({pages,provider,profile,consumption:evidence.stalePublication,expected:state.expected});
   evidence.pass=true;result.samples.push({role:'desktop'},{role:'paired'});result.convergenceRestart={pass:true};
  }finally{provider.release();await writeFile(resolve(out,'convergence-restart.json'),JSON.stringify(evidence,null,2));}
 }
