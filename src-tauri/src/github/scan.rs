@@ -1,5 +1,6 @@
 //! Finite queue steps. Rich rows are observations from this step only.
 use super::{
+    admission::{FirstAttempt, LiveRead, ReadClass, ReadContext},
     client::{refused_fields, ClientError, FetchedList, GitHubClient},
     map::map_list,
     model::PullRequest,
@@ -14,12 +15,95 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
 };
+#[cfg(test)]
+mod demand_tests;
 mod partition;
+
+/// Intent is independent of the shared (list, revision) key. A finished
+/// continuation must never authorize a fresh discovery pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    Refresh,
+    Continue,
+}
 
 type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
 #[derive(Default)]
 pub(super) struct Reads(Mutex<HashMap<(bool, i64), Weak<ScanSlot>>>);
-type ScanSlot = tokio::sync::Mutex<Receipt>;
+struct ScanSlot {
+    #[cfg(feature = "enterprise-harness")]
+    metric: crate::enterprise_harness::metrics::Scope,
+    state: Mutex<SlotState>,
+    live: tokio::sync::watch::Sender<Option<LiveRead>>,
+    completed: tokio::sync::Notify,
+}
+#[derive(Default)]
+struct SlotState {
+    callers: HashMap<u64, (ReadContext, ScanMode)>,
+    next_id: u64,
+    task: Option<tokio::task::AbortHandle>,
+    receipt: Receipt,
+    abandoned: bool,
+    dispatch_deadline: Option<tokio::time::Instant>,
+}
+impl ScanSlot {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "enterprise-harness")]
+            metric: crate::enterprise_harness::metrics::Scope::new("scan-slot", 0),
+            state: Mutex::new(SlotState::default()),
+            live: tokio::sync::watch::channel(None).0,
+            completed: tokio::sync::Notify::new(),
+        }
+    }
+    fn publish_demand(&self, state: &SlotState) {
+        let callers: Vec<_> = state
+            .callers
+            .values()
+            .filter(|(c, _)| c.deadline > tokio::time::Instant::now())
+            .collect();
+        let demand = callers
+            .iter()
+            .map(|(c, _)| c.deadline)
+            .max()
+            .map(|deadline| LiveRead {
+                deadline: state
+                    .dispatch_deadline
+                    .map_or(deadline, |cap| deadline.min(cap)),
+                class: if callers
+                    .iter()
+                    .any(|(c, _)| c.class == ReadClass::Foreground)
+                {
+                    ReadClass::Foreground
+                } else if callers
+                    .iter()
+                    .any(|(c, _)| c.class == ReadClass::Background)
+                {
+                    ReadClass::Background
+                } else {
+                    ReadClass::Advisory
+                },
+            });
+        self.live.send_replace(demand);
+    }
+}
+struct ScanCaller {
+    slot: Arc<ScanSlot>,
+    id: u64,
+}
+impl Drop for ScanCaller {
+    fn drop(&mut self) {
+        let mut state = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.callers.remove(&self.id);
+        self.slot.publish_demand(&state);
+        if state.callers.is_empty() {
+            state.abandoned = true;
+            if let Some(task) = state.task.take() {
+                task.abort();
+            }
+        }
+    }
+}
 
 fn predicate(list: CachedList) -> &'static str {
     match list {
@@ -46,29 +130,173 @@ impl GitHubClient {
         previous: &[PullRequest],
         now: i64,
     ) -> Result<FetchedList, ClientError> {
+        self.advance_scan_mode(list, loaded, previous, now, ScanMode::Refresh)
+            .await
+    }
+    pub(crate) async fn advance_scan_mode(
+        &self,
+        list: CachedList,
+        loaded: Loaded,
+        previous: &[PullRequest],
+        now: i64,
+        mode: ScanMode,
+    ) -> Result<FetchedList, ClientError> {
         let _active = self.active_queue_read();
-        let slot = {
+        let context = self.read_context();
+        let (slot, caller) = {
             let mut reads = self.scans.0.lock().unwrap_or_else(|e| e.into_inner());
             reads.retain(|_, weak| weak.strong_count() > 0);
             let key = (list == CachedList::Reviewing, loaded.revision);
-            reads.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-                let slot = Arc::new(tokio::sync::Mutex::new(None));
-                reads.insert(key, Arc::downgrade(&slot));
-                slot
-            })
+            loop {
+                let slot = reads.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                    let slot = Arc::new(ScanSlot::new());
+                    reads.insert(key, Arc::downgrade(&slot));
+                    slot
+                });
+                let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                // Last-consumer retirement may race registry selection. No
+                // registration or receipt can revive an abandoned producer.
+                if state.abandoned {
+                    reads.remove(&key);
+                    continue;
+                }
+                let id = state.next_id;
+                state.next_id += 1;
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::metrics::record(
+                    slot.metric.id(),
+                    "caller",
+                    "scan-slot",
+                    state.callers.len() as u64,
+                );
+                state.callers.insert(id, (context.clone(), mode));
+                slot.publish_demand(&state);
+                if state.task.is_none() && state.receipt.is_none() {
+                    let shared = slot.clone();
+                    let previous = previous.to_vec();
+                    // A slot has one finite allowance. Queue lifetime follows live
+                    // consumers; its execution cap starts at first dispatch.
+                    let mut operation = context.clone();
+                    operation.live = Some(slot.live.subscribe());
+                    let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let mark = dispatched.clone();
+                    let observers = Arc::downgrade(&slot);
+                    operation.first_attempt = Some(FirstAttempt::new(move || {
+                        mark.store(true, std::sync::atomic::Ordering::Release);
+                        if let Some(slot) = observers.upgrade() {
+                            let callbacks: Vec<_> = {
+                                let mut state =
+                                    slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                                state.dispatch_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(30),
+                                );
+                                slot.publish_demand(&state);
+                                state
+                                    .callers
+                                    .values()
+                                    .filter_map(|(c, _)| c.first_attempt.clone())
+                                    .collect()
+                            };
+                            for callback in callbacks {
+                                callback.observe();
+                            }
+                        }
+                    }));
+                    let client = self.with_scan_context(operation).with_attempt_limit(3);
+                    let task = tokio::spawn(async move {
+                        #[cfg(feature = "enterprise-harness")]
+                        let mut metric =
+                            crate::enterprise_harness::metrics::Scope::new("scan-producer", 0);
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.mark("slot", shared.metric.id());
+                        let mut changes = shared.live.subscribe();
+                        let run = async {
+                            loop {
+                                changes.borrow_and_update();
+                                let mode = {
+                                    let state =
+                                        shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    if state.callers.values().any(|(c, m)| {
+                                        c.deadline > tokio::time::Instant::now()
+                                            && *m == ScanMode::Refresh
+                                    }) {
+                                        ScanMode::Refresh
+                                    } else {
+                                        ScanMode::Continue
+                                    }
+                                };
+                                let step = client.advance_scan_inner(
+                                    list,
+                                    Loaded {
+                                        revision: loaded.revision,
+                                        state: loaded.state.clone(),
+                                    },
+                                    &previous,
+                                    now,
+                                    mode,
+                                );
+                                tokio::pin!(step);
+                                loop {
+                                    if dispatched.load(std::sync::atomic::Ordering::Acquire) {
+                                        // Every admission, full response body and
+                                        // retry wait observes the execution cap.
+                                        // Let those errors return through the scan
+                                        // so received rows/checkpoints survive;
+                                        // an outer timeout would drop that progress.
+                                        return step.await;
+                                    }
+                                    tokio::select! {
+                                        biased;
+                                        _ = changes.changed(), if !dispatched.load(std::sync::atomic::Ordering::Acquire) => {
+                                            // Only a proven zero-dispatch plan can
+                                            // be replaced. Its shared allowance is
+                                            // retained across all demand changes.
+                                            if !dispatched.load(std::sync::atomic::Ordering::Acquire) { break; }
+                                        }
+                                        result = &mut step => return result,
+                                    }
+                                }
+                            }
+                        };
+                        let result = run.await.map_err(Arc::new);
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.finish(if result.is_ok() { "receipt" } else { "failed" });
+                        shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .receipt = Some(result);
+                        shared.completed.notify_waiters();
+                    });
+                    state.task = Some(task.abort_handle());
+                }
+                drop(state);
+                break (slot.clone(), ScanCaller { slot, id });
+            }
         };
-        let mut receipt = tokio::time::timeout_at(self.read_context().deadline, slot.lock())
+        let wait = async {
+            loop {
+                let notified = slot.completed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(result) = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .receipt
+                    .clone()
+                {
+                    return result.map_err(ClientError::shared);
+                }
+                notified.await;
+            }
+        };
+        let result = tokio::time::timeout_at(context.deadline, wait)
             .await
             .map_err(|_| ClientError::Timeout(30))?;
-        if let Some(result) = receipt.as_ref() {
-            return result.clone().map_err(ClientError::shared);
-        }
-        let result = self
-            .advance_scan_inner(list, loaded, previous, now)
-            .await
-            .map_err(Arc::new);
-        *receipt = Some(result.clone());
-        result.map_err(ClientError::shared)
+        drop(caller);
+        result
     }
     async fn advance_scan_inner(
         &self,
@@ -76,6 +304,7 @@ impl GitHubClient {
         loaded: Loaded,
         previous: &[PullRequest],
         now: i64,
+        mode: ScanMode,
     ) -> Result<FetchedList, ClientError> {
         let client = self.with_attempt_limit(3);
         let mut state = loaded.state;
@@ -100,7 +329,7 @@ impl GitHubClient {
                 state.eligible_at = finished_at + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
             }
         }
-        if state.done && now >= state.eligible_at {
+        if mode == ScanMode::Refresh && state.done && now >= state.eligible_at {
             state.fresh_pass();
         }
         let began_at_head = state.after.is_none();
@@ -135,7 +364,12 @@ impl GitHubClient {
                             }
                             partition::accept(&mut state, &raw, &mut prs, now);
                             if state.done {
-                                seed_candidates(&mut state, previous, now);
+                                seed_candidates(
+                                    &mut state,
+                                    previous,
+                                    now,
+                                    &removals.iter().cloned().collect(),
+                                );
                                 break;
                             }
                             if state.failures > 0 {
@@ -243,7 +477,12 @@ impl GitHubClient {
                         state.completed_total = total;
                     }
                     state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
-                    seed_candidates(&mut state, previous, now);
+                    seed_candidates(
+                        &mut state,
+                        previous,
+                        now,
+                        &removals.iter().cloned().collect(),
+                    );
                     break;
                 }
                 if state.seen.len() >= 1000 || state.pages >= 39 {
@@ -252,7 +491,12 @@ impl GitHubClient {
                     state.ceiling = true;
                     state.tainted = true;
                     state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
-                    seed_candidates(&mut state, previous, now);
+                    seed_candidates(
+                        &mut state,
+                        previous,
+                        now,
+                        &removals.iter().cloned().collect(),
+                    );
                     break;
                 }
                 if next != Some(true)
@@ -320,6 +564,9 @@ impl GitHubClient {
         }
         // A positive measurement in this step always beats a tentative negative.
         removals.retain(|id| !prs.iter().any(|r| &r.identity() == id));
+        state
+            .candidates
+            .retain(|c| !prs.iter().any(|r| r.identity() == c.identity));
         let total = state.total;
         if state.no_work && state.step_failure.is_none() {
             state.step_failure = previous_failure;
@@ -363,10 +610,17 @@ impl GitHubClient {
         now: i64,
     ) -> Vec<PrIdentity> {
         let mut batch = vec![];
-        let cap = if state.isolate { 1 } else { 4 };
+        // The first due entry owns the turn. An isolated entry gets a singleton;
+        // otherwise healthy candidates may batch without re-poisoning known failures.
+        let isolated = state
+            .candidates
+            .iter()
+            .find(|c| c.eligible_at <= now)
+            .is_some_and(|c| c.isolated);
+        let cap = if isolated { 1 } else { 4 };
         for _ in 0..state.candidates.len() {
             let c = state.candidates.pop_front().unwrap();
-            if c.eligible_at <= now && batch.len() < cap {
+            if c.eligible_at <= now && batch.len() < cap && c.isolated == isolated {
                 batch.push(c);
             } else {
                 state.candidates.push_back(c);
@@ -397,7 +651,6 @@ impl GitHubClient {
             .as_ref()
             .is_ok_and(|v| clean(v) && v["viewer"]["login"].as_str() == Some(owner));
         if !healthy {
-            state.isolate = true;
             state.tainted = true;
             state.step_failure = Some(match &raw {
                 Err(error) => scan_failure(error),
@@ -430,12 +683,14 @@ impl GitHubClient {
                     removed.push(c.identity)
                 }
                 Verdict::Absent => {
+                    c.isolated = false;
                     c.negative_at.get_or_insert(now);
                     c.failures = 0;
                     c.eligible_at = now + queue_scan::CONFIRM_DELAY;
                     state.candidates.push_back(c);
                 }
                 Verdict::Unknown => {
+                    c.isolated = true;
                     c.negative_at = None;
                     c.failures = c.failures.saturating_add(1);
                     c.eligible_at = now + queue_scan::backoff(c.failures);
@@ -467,7 +722,12 @@ fn merge_observation(rows: &mut Vec<PullRequest>, row: PullRequest) {
         rows.push(row);
     }
 }
-fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
+fn seed_candidates(
+    state: &mut State,
+    previous: &[PullRequest],
+    now: i64,
+    excluded: &HashSet<PrIdentity>,
+) {
     if previous.is_empty() {
         return;
     }
@@ -476,7 +736,8 @@ fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
         let index = (start + offset) % previous.len();
         let row = &previous[index];
         state.candidate_position = (index + 1) % previous.len();
-        if state.seen.contains(&row.identity())
+        if excluded.contains(&row.identity())
+            || state.seen.contains(&row.identity())
             || row.id.is_empty()
             || state
                 .candidates
@@ -499,6 +760,7 @@ fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
             state.candidates.remove(evict);
         }
         state.candidates.push_back(Candidate {
+            isolated: false,
             identity: row.identity(),
             id: row.id.clone(),
             head: row.head_oid.clone(),
@@ -573,6 +835,83 @@ mod tests {
     use crate::queue_scan::State;
     use serde_json::{json, Value};
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    #[tokio::test]
+    async fn queued_scan_promotes_live_foreground_joiner_with_one_receipt() {
+        use crate::github::admission::{ReadClass, ReadContext};
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}}}))).mount(&server).await;
+        let base = client(&server);
+        base.fetch_viewer().await.unwrap();
+        Mock::given(wiremock::matchers::body_partial_json(
+            json!({"query":"blocker"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(json!({"data":{}})),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+        let mut blockers = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let client = base.with_read_context(ReadContext::new(
+                ReadClass::Background,
+                Duration::from_secs(5),
+            ));
+            blockers.spawn(async move { client.stats_graphql(&json!({"query":"blocker"})).await });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.received_requests().await.unwrap().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let background = base.with_read_context(ReadContext::new(
+            ReadClass::Background,
+            Duration::from_secs(2),
+        ));
+        let worker = tokio::spawn(async move {
+            background
+                .advance_scan_mode(
+                    CachedList::Authored,
+                    Loaded {
+                        revision: 0,
+                        state: State::default(),
+                    },
+                    &[],
+                    1000,
+                    ScanMode::Continue,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(300),
+            base.advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 0,
+                    state: State::default(),
+                },
+                &[],
+                1000,
+            ),
+        )
+        .await
+        .expect("foreground joiner must use reserved capacity")
+        .unwrap();
+        assert_eq!(result.scan, worker.await.unwrap().unwrap().scan);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "one identity, two blockers and exactly one shared page"
+        );
+        blockers.abort_all();
+        while blockers.join_next().await.is_some() {}
+    }
     fn client(server: &MockServer) -> GitHubClient {
         GitHubClient::new(
             octocrab::Octocrab::builder()
@@ -1092,7 +1431,7 @@ mod tests {
         );
         state.candidates[0].negative_at = Some(1000);
         state.candidates[1].failures = 1;
-        seed_candidates(&mut state, &previous, 1010);
+        seed_candidates(&mut state, &previous, 1010, &HashSet::new());
         assert_eq!(state.candidates.len(), 1000);
         assert!(state
             .candidates
@@ -1106,7 +1445,7 @@ mod tests {
         state.candidates[2].failures = 1;
         state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         state.fresh_pass();
-        seed_candidates(&mut state, &previous, 1100);
+        seed_candidates(&mut state, &previous, 1100, &HashSet::new());
         assert!(state
             .candidates
             .iter()
@@ -1226,9 +1565,10 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
-    fn candidate(number: usize) -> Candidate {
+    pub(super) fn candidate(number: usize) -> Candidate {
         let raw = node(number);
         Candidate {
+            isolated: false,
             identity: identity(&raw).unwrap(),
             id: raw["id"].as_str().unwrap().into(),
             head: raw["headRefOid"].as_str().unwrap().into(),

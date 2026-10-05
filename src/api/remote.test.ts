@@ -271,3 +271,13 @@ it("validates watch replies and drops malformed activity frames without retiring
   expect(cb).toHaveBeenLastCalledWith({ payload: { watch_id: "opaque", size: 11, seq: 3 } });
   stop();
 });
+
+it("accepts old registered stats boards and old progress at the real remote boundary", async () => {
+  const legacy = { viewer:"alice", scopeKey:"scope", backfill:{state:"registered",lastFrame:null}, rows:[], total:null, retrieved:0, complete:false, truncatedSlices:[], refusedFields:0, slices:0, rounds:0, spend:{points:0,requests:0,unmetered:0,remaining:null,resetAt:null}, slowest:[],largest:[],repoCounts:[],accumulated:0,accumulating:false,daysCovered:0,daysTotal:30 };
+  tauri.invoke.mockResolvedValueOnce(legacy);
+  expect(await remote.call("stats_board")).toBe(legacy);
+  const receive=vi.fn(); await remote.listen("stats-backfill-progress",receive);
+  const handler=tauri.listen.mock.calls.find(([name])=>name==="stats-backfill-progress")?.[1] as (event:{payload:unknown})=>void;
+  const frame={scopeKey:"scope",daysCovered:1,daysTotal:30,collected:17,total:20,phase:{kind:"working"},nextTickAtMs:null};
+  handler({payload:frame});expect(receive).toHaveBeenCalledWith({payload:frame});
+});

@@ -258,6 +258,8 @@ pub fn degrade(chunk: usize, page: u32) -> Option<(usize, u32)> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<super::receipt::StatsReceipt>,
     /// The exact count, summed from `issueCount` across every slice.
     /// Exact even when `retrievable` is false -- the 1,000 cap limits
     /// retrieval, not counting.
@@ -414,6 +416,7 @@ async fn load_count_inner(
 /// untested of the pair").
 fn outcome_from_plan(plan: &Plan, budget: &Budget) -> Outcome {
     Outcome {
+        receipt: None,
         total: plan.total(),
         // An unprobed slice is not retrievable either -- its nodes were
         // never even counted, let alone fetched. Folding it in here
@@ -886,6 +889,7 @@ async fn connection_count(
             ))
         })?;
     Ok(Outcome {
+        receipt: None,
         total,
         // The connection has no cap, so a connection answer is
         // retrievable by construction. This is the whole reason item 5
@@ -1388,6 +1392,8 @@ pub struct ScopedPoint {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Series {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<super::receipt::StatsReceipt>,
     /// One point per day, oldest first.
     pub points: Vec<ScopedPoint>,
     /// Days whose counts did not come back.
@@ -1428,6 +1434,10 @@ pub struct Series {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum Unmeasured {
+    Timeout,
+    Unavailable {
+        reason: String,
+    },
     /// The rate-limit budget was under [`super::budget::RESERVE`], so the
     /// request was never issued.
     ///
@@ -1470,10 +1480,7 @@ pub async fn load_series(
     days: &[String],
     budget: &Budget,
 ) -> Result<Series, ClientError> {
-    match tokio::time::timeout(LOAD_TIMEOUT, series_inner(client, q, days, budget)).await {
-        Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
-    }
+    series_inner(client, q, days, budget).await
 }
 
 async fn series_inner(
@@ -1488,9 +1495,17 @@ async fn series_inner(
     let mut opened = vec![None::<u64>; days.len()];
     let mut refused = 0usize;
     let mut unmeasured: Option<Unmeasured> = None;
+    let deadline = client
+        .stats_deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + LOAD_TIMEOUT)
+        .min(tokio::time::Instant::now() + LOAD_TIMEOUT);
     let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
 
-    for (w, wave) in days.chunks(per_wave).enumerate() {
+    'waves: for (w, wave) in days.chunks(per_wave).enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            unmeasured = Some(Unmeasured::Timeout);
+            break;
+        }
         let base = w * per_wave;
         // MID-LOAD budget re-check (#843). Stopping leaves these days as
         // `None`, which the tail of this function turns into named
@@ -1543,7 +1558,16 @@ async fn series_inner(
                 ))
             });
         }
-        while let Some(joined) = set.join_next().await {
+        loop {
+            let joined = tokio::select! {
+                biased;
+                // Drain already-completed chunks before finalizing the deadline.
+                joined = set.join_next() => joined,
+                _ = tokio::time::sleep_until(deadline) => { unmeasured = Some(Unmeasured::Timeout); break 'waves; },
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             // A chunk that FAILED outright leaves its days as `None`, and
             // they become named failed days. Not propagated as an error:
             // see `load_series`' doc for why a chart differs from a count
@@ -1557,10 +1581,19 @@ async fn series_inner(
                         opened[first_index + i] = o;
                     }
                 }
-                Err(e) => log::warn!(
-                    "a scoped series chunk failed ({e}); its days are reported as \
-                     unmeasured rather than as zero"
-                ),
+                Err(e) => {
+                    unmeasured = Some(
+                        if tokio::time::Instant::now() >= deadline
+                            || matches!(e, ClientError::Timeout(_))
+                        {
+                            Unmeasured::Timeout
+                        } else {
+                            Unmeasured::Unavailable {
+                                reason: e.to_string(),
+                            }
+                        },
+                    );
+                }
             }
         }
     }
@@ -1582,6 +1615,7 @@ async fn series_inner(
     }
 
     Ok(Series {
+        receipt: None,
         points,
         failed_days,
         refused_fields: refused,
@@ -1604,6 +1638,10 @@ pub struct ReviewerRow {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reviewers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<Unmeasured>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<super::receipt::StatsReceipt>,
     /// One row per login that was successfully counted, ranked highest
     /// first with ties broken on login.
     ///
@@ -1683,15 +1721,7 @@ pub async fn load_reviewers(
     window: &Slice,
     budget: &Budget,
 ) -> Result<Reviewers, ClientError> {
-    match tokio::time::timeout(
-        LOAD_TIMEOUT,
-        reviewers_inner(client, q, logins, window, budget),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
-    }
+    reviewers_inner(client, q, logins, window, budget).await
 }
 
 async fn reviewers_inner(
@@ -1708,9 +1738,18 @@ async fn reviewers_inner(
     // review count to another by name.
     let mut counts = vec![None::<u64>; logins.len()];
     let mut refused = 0usize;
+    let mut stop_reason = None;
+    let deadline = client
+        .stats_deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + LOAD_TIMEOUT)
+        .min(tokio::time::Instant::now() + LOAD_TIMEOUT);
     let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
 
-    for (w, wave) in logins.chunks(per_wave).enumerate() {
+    'waves: for (w, wave) in logins.chunks(per_wave).enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            stop_reason = Some(Unmeasured::Timeout);
+            break;
+        }
         let base = w * per_wave;
         // MID-LOAD budget re-check (#843). Stopping leaves these logins as
         // `None`, which becomes `Reviewers::unmeasured` -- named people whose
@@ -1724,6 +1763,12 @@ async fn reviewers_inner(
                 super::budget::RESERVE,
                 logins.len().saturating_sub(base)
             );
+            let snap = budget.snapshot();
+            stop_reason = Some(Unmeasured::BudgetExhausted {
+                remaining: snap.remaining,
+                reserve: super::budget::RESERVE,
+                reset_at: snap.reset_at,
+            });
             break;
         }
         let mut set = tokio::task::JoinSet::new();
@@ -1748,7 +1793,16 @@ async fn reviewers_inner(
                 Ok::<(usize, Vec<Option<u64>>, usize), ClientError>((first_index, out, refused))
             });
         }
-        while let Some(joined) = set.join_next().await {
+        loop {
+            let joined = tokio::select! {
+                biased;
+                // Drain already-completed chunks before finalizing the deadline.
+                joined = set.join_next() => joined,
+                _ = tokio::time::sleep_until(deadline) => { stop_reason = Some(Unmeasured::Timeout); break 'waves; },
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             // A chunk that failed outright leaves its logins as `None` and
             // they become named unmeasured rows. A panic IS propagated: a
             // dropped task is a bug rather than a server refusal, which is
@@ -1760,10 +1814,19 @@ async fn reviewers_inner(
                         counts[first_index + i] = c;
                     }
                 }
-                Err(e) => log::warn!(
-                    "a reviewer-count chunk failed ({e}); its logins are reported as \
-                     unmeasured rather than as zero"
-                ),
+                Err(e) => {
+                    stop_reason = Some(
+                        if tokio::time::Instant::now() >= deadline
+                            || matches!(e, ClientError::Timeout(_))
+                        {
+                            Unmeasured::Timeout
+                        } else {
+                            Unmeasured::Unavailable {
+                                reason: e.to_string(),
+                            }
+                        },
+                    );
+                }
             }
         }
     }
@@ -1791,6 +1854,9 @@ async fn reviewers_inner(
     });
 
     Ok(Reviewers {
+        stop_reason,
+
+        receipt: None,
         rows,
         unmeasured,
         refused_fields: refused,
@@ -2388,6 +2454,7 @@ mod tests {
     #[test]
     fn an_outcome_states_its_own_completeness() {
         let complete = Outcome {
+            receipt: None,
             total: 337,
             retrievable: true,
             unretrievable: 0,
@@ -2401,6 +2468,7 @@ mod tests {
         assert!(!complete.is_assembled());
 
         let capped = Outcome {
+            receipt: None,
             retrievable: false,
             unretrievable: 260,
             slices: 12,
@@ -2412,6 +2480,7 @@ mod tests {
         // A refusal is its own partiality channel, independent of the
         // cap -- inherited from `client.rs`'s partial-success handling.
         let refused = Outcome {
+            receipt: None,
             refused_fields: 3,
             ..complete
         };
@@ -2439,6 +2508,8 @@ mod tests {
     #[test]
     fn a_reviewer_board_distinguishes_a_measured_zero_from_an_unmeasured_login() {
         let all_zero = Reviewers {
+            stop_reason: None,
+            receipt: None,
             rows: vec![
                 ReviewerRow {
                     login: "octocat".into(),
@@ -2461,6 +2532,8 @@ mod tests {
         assert_eq!(all_zero.rows.len(), 2);
 
         let short = Reviewers {
+            stop_reason: None,
+            receipt: None,
             unmeasured: vec!["hubot".into()],
             ..all_zero.clone()
         };
@@ -2474,6 +2547,8 @@ mod tests {
         // suggests a SAML authorization to fix where a missing alias suggests
         // a retry, which is the same three-channel split `Board` carries.
         let refused = Reviewers {
+            stop_reason: None,
+            receipt: None,
             refused_fields: 2,
             ..all_zero
         };

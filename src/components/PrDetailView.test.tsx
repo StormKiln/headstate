@@ -91,7 +91,7 @@ vi.mock("../api/hooks", () => ({
     error: claudifyState.scanError,
   }),
   useUiPrefs: () => ({ prefs: { terminal_command: claudifyState.terminal } }),
-  useReviewGates: () => ({ data: state.gates }),
+  useReviewGates: () => ({ data: state.gates, refetch: vi.fn(async () => {}), isFetching: false }),
 }));
 
 /// What Claudify sees (#1455). Defaults: scanned, no checkout of the

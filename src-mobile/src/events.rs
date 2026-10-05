@@ -159,6 +159,7 @@ pub struct Snapshot {
 
 const SNAPSHOT_VERSION: u32 = 1;
 
+#[cfg(test)]
 impl Snapshot {
     pub fn received_at(&self) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(&self.received_at)
@@ -167,6 +168,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(test)]
 pub fn cached_snapshot(store: &dyn Store) -> Result<Option<Snapshot>, StoreError> {
     get_json(store, SNAPSHOT_KEY)
 }
@@ -192,7 +194,169 @@ pub fn save_snapshot(
     )
 }
 
+const OWNED_SNAPSHOT_KEY: &str = "owned-source-receipts-v2";
+static OWNED_RECEIPTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn save_owned_receipt(
+    store: &dyn Store,
+    desktop: &str,
+    receipt: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let _guard = OWNED_RECEIPTS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(list @ ("authored" | "reviewing")) = receipt["list"].as_str() else {
+        return Ok(());
+    };
+    if receipt["ownership"]["state"] == "different_account"
+        && receipt["source"]["provider"] == "github"
+    {
+        let Some(session) = receipt["session"].as_str() else {
+            return Ok(());
+        };
+        let mut saved: serde_json::Value = get_json(store, OWNED_SNAPSHOT_KEY)?
+            .unwrap_or(serde_json::json!({"desktop":desktop,"retired":[]}));
+        if saved["desktop"] != desktop {
+            return Ok(());
+        }
+        if saved["retired"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|old| old == session))
+        {
+            return Ok(());
+        }
+        let mut retired = saved["retired"].as_array().cloned().unwrap_or_default();
+        if saved["session"].as_str().is_some_and(|old| old != session) {
+            retired.push(saved["session"].clone());
+        }
+        saved["retired"] = retired.into();
+        saved["session"] = session.into();
+        saved["owner"] = serde_json::Value::Null;
+        saved["receipts"] = serde_json::json!({});
+        put_json(store, OWNED_SNAPSHOT_KEY, &saved)?;
+        return Ok(());
+    }
+    let owner = receipt["ownership"]["owner"]
+        .as_str()
+        .filter(|s| !s.is_empty());
+    if !matches!(
+        receipt["ownership"]["state"].as_str(),
+        Some("live_verified" | "credential_bound")
+    ) || owner.is_none()
+        || receipt["source"]["provider"] != "github"
+        || receipt["source"]["host"] != "github.com"
+        || receipt["data"]["state"] != "available"
+        || !receipt["data"]["prs"].is_array()
+        || receipt["data"]["fetched_at"]
+            .as_str()
+            .and_then(provider_time)
+            .is_none()
+    {
+        return Ok(());
+    }
+    let Some(session) = receipt["session"].as_str().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let mut saved: serde_json::Value =
+        get_json(store, OWNED_SNAPSHOT_KEY)?.unwrap_or(serde_json::json!({}));
+    if saved["desktop"] != desktop {
+        saved = serde_json::json!({"v":2,"desktop":desktop,"owner":owner,"session":session,"retired":[],"receipts":{}});
+    }
+    if saved["retired"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|old| old == session))
+    {
+        return Ok(());
+    }
+    if let Some(previous) = saved["session"]
+        .as_str()
+        .filter(|old| *old != session)
+        .map(str::to_owned)
+    {
+        let mut retired = saved["retired"].as_array().cloned().unwrap_or_default();
+        retired.push(previous.into());
+        saved["retired"] = retired.into();
+    }
+    if saved["owner"].as_str() != owner {
+        saved["receipts"] = serde_json::json!({});
+    }
+    let old_time = saved["receipts"][list]["data"]["fetched_at"]
+        .as_str()
+        .and_then(provider_time);
+    let new_time = receipt["data"]["fetched_at"]
+        .as_str()
+        .and_then(provider_time);
+    if old_time.zip(new_time).is_some_and(|(old, new)| new < old) {
+        return Ok(());
+    }
+    saved["owner"] = serde_json::json!(owner);
+    saved["session"] = session.into();
+    saved["receipts"][list] = receipt.clone();
+    put_json(store, OWNED_SNAPSHOT_KEY, &saved)
+}
+/// The ribbon describes saved provider evidence, never transport arrival. Use
+/// the oldest retained list so a newer queue cannot rejuvenate another queue.
+pub fn saved_provider_time(
+    store: &dyn Store,
+    desktop: &str,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(saved): Option<serde_json::Value> = get_json(store, OWNED_SNAPSHOT_KEY)? else {
+        return Ok(None);
+    };
+    if saved["v"] != 2 || saved["desktop"] != desktop || saved["owner"].as_str().is_none() {
+        return Ok(None);
+    }
+    Ok(["authored", "reviewing"]
+        .iter()
+        .filter_map(|list| {
+            saved["receipts"][list]["data"]["fetched_at"]
+                .as_str()
+                .and_then(provider_time)
+        })
+        .min())
+}
+fn provider_time(at: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(at)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| t.and_utc())
+        })
+}
+pub fn offline_receipt(
+    store: &dyn Store,
+    desktop: &str,
+    list: &str,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let Some(saved): Option<serde_json::Value> = get_json(store, OWNED_SNAPSHOT_KEY)? else {
+        return Ok(None);
+    };
+    if saved["v"] != 2 || saved["desktop"] != desktop {
+        return Ok(None);
+    }
+    let mut receipt = saved["receipts"][list].clone();
+    let Some(at) = receipt["data"]["fetched_at"]
+        .as_str()
+        .and_then(provider_time)
+    else {
+        return Ok(None);
+    };
+    if receipt["data"]["state"] != "available" {
+        return Ok(None);
+    }
+    receipt["ownership"] =
+        serde_json::json!({"state":"saved_desktop","owner":saved["owner"],"desktop":desktop});
+    receipt["data"]["stale_secs"] = serde_json::json!((Utc::now() - at).num_seconds().max(1));
+    Ok(Some(receipt))
+}
+
 pub fn forget_snapshot(store: &dyn Store) -> Result<(), StoreError> {
+    let _guard = OWNED_RECEIPTS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    store.remove(OWNED_SNAPSHOT_KEY)?;
     store.remove(SNAPSHOT_KEY)
 }
 
@@ -323,6 +487,7 @@ impl SseParser {
 pub struct Handle {
     wake: Arc<Notify>,
     stopped: Arc<AtomicBool>,
+    publication: Arc<std::sync::Mutex<()>>,
 }
 
 impl Handle {
@@ -349,8 +514,15 @@ impl Handle {
     }
     /// End the loop at its next opportunity.
     pub fn stop(&self) {
+        let _guard = self.publication.lock().unwrap_or_else(|e| e.into_inner());
         self.stopped.store(true, Ordering::SeqCst);
         self.wake.notify_one();
+    }
+    fn publish(&self, work: impl FnOnce()) {
+        let _guard = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_stopped() {
+            work();
+        }
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
@@ -395,18 +567,21 @@ pub async fn run(sub: Subscriber, handle: Handle) {
         if handle.is_stopped() {
             return;
         }
-        sub.conn.set_state(State::Connecting);
+        handle.publish(|| sub.conn.set_state(State::Connecting));
 
         let hello = match sub.client.hello().await {
             Ok(h) => h,
             Err(e) if is_revocation(&e) => {
                 log::warn!("companion: the desktop refused this phone: {e}");
-                sub.conn.set_state(State::Revoked);
+                handle.publish(|| {
+                    let _ = forget_snapshot(sub.store.as_ref());
+                    sub.conn.set_state(State::Revoked);
+                });
                 return;
             }
             Err(e) => {
                 log::info!("companion: desktop unreachable: {e}");
-                sub.conn.set_state(State::Unreachable);
+                handle.publish(|| sub.conn.set_state(State::Unreachable));
                 if !wait(&handle, backoff).await {
                     return;
                 }
@@ -423,10 +598,15 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                 hello.protocol_version
             );
         }
-        if let Err(e) = pairing::record_hello(sub.store.as_ref(), &sub.desktop_fp, &hello) {
-            log::warn!("companion: could not record hello: {e}");
+        handle.publish(|| {
+            if let Err(e) = pairing::record_hello(sub.store.as_ref(), &sub.desktop_fp, &hello) {
+                log::warn!("companion: could not record hello: {e}");
+            }
+            sub.conn.connected(hello.protocol_version);
+        });
+        if handle.is_stopped() {
+            return;
         }
-        sub.conn.connected(hello.protocol_version);
 
         match sub.client.events().await {
             Ok(mut resp) => {
@@ -441,7 +621,7 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                         chunk = resp.chunk() => match chunk {
                             Ok(Some(bytes)) => {
                                 for frame in parser.feed(&bytes) {
-                                    deliver(&sub, frame);
+                                    handle.publish(|| deliver(&sub, frame));
                                 }
                             }
                             Ok(None) => {
@@ -482,19 +662,22 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                 // Ended streams reconnect after the minimum backoff, not
                 // instantly, so a desktop that keeps ending them is not
                 // hammered; a revocation shows on the next hello.
-                sub.conn.set_state(State::Unreachable);
+                handle.publish(|| sub.conn.set_state(State::Unreachable));
                 if !wait(&handle, MIN_BACKOFF).await {
                     return;
                 }
             }
             Err(e) if is_revocation(&e) => {
                 log::warn!("companion: the desktop refused the event stream: {e}");
-                sub.conn.set_state(State::Revoked);
+                handle.publish(|| {
+                    let _ = forget_snapshot(sub.store.as_ref());
+                    sub.conn.set_state(State::Revoked);
+                });
                 return;
             }
             Err(e) => {
                 log::info!("companion: could not open the event stream: {e}");
-                sub.conn.set_state(State::Unreachable);
+                handle.publish(|| sub.conn.set_state(State::Unreachable));
                 if !wait(&handle, backoff).await {
                     return;
                 }
@@ -509,10 +692,26 @@ fn deliver(sub: &Subscriber, frame: Frame) {
         log::debug!("companion: dropping unknown event {:?}", frame.name);
         return;
     }
+    if frame.name == "source-poll-status" {
+        if let Ok(update) = serde_json::from_str::<serde_json::Value>(&frame.data) {
+            if update["prs"].is_array() && !update["receipt_revision"].is_null() {
+                let receipt = serde_json::json!({"session":update["session"],"source":update["source"],"list":update["list"],
+                    "ownership":{"state":"live_verified","owner":update["owner"]},
+                    "data":{"state":"available","prs":update["prs"],"fetched_at":update["last_received_at"],
+                    "stale_secs":null,"coverage":update["coverage"]}});
+                if let Err(e) = save_owned_receipt(sub.store.as_ref(), &sub.desktop_fp, &receipt) {
+                    log::warn!("companion: could not cache the owned receipt: {e}");
+                }
+                if let Ok(at) = saved_provider_time(sub.store.as_ref(), &sub.desktop_fp) {
+                    sub.conn.mark_poll(at);
+                }
+            }
+        }
+    }
     if frame.name == SNAPSHOT_EVENT {
         let now = Utc::now();
         match save_snapshot(sub.store.as_ref(), &frame.data, now) {
-            Ok(()) => sub.conn.mark_poll(now),
+            Ok(()) => {}
             Err(e) => log::warn!("companion: could not cache the snapshot: {e}"),
         }
     }
@@ -540,6 +739,92 @@ mod tests {
     /// It also guards the boundary in the widening direction: adding a
     /// name to one side alone fails here, so nobody can quietly grow
     /// the set of events the desktop may fire in this webview.
+    #[test]
+    fn simultaneous_authored_and_reviewing_receipts_both_survive() {
+        struct SlowRead(MemoryStore);
+        impl Store for SlowRead {
+            fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+                let value = self.0.get(key)?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok(value)
+            }
+            fn put(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+                self.0.put(key, value)
+            }
+            fn remove(&self, key: &str) -> Result<(), StoreError> {
+                self.0.remove(key)
+            }
+        }
+        let store = Arc::new(SlowRead(MemoryStore::default()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let tasks: Vec<_> = ["authored", "reviewing"].into_iter().map(|list| {
+            let store = store.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let receipt = serde_json::json!({"session":"session","source":{"provider":"github","host":"github.com"},"list":list,
+                    "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":[],"fetched_at":"2026-01-01T00:00:00Z","stale_secs":null,"coverage":"complete"}});
+                barrier.wait(); save_owned_receipt(store.as_ref(), "desktop", &receipt).unwrap();
+            })
+        }).collect();
+        for task in tasks {
+            task.join().unwrap();
+        }
+        for list in ["authored", "reviewing"] {
+            assert!(offline_receipt(store.as_ref(), "desktop", list)
+                .unwrap()
+                .is_some());
+        }
+    }
+    #[test]
+    fn old_session_and_older_same_session_cannot_replace_phone_receipt() {
+        let store = MemoryStore::default();
+        let receipt = |session: &str, owner: &str, at: &str| {
+            serde_json::json!({"session":session,"source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":owner},"data":{"state":"available","prs":[],"fetched_at":at,"stale_secs":null,"coverage":"complete"}})
+        };
+        let alice = receipt("a", "alice", "2026-01-01T00:00:00Z");
+        let bob = receipt("b", "bob", "2026-01-02T00:00:00Z");
+        save_owned_receipt(&store, "desktop", &alice).unwrap();
+        save_owned_receipt(&store, "desktop", &bob).unwrap();
+        save_owned_receipt(&store, "desktop", &alice).unwrap();
+        let saved = offline_receipt(&store, "desktop", "authored")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["ownership"]["owner"], "bob");
+        let older_bob = receipt("b", "bob", "2026-01-01T12:00:00Z");
+        save_owned_receipt(&store, "desktop", &older_bob).unwrap();
+        assert_eq!(
+            offline_receipt(&store, "desktop", "authored")
+                .unwrap()
+                .unwrap()["data"]["fetched_at"],
+            bob["data"]["fetched_at"]
+        );
+    }
+    #[test]
+    fn owned_phone_receipt_preserves_provider_age_and_refuses_other_desktop() {
+        let store = MemoryStore::default();
+        let receipt = serde_json::json!({"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":"alice"},
+            "data":{"state":"available","prs":[],"fetched_at":"2026-01-01T00:00:00Z","stale_secs":86400,"coverage":"complete"}});
+        save_owned_receipt(&store, "desktop-a", &receipt).unwrap();
+        let cached = offline_receipt(&store, "desktop-a", "authored")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached["ownership"]["state"], "saved_desktop");
+        assert_eq!(cached["ownership"]["owner"], "alice");
+        assert_eq!(cached["data"]["fetched_at"], receipt["data"]["fetched_at"]);
+        assert!(cached["data"]["stale_secs"].as_i64().unwrap() >= 86400);
+        assert!(offline_receipt(&store, "desktop-b", "authored")
+            .unwrap()
+            .is_none());
+        save_snapshot(&store, "[]", Utc::now()).unwrap();
+        assert!(offline_receipt(&store, "desktop-a", "authored")
+            .unwrap()
+            .is_some());
+        forget_snapshot(&store).unwrap();
+        assert!(offline_receipt(&store, "desktop-a", "authored")
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn the_allowlist_matches_the_desktops() {
         let src = include_str!("../../src-tauri/src/remote/events.rs");
@@ -737,6 +1022,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saved_provider_age_is_scoped_and_never_uses_legacy_arrival() {
+        let store = MemoryStore::default();
+        save_snapshot(&store, "[]", Utc::now()).unwrap();
+        assert_eq!(saved_provider_time(&store, "desktop").unwrap(), None);
+        let receipt = serde_json::json!({"session":"desktop-session","source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":[],"fetched_at":"2026-01-01 00:00:00","coverage":"complete"}});
+        save_owned_receipt(&store, "desktop", &receipt).unwrap();
+        assert_eq!(saved_provider_time(&store, "other-desktop").unwrap(), None);
+        let mut newer_list = receipt.clone();
+        newer_list["list"] = "reviewing".into();
+        newer_list["data"]["fetched_at"] = "2026-01-02T00:00:00Z".into();
+        save_owned_receipt(&store, "desktop", &newer_list).unwrap();
+        assert_eq!(
+            saved_provider_time(&store, "desktop").unwrap(),
+            Some("2026-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_arrays_never_rejuvenate_owned_provider_age() {
+        let yesterday = (Utc::now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let update = serde_json::json!({"session":"desktop", "source":{"provider":"github","host":"github.com"},
+            "list":"authored","owner":"alice","receipt_revision":1,"prs":[],
+            "last_received_at":yesterday,"coverage":"complete"}).to_string();
+        let r = rig(&[("source-poll-status", &update), ("prs-updated", "[]")]).await;
+        until(|| r.rec.last("prs-updated").is_some()).await;
+        assert_eq!(r.conn.report().last_poll, Some(yesterday.parse().unwrap()));
+        r.handle.stop();
+    }
+
     /// Poll until `cond` holds, or give up.
     ///
     /// The budget is deliberately far larger than the ~10ms these
@@ -799,7 +1116,10 @@ mod tests {
         let report = r.conn.report();
         assert_eq!(report.state, State::Connected);
         assert_eq!(report.protocol_version, Some(PROTOCOL_VERSION));
-        assert!(report.last_poll.is_some());
+        assert!(
+            report.last_poll.is_none(),
+            "ownerless opening arrays have no provider time"
+        );
         // The hello was filed with the desktop record it belongs to.
         pairing::save_desktops(
             r.store.as_ref(),

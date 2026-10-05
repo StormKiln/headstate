@@ -1,3 +1,4 @@
+import type { SourceSnapshot } from "./tauri";
 import type { PullRequest } from "../types/pr";
 
 export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
@@ -5,6 +6,8 @@ export type SourceCoverage = "complete" | "unknown" | { partial: { total: number
 export type SourceStatus = {
   source: { provider: string; host: string };
   list: "authored" | "reviewing";
+  owner?: string | null;
+  last_received_at?: string | null;
   phase: "not_requested" | "fetching" | "ready" | "partial" | "unknown" | "retrying" | "failed" | "not_asked";
   error: string | null;
   // Absent on older desktops. Their legacy array replies remain supported.
@@ -16,8 +19,9 @@ export type SourceStatus = {
   coverage?: SourceCoverage | null;
 };
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
+export type ProviderReceipt = { rows: PullRequest[]; session?: string; coverage?: SourceCoverage | null };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null };
+type Snapshot = { phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
@@ -36,7 +40,12 @@ export function receiptAdvisory(snapshot: Snapshot, kind: "total" | "missing"): 
 /// are ordered by desktop revision; a transport failure belongs to a particular
 /// local request and cannot be cleared by an unrelated background publication.
 export class SourceRefreshState {
+  private retained: { staleSecs: number | null; fetchedAt: string; savedOwner?: string } | undefined;
+  private providerReceipt = false;
+  private providerAt: string | undefined;
+  private retired = false;
   private value: Snapshot = { prs: undefined, error: null, modern: false };
+  private phase: string | undefined;
   private backendError: string | null = null;
   private legacyStatusError = false;
   private transportError: { id: string; message: string } | null = null;
@@ -50,9 +59,9 @@ export class SourceRefreshState {
   private order = 0;
   private requests = new Map<string, Request>();
   private listeners = new Set<() => void>();
-  private onProviderRows?: (rows: PullRequest[], session: string | undefined) => void;
+  private onProviderRows?: (receipt: ProviderReceipt) => void;
 
-  constructor(onProviderRows?: (rows: PullRequest[], session: string | undefined) => void) {
+  constructor(onProviderRows?: (receipt: ProviderReceipt) => void) {
     this.onProviderRows = onProviderRows;
   }
 
@@ -62,21 +71,28 @@ export class SourceRefreshState {
     return () => { this.listeners.delete(listener); };
   };
   private publish(prs = this.value.prs, fromProvider = false) {
-    this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage };
+    const providerAge = this.providerAt ? Math.max(0, Math.floor((Date.now() - Date.parse(this.providerAt)) / 1000)) : 0;
+    this.value = { phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
     for (const listener of this.listeners) listener();
     // Display patches and status-only publications are not provider evidence.
     // Deliver the accepted rows themselves, never a later patched snapshot.
-    if (fromProvider && prs !== undefined) this.onProviderRows?.(prs, this.session);
+    if (fromProvider && prs !== undefined) this.onProviderRows?.({ rows: prs, session: this.session, coverage: this.coverage });
   }
   start(id: string): Request {
     const request = { id, order: ++this.order, rows: this.rowEpoch, status: this.statusEpoch, completed: false, session: this.session };
     this.requests.set(id, request);
     return request;
   }
+  allowsOwnership(update: SourceStatus) {
+    if (this.retired || (update.session && this.retiredSessions.has(update.session))) return false;
+    return update.session !== this.session || update.revision === undefined || update.revision > this.revision;
+  }
   accept(update: SourceStatus) {
+    if (this.retired) return;
     const modern = update.session !== undefined && update.revision !== undefined;
     if (!modern) {
       if (this.session !== undefined) return;
+      this.phase = update.phase;
       if (update.phase !== "fetching") this.statusEpoch++;
       this.backendError = update.phase === "retrying" ? null : update.error;
       this.legacyStatusError = update.error !== null;
@@ -97,12 +113,16 @@ export class SourceRefreshState {
     }
     if (update.revision! > this.revision) {
       this.revision = update.revision!;
+      this.phase = update.phase;
       this.backendError = update.phase === "retrying" ? null : update.error;
       this.statusEpoch++;
     }
     let rows = this.value.prs;
     let fromProvider = false;
     if (update.prs != null && update.receipt_revision != null && update.receipt_revision > this.receiptRevision) {
+      this.retained = undefined;
+      this.providerReceipt = true;
+      this.providerAt = update.last_received_at ?? undefined;
       this.receiptRevision = update.receipt_revision;
       this.coverage = update.coverage ?? null;
       this.rowEpoch++;
@@ -112,7 +132,12 @@ export class SourceRefreshState {
     this.publish(rows, fromProvider);
   }
   legacyRows(prs: PullRequest[]) {
+    if (this.retired) return;
     if (this.session !== undefined) return;
+    this.retained = undefined;
+    this.providerReceipt = true;
+    this.providerAt = undefined;
+    this.phase = "ready";
     this.rowEpoch++;
     if (!this.legacyStatusError) this.backendError = null;
     this.publish(prs, true);
@@ -124,6 +149,7 @@ export class SourceRefreshState {
     this.publish();
   }
   resolve(request: Request, reply: RefreshReply) {
+    if (this.retired) return undefined;
     if (Array.isArray(reply)) {
       // Version skew: older desktops ignore requestId and return arrays.
       if (request.rows === this.rowEpoch) this.legacyRows(reply);
@@ -148,6 +174,7 @@ export class SourceRefreshState {
     this.publish(rows);
   }
   reject(request: Request, error: unknown) {
+    if (this.retired) return;
     // A matching terminal event proves the desktop already reported this
     // request's provider outcome. A later command rejection adds no outcome.
     const legacyOutcome = this.session === undefined && request.status !== this.statusEpoch;
@@ -156,6 +183,45 @@ export class SourceRefreshState {
     }
     this.requests.delete(request.id);
     this.publish();
+  }
+  seed(receipt: SourceSnapshot) {
+    if (this.retired || this.providerReceipt) return;
+    const ownership = receipt.ownership;
+    if (!ownership || !["live_verified", "credential_bound", "saved_desktop"].includes(ownership.state)) {
+      this.backendError = receipt.data.state === "withheld" ? receipt.data.reason : "The saved snapshot's account could not be verified. Refresh to verify it.";
+      this.publish();
+      return;
+    }
+    if (receipt.data.state !== "available") {
+      if (receipt.data.state === "withheld") this.backendError = receipt.data.reason;
+      this.publish();
+      return;
+    }
+    if (receipt.session && receipt.session !== this.session) {
+      if (this.retiredSessions.has(receipt.session)) return;
+      if (this.session) this.retiredSessions.add(this.session);
+      this.session = receipt.session;
+      this.revision = -1;
+      this.receiptRevision = -1;
+    }
+    this.coverage = receipt.data.coverage;
+    this.retained = { staleSecs: receipt.data.stale_secs, fetchedAt: receipt.data.fetched_at,
+      savedOwner: ownership.state === "saved_desktop" ? ownership.owner : undefined };
+    // Disk replay is readable inventory, never a fresh detail/action observation.
+    const rows = receipt.data.prs.map(pr => ({ ...pr, observation: {
+      ...(pr.observation ?? { last_observed_at: null, unknown_fields: [], retained_fields: [] }),
+      state: "retained" as const,
+    } }));
+    this.publish(rows);
+  }
+  retire() {
+    this.retired = true;
+    this.requests.clear();
+    this.coverage = undefined;
+    this.transportError = null;
+    this.backendError = null;
+    this.value = { prs: undefined, error: null, modern: false };
+    for (const listener of this.listeners) listener();
   }
   dismiss() {
     this.transportError = null;

@@ -1,6 +1,10 @@
 //! Durable, bounded search continuations (#1626). A dense day previously
 //! repeated its first page forever. Attempts also rotate dates within a scope.
-use super::{pr_history, pr_slice, settings, StoreError};
+use super::{
+    pr_history, pr_slice,
+    stats_owner::{self, StatsOwner},
+    StoreError,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,8 @@ const CAP: usize = crate::github::stats::slice::SEARCH_CAP as usize;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Page {
     version: u32,
+    #[serde(default)]
+    revision: i64,
     pub day: String,
     pub after: Option<String>,
     total: Option<u64>,
@@ -22,6 +28,7 @@ impl Page {
     fn new(day: String) -> Self {
         Self {
             version: VERSION,
+            revision: 0,
             day,
             after: None,
             total: None,
@@ -31,48 +38,19 @@ impl Page {
     }
 }
 
-fn identity(conn: &Connection, viewer: &str) -> Result<(), String> {
-    let current: Option<String> =
-        settings::get(conn, settings::keys::STATS_VIEWER).map_err(|e| e.to_string())?;
-    if current.as_deref() != Some(viewer) {
-        return Err("stats account changed; discarded background page".into());
-    }
-    Ok(())
-}
-
 /// Reservations commit before network work: cancellation/failure still yields
-/// to other dates. The only worker is sequential; history is never claimed here.
-pub fn select(
-    conn: &mut Connection,
-    viewer: &str,
+/// to other dates. This selects work without claiming history coverage.
+pub fn select_in(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &StatsOwner,
     key: &str,
     dates: &[String],
     limit: usize,
 ) -> Result<Vec<Page>, String> {
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    identity(&tx, viewer)?;
-    // Retain only this scope's still-uncovered dates. Old horizons and
-    // days completed by the foreground do not accumulate orphan cursors.
-    let old_days: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT day FROM pr_backfill_page WHERE viewer=?1 AND scope_key=?2")
-            .map_err(|e| e.to_string())?;
-        let days = stmt
-            .query_map(params![viewer, key], |r| r.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        days
-    };
-    for day in old_days {
-        if !dates.contains(&day) {
-            tx.execute(
-                "DELETE FROM pr_backfill_page WHERE viewer=?1 AND scope_key=?2 AND day=?3",
-                params![viewer, key, day],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
+    stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
+    let viewer = owner.viewer();
+    // A narrower live horizon is not permission to discard stored progress.
+    let revision = super::pr_scope_evidence::reserve(tx, key)?;
     let mut candidates = Vec::new();
     for day in dates {
         let row: Option<(String, i64)> = tx.query_row(
@@ -110,33 +88,40 @@ pub fn select(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    let selected: Vec<Page> = candidates.into_iter().take(limit).map(|(_, p)| p).collect();
+    let selected: Vec<Page> = candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, mut p)| {
+            p.revision = revision;
+            p
+        })
+        .collect();
     for page in &selected {
         let payload = serde_json::to_string(page).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO pr_backfill_page(viewer,scope_key,day,payload,attempted) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(viewer,scope_key,day) DO UPDATE SET payload=excluded.payload,attempted=excluded.attempted",params![viewer,key,page.day,payload,order]).map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(selected)
 }
 
 /// Persist usable rows even when the page cannot support a cursor/coverage
 /// claim. Each returned bool says whether this page's contract was sound.
-pub fn commit(
-    conn: &mut Connection,
-    viewer: &str,
+pub fn commit_in(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &StatsOwner,
     key: &str,
     pages: &[Page],
     map: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<(usize, bool), String> {
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    identity(&tx, viewer)?;
+    stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
+    let viewer = owner.viewer();
     let mut written = 0;
     let mut valid = true;
     for (i, previous) in pages.iter().enumerate() {
+        super::pr_scope_evidence::require(tx, key, previous.revision)?;
         // A foreground load may have completed this day while we fetched it.
-        let coverage = pr_slice::coverage(&tx, key, &previous.day, &previous.day)
-            .map_err(|e| e.to_string())?;
+        let coverage =
+            pr_slice::coverage(tx, key, &previous.day, &previous.day).map_err(|e| e.to_string())?;
         if coverage.days_covered() == 1 && !coverage.partial {
             continue;
         }
@@ -152,7 +137,7 @@ pub fn commit(
         let slices =
             crate::github::stats::backfill::day_slices(std::slice::from_ref(&previous.day));
         let rows = crate::github::stats::Board::retrieved_prs(&one, &slices);
-        written += pr_history::put_many_in(&tx, key, &previous.day, &previous.day, &rows, now)
+        written += pr_history::put_many_in(tx, key, &previous.day, &previous.day, &rows, now)
             .map_err(|e| e.to_string())?;
         let mut page = previous.clone();
         let count = alias["issueCount"].as_u64();
@@ -202,7 +187,7 @@ pub fn commit(
                 pr_slice::SliceState::Refused
             };
             pr_slice::put(
-                &tx,
+                tx,
                 key,
                 &pr_slice::SliceRow {
                     from: page.day.clone(),
@@ -219,7 +204,7 @@ pub fn commit(
                 // Remove obsolete observations from a discarded pass only
                 // once a full current pass proves the day's membership.
                 if !capped {
-                    for old in pr_history::load(&tx, key, &page.day, &page.day)
+                    for old in pr_history::load(tx, key, &page.day, &page.day)
                         .map_err(|e| e.to_string())?
                     {
                         if !page.ids.contains(&(old.repo.clone(), old.number)) {
@@ -251,8 +236,45 @@ pub fn commit(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok((written, valid))
+}
+
+#[cfg(test)]
+fn select(
+    conn: &mut Connection,
+    viewer: &str,
+    key: &str,
+    dates: &[String],
+    limit: usize,
+) -> Result<Vec<Page>, String> {
+    let owner = stats_owner::current_for_verified(conn, viewer)
+        .map_err(|e| e.to_string())?
+        .ok_or("stats account changed")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let pages = select_in(&tx, &owner, key, dates, limit)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(pages)
+}
+#[cfg(test)]
+fn commit(
+    conn: &mut Connection,
+    viewer: &str,
+    key: &str,
+    pages: &[Page],
+    map: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<(usize, bool), String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let owner = stats_owner::current_for_verified(&tx, viewer)
+        .map_err(|e| e.to_string())?
+        .ok_or("stats account changed")?;
+    let result = commit_in(&tx, &owner, key, pages, map, now)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 
 fn valid_node(n: &serde_json::Value, day: &str) -> bool {
@@ -288,7 +310,7 @@ mod tests {
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
-        settings::set(&conn, settings::keys::STATS_VIEWER, &"a").unwrap();
+        stats_owner::capture_verified(&conn, "a").unwrap();
         conn
     }
     fn page() -> serde_json::Value {
@@ -297,6 +319,35 @@ mod tests {
             "createdAt":"2026-09-01T00:00:00Z","mergedAt":"2026-09-01T01:00:00Z","additions":1,"deletions":0,"changedFiles":1,"reviews":{"totalCount":0}
         }]}})
     }
+    #[test]
+    fn superseded_reservation_cannot_publish_history_or_coverage() {
+        let mut conn = db();
+        let dates = vec!["2026-09-01".into()];
+        let stale = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        let _newer = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        let result = commit(&mut conn, "a", "fixture", &stale, &page(), Utc::now());
+        assert!(
+            result.is_err(),
+            "a dispatched page must retain its reservation authority"
+        );
+        assert_eq!(pr_history::total_rows(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn narrowing_the_horizon_preserves_unrequested_continuations() {
+        let mut conn = db();
+        let dates = vec!["2026-09-01".into()];
+        let pages = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        commit(&mut conn, "a", "fixture", &pages, &page(), Utc::now()).unwrap();
+        select(&mut conn, "a", "fixture", &["2026-09-02".into()], 1).unwrap();
+        assert_eq!(
+            select(&mut conn, "a", "fixture", &dates, 1).unwrap()[0]
+                .after
+                .as_deref(),
+            Some("next")
+        );
+    }
+
     #[test]
     fn dense_pages_roll_back_history_cursor_and_ledger_together() {
         let mut conn = db();

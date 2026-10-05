@@ -234,6 +234,9 @@ pub struct DiagnosticBundle {
     pub graphql_remaining: Option<u64>,
     /// REST (core) requests left this hour, as last reported.
     pub rest_remaining: Option<u64>,
+    /// Account-owned evidence captured after local probes. Absent without a client.
+    #[serde(default)]
+    pub admission: Option<crate::github::admission::AdmissionSnapshot>,
     /// Whether `[diag]` lines are being written right now.
     pub diagnostics_on: bool,
     /// The log's last lines, redacted, when diagnostics are on.
@@ -286,6 +289,7 @@ pub async fn bundle(
     app_version: String,
     focused_interval_secs: Option<u64>,
     log_file: Option<std::path::PathBuf>,
+    admission: impl FnOnce() -> Option<crate::github::admission::AdmissionSnapshot>,
 ) -> DiagnosticBundle {
     let os = std::env::consts::OS;
     let exe = std::env::current_exe().ok();
@@ -303,6 +307,7 @@ pub async fn bundle(
     })
     .await
     .unwrap_or_else(|e| (None, Some(format!("the log could not be read: {e}")), None));
+    let admission = admission();
     DiagnosticBundle {
         app_version,
         os: os.to_string(),
@@ -312,8 +317,9 @@ pub async fn bundle(
         gh_version,
         gh_note,
         poll: poll_report(focused_interval_secs),
-        graphql_remaining: crate::github::stats::budget::observed_remaining(),
-        rest_remaining: crate::github::stats::budget::observed_rest_remaining(),
+        graphql_remaining: admission.as_ref().and_then(|a| a.graphql.remaining),
+        rest_remaining: admission.as_ref().and_then(|a| a.rest.remaining),
+        admission,
         diagnostics_on,
         log_tail,
         log_note,

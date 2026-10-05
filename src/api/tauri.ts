@@ -112,10 +112,13 @@ export const getCached = () => call<PullRequest[]>("get_cached");
 export type SourceList = "authored" | "reviewing";
 export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
 export type SourceSnapshot = {
+  session?: string | null;
   source: Source;
   list: SourceList;
+  ownership?: { state: "live_verified" | "credential_bound"; owner: string } | { state: "unverified" | "different_account" } | { state: "saved_desktop"; owner: string; desktop: string };
   data:
     | { state: "missing" | "unreadable" }
+    | { state: "withheld"; reason: string }
     | { state: "available"; prs: PullRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage }
     | { state: "git_lab_available"; mrs: MergeRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage };
 };
@@ -409,6 +412,10 @@ export const statsBoard = (
   days: number,
 ) => call<StatsBoard>("stats_board", { scopeKind, scopeValue, measure, days });
 
+/** Never falls back to the provider-loading command on an older backend. */
+export const statsBoardCached = (scopeKind: string, scopeValue: string | undefined, measure: "merged" | "opened", days: number, expectedOwner: import("../types/pr").StatsOwner) =>
+  call<import("../types/pr").StatsBoardReadback>("stats_board_cached", { scopeKind, scopeValue, measure, days, expectedOwner });
+
 /// The scoped daily opened/merged series (#826).
 ///
 /// The cheap half of a scope page: count-only searches, no per-PR nodes, so
@@ -462,7 +469,8 @@ export const statsReviewers = (
   scopeValue: string | undefined,
   days: number,
   logins: string[],
-) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins });
+  refresh?: boolean,
+) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins, ...(refresh === undefined ? {} : { refresh }) });
 
 /// Repos and their worktrees, WITHOUT safety classification, and what the
 /// walk could not read.
@@ -2283,7 +2291,7 @@ export const gitLabAction = (request: import("../types/gitlabActions").GitLabAct
 /// Bounded metadata-only stack lookups for Ready rows (#1602).
 export type StackAsk = PrIdentity & { head_oid?: string; base_ref?: string };
 export const getReadyStacks = (rows: StackAsk[]) =>
-  call<(PrIdentity & { stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number; last_known_stack?: { value: PrStack; age_ms: number } })[]>("get_ready_stacks", { rows });
+  call<(PrIdentity & { advisory_progress?: import("../types/pr").AdvisoryProgress; stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number; last_known_stack?: { value: PrStack; age_ms: number } })[]>("get_ready_stacks", { rows });
 
 /** Desktop notification clicks wait here until the app shell mounts. */
 export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");
@@ -2297,3 +2305,9 @@ export function saveMarkdown(markdown: string): Promise<ExportOutcome> {
   }
   return call<ExportOutcome>('save_markdown', {markdown});
 }
+
+export type StatsDemandRequest =
+  | { op: "acquire"; scopeKind: string; scopeValue?: string; measure: "merged" | "opened"; days: number }
+  | { op: "renew" | "release"; handle: string; sequence: number };
+export interface StatsDemandReceipt { handle: string; owner: import("../types/pr").StatsOwner }
+export const statsDemand = (request: StatsDemandRequest) => call<StatsDemandReceipt>("stats_demand", { request });

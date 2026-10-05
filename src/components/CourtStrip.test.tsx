@@ -5,6 +5,8 @@ import type { PullRequest } from "@/types/pr";
 
 afterEach(cleanup);
 
+const complete = { authored: { status: "available", coverage: "complete" }, reviewing: { status: "available", coverage: "complete" } } as const;
+
 const pr = (over: Partial<PullRequest> = {}) =>
   ({
     repo: "octocat/api",
@@ -24,27 +26,27 @@ const pr = (over: Partial<PullRequest> = {}) =>
 /// is computed from it -- so the glance surface should say it plainly.
 describe("CourtStrip", () => {
   it("states the all-clear confidently, not as a footnote", () => {
-    render(<CourtStrip authored={[pr()]} reviewing={[]} onSelect={vi.fn()} />);
+    render(<CourtStrip availability={complete} authored={[pr()]} reviewing={[]} onSelect={vi.fn()} />);
     expect(screen.getByText(/nothing needs your attention/i)).toBeTruthy();
   });
 
   // The counts are the context that makes an all-clear trustworthy: "0
   // of nothing" and "0 of 24" feel very different to a reader.
   it("still says what it looked at when all is clear", () => {
-    render(<CourtStrip authored={[pr(), pr({ number: 2 })]} reviewing={[]} onSelect={vi.fn()} />);
+    render(<CourtStrip availability={complete} authored={[pr(), pr({ number: 2 })]} reviewing={[]} onSelect={vi.fn()} />);
     expect(screen.getByText(/2 open/i)).toBeTruthy();
   });
 
   it("counts what is in my court", () => {
     render(
-      <CourtStrip authored={[pr({ ci: "failure" })]} reviewing={[]} onSelect={vi.fn()} />,
+      <CourtStrip availability={complete} authored={[pr({ ci: "failure" })]} reviewing={[]} onSelect={vi.fn()} />,
     );
     expect(screen.getByText(/1 needs you/i)).toBeTruthy();
   });
 
   it("counts what is waiting on someone else separately", () => {
     render(
-      <CourtStrip
+      <CourtStrip availability={complete}
         authored={[pr({ review: "review_required" })]}
         reviewing={[]}
         onSelect={vi.fn()}
@@ -59,7 +61,7 @@ describe("CourtStrip", () => {
   // going wrong rather than a deliberate exclusion.
   it("names the total, so the gap is legible rather than suspicious", () => {
     render(
-      <CourtStrip
+      <CourtStrip availability={complete}
         authored={[
           pr({ ci: "failure" }),
           pr({ number: 2, review: "review_required" }),
@@ -77,14 +79,14 @@ describe("CourtStrip", () => {
 
   it("opens the list scoped to my court when clicked", () => {
     const onSelect = vi.fn();
-    render(<CourtStrip authored={[pr({ ci: "failure" })]} reviewing={[]} onSelect={onSelect} />);
+    render(<CourtStrip availability={complete} authored={[pr({ ci: "failure" })]} reviewing={[]} onSelect={onSelect} />);
     fireEvent.click(screen.getByRole("button", { name: /needs you/i }));
     expect(onSelect).toHaveBeenCalledWith("mine");
   });
 
   // A card that cannot be acted on is decoration.
   it("does not offer a click when the count is zero", () => {
-    render(<CourtStrip authored={[pr()]} reviewing={[]} onSelect={vi.fn()} />);
+    render(<CourtStrip availability={complete} authored={[pr()]} reviewing={[]} onSelect={vi.fn()} />);
     expect(screen.queryByRole("button", { name: /needs you/i })).toBeNull();
   });
 
@@ -95,7 +97,7 @@ describe("CourtStrip", () => {
   /// numbers in one sentence.
   it("counts both lists in the denominator, not just the authored one", () => {
     render(
-      <CourtStrip
+      <CourtStrip availability={complete}
         authored={[pr({ number: 1, ci: "failure" })]}
         reviewing={[pr({ number: 2, repo: "o/other" }), pr({ number: 3, repo: "o/other" })]}
         onSelect={vi.fn()}
@@ -112,8 +114,16 @@ describe("CourtStrip", () => {
   it("does not double-count a pull request present in both lists", () => {
     const shared = pr({ number: 7, repo: "o/r", ci: "failure" });
     render(
-      <CourtStrip authored={[shared]} reviewing={[shared]} onSelect={vi.fn()} />,
+      <CourtStrip availability={complete} authored={[shared]} reviewing={[shared]} onSelect={vi.fn()} />,
     );
     expect(screen.getByText("of 1 open")).toBeTruthy();
   });
+});
+
+
+it.each(["pending", "failed", "retained", "unknown", "partial"] as const)("qualifies %s inventory while preserving useful attention", state => {
+  const unavailable = { status: state === "pending" || state === "failed" ? state : "available" as const, coverage: state === "unknown" ? "unknown" as const : state === "partial" ? { partial: { total: null } } : "complete" as const, retained: state === "retained" };
+  render(<CourtStrip availability={{ authored: complete.authored, reviewing: unavailable }} authored={[pr({ ci: "failure" })]} reviewing={[]} onSelect={vi.fn()} />);
+  expect(screen.getByRole("button", { name: "1 needs you" })).toBeTruthy();
+  expect(screen.getByText("of 1 known open · completeness is unconfirmed")).toBeTruthy();
 });

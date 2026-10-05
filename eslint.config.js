@@ -27,6 +27,7 @@ export default tseslint.config(
       "dist",
       "dist-harness",
       "dist-harness-worktrees",
+      "dist-harness-enterprise",
       "src-tauri/target",
       "src-mobile/target",
       "src-mobile/gen/apple/build",

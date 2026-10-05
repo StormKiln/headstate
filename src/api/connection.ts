@@ -1,3 +1,4 @@
+import { retireSourceOwnership } from "./sourceRefreshHooks";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { call, listen, type UnlistenFn } from "./transport";
@@ -175,6 +176,11 @@ function useRemoteConnectionState(): ConnectionState {
         // Written straight into the cache rather than held in component
         // state: the query is the single source for this value, and two
         // copies would disagree the moment a poll landed between events.
+        if (["unpaired", "revoked"].includes(e.payload.state)) {
+          retireSourceOwnership(client);
+          void client.cancelQueries();
+          client.removeQueries({ predicate: query => query.queryKey[0] !== "connection-state" });
+        }
         client.setQueryData(["connection-state"], e.payload);
       }).then(
         (off) => {

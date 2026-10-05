@@ -1,11 +1,12 @@
 import { useEffect, useReducer, useSyncExternalStore } from "react";
 import type { QueryClient } from "@tanstack/react-query";
+import { retireAdvisoryDispatch } from "./advisoryDispatch";
 
 export interface Evidence<T> { value: T; expiresAt: number; observedAt: number }
 export interface DisplayEvidence<T> { value: T; freshness: "fresh" | "retained"; observedAt: number }
 // Capacity, not elapsed browsing time, bounds retained display memory.
 export const advisoryGcTime = Infinity;
-const isAdvisory = (key: readonly unknown[]) => key[0] === "ready-stack" || key[0] === "ready-pushers";
+const isAdvisory = (key: readonly unknown[]) => key[0] === "ready-stack" || key[0] === "ready-pushers" || key[0] === "review-gates";
 
 // Only session control lives outside query state. Query reset/removal owns all
 // evidence, including last successes. A login round trip is a new generation.
@@ -21,6 +22,7 @@ function createSession(qc: QueryClient) {
       if (next !== owner || reset || event.type === "removed") {
         owner = next;
         generation++;
+        retireAdvisoryDispatch(qc);
         qc.removeQueries({ predicate: query => isAdvisory(query.queryKey) });
         for (const listener of listeners) listener();
       }

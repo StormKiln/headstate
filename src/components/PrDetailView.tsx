@@ -218,6 +218,7 @@ function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
 /// is for deciding and acting; reviewing code belongs in GitHub or an
 /// editor, and the header's GitHub link covers the rest.
 export function PrDetailView({
+  localTools = true,
   repo,
   number,
   onBack,
@@ -225,6 +226,7 @@ export function PrDetailView({
   repo: string;
   number: number;
   onBack: () => void;
+  localTools?: boolean;
 }) {
   // `isPlaceholderData` is true while this is the clicked row's own data
   // standing in for the fetch (#790). `isLoading` is false in that state
@@ -256,7 +258,12 @@ export function PrDetailView({
   // The base branch's review rules (#1451, #1454). Undefined while pending
   // and when unreadable alike -- both render nothing new -- so `gate` is
   // all-null until a rule is actually READ.
-  const { data: gates } = useReviewGates(pr, isPlaceholderData);
+  const gateQuery = useReviewGates(pr, isPlaceholderData);
+  const gates = gateQuery.data;
+  const refreshDetail = () => Promise.all([
+    refetch({ cancelRefetch: false }),
+    ...(matchingFull ? [gateQuery.refetch({ cancelRefetch: false })] : []),
+  ]);
   const gate = pr
     ? gateVerdict(gates, pr, viewer, isPlaceholderData)
     : { approveWontCount: null, approveCaveat: null, mergeBlocked: null };
@@ -370,7 +377,7 @@ export function PrDetailView({
         <QueryError
           title="Could not load this pull request"
           message={errorMessage(error)}
-          onRetry={() => void refetch()}
+          onRetry={() => void refreshDetail()}
         />
       </div>
     );
@@ -398,6 +405,8 @@ export function PrDetailView({
   /// place the same elements rather than two copies that drift.
   const pinnedActions = (
     <>
+      <button type="button" onClick={() => void refreshDetail()} disabled={isFetching || gateQuery.isFetching}
+        className="rounded border border-[#30363d] px-2.5 py-1 text-sm disabled:opacity-50">Refresh</button>
       {/* The two the user actually reaches for, in the order they
           reach for them. Approve is absent: it needs the comment box
           that only makes sense in the body, and a bare approve
@@ -458,7 +467,7 @@ export function PrDetailView({
 
           `compact` on the desktop's one-line bar only; the phone's
           second line wraps, so it has room for the full reason. */}
-      {!isError && <PrClaudifyButton pr={pr} compact={!isMobile} />}
+      {localTools && !isError && <PrClaudifyButton pr={pr} compact={!isMobile} />}
     </>
   );
 
@@ -473,7 +482,7 @@ export function PrDetailView({
         <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
         <p>Reviews use the loaded commit shown here. Refresh before merging or other actions, or open GitHub for the current state.</p>
-        <button type="button" disabled={isFetching} onClick={() => void refetch({ cancelRefetch: false })}
+        <button type="button" disabled={isFetching} onClick={() => void refreshDetail()}
           className="tap-target mt-2 rounded border border-[#30363d] px-3 py-1.5 disabled:opacity-50">
           {isFetching ? "Refreshing…" : "Retry refresh"}
         </button>

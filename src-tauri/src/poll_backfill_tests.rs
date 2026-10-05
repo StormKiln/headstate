@@ -20,6 +20,7 @@ struct Rig {
     server: wiremock::MockServer,
     client: Arc<GitHubClient>,
     fault: Arc<Mutex<String>>,
+    demand: Arc<crate::stats_demand::Registry>,
     from: String,
     to: String,
 }
@@ -62,6 +63,7 @@ impl Rig {
                     "cursor-number" => page["pageInfo"]["endCursor"] = json!(120),
                     "duplicate" if after>0 => page["nodes"][0]["number"] = json!(base+1),
                     "short-terminal" => page["pageInfo"]["hasNextPage"] = json!(false),
+                    "corrected-short-terminal" => { page["pageInfo"]["hasNextPage"] = json!(false); page["nodes"][0]["additions"] = json!(9); },
                     "bad-node" => {page["nodes"][0].as_object_mut().unwrap().remove("number");},
                     _ => {},
                 }
@@ -86,12 +88,7 @@ impl Rig {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("worker.db");
         let conn = crate::store::open_db(&db).unwrap();
-        crate::store::settings::set(
-            &conn,
-            crate::store::settings::keys::STATS_VIEWER,
-            &"fixture-viewer",
-        )
-        .unwrap();
+        crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
         let (from, to) = bf::horizon_window(chrono::Utc::now(), days).unwrap();
         let rig = Self {
             _dir: dir,
@@ -99,6 +96,7 @@ impl Rig {
             server,
             client,
             fault,
+            demand: Arc::new(crate::stats_demand::Registry::default()),
             from,
             to,
         };
@@ -119,12 +117,37 @@ impl Rig {
             chrono::Utc::now(),
         )
         .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+            .unwrap()
+            .unwrap();
+        self.demand
+            .acquire(
+                &tx,
+                &owner,
+                &crate::remote::context::DispatchContext::desktop(),
+                crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: format!("merged|*|org:{org}"),
+                    scope_kind: "org".into(),
+                    scope_value: org.into(),
+                    measure: "merged".into(),
+                    horizon_days: days,
+                },
+                std::time::Instant::now(),
+                true,
+            )
+            .unwrap();
+        tx.commit().unwrap();
     }
     fn fault(&self, f: &str) {
         *self.fault.lock().unwrap() = f.into();
     }
     async fn tick(&self) -> bf::TickOutcome {
-        backfill_tick(self.db.clone(), &self.client).await.outcome
+        backfill_tick(self.db.clone(), &self.client, self.demand.clone())
+            .await
+            .outcome
     }
     fn count(&self) -> u64 {
         crate::store::pr_history::count(
@@ -170,7 +193,7 @@ fn dense_backfill_bad_pages_never_complete_and_recover() {
                 r.tick().await;
             }
             assert!(
-                matches!(r.tick().await, bf::TickOutcome::Complete),
+                matches!(r.tick().await, bf::TickOutcome::NoScope),
                 "{fault}"
             );
             assert_eq!(r.count(), 120);
@@ -195,7 +218,7 @@ fn dense_backfill_reordered_or_changed_pages_restart_without_false_counts() {
                 r.tick().await;
             }
             assert!(
-                matches!(r.tick().await, bf::TickOutcome::Complete),
+                matches!(r.tick().await, bf::TickOutcome::NoScope),
                 "{fault}"
             );
             assert_eq!(r.count(), 120);
@@ -221,6 +244,13 @@ fn dense_backfill_dates_and_scopes_get_turns() {
         );
         r.register("other", 1);
         r.tick().await;
+        // A new scope joins behind already waiting demand instead of resetting
+        // priority to zero. With two eligible scopes its bound is two turns.
+        assert_eq!(
+            crate::store::pr_history::count(&conn, "merged|*|org:other", &r.to, &r.to).unwrap(),
+            0
+        );
+        r.tick().await;
         assert_eq!(
             crate::store::pr_history::count(&conn, "merged|*|org:other", &r.to, &r.to).unwrap(),
             50
@@ -238,7 +268,7 @@ fn dense_backfill_search_cap_is_stalled_not_converged() {
         }
         assert_eq!(r.count(), 1000);
         let requests = r.server.received_requests().await.unwrap().len();
-        assert!(matches!(r.tick().await, bf::TickOutcome::Failed(_)));
+        assert!(matches!(r.tick().await, bf::TickOutcome::NoScope));
         assert_eq!(r.server.received_requests().await.unwrap().len(), requests);
     });
 }
@@ -251,7 +281,8 @@ fn dense_backfill_account_switch_discards_inflight_page() {
         r.fault("delay");
         let db = r.db.clone();
         let client = r.client.clone();
-        let task = tokio::spawn(async move { backfill_tick(db, &client).await });
+        let demand = r.demand.clone();
+        let task = tokio::spawn(async move { backfill_tick(db, &client, demand).await });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while r.server.received_requests().await.unwrap().len() < 2 {
                 tokio::task::yield_now().await;
@@ -260,12 +291,7 @@ fn dense_backfill_account_switch_discards_inflight_page() {
         .await
         .unwrap();
         let conn = crate::store::open_db(&r.db).unwrap();
-        crate::store::settings::set(
-            &conn,
-            crate::store::settings::keys::STATS_VIEWER,
-            &"other-viewer",
-        )
-        .unwrap();
+        crate::store::stats_owner::capture_verified(&conn, "other-viewer").unwrap();
         crate::store::pr_backfill_page::clear(&conn).unwrap();
         assert!(matches!(
             task.await.unwrap().outcome,
@@ -351,7 +377,8 @@ fn dense_backfill_cancellation_keeps_the_last_committed_cursor() {
         let before = r.server.received_requests().await.unwrap().len();
         let db = r.db.clone();
         let client = r.client.clone();
-        let task = tokio::spawn(async move { backfill_tick(db, &client).await });
+        let demand = r.demand.clone();
+        let task = tokio::spawn(async move { backfill_tick(db, &client, demand).await });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while r.server.received_requests().await.unwrap().len() == before {
                 tokio::task::yield_now().await;
@@ -410,5 +437,204 @@ fn dense_backfill_terminal_cursor_must_be_fresh_and_present() {
         let empty = Rig::new(0, 1).await;
         empty.fault("missing-cursor"); // GraphQL legitimately returns null for an empty result.
         assert!(matches!(empty.tick().await, bf::TickOutcome::Complete));
+    });
+}
+
+#[test]
+fn evicted_150_row_day_refills_in_three_real_provider_pages_after_reopen() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(150, 1).await;
+        for expected in [50, 100, 150] {
+            r.tick().await;
+            assert_eq!(r.count(), expected);
+        }
+        let conn = crate::store::open_db(&r.db).unwrap();
+        conn.execute("UPDATE pr_history SET stored_at='1900-01-01'", [])
+            .unwrap();
+        conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<199851)
+            INSERT INTO pr_history(scope_key,slice_from,slice_to,repo,number,merged_at,title,url,author,cycle_time_hours,size,additions,deletions,changed_files,reviews_received,stored_at)
+            SELECT 'unrelated','2026-01-01','2026-01-31','fixture/padding',x,'2026-01-15','fixture','https://example.test/pr','fixture',1,1,1,0,1,0,'2026-01-01' FROM n;").unwrap();
+        assert_eq!(crate::store::pr_history::total_rows(&conn).unwrap(), 200001);
+        conn.execute_batch("CREATE TRIGGER refuse_eviction BEFORE UPDATE ON pr_scope_evidence BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END;").unwrap();
+        assert!(crate::store::pr_history::prune(&conn).is_err());
+        assert_eq!(r.count(), 150);
+        assert_eq!(crate::store::pr_history::total_rows(&conn).unwrap(), 200001);
+        conn.execute_batch("DROP TRIGGER refuse_eviction;").unwrap();
+        assert_eq!(crate::store::pr_history::prune(&conn).unwrap(), 20001);
+        drop(conn);
+        assert_eq!(r.count(), 0);
+        let conn = crate::store::open_db(&r.db).unwrap();
+        assert_eq!(
+            crate::store::pr_slice::uncovered_days(&conn, "merged|*|org:fixture", &r.from, &r.to)
+                .unwrap(),
+            vec![r.from.clone()]
+        );
+        assert_eq!(
+            crate::store::pr_history::count(&conn, "unrelated", "2026-01-01", "2026-01-31")
+                .unwrap(),
+            180000
+        );
+        let before = r.server.received_requests().await.unwrap().len();
+        for expected in [50, 100, 150] {
+            r.tick().await;
+            assert_eq!(r.count(), expected);
+        }
+        assert_eq!(
+            r.server.received_requests().await.unwrap().len(),
+            before + 3
+        );
+        assert!(crate::store::pr_slice::uncovered_days(
+            &conn,
+            "merged|*|org:fixture",
+            &r.from,
+            &r.to
+        )
+        .unwrap()
+        .is_empty());
+    });
+}
+
+#[test]
+fn a_page_dispatched_before_pruning_cannot_restore_coverage_after_reopen() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(150, 1).await;
+        r.tick().await;
+        r.tick().await;
+        assert_eq!(r.count(), 100);
+        let key = "merged|*|org:fixture";
+        let (owner, pages) = {
+            let mut conn = crate::store::open_db(&r.db).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                .unwrap()
+                .unwrap();
+            let pages = crate::store::pr_backfill_page::select_in(
+                &tx,
+                &owner,
+                key,
+                std::slice::from_ref(&r.from),
+                1,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (owner, pages)
+        };
+        let query = bf::query_for("org", "fixture", "merged").unwrap();
+        let slices = bf::day_slices(std::slice::from_ref(&r.from));
+        let fetched = crate::github::stats::fetch::load_backfill_pages(
+            &r.client,
+            &query,
+            &slices,
+            &[pages[0].after.clone()],
+            &r.client.request_budget(),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = crate::store::open_db(&r.db).unwrap();
+            conn.execute("UPDATE pr_history SET stored_at='1900-01-01'", [])
+                .unwrap();
+            conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<199901)
+                INSERT INTO pr_history(scope_key,slice_from,slice_to,repo,number,merged_at,title,url,author,cycle_time_hours,size,additions,deletions,changed_files,reviews_received,stored_at)
+                SELECT 'padding','2026-01-01','2026-01-31','fixture/padding',x,'2026-01-15','fixture','https://example.test/pr','fixture',1,1,1,0,1,0,'2026-01-01' FROM n;").unwrap();
+            crate::store::pr_history::prune(&conn).unwrap();
+        }
+        let mut conn = crate::store::open_db(&r.db).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(crate::store::pr_backfill_page::commit_in(
+            &tx,
+            &owner,
+            key,
+            &pages,
+            &fetched,
+            chrono::Utc::now()
+        )
+        .is_err());
+        tx.rollback().unwrap();
+        assert_eq!(r.count(), 0);
+        for expected in [50, 100, 150] {
+            r.tick().await;
+            assert_eq!(r.count(), expected);
+        }
+    });
+}
+
+#[test]
+fn committed_partial_tick_invalidates_stored_measurements_but_refused_admission_does_not() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("bad-node");
+        let partial = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(partial.outcome, bf::TickOutcome::Failed(_)));
+        assert!(
+            r.count() > 0,
+            "usable members of a refused page were committed"
+        );
+        assert!(
+            partial.cache_changed,
+            "failed outcome must not hide committed usable rows"
+        );
+        let idle = backfill_tick(
+            r.db.clone(),
+            &r.client,
+            Arc::new(crate::stats_demand::Registry::default()),
+        )
+        .await;
+        assert!(
+            !idle.cache_changed,
+            "no-demand admission cannot claim durable progress"
+        );
+    });
+}
+
+#[test]
+fn an_unusable_page_only_resets_continuation_and_does_not_dirty_board_data() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("missing-alias");
+        let tick = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(tick.outcome, bf::TickOutcome::Failed(_)));
+        assert_eq!(r.count(), 0);
+        assert!(
+            !tick.cache_changed,
+            "continuation bookkeeping is not a materialized board change"
+        );
+    });
+}
+
+#[test]
+fn same_population_correction_commits_and_invalidates_even_with_failed_coverage() {
+    let _observed = budget::observed_test_lock();
+    let _restore = budget::RestoreObserved::capture();
+    run(|| async {
+        let r = Rig::new(120, 1).await;
+        r.fault("short-terminal");
+        r.tick().await;
+        assert_eq!(r.count(), 50);
+        r.fault("corrected-short-terminal");
+        let tick = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
+        assert!(matches!(tick.outcome, bf::TickOutcome::Failed(_)));
+        assert!(tick.cache_changed);
+        assert_eq!(r.count(), 50, "count alone cannot detect a corrected row");
+        let rows = crate::store::pr_history::load(
+            &crate::store::open_db(&r.db).unwrap(),
+            "merged|*|org:fixture",
+            &r.from,
+            &r.to,
+        )
+        .unwrap();
+        assert!(rows.iter().any(|row| row.additions == 9));
     });
 }

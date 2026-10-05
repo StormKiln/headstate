@@ -153,7 +153,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // uses it: two early returns sit between, and a hook after one of them
   // runs in a different order on the renders that take it. React's own
   // lint caught this; the caveat reads the value a hundred lines below.
-  const liveFrame = useStatsBackfill(boardQ.data?.scopeKey);
+  const registration = boardQ.data?.backfill;
+  const liveFrame = useStatsBackfill(boardQ.data?.scopeKey, registration?.state === "registered" ? registration.owner : undefined, boardQ.data?.stream);
   // Seeded from the last frame the collector emitted for this scope (#1570),
   // which the board carries when the scope is registered. The events are
   // fire-and-forget, so after a scope switch the hook holds nothing until the
@@ -163,10 +164,14 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   //
   // Matched on the scope key as the hook matches its frames, so a seed can
   // never put another scope's coverage under this heading.
-  const registration = boardQ.data?.backfill;
   const seedFrame =
     registration?.state === "registered" &&
-    registration.lastFrame?.scopeKey === boardQ.data?.scopeKey
+    registration.owner !== undefined &&
+    registration.lastFrame?.owner !== undefined &&
+    registration.lastFrame?.scopeKey === boardQ.data?.scopeKey &&
+    registration.lastFrame?.owner?.viewer === registration.owner?.viewer &&
+    registration.lastFrame?.owner?.generation === registration.owner?.generation &&
+    (!registration.lastFrame.observation || registration.lastFrame.observation.stream === boardQ.data?.stream)
       ? registration.lastFrame
       : null;
   const backfill = liveFrame ?? seedFrame;
@@ -206,7 +211,7 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // strings cannot say whether a 101st existed.
   const reviewersTruncated =
     !!scopeOrg && scopeOrg.members.length < scopeOrg.membersTotal;
-  const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable);
+  const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable, boardQ.data?.owner ?? (registration?.state === "registered" ? registration.owner : undefined));
 
   const board = boardQ.data;
   const series = seriesQ.data;
@@ -246,7 +251,7 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
     void seriesQ.refetch();
     void boardQ.refetch();
   };
-  if (allFailed) {
+  if (allFailed && !boardQ.data) {
     return (
       <QueryError
         title="Could not load statistics for this scope"
@@ -302,10 +307,12 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       ? `The remaining days are not being collected: this scope could not be recorded (${registration.reason}).`
       : undefined;
   const activity = backfill
-    ? backfillActivity(backfill.phase, secsToNextTick, {
-        daysCovered: backfill.daysCovered,
-        daysTotal: backfill.daysTotal,
-      })
+    ? backfillActivity(backfill.phase, secsToNextTick,
+        board && backfill.observation?.stream === board.stream &&
+        backfill.observation?.from === board.window?.from && backfill.observation?.to === board.window?.to
+          ? { daysCovered: board.daysCovered, daysTotal: board.daysTotal }
+          : undefined,
+      )
     : // NO FRAME YET. The worker sleeps one `BACKFILL_INTERVAL` before its
       // first tick and walks one scope per tick, so the first frame for a
       // freshly opened scope is up to a minute away -- longer if other
@@ -328,25 +335,9 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       daysOwed && !notCollecting
       ? "The remaining days are queued for collection."
       : undefined;
-  const caveat = board
-    ? partialityCaveat(
-        backfill
-          ? {
-              ...board,
-              total: backfill.total,
-              accumulated: backfill.collected,
-              accumulating: true,
-              daysCovered: backfill.daysCovered,
-              daysTotal: backfill.daysTotal,
-              // A window the worker has now covered end to end is complete
-              // only if nothing else on the board is short. The other
-              // partiality channels are the board's own and are carried
-              // through untouched.
-              complete: board.complete && backfill.daysCovered >= backfill.daysTotal,
-            }
-          : board,
-      )
-    : undefined;
+  // A frame can precede the SQLite snapshot it triggers. Measurement numbers
+  // belong to the accepted board, never to the older notification.
+  const caveat = board ? partialityCaveat(board) : undefined;
 
   // Some days missing, or none measured at all (#1045). Classified against
   // `days` -- the window the chart ASKED for -- rather than against
@@ -380,6 +371,17 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       ) : (
         <SkeletonRow count={2} cols="sm:grid-cols-2" />
       )}
+
+      {([ ["Merged count", counts.merged?.receipt], ["Opened count", counts.opened?.receipt], ["Activity", series?.receipt], ["Reviewers", reviewersQ.data?.receipt] ] as const).map(([label, receipt]) => receipt && (receipt.reused || receipt.retained || receipt.qualification) ? (
+        <p key={label} role="status" className="text-xs text-[#8b949e]">
+          {label}: measurements from <time dateTime={receipt.fetchedAt}>{new Date(receipt.fetchedAt).toLocaleString()}</time>. {receipt.qualification}
+        </p>
+      ) : null)}
+      {series?.unmeasured?.kind === "timeout" && series.points.length > 0 && <p role="status">Activity measurements timed out. Completed days are shown; retry to measure the missing days.</p>}
+      {reviewersQ.data?.stopReason && <p role="status">
+        {reviewersQ.data.stopReason.kind === "timeout" ? "Reviewer measurements timed out. Completed measurements are shown." : "Some reviewer measurements could not be refreshed."}
+        <button type="button" onClick={() => void reviewersQ.refetch()}>Retry reviewer measurements</button>
+      </p>}
 
       {series && failedDays.kind === "total" ? (
         /* NO day was measured, so there is no chart to annotate (#1045).
@@ -421,6 +423,9 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
               stops holding for a wall: past `NAMED_DAYS` the rest are
               counted, so the sentence still says how much is missing
               without becoming a paragraph nobody reads. */}
+          {(failedDays.kind === "partial" || series.receipt?.retained) && (
+            <button type="button" disabled={seriesQ.isFetching} onClick={() => void seriesQ.refetch()}>Retry activity measurements</button>
+          )}
           {failedDays.kind === "partial" && (
             <p className="text-xs text-[#d29922]">
               {failedDays.count} day{failedDays.count === 1 ? "" : "s"} could
@@ -474,6 +479,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
         ))}
       </div>
 
+      {board && boardQ.refresh?.error ? <p role="status">{boardQ.refresh.error}{!boardQ.refresh.unsupported ? <button onClick={boardQ.refresh.retry}>Retry stored Stats</button> : null}</p> : null}
+      {board && boardQ.refresh?.retained ? <p role="status">Earlier measurements retained while stored history is incomplete.</p> : null}
       {board ? (
         <>
           {/* The partiality caveat sits ABOVE both views rather than inside
@@ -556,11 +563,11 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                     // unmeasured total -- the Rust side requires a
                     // denominator for it -- so the first arm is safe.
                     hint={
-                      board.complete && board.total !== null
+                      board.complete && board.total !== null && board.total >= (board.accumulating ? board.accumulated : board.retrieved)
                         ? `share of all ${board.total.toLocaleString()} merged in this window`
-                        : board.total !== null
-                          ? `share of the ${board.retrieved.toLocaleString()} of ${board.total.toLocaleString()} merged that could be measured`
-                          : `share of the ${board.retrieved.toLocaleString()} merged that could be measured`
+                        : board.total !== null && board.total >= (board.accumulating ? board.accumulated : board.retrieved)
+                          ? `share of the ${(board.accumulating ? board.accumulated : board.retrieved).toLocaleString()} of ${board.total.toLocaleString()} merged that could be measured`
+                          : `share of the ${(board.accumulating ? board.accumulated : board.retrieved).toLocaleString()} merged that could be measured`
                     }
                   />
                 </>
@@ -598,8 +605,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                 // account's real data makes TRUE -- so a reader could not tell
                 // the transient from the answer.
                 reviewers={reviewersQ.data}
-                reviewersPending={reviewersQ.isPending && reviewerLogins.length > 0}
-                reviewersError={reviewersQ.isError}
+                reviewersPending={reviewersQ.isPending && !reviewersQ.data && reviewerLogins.length > 0}
+                reviewersError={reviewersQ.isError && !reviewersQ.data}
                 // Absent, not empty, when nothing enumerated a roster. Only an
                 // org scope has members; on a repository or Personal scope
                 // there is nobody to ask about, and an empty chart there would

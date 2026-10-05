@@ -11,7 +11,7 @@ import { stubViewport } from "./test-utils";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
 
-const cacheReadAt = vi.hoisted(() => ({ value: 0 }));
+const cacheReadAt = vi.hoisted(() => ({ value: 0, savedOwner: undefined as string | undefined, reviewing: [] as typeof PR_FIXTURES }));
 
 // The shell talks to Tauri on mount. Stub the command surface so these
 // tests exercise the layout, not the backend -- the same set App.test
@@ -31,7 +31,7 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
+  usePullRequests: () => ({ savedOwner: cacheReadAt.savedOwner, staleSecs: cacheReadAt.savedOwner ? 86400 : null, data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
   usePollError: () => null,
   useStoreError: () => ({ message: null, dismiss: () => {} }),
   clearPollError: () => {},
@@ -63,7 +63,7 @@ vi.mock("./api/hooks", () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },
     set: () => Promise.resolve(),
   }),
-  useReviewing: () => ({ data: [], isLoading: false }),
+  useReviewing: () => ({ data: cacheReadAt.reviewing, isLoading: false }),
   useReviewingCount: () => ({ data: 0 }),
   usePrDetail: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
   useDeleteHeadBranch: () => () => Promise.resolve(),
@@ -71,6 +71,7 @@ vi.mock("./api/hooks", () => ({
   useCommentOnPr: () => () => Promise.resolve(),
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
   useCycleTrend: () => ({ data: undefined }),
   usePeriods: () => ({
     data: {
@@ -151,6 +152,9 @@ afterEach(() => {
   useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
   clearMocks();
   cacheReadAt.value = 0;
+  cacheReadAt.savedOwner = undefined;
+  cacheReadAt.reviewing = [];
+  useFilters.setState({ selectedPr: null, checked: [] });
   stubViewport(null);
   connection.current = { kind: "local" };
 });
@@ -189,6 +193,28 @@ describe("App shell on a phone", () => {
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
       stale: false,
     };
+  });
+
+  it("qualifies saved-owner phone rows and prevents list, bulk and detail actions after reconnect", async () => {
+    cacheReadAt.savedOwner = "alice";
+    useFilters.setState({ checked: ["octocat/api#1"] });
+    renderApp();
+    expect(screen.getByText(/Saved snapshot for alice from the paired desktop/)).toBeTruthy();
+    expect(screen.getByText(/Showing a saved list from/)).toBeTruthy();
+    expect(screen.queryByText(/1 selected/)).toBeNull();
+    fireEvent.click(screen.getByText(PR_FIXTURES[0].title));
+    expect(await screen.findByText(/Refresh from the paired desktop to verify the current account/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Approve/ })).toBeNull();
+    expect(screen.getByRole("link", { name: "Open on GitHub" }).getAttribute("href")).toBe(`https://github.com/${PR_FIXTURES[0].repo}/pull/${PR_FIXTURES[0].number}`);
+  });
+
+  it("opens live reviewing details when unrelated authored rows are saved", async () => {
+    cacheReadAt.savedOwner = "alice";
+    cacheReadAt.reviewing = PR_FIXTURES;
+    useFilters.setState({ view: "to-review", selectedPr: { repo: PR_FIXTURES[0].repo, number: PR_FIXTURES[0].number } });
+    renderApp();
+    expect(screen.queryByText(/Refresh from the paired desktop to verify the current account/)).toBeNull();
+    expect(screen.getByRole("navigation", { name: "Pull request navigation" })).toBeTruthy();
   });
 
   it("shows a settled GitLab host error when the desktop cannot answer", async () => {
@@ -472,6 +498,12 @@ describe("the phone's shell with the desktop unreachable", () => {
     const ribbon = screen.getByRole("status");
     expect(ribbon.textContent).toContain("Showing a saved copy");
     expect(ribbon.textContent).toContain("octocat's laptop");
+  });
+
+  it("uses yesterday's provider receipt for the saved-copy age", () => {
+    connection.current = { kind: "unreachable", desktop: "octocat's laptop", lastPoll: new Date(Date.now() - 86400_000).toISOString(), stale: true } as ConnectionState;
+    renderApp();
+    expect(screen.getByRole("status").textContent).toContain("last updated 1 day ago");
   });
 
   it("puts the desktop's status in the banner, in one line", () => {

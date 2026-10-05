@@ -222,6 +222,15 @@ pub(super) async fn verified_identity(
     Ok((body, captured))
 }
 
+/// No provider request: qualify a cache against the CLI session's verified owner.
+pub(crate) fn with_known_viewer<T>(host: &str, read: impl FnOnce(Option<&str>) -> T) -> T {
+    if let Some(program) = find_glab() {
+        super::process_session::with_known_viewer(&program, host, read)
+    } else {
+        read(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

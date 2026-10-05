@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewThread } from "@/types/pr";
 
@@ -237,4 +237,62 @@ describe("ReviewThreads", () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
   });
+});
+
+
+describe("background conversation continuity", () => {
+  it.each(["is_resolved", "is_outdated"] as const)("preserves draft, focus and selection when %s moves the card and back", field => {
+    const edited = thread({ path: "edited.ts" });
+    const other = thread({ id: "RT_other", path: "other.ts" });
+    const { rerender } = view([edited, other]);
+    const box = screen.getByRole("textbox", { name: /edited.ts/ }) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "unsent background draft" } });
+    box.focus(); box.setSelectionRange(3, 9, "backward");
+    for (const changed of [{ ...edited, [field]: true }, edited]) {
+      rerender(<ReviewThreads threads={[changed, other]} total={2} repo="o/r" number={7} />);
+      const order = screen.getAllByRole("button").filter(button => button.hasAttribute("aria-expanded"));
+      expect(order[0].textContent).toContain(changed[field] ? "other.ts" : "edited.ts");
+      if (changed[field]) expect(screen.getByText(field === "is_resolved" ? "resolved" : "outdated")).toBeTruthy();
+      expect(screen.getByRole("textbox", { name: /edited.ts/ })).toBe(box);
+      expect(document.activeElement).toBe(box);
+      expect(box.value).toBe("unsent background draft");
+      expect([box.selectionStart, box.selectionEnd, box.selectionDirection]).toEqual([3, 9, "backward"]);
+    }
+  });
+  it("isolates drafts on a real PR change", () => {
+    const { rerender } = view([thread()]);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "private draft" } });
+    rerender(<ReviewThreads threads={[thread()]} total={1} repo="o/r" number={8} />);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+  it.each(["newer", "unchanged", "failure"])("handles pending reply completion with %s text", async mode => {
+    let finish!: () => void, fail!: (error: Error) => void;
+    reply.mockImplementationOnce(() => new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; }));
+    view([thread()]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "submitted" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+    if (mode === "newer") fireEvent.change(box, { target: { value: "next draft" } });
+    await act(async () => { if (mode === "failure") fail(new Error("offline")); else finish(); });
+    expect(box.value).toBe(mode === "newer" ? "next draft" : mode === "failure" ? "submitted" : "");
+  });
+  it("does not erase an unsent reply on resolution", async () => {
+    view([thread()]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "still composing" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resolve conversation" })));
+    expect(box.value).toBe("still composing");
+  });
+});
+
+it("preserves intentional closed disclosure and never takes focus from another conversation", () => {
+  const first = thread({ path: "first.ts" }); const second = thread({ id: "RT_2", path: "second.ts" });
+  const { rerender } = view([first, second]);
+  const toggle = screen.getByRole("button", { name: /first.ts/ });
+  fireEvent.click(toggle);
+  const other = screen.getByRole("textbox", { name: /second.ts/ }); other.focus();
+  rerender(<ReviewThreads threads={[{ ...first, is_resolved: true }, second]} total={2} repo="o/r" number={7} />);
+  expect(screen.getByRole("button", { name: /first.ts/ })).toBe(toggle);
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(document.activeElement).toBe(other);
 });

@@ -136,3 +136,5 @@ __pycache__
 # in the source tree rather than a temp dir.
 mutants.out/
 mutants.out.old/
+
+/dist-harness-enterprise/

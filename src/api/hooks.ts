@@ -1,4 +1,7 @@
-import { beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
+import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
+import { useStatsDemand } from "./useStatsDemand";
+import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
+import { useDetailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
@@ -8,9 +11,9 @@ import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
-import { clearAuthoredError, patchSourceRows, readAuthored, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
+import { clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   AlertReport,
   ClaudeMdAdviceMode,
@@ -19,6 +22,8 @@ import type {
   BranchDeleteFrame,
   BranchScanFrame,
   StatsBackfillFrame,
+  StatsOwner,
+  StatsReviewers,
   ClaudeImported,
   ClaudeOverview,
   ClaudeCoverage,
@@ -40,6 +45,7 @@ import type {
   HealthSample,
   NetProcess,
   PrDetail,
+  ReviewGates,
   PullRequest,
   Upstream,
   Venv,
@@ -176,7 +182,6 @@ import {
   sizeWorktrees,
   repoTree,
   repoFile,
-  getCachedReviewing,
   countReviewing,
   getStats,
   cancelUpdateRun,
@@ -223,7 +228,8 @@ export function usePullRequests(enabled = true) {
     enabled,
     staleTime: Infinity,
   });
-  return { ...query, data: source.prs ?? query.data };
+  const retainedAt = source.fetchedAt ? Date.parse(source.fetchedAt.includes("T") ? source.fetchedAt : `${source.fetchedAt.replace(" ", "T")}Z`) : undefined;
+  return { ...query, data: source.prs ?? query.data, dataUpdatedAt: retainedAt ?? query.dataUpdatedAt, staleSecs: source.staleSecs ?? null, savedOwner: source.savedOwner };
 }
 
 /// `Stats`'s five derived fields always come back zero from the Rust layer
@@ -367,6 +373,8 @@ export function usePollState(): "idle" | "fetching" | "retrying" {
 /// is not being watched is the reason polling lives in Rust.
 export function useViewCadence(view: string): void {
   useEffect(() => {
+    // Phone demand uses explicit minute/resume refreshes; cadence belongs to the desktop.
+    if (IS_MOBILE_BUILD) return;
     // Tolerate a host without the command, as the other listeners do:
     // cadence is an optimisation, and failing to set it must not break
     // the page.
@@ -405,7 +413,6 @@ export function useViewCadence(view: string): void {
 const SCAN_ARTIFACTS_FN = timed("scan_artifacts", scanArtifacts);
 const SCAN_VENVS_FN = timed("scan_venvs", scanVenvs);
 
-const CACHED_REVIEWING_FN = timed("reviewing-cached", getCachedReviewing);
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
 
 
@@ -2611,27 +2618,52 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
 ///
 /// Keyed on the head commit, so a push re-asks who pushed. The rules half
 /// is cached per (repo, base) on the Rust side, so re-asking is cheap.
+interface GateReceipt {
+  value: ReviewGates;
+  rules?: Evidence<ReviewGates["rules"]>;
+  pusher?: Evidence<ReviewGates["last_pusher"]>;
+  nextRead: number;
+  staleFor: number;
+}
 export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean) {
-  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined;
-  return useQuery({
-    queryKey: [
-      "review-gates",
-      pr?.repo,
-      pr?.base_ref,
-      pr?.head_repo ?? null,
-      pr?.head_ref,
-      pr?.head_oid,
-    ],
-    queryFn: () => {
+  const qc = useQueryClient();
+  const session = useAdvisorySession(qc);
+  const sourceGeneration = useDetailSourceGeneration(qc);
+  const viewer = useViewer();
+  const visible = useSyncExternalStore(subscribeVisibility, documentVisible, () => true);
+  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined && !!viewer.data;
+  const query = useQuery({
+    queryKey: ["review-gates", viewer.data, session.generation, sourceGeneration,
+      pr?.repo, pr?.base_ref, pr?.head_repo ?? null, pr?.head_ref, pr?.head_oid],
+    queryFn: async ({ signal }): Promise<GateReceipt> => {
       const p = pr as PrDetail;
-      return getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+      const started = performance.now();
+      const value = await getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+      assertCurrent(signal, session.generation, session.current);
+      if (!detailReadIsCurrent(qc, sourceGeneration)) throw new DOMException("Connection retired", "AbortError");
+      const rules = value.rules.state === "read" ? receipt(value.rules, value.rules_valid_for_ms, 600_000, started) : undefined;
+      const pusher = value.last_pusher.state === "known" ? receipt(value.last_pusher, value.pusher_valid_for_ms, 60_000, started) : undefined;
+      const expiry = Math.min(rules?.expiresAt ?? 0, value.last_pusher.state === "not_needed" ? Infinity : pusher?.expiresAt ?? 0);
+      // One selected query, never a row interval. Inconclusive reads retry at
+      // most twice a minute; original successful receipts keep their own TTLs.
+      const nextRead = Math.max(performance.now() + 30_000, expiry);
+      return { value, rules, pusher, nextRead, staleFor: Math.max(0, expiry - performance.now()) };
     },
-    enabled: ready,
-    staleTime: 60_000,
-    // The command folds every GitHub failure into a state; a rejection is
-    // only "no client", which a retry cannot fix.
-    retry: 0,
+    enabled: ready && visible,
+    staleTime: query => query.state.data?.staleFor ?? 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchInterval: query => query.state.fetchStatus === "fetching" ? false : query.state.status === "error" ? 30_000 : Math.max(1, (query.state.data?.nextRead ?? performance.now() + 30_000) - performance.now()),
   });
+  const value = query.data;
+  useEvidenceExpiry(() => [value?.rules?.expiresAt, value?.pusher?.expiresAt].filter((at): at is number => at !== undefined), ready);
+  const data: ReviewGates | undefined = value && { ...value.value,
+    rules: value.value.rules.state === "read" && display(value.rules)?.freshness !== "fresh"
+      ? { state: "declined", reason: "Policy needs revalidation" } : value.value.rules,
+    last_pusher: value.value.last_pusher.state === "known" && display(value.pusher)?.freshness !== "fresh"
+      ? { state: "declined", reason: "Pusher needs revalidation" } : value.value.last_pusher,
+  };
+  return { ...query, data };
 }
 
 export { useReadyPushers } from "./useReadyPushers";
@@ -3955,27 +3987,18 @@ function scopeKey(scope: StatsScope): string {
 /// a failed board is an expensive thing to repeat silently, and the view has
 /// an explicit retry that tells the user it is trying again.
 export function useStatsBoard(
-  scope: StatsScope | undefined,
-  measure: "merged" | "opened",
-  days: number,
-  enabled: boolean,
+  scope: StatsScope | undefined, measure: "merged" | "opened", days: number, enabled: boolean,
 ) {
+  const qc = useQueryClient();
   const loadable = scopeIsLoadable(scope);
-  return useQuery({
-    queryKey: [
-      "stats-board",
-      loadable ? scopeKey(scope) : "none",
-      measure,
-      days,
-    ],
-    queryFn: () =>
-      timeCall(`stats-board[${scopeKey(scope!)} ${measure} ${days}d]`, () =>
-        statsBoard(scope!.kind, scope!.value, measure, days),
-      ),
-    enabled: enabled && loadable,
-    staleTime: 5 * 60 * 1000,
-    retry: false,
+  useStatsDemand(scope?.kind,scope?.value,measure,days,enabled && loadable);
+  const key = ["stats-board", loadable ? scopeKey(scope) : "none", measure, days];
+  const query = useQuery({ queryKey:key,
+    queryFn: () => readStatsBoard(qc,key,()=>timeCall(`stats-board[${scopeKey(scope!)} ${measure} ${days}d]`,()=>statsBoard(scope!.kind,scope!.value,measure,days))),
+    enabled:enabled && loadable, staleTime:5*60*1000, retry:false,
   });
+  const refresh = useStatsBoardRefresh(qc,key,{scopeKind:scope?.kind??"all",scopeValue:scope?.value,measure,days},enabled&&loadable);
+  return {...query,refresh};
 }
 
 /// The scoped daily activity series (#826).
@@ -4126,24 +4149,8 @@ export function useScopedCounts(
 /// both measurements agree the unpaged form is free, so this takes the cheap
 /// path that neither disputes.
 ///
-/// # Where the logins come from, and why they are not in the key
-///
-/// The caller passes the roster it already holds for this scope, read off
-/// `useStatsTree`'s `org.members` -- so no request is spent re-deriving a
-/// list that is on screen in the sidebar beside the board.
-///
-/// The key carries the scope and the window and deliberately NOT the member
-/// list. That is this file's standing rule, which `useStatsBoard` states as
-/// "a count in a key makes every sibling key change when one item is
-/// removed, refetching everything": a roster that gained a person would
-/// invalidate every window's cached board. The logins are an INPUT to the
-/// request rather than part of its identity -- the question is "who reviewed
-/// most in this scope and window", and that question is the same question
-/// when the roster changes. The consequence, stated because it is a real
-/// trade rather than a free win: a newly-added member does not appear until
-/// the five-minute `staleTime` lapses. Five minutes of a missing row beats
-/// re-spending every board in the cache on a roster edit, and a roster that
-/// changed mid-session is the rarer event by far.
+/// The complete canonical roster is part of the question. Changed membership
+/// gets its own result; reordering the same names keeps the existing receipt.
 ///
 /// # `enabled`
 ///
@@ -4157,19 +4164,74 @@ export function useStatsReviewers(
   days: number,
   logins: string[],
   enabled: boolean,
+  owner?: StatsOwner,
 ) {
+  const client = useQueryClient();
   const loadable = scopeIsLoadable(scope);
-  return useQuery({
-    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days],
-    queryFn: () =>
-      timeCall(
-        `stats-reviewers[${scopeKey(scope!)} ${days}d n=${logins.length}]`,
-        () => statsReviewers(scope!.kind, scope!.value, days, logins),
-      ),
-    enabled: enabled && loadable && logins.length > 0,
+  const key = loadable ? scopeKey(scope) : "none";
+  const roster = [...new Set(logins.map(login => login.trim().toLowerCase()).filter(Boolean))].sort();
+  const windowDate = new Date().toISOString().slice(0, 10);
+  const refresh = useRef(false);
+  const query = useQuery({
+    queryKey: ["stats-reviewers", key, days, windowDate, roster, owner],
+    queryFn: () => timeCall(
+      `stats-reviewers[${key} ${days}d n=${roster.length}]`,
+      () => {
+        const force = refresh.current;
+        refresh.current = false;
+        return statsReviewers(scope!.kind, scope!.value, days, roster, force || undefined);
+      },
+    ),
+    enabled: enabled && loadable && roster.length > 0,
     staleTime: 5 * 60 * 1000,
     retry: false,
   });
+  const matchesOwner = (value: StatsReviewers) => owner !== undefined &&
+    value.receipt?.owner.viewer === owner.viewer && value.receipt.owner.generation === owner.generation;
+  let data = query.data;
+  // Fallback lives only in the current QueryClient: backend/pairing cache
+  // retirement also retires these rows. Never infer identity from missing metadata.
+  if (enabled && loadable && owner && roster.length > 0) {
+    const compatible = client.getQueriesData<StatsReviewers>({ queryKey: ["stats-reviewers", key, days, windowDate] })
+      .map(([, value]) => value)
+      .filter((value): value is StatsReviewers => value !== undefined && value !== data && matchesOwner(value))
+      .sort((a, b) => Date.parse(b.receipt!.fetchedAt) - Date.parse(a.receipt!.fetchedAt));
+    const fresh = data && matchesOwner(data) ? data : undefined;
+    const rows = new Map(fresh?.rows.map(row => [row.login, row]));
+    let age = fresh?.receipt?.fetchedAt;
+    let retained = false;
+    for (const previous of compatible) {
+      for (const row of previous.rows) {
+        if (roster.includes(row.login) && !rows.has(row.login)) {
+          rows.set(row.login, row);
+          retained = true;
+          if (!age || Date.parse(previous.receipt!.fetchedAt) < Date.parse(age)) age = previous.receipt!.fetchedAt;
+        }
+      }
+    }
+    if (retained && age) {
+      data = {
+        rows: [...rows.values()].filter(row => roster.includes(row.login))
+          .sort((a, b) => b.reviews - a.reviews || a.login.localeCompare(b.login)),
+        unmeasured: roster.filter(login => !rows.has(login)),
+        refusedFields: fresh?.refusedFields ?? 0,
+        spend: fresh?.spend ?? { points: 0, requests: 0, unmetered: 0, remaining: null, resetAt: null },
+        stopReason: fresh?.stopReason ?? (query.isError ? { kind: "unavailable", reason: "Reviewer revalidation failed." } : undefined),
+        receipt: { owner, fetchedAt: age, reused: true, retained: true,
+          qualification: query.isError
+            ? "Saved measurements for current members are shown; roster revalidation failed. Retry to continue."
+            : query.isFetching
+              ? "Saved measurements for current members are shown while this roster is revalidated."
+              : "Saved measurements for current members are shown because the latest response did not measure everyone." },
+      };
+    } else if (data && !matchesOwner(data)) {
+      data = undefined;
+    }
+  }
+  return { ...query, data, refetch: (options?: Parameters<typeof query.refetch>[0]) => {
+    refresh.current = true;
+    return query.refetch(options);
+  } };
 }
 
 /// The period comparisons behind the unscoped page's delta cards.
@@ -4895,7 +4957,7 @@ export function useReviewing(enabled = true) {
   // requests in ~7s against ~21s-then-truncate.
   const cached = useQuery({
     queryKey: ["reviewing-cached"],
-    queryFn: CACHED_REVIEWING_FN,
+    queryFn: () => readRetained(qc, "reviewing"),
     enabled,
     // Read once per mount. The live query is what keeps the view
     // current; re-reading the cache would only ever show older data.
@@ -4934,7 +4996,7 @@ export function useReviewing(enabled = true) {
 
   // Only meaningful while the CACHE is what is on screen: once live data
   // arrives it is current by definition, whatever the disk said.
-  const staleSecs = live.data === undefined ? (cached.data?.stale_secs ?? null) : null;
+  const staleSecs = source.staleSecs ?? (live.data === undefined ? (cached.data?.stale_secs ?? null) : null);
 
   // Provider status and command transport outcomes are reconciled separately;
   // TanStack's last promise completion cannot replace a newer publication.
@@ -4960,10 +5022,11 @@ export function useReviewing(enabled = true) {
     // blocked".
     isRefreshing: live.isFetching,
     /// Whether what is on screen came from disk rather than GitHub.
-    isFromCache: live.data === undefined && cached.data !== undefined,
+    isFromCache: source.fetchedAt !== undefined || (live.data === undefined && cached.data !== undefined),
     /// How old the shown rows are, when they are too old to present as
     /// current. `null` means either fresh or live -- no marker needed.
     staleSecs,
+    savedOwner: source.savedOwner,
   };
 }
 
@@ -5263,21 +5326,29 @@ export type StatsBackfillState = StatsBackfillFrame | null;
 /// A direct import works on the desktop and silently never fires on the
 /// phone, which is the failure `POLL_EVENTS` in `transport.test.ts` exists
 /// to make impossible.
-export function useStatsBackfill(scopeKey: string | undefined): StatsBackfillState {
+export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwner, stream?: string): StatsBackfillState {
+  const qc = useQueryClient();
   const [held, setState] = useState<{ scopeKey?: string; frame: StatsBackfillFrame | null }>({
     frame: null,
   });
-  const state = held.scopeKey === scopeKey ? held.frame : null;
+  const state = held.scopeKey === scopeKey && held.frame?.owner?.viewer === owner?.viewer && held.frame?.owner?.generation === owner?.generation && (!held.frame?.observation || held.frame.observation.stream === stream) ? held.frame : null;
 
+  const viewer = owner?.viewer;
+  const generation = owner?.generation;
   useEffect(() => {
-    if (!scopeKey) return;
+    if (!scopeKey || viewer === undefined || generation === undefined) return;
 
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
+    const epoch = statsOwnership(qc);
+    let sequence = -1;
     listen<StatsBackfillFrame>("stats-backfill-progress", (e) => {
+      if (cancelled || epoch !== statsOwnership(qc)) return;
       const f = e.payload;
-      // Another scope's progress is not this page's news.
-      if (f.scopeKey !== scopeKey) return;
+      // Unrelated frames do not advance this scope's observation watermark.
+      if (f.scopeKey !== scopeKey || f.owner?.viewer !== viewer || f.owner?.generation !== generation) return;
+      if (f.observation && (f.observation.stream !== stream || f.observation.sequence <= sequence)) return;
+      if (f.observation) sequence = f.observation.sequence;
       setState({ scopeKey, frame: f });
     }).then(
       (fn) => {
@@ -5291,7 +5362,7 @@ export function useStatsBackfill(scopeKey: string | undefined): StatsBackfillSta
       safeUnlisten(unlisten);
       unlisten = undefined;
     };
-  }, [scopeKey]);
+  }, [scopeKey, viewer, generation, stream, qc]);
 
   return state;
 }

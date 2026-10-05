@@ -25,6 +25,28 @@ pub struct LastKnown<V> {
     pub value: V,
     pub age_ms: u64,
 }
+/// Scheduling only. This never grants freshness or action authority.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressOutcome {
+    Deferred,
+    Partial,
+    Offered,
+    Ineligible,
+}
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Progress {
+    pub outcome: ProgressOutcome,
+    pub admitted: bool,
+}
+
+pub(super) struct Measurement<V> {
+    pub value: V,
+    pub observed_at: Instant,
+    pub valid_until: Instant,
+    pub successful: bool,
+}
+
 type Slot<V> = Arc<AsyncMutex<Receipts<V>>>;
 #[derive(Debug)]
 pub(super) struct Cache<K, V> {
@@ -88,6 +110,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             age_ms: at.elapsed().as_millis() as u64,
         })
     }
+    #[cfg(test)]
     pub async fn load<F: Future<Output = V>>(
         &self,
         key: K,
@@ -107,26 +130,54 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         ttl: impl Fn(&V) -> Duration,
         work: F,
     ) -> Option<(V, Duration)> {
+        self.load_measurement(key, deadline, |_| true, async {
+            let value = work.await;
+            let lifetime = ttl(&value);
+            let observed_at = Instant::now();
+            Measurement {
+                value,
+                observed_at,
+                valid_until: observed_at + lifetime,
+                successful: lifetime > FAILURE_TTL,
+            }
+        })
+        .await
+    }
+    /// Explicit success and oldest-input time let resumed work keep its original
+    /// authority even when a successful result has less than FAILURE_TTL left.
+    pub async fn load_measurement<F: Future<Output = Measurement<V>>>(
+        &self,
+        key: K,
+        deadline: Instant,
+        reusable: impl Fn(&V) -> bool,
+        work: F,
+    ) -> Option<(V, Duration)> {
         let slot = self.slot(key)?;
         tokio::time::timeout_at(deadline, async {
             let mut receipt = slot.lock().await;
             if let Some((until, value)) = receipt.latest.as_ref() {
-                if *until > Instant::now() {
+                if *until > Instant::now() && reusable(value) {
+                    #[cfg(feature = "enterprise-harness")]
+                    crate::enterprise_harness::metrics::record(0, "hit", "advisory-cache", 1);
                     return (
                         value.clone(),
                         until.saturating_duration_since(Instant::now()),
                     );
                 }
             }
-            let value = work.await;
-            let lifetime = ttl(&value);
-            // Every cache in this module uses FAILURE_TTL for inconclusive
-            // attempts; longer receipts certify an actual successful read.
-            if lifetime > FAILURE_TTL {
-                receipt.success = Some((Instant::now(), value.clone()));
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::metrics::record(0, "miss", "advisory-cache", 1);
+            let measured = work.await;
+            if measured.successful {
+                receipt.success = Some((measured.observed_at, measured.value.clone()));
             }
-            receipt.latest = Some((Instant::now() + lifetime, value.clone()));
-            (value, lifetime)
+            receipt.latest = Some((measured.valid_until, measured.value.clone()));
+            (
+                measured.value,
+                measured
+                    .valid_until
+                    .saturating_duration_since(Instant::now()),
+            )
         })
         .await
         .ok()
@@ -139,9 +190,86 @@ pub(super) struct Advisory {
     pub rules: Cache<(String, String), BaseRules>,
     pub pushers: Cache<(String, String, String), LastPusher>,
     pub stacks: Cache<StackKey, PrStack>,
+    pub stack_continuations: super::stack::Continuations,
     order: Mutex<(u64, HashMap<String, u64>)>,
     rotations: Mutex<HashMap<String, (Instant, usize)>>,
+    batches: Mutex<HashMap<[u8; 32], Arc<Mutex<Batch>>>>,
 }
+// Contexts are never evicted while admitted or recently demanded. The extra
+// registry has an explicit overload result instead of silently losing progress.
+const BATCH_IDLE: Duration = Duration::from_secs(300);
+#[derive(Debug)]
+pub(super) struct Batch {
+    demanded: Instant,
+    cursor: Option<String>,
+}
+impl Advisory {
+    pub fn batch(&self, members: &[String]) -> Result<Option<Arc<Mutex<Batch>>>, String> {
+        if members.len() < 2 {
+            return Ok(None);
+        }
+        use sha2::{Digest, Sha256};
+        let mut sorted = members.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let key: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&sorted).expect("string members")).into();
+        let mut batches = self.batches.lock().unwrap_or_else(|e| e.into_inner());
+        batches.retain(|_, batch| {
+            Arc::strong_count(batch) > 1
+                || batch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .demanded
+                    .elapsed()
+                    < BATCH_IDLE
+        });
+        if let Some(batch) = batches.get(&key) {
+            batch.lock().unwrap_or_else(|e| e.into_inner()).demanded = Instant::now();
+            return Ok(Some(batch.clone()));
+        }
+        if batches.len() >= CAPACITY {
+            return Err("Too many active advisory batches (512). Retry this batch after an idle batch has had five minutes to retire.".into());
+        }
+        let batch = Arc::new(Mutex::new(Batch {
+            demanded: Instant::now(),
+            cursor: None,
+        }));
+        batches.insert(key, batch.clone());
+        Ok(Some(batch))
+    }
+    pub fn batch_order(
+        &self,
+        keys: &[String],
+        members: &[String],
+        batch: &Option<Arc<Mutex<Batch>>>,
+    ) -> Vec<usize> {
+        let cursor = batch.as_ref().and_then(|batch| {
+            batch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cursor
+                .clone()
+        });
+        let Some(cursor) = cursor else {
+            return self.order(keys);
+        };
+        let mut indices: Vec<_> = (0..keys.len()).collect();
+        indices.sort_by(|a, b| {
+            (members[*a] <= cursor, &members[*a]).cmp(&(members[*b] <= cursor, &members[*b]))
+        });
+        indices
+    }
+    pub fn batch_offered(&self, key: String, member: String, batch: &Option<Arc<Mutex<Batch>>>) {
+        self.offered(key);
+        if let Some(batch) = batch {
+            let mut batch = batch.lock().unwrap_or_else(|e| e.into_inner());
+            batch.cursor = Some(member);
+            batch.demanded = Instant::now();
+        }
+    }
+}
+
 impl Advisory {
     pub fn rotation(&self, key: String, len: usize) -> usize {
         if len == 0 {

@@ -233,14 +233,15 @@ it("enforces the hard cap even with more live consumers than cache capacity", as
   expect(qc.getQueryCache().findAll({ queryKey: ["ready-stack"] })).toHaveLength(512);
 });
 
-it("alternates the first strip class across complete drains even when both windows contain eight rows", async () => {
+it("services both strip classes across complete legacy drains even when both windows contain eight rows", async () => {
   failure = true;
   renderHook(() => ({ pusher: useReadyPushers(rows), stack: useReadyStacks(rows) }), { wrapper });
   await advance(5);
-  const first = invoke.mock.calls[0][0];
+  expect(new Set(invoke.mock.calls.map(call => call[0]))).toEqual(new Set(["get_ready_pushers", "get_ready_stacks"]));
   invoke.mockClear();
   await advance(30_000); await advance(5);
-  expect(invoke.mock.calls[0][0]).not.toBe(first);
+  expect(new Set(invoke.mock.calls.map(call => call[0]))).toEqual(new Set(["get_ready_pushers", "get_ready_stacks"]));
+  expect(invoke.mock.calls).toHaveLength(16);
 });
 
 it("does not certify a legacy reply with the unexpired lifetime of a previous receipt", async () => {

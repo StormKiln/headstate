@@ -32,7 +32,7 @@ vi.mock("../api/hooks", () => ({
   useWorktrees: () => ({ data: [], unreadable: [], isError: false, error: null }),
   useUiPrefs: () => ({ prefs: { terminal_command: null } }),
   // Review gates (#1454): not fetched here, as when the lookup is pending.
-  useReviewGates: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
 }));
 
 import { PrDetailView } from "./PrDetailView";

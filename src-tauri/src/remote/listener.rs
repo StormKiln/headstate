@@ -219,6 +219,7 @@ pub trait PairedCerts: Send + Sync {
     /// The paired device's row -- its name for the log and its step-up
     /// keys for `/v1/call` -- or `None` when not paired.
     fn device(&self, sha256_fp_hex: &str) -> Option<PairedDevice>;
+    fn authorized_device(&self, sha256_fp_hex: &str) -> Option<super::context::AuthorizedDevice>;
 }
 
 /// Where `/v1/call` sends a command once the listener has admitted it.
@@ -235,7 +236,7 @@ pub trait CommandHost: Send + Sync {
         &'a self,
         command: &'a str,
         args: Value,
-        device_name: &'a str,
+        context: &'a crate::remote::context::DispatchContext,
     ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>>;
     /// A destructive command just ran for the named device;
     /// `stepup::notify_destructive` in production.
@@ -607,9 +608,11 @@ async fn call(
 ) -> Response {
     // The gate admitted the fingerprint; the row is what the signature
     // check and the log line need. Gone between the two means revoked.
-    let Some(device) = st.paired.device(&peer.fingerprint) else {
+    let Some(authorized) = st.paired.authorized_device(&peer.fingerprint) else {
         return refusal(403, "not paired".into());
     };
+    let context = authorized.context();
+    let device = authorized.device;
     let class = match surface::class_of(&command) {
         None => return refusal_for(RemoteError::Unknown(command)),
         Some(Class::Local) => return refusal_for(RemoteError::Local(command)),
@@ -643,7 +646,7 @@ async fn call(
         Ok(admitted) => admitted,
         Err(e) => return refusal(403, e.to_string()),
     };
-    let result = st.host.dispatch(&command, args, &device.name).await;
+    let result = st.host.dispatch(&command, args, &context).await;
     if class == Class::Destructive {
         // The attempt is the news, whether or not it succeeded.
         st.host.notify_destructive(&device.name, &command);
@@ -967,7 +970,7 @@ pub(crate) mod tests {
     /// The in-memory `PairedCerts` the spec's verifier tests run against.
     #[derive(Default)]
     pub(crate) struct MemoryCerts {
-        paired: Mutex<HashMap<String, PairedDevice>>,
+        paired: Mutex<HashMap<String, super::super::context::AuthorizedDevice>>,
         window: AtomicBool,
     }
 
@@ -994,13 +997,15 @@ pub(crate) mod tests {
             self.pair_device(placeholder_device(fp));
         }
         pub(crate) fn pair_device(&self, device: PairedDevice) {
-            self.paired
-                .lock()
-                .unwrap()
-                .insert(device.cert_fp.clone(), device);
+            self.paired.lock().unwrap().insert(
+                device.cert_fp.clone(),
+                super::super::context::AuthorizedDevice::fresh(device),
+            );
         }
         pub(crate) fn revoke(&self, fp: &str) {
-            self.paired.lock().unwrap().remove(fp);
+            if let Some(entry) = self.paired.lock().unwrap().remove(fp) {
+                entry.capability.retire();
+            }
         }
         fn open_window(&self, open: bool) {
             self.window.store(open, Ordering::SeqCst);
@@ -1014,8 +1019,15 @@ pub(crate) mod tests {
         fn pairing_window_open(&self) -> bool {
             self.window.load(Ordering::SeqCst)
         }
-        fn device(&self, fp: &str) -> Option<PairedDevice> {
+        fn authorized_device(&self, fp: &str) -> Option<super::super::context::AuthorizedDevice> {
             self.paired.lock().unwrap().get(fp).cloned()
+        }
+        fn device(&self, fp: &str) -> Option<PairedDevice> {
+            self.paired
+                .lock()
+                .unwrap()
+                .get(fp)
+                .map(|entry| entry.device.clone())
         }
     }
 
@@ -1028,6 +1040,7 @@ pub(crate) mod tests {
     pub(crate) struct RecordingHost {
         pub(crate) calls: Mutex<Vec<(String, Value, String)>>,
         pub(crate) notices: Mutex<Vec<(String, String)>>,
+        pub(crate) contexts: Mutex<Vec<crate::remote::context::DispatchContext>>,
         pub(crate) fail_with: Mutex<Option<RemoteError>>,
         pub(crate) reply_with: Mutex<Option<Value>>,
     }
@@ -1037,13 +1050,14 @@ pub(crate) mod tests {
             &'a self,
             command: &'a str,
             args: Value,
-            device_name: &'a str,
+            context: &'a crate::remote::context::DispatchContext,
         ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>> {
             Box::pin(async move {
+                self.contexts.lock().unwrap().push(context.clone());
                 self.calls.lock().unwrap().push((
                     command.to_string(),
                     args,
-                    device_name.to_string(),
+                    context.display_name.clone(),
                 ));
                 match self.fail_with.lock().unwrap().clone() {
                     Some(e) => Err(e),

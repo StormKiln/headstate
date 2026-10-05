@@ -10,6 +10,8 @@ pub mod cleanup;
 pub mod commands;
 pub mod diag;
 pub mod docker;
+#[cfg(feature = "enterprise-harness")]
+pub mod enterprise_harness;
 pub mod github;
 pub mod gitlab;
 pub mod health;
@@ -32,6 +34,7 @@ pub mod remote;
 pub mod report;
 pub mod repos;
 pub mod source_poll;
+pub mod stats_demand;
 pub mod store;
 pub mod tools;
 pub mod tray;
@@ -41,7 +44,7 @@ use commands::{AuthState, GhClient};
 use github::client::GitHubClient;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Whether the main window is currently focused. Shared with `poll::spawn`
 /// so the background loop can pick FOCUSED vs BACKGROUND cadence; managed as
@@ -479,6 +482,8 @@ pub fn run() {
             commands::gitlab_stats_load,
             commands::gitlab_stats_backfill,
             commands::stats_board,
+            commands::stats_board_cached,
+            commands::stats_demand,
             commands::stats_series,
             commands::stats_reviewers,
             commands::get_auth_state,
@@ -519,7 +524,7 @@ pub fn run() {
                 Ok(token) => {
                     match tauri::async_runtime::block_on(async { auth::build_client(&token) }) {
                         Ok(octocrab) => {
-                            let client = Arc::new(GitHubClient::new(octocrab));
+                            let client = Arc::new(GitHubClient::new(octocrab).with_credential(&token, commands::db_path(&handle)));
                             (
                                 AuthState {
                                     ok: true,
@@ -563,6 +568,7 @@ pub fn run() {
             app.manage(poll::Waker(waker.clone()));
             let backfill_waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::BackfillWaker(backfill_waker.clone()));
+            app.manage(Arc::new(stats_demand::Registry::default()));
             app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
@@ -1069,9 +1075,18 @@ pub fn run() {
                 // or failed lookup cannot delay startup.
                 {
                     let c = client.clone();
+                    let identity_app = handle.clone();
                     tauri::async_runtime::spawn(async move {
                         match c.fetch_viewer().await {
-                            Ok(login) => log::info!("signed in as {login}"),
+                            Ok(login) => {
+                                log::info!("signed in as {login}");
+                                for list in [store::CachedList::Authored, store::CachedList::Reviewing] {
+                                    let mut update = identity_app.state::<source_poll::SourcePolls>()
+                                        .snapshot(&identity::Source::default(), list).await;
+                                    update.owner = Some(login.clone());
+                                    let _ = identity_app.emit("source-poll-status", update);
+                                }
+                            },
                             Err(e) => log::warn!("could not read the signed-in account: {e}"),
                         }
                     });

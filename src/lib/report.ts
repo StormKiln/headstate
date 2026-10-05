@@ -1,4 +1,4 @@
-import type { DiagnosticBundle, PollReport } from "../types/report";
+import type { DiagnosticBundle, PollReport, QuotaSnapshot } from "../types/report";
 import { NEW_ISSUE_URL } from "./repo";
 
 /// A bug report the user can read, edit and cut before it is posted.
@@ -229,10 +229,12 @@ function pollLines(p: PollReport): string[] {
   return lines;
 }
 
-function remaining(n: number | null, unit: string): string {
-  return n === null
-    ? `${UNKNOWN} (no response has reported it yet)`
+function remaining(n: number | null, unit: string, quota?: QuotaSnapshot): string {
+  const value = n === null
+    ? `${UNKNOWN} (no current quota evidence)`
     : `${n.toLocaleString("en-US")} ${unit} left this hour`;
+  if (!quota) return value;
+  return `${value}; evidence age ${quota.evidenceAgeMs === null ? UNKNOWN : `${quota.evidenceAgeMs}ms`}; reset epoch ${quota.resetUnixSecs ?? UNKNOWN}; primary cooldown ${quota.primaryCooldownMs}ms; reserve cooldown ${quota.reserveCooldownMs}ms; recovery probe ${quota.recoveryProbe ? "active" : "inactive"}`;
 }
 
 function block(text: string): string {
@@ -275,9 +277,13 @@ export function buildSections(
 
   const poll = b ? pollLines(b.poll).map(clean) : [`- Background refresh: ${missing(g)}`];
   const budgets = [
-    `- GraphQL: ${b ? remaining(b.graphqlRemaining, "points") : missing(g)}`,
-    `- REST: ${b ? remaining(b.restRemaining, "requests") : missing(g)}`,
+    `- GraphQL: ${b ? remaining(b.graphqlRemaining, "points", b.admission?.graphql) : missing(g)}`,
+    `- REST: ${b ? remaining(b.restRemaining, "requests", b.admission?.rest) : missing(g)}`,
   ];
+
+  if (b?.admission) {
+    budgets.push(`- Shared secondary cooldown: ${b.admission.secondaryCooldownMs}ms; captured at epoch ${b.admission.capturedAtUnixMs}ms`);
+  }
 
   // The desktop's version when the bundle has it: on the phone that is
   // the machine whose poll failed, and on the desktop the two agree.

@@ -90,6 +90,7 @@ pub struct Update {
     pub status: Status,
     pub session: String,
     pub completed_request: Option<String>,
+    pub owner: Option<String>,
     pub prs: Option<Vec<crate::github::model::PullRequest>>,
     pub mrs: Option<Vec<crate::gitlab::queues::MergeRequest>>,
 }
@@ -517,13 +518,20 @@ impl SourcePolls {
             .unwrap_or(fallback)
     }
 
+    pub(crate) fn session_id(&self) -> &str {
+        &self.3
+    }
+
     fn update(&self, status: Status, completed_request: Option<String>) -> Update {
-        let prs = self
+        let receipt = self
             .2
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(status.source.clone(), status.list))
-            .map(|(_, receipt)| receipt.prs.clone());
+            .map(|(_, receipt)| (receipt.prs.clone(), receipt.viewer.clone()));
+        let (prs, owner) = receipt
+            .map(|(rows, owner)| (Some(rows), owner))
+            .unwrap_or_default();
         let mrs = self
             .4
             .lock()
@@ -534,6 +542,7 @@ impl SourcePolls {
             status,
             session: self.3.clone(),
             completed_request,
+            owner,
             prs,
             mrs,
         }
@@ -974,7 +983,19 @@ pub(crate) async fn fetch_github_step_at(
             }),
         });
     }
-    client.advance_scan(list, loaded, &rows, now).await
+    if continuation {
+        client
+            .advance_scan_mode(
+                list,
+                loaded,
+                &rows,
+                now,
+                crate::github::scan::ScanMode::Continue,
+            )
+            .await
+    } else {
+        client.advance_scan(list, loaded, &rows, now).await
+    }
 }
 
 /// Called with the source publication permit held, before persistence and emission.

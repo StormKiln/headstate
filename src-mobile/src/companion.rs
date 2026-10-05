@@ -52,6 +52,7 @@ struct Live {
 pub const CANCELLED: &str = "headstate:cancelled";
 
 pub struct Companion {
+    pairing_epoch: std::sync::atomic::AtomicU64,
     store: Arc<dyn Store>,
     keys: Arc<dyn DeviceKeys>,
     sink: Arc<dyn EventSink>,
@@ -68,9 +69,9 @@ pub struct Companion {
 /// than a silent `None` that would read as "not paired". The effect is
 /// bounded (the banner loses its timestamp), but on a phone there is no
 /// console, so a corrupt cache was undiagnosable.
-fn last_poll_from_cache(store: &dyn Store) -> Option<DateTime<Utc>> {
-    match events::cached_snapshot(store) {
-        Ok(snapshot) => snapshot.and_then(|s| s.received_at()),
+fn last_poll_from_cache(store: &dyn Store, desktop: &str) -> Option<DateTime<Utc>> {
+    match events::saved_provider_time(store, desktop) {
+        Ok(at) => at,
         Err(e) => {
             log::warn!("companion: the cached snapshot could not be read: {e}");
             None
@@ -86,6 +87,7 @@ impl Companion {
         spawn: Spawner,
     ) -> Self {
         Self {
+            pairing_epoch: std::sync::atomic::AtomicU64::new(0),
             conn: Arc::new(Connection::new(sink.clone())),
             store,
             keys,
@@ -104,7 +106,7 @@ impl Companion {
         let Some(desktop) = list.into_iter().next() else {
             return Ok(());
         };
-        let last_poll = last_poll_from_cache(self.store.as_ref());
+        let last_poll = last_poll_from_cache(self.store.as_ref(), &desktop.fp);
         self.conn.set_desktop(Some(desktop.name.clone()), last_poll);
         let identity = match self.keys.session_identity() {
             Ok(id) => id,
@@ -169,6 +171,7 @@ impl Companion {
         .await
         .map_err(|e| e.to_string())?;
         let name = desktop.name.clone();
+        events::forget_snapshot(self.store.as_ref()).map_err(|e| e.to_string())?;
         self.attach(desktop, client);
         Ok(name)
     }
@@ -214,6 +217,13 @@ impl Companion {
     /// Best effort throughout: a failure here costs one slow start, and
     /// is not worth failing the user's command over.
     fn remember_address(&self, client: &Client) {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if !live
+            .as_ref()
+            .is_some_and(|l| std::ptr::eq(l.client.as_ref(), client))
+        {
+            return;
+        }
         let Some(best) = client.best_address() else {
             return;
         };
@@ -301,10 +311,15 @@ impl Companion {
     /// `remote_call`.
     pub async fn call(&self, command: &str, args: Value) -> Result<Value, String> {
         let class = surface::admit(command).map_err(|e| e.to_string())?;
-        let (client, events, desktop_name) = {
+        let (client, events, desktop_name, desktop_fp) = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             let l = live.as_ref().ok_or("not paired with a desktop")?;
-            (l.client.clone(), l.events.clone(), l.desktop.name.clone())
+            (
+                l.client.clone(),
+                l.events.clone(),
+                l.desktop.name.clone(),
+                l.desktop.fp.clone(),
+            )
         };
         // A desktop too old to speak this protocol is refused for EVERY
         // command, reads included (#734). Checked before the reachability
@@ -356,19 +371,37 @@ impl Companion {
         } else {
             None
         };
-        match client.call(command, &args, signature.as_deref()).await {
+        let response = client.call(command, &args, signature.as_deref()).await;
+        // Check and publish under the same pairing lock. Otherwise an old
+        // error could revoke/clear a newly attached pairing after the check.
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if !live
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
+        {
+            return Err("The paired desktop changed during this request.".into());
+        }
+        match response {
             Ok(value) => {
+                if command == "get_source_snapshot" {
+                    events::save_owned_receipt(self.store.as_ref(), &desktop_fp, &value)
+                        .map_err(|e| e.to_string())?;
+                    self.conn
+                        .mark_poll(last_poll_from_cache(self.store.as_ref(), &desktop_fp));
+                }
                 if self.conn.state() == State::Unreachable {
                     // Back, evidently; let the subscriber confirm and
                     // fill in the protocol version.
                     events.resume();
                 }
+                drop(live);
                 self.remember_address(&client);
                 Ok(value)
             }
             Err(e) if e.is_handshake() => {
                 log::warn!("companion: the desktop refused this phone on {command}: {e}");
                 events.stop();
+                let _ = events::forget_snapshot(self.store.as_ref());
                 self.conn.set_state(State::Revoked);
                 Err(format!(
                     "{desktop_name} no longer recognises this phone; pair again"
@@ -377,20 +410,18 @@ impl Companion {
             Err(ClientError::Unreachable(m)) => {
                 self.conn.set_state(State::Unreachable);
                 events.resume();
-                if command == "get_cached" {
-                    // An `Err` here is a corrupt cache, not an absent
-                    // one, and it decides whether the phone shows a list
-                    // at all -- worth a line rather than a silent empty
-                    // screen.
-                    let cached = events::cached_snapshot(self.store.as_ref()).unwrap_or_else(|e| {
-                        log::warn!("companion: the cached snapshot could not be read: {e}");
-                        None
-                    });
-                    if let Some(snap) = cached {
-                        log::info!(
-                            "companion: {desktop_name} unreachable; serving the cached list"
-                        );
-                        return serde_json::from_str(snap.prs.get()).map_err(|e| e.to_string());
+                if command == "get_source_snapshot"
+                    && args["source"]["provider"] == "github"
+                    && args["source"]["host"] == "github.com"
+                {
+                    if let Some(receipt) = events::offline_receipt(
+                        self.store.as_ref(),
+                        &desktop_fp,
+                        args["list"].as_str().unwrap_or(""),
+                    )
+                    .map_err(|e| e.to_string())?
+                    {
+                        return Ok(receipt);
                     }
                 }
                 Err(format!("{desktop_name} is unreachable: {m}"))
@@ -415,9 +446,10 @@ impl Companion {
     }
 
     fn attach(&self, desktop: Desktop, client: Arc<Client>) {
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         self.conn.set_desktop(
             Some(desktop.name.clone()),
-            last_poll_from_cache(self.store.as_ref()),
+            last_poll_from_cache(self.store.as_ref(), &desktop.fp),
         );
         self.conn.set_state(State::Connecting);
         let live = Live {
@@ -426,7 +458,7 @@ impl Companion {
             events: events::Handle::new(),
         };
         self.start_events(&live);
-        *self.live.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
+        *slot = Some(live);
     }
 
     fn start_events(&self, live: &Live) {
@@ -441,6 +473,8 @@ impl Companion {
     }
 
     fn detach(&self) {
+        self.pairing_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(l) = self.live.lock().unwrap_or_else(|e| e.into_inner()).take() {
             l.events.stop();
         }
@@ -460,13 +494,34 @@ impl Companion {
             .ok_or_else(|| "not paired with a desktop".to_string())
     }
 
-    /// Keep a list the background window fetched, exactly as the
-    /// subscriber keeps a `prs-updated` frame: the snapshot, and the
-    /// poll time the banner shows.
+    pub(crate) fn snapshot_desktop(&self) -> Result<(Arc<Client>, String, u64), String> {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let current = live.as_ref().ok_or("not paired with a desktop")?;
+        Ok((
+            current.client.clone(),
+            current.desktop.fp.clone(),
+            self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        ))
+    }
+
+    /// Keep the background receipt and its original provider time,
+    /// scoped to the pairing generation that requested it.
     pub(crate) fn record_snapshot(&self, prs_json: &str) -> Result<(), String> {
-        let now = Utc::now();
-        events::save_snapshot(self.store.as_ref(), prs_json, now).map_err(|e| e.to_string())?;
-        self.conn.mark_poll(now);
+        let value: Value = serde_json::from_str(prs_json).map_err(|e| e.to_string())?;
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let current = live.as_ref().ok_or("not paired with a desktop")?;
+        if value["desktop"].as_str() != Some(current.desktop.fp.as_str())
+            || value["pairing_epoch"].as_u64()
+                != Some(self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err("The saved receipt belongs to another desktop.".into());
+        }
+        events::save_owned_receipt(self.store.as_ref(), &current.desktop.fp, &value["receipt"])
+            .map_err(|e| e.to_string())?;
+        self.conn.mark_poll(last_poll_from_cache(
+            self.store.as_ref(),
+            &current.desktop.fp,
+        ));
         Ok(())
     }
 
@@ -887,7 +942,7 @@ mod tests {
         server.open_window(true);
         server.reply(
             "/v1/events",
-            Reply::sse(&[("prs-updated", r#"[{"number":1347}]"#)], true),
+            Reply::sse(&[("prs-updated", r#"[{"number":1347}]"#), ("source-poll-status", r#"{"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored","owner":"alice","receipt_revision":1,"prs":[{"number":1347}],"last_received_at":"2025-12-31T00:00:00Z","coverage":"complete"}"#)], true),
         );
         let qr = server.qr(&token(), Utc::now().timestamp() + 120);
         assert_eq!(c.pair(&qr, None).await.unwrap(), "octocat's laptop");
@@ -996,15 +1051,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_reply_from_retired_same_fingerprint_pairing_is_refused() {
+        let (_server, _store, _rec, c) = paired().await;
+        let (_, desktop, pairing_epoch) = c.snapshot_desktop().unwrap();
+        let pending = json!({"desktop":desktop,"pairing_epoch":pairing_epoch,"receipt":{
+            "session":"old-session","source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":[],"fetched_at":"2026-01-01T00:00:00Z","stale_secs":null,"coverage":"complete"}}});
+        c.detach();
+        c.load().unwrap();
+        assert_eq!(c.snapshot_desktop().unwrap().1, pending["desktop"]);
+        assert!(c.record_snapshot(&pending.to_string()).is_err());
+    }
+
+    #[tokio::test]
     async fn while_unreachable_the_list_comes_from_the_cache_and_actions_are_refused() {
         let (server, _, _, c) = paired().await;
+        let receipt = json!({"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored",
+            "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":[{"number":1347}],
+            "fetched_at":"2026-01-01T00:00:00Z","stale_secs":86400,"coverage":"complete"}});
+        server.reply(
+            "/v1/call/get_source_snapshot",
+            Reply::json(200, receipt.clone()),
+        );
+        let args = json!({"source":{"provider":"github","host":"github.com"},"list":"authored"});
+        assert_eq!(
+            c.call("get_source_snapshot", args.clone()).await.unwrap(),
+            receipt
+        );
         server.go_away();
         until(|| c.connection_state().state == State::Unreachable).await;
-        assert_eq!(
-            c.call("get_cached", json!({})).await.unwrap(),
-            json!([{"number": 1347}]),
-            "the cached snapshot, marked by the connection state"
+        assert!(
+            c.call("get_cached", json!({})).await.is_err(),
+            "legacy ownerless cache is withheld"
         );
+        let saved = c.call("get_source_snapshot", args).await.unwrap();
+        assert_eq!(saved["data"]["prs"], receipt["data"]["prs"]);
+        assert_eq!(saved["data"]["fetched_at"], receipt["data"]["fetched_at"]);
+        assert_eq!(saved["ownership"]["state"], "saved_desktop");
         assert_eq!(c.connection_state().protocol_version, None);
         let err = c
             .call("act_on_pr", json!({"id": "PR_1"}))
@@ -1022,6 +1105,70 @@ mod tests {
         // Other reads are attempted and fail honestly.
         let err = c.call("get_stats", json!({})).await.unwrap_err();
         assert!(err.starts_with("octocat's laptop is unreachable:"), "{err}");
+        let err = c
+            .call(
+                "stats_demand",
+                json!({"request":{"op":"renew","handle":"fixture","sequence":1}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("octocat's laptop is unreachable:"),
+            "ephemeral read interest attempts recovery: {err}"
+        );
+        let err = c
+            .call("set_view_needs_github", json!({"needs":true}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("actions are disabled"));
+    }
+
+    #[tokio::test]
+    async fn call_error_keeps_pairing_ownership_through_snapshot_removal() {
+        struct CheckedStore {
+            inner: Arc<MemoryStore>,
+            companion: Mutex<std::sync::Weak<Companion>>,
+            checked: AtomicBool,
+        }
+        impl Store for CheckedStore {
+            fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &str, value: &[u8]) -> Result<(), crate::store::StoreError> {
+                self.inner.put(key, value)
+            }
+            fn remove(&self, key: &str) -> Result<(), crate::store::StoreError> {
+                let c = self.companion.lock().unwrap().upgrade().unwrap();
+                // This is the destructive publication seam. A replacement
+                // attach must not acquire ownership between check and clear.
+                assert!(
+                    c.live.try_lock().is_err(),
+                    "pairing replacement could interleave with old error publication"
+                );
+                self.checked.store(true, Ordering::SeqCst);
+                self.inner.remove(key)
+            }
+        }
+        let (server, store, _, mut c) = paired().await;
+        c.live.lock().unwrap().as_ref().unwrap().events.stop();
+        let checked = Arc::new(CheckedStore {
+            inner: store,
+            companion: Mutex::new(std::sync::Weak::new()),
+            checked: AtomicBool::new(false),
+        });
+        c.store = checked.clone();
+        let c = Arc::new(c);
+        *checked.companion.lock().unwrap() = Arc::downgrade(&c);
+        server.revoke(&server.requests()[0].peer_fp);
+        server.end_streams();
+        loop {
+            if c.call("get_stats", json!({})).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(checked.checked.load(Ordering::SeqCst));
+        assert_eq!(c.connection_state().state, State::Revoked);
     }
 
     #[tokio::test]
@@ -1192,6 +1339,12 @@ mod tests {
             "{err}"
         );
 
+        let err = c
+            .call("stats_demand", json!({"request":{"op":"acquire"}}))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("octocat's laptop runs an older Headstate"));
+
         // The refusal happens on the PHONE: nothing was sent to a
         // desktop that cannot answer it correctly. Asserting on the
         // request log rather than only on the error keeps this honest --
@@ -1238,9 +1391,10 @@ mod tests {
             again.connection_state().desktop.as_deref(),
             Some("octocat's laptop")
         );
-        assert!(
-            again.connection_state().last_poll.is_some(),
-            "from the snapshot"
+        assert_eq!(
+            again.connection_state().last_poll.as_deref(),
+            Some("2025-12-31T00:00:00Z"),
+            "restart preserves original provider evidence"
         );
         // Wait for the RESUBSCRIBE itself, not merely for the state to
         // read Connected. Those are different moments: the restarted

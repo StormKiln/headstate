@@ -19,7 +19,7 @@
 //! cannot become the second permanently-empty table implying a feature
 //! that does not exist.
 //!
-//! # Why a closed window is cacheable FOREVER
+//! # Closed-window eligibility is separate from bounded retention
 //!
 //! The PRs merged in August 2026 are fixed once August is over. A
 //! leaderboard over that window is a constant, so recomputing it per
@@ -256,6 +256,28 @@ pub fn get(
     }))
 }
 
+/// Bound only derived answers: three recent UTC end dates and 2,048 rows.
+/// Called in the owner's write transaction, never on the WAL read fast path.
+pub fn prune_answers(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    active: (&str, &str, &str),
+) -> Result<usize, StoreError> {
+    let earliest = (now.date_naive() - chrono::Duration::days(3)).to_string();
+    let mut removed = conn.execute("DELETE FROM stats_cache WHERE window_end < ?1", [earliest])?;
+    // Protect this write only during cardinality eviction. Acquisition age
+    // stays unchanged, and the UTC-end horizon applies even to this row.
+    removed += conn.execute(
+        "DELETE FROM stats_cache WHERE rowid IN (
+            SELECT rowid FROM stats_cache
+            ORDER BY (key=?1 AND window_start=?2 AND window_end=?3) DESC,
+                     fetched_at DESC, rowid DESC LIMIT -1 OFFSET 2048
+        )",
+        params![active.0, active.1, active.2],
+    )?;
+    Ok(removed)
+}
+
 /// Drop every cached answer.
 ///
 /// For the moment when the identity behind `@me` changes: a new token is
@@ -265,14 +287,8 @@ pub fn get(
 /// user, but it can still sit there forever taking space for a user who
 /// is gone.
 ///
-/// NOT called on a schedule. A closed window's answer never expires, so
-/// time-based eviction would throw away exactly the rows the cache exists
-/// for. This table grows in proportion to the number of distinct scopes
-/// and windows a user actually looks at, which is small.
-///
-/// #840 found this had no production caller, so the scenario the
-/// paragraph above describes never actually fired.
-/// [`note_viewer`] is that caller.
+/// Owner transitions clear all derived answers. Ordinary writes separately
+/// reclaim unreachable daily keys and bound cardinality with `prune_answers`.
 pub fn clear(conn: &Connection) -> Result<usize, StoreError> {
     Ok(conn.execute("DELETE FROM stats_cache", [])?)
 }
@@ -315,7 +331,8 @@ pub fn clear(conn: &Connection) -> Result<usize, StoreError> {
 /// propagated: a settings row that will not parse must not be able to
 /// break the stats page, and the cost of getting this wrong is one
 /// unnecessary re-fetch.
-pub fn note_viewer(conn: &Connection, login: &str) -> Result<usize, StoreError> {
+#[cfg(test)]
+fn note_viewer(conn: &Connection, login: &str) -> Result<usize, StoreError> {
     let previous: Option<String> = super::settings::get(conn, super::settings::keys::STATS_VIEWER)
         .ok()
         .flatten();

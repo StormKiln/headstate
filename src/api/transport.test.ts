@@ -465,6 +465,10 @@ const ROWS: Row[] = [
   // No `subject` at all, which is the board's defining property: it asks
   // about everyone in the scope. A subject here would render a leaderboard
   // with one name on it.
+  row(api.statsDemand, [{op:"renew",handle:"fixture",sequence:1}], "stats_demand", {request:{op:"renew",handle:"fixture",sequence:1}}),
+  row(api.statsBoardCached, ["org", "acme", "merged", 30, {viewer:"synthetic",generation:1}], "stats_board_cached", {
+    scopeKind:"org", scopeValue:"acme", measure:"merged", days:30, expectedOwner:{viewer:"synthetic",generation:1},
+  }),
   row(api.statsBoard, ["org", "acme", "merged", 30], "stats_board", {
     scopeKind: "org",
     scopeValue: "acme",
@@ -647,7 +651,7 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // it is open — and a hook that imported Tauri's `listen` directly would
   // work on the desktop and silently never fire on the phone, which is
   // the client with no window to leave open and wait in.
-  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X")],
+  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X", { viewer: "fixture", generation: 1 })],
   // The fifteenth (#1477). A content-free nudge that a running session's
   // transcript changed: the list's "active now" set hears every one, and
   // the open transcript's follow hears its own session's. Through the seam
@@ -739,4 +743,12 @@ describe("transport selection", () => {
     vi.resetModules();
     await expect(import("./transport")).rejects.toThrow(/VITE_TARGET/);
   });
+});
+
+it("keeps additive Stats owner metadata optional while rejecting malformed present owners", async () => {
+  const { remoteEventError } = await import("./wireContract");
+  const frame={scopeKey:"scope",daysCovered:1,daysTotal:30,collected:11,total:22,phase:{kind:"working"},nextTickAtMs:null};
+  expect(remoteEventError("stats-backfill-progress",frame)).toBeNull();
+  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:1}})).toBeNull();
+  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:"wrong"}})).not.toBeNull();
 });

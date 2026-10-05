@@ -2884,9 +2884,15 @@ export type BranchScanFrame =
   | { kind: "listed"; repo: string; total: number; branches: Branch[] }
   | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
 
-/// A registered scope's payload (#1570). Mirrors `BackfillRegistered` in
-/// `src-tauri/src/commands.rs`.
+/// Captured durable Stats ownership, correlated with progress events.
+export interface StatsOwner {
+  viewer: string;
+  generation: number;
+}
+
+/// A registered scope payload. Mirrors `BackfillRegistered` in `src-tauri/src/commands.rs`.
 export interface BackfillRegistered {
+  owner?: StatsOwner;
   /// The last frame the collector emitted for this scope, or `null` when it
   /// has emitted none since the app started. `null` is PENDING -- a frame
   /// will come -- and never a zeroed frame, which would read as measured.
@@ -2911,6 +2917,27 @@ export type BackfillRegistration =
   | ({ state: "registered" } & BackfillRegistered)
   | ({ state: "failed" } & BackfillRegistrationFailed);
 
+/// Exact UTC closed-day window represented by a stored measurement.
+export interface StatsWindow {
+  from: string;
+  to: string;
+}
+/// Process-local observation ordering, not a SQLite revision or freshness grant.
+export interface StatsObservation extends StatsWindow {
+  stream: string;
+  sequence: number;
+  cacheChange: number;
+}
+/// A local read reports measurements, never a demand registration.
+export interface StatsBoardReadback {
+  owner: StatsOwner;
+  viewer: string;
+  scopeKey: string;
+  window: StatsWindow;
+  stream: string;
+  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill">;
+}
+
 /// One frame of PR Stats backfill progress (#1093). Mirrors
 /// `StatsBackfillFrame` in `src-tauri/src/commands.rs`.
 ///
@@ -2920,6 +2947,8 @@ export type BackfillRegistration =
 /// frame while the page was closed -- renders correctly from the next one
 /// instead of accumulating from a start it never saw.
 export interface StatsBackfillFrame {
+  observation?: StatsObservation;
+  owner?: StatsOwner;
   /// The scope this describes, as the Rust side keys it. Compared before
   /// anything is rendered: the event is app-global while the work is
   /// per-scope, so a page that changed scope mid-walk would otherwise
@@ -3575,7 +3604,16 @@ export interface StatsTree {
 /// to read `total` without the facts about whether it is exact sitting
 /// beside it -- anything capped, sliced or assembled says so in the same
 /// object, which is the requirement #824 item 8 states.
+export interface StatsReceipt {
+  fetchedAt: string;
+  reused: boolean;
+  retained: boolean;
+  qualification: string | null;
+  owner: StatsOwner;
+}
+
 export interface StatsOutcome {
+  receipt?: StatsReceipt;
   /// The exact count, summed across every slice. Exact even when
   /// `retrievable` is false: the 1,000-result cap limits retrieval, not
   /// counting.
@@ -3683,6 +3721,11 @@ export interface ShortSlice {
 /// Rust `Subject::cache_key` doc records as a real case -- would put the
 /// viewer's own work under "Others" and show "no activity" for Mine.
 export interface StatsBoard {
+  window?: StatsWindow;
+  stream?: string;
+  totalVerified?: boolean;
+  /** Captured durable owner; absent on older peers and saved payloads. */
+  owner?: StatsOwner;
   /// The authenticated login. What splits the board into Mine and Others.
   viewer: string;
   /// The key this board's stored rows are filed under (#1093).
@@ -3775,6 +3818,7 @@ interface ScopedPoint {
 
 /// The scoped daily series behind a scope page's activity chart.
 export interface StatsSeries {
+  receipt?: StatsReceipt;
   points: ScopedPoint[];
   /// Days whose counts did not come back, NAMED rather than counted and
   /// never defaulted to zero. A missing day rendered as `0` would draw a
@@ -3799,7 +3843,7 @@ export interface StatsSeries {
 /// Mirrors the Rust `github::stats::fetch::Unmeasured`. A tagged union rather
 /// than a boolean, so a second non-GitHub reason adds a variant instead of a
 /// parallel flag nothing forces anyone to read.
-export type Unmeasured = {
+export type Unmeasured = { kind: "timeout" } | { kind: "unavailable"; reason: string } | {
   kind: "budgetExhausted";
   /// The lowest remaining budget GitHub reported. `null` means nothing
   /// reported one, which is NOT the same as zero.
@@ -3835,6 +3879,8 @@ export interface ReviewerRow {
 
 /// The reviews-given leaderboard for one scope (#826).
 export interface StatsReviewers {
+  stopReason?: Unmeasured;
+  receipt?: StatsReceipt;
   /// One row per login successfully counted, ranked highest first with ties
   /// broken on login. Includes measured zeroes; the UI is what declines to
   /// rank them (`Leaderboard.tsx`'s "a zero has no rank" rule).
@@ -3983,6 +4029,9 @@ type LastPusher =
   | { state: "unknown"; reason: string };
 
 export interface ReviewGates {
+  /** Original native cache lifetime; absent on older paired desktops. */
+  rules_valid_for_ms?: number;
+  pusher_valid_for_ms?: number;
   rules: BaseRules;
   last_pusher: LastPusher;
 }
@@ -4005,7 +4054,10 @@ export interface PusherAsk {
 /// -- the budget, the per-refresh cap, or no head repository to ask --
 /// and is never a verdict. `head_oid` is echoed so an answer about a head
 /// the row has since moved off is dropped rather than applied.
+/** Scheduling only; never grants data or action authority. Optional for older peers. */
+export interface AdvisoryProgress { outcome: "deferred" | "partial" | "offered" | "ineligible"; admitted: boolean }
 export interface RowPusher {
+  advisory_progress?: AdvisoryProgress;
   /** Original native remaining lifetime. Absent on older desktops. */
   last_known_pusher?: { value: LastPusher; age_ms: number };
   last_known_rules?: { value: BaseRules; age_ms: number };

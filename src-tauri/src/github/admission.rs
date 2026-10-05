@@ -22,6 +22,8 @@ pub struct ReadContext {
     pub deadline: Instant,
     pub(crate) attempts: Option<AttemptAllowance>,
     pub(crate) first_attempt: Option<FirstAttempt>,
+    pub(crate) advisory_context: Option<crate::remote::context::DispatchContext>,
+    pub(super) live: Option<tokio::sync::watch::Receiver<Option<LiveRead>>>,
 }
 impl ReadContext {
     pub fn new(class: ReadClass, budget: Duration) -> Self {
@@ -30,9 +32,18 @@ impl ReadContext {
             deadline: Instant::now() + budget,
             attempts: None,
             first_attempt: None,
+            advisory_context: None,
+            live: None,
         }
     }
 }
+/// Only queued shared scans carry live demand; dispatched requests freeze it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LiveRead {
+    pub class: ReadClass,
+    pub deadline: Instant,
+}
+
 type FirstAttemptCallback = Box<dyn FnOnce() + Send>;
 
 /// An operation-local, once-only scheduling mark after admission, before HTTP.
@@ -52,7 +63,7 @@ impl FirstAttempt {
             callback: Arc::new(Mutex::new(Some(Box::new(callback)))),
         }
     }
-    fn observe(&self) {
+    pub(super) fn observe(&self) {
         let callback = self
             .callback
             .lock()
@@ -123,13 +134,125 @@ struct Quota {
     reserve_until: Option<Instant>,
     probing: bool,
     revision: u64,
+    observed_at: Option<Instant>,
 }
+/// Read-only account admission evidence captured under one lock. No identity or inputs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaSnapshot {
+    pub remaining: Option<u64>,
+    pub reset_unix_secs: Option<u64>,
+    pub evidence_age_ms: Option<u64>,
+    pub primary_cooldown_ms: u64,
+    pub reserve_cooldown_ms: u64,
+    pub recovery_probe: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionSnapshot {
+    pub captured_at_unix_ms: u64,
+    pub graphql: QuotaSnapshot,
+    pub rest: QuotaSnapshot,
+    pub secondary_cooldown_ms: u64,
+}
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+const ADVISORY_PARTICIPANTS: usize = 32;
+const ADVISORY_INTEREST: Duration = Duration::from_secs(100);
+#[derive(Debug)]
+struct Participant {
+    context: crate::remote::context::DispatchContext,
+    demanded_at: Instant,
+    allocated: u8,
+    spent: u8,
+}
+#[derive(Debug, Default)]
+struct AdvisoryShares {
+    // Vector head is the remainder-allocation cursor. Rotation preserves
+    // insertion order; removal naturally skips absent/revoked participants.
+    participants: Vec<Participant>,
+    initialized: bool,
+}
+impl AdvisoryShares {
+    fn demand(
+        &mut self,
+        context: &crate::remote::context::DispatchContext,
+        now: Instant,
+        new_cycle: bool,
+    ) -> Result<(), ClientError> {
+        let principal = context.principal();
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::metrics::record(principal, "demand", "advisory-share", 0);
+        if new_cycle {
+            self.participants
+                .retain(|p| now.duration_since(p.demanded_at) < ADVISORY_INTEREST);
+        }
+        if let Some(participant) = self
+            .participants
+            .iter_mut()
+            .find(|p| p.context.principal() == principal)
+        {
+            participant.demanded_at = now;
+        } else if self.participants.len() < ADVISORY_PARTICIPANTS {
+            self.participants.push(Participant {
+                context: context.clone(),
+                demanded_at: now,
+                allocated: 0,
+                spent: 0,
+            });
+        }
+        // Even a refused newcomer can be the first request at a boundary.
+        // Allocate existing participants before returning the capacity error.
+        if new_cycle || !self.initialized {
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::metrics::record(0, "reset", "advisory-cycle", 0);
+            let count = self.participants.len();
+            let base = 8 / count;
+            let remainder = 8 % count;
+            for (index, participant) in self.participants.iter_mut().enumerate() {
+                participant.allocated = (base + usize::from(index < remainder)) as u8;
+                participant.spent = 0;
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::metrics::record(
+                    participant.context.principal(),
+                    "allocated",
+                    "advisory-share",
+                    u64::from(participant.allocated),
+                );
+            }
+            self.participants.rotate_left(remainder);
+            self.initialized = true;
+        }
+        let participant = self
+            .participants
+            .iter()
+            .find(|p| p.context.principal() == principal)
+            .ok_or_else(|| refused("advisory consumer capacity is full"))?;
+        if participant.spent >= participant.allocated {
+            return Err(refused("advisory consumer share is spent for this cycle"));
+        }
+        Ok(())
+    }
+    fn debit(&mut self, principal: u64) {
+        self.participants
+            .iter_mut()
+            .find(|p| p.context.principal() == principal)
+            .expect("share checked before atomic debit")
+            .spent += 1;
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::metrics::record(principal, "debit", "advisory-share", 1);
+    }
+}
+
 #[derive(Debug)]
 struct State {
     quotas: [Quota; 2],
     secondary: Option<Instant>,
+    secondary_revision: u64,
     cycle: Instant,
     spent: u8,
+    shares: AdvisoryShares,
 }
 #[derive(Debug)]
 pub(super) struct Admission {
@@ -145,8 +268,10 @@ impl Default for Admission {
             state: Mutex::new(State {
                 quotas: Default::default(),
                 secondary: None,
+                secondary_revision: 0,
                 cycle: Instant::now(),
                 spent: 0,
+                shares: AdvisoryShares::default(),
             }),
         }
     }
@@ -157,10 +282,13 @@ fn refused(message: &str) -> ClientError {
 pub(super) struct Attempt<'a> {
     admission: &'a Admission,
     bucket: Bucket,
-    probe: Option<u64>,
+    probe: Option<(u64, Option<u64>, bool)>,
     done: bool,
+    pub(super) deadline: Option<Instant>,
     _total: Option<SemaphorePermit<'a>>,
     _background: Option<SemaphorePermit<'a>>,
+    #[cfg(feature = "enterprise-harness")]
+    metric: crate::enterprise_harness::metrics::Scope,
 }
 impl Attempt<'_> {
     pub fn complete(&mut self) {
@@ -169,7 +297,9 @@ impl Attempt<'_> {
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
-        if let Some(revision) = self.probe {
+        #[cfg(feature = "enterprise-harness")]
+        self.metric.finish("released");
+        if let Some((revision, secondary_revision, primary_recovery)) = self.probe {
             let mut state = self
                 .admission
                 .state
@@ -177,18 +307,23 @@ impl Drop for Attempt<'_> {
                 .unwrap_or_else(|e| e.into_inner());
             let quota = &mut state.quotas[self.bucket as usize];
             quota.probing = false;
-            if quota.revision == revision {
+            if primary_recovery && quota.revision == revision {
                 if self.done {
                     quota.blocked = None;
                     quota.reserve_until = None;
+                } else {
+                    let retry = Instant::now() + Duration::from_secs(1);
+                    quota.blocked = Some(quota.blocked.map_or(retry, |old| old.max(retry)));
+                }
+            }
+            if secondary_revision == Some(state.secondary_revision) {
+                if self.done {
                     if state.secondary.is_some_and(|until| until <= Instant::now()) {
                         state.secondary = None;
                     }
                 } else {
-                    quota.blocked = Some(Instant::now() + Duration::from_secs(1));
-                    if state.secondary.is_some() {
-                        state.secondary = Some(Instant::now() + Duration::from_secs(1));
-                    }
+                    let retry = Instant::now() + Duration::from_secs(1);
+                    state.secondary = Some(state.secondary.map_or(retry, |old| old.max(retry)));
                 }
             }
         }
@@ -200,9 +335,28 @@ impl Admission {
         bucket: Bucket,
         class: Option<ReadClass>,
         allowance: Option<&AttemptAllowance>,
+        caller: Option<&crate::remote::context::DispatchContext>,
     ) -> Result<Attempt<'_>, ClientError> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let desktop = crate::remote::context::DispatchContext::desktop();
+        let caller = caller.unwrap_or(&desktop);
+        // Registry-before-capability lock order, held only through accounting.
+        // A revoked paired incarnation cannot renew demand or admit an attempt.
+        let _capability = if class == Some(ReadClass::Advisory) {
+            // Drop each liveness snapshot before acquiring the next guard.
+            // Different immutable account instances may share capabilities;
+            // holding two reader guards could deadlock behind queued revokers.
+            state
+                .shares
+                .participants
+                .retain(|p| p.context.guard().is_ok());
+            caller
+                .guard()
+                .map_err(|_| refused("advisory consumer pairing has been retired"))?
+        } else {
+            None
+        };
         if state.secondary.is_some_and(|until| until > now) {
             return Err(refused("provider cooldown is active"));
         }
@@ -225,10 +379,14 @@ impl Admission {
             return Err(refused("provider recovery probe is in progress"));
         }
         if class == Some(ReadClass::Advisory) {
-            if now.duration_since(state.cycle) >= Duration::from_secs(30) {
+            let new_cycle = now.duration_since(state.cycle) >= Duration::from_secs(30);
+            if new_cycle {
                 state.cycle = now;
                 state.spent = 0;
             }
+            // Refused late demand is remembered before checking spent credit.
+            // New callers cannot mint shares inside an already allocated cycle.
+            state.shares.demand(caller, now, new_cycle)?;
             if state.spent >= 8 {
                 return Err(refused(
                     "advisory attempt allowance is spent for this cycle",
@@ -241,20 +399,36 @@ impl Admission {
         let probe = if deadline.is_some() || secondary_recovery {
             let quota = &mut state.quotas[bucket as usize];
             quota.probing = true;
-            Some(quota.revision)
+            Some((
+                quota.revision,
+                secondary_recovery.then_some(state.secondary_revision),
+                deadline.is_some(),
+            ))
         } else {
             None
         };
         if class == Some(ReadClass::Advisory) {
             state.spent += 1;
+            state.shares.debit(caller.principal());
         }
         Ok(Attempt {
             admission: self,
             bucket,
             probe,
             done: false,
+            deadline: None,
             _total: None,
             _background: None,
+            #[cfg(feature = "enterprise-harness")]
+            metric: crate::enterprise_harness::metrics::Scope::new(
+                "admitted",
+                match class {
+                    Some(ReadClass::Foreground) => 0,
+                    Some(ReadClass::Background) => 1,
+                    Some(ReadClass::Advisory) => 2,
+                    None => 3,
+                },
+            ),
         })
     }
     pub async fn read(
@@ -262,46 +436,122 @@ impl Admission {
         bucket: Bucket,
         context: ReadContext,
     ) -> Result<Attempt<'_>, ClientError> {
-        let acquire = async {
-            let background = if context.class != ReadClass::Foreground {
-                Some(
-                    self.background
-                        .acquire()
-                        .await
-                        .map_err(|_| refused("read admission closed"))?,
-                )
-            } else {
-                None
+        let mut live = context.live.clone();
+        loop {
+            let demand = match &mut live {
+                Some(receiver) => (*receiver.borrow_and_update())
+                    .ok_or_else(|| refused("shared read has no live consumers"))?,
+                None => LiveRead {
+                    class: context.class,
+                    deadline: context.deadline,
+                },
             };
-            let total = self
-                .total
-                .acquire()
-                .await
-                .map_err(|_| refused("read admission closed"))?;
-            if Instant::now() >= context.deadline {
-                return Err(refused("read deadline elapsed before dispatch"));
-            }
-            let mut attempt = self
-                .enter(bucket, Some(context.class), context.attempts.as_ref())
-                .map_err(|error| match error {
-                    ClientError::NotDispatched(message) if message.starts_with("provider") => {
-                        ClientError::RateLimited(message)
+            let deadline = demand.deadline;
+            let acquire = async {
+                let background = if demand.class != ReadClass::Foreground {
+                    Some(
+                        self.background
+                            .acquire()
+                            .await
+                            .map_err(|_| refused("read admission closed"))?,
+                    )
+                } else {
+                    None
+                };
+                let total = self
+                    .total
+                    .acquire()
+                    .await
+                    .map_err(|_| refused("read admission closed"))?;
+                if Instant::now() >= deadline {
+                    return Err(refused("read deadline elapsed before dispatch"));
+                }
+                let mut attempt = self
+                    .enter(
+                        bucket,
+                        Some(demand.class),
+                        context.attempts.as_ref(),
+                        context.advisory_context.as_ref(),
+                    )
+                    .map_err(|error| match error {
+                        ClientError::NotDispatched(message) if message.starts_with("provider") => {
+                            ClientError::RateLimited(message)
+                        }
+                        other => other,
+                    })?;
+                attempt._background = background;
+                attempt._total = Some(total);
+                attempt.deadline = Some(deadline);
+                if let Some(observer) = &context.first_attempt {
+                    observer.observe();
+                }
+                Ok(attempt)
+            };
+            let wait = tokio::time::timeout_at(deadline, acquire);
+            if let Some(receiver) = &mut live {
+                tokio::select! {
+                    biased;
+                    changed = receiver.changed() => {
+                        if changed.is_err() { return Err(refused("shared read demand closed")); }
+                        // Dropping only this pre-dispatch acquisition releases
+                        // any partial permits; attempts have not been debited.
+                        continue;
                     }
-                    other => other,
-                })?;
-            attempt._background = background;
-            attempt._total = Some(total);
-            if let Some(observer) = &context.first_attempt {
-                observer.observe();
+                    result = wait => return result.map_err(|_| refused("read deadline elapsed before dispatch"))?,
+                }
+            } else {
+                return wait
+                    .await
+                    .map_err(|_| refused("read deadline elapsed before dispatch"))?;
             }
-            Ok(attempt)
-        };
-        tokio::time::timeout_at(context.deadline, acquire)
-            .await
-            .map_err(|_| refused("read deadline elapsed before dispatch"))?
+        }
     }
+
     pub fn write(&self, bucket: Bucket) -> Result<Attempt<'_>, ClientError> {
-        self.enter(bucket, None, None)
+        self.enter(bucket, None, None, None)
+    }
+    pub(super) fn retry_wait(&self, bucket: Bucket) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.quotas[bucket as usize]
+            .blocked
+            .into_iter()
+            .chain(state.secondary)
+            .map(|until| {
+                let wait = until.saturating_duration_since(Instant::now());
+                wait.as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() > 0))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let cooldown = |until: Option<Instant>| {
+            until.map_or(0, |until| millis(until.saturating_duration_since(now)))
+        };
+        let quota = |q: &Quota| QuotaSnapshot {
+            remaining: if q.reset.is_some_and(|at| seconds_until(at) == 0)
+                || q.unknown_until.is_some_and(|at| at <= now)
+            {
+                None
+            } else {
+                q.remaining
+            },
+            reset_unix_secs: q.reset,
+            evidence_age_ms: q
+                .observed_at
+                .map(|at| millis(now.saturating_duration_since(at))),
+            primary_cooldown_ms: cooldown(q.blocked),
+            reserve_cooldown_ms: cooldown(q.reserve_until),
+            recovery_probe: q.probing,
+        };
+        AdmissionSnapshot {
+            captured_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+            graphql: quota(&state.quotas[0]),
+            rest: quota(&state.quotas[1]),
+            secondary_cooldown_ms: cooldown(state.secondary),
+        }
     }
     pub fn remaining(&self, bucket: Bucket) -> Option<u64> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -329,6 +579,7 @@ impl Admission {
         }
         if reset.is_some() && reset != quota.reset {
             quota.remaining = None;
+            quota.observed_at = None;
             quota.reserve_until = None;
         }
         if let Some(reset) = reset {
@@ -347,6 +598,11 @@ impl Admission {
                 quota.remaining = None;
                 quota.reserve_until = None;
             }
+            // A higher out-of-order same-window value does not refresh the
+            // age of the lower, retained constraint.
+            if quota.remaining.is_none_or(|old| remaining <= old) {
+                quota.observed_at = Some(Instant::now());
+            }
             quota.remaining = Some(quota.remaining.map_or(remaining, |old| old.min(remaining)));
             if matches!(bucket, Bucket::Rest) && quota.remaining.is_some_and(|r| r <= 500) {
                 let seconds = reset.map(seconds_until).unwrap_or(60).max(1);
@@ -360,11 +616,13 @@ impl Admission {
         let seconds = seconds.max(1);
         let until = provider_deadline(seconds);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let quota = &mut state.quotas[bucket as usize];
-        quota.blocked = Some(quota.blocked.map_or(until, |old| old.max(until)));
-        quota.revision += 1;
         if secondary {
             state.secondary = Some(state.secondary.map_or(until, |old| old.max(until)));
+            state.secondary_revision += 1;
+        } else {
+            let quota = &mut state.quotas[bucket as usize];
+            quota.blocked = Some(quota.blocked.map_or(until, |old| old.max(until)));
+            quota.revision += 1;
         }
         seconds
     }
@@ -402,9 +660,301 @@ pub(super) fn retry_seconds(value: &str, now: chrono::DateTime<chrono::Utc>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn newer_cross_protocol_cooldown_survives_old_probe_cleanup() {
+        for (first, other) in [
+            (Bucket::Graphql, Bucket::Rest),
+            (Bucket::Rest, Bucket::Graphql),
+        ] {
+            for completed in [false, true] {
+                let admission = Admission::default();
+                admission.limit(first, 1, true);
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let mut probe = admission.write(first).unwrap();
+                admission.limit(other, 60, true);
+                if completed {
+                    probe.complete();
+                }
+                drop(probe);
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert!(
+                    admission.write(first).is_err(),
+                    "old probe shortened newer shared refusal"
+                );
+                tokio::time::advance(Duration::from_secs(58)).await;
+                let mut recovery = admission.write(first).unwrap();
+                assert!(admission.write(other).is_err());
+                recovery.complete();
+                drop(recovery);
+                assert!(admission.write(other).is_ok());
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn secondary_recovery_in_other_bucket_cannot_clear_primary_exhaustion() {
+        let admission = Admission::default();
+        admission.limit(Bucket::Graphql, 1800, false);
+        admission.limit(Bucket::Rest, 1, true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(admission.write(Bucket::Graphql).is_err());
+        let mut recovery = admission.write(Bucket::Rest).unwrap();
+        recovery.complete();
+        drop(recovery);
+        assert!(admission.write(Bucket::Rest).is_ok());
+        assert!(admission.write(Bucket::Graphql).is_err());
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        let mut recovery = admission.write(Bucket::Graphql).unwrap();
+        recovery.complete();
+        drop(recovery);
+        assert!(admission.write(Bucket::Graphql).is_ok());
+    }
     fn context(class: ReadClass) -> ReadContext {
         ReadContext::new(class, Duration::from_secs(30))
     }
+    fn principal_read(caller: &crate::remote::context::DispatchContext) -> ReadContext {
+        let mut read = context(ReadClass::Advisory);
+        read.advisory_context = Some(caller.clone());
+        read
+    }
+    async fn spend_share(
+        admission: &Admission,
+        caller: &crate::remote::context::DispatchContext,
+    ) -> usize {
+        let mut admitted = 0;
+        for _ in 0..9 {
+            if admission
+                .read(Bucket::Rest, principal_read(caller))
+                .await
+                .is_ok()
+            {
+                admitted += 1;
+            }
+        }
+        admitted
+    }
+    #[test]
+    fn two_account_ledgers_release_capability_snapshots_before_retirement_fences() {
+        use crate::remote::context::DispatchContext;
+        let a = DispatchContext::paired_for_test();
+        let b = DispatchContext::paired_for_test();
+        let ledgers = [Admission::default(), Admission::default()];
+        for ledger in &ledgers {
+            for caller in [&a, &b] {
+                drop(ledger.enter(Bucket::Rest, Some(ReadClass::Advisory), None, Some(caller)));
+            }
+        }
+        let held_a = a.guard().unwrap();
+        let held_b = b.guard().unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        for caller in [a.clone(), b.clone()] {
+            let started = started.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                caller.retire_for_test();
+                done.send(()).unwrap();
+            });
+        }
+        for _ in 0..2 {
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for (ledger, caller) in ledgers.into_iter().zip([a.clone(), b.clone()]) {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                // A race may enter before retirement; after the writer completes,
+                // the same incarnation must always be refused.
+                drop(ledger.enter(Bucket::Rest, Some(ReadClass::Advisory), None, Some(&caller)));
+                done.send(()).unwrap();
+            });
+        }
+        drop(held_a);
+        drop(held_b);
+        for _ in 0..4 {
+            finished
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability pruning and concurrent retirement must finish");
+        }
+        assert!(a.guard().is_err());
+        assert!(b.guard().is_err());
+        let fresh = Admission::default();
+        for caller in [&a, &b] {
+            assert!(fresh
+                .enter(Bucket::Rest, Some(ReadClass::Advisory), None, Some(caller))
+                .is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn principal_share_capacity_refusal_cannot_poison_a_new_cycle() {
+        use crate::remote::context::DispatchContext;
+        let admission = Admission::default();
+        let callers: Vec<_> = (0..33)
+            .map(|_| DispatchContext::paired_for_test())
+            .collect();
+        for caller in &callers[..32] {
+            let _ = admission.read(Bucket::Rest, principal_read(caller)).await;
+        }
+        assert_eq!(
+            admission.state.lock().unwrap().shares.participants.len(),
+            32
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(admission
+            .read(Bucket::Rest, principal_read(&callers[32]))
+            .await
+            .is_err());
+        let mut total = 0;
+        for caller in &callers[..32] {
+            total += spend_share(&admission, caller).await;
+        }
+        assert_eq!(
+            total, 8,
+            "33rd caller refusal must not prevent existing participants' boundary allocation"
+        );
+        assert_eq!(
+            admission.state.lock().unwrap().shares.participants.len(),
+            32
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn principal_share_allocations_rotate_for_one_through_thirty_two_consumers() {
+        use crate::remote::context::DispatchContext;
+        for n in [1, 2, 3, 8, 9, 32] {
+            let admission = Admission::default();
+            let callers: Vec<_> = (0..n).map(|_| DispatchContext::paired_for_test()).collect();
+            for caller in &callers {
+                let _ = admission.read(Bucket::Rest, principal_read(caller)).await;
+            }
+            let mut totals = vec![0; n];
+            for _ in 0..n {
+                tokio::time::advance(Duration::from_secs(31)).await;
+                let mut cycle = 0;
+                for (i, caller) in callers.iter().enumerate() {
+                    let count = spend_share(&admission, caller).await;
+                    assert!(count >= 8 / n && count <= (8 / n) + usize::from(8 % n != 0));
+                    cycle += count;
+                    totals[i] += count;
+                }
+                assert_eq!(cycle, 8);
+                assert_eq!(admission.state.lock().unwrap().spent, 8);
+            }
+            assert!(
+                totals.iter().all(|count| *count == 8),
+                "stable remainder rotation for {n} participants: {totals:?}"
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn principal_interest_covers_cached_sixty_plus_thirty_but_abandoned_credit_expires() {
+        use crate::remote::context::DispatchContext;
+        let admission = Admission::default();
+        let a = DispatchContext::desktop();
+        let b = DispatchContext::paired_for_test();
+        assert_eq!(spend_share(&admission, &a).await, 8);
+        assert_eq!(spend_share(&admission, &b).await, 0);
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert_eq!(spend_share(&admission, &a).await, 4);
+        }
+        assert_eq!(
+            admission.state.lock().unwrap().shares.participants.len(),
+            2,
+            "cached peer survives ordinary60s plus next30s window"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(
+            spend_share(&admission, &a).await,
+            8,
+            "last absent demand at0 expires at100, allocation catches up at120 <130"
+        );
+        assert_eq!(admission.state.lock().unwrap().shares.participants.len(), 1);
+        assert_eq!(
+            spend_share(&admission, &b).await,
+            0,
+            "return cannot mint credit mid-cycle"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(spend_share(&admission, &a).await, 4);
+        assert_eq!(spend_share(&admission, &b).await, 4);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn revoked_principal_cannot_renew_or_admit_and_unused_credit_is_not_borrowed() {
+        use crate::remote::context::DispatchContext;
+        let admission = Admission::default();
+        let a = DispatchContext::desktop();
+        let b = DispatchContext::paired_for_test();
+        let _ = admission.read(Bucket::Rest, principal_read(&a)).await;
+        let _ = admission.read(Bucket::Rest, principal_read(&b)).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(admission
+            .read(Bucket::Rest, principal_read(&a))
+            .await
+            .is_ok());
+        b.retire_for_test();
+        assert_eq!(spend_share(&admission, &b).await, 0);
+        assert_eq!(
+            spend_share(&admission, &a).await,
+            3,
+            "revoked peer's current frozen credit remains unused"
+        );
+        assert_eq!(admission.state.lock().unwrap().shares.participants.len(), 1);
+        for _ in 0..8 {
+            assert!(admission
+                .read(Bucket::Rest, context(ReadClass::Foreground))
+                .await
+                .is_ok());
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(spend_share(&admission, &a).await, 8);
+        let repaired = DispatchContext::paired_for_test();
+        assert_ne!(repaired.principal(), b.principal());
+        assert_eq!(spend_share(&admission, &repaired).await, 0);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(spend_share(&admission, &a).await, 4);
+        assert_eq!(spend_share(&admission, &repaired).await, 4);
+        assert_eq!(
+            spend_share(&Admission::default(), &repaired).await,
+            8,
+            "new immutable account has no prior sharing state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remembered_late_principal_receives_four_attempts_despite_early_competitor() {
+        use crate::remote::context::DispatchContext;
+        let admission = Admission::default();
+        let desktop = DispatchContext::desktop();
+        let paired = DispatchContext::paired_for_test();
+        let read = |caller: &DispatchContext| {
+            let mut context = context(ReadClass::Advisory);
+            context.advisory_context = Some(caller.clone());
+            context
+        };
+        for _ in 0..8 {
+            assert!(admission.read(Bucket::Rest, read(&desktop)).await.is_ok());
+        }
+        assert!(admission
+            .read(Bucket::Graphql, read(&paired))
+            .await
+            .is_err());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        for _ in 0..4 {
+            assert!(admission.read(Bucket::Rest, read(&desktop)).await.is_ok());
+        }
+        assert!(
+            admission.read(Bucket::Rest, read(&desktop)).await.is_err(),
+            "early caller cannot consume a remembered late caller's four credits"
+        );
+        for _ in 0..4 {
+            assert!(admission.read(Bucket::Graphql, read(&paired)).await.is_ok());
+        }
+        assert!(admission
+            .read(Bucket::Graphql, read(&paired))
+            .await
+            .is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn first_attempt_observer_ignores_refusals_and_runs_once_outside_accounting_lock() {
         use std::sync::atomic::{AtomicUsize, Ordering};

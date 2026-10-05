@@ -1186,6 +1186,232 @@ async fn coalesced_adoption_cannot_settle_an_independent_newer_failure() {
     }
 }
 
+// Separate the virtual cadence assertion from real HTTP/SQLite completion.
+// Entry must occur before another real 15-second sleep can rescue a missed tick.
+#[derive(Debug, PartialEq)]
+struct ContinuationEvent {
+    list: CachedList,
+    logical_now: i64,
+    entered: bool,
+    at: tokio::time::Instant,
+}
+async fn continuation_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ContinuationEvent>,
+    worker: &mut tokio::task::JoinHandle<()>,
+    list: CachedList,
+    logical_now: i64,
+    entered: bool,
+    not_before: tokio::time::Instant,
+) -> Result<tokio::time::Instant, String> {
+    // Completion includes the existing 30s request context plus a 5s SQLite
+    // busy allowance. This is a diagnostic watchdog, not a new product SLA.
+    let limit = Duration::from_secs(if entered { 3 } else { 35 });
+    let deadline = not_before + limit;
+    let event = tokio::select! {
+        // A timely queued event remains valid if the test task is polled late.
+        // Worker failure wins; then event timestamps decide before the watchdog.
+        biased;
+        result = worker => return Err(format!("continuation worker ended before expected event: {result:?}")),
+        event = rx.recv() => event.ok_or_else(|| "continuation event channel closed".to_string())?,
+        _ = tokio::time::sleep_until(deadline) => return Err(format!("continuation {} timed out: list={list:?} logical_now={logical_now}", if entered { "entry" } else { "completion" })),
+    };
+    if event.list != list
+        || event.logical_now != logical_now
+        || event.entered != entered
+        || event.at < not_before
+        || event.at > deadline
+    {
+        return Err(format!("unexpected continuation event: {event:?}; expected list={list:?} logical_now={logical_now} entered={entered} not_before={not_before:?} deadline={deadline:?}"));
+    }
+    Ok(event.at)
+}
+async fn continuation_round(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ContinuationEvent>,
+    worker: &mut tokio::task::JoinHandle<()>,
+    logical_now: i64,
+    tick: tokio::time::Instant,
+) -> Result<(), String> {
+    let mut phase_start = tick;
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let entered = continuation_event(rx, worker, list, logical_now, true, phase_start).await?;
+        phase_start = continuation_event(rx, worker, list, logical_now, false, entered).await?;
+    }
+    Ok(())
+}
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_rejects_missing_tick_before_next_wake() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        tx.send(ContinuationEvent {
+            list: CachedList::Authored,
+            logical_now: 1015,
+            entered: true,
+            at: tokio::time::Instant::now(),
+        })
+        .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let error = continuation_event(
+        &mut rx,
+        &mut worker,
+        CachedList::Authored,
+        1015,
+        true,
+        start,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("entry timed out"), "{error}");
+    assert_eq!(start.elapsed(), Duration::from_secs(3));
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_rejects_wrong_identity_phase_and_out_of_window_event() {
+    let start = tokio::time::Instant::now();
+    for (list, logical_now, entered, at) in [
+        (CachedList::Reviewing, 1015, true, start),
+        (CachedList::Authored, 1030, true, start),
+        (CachedList::Authored, 1015, false, start),
+        (
+            CachedList::Authored,
+            1015,
+            true,
+            start - Duration::from_secs(1),
+        ),
+        (
+            CachedList::Authored,
+            1015,
+            true,
+            start + Duration::from_secs(4),
+        ),
+    ] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ContinuationEvent {
+            list,
+            logical_now,
+            entered,
+            at,
+        })
+        .unwrap();
+        let mut worker = tokio::spawn(std::future::pending::<()>());
+        let error = continuation_event(
+            &mut rx,
+            &mut worker,
+            CachedList::Authored,
+            1015,
+            true,
+            start,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unexpected continuation event"), "{error}");
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_uses_event_time_when_observed_after_deadline() {
+    for entered in [true, false] {
+        for timely in [true, false] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let start = tokio::time::Instant::now();
+            let limit = Duration::from_secs(if entered { 3 } else { 35 });
+            let at = start
+                + if timely {
+                    limit
+                } else {
+                    limit + Duration::from_millis(1)
+                };
+            tx.send(ContinuationEvent {
+                list: CachedList::Authored,
+                logical_now: 1015,
+                entered,
+                at,
+            })
+            .unwrap();
+            let mut worker = tokio::spawn(std::future::pending::<()>());
+            tokio::time::advance(limit + Duration::from_secs(1)).await;
+            let result = continuation_event(
+                &mut rx,
+                &mut worker,
+                CachedList::Authored,
+                1015,
+                entered,
+                start,
+            )
+            .await;
+            if timely {
+                assert_eq!(result.unwrap(), at);
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("unexpected continuation event"));
+            }
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_reports_worker_failure_without_waiting() {
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async { panic!("controlled worker failure") });
+    let error = continuation_event(
+        &mut rx,
+        &mut worker,
+        CachedList::Authored,
+        1015,
+        true,
+        start,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("worker ended") && error.contains("controlled worker failure"),
+        "{error}"
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_allows_io_after_verified_entry() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async move {
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            tx.send(ContinuationEvent {
+                list,
+                logical_now: 1015,
+                entered: true,
+                at: tokio::time::Instant::now(),
+            })
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(3200)).await;
+            tx.send(ContinuationEvent {
+                list,
+                logical_now: 1015,
+                entered: false,
+                at: tokio::time::Instant::now(),
+            })
+            .unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+    continuation_round(&mut rx, &mut worker, 1015, start)
+        .await
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_millis(6400));
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
 /// This drives the same sleeping dispatcher and persisted fetch path used by
 /// poll::spawn, rather than calling advance_scan at a list of timestamps.
 #[tokio::test(start_paused = true)]
@@ -1215,7 +1441,7 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
     .unwrap();
     publish(&polls, &conn, Ok(first)).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker = tokio::spawn(crate::poll::run_queue_continuations(
+    let mut worker = tokio::spawn(crate::poll::run_queue_continuations(
         focused.clone(),
         needed.clone(),
         enabled.clone(),
@@ -1231,6 +1457,14 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
                 let now = now.clone();
                 let tx = tx.clone();
                 async move {
+                    let dispatch_now = now.load(Ordering::SeqCst);
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: true,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                     // The production fetch adapter rechecks the durable owner,
                     // continuation eligibility and attempt limit at dispatch.
                     let scoped = client.with_read_context(ReadContext::new(
@@ -1244,14 +1478,20 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
                         list,
                         Duration::from_secs(30),
                         true,
-                        || (120, now.load(Ordering::SeqCst)),
+                        || (120, dispatch_now),
                     )
                     .await
                     .unwrap();
                     let permit = polls.success_publication(&attempt).await.unwrap();
                     let result = reconcile_github_at(path, &polls, &permit, result).await;
                     polls.complete(permit, result, |_| {});
-                    tx.send(list).unwrap();
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: false,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                 }
             }
         },
@@ -1289,16 +1529,14 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
         for _ in 0..5 {
             let before = server.received_requests().await.unwrap().len();
             now.fetch_add(15, Ordering::SeqCst);
+            let tick = tokio::time::Instant::now() + Duration::from_secs(15);
             tokio::time::advance(Duration::from_secs(15)).await;
             // Real sockets and blocking SQLite are allowed to complete. Virtual
             // time drives the timer; it does not stand in for provider completion.
             tokio::time::resume();
-            for _ in 0..2 {
-                tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            }
+            continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+                .await
+                .unwrap();
             tokio::time::pause();
             assert!(server.received_requests().await.unwrap().len() - before <= 3);
             if pass > 0 {
@@ -1334,14 +1572,12 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
     // Even well after the next-pass deadline, the continuation timer must
     // not start a fresh scan. Only an ordinary/foreground refresh can do so.
     now.fetch_add(3600, Ordering::SeqCst);
+    let tick = tokio::time::Instant::now() + Duration::from_secs(15);
     tokio::time::advance(Duration::from_secs(15)).await;
     tokio::time::resume();
-    for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
+    continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+        .await
+        .unwrap();
     assert_eq!(server.received_requests().await.unwrap().len(), before);
     assert_eq!(saved(&conn), rows);
     assert_eq!(
@@ -1909,4 +2145,921 @@ async fn settle_independent_readback_failure(polls: &SourcePolls) -> Status {
         |_| {},
     );
     polls.get(&source, list)
+}
+
+// These regressions use the same durable dispatch/publication boundary as desktop
+// and paired callers. Only the external provider is synthetic.
+async fn terminal_provider(fail_first: bool) -> (MockServer, GitHubClient) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = MockServer::start().await;
+    let fail = AtomicBool::new(fail_first);
+    Mock::given(method("POST")).respond_with(move |request: &wiremock::Request| {
+        let body: Value = request.body_json().unwrap();
+        let mut data = json!({"viewer":{"login":"synthetic-viewer"}});
+        if body["variables"]["n0"].is_number() {
+            if fail.swap(false, Ordering::SeqCst) {
+                return ResponseTemplate::new(503);
+            }
+            for i in 0..4 {
+                if let Some(n) = body["variables"][format!("n{i}")].as_u64() {
+                    let mut direct = node(n as usize, false);
+                    direct["state"] = json!("CLOSED");
+                    data[format!("p{i}")] = json!({"pullRequest":direct});
+                }
+            }
+        } else {
+            data["authored"] = json!({"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+        }
+        ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+    }).mount(&server).await;
+    let client = github_client(&server);
+    client.fetch_viewer().await.unwrap();
+    (server, client)
+}
+fn seed_terminal_inventory(
+    conn: &rusqlite::Connection,
+    list: CachedList,
+    count: usize,
+    done: bool,
+) {
+    let raw = json!({"authored":{"nodes":(1..=count).map(|n|node(n,false)).collect::<Vec<_>>()}});
+    let rows = crate::github::map::map_list(&raw, "authored");
+    assert_eq!(rows.len(), count);
+    let candidates = rows
+        .iter()
+        .map(|r| queue_scan::Candidate {
+            isolated: false,
+            identity: r.identity(),
+            id: r.id.clone(),
+            head: r.head_oid.clone(),
+            created_at: r.created_at,
+            negative_at: None,
+            eligible_at: 1000,
+            failures: 0,
+        })
+        .collect();
+    reconcile_github_snapshot(
+        conn,
+        &Source::default(),
+        list,
+        FetchedList {
+            viewer: Some("synthetic-viewer".into()),
+            prs: rows,
+            total: Some(0),
+            coverage: Coverage::Complete,
+            scan: Some(queue_scan::Commit {
+                expected_revision: 0,
+                removals: vec![],
+                state: queue_scan::State {
+                    candidates,
+                    done,
+                    started_at: Some(900),
+                    finished_at: done.then_some(1000),
+                    completed_at: Some(1000),
+                    completed_total: Some(0),
+                    coverage_valid: true,
+                    total: Some(0),
+                    count_seen: true,
+                    eligible_at: 1000,
+                    ..Default::default()
+                },
+            }),
+        },
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{}", e.message));
+}
+async fn durable_terminal_step(
+    path: std::path::PathBuf,
+    polls: &SourcePolls,
+    client: &GitHubClient,
+    list: CachedList,
+    now: i64,
+    continuation: bool,
+) {
+    let (attempt, _) = polls.begin_attempt(Source::default(), list).await;
+    let result = fetch_github_step_at(
+        path.clone(),
+        client,
+        list,
+        Duration::from_secs(30),
+        continuation,
+        || (120, now),
+    )
+    .await
+    .unwrap();
+    let permit = polls.success_publication(&attempt).await.unwrap();
+    let result = reconcile_github_at(path, polls, &permit, result).await;
+    assert!(result.is_ok(), "durable publication failed");
+    polls.complete(permit, result, |_| {});
+}
+fn terminal_inventory(
+    conn: &rusqlite::Connection,
+    list: CachedList,
+) -> Vec<crate::github::model::PullRequest> {
+    let SnapshotData::Available { prs, .. } =
+        source_cache::load_source_snapshot(conn, &Source::default(), list)
+            .unwrap()
+            .data
+    else {
+        panic!("missing inventory")
+    };
+    prs
+}
+fn confirmation_numbers(request: &wiremock::Request) -> Vec<u64> {
+    let body: Value = request.body_json().unwrap();
+    (0..4)
+        .filter_map(|i| body["variables"][format!("n{i}")].as_u64())
+        .collect()
+}
+#[tokio::test]
+async fn terminal_proofs_are_not_reseeded_at_discovery_completion() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("terminal.sqlite");
+    let polls = SourcePolls::default();
+    let list = CachedList::Reviewing;
+    seed_terminal_inventory(&crate::store::open_db(&path).unwrap(), list, 8, false);
+    for now in [1000, 1120] {
+        durable_terminal_step(path.clone(), &polls, &client, list, now, false).await;
+        let conn = crate::store::open_db(&path).unwrap();
+        let rows = terminal_inventory(&conn, list);
+        let loaded = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+        assert!(
+            loaded
+                .state
+                .candidates
+                .iter()
+                .all(|c| rows.iter().any(|r| r.identity() == c.identity)),
+            "confirmed removals must never survive in durable candidates"
+        );
+    }
+    assert!(terminal_inventory(&crate::store::open_db(&path).unwrap(), list).is_empty());
+    let numbers: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(confirmation_numbers)
+        .collect();
+    assert_eq!(numbers, (1..=8).collect::<Vec<_>>());
+}
+#[tokio::test]
+async fn transient_confirmation_failure_recovers_batching_after_reload() {
+    for continuation in [false, true] {
+        let (server, client) = terminal_provider(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.sqlite");
+        let polls = SourcePolls::default();
+        let list = CachedList::Reviewing;
+        seed_terminal_inventory(&crate::store::open_db(&path).unwrap(), list, 150, true);
+        // Refresh crosses fresh_pass; Continue exercises the 15-second cadence.
+        for step in 1..=42 {
+            durable_terminal_step(
+                path.clone(),
+                &polls,
+                &client,
+                list,
+                1000 + step * if continuation { 15 } else { 60 },
+                continuation,
+            )
+            .await;
+        }
+        assert!(
+            terminal_inventory(&crate::store::open_db(&path).unwrap(), list).is_empty(),
+            "healthy batching must recover within 42 opportunities"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let batches: Vec<_> = requests
+            .iter()
+            .map(confirmation_numbers)
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(batches.len(), 42);
+        assert_eq!(batches.iter().filter(|n| n.len() == 1).count(), 4);
+        let healthy: Vec<_> = batches.iter().skip(1).flatten().copied().collect();
+        assert_eq!(healthy.len(), 150);
+        assert_eq!(
+            healthy
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            150
+        );
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn completed_discovery_continuations_drain_terminal_inventory_within_budget() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    tokio::time::resume();
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timer-terminal.sqlite");
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        seed_terminal_inventory(&crate::store::open_db(&path).unwrap(), list, 150, true);
+    }
+    let baseline = server.received_requests().await.unwrap().len();
+    let polls = Arc::new(SourcePolls::default());
+    let client = Arc::new(client);
+    let now = Arc::new(AtomicI64::new(1000));
+    let flags = [
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+    ];
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut worker = tokio::spawn(crate::poll::run_queue_continuations(
+        flags[0].clone(),
+        flags[1].clone(),
+        flags[2].clone(),
+        {
+            let polls = polls.clone();
+            let path = path.clone();
+            let now = now.clone();
+            move |list| {
+                let polls = polls.clone();
+                let client = client.clone();
+                let path = path.clone();
+                let now = now.clone();
+                let tx = tx.clone();
+                async move {
+                    let dispatch_now = now.load(Ordering::SeqCst);
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: true,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
+                    let scoped = client.with_read_context(ReadContext::new(
+                        ReadClass::Background,
+                        Duration::from_secs(30),
+                    ));
+                    durable_terminal_step(path, &polls, &scoped, list, dispatch_now, true).await;
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: false,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
+                }
+            }
+        },
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    for flag in &flags {
+        flag.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), baseline);
+        flag.store(true, Ordering::SeqCst);
+    }
+    for round in 1..=39 {
+        now.store(1000 + round * 15, Ordering::SeqCst);
+        let tick = tokio::time::Instant::now() + Duration::from_secs(15);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let conn = crate::store::open_db(&path).unwrap();
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let rows = terminal_inventory(&conn, list);
+            let loaded =
+                queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+            assert_eq!(
+                rows.len(),
+                150usize.saturating_sub(round as usize * 4),
+                "continuation round {round}"
+            );
+            assert_eq!(loaded.state.candidates.len(), rows.len());
+            assert_eq!(
+                loaded.state.completed_at,
+                Some(1000),
+                "confirmation must not refresh discovery age"
+            );
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len() - baseline,
+        76,
+        "38 bounded documents per list; no extra discovery or exhausted work"
+    );
+    for reviewing in [false, true] {
+        let numbers: Vec<_> = requests[baseline..]
+            .iter()
+            .filter(|r| {
+                let b: Value = r.body_json().unwrap();
+                b["variables"]["q0"]
+                    .as_str()
+                    .unwrap()
+                    .contains("review-requested")
+                    == reviewing
+            })
+            .flat_map(confirmation_numbers)
+            .collect();
+        assert_eq!(numbers, (1..=150).collect::<Vec<_>>());
+    }
+    worker.abort();
+    let _ = worker.await;
+}
+
+fn rewrite_terminal_checkpoint(
+    conn: &rusqlite::Connection,
+    list: CachedList,
+    edit: impl FnOnce(&mut Value),
+) {
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM queue_scan WHERE list=?1",
+            [list.id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    edit(&mut payload);
+    conn.execute(
+        "UPDATE queue_scan SET payload=?1 WHERE list=?2",
+        rusqlite::params![payload.to_string(), list.id()],
+    )
+    .unwrap();
+}
+#[tokio::test]
+async fn completed_continue_is_confirmation_only_but_standalone_refresh_discovers() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mode.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Authored;
+    let polls = SourcePolls::default();
+    seed_terminal_inventory(&conn, list, 8, true);
+    let before = server.received_requests().await.unwrap().len();
+    durable_terminal_step(path.clone(), &polls, &client, list, 2000, true).await;
+    assert_eq!(server.received_requests().await.unwrap().len() - before, 1);
+    assert_eq!(
+        queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+            .unwrap()
+            .state
+            .completed_at,
+        Some(1000)
+    );
+    durable_terminal_step(path.clone(), &polls, &client, list, 2001, false).await;
+    assert_eq!(
+        server.received_requests().await.unwrap().len() - before,
+        3,
+        "Refresh authorizes a new discovery document"
+    );
+    assert_eq!(
+        queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+            .unwrap()
+            .state
+            .completed_at,
+        Some(2001)
+    );
+    durable_terminal_step(path, &polls, &client, list, 4000, true).await;
+    assert_eq!(
+        server.received_requests().await.unwrap().len() - before,
+        3,
+        "exhausted Continue is no work even after pass delay"
+    );
+}
+#[tokio::test]
+async fn due_confirmation_ignores_discovery_backoff_and_future_candidates_make_no_requests() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("due.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let polls = SourcePolls::default();
+    seed_terminal_inventory(&conn, list, 8, false);
+    rewrite_terminal_checkpoint(&conn, list, |p| {
+        p["eligible_at"] = json!(5000);
+        for c in p["candidates"].as_array_mut().unwrap() {
+            c["eligible_at"] = json!(3000);
+        }
+    });
+    let before = server.received_requests().await.unwrap().len();
+    let initial = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    durable_terminal_step(path.clone(), &polls, &client, list, 2000, true).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(
+        queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+            .unwrap()
+            .state,
+        initial.state
+    );
+    durable_terminal_step(path, &polls, &client, list, 3000, true).await;
+    assert_eq!(server.received_requests().await.unwrap().len() - before, 1);
+    assert_eq!(terminal_inventory(&conn, list).len(), 4);
+}
+#[tokio::test]
+async fn confirmation_refusal_preserves_exact_durable_retry_and_proof_state() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refused.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let polls = SourcePolls::default();
+    seed_terminal_inventory(&conn, list, 8, true);
+    rewrite_terminal_checkpoint(&conn, list, |p| {
+        p["candidates"][0]["isolated"] = json!(true);
+        p["candidates"][0]["negative_at"] = json!(900);
+        p["candidates"][0]["failures"] = json!(2);
+    });
+    let initial = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    let rows = terminal_inventory(&conn, list);
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "60")
+                .set_body_json(json!({"message":"Synthetic provider cooldown"})),
+        )
+        .mount(&server)
+        .await;
+    assert!(client
+        .fetch_viewer_metered(&client.request_budget())
+        .await
+        .is_err());
+    let before = server.received_requests().await.unwrap().len();
+    durable_terminal_step(path, &polls, &client, list, 2000, true).await;
+    let after = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(after.revision, initial.revision);
+    assert_eq!(after.state, initial.state);
+    assert_eq!(terminal_inventory(&conn, list), rows);
+}
+#[tokio::test]
+async fn legacy_isolation_preserves_proofs_and_poison_stays_singleton_after_one_probe() {
+    let (server, client) = terminal_provider(false).await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let mut data = json!({"viewer":{"login":"synthetic-viewer"}});
+            let mut errors = vec![];
+            for i in 0..4 {
+                if let Some(n) = body["variables"][format!("n{i}")].as_u64() {
+                    if n == 1 {
+                        errors.push(
+                            json!({"message":"Synthetic poisoned alias","path":[format!("p{i}")]}),
+                        );
+                    } else {
+                        let mut direct = node(n as usize, false);
+                        direct["state"] = json!("CLOSED");
+                        data[format!("p{i}")] = json!({"pullRequest":direct});
+                    }
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(json!({"data":data,"errors":errors}))
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let polls = SourcePolls::default();
+    seed_terminal_inventory(&conn, list, 150, true);
+    rewrite_terminal_checkpoint(&conn, list, |p| {
+        p["isolate"] = json!(true);
+        for c in p["candidates"].as_array_mut().unwrap() {
+            c.as_object_mut().unwrap().remove("isolated");
+        }
+        p["candidates"][0]["negative_at"] = json!(900);
+        p["candidates"][0]["failures"] = json!(2);
+        p["candidates"][149]["eligible_at"] = json!(1015);
+    });
+    let migrated = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+        .unwrap()
+        .state;
+    assert!(!migrated.isolate);
+    assert!(migrated.candidates.iter().all(|c| !c.isolated));
+    assert_eq!(migrated.candidates[0].negative_at, Some(900));
+    assert_eq!(migrated.candidates[0].failures, 2);
+    assert_eq!(migrated.candidates[149].eligible_at, 1015);
+    for step in 0..50 {
+        durable_terminal_step(path.clone(), &polls, &client, list, 1000 + step * 15, true).await;
+        let state = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+            .unwrap()
+            .state;
+        if step == 0 {
+            assert_eq!(state.candidates.iter().filter(|c| c.isolated).count(), 4);
+            assert!(state
+                .candidates
+                .iter()
+                .filter(|c| c.isolated)
+                .all(|c| c.negative_at.is_none()));
+        }
+    }
+    let rows = terminal_inventory(&conn, list);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].number, 1);
+    let requests = server.received_requests().await.unwrap();
+    let poisoned: Vec<_> = requests
+        .iter()
+        .map(confirmation_numbers)
+        .filter(|n| n.contains(&1))
+        .collect();
+    assert_eq!(poisoned[0], vec![1, 2, 3, 4]);
+    assert!(poisoned[1..].iter().all(|n| n == &vec![1]));
+    let healthy: Vec<_> = requests
+        .iter()
+        .skip(1)
+        .flat_map(confirmation_numbers)
+        .filter(|n| *n != 1)
+        .collect();
+    assert_eq!(healthy.len(), 149);
+    assert_eq!(
+        healthy
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        149
+    );
+}
+
+#[tokio::test]
+async fn partition_completion_excludes_removed_candidates_and_positive_observation_wins() {
+    for positive in [false, true] {
+        let (server, client) = terminal_provider(false).await;
+        if positive {
+            server.reset().await;
+            Mock::given(method("POST")).respond_with(|request:&wiremock::Request| {
+                let body:Value=request.body_json().unwrap();let mut data=json!({"viewer":{"login":"synthetic-viewer"}});
+                if body["variables"]["n0"].is_number() {
+                    for i in 0..4 {if let Some(n)=body["variables"][format!("n{i}")].as_u64(){let mut direct=node(n as usize,false);direct["state"]=json!("CLOSED");data[format!("p{i}")]=json!({"pullRequest":direct});}}
+                } else {data["authored"]=json!({"issueCount":1,"nodes":[node(1,false)],"pageInfo":{"hasNextPage":false,"endCursor":null}});}
+                ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+            }).mount(&server).await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partition.sqlite");
+        let conn = crate::store::open_db(&path).unwrap();
+        let list = CachedList::Reviewing;
+        let polls = SourcePolls::default();
+        seed_terminal_inventory(&conn, list, 8, false);
+        rewrite_terminal_checkpoint(&conn, list, |p| {
+            p["github_partition"] = serde_json::to_value(queue_scan::GithubPartition {
+                phase: queue_scan::PartitionPhase::FinalCheck,
+                lower: Some(0),
+                upper: Some(2_000_000_000),
+                windows_started: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            p["total"] = json!(usize::from(positive));
+        });
+        durable_terminal_step(path, &polls, &client, list, 1000, false).await;
+        let rows = terminal_inventory(&conn, list);
+        let state = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+            .unwrap()
+            .state;
+        assert!(state.done);
+        assert_eq!(state.candidates.len(), 4);
+        assert!(state.candidates.iter().all(|c| c.identity.number >= 5));
+        assert_eq!(rows.len(), 4 + usize::from(positive));
+        assert_eq!(rows.iter().any(|r| r.number == 1), positive);
+    }
+}
+#[tokio::test]
+async fn healthy_isolated_absence_recovers_batching_without_shortening_negative_spacing() {
+    let (server, client) = terminal_provider(false).await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let mut data = json!({"viewer":{"login":"synthetic-viewer"}});
+            for i in 0..4 {
+                if let Some(n) = body["variables"][format!("n{i}")].as_u64() {
+                    let mut direct = node(n as usize, false);
+                    direct["state"] = json!("OPEN");
+                    data[format!("p{i}")] = json!({"pullRequest":direct});
+                    data[format!("m{i}")] =
+                        json!({"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}});
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("negative.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let polls = SourcePolls::default();
+    seed_terminal_inventory(&conn, list, 4, true);
+    rewrite_terminal_checkpoint(&conn, list, |p| {
+        for c in p["candidates"].as_array_mut().unwrap() {
+            c["isolated"] = json!(true);
+        }
+    });
+    for now in [1015, 1030, 1045, 1060, 1074] {
+        durable_terminal_step(path.clone(), &polls, &client, list, now, true).await;
+        assert_eq!(
+            terminal_inventory(&conn, list).len(),
+            4,
+            "first negative or premature retry must retain"
+        );
+    }
+    let state = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+        .unwrap()
+        .state;
+    assert!(state.candidates.iter().all(|c| !c.isolated));
+    assert_eq!(state.candidates[0].negative_at, Some(1015));
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        4,
+        "no due proof means zero HTTP"
+    );
+    durable_terminal_step(path, &polls, &client, list, 1120, true).await;
+    assert!(terminal_inventory(&conn, list).is_empty());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| confirmation_numbers(r).len())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1, 4]
+    );
+}
+
+#[tokio::test]
+async fn queued_continuation_promotes_foreground_refresh_and_publishes_checkpoint_once() {
+    let (server, client) = terminal_provider(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("promoted.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    seed_terminal_inventory(&conn, list, 8, true);
+    let baseline = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer")
+        .unwrap()
+        .revision;
+    conn.execute_batch("CREATE TABLE checkpoint_writes (id INTEGER); CREATE TRIGGER audit_checkpoint AFTER UPDATE ON queue_scan BEGIN INSERT INTO checkpoint_writes VALUES(1); END;").unwrap();
+    Mock::given(wiremock::matchers::body_partial_json(
+        json!({"query":"blocker"}),
+    ))
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_secs(30))
+            .set_body_json(json!({"data":{}})),
+    )
+    .with_priority(1)
+    .mount(&server)
+    .await;
+    let before = server.received_requests().await.unwrap().len();
+    let mut blockers = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let scoped = client.with_read_context(ReadContext::new(
+            ReadClass::Background,
+            Duration::from_secs(30),
+        ));
+        blockers.spawn(async move { scoped.stats_graphql(&json!({"query":"blocker"})).await });
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.received_requests().await.unwrap().len() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let loaded = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered = loaded.clone();
+    let background = client.with_read_context(ReadContext::new(
+        ReadClass::Background,
+        Duration::from_secs(3),
+    ));
+    let background_path = path.clone();
+    let leader = tokio::spawn(async move {
+        fetch_github_step_at(
+            background_path,
+            &background,
+            list,
+            Duration::from_secs(3),
+            true,
+            || {
+                entered.notify_one();
+                (120, 2000)
+            },
+        )
+        .await
+    });
+    // This current-thread runtime observes the notification after the source
+    // future has synchronously registered its shared scan and yielded.
+    loaded.notified().await;
+    let foreground = tokio::time::timeout(
+        Duration::from_secs(1),
+        fetch_github_step_at(path, &client, list, Duration::from_secs(3), false, || {
+            (120, 2000)
+        }),
+    )
+    .await
+    .expect("foreground source refresh must progress with Background HTTP still held")
+    .unwrap();
+    let background = leader.await.unwrap().unwrap();
+    assert_eq!(foreground.scan, background.scan);
+    assert_eq!(
+        server.received_requests().await.unwrap().len() - before,
+        4,
+        "two blockers, one terminal proof and one promoted discovery"
+    );
+    let polls = SourcePolls::default();
+    let (a, _) = polls.begin_attempt(Source::default(), list).await;
+    let (b, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &a, foreground).await;
+    publish_scan_attempt(&polls, &conn, &b, background).await;
+    let accepted = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(accepted.revision, baseline + 1);
+    assert_eq!(accepted.state.completed_at, Some(2000));
+    assert_eq!(terminal_inventory(&conn, list).len(), 4);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM checkpoint_writes", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "shared receipt can publish only one durable checkpoint advancement"
+    );
+    blockers.abort_all();
+    while blockers.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn stalled_success_body_retains_shared_receipt_and_durable_continuation() {
+    stalled_body_retains_shared_receipt_and_durable_continuation("200 OK").await;
+}
+
+#[tokio::test]
+async fn stalled_error_body_retains_shared_receipt_and_durable_continuation() {
+    stalled_body_retains_shared_receipt_and_durable_continuation("403 Forbidden").await;
+}
+
+async fn stalled_body_retains_shared_receipt_and_durable_continuation(status: &'static str) {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let signal = stalled.clone();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut held_bodies = vec![];
+        for n in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            let body_start = loop {
+                let mut buf = [0; 4096];
+                let got = stream.read(&mut buf).await.unwrap();
+                assert!(got > 0);
+                request.extend_from_slice(&buf[..got]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break end + 4;
+                    }
+                }
+            };
+            observed
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&request[body_start..]).unwrap());
+            if n == 2 {
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
+                held_bodies.push(stream);
+                signal.notify_one();
+                continue;
+            }
+            let body = if n == 0 {
+                json!({"data":{"viewer":{"login":"synthetic-viewer"}}})
+            } else {
+                let numbers = if n == 1 { 1..=25 } else { 26..=50 };
+                let nodes: Vec<_> = numbers.map(|n| node(n, false)).collect();
+                json!({"data":{"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":50,"nodes":nodes,"pageInfo":{"hasNextPage":n == 1,"endCursor": if n == 1 {Some("next-page")} else {None}}}}})
+            }.to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        }
+    });
+    let client = GitHubClient::new(
+        octocrab::Octocrab::builder()
+            .base_uri(format!("http://{addr}"))
+            .unwrap()
+            .personal_token("synthetic")
+            .build()
+            .unwrap(),
+    );
+    client.fetch_viewer().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("body-stall.sqlite");
+    let conn = crate::store::open_db(&path).unwrap();
+    let list = CachedList::Reviewing;
+    let spawn = || {
+        let path = path.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            fetch_github_step_at(path, &client, list, Duration::from_secs(60), false, || {
+                (120, 1000)
+            })
+            .await
+        })
+    };
+    let first = spawn();
+    stalled.notified().await;
+    // Join after headers have arrived, while the second response is incomplete.
+    let loaded = Arc::new(tokio::sync::Notify::new());
+    let entered = loaded.clone();
+    let joined_client = client.clone();
+    let joined_path = path.clone();
+    let joined = tokio::spawn(async move {
+        fetch_github_step_at(
+            joined_path,
+            &joined_client,
+            list,
+            Duration::from_secs(60),
+            false,
+            || {
+                entered.notify_one();
+                (120, 1000)
+            },
+        )
+        .await
+    });
+    loaded.notified().await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let completed_at_cap = first.is_finished() && joined.is_finished();
+    tokio::time::resume();
+    assert!(
+        completed_at_cap,
+        "whole-body timeout must finish within the execution cap"
+    );
+    let first = first
+        .await
+        .unwrap()
+        .expect("body timeout must retain the received first page");
+    let joined = joined.await.unwrap().unwrap();
+    assert_eq!(first.prs.len(), 25);
+    assert_eq!(first.scan, joined.scan);
+    let receipt = first.scan.as_ref().unwrap();
+    assert_eq!(receipt.state.after.as_deref(), Some("next-page"));
+    assert!(receipt.state.received);
+    assert!(!receipt.state.done);
+    assert!(receipt.state.step_failure.as_ref().unwrap().transient);
+    assert!(!receipt.state.step_failure.as_ref().unwrap().not_asked);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "viewer plus two scan attempts; no retry after cap"
+    );
+    let polls = SourcePolls::default();
+    let (a, _) = polls.begin_attempt(Source::default(), list).await;
+    let (b, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &a, first).await;
+    publish_scan_attempt(&polls, &conn, &b, joined).await;
+    let checkpoint = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(checkpoint.revision, 1, "one accepted shared receipt");
+    assert_eq!(checkpoint.state.after.as_deref(), Some("next-page"));
+    assert_eq!(saved(&conn).len(), 25);
+    let continued =
+        fetch_github_step_at(path, &client, list, Duration::from_secs(60), true, || {
+            (120, 2000)
+        })
+        .await
+        .unwrap();
+    assert_eq!(continued.prs.len(), 25);
+    assert!(continued.scan.as_ref().unwrap().state.done);
+    let (next, _) = polls.begin_attempt(Source::default(), list).await;
+    publish_scan_attempt(&polls, &conn, &next, continued).await;
+    assert_eq!(saved(&conn).len(), 50);
+    let checkpoint = queue_scan::load(&conn, &Source::default(), list, "synthetic-viewer").unwrap();
+    assert_eq!(checkpoint.revision, 2);
+    assert_eq!(checkpoint.state.total, Some(50));
+    assert!(
+        !checkpoint.state.coverage_valid,
+        "the interrupted pass cannot claim complete coverage"
+    );
+    assert_eq!(checkpoint.state.completed_total, None);
+    assert_eq!(
+        requests.lock().unwrap()[3]["variables"]["after"],
+        "next-page"
+    );
+    server.await.unwrap();
 }

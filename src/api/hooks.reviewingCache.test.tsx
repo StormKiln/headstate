@@ -20,6 +20,10 @@ const client = () => new QueryClient({ defaultOptions: { queries: { retry: false
 
 const pr = (n: number) => ({ number: n, title: `pr ${n}` }) as unknown as PullRequest;
 
+function owned(prs: PullRequest[], stale_secs: number | null) {
+  return { source: { provider: "github", host: "github.com" }, list: "reviewing", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs, stale_secs, fetched_at: "2026-01-01T00:00:00Z", coverage: "complete" } };
+}
+
 function deferred<T>() {
   let resolve!: (v: T) => void;
   const promise = new Promise<T>((r) => (resolve = r));
@@ -43,8 +47,8 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("shows the cached list without waiting for GitHub", async () => {
     const live = deferred<PullRequest[]>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing")
-        return Promise.resolve({ prs: [pr(1), pr(2)], stale_secs: null });
+      if (cmd === "get_source_snapshot")
+        return Promise.resolve(owned([pr(1), pr(2)], null));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -64,8 +68,8 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("replaces the cache with live data when it arrives", async () => {
     const live = deferred<PullRequest[]>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing")
-        return Promise.resolve({ prs: [pr(1)], stale_secs: null });
+      if (cmd === "get_source_snapshot")
+        return Promise.resolve(owned([pr(1)], null));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -84,8 +88,8 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("still reports loading when there is nothing cached", async () => {
     const live = deferred<PullRequest[]>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing")
-        return Promise.resolve({ prs: [], stale_secs: null });
+      if (cmd === "get_source_snapshot")
+        return Promise.resolve(owned([], null));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -110,10 +114,10 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("keeps showing a stale snapshot, marked, rather than emptying the list", async () => {
     const live = deferred<PullRequest[]>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing")
+      if (cmd === "get_source_snapshot")
         // Two hours old: past the hour-long window, so the backend now
         // returns the rows AND says how old they are.
-        return Promise.resolve({ prs: [pr(1), pr(2)], stale_secs: 7200 });
+        return Promise.resolve(owned([pr(1), pr(2)], 7200));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -139,8 +143,8 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("does not mark a snapshot inside the freshness window", async () => {
     const live = deferred<PullRequest[]>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing")
-        return Promise.resolve({ prs: [pr(1)], stale_secs: null });
+      if (cmd === "get_source_snapshot")
+        return Promise.resolve(owned([pr(1)], null));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -154,7 +158,7 @@ describe("useReviewing paints from cache while the live query runs", () => {
   it("retains the SQLite rows and stale marker when a correlated failure has no receipt", async () => {
     const live = deferred<unknown>();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === "get_cached_reviewing") return Promise.resolve({ prs: [pr(1)], stale_secs: 7200 });
+      if (cmd === "get_source_snapshot") return Promise.resolve(owned([pr(1)], 7200));
       if (cmd === "get_reviewing") return live.promise;
       return Promise.resolve(undefined);
     });
@@ -175,7 +179,7 @@ describe("useReviewing paints from cache while the live query runs", () => {
   });
 
   it("reads nothing at all while the view is disabled", async () => {
-    invoke.mockImplementation(() => Promise.resolve({ prs: [], stale_secs: null }));
+    invoke.mockImplementation(() => Promise.resolve(owned([], null)));
     renderHook(() => useReviewing(false), { wrapper: wrapper(client()) });
     expect(invoke).not.toHaveBeenCalled();
   });

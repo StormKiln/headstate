@@ -130,12 +130,13 @@ pub fn load_snapshot_marked(
         SnapshotData::Available {
             prs, stale_secs, ..
         } => CachedSnapshot { prs, stale_secs },
-        SnapshotData::Missing | SnapshotData::Unreadable | SnapshotData::GitLabAvailable { .. } => {
-            CachedSnapshot {
-                prs: Vec::new(),
-                stale_secs: None,
-            }
-        }
+        SnapshotData::Missing
+        | SnapshotData::Unreadable
+        | SnapshotData::Withheld { .. }
+        | SnapshotData::GitLabAvailable { .. } => CachedSnapshot {
+            prs: Vec::new(),
+            stale_secs: None,
+        },
     })
 }
 

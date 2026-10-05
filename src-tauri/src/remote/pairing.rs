@@ -339,7 +339,8 @@ pub struct PairingState {
     /// request, from tokio workers that must not wait on SQLite; this
     /// copy answers both, and every write to the table in this module
     /// refreshes it before the caller hears the outcome.
-    devices: RwLock<HashMap<String, PairedDevice>>,
+    devices: RwLock<HashMap<String, super::context::AuthorizedDevice>>,
+    lifecycle: Mutex<()>,
 }
 
 impl PairingState {
@@ -363,6 +364,7 @@ impl PairingState {
             revocations,
             config,
             devices: RwLock::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
         }
     }
 
@@ -379,17 +381,64 @@ impl PairingState {
     /// every write, so the listener's answers are never staler than the
     /// last change made through this module.
     pub fn reload_devices(&self, conn: &Connection) -> Result<(), StoreError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.reload_devices_locked(conn)
+    }
+
+    fn reload_devices_locked(&self, conn: &Connection) -> Result<(), StoreError> {
         let rows = devices::list(conn)?;
-        let map = rows.into_iter().map(|d| (d.cert_fp.clone(), d)).collect();
-        *self.devices.write().unwrap_or_else(|e| e.into_inner()) = map;
+        let mut map = self.devices.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = HashMap::new();
+        for device in rows {
+            let previous = map.remove(&device.cert_fp);
+            let entry = match previous {
+                Some(mut entry)
+                    if entry.device.id == device.id
+                        && entry.device.cert_der == device.cert_der
+                        && entry.device.paired_at == device.paired_at =>
+                {
+                    entry.device = device;
+                    entry
+                }
+                Some(entry) => {
+                    entry.capability.retire();
+                    super::context::AuthorizedDevice::fresh(device)
+                }
+                None => super::context::AuthorizedDevice::fresh(device),
+            };
+            next.insert(entry.device.cert_fp.clone(), entry);
+        }
+        for entry in map.values() {
+            entry.capability.retire();
+        }
+        *map = next;
         Ok(())
+    }
+
+    fn retire_device(&self, fingerprint: &str) {
+        if let Some(entry) = self
+            .devices
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(fingerprint)
+        {
+            entry.capability.retire();
+        }
+    }
+
+    pub fn authorized_device(&self, fingerprint: &str) -> Option<super::context::AuthorizedDevice> {
+        self.devices
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(fingerprint)
+            .cloned()
     }
 
     /// Reload after a write, or say so: the write itself succeeded and
     /// the caller must still hear that, but a listener that cannot see
     /// it is worth a warning.
     fn refresh_devices(&self, conn: &Connection) {
-        if let Err(e) = self.reload_devices(conn) {
+        if let Err(e) = self.reload_devices_locked(conn) {
             log::warn!("could not refresh the paired devices the listener checks: {e}");
         }
     }
@@ -410,7 +459,7 @@ impl PairingState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(cert_fp)
-            .cloned()
+            .map(|entry| entry.device.clone())
     }
 
     /// Mint a new token, replacing any outstanding one.
@@ -503,6 +552,7 @@ impl PairingState {
         request_id: u64,
         decision: PairDecision,
     ) -> Result<(), RespondError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let same_name = match decision {
             PairDecision::Deny => {
                 let pending = self
@@ -543,6 +593,7 @@ impl PairingState {
         let result = (|| -> Result<PairOutcome, StoreError> {
             for old in to_replace {
                 if devices::revoke(conn, old.id)?.is_some() {
+                    self.retire_device(&old.cert_fp);
                     let _ = self.revocations.send(old.cert_fp.clone());
                 }
             }
@@ -575,8 +626,10 @@ impl PairingState {
     /// Delete a device and tell the listener to close its connections.
     /// Returns the removed row, or `None` if there was none.
     pub fn revoke(&self, conn: &Connection, id: i64) -> Result<Option<PairedDevice>, StoreError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let removed = devices::revoke(conn, id)?;
         if let Some(device) = &removed {
+            self.retire_device(&device.cert_fp);
             log::info!("revoked device {id} ({})", device.name);
             // The copy first, then the broadcast: a listener reacting to
             // the broadcast by re-checking must already see it gone.
@@ -596,9 +649,24 @@ impl PairingState {
         transcripts_allowed: bool,
         reveal_allowed: bool,
     ) -> Result<bool, StoreError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let changed =
             devices::set_transcript_access(conn, id, transcripts_allowed, reveal_allowed)?;
         if changed {
+            // The successful policy write is authoritative even if a different
+            // malformed row makes the full reload fail. Keep the incarnation.
+            for entry in self
+                .devices
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .values_mut()
+            {
+                if entry.device.id == id {
+                    entry.device.transcripts_allowed = transcripts_allowed;
+                    entry.device.reveal_allowed = reveal_allowed;
+                }
+            }
+
             log::info!(
                 "device {id}: transcripts {}, reveal {}",
                 if transcripts_allowed { "on" } else { "off" },
@@ -998,6 +1066,161 @@ mod tests {
             .as_secs() as i64;
         let issued = state.issue_token();
         assert!((issued.exp - now - 60).abs() <= 1);
+    }
+
+    #[tokio::test]
+    async fn failed_replace_never_revives_the_deleted_pairing_incarnation() {
+        let (state, mut events) = state(quick());
+        let conn = db();
+        devices::insert(
+            &conn,
+            &NewDevice {
+                name: "synthetic phone".into(),
+                cert_fp: "old-fixture".into(),
+                cert_der: vec![1],
+                ecdsa_pubkey: vec![4; 65],
+                mldsa_pubkey: None,
+            },
+        )
+        .unwrap();
+        state.reload_devices(&conn).unwrap();
+        let old = state.authorized_device("old-fixture").unwrap().context();
+        let issued = state.issue_token();
+        let req = request(&issued, "synthetic phone", false);
+        let handshake = {
+            let state = state.clone();
+            tokio::spawn(async move { handle_pair(&state, req, &client(), SERVER_FP).await })
+        };
+        let event = events.recv().await.unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_replace BEFORE INSERT ON paired_devices BEGIN SELECT RAISE(ABORT,'synthetic insert failure'); END;").unwrap();
+        assert!(state
+            .respond(
+                &conn,
+                event.request_id,
+                PairDecision::Approve {
+                    same_name: SameName::Replace
+                }
+            )
+            .is_err());
+        assert!(handshake.await.unwrap().is_err());
+        assert!(old.guard().is_err());
+        assert!(!state.is_device_paired("old-fixture"));
+        assert!(devices::list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_revoke_cleanup_cannot_delete_a_still_authorized_pairing() {
+        let (state, _) = state(quick());
+        let conn = db();
+        let id = devices::insert(
+            &conn,
+            &NewDevice {
+                name: "fixture".into(),
+                cert_fp: CLIENT_FP.into(),
+                cert_der: vec![1],
+                ecdsa_pubkey: vec![4; 65],
+                mldsa_pubkey: None,
+            },
+        )
+        .unwrap();
+        devices::set_transcript_access(&conn, id, true, false).unwrap();
+        state.reload_devices(&conn).unwrap();
+        let old = state.authorized_device(CLIENT_FP).unwrap().context();
+        conn.execute_batch("CREATE TRIGGER refuse_access_cleanup BEFORE DELETE ON paired_device_access BEGIN SELECT RAISE(ABORT,'synthetic cleanup failure'); END;").unwrap();
+        assert!(state.revoke(&conn, id).is_err());
+        assert!(
+            devices::find_by_fingerprint(&conn, CLIENT_FP)
+                .unwrap()
+                .is_some(),
+            "failed cleanup must roll back authoritative deletion"
+        );
+        assert!(old.guard().is_ok());
+    }
+
+    #[test]
+    fn successful_privacy_restriction_is_authoritative_when_reload_fails() {
+        let (state, _) = state(quick());
+        let conn = db();
+        let device = NewDevice {
+            name: "fixture".into(),
+            cert_fp: CLIENT_FP.into(),
+            cert_der: vec![1],
+            ecdsa_pubkey: vec![4; 65],
+            mldsa_pubkey: None,
+        };
+        let id = devices::insert(&conn, &device).unwrap();
+        let mut other = device.clone();
+        other.cert_fp = "other-fixture".into();
+        let other_id = devices::insert(&conn, &other).unwrap();
+        devices::set_transcript_access(&conn, id, true, true).unwrap();
+        devices::set_transcript_access(&conn, other_id, true, true).unwrap();
+        state.reload_devices(&conn).unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER break_policy_refresh AFTER UPDATE ON paired_device_access WHEN new.device_id={id} BEGIN UPDATE paired_device_access SET transcripts_allowed='unreadable' WHERE device_id={other_id}; END;")).unwrap();
+        assert!(state
+            .set_transcript_access(&conn, id, false, false)
+            .unwrap());
+        assert!(devices::list(&conn).is_err());
+        let device = state.paired_device(CLIENT_FP).unwrap();
+        assert!(
+            !device.transcripts_allowed && !device.reveal_allowed,
+            "successful privacy writes cannot leave permissive admission"
+        );
+    }
+
+    #[test]
+    fn pairing_incarnations_survive_refresh_but_never_revocation_or_id_reuse() {
+        let (state, _) = state(quick());
+        let conn = db();
+        let device = NewDevice {
+            name: "fixture".into(),
+            cert_fp: CLIENT_FP.into(),
+            cert_der: vec![1],
+            ecdsa_pubkey: vec![4; 65],
+            mldsa_pubkey: None,
+        };
+        let id = devices::insert(&conn, &device).unwrap();
+        state.reload_devices(&conn).unwrap();
+        let old = state.authorized_device(CLIENT_FP).unwrap().context();
+        state
+            .set_transcript_access(&conn, id, false, false)
+            .unwrap();
+        let refreshed = state.authorized_device(CLIENT_FP).unwrap().context();
+        assert_eq!(old.principal(), refreshed.principal());
+        state.revoke(&conn, id).unwrap();
+        assert!(old.guard().is_err());
+        let reused = devices::insert(&conn, &device).unwrap();
+        assert_eq!(reused, id);
+        state.reload_devices(&conn).unwrap();
+        let fresh = state.authorized_device(CLIENT_FP).unwrap().context();
+        assert_ne!(old.principal(), fresh.principal());
+        assert!(fresh.guard().is_ok());
+        assert!(old.guard().is_err());
+    }
+
+    #[test]
+    fn successful_revoke_is_authoritative_even_when_reload_fails() {
+        let (state, _) = state(quick());
+        let conn = db();
+        let device = NewDevice {
+            name: "fixture".into(),
+            cert_fp: CLIENT_FP.into(),
+            cert_der: vec![1],
+            ecdsa_pubkey: vec![4; 65],
+            mldsa_pubkey: None,
+        };
+        let id = devices::insert(&conn, &device).unwrap();
+        let mut other = device.clone();
+        other.cert_fp = "other-fixture".into();
+        let other_id = devices::insert(&conn, &other).unwrap();
+        devices::set_transcript_access(&conn, other_id, true, false).unwrap();
+        state.reload_devices(&conn).unwrap();
+        conn.execute_batch("CREATE TRIGGER break_refresh AFTER DELETE ON paired_devices BEGIN UPDATE paired_device_access SET transcripts_allowed='unreadable'; END;").unwrap();
+        state.revoke(&conn, id).unwrap();
+        assert!(devices::list(&conn).is_err(), "the reload must really fail");
+        assert!(
+            !state.is_device_paired(CLIENT_FP),
+            "a successful deletion cannot leave authorization alive"
+        );
     }
 
     #[tokio::test]

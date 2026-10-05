@@ -24,6 +24,9 @@ import type { HistoryPoint } from "@/types/pr";
 /// that state because `ScopeCounts` and the series query read it too.
 export const RANGES = [7, 14, 30];
 
+// Stable identity keeps unchanged countdown renders from restarting chart animation (#1708).
+const formatActivityDate = (value: string) => value.slice(5);
+
 const config = {
   merged: { label: "Merged", color: "var(--chart-merged)" },
   opened: { label: "Opened", color: "var(--chart-opened)" },
@@ -156,7 +159,7 @@ export function ActivityChart({
               minTickGap={24}
               tick={{ fill: "#8b949e", fontSize: 11 }}
               // Full ISO dates collide at 30 points; month-day is enough.
-              tickFormatter={(v: string) => v.slice(5)}
+              tickFormatter={formatActivityDate}
             />
             <YAxis
               tickLine={false}

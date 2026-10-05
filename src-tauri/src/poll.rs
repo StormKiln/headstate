@@ -708,7 +708,7 @@ fn emit_store_error(app: &AppHandle, msg: String) {
 /// what makes the foreground query look slow"; this is the half of that
 /// which was measurable and unnecessary.
 async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(dir) = crate::commands::profile_dir(app) else {
         return NotifyPrefs::default();
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -763,7 +763,7 @@ async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
     let prs = &result.prs;
     let coverage = result.coverage.clone();
     let owner = result.viewer.clone();
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(dir) = crate::commands::profile_dir(app) else {
         return;
     };
     let owned: Vec<PullRequest> = prs.to_vec();
@@ -795,7 +795,7 @@ async fn persist_and_emit(
     already_saved: bool,
 ) {
     if !already_saved {
-        match app.path().app_data_dir() {
+        match crate::commands::profile_dir(app) {
             Ok(dir) => {
                 let owned: Vec<PullRequest> = prs.to_vec();
                 let written = tauri::async_runtime::spawn_blocking(move || {
@@ -865,7 +865,7 @@ fn active_recheck_client(app: &AppHandle, captured: &Arc<GitHubClient>) -> bool 
 /// #22: one delayed supplemental refresh of at most three captured Checking
 /// identities. This task never schedules another recheck or advances a scan.
 fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, capture: source_poll::CheckingCapture) {
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
         // Keep the original managed Arc, not a newly wrapped read-context clone.
         {
@@ -1126,9 +1126,8 @@ pub(crate) fn queue_continuation_due(
     focused
         && view_needs_github
         && enabled
-        && !state.done
-        && state.started_at.is_some()
-        && now >= state.eligible_at
+        && ((!state.done && state.started_at.is_some() && now >= state.eligible_at)
+            || state.candidates.iter().any(|c| c.eligible_at <= now))
 }
 
 /// The production continuation clock and visibility dispatch boundary. The
@@ -1244,14 +1243,14 @@ pub fn spawn(
     view_needs_github: Arc<AtomicBool>,
     github_source_enabled: Arc<AtomicBool>,
 ) {
-    tauri::async_runtime::spawn(continue_queues(
+    spawn_worker(continue_queues(
         app.clone(),
         client.clone(),
         focused.clone(),
         view_needs_github.clone(),
         github_source_enabled.clone(),
     ));
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
         // Whether a tick has ever completed, so `newly_appeared` has
         // something real to compare against (#789).
@@ -1628,7 +1627,7 @@ pub struct BackfillWaker(pub Arc<Notify>);
 /// mid-tick leave no stuck row: there is no `pending` state to be stuck
 /// in.
 pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Notify>) {
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         // The first tick waits a full interval unless a Stats click nudges
         // it. Startup is the busiest moment the app has -- the poll
         // loop's first tick, the window's first render and whatever the
@@ -1638,7 +1637,20 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
         loop {
             wait_backfill_tick(&waker, last_started).await;
             last_started = Some(tokio::time::Instant::now());
-            let tick = backfill_tick(crate::commands::db_path(&app), &client).await;
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("backfill-tick", 0);
+            let tick = backfill_tick(
+                crate::commands::db_path(&app),
+                &client,
+                app.state::<Arc<crate::stats_demand::Registry>>()
+                    .inner()
+                    .clone(),
+            )
+            .await;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("complete");
+            #[cfg(feature = "enterprise-harness")]
+            drop(metric);
             match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
@@ -1681,11 +1693,13 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
                 emit_backfill(
                     &app,
                     &crate::commands::db_path(&app),
+                    &scope.owner,
                     &scope.key,
                     &scope.from,
                     &scope.to,
                     tick.outcome.phase(),
                     Some(next.timestamp_millis()),
+                    tick.cache_changed,
                 )
                 .await;
             }
@@ -1718,12 +1732,14 @@ async fn wait_backfill_tick(waker: &Notify, last_started: Option<tokio::time::In
 /// there is then no scope to report about, and the page keeps its last
 /// frame.
 struct Tick {
+    cache_changed: bool,
     outcome: crate::github::stats::backfill::TickOutcome,
     scope: Option<TickScope>,
 }
 
 /// The scope a tick touched, and the window it was walking.
 struct TickScope {
+    owner: crate::store::stats_owner::StatsOwner,
     key: String,
     from: String,
     to: String,
@@ -1735,6 +1751,7 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
     fn from(outcome: crate::github::stats::backfill::TickOutcome) -> Self {
         Self {
             outcome,
+            cache_changed: false,
             scope: None,
         }
     }
@@ -1745,7 +1762,11 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 ///
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
-async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Tick {
+async fn backfill_tick(
+    db: std::path::PathBuf,
+    client: &Arc<GitHubClient>,
+    demand: Arc<crate::stats_demand::Registry>,
+) -> Tick {
     use crate::github::stats::backfill::{self as bf, TickOutcome};
 
     // The gate, BEFORE any request. `None` means skip -- deliberately the
@@ -1755,6 +1776,9 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     if client.has_interactive_reads() {
         crate::diag!("[diag] stats backfill deferred: user-facing read active");
         return TickOutcome::ForegroundBusy.into();
+    }
+    if !demand.has_live_interest(std::time::Instant::now()) {
+        return TickOutcome::NoScope.into();
     }
     let observed = client.observed_remaining();
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
@@ -1792,28 +1816,33 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
         let db = db.clone();
         let viewer = viewer.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<Option<_>, String> {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric =
+                crate::enterprise_harness::metrics::Scope::new("backfill-transaction", 0);
             let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-            let Some(scope) =
-                crate::store::pr_backfill_scope::next_to_work(&conn).map_err(|e| e.to_string())?
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            let Some(owner) = crate::store::stats_owner::current_for_verified(&tx, &viewer)
+                .map_err(|e| e.to_string())?
             else {
                 return Ok(None);
             };
-            let Some((from, to)) = bf::horizon_window(now, scope.horizon_days) else {
+            let Some(pick) = demand.pick(&tx, &owner, std::time::Instant::now(), now)? else {
                 return Ok(None);
             };
-            let uncovered =
-                crate::store::pr_slice::uncovered_days(&conn, &scope.scope_key, &from, &to)
-                    .map_err(|e| e.to_string())?;
-            let pages = crate::store::pr_backfill_page::select(
-                &mut conn,
-                &viewer,
-                &scope.scope_key,
-                &uncovered,
-                bf::GROUP_SLICES,
-            )?;
-            let coverage = crate::store::pr_slice::coverage(&conn, &scope.scope_key, &from, &to)
-                .map_err(|e| e.to_string())?;
-            Ok(Some((scope, from, to, uncovered, pages, coverage.partial)))
+            let crate::stats_demand::Pick {
+                scope,
+                from,
+                to,
+                uncovered,
+                pages,
+                partial,
+            } = pick;
+            tx.commit().map_err(|e| e.to_string())?;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("committed");
+            Ok(Some((owner, scope, from, to, uncovered, pages, partial)))
         })
         .await
     };
@@ -1823,13 +1852,15 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
         Ok(Err(e)) => return TickOutcome::Failed(e).into(),
         Err(e) => return TickOutcome::Failed(e.to_string()).into(),
     };
-    let (scope, from, to, uncovered, pages, partial) = picked;
+    let (owner, scope, from, to, uncovered, pages, partial) = picked;
     let covered_before = bf::days_between(&from, &to).saturating_sub(uncovered.len());
     // Everything past this point knows its scope, so every exit can report
     // one.
     let here = |outcome| Tick {
+        cache_changed: false,
         outcome,
         scope: Some(TickScope {
+            owner: owner.clone(),
             key: scope.scope_key.clone(),
             from: from.clone(),
             to: to.clone(),
@@ -1840,7 +1871,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
         // Every day in the horizon is covered. The scope is still marked
         // worked, so the rotation moves on rather than re-deciding this
         // same scope every minute.
-        mark_worked(&db, &scope.scope_key, now).await;
+        mark_worked(&db, &owner, &scope.scope_key, now).await;
         return here(if partial {
             TickOutcome::Failed("some days exceed the search retrieval limit".into())
         } else {
@@ -1852,7 +1883,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     // see `backfill::walkable`. Marked worked so it cannot hold the
     // rotation, and left alone otherwise.
     if !bf::walkable(&scope.measure) {
-        mark_worked(&db, &scope.scope_key, now).await;
+        mark_worked(&db, &owner, &scope.scope_key, now).await;
         return here(TickOutcome::Failed(
             "this measure cannot be backfilled".into(),
         ));
@@ -1860,7 +1891,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     let Some(q) = bf::query_for(&scope.scope_kind, &scope.scope_value, &scope.measure) else {
         // A row this build cannot interpret. Marked worked so it cannot
         // hold the rotation, and left alone otherwise.
-        mark_worked(&db, &scope.scope_key, now).await;
+        mark_worked(&db, &owner, &scope.scope_key, now).await;
         return here(TickOutcome::Failed(format!(
             "unreadable scope kind {}",
             scope.scope_kind
@@ -1876,7 +1907,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     let map = match fetched {
         Ok(value) => value,
         Err(_) => {
-            mark_worked(&db, &scope.scope_key, now).await;
+            mark_worked(&db, &owner, &scope.scope_key, now).await;
             return here(TickOutcome::Failed(
                 "could not retrieve the next background page".into(),
             ));
@@ -1885,24 +1916,39 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     let written = {
         let db = db.clone();
         let key = scope.scope_key.clone();
+        let owner = owner.clone();
         let from = from.clone();
         let to = to.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric =
+                crate::enterprise_harness::metrics::Scope::new("backfill-transaction", 0);
             let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-            let (rows, valid) = crate::store::pr_backfill_page::commit(
-                &mut conn, &viewer, &key, &pages, &map, now,
-            )?;
-            let coverage = crate::store::pr_slice::coverage(&conn, &key, &from, &to)
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| e.to_string())?;
-            let remaining = crate::store::pr_slice::uncovered_days(&conn, &key, &from, &to)
+            let (rows, valid) =
+                crate::store::pr_backfill_page::commit_in(&tx, &owner, &key, &pages, &map, now)?;
+            crate::store::pr_history::prune_in(&tx).map_err(|e| e.to_string())?;
+            let coverage = crate::store::pr_slice::coverage(&tx, &key, &from, &to)
                 .map_err(|e| e.to_string())?;
-            let _ = crate::store::pr_history::prune(&conn);
+            let remaining = crate::store::pr_slice::uncovered_days(&tx, &key, &from, &to)
+                .map_err(|e| e.to_string())?;
+            crate::store::pr_backfill_scope::note_worked(&tx, &key, now)
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("committed");
             Ok((rows, valid, coverage, remaining.is_empty()))
         })
         .await
     };
-    mark_worked(&db, &scope.scope_key, now).await;
-    match written {
+    mark_worked(&db, &owner, &scope.scope_key, now).await;
+    // Useful row upserts include same-count corrections and partial failures.
+    // Empty-day/coverage/count changes are compared in the emitted frame;
+    // continuation bookkeeping alone is not a board invalidation.
+    let committed = matches!(&written, Ok(Ok((rows, _, _, _))) if *rows > 0);
+    let mut tick = match written {
         Ok(Ok((_, true, coverage, true))) if !coverage.partial => here(TickOutcome::Complete),
         Ok(Ok((rows, true, coverage, false))) => here(TickOutcome::Advanced {
             days: coverage.days_covered().saturating_sub(covered_before),
@@ -1915,7 +1961,9 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
         Err(_) => here(TickOutcome::Failed(
             "background page storage task failed".into(),
         )),
-    }
+    };
+    tick.cache_changed = committed;
+    tick
 }
 
 /// Note that a scope was advanced, so the rotation moves on.
@@ -1923,15 +1971,23 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
 /// Called on EVERY outcome including failure: a scope whose tick failed
 /// must still yield, or one persistently failing scope holds the worker
 /// forever and starves every other one.
-async fn mark_worked(db: &std::path::Path, scope_key: &str, now: chrono::DateTime<chrono::Utc>) {
+async fn mark_worked(
+    db: &std::path::Path,
+    owner: &crate::store::stats_owner::StatsOwner,
+    scope_key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let db = db.to_path_buf();
     let key = scope_key.to_string();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(conn) = open_db(&db) {
-            if let Err(e) = crate::store::pr_backfill_scope::note_worked(&conn, &key, now) {
-                log::warn!("could not record backfill progress: {e}");
-            }
-        }
+    let owner = owner.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        crate::store::stats_owner::require_current(&tx, &owner).map_err(|e| e.to_string())?;
+        crate::store::pr_backfill_scope::note_worked(&tx, &key, now).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     })
     .await;
 }
@@ -1942,24 +1998,35 @@ async fn mark_worked(db: &std::path::Path, scope_key: &str, now: chrono::DateTim
 /// memory, so the figure the user sees is the figure that is stored -- a
 /// counter kept alongside could drift from it, and the drift would be
 /// invisible.
+#[allow(clippy::too_many_arguments)]
 async fn emit_backfill(
     app: &AppHandle,
     db: &std::path::Path,
+    owner: &crate::store::stats_owner::StatsOwner,
     scope_key: &str,
     from: &str,
     to: &str,
     phase: crate::github::stats::backfill::BackfillPhase,
     next_tick_at_ms: Option<i64>,
+    cache_changed: bool,
 ) {
+    let owner = owner.clone();
     let db = db.to_path_buf();
     let key = scope_key.to_string();
     let (from, to) = (from.to_string(), to.to_string());
     let report = tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).ok()?;
-        let cov = crate::store::pr_slice::coverage(&conn, &key, &from, &to).ok()?;
-        let held = crate::store::pr_history::count(&conn, &key, &from, &to).unwrap_or(0);
+        let mut conn = open_db(&db).ok()?;
+        let tx = conn.transaction().ok()?;
+        crate::store::stats_owner::require_current(&tx, &owner).ok()?;
+        let cov = crate::store::pr_slice::coverage(&tx, &key, &from, &to).ok()?;
+        let held = crate::store::pr_history::count(&tx, &key, &from, &to).ok()?;
         let days_total = crate::github::stats::backfill::days_between(&from, &to);
         Some(crate::github::stats::backfill::Report {
+            from,
+            to,
+            cache_changed,
+            covered_days: cov.days.clone(),
+            owner,
             scope_key: key,
             days_covered: cov.days_covered(),
             days_total,
@@ -1967,7 +2034,7 @@ async fn emit_backfill(
             // Straight through, `None` and all. Defaulting it here would
             // be the "400 of 0" the design forbids, introduced at the one
             // layer nobody would look at.
-            total: cov.total,
+            total: cov.window_total.filter(|total| *total >= held),
             phase,
             next_tick_at_ms,
         })
@@ -2087,12 +2154,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("dense.db");
             let conn = crate::store::open_db(&db).unwrap();
-            crate::store::settings::set(
-                &conn,
-                crate::store::settings::keys::STATS_VIEWER,
-                &"fixture-viewer",
-            )
-            .unwrap();
+            crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
             let key = "merged|*|org:fixture";
             crate::store::pr_backfill_scope::note_seen(
                 &conn,
@@ -2106,11 +2168,39 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 1,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
             let mut client = new_client();
             client.fetch_viewer().await.unwrap();
             let before = server.received_requests().await.unwrap().len();
             for (pass, expected) in [50, 100, 120].into_iter().enumerate() {
-                let tick = super::backfill_tick(db.clone(), &client).await;
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
                 assert_eq!(
                     crate::store::pr_history::count(&conn, key, &day, &day).unwrap(),
                     expected
@@ -2130,8 +2220,164 @@ mod tests {
             assert_eq!(server.received_requests().await.unwrap().len(), before + 4);
             let before = server.received_requests().await.unwrap().len();
             assert!(matches!(
-                super::backfill_tick(db, &client).await.outcome,
-                bf::TickOutcome::Complete
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+        });
+    }
+
+    #[test]
+    fn fifty_stale_scopes_do_not_delay_the_active_dense_day() {
+        use crate::github::stats::{backfill as bf, budget};
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = wiremock::MockServer::start().await;
+            let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string();
+            let reply_day = day.clone();
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap();
+                    if !doc.contains("search(") {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"},"rateLimit":{"remaining":5000}}}));
+                    }
+                    let offset = if doc.contains("after: \"100\"") {100} else if doc.contains("after: \"50\"") {50} else {0};
+                    let end = (offset + 50).min(120);
+                    let nodes: Vec<_> = (offset..end).map(|n| serde_json::json!({
+                        "number":n+1,"title":"fixture","url":"https://example.com/pr",
+                        "repository":{"nameWithOwner":"fixture/repo"},"author":{"login":"fixture-author"},
+                        "createdAt":format!("{reply_day}T00:00:00Z"),"mergedAt":format!("{reply_day}T01:00:00Z"),
+                        "additions":1,"deletions":0,"changedFiles":1,"reviews":{"totalCount":0}
+                    })).collect();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"s0":{
+                        "issueCount":120,"nodes":nodes,"pageInfo":{"hasNextPage":end<120,"endCursor":end.to_string()}
+                    }}}))
+                }).mount(&server).await;
+            let new_client = || {
+                std::sync::Arc::new(crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(server.uri())
+                        .unwrap()
+                        .personal_token("fixture-token".to_string())
+                        .build()
+                        .unwrap(),
+                ))
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("dense.db");
+            let conn = crate::store::open_db(&db).unwrap();
+            crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
+            let key = "merged|*|org:fixture";
+            crate::store::pr_backfill_scope::note_seen(
+                &conn,
+                &crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: key.into(),
+                    scope_kind: "org".into(),
+                    scope_value: "fixture".into(),
+                    measure: "merged".into(),
+                    horizon_days: 1,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            for i in 0..50 {
+                let stale = crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: format!("merged|*|org:stale-{i}"),
+                    scope_kind: "org".into(),
+                    scope_value: format!("stale-{i}"),
+                    measure: "merged".into(),
+                    horizon_days: 1,
+                };
+                crate::store::pr_backfill_scope::note_seen(
+                    &conn,
+                    &stale,
+                    chrono::Utc::now() - chrono::Duration::days(7),
+                )
+                .unwrap();
+                crate::store::pr_backfill_scope::note_worked(
+                    &conn,
+                    &stale.scope_key,
+                    chrono::Utc::now() - chrono::Duration::days(7),
+                )
+                .unwrap();
+                crate::store::pr_slice::put(
+                    &conn,
+                    &stale.scope_key,
+                    &crate::store::pr_slice::SliceRow {
+                        from: day.clone(),
+                        to: day.clone(),
+                        state: crate::store::pr_slice::SliceState::Complete,
+                        issue_count: 0,
+                        retrieved: 0,
+                        refused_fields: 0,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            }
+            crate::store::pr_backfill_scope::note_worked(&conn, key, chrono::Utc::now()).unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 1,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            let mut client = new_client();
+            client.fetch_viewer().await.unwrap();
+            let before = server.received_requests().await.unwrap().len();
+            for (pass, expected) in [50, 100, 120].into_iter().enumerate() {
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
+                assert_eq!(
+                    crate::store::pr_history::count(&conn, key, &day, &day).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    matches!(tick.outcome, bf::TickOutcome::Complete),
+                    pass == 2,
+                    "{:?}",
+                    tick.outcome
+                );
+                if pass == 0 {
+                    // A fresh client/process must resume the durable cursor.
+                    client = new_client();
+                    client.fetch_viewer().await.unwrap();
+                }
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), before + 4);
+            let before = server.received_requests().await.unwrap().len();
+            assert!(matches!(
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
             ));
             assert_eq!(server.received_requests().await.unwrap().len(), before);
         });
@@ -2203,12 +2449,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("backfill.db");
             let conn = crate::store::open_db(&db).unwrap();
-            crate::store::settings::set(
-                &conn,
-                crate::store::settings::keys::STATS_VIEWER,
-                &"fixture-viewer",
-            )
-            .unwrap();
+            crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
             let key = bf::query_for("org", "fixture", "merged")
                 .unwrap()
                 .cache_key("fixture-viewer");
@@ -2224,11 +2465,39 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 30,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
             let (from, to) = bf::horizon_window(chrono::Utc::now(), 30).unwrap();
             client.fetch_viewer().await.unwrap();
             let ticks = 30usize.div_ceil(bf::GROUP_SLICES);
             for pass in 1..=ticks {
-                let tick = super::backfill_tick(db.clone(), &client).await;
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
                 assert!(
                     !matches!(tick.outcome, bf::TickOutcome::Failed(_)),
                     "{:?}",
@@ -2250,8 +2519,10 @@ mod tests {
             let issued = server.received_requests().await.unwrap().len();
             assert_eq!(issued, ticks + 1);
             assert!(matches!(
-                super::backfill_tick(db, &client).await.outcome,
-                bf::TickOutcome::Complete
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
             ));
             assert_eq!(server.received_requests().await.unwrap().len(), issued);
         });
@@ -3572,3 +3843,12 @@ mod tests {
 #[cfg(test)]
 #[path = "poll_backfill_tests.rs"]
 mod backfill_tests;
+
+/// Keep the production worker future unchanged while the isolated driver owns shutdown.
+fn spawn_worker(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let task = tauri::async_runtime::spawn(future);
+    #[cfg(feature = "enterprise-harness")]
+    crate::enterprise_harness::track_worker(task);
+    #[cfg(not(feature = "enterprise-harness"))]
+    drop(task);
+}

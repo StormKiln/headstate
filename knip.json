@@ -13,7 +13,16 @@
     "scripts/check-shell-scroll.mjs",
     "vite.harness-worktrees.config.ts",
     "src/harness/worktreesBench.tsx",
-    "scripts/worktrees-browser-bench.mjs"
+    "scripts/worktrees-browser-bench.mjs",
+    "vite.harness-enterprise.config.ts",
+    "src/harness/enterprise.tsx",
+    "src/harness/enterpriseTransport.ts",
+    "scripts/enterprise-run.mjs",
+    "scripts/enterprise-smoke.mjs",
+    "scripts/enterprise/*.test.mjs",
+    "scripts/enterprise-baseline.mjs",
+    "src/harness/activityChart.tsx",
+    "scripts/check-activity-chart.mjs"
   ],
   "project": [
     "src/**/*.{ts,tsx}"

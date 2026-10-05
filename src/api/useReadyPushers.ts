@@ -1,9 +1,10 @@
-import { useEffect } from "react";
+import { useLayoutEffect } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { advisoryDispatch } from "./advisoryDispatch";
 import { getReadyPushers } from "./tauri";
 import { useViewer } from "./hooks";
 import { useAdvisoryWindow } from "./useAdvisoryWindow";
+import { acknowledgeSchedule, isPreferred, readSchedule, scheduleMeta, useScheduleClaims } from "./advisorySchedule";
 import { advisoryGcTime, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { commandError } from "@/lib/errorKind";
 import { prKey } from "@/lib/prIdentity";
@@ -22,15 +23,23 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   const owner = typeof viewer.data === "string" ? viewer.data : undefined;
   const rows = prs.filter(pr => !pr.source || (pr.source.provider === "github" && pr.source.host === "github.com"));
   const preferred = new Set(rows.filter(pr => priority.has(prKey(pr)) || rows.length <= 8).map(keyOf));
-  const demand = new Set(rows.filter(pr => preferred.has(keyOf(pr)) || !qc.getQueryData<Receipt>(["ready-pushers", owner, session.generation, keyOf(pr)])?.pusher).map(keyOf));
-  const window = useAdvisoryWindow(rows.map(keyOf), preferred, !!owner, demand);
+  const queryKey = (key: string) => ["ready-pushers", owner, session.generation, key];
+  const schedule = (key: string) => readSchedule(qc, queryKey(key));
+  const demand = new Set(rows.filter(pr => {
+    const value = qc.getQueryData<Receipt>(queryKey(keyOf(pr)));
+    return preferred.has(keyOf(pr)) || !value?.pusher || !value.rules || schedule(keyOf(pr))?.hasContinuation;
+  }).map(keyOf));
+  const window = useAdvisoryWindow(rows.map(keyOf), preferred, !!owner, demand, schedule);
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });
   const keys = selected.map(pr => ["ready-pushers", owner, session.generation, keyOf(pr)]);
+  const metas = keys.map(key => scheduleMeta(qc, key));
+  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: window.preferred.has(keyOf(pr)) })));
   const queries = useQueries({ queries: selected.map((pr, i) => ({
-    queryKey: keys[i], queryFn: async ({ signal }: { signal: AbortSignal }): Promise<Receipt> => {
+    queryKey: keys[i], meta: metas[i], queryFn: async ({ signal }: { signal: AbortSignal }): Promise<Receipt> => {
       let answer: Answer;
       let dispatchedAt: number | undefined;
+      let completed = false;
       const unreadable = (): RowPusher => ({ ...askOf(pr),
         last_pusher: { state: "unknown", reason: "Pusher response unavailable" },
         rules: { state: "unreadable", reason: "Policy response unavailable" },
@@ -41,6 +50,17 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
         const ask = askOf(pr);
         const answers = await getReadyPushers([ask]);
         return { started, row: answers?.find(value => value.repo === ask.repo && value.number === ask.number && value.head_oid === ask.head_oid && value.base === ask.base && value.head_ref === ask.head_ref && value.head_repo === ask.head_repo) ?? unreadable() };
+      }, {
+        preferred: () => isPreferred(metas[i], window.preferred.has(keyOf(pr))),
+        rank: () => metas[i].advisorySchedule.lastAdmittedAt ?? -1,
+        boosted: () => window.boosted.has(keyOf(pr)) && !metas[i].advisorySchedule.resumeBoostSpent,
+        current: () => session.generation === session.current(),
+        progress: value => {
+          completed = value.row?.last_pusher.state === "known" && value.row.rules.state === "read" && (value.row.pusher_valid_for_ms ?? 0) > 0 && (value.row.rules_valid_for_ms ?? 0) > 0;
+          return value.row?.advisory_progress;
+        },
+        acknowledge: progress => acknowledgeSchedule(metas[i], progress, window.boosted.has(keyOf(pr)),
+          completed),
       }); }
       catch (error) {
         // Queue refusal and explicit native no-dispatch are still not checked.
@@ -65,11 +85,11 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
     gcTime: advisoryGcTime, retry: false, refetchOnWindowFocus: false,
   })) });
   const signature = JSON.stringify(keys);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const now = performance.now();
     for (const key of JSON.parse(signature) as string[][]) {
       const receipt = qc.getQueryData<Receipt>(key);
-      if (receipt !== undefined && receipt.expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+      if (receipt !== undefined && (receipt.expiresAt <= now || readSchedule(qc, key)?.hasContinuation)) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick]);
   const read = (pr: PullRequest) => qc.getQueryData<Receipt>(["ready-pushers", owner, session.generation, keyOf(pr)]);

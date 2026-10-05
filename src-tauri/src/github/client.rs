@@ -326,12 +326,35 @@ fn server_gave_up(e: &ClientError) -> bool {
 #[derive(Clone)]
 pub struct GitHubClient {
     octocrab: Octocrab,
+    credential: Option<Arc<CredentialBinding>>,
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
+    pub(crate) reviewer_receipts: Arc<super::stats::reviewer_receipts::Reads>,
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
+    read_class: super::admission::ReadClass,
+}
+
+struct CredentialBinding {
+    digest: String,
+    path: std::path::PathBuf,
+    // No queued database jobs: clones share one running best-effort save.
+    persistence: Arc<tokio::sync::Semaphore>,
+    confirmed: std::sync::Mutex<Option<String>>,
+}
+
+struct AbortQueuedBinding {
+    abort: tokio::task::AbortHandle,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for AbortQueuedBinding {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.abort.abort();
+    }
 }
 
 // Client-local: separate accounts never share a result. Only callers which
@@ -514,6 +537,9 @@ impl GitHubClient {
     pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
         if let Some(parent) = &self.read_context {
             context.deadline = context.deadline.min(parent.deadline);
+            if parent.advisory_context.is_some() {
+                context.advisory_context = parent.advisory_context.clone();
+            }
             if parent.first_attempt.is_some() {
                 context.first_attempt = parent.first_attempt.clone();
             }
@@ -525,14 +551,69 @@ impl GitHubClient {
         view.read_context = Some(context);
         view
     }
-    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
-        self.read_context.clone().unwrap_or_else(|| {
-            super::admission::ReadContext::new(
-                super::admission::ReadClass::Foreground,
-                SEARCH_BUDGET,
-            )
-        })
+    pub(crate) fn with_advisory_context(
+        &self,
+        caller: crate::remote::context::DispatchContext,
+    ) -> Self {
+        let mut context = super::admission::ReadContext::new(
+            super::admission::ReadClass::Advisory,
+            std::time::Duration::from_secs(10),
+        );
+        context.advisory_context = Some(caller);
+        self.with_read_context(context)
     }
+    /// Add a row-local admission observer without replacing its parent operation's
+    /// once-only observer or any deadline/allowance ownership.
+    pub(super) fn with_first_attempt(&self, callback: impl FnOnce() + Send + 'static) -> Self {
+        let mut context = self.read_context();
+        let parent = context.first_attempt.take();
+        context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
+            if let Some(parent) = parent {
+                parent.observe();
+            }
+            callback();
+        }));
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+    /// Bulk loads may finish warming their shared cache after navigation, but
+    /// cannot occupy the two slots reserved for visible foreground reads.
+    pub(crate) fn with_bulk_reads(&self) -> Self {
+        let mut view = self.clone();
+        view.read_class = super::admission::ReadClass::Background;
+        if let Some(context) = &mut view.read_context {
+            context.class = super::admission::ReadClass::Background;
+        }
+        // Class-only: preserve parent bounds and the load's existing overall
+        // timeout; default per-request deadlines still begin at each read.
+        view
+    }
+
+    pub(super) fn with_scan_context(&self, context: super::admission::ReadContext) -> Self {
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+
+    pub(crate) fn stats_deadline(&self) -> Option<tokio::time::Instant> {
+        self.read_context
+            .as_ref()
+            .map(|_| self.read_context().deadline)
+    }
+    pub(crate) fn read_context(&self) -> super::admission::ReadContext {
+        let mut context = self
+            .read_context
+            .clone()
+            .unwrap_or_else(|| super::admission::ReadContext::new(self.read_class, SEARCH_BUDGET));
+        if let Some(live) = &context.live {
+            if let Some(demand) = *live.borrow() {
+                context.deadline = demand.deadline;
+            }
+        }
+        context
+    }
+
     pub(crate) fn with_attempt_limit(&self, limit: usize) -> Self {
         let mut view = self.clone();
         let mut context = self.read_context();
@@ -550,6 +631,10 @@ impl GitHubClient {
             .map_or(usize::MAX, |a| a.remaining())
     }
 
+    pub(crate) fn admission_snapshot(&self) -> super::admission::AdmissionSnapshot {
+        self.read_transport.admission.snapshot()
+    }
+
     pub(crate) fn request_budget(&self) -> super::stats::Budget {
         super::stats::Budget::with_transport(self.read_transport.clone())
     }
@@ -564,13 +649,116 @@ impl GitHubClient {
     pub fn new(octocrab: Octocrab) -> Self {
         Self {
             octocrab,
+            credential: None,
             searches: Arc::new(Searches::default()),
             scans: Arc::default(),
             viewer: Arc::default(),
+            reviewer_receipts: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
+            read_class: super::admission::ReadClass::Foreground,
         }
+    }
+
+    /// Bind the exact immutable token used by Octocrab; never expose this digest.
+    pub(crate) fn with_credential(mut self, token: &str, path: std::path::PathBuf) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for part in [
+            "headstate-snapshot-credential-v1",
+            "github",
+            "github.com",
+            token.trim(),
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        self.credential = Some(Arc::new(CredentialBinding {
+            digest: digest
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            path,
+            persistence: Arc::new(tokio::sync::Semaphore::new(1)),
+            confirmed: std::sync::Mutex::new(None),
+        }));
+        self
+    }
+    pub(crate) fn credential_binding(&self) -> Option<&str> {
+        self.credential.as_ref().map(|v| v.digest.as_str())
+    }
+    async fn persist_verified_viewer(&self, viewer: &str) {
+        self.persist_viewer_binding(viewer, false).await;
+    }
+    async fn persist_viewer_binding(&self, viewer: &str, only_if_unsaved: bool) {
+        let Some(binding) = self.credential.clone() else {
+            return;
+        };
+        let confirmed = || {
+            binding
+                .confirmed
+                .lock()
+                .expect("credential persistence state")
+                .as_deref()
+                .is_some_and(|saved| only_if_unsaved || saved == viewer)
+        };
+        if confirmed() {
+            return;
+        }
+        let deadline = self.read_context().deadline;
+        if deadline <= tokio::time::Instant::now() {
+            return;
+        }
+        let Ok(permit) = binding.persistence.clone().try_acquire_owned() else {
+            return;
+        };
+        // A running newer save may have completed between the fast path and
+        // acquiring its permit. Cached retries never replace confirmed identity.
+        if confirmed() {
+            return;
+        }
+        let viewer = viewer.to_owned();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_cancelled = cancelled.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if deadline <= tokio::time::Instant::now()
+                || job_cancelled.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            if let Ok(conn) = crate::store::open_db(&binding.path) {
+                // Persistence is best-effort, not a reason to hold a verified network
+                // answer behind another writer. Never queue a write past its caller.
+                if deadline <= tokio::time::Instant::now()
+                    || job_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || conn.busy_timeout(std::time::Duration::ZERO).is_err()
+                {
+                    return;
+                }
+                if crate::store::source_cache::save_verified_binding(
+                    &conn,
+                    &binding.digest,
+                    &viewer,
+                )
+                .is_ok()
+                {
+                    *binding
+                        .confirmed
+                        .lock()
+                        .expect("credential persistence state") = Some(viewer);
+                }
+            }
+        });
+        // Aborts a queued blocking job on cancellation/deadline; a running job keeps
+        // the single permit, its immutable binding, and its own deadline checks.
+        let _abort = AbortQueuedBinding {
+            abort: task.abort_handle(),
+            cancelled,
+        };
+        let _ = tokio::time::timeout_at(deadline, task).await;
     }
 
     /// Run a GraphQL document, keeping `data` on a PARTIAL success.
@@ -1012,6 +1200,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            self.persist_verified_viewer(&viewer).await;
             let _ = self.viewer.set(viewer);
         }
         // Counted from THIS response, not from shared state. A global
@@ -1172,14 +1361,18 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._post(path, None::<&()>)
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1187,13 +1380,11 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .map_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Rest,
-                            &error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Rest,
+                        &error,
+                        retry,
+                    );
                     if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
@@ -1204,6 +1395,8 @@ impl GitHubClient {
                 .await
                 .map_err(write_error)?;
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(())
         })
         .await
@@ -1226,14 +1419,18 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._post(path, Some(body))
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1241,13 +1438,11 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .map_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Rest,
-                            &error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Rest,
+                        &error,
+                        retry,
+                    );
                     if status < 500 && matches!(&error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
@@ -1260,6 +1455,8 @@ impl GitHubClient {
                 .map_err(write_error)?;
             let value = serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(value)
         })
         .await
@@ -1322,14 +1519,18 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._put(path, Some(body))
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
                 response.status().as_u16(),
                 response.headers(),
@@ -1351,10 +1552,10 @@ impl GitHubClient {
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
             // PUT's non-success JSON is a semantic answer consumed by its caller.
-            if current_window {
-                self.read_transport.observe_rest_body(&value, retry);
-            }
+            self.read_transport.observe_rest_body(&value, retry);
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok((status, value))
         })
         .await
@@ -1392,10 +1593,14 @@ impl GitHubClient {
         let _epoch = MutationEpoch::new(&self.searches.generation);
         let started = std::time::Instant::now();
         let posted = tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self.octocrab._post("/graphql", Some(body)).await?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
-            let current_window = self.read_transport.observe_headers(
+            self.read_transport.observe_headers(
                 super::admission::Bucket::Graphql,
                 response.status().as_u16(),
                 response.headers(),
@@ -1403,23 +1608,21 @@ impl GitHubClient {
             let response = octocrab::map_github_error(response)
                 .await
                 .inspect_err(|error| {
-                    if current_window {
-                        self.read_transport.observe_error(
-                            super::admission::Bucket::Graphql,
-                            error,
-                            retry,
-                        );
-                    }
+                    self.read_transport.observe_error(
+                        super::admission::Bucket::Graphql,
+                        error,
+                        retry,
+                    );
                     if status < 500 && matches!(error, octocrab::Error::GitHub { .. }) {
                         admission.complete();
                     }
                 })?;
             let value =
                 <serde_json::Value as octocrab::FromResponse>::from_response(response).await?;
-            if current_window {
-                self.read_transport.observe_graphql(&value, retry);
-            }
+            self.read_transport.observe_graphql(&value, retry);
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(value)
         })
         .await;
@@ -1601,6 +1804,12 @@ impl GitHubClient {
     /// accumulator to report into and use this; everything in a stats load
     /// uses [`Self::fetch_viewer_metered`] instead.
     pub async fn fetch_viewer(&self) -> Result<String, ClientError> {
+        if let Some(viewer) = self.viewer.get() {
+            // A later normal call can recover a transiently refused save without
+            // another provider request. Successful persistence is binding-local.
+            self.persist_viewer_binding(viewer, true).await;
+            return Ok(viewer.clone());
+        }
         tokio::time::timeout_at(
             self.read_context().deadline,
             self.viewer.get_or_try_init(|| async {
@@ -1610,8 +1819,11 @@ impl GitHubClient {
                 if let Some((remaining, _)) = map_rate_limit(&v) {
                     crate::github::stats::budget::note_remaining(remaining);
                 }
-                map_viewer(&v)
-                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+                let viewer = map_viewer(&v)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
+                self.persist_verified_viewer(&viewer).await;
+                Ok(viewer)
             }),
         )
         .await
@@ -1645,7 +1857,11 @@ impl GitHubClient {
         // Recorded BEFORE the login is extracted, so a response that answered
         // but carried no login still counts the point it spent.
         budget.record(&v);
-        map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+        let viewer = map_viewer(&v)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
+        self.persist_verified_viewer(&viewer).await;
+        Ok(viewer)
     }
 
     pub async fn stats_viewer_metered(
@@ -1714,6 +1930,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            self.persist_verified_viewer(&viewer).await;
             let _ = self.viewer.set(viewer);
         }
         // How long GitHub took, and what it was asked for. A slow
@@ -2538,6 +2755,8 @@ mod tests {
             .await;
         let client = client_for(&server).await;
         let mut context = ReadContext::new(ReadClass::Advisory, std::time::Duration::from_secs(5));
+        let paired = crate::remote::context::DispatchContext::paired_for_test();
+        context.advisory_context = Some(paired.clone());
         let count = observed.clone();
         context.first_attempt = Some(FirstAttempt::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
@@ -2547,6 +2766,20 @@ mod tests {
             ReadClass::Advisory,
             std::time::Duration::from_secs(5),
         ));
+        let row_observed = Arc::new(AtomicUsize::new(0));
+        let row_count = row_observed.clone();
+        let child = child.with_first_attempt(move || {
+            row_count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            child
+                .read_context()
+                .advisory_context
+                .as_ref()
+                .unwrap()
+                .principal(),
+            paired.principal()
+        );
         child
             .rest_get("/first-stage", &client.request_budget())
             .await
@@ -2561,10 +2794,429 @@ mod tests {
             "retry and second stage both dispatched"
         );
         assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            row_observed.load(Ordering::SeqCst),
+            1,
+            "row observation composes with parent across retries"
+        );
+        let desktop =
+            client.with_advisory_context(crate::remote::context::DispatchContext::desktop());
+        assert!(
+            matches!(
+                desktop
+                    .rest_get("/late-desktop", &client.request_budget())
+                    .await,
+                Err(ClientError::NotDispatched(_))
+            ),
+            "new principal does not borrow the paired leader's remaining discovery credit"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(client.read_context().advisory_context.is_none());
         assert!(
             client.read_context().first_attempt.is_none(),
             "managed client must not retain a row observer"
         );
+    }
+
+    #[tokio::test]
+    async fn verified_credential_survives_offline_restart_without_hydrating_live_viewer() {
+        use crate::store::{source_cache::*, CachedList};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"alice"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        save_owned_source_snapshot(
+            &conn,
+            &Default::default(),
+            CachedList::Authored,
+            &[],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("fixture-token-a", path.clone());
+        assert!(matches!(
+            load_qualified_snapshot(
+                &conn,
+                &Default::default(),
+                CachedList::Authored,
+                None,
+                client.credential_binding()
+            )
+            .unwrap()
+            .snapshot
+            .data,
+            SnapshotData::Withheld { .. }
+        ));
+        assert_eq!(client.fetch_viewer().await.unwrap(), "alice");
+        let restarted = client_for(&server)
+            .await
+            .with_credential("fixture-token-a", path.clone());
+        assert_eq!(restarted.known_viewer(), None);
+        let saved = load_qualified_snapshot(
+            &conn,
+            &Default::default(),
+            CachedList::Authored,
+            restarted.known_viewer(),
+            restarted.credential_binding(),
+        )
+        .unwrap();
+        assert!(matches!(saved.ownership, Ownership::CredentialBound { .. }));
+        assert!(matches!(
+            saved.snapshot.data,
+            SnapshotData::Available { .. }
+        ));
+        assert_eq!(restarted.known_viewer(), None);
+        let changed = client_for(&server)
+            .await
+            .with_credential("fixture-token-b", path);
+        assert!(matches!(
+            load_qualified_snapshot(
+                &conn,
+                &Default::default(),
+                CachedList::Authored,
+                None,
+                changed.credential_binding()
+            )
+            .unwrap()
+            .snapshot
+            .data,
+            SnapshotData::Withheld { .. }
+        ));
+        let wire = serde_json::to_string(&saved).unwrap();
+        assert!(!wire.contains("fixture-token"));
+        assert!(!wire.contains(restarted.credential_binding().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn credential_binding_persistence_respects_viewer_deadline() {
+        use std::time::{Duration, Instant};
+        let artifact =
+            std::env::var_os("HEADSTATE_CREDENTIAL_PROBE_DIR").map(std::path::PathBuf::from);
+        let temporary = tempfile::tempdir().unwrap();
+        let root = artifact.as_deref().unwrap_or_else(|| temporary.path());
+        std::fs::create_dir_all(root).unwrap();
+        let mut observations = Vec::new();
+        for metered in [false, true] {
+            for existing in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let path = root.join(format!("binding-{metered}-{existing}.db"));
+                let conn = crate::store::open_db(&path).unwrap();
+                let client = client_for(&server)
+                    .await
+                    .with_credential("synthetic-binding-probe", path.clone());
+                if existing {
+                    crate::store::source_cache::save_verified_binding(
+                        &conn,
+                        client.credential_binding().unwrap(),
+                        "synthetic-viewer",
+                    )
+                    .unwrap();
+                }
+                drop(conn);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let writer_path = path.clone();
+                let writer = std::thread::spawn(move || {
+                    let conn = crate::store::open_db(&writer_path).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(700));
+                    conn.execute_batch("ROLLBACK").unwrap();
+                });
+                ready_rx.recv().unwrap();
+                let started = Instant::now();
+                let timer = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    started.elapsed().as_millis()
+                });
+                let managed_client = client.clone();
+                let client = client.with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    Duration::from_millis(50),
+                ));
+                let result = if metered {
+                    client
+                        .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                        .await
+                } else {
+                    client.fetch_viewer().await
+                };
+                let elapsed = started.elapsed().as_millis();
+                let timer_elapsed = timer.await.unwrap();
+                writer.join().unwrap();
+                // A contended best-effort save must not become a late queued write.
+                let conn = crate::store::open_db(&path).unwrap();
+                let saved: i64 = conn
+                    .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                if !metered {
+                    assert_eq!(
+                        managed_client.fetch_viewer().await.unwrap(),
+                        "synthetic-viewer"
+                    );
+                    let recovered: i64 = conn
+                        .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(recovered, 1, "normal cached viewer call retries a transiently refused save without new HTTP");
+                }
+                observations.push(json!({"metered":metered,"alreadyBound":existing,
+                    "elapsedMs":elapsed,"timerMs":timer_elapsed,"success":result.is_ok(),
+                    "providerReceipts":server.received_requests().await.unwrap().len(),"bindingSaved":saved==1}));
+            }
+        }
+        let evidence = serde_json::to_string_pretty(&observations).unwrap();
+        println!("credential binding probe: {evidence}");
+        if artifact.is_some() {
+            std::fs::write(root.join("result.json"), &evidence).unwrap();
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|row| row["elapsedMs"].as_u64().unwrap() < 250
+                    && row["timerMs"].as_u64().unwrap() < 250
+                    && row["bindingSaved"] == row["alreadyBound"]
+                    && row["success"] == true),
+            "50ms viewer budget and concurrent runtime timer must not wait for the held writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_binding_cached_identity_does_not_overwrite_newer_verified_binding() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path);
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-old-login"}}})),
+            )
+            .mount(&server)
+            .await;
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-old-login");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-current-login"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            client
+                .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                .await
+                .unwrap(),
+            "synthetic-current-login"
+        );
+        // This test preserves the existing cached-viewer semantics. A retry for
+        // that older cache entry must not roll back newer durable verification.
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-old-login");
+        let owner: String = conn
+            .query_row("SELECT owner FROM snapshot_credentials", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "synthetic-current-login");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_binding_confirmed_save_does_not_reopen_database_on_cached_viewer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        drop(crate::store::open_db(&path).unwrap());
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path.clone());
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        // Preserve the DB under another name: any attempted reopen would recreate
+        // the original path. A confirmed binding needs neither DB nor HTTP work.
+        std::fs::rename(&path, dir.path().join("retained.db")).unwrap();
+        for _ in 0..10 {
+            assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        }
+        assert!(!path.exists());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_binding_failed_save_keeps_durable_owner_and_cached_verified_viewer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path);
+        crate::store::source_cache::save_verified_binding(
+            &conn,
+            client.credential_binding().unwrap(),
+            "synthetic-previous",
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER refuse_binding BEFORE UPDATE ON snapshot_credentials BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END").unwrap();
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        let owner: String = conn
+            .query_row("SELECT owner FROM snapshot_credentials", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "synthetic-previous");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn credential_binding_queued_job_is_bounded_cancelled_and_never_publishes_late() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("binding.db");
+            let conn = crate::store::open_db(&path).unwrap();
+            let client = client_for(&server)
+                .await
+                .with_credential("synthetic-old", path.clone());
+            let gate = client.credential.as_ref().unwrap().persistence.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let pending_client = client.clone();
+            let pending = tokio::spawn(async move {
+                pending_client
+                    .persist_verified_viewer("synthetic-old-viewer")
+                    .await;
+            });
+            while gate.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            // All overlapping callers skip rather than enqueue another blocking job.
+            for _ in 0..100 {
+                client.persist_verified_viewer("synthetic-old-viewer").await;
+                assert_eq!(gate.available_permits(), 0);
+            }
+            pending.abort();
+            let _ = pending.await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while gate.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "aborted queued job cannot publish after its caller retires"
+            );
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let short = client.with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Foreground,
+                std::time::Duration::from_millis(30),
+            ));
+            let started = std::time::Instant::now();
+            short.persist_verified_viewer("synthetic-old-viewer").await;
+            assert!(started.elapsed() < std::time::Duration::from_millis(250));
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while gate.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "deadline also retires queued persistence without a late write"
+            );
+            let replacement = client_for(&server)
+                .await
+                .with_credential("synthetic-new", path);
+            replacement
+                .persist_verified_viewer("synthetic-new-viewer")
+                .await;
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT binding,owner FROM snapshot_credentials")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(
+                    replacement.credential_binding().unwrap().into(),
+                    "synthetic-new-viewer".into()
+                )]
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        });
     }
 
     #[tokio::test]

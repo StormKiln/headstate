@@ -194,3 +194,11 @@ export async function submitBoundReview(qc: QueryClient, request: BoundReviewReq
   }, REVIEW_ACK_MS);
   return outcome;
 }
+
+export function retireReviewOwnership(qc: QueryClient) {
+  const value = store(qc);
+  value.accountRevision++;
+  value.owner = undefined;
+  value.operations.clear();
+  changed(value);
+}

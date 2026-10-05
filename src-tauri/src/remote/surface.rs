@@ -130,6 +130,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the property that makes exposing the expensive path safe rather
     // than a second set of limits to keep in sync.
     ("stats_board", Class::Read),
+    ("stats_board_cached", Class::Read),
+    // Ephemeral bounded read interest, including mobile read recovery.
+    ("stats_demand", Class::Read),
     // The scoped daily activity series (#826). A Read, and the cheap half
     // of a scope page: count-only searches, no nodes.
     ("stats_series", Class::Read),
@@ -1020,6 +1023,14 @@ impl<'a> Args<'a> {
     }
 }
 
+// Keep old phones wire-compatible without granting them ownership of the
+// desktop poll cadence. Phone reads still use refresh_now/get_reviewing.
+fn legacy_phone_cadence(args: &Args<'_>) -> Result<Value, RemoteError> {
+    let _: bool = args.get("needs")?;
+    let _: Option<bool> = args.get("reviewing")?;
+    ok(())
+}
+
 /// A command's plain return value, as the webview would receive it.
 fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
     serde_json::to_value(value)
@@ -1051,11 +1062,12 @@ pub async fn dispatch(
     app: &AppHandle,
     command: &str,
     args: Value,
-    device_name: &str,
+    context: &super::context::DispatchContext,
 ) -> Result<Value, RemoteError> {
+    let device_name = &context.display_name;
     let class = admit(command)?;
     log::info!("remote: {device_name} called {command} ({class:?})");
-    let result = call(app, command, Args::new(command, args)?).await;
+    let result = call(app, command, Args::new(command, args)?, context).await;
     if let Err(e) = &result {
         log::warn!("remote: {command} for {device_name} failed: {e}");
     }
@@ -1070,7 +1082,12 @@ pub async fn dispatch(
 /// `State<'_, T>` Tauri injects into the command; `AppHandle` arguments
 /// get a clone of `app`. Argument keys are the camelCase names the
 /// webview sends, so `repo_path` on the Rust side is `"repoPath"` here.
-async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, RemoteError> {
+async fn call(
+    app: &AppHandle,
+    command: &str,
+    a: Args<'_>,
+    context: &super::context::DispatchContext,
+) -> Result<Value, RemoteError> {
     match command {
         // ---- read -------------------------------------------------------
         "background_panicked" => ok(commands::background_panicked()),
@@ -1138,13 +1155,30 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // about everyone in the scope, and a subject qualifier would render
         // a leaderboard with one name on it. The viewer's login comes back
         // IN the answer so the caller can split Mine from Others.
-        "stats_board" => res(commands::stats_board(
+        "stats_demand" => res(commands::stats_demand_with_context(
+            app.clone(),
+            a.get("request")?,
+            context.clone(),
+        )
+        .await),
+        "stats_board_cached" => res(commands::stats_board_cached(
+            app.clone(),
+            app.state(),
+            a.get("expectedOwner")?,
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            a.get("measure")?,
+            a.get("days")?,
+        )
+        .await),
+        "stats_board" => res(commands::stats_board_with_context(
             app.clone(),
             app.state(),
             a.get("scopeKind")?,
             a.get("scopeValue")?,
             a.get("measure")?,
             a.get("days")?,
+            context.clone(),
         )
         .await),
         "stats_series" => res(commands::stats_series(
@@ -1157,6 +1191,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_reviewers" => res(commands::stats_reviewers(
+            app.clone(),
             app.state(),
             a.get("scopeKind")?,
             a.get("scopeValue")?,
@@ -1166,6 +1201,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             // list that would produce an empty leaderboard.
             a.get("logins")?,
             a.get("days")?,
+            a.get("refresh")?,
         )
         .await),
         "get_reviewing" => {
@@ -1187,8 +1223,18 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("headOid")?,
         )
         .await),
-        "get_ready_pushers" => res(commands::get_ready_pushers(app.state(), a.get("rows")?).await),
-        "get_ready_stacks" => res(commands::get_ready_stacks(app.state(), a.get("rows")?).await),
+        "get_ready_pushers" => res(commands::get_ready_pushers_with_context(
+            app.state(),
+            a.get("rows")?,
+            context.clone(),
+        )
+        .await),
+        "get_ready_stacks" => res(commands::get_ready_stacks_with_context(
+            app.state(),
+            a.get("rows")?,
+            context.clone(),
+        )
+        .await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),
@@ -1496,16 +1542,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // engine start does not stall the listener for everyone else.
         "docker_start" => res(blocking(commands::docker_start).await?),
         "docker_restart" => res(blocking(commands::docker_restart).await?),
-        "set_view_needs_github" => {
-            commands::set_view_needs_github(
-                a.get("needs")?,
-                app.state(),
-                app.state(),
-                app.state(),
-                a.get("reviewing")?,
-            );
-            ok(())
-        }
+        "set_view_needs_github" => legacy_phone_cadence(&a),
         "set_poll_interval" => ok(commands::set_poll_interval(
             app.clone(),
             a.get("secs")?,
@@ -1633,6 +1670,39 @@ mod tests {
             .filter_map(|tok| tok.rsplit("::").next())
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn legacy_phone_cadence_validates_wire_args_without_host_state() {
+        for needs in [false, true] {
+            for reviewing in [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                Value::Null,
+            ] {
+                let args = Args::new(
+                    "set_view_needs_github",
+                    serde_json::json!({"needs":needs,"reviewing":reviewing}),
+                )
+                .unwrap();
+                assert_eq!(legacy_phone_cadence(&args).unwrap(), Value::Null);
+            }
+        }
+        assert!(legacy_phone_cadence(
+            &Args::new("set_view_needs_github", serde_json::json!({})).unwrap()
+        )
+        .is_err());
+        assert_eq!(class_of("set_view_needs_github"), Some(Class::Write));
+        let source = include_str!("surface.rs");
+        let arm = source
+            .split("\"set_view_needs_github\" =>")
+            .nth(1)
+            .unwrap()
+            .split("\"set_poll_interval\"")
+            .next()
+            .unwrap();
+        assert!(arm.contains("legacy_phone_cadence(&a)"));
+        assert!(!arm.contains("app.state()"));
     }
 
     #[test]

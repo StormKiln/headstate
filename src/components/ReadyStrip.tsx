@@ -345,11 +345,13 @@ function MyPushesBar({
 /// persists it without a second mechanism. Per-view rather than global
 /// because this strip only renders on To Review.
 export function ReadyStrip({
+  localTools = true,
   prs,
   availability = { status: "available", coverage: "complete" },
   onOpen,
 }: {
   prs: PullRequest[];
+  localTools?: boolean;
   /// Accepted source evidence. Every production caller must pass this;
   /// the default exists only for older isolated component callers.
   availability?: { status: "pending" | "failed" | "available"; coverage: SourceCoverage | null };
@@ -440,7 +442,7 @@ export function ReadyStrip({
         />
         {/* The same rows, handed to Claude to approve and merge what is
             eligible (#1579). It only starts Claude; see ReadyClaudify. */}
-        <ReadyClaudify rows={shown} />
+        {localTools && <ReadyClaudify rows={shown} />}
         <DropdownMenu>
           <DropdownMenuTrigger
             render={

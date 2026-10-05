@@ -85,6 +85,10 @@ pub enum LastPusher {
 /// Both answers the detail view needs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReviewGates {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_valid_for_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pusher_valid_for_ms: Option<u64>,
     pub rules: BaseRules,
     pub last_pusher: LastPusher,
 }
@@ -192,15 +196,27 @@ pub async fn base_rules(
     repo: &str,
     base: &str,
 ) -> BaseRules {
+    base_rules_receipt(client, budget, repo, base).await.0
+}
+
+async fn base_rules_receipt(
+    client: &GitHubClient,
+    budget: &Budget,
+    repo: &str,
+    base: &str,
+) -> (BaseRules, Duration) {
     if !valid_repo(repo) || base.is_empty() {
-        return BaseRules::Declined {
-            reason: "no base branch to ask about".into(),
-        };
+        return (
+            BaseRules::Declined {
+                reason: "no base branch to ask about".into(),
+            },
+            Duration::ZERO,
+        );
     }
     client
         .advisory
         .rules
-        .load(
+        .load_receipt(
             (repo.into(), base.into()),
             client.read_context().deadline,
             |value| {
@@ -213,8 +229,13 @@ pub async fn base_rules(
             base_rules_uncached(client, budget, repo, base),
         )
         .await
-        .unwrap_or_else(|| BaseRules::Declined {
-            reason: "not checked before the request deadline".into(),
+        .unwrap_or_else(|| {
+            (
+                BaseRules::Declined {
+                    reason: "not checked before the request deadline".into(),
+                },
+                Duration::ZERO,
+            )
         })
 }
 
@@ -258,23 +279,41 @@ pub async fn last_pusher(
     head_ref: &str,
     head_oid: &str,
 ) -> LastPusher {
+    last_pusher_receipt(client, budget, head_repo, head_ref, head_oid)
+        .await
+        .0
+}
+
+async fn last_pusher_receipt(
+    client: &GitHubClient,
+    budget: &Budget,
+    head_repo: Option<&str>,
+    head_ref: &str,
+    head_oid: &str,
+) -> (LastPusher, Duration) {
     // No head repository means the fork is gone or the detail has not
     // arrived. Asking the BASE repository instead would be a guess -- a
     // same-named branch there is a different branch.
     let Some(head_repo) = head_repo.filter(|r| valid_repo(r)) else {
-        return LastPusher::Declined {
-            reason: "the head repository is not known".into(),
-        };
+        return (
+            LastPusher::Declined {
+                reason: "the head repository is not known".into(),
+            },
+            Duration::ZERO,
+        );
     };
     if head_ref.is_empty() || head_oid.is_empty() {
-        return LastPusher::Declined {
-            reason: "the head branch is not known".into(),
-        };
+        return (
+            LastPusher::Declined {
+                reason: "the head branch is not known".into(),
+            },
+            Duration::ZERO,
+        );
     }
     client
         .advisory
         .pushers
-        .load(
+        .load_receipt(
             (head_repo.into(), head_ref.into(), head_oid.into()),
             client.read_context().deadline,
             |value| {
@@ -287,8 +326,13 @@ pub async fn last_pusher(
             last_pusher_uncached(client, budget, head_repo, head_ref, head_oid),
         )
         .await
-        .unwrap_or_else(|| LastPusher::Declined {
-            reason: "not checked before the request deadline".into(),
+        .unwrap_or_else(|| {
+            (
+                LastPusher::Declined {
+                    reason: "not checked before the request deadline".into(),
+                },
+                Duration::ZERO,
+            )
         })
 }
 
@@ -345,26 +389,48 @@ pub async fn review_gates(
     head_oid: &str,
     per_request: Duration,
 ) -> ReviewGates {
-    let rules = tokio::time::timeout(per_request, base_rules(client, budget, repo, base))
-        .await
-        .unwrap_or_else(|_| BaseRules::Unreadable {
-            reason: format!("timed out after {}s", per_request.as_secs()),
-        });
-    let last_pusher = match rules {
+    let (rules, rules_lifetime) =
+        tokio::time::timeout(per_request, base_rules_receipt(client, budget, repo, base))
+            .await
+            .unwrap_or_else(|_| {
+                (
+                    BaseRules::Unreadable {
+                        reason: format!("timed out after {}s", per_request.as_secs()),
+                    },
+                    Duration::ZERO,
+                )
+            });
+    let rules_until = tokio::time::Instant::now() + rules_lifetime;
+    let (last_pusher, pusher_lifetime) = match rules {
         BaseRules::Read {
             require_last_push_approval: true,
             ..
         } => tokio::time::timeout(
             per_request,
-            last_pusher(client, budget, head_repo, head_ref, head_oid),
+            last_pusher_receipt(client, budget, head_repo, head_ref, head_oid),
         )
         .await
-        .unwrap_or_else(|_| LastPusher::Unknown {
-            reason: format!("timed out after {}s", per_request.as_secs()),
+        .unwrap_or_else(|_| {
+            (
+                LastPusher::Unknown {
+                    reason: format!("timed out after {}s", per_request.as_secs()),
+                },
+                Duration::ZERO,
+            )
         }),
-        _ => LastPusher::NotNeeded,
+        _ => (LastPusher::NotNeeded, Duration::ZERO),
     };
-    ReviewGates { rules, last_pusher }
+    // The independent pusher stage consumes the rules receipt's remaining life.
+    ReviewGates {
+        rules,
+        last_pusher,
+        rules_valid_for_ms: Some(
+            rules_until
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64,
+        ),
+        pusher_valid_for_ms: Some(pusher_lifetime.as_millis() as u64),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -388,6 +454,8 @@ pub struct PusherAsk {
 /// an answer about a head the row has since moved off.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowPusher {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_progress: Option<super::advisory::Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pusher_valid_for_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -415,7 +483,7 @@ pub async fn strip_pushers(
     budget: &Budget,
     asks: &[PusherAsk],
     per_request: Duration,
-) -> Vec<RowPusher> {
+) -> Result<Vec<RowPusher>, String> {
     let client = client.with_read_context(super::admission::ReadContext::new(
         super::admission::ReadClass::Advisory,
         Duration::from_secs(10),
@@ -424,10 +492,18 @@ pub async fn strip_pushers(
         .iter()
         .map(|a| serde_json::to_string(a).expect("string-only advisory identity"))
         .collect();
-    let order = client.advisory.order(&keys);
+    // Membership is logical row identity: reordering and head movement do not
+    // reset continuation. Actual value-cache keys still include all head facts.
+    let members: Vec<_> = asks
+        .iter()
+        .map(|a| serde_json::to_string(&(a.repo.to_lowercase(), a.number)).expect("row identity"))
+        .collect();
+    let batch = client.advisory.batch(&members)?;
+    let order = client.advisory.batch_order(&keys, &members, &batch);
     let mut out: Vec<RowPusher> = asks
         .iter()
         .map(|a| RowPusher {
+            advisory_progress: None,
             pusher_valid_for_ms: None,
             rules_valid_for_ms: None,
             last_known_pusher: None,
@@ -446,6 +522,10 @@ pub async fn strip_pushers(
             },
         })
         .collect();
+    let admitted: Vec<_> = asks
+        .iter()
+        .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .collect();
     let mut work = stream::iter(
         order
             .into_iter()
@@ -454,13 +534,15 @@ pub async fn strip_pushers(
                 let budget = budget.clone();
                 let a = asks[i].clone();
                 let key = keys[i].clone();
+                let member = members[i].clone();
+                let batch = batch.clone();
+                let admitted = admitted[i].clone();
                 async move {
-                    let mut context = client.read_context();
                     let advisory = client.advisory.clone();
-                    context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
-                        advisory.offered(key);
-                    }));
-                    let client = client.with_read_context(context);
+                    let client = client.with_first_attempt(move || {
+                        admitted.store(true, std::sync::atomic::Ordering::Release);
+                        advisory.batch_offered(key, member, &batch);
+                    });
                     let rules = tokio::time::timeout(
                         per_request,
                         base_rules(&client, &budget, &a.repo, &a.base),
@@ -497,7 +579,8 @@ pub async fn strip_pushers(
         out[i].rules = rules;
         out[i].last_pusher = pusher;
     }
-    for (row, ask) in out.iter_mut().zip(asks) {
+    drop(work);
+    for ((row, ask), admitted) in out.iter_mut().zip(asks).zip(&admitted) {
         let rules_key = (ask.repo.clone(), ask.base.clone());
         if let Some((rules, lifetime)) = client.advisory.rules.peek_receipt(&rules_key) {
             row.rules = rules;
@@ -512,8 +595,32 @@ pub async fn strip_pushers(
             }
             row.last_known_pusher = client.advisory.pushers.last_success(&key);
         }
+        use super::advisory::{Progress, ProgressOutcome};
+        let admitted = admitted.load(std::sync::atomic::Ordering::Acquire);
+        let rules = matches!(row.rules, BaseRules::Read { .. });
+        let pusher = matches!(row.last_pusher, LastPusher::Known { .. });
+        let eligible = valid_repo(&ask.repo)
+            && ask.number > 0
+            && !ask.base.is_empty()
+            && ask.head_repo.as_ref().is_some_and(|repo| valid_repo(repo))
+            && !ask.head_ref.is_empty()
+            && !ask.head_oid.is_empty();
+        let partial = (rules && matches!(row.last_pusher, LastPusher::Declined { .. }))
+            || (pusher && matches!(row.rules, BaseRules::Declined { .. }));
+        row.advisory_progress = Some(Progress {
+            admitted,
+            outcome: if !eligible {
+                ProgressOutcome::Ineligible
+            } else if partial {
+                ProgressOutcome::Partial
+            } else if admitted || (rules && pusher) {
+                ProgressOutcome::Offered
+            } else {
+                ProgressOutcome::Deferred
+            },
+        });
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -550,10 +657,14 @@ mod tests {
             .await;
         let client = client_for(&server).await;
         let asks = [ask("octocat/hello-world", 1, HEAD)];
-        let first = strip_pushers(&client, &client.request_budget(), &asks, T).await;
+        let first = strip_pushers(&client, &client.request_budget(), &asks, T)
+            .await
+            .unwrap();
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(55)).await;
-        let second = strip_pushers(&client, &client.request_budget(), &asks, T).await;
+        let second = strip_pushers(&client, &client.request_budget(), &asks, T)
+            .await
+            .unwrap();
         tokio::time::resume();
         let first = serde_json::to_value(&first[0]).unwrap();
         let second = serde_json::to_value(&second[0]).unwrap();
@@ -566,6 +677,14 @@ mod tests {
         assert!(second["rules_valid_for_ms"]
             .as_u64()
             .is_some_and(|ms| ms > 544_000 && ms <= 545_000));
+        assert_eq!(
+            first["advisory_progress"],
+            json!({"outcome":"offered", "admitted":true})
+        );
+        assert_eq!(
+            second["advisory_progress"],
+            json!({"outcome":"offered", "admitted":false})
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
@@ -631,7 +750,7 @@ mod tests {
                 strip_pushers(&client, &budget, &asks, T),
                 strip_pushers(&client, &budget, &asks, T)
             );
-            for row in a.iter().chain(&b) {
+            for row in a.unwrap().iter().chain(&b.unwrap()) {
                 if matches!(row.last_pusher, LastPusher::Known { .. }) {
                     known.insert(row.number);
                 }
@@ -682,7 +801,7 @@ mod tests {
             strip_pushers(&client, &budget, &asks, T),
             super::super::ready_stacks::ready_stacks(&client, stacks)
         );
-        assert_eq!(pushers.len(), 120);
+        assert_eq!(pushers.unwrap().len(), 120);
         assert_eq!(stacks.unwrap().len(), 8);
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 8);
@@ -780,8 +899,9 @@ mod tests {
             for row in &window {
                 for pusher_turn in [cycle % 2 == 0, cycle % 2 != 0] {
                     if pusher_turn {
-                        let pushers =
-                            strip_pushers(&client, &budget, std::slice::from_ref(row), T).await;
+                        let pushers = strip_pushers(&client, &budget, std::slice::from_ref(row), T)
+                            .await
+                            .unwrap();
                         pushers_seen.extend(
                             pushers
                                 .iter()
@@ -964,11 +1084,149 @@ mod tests {
         budget: Budget,
         asks: Vec<PusherAsk>,
     ) -> tokio::task::JoinHandle<Vec<RowPusher>> {
-        tokio::spawn(async move { strip_pushers(&client, &budget, &asks, T).await })
+        tokio::spawn(async move { strip_pushers(&client, &budget, &asks, T).await.unwrap() })
     }
     async fn finish_strip(task: tokio::task::JoinHandle<Vec<RowPusher>>) -> Vec<RowPusher> {
         drive_advisory_until(|| task.is_finished()).await;
         task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_515_canceled_prefix_has_finite_opportunity() {
+        oversized_progress(false).await;
+    }
+    #[tokio::test]
+    async fn concurrent_oversized_515_canceled_prefix_has_finite_opportunity() {
+        oversized_progress(true).await;
+    }
+    async fn oversized_progress(concurrent: bool) {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        let asks: Vec<_> = (0..515)
+            .map(|i| ask(&format!("synthetic/slow-{i:04}"), i + 1, HEAD))
+            .collect();
+        tokio::time::pause();
+        let budget = client.request_budget();
+        for _ in 0..300 {
+            let bounded = client.with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Advisory,
+                Duration::from_millis(150),
+            ));
+            let before = provider.paths().len();
+            let task = start_strip(bounded.clone(), budget.clone(), asks.clone());
+            let peer = concurrent.then(|| start_strip(bounded, budget.clone(), asks.clone()));
+            drive_advisory_until(|| provider.paths().len() >= before + 2).await;
+            tokio::time::advance(Duration::from_millis(151)).await;
+            let out = finish_strip(task).await;
+            if let Some(peer) = peer {
+                assert_eq!(finish_strip(peer).await.len(), 515);
+            }
+            assert_eq!(out.len(), 515, "no silent tail omission");
+            assert_eq!(
+                provider.paths().len(),
+                before + 2,
+                "two held actual attempts per canceled command"
+            );
+            tokio::time::advance(Duration::from_secs(31)).await;
+        }
+        let seen: std::collections::HashSet<_> = provider.paths().into_iter().collect();
+        assert_eq!(
+            seen.len(),
+            515,
+            "every accepted identity must reach the provider"
+        );
+        assert_eq!(
+            provider.paths().len(),
+            600,
+            "count dispatched requests, including canceled replies"
+        );
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn alternating_oversized_batches_keep_independent_continuation_after_reorder_and_head_churn(
+    ) {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        let mut batches: Vec<Vec<_>> = ["a", "b"]
+            .iter()
+            .map(|prefix| {
+                (0..515)
+                    .map(|i| ask(&format!("synthetic/slow-{prefix}-{i:04}"), i + 1, HEAD))
+                    .collect()
+            })
+            .collect();
+        tokio::time::pause();
+        let budget = client.request_budget();
+        for cycle in 0..300 {
+            for asks in &mut batches {
+                asks.reverse();
+                if cycle == 100 {
+                    asks[0].head_oid = OTHER.into();
+                }
+                let bounded = client.with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Advisory,
+                    Duration::from_millis(150),
+                ));
+                let before = provider.paths().len();
+                let task = start_strip(bounded, budget.clone(), asks.clone());
+                drive_advisory_until(|| provider.paths().len() >= before + 2).await;
+                tokio::time::advance(Duration::from_millis(151)).await;
+                assert_eq!(finish_strip(task).await.len(), 515);
+                assert_eq!(provider.paths().len(), before + 2);
+                tokio::time::advance(Duration::from_secs(31)).await;
+            }
+        }
+        let seen: std::collections::HashSet<_> = provider.paths().into_iter().collect();
+        assert_eq!(
+            seen.len(),
+            1030,
+            "both stable sets receive finite provider opportunity"
+        );
+        assert_eq!(
+            provider.paths().len(),
+            1200,
+            "count dispatched requests, including canceled replies"
+        );
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn batch_context_overload_is_explicit_without_http_and_idle_contexts_can_reenter() {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        tokio::time::pause();
+        for i in 0..512 {
+            client
+                .advisory
+                .batch(&[format!("context-{i}"), "other".into()])
+                .unwrap();
+        }
+        let asks = [
+            ask("synthetic/slow-a", 1, HEAD),
+            ask("synthetic/slow-b", 2, HEAD),
+        ];
+        let result = strip_pushers(&client, &client.request_budget(), &asks, T).await;
+        assert!(result.unwrap_err().contains("Retry this batch"));
+        assert!(provider.paths().is_empty());
+        // A live lease survives the idle TTL and shares its cursor with another caller.
+        let lease = client
+            .advisory
+            .batch(&["context-0".into(), "other".into()])
+            .unwrap()
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let same = client
+            .advisory
+            .batch(&["other".into(), "context-0".into()])
+            .unwrap()
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&lease, &same));
+        assert!(client
+            .advisory
+            .batch(&["new".into(), "other".into()])
+            .is_ok());
+        tokio::time::resume();
     }
 
     async fn slow_prefix_progress(concurrent: bool, churn: bool, staggered: bool) {
@@ -1184,7 +1442,8 @@ mod tests {
             &[ask("octocat/hello-world", 1, HEAD)],
             Duration::from_secs(10),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(matches!(rows[0].rules, BaseRules::Read { .. }));
         assert!(!matches!(rows[0].last_pusher, LastPusher::Known { .. }));
@@ -1372,6 +1631,117 @@ mod tests {
             }
         );
         assert_eq!(budget.rest_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn detail_receipts_keep_original_rules_and_pusher_lifetimes_across_shared_clients() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.url.path().contains("/activity") {
+                    ResponseTemplate::new(200).set_body_json(json!([push("push", HEAD, "viewer")]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!([pr_rule(true, true)]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let first = review_gates(
+            &client,
+            &client.request_budget(),
+            "receipt/repo",
+            "main",
+            Some("receipt/repo"),
+            "topic",
+            HEAD,
+            T,
+        )
+        .await;
+        assert!(first
+            .rules_valid_for_ms
+            .is_some_and(|ms| ms > 599_000 && ms <= 600_000));
+        assert!(first
+            .pusher_valid_for_ms
+            .is_some_and(|ms| ms > 59_000 && ms <= 60_000));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(55)).await;
+        let peer = client.clone();
+        let second = review_gates(
+            &peer,
+            &peer.request_budget(),
+            "receipt/repo",
+            "main",
+            Some("receipt/repo"),
+            "topic",
+            HEAD,
+            T,
+        )
+        .await;
+        assert!(second
+            .rules_valid_for_ms
+            .is_some_and(|ms| ms > 544_000 && ms <= 545_000));
+        assert!(second
+            .pusher_valid_for_ms
+            .is_some_and(|ms| ms > 4_000 && ms <= 5_000));
+        tokio::time::resume();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let legacy: ReviewGates = serde_json::from_value(json!({"rules":{"state":"unreadable","reason":"old peer"},"last_pusher":{"state":"not_needed"}})).unwrap();
+        assert_eq!(legacy.rules_valid_for_ms, None);
+    }
+
+    #[tokio::test]
+    async fn independent_pusher_timeout_preserves_rules_and_consumes_original_lifetime() {
+        let provider = HeldPusherProvider::start().await;
+        let client = provider.client();
+        // A previous selected read supplied the shared native policy receipt.
+        client
+            .advisory
+            .rules
+            .load(
+                ("receipt/repo".into(), "main".into()),
+                tokio::time::Instant::now() + T,
+                |_| RULES_TTL,
+                async {
+                    BaseRules::Read {
+                        require_last_push_approval: true,
+                        required_review_thread_resolution: true,
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let worker = client.clone();
+        let task = tokio::spawn(async move {
+            review_gates(
+                &worker,
+                &worker.request_budget(),
+                "receipt/repo",
+                "main",
+                Some("synthetic/slow-pusher"),
+                "topic",
+                HEAD,
+                T,
+            )
+            .await
+        });
+        drive_advisory_until(|| provider.paths().len() == 1).await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        drive_advisory_until(|| task.is_finished()).await;
+        let value = task.await.unwrap();
+        assert!(matches!(value.rules, BaseRules::Read { .. }));
+        assert!(matches!(value.last_pusher, LastPusher::Unknown { .. }));
+        assert!(value
+            .rules_valid_for_ms
+            .is_some_and(|ms| ms > 588_000 && ms <= 589_000));
+        assert_eq!(value.pusher_valid_for_ms, Some(0));
+        assert_eq!(
+            provider.paths().len(),
+            1,
+            "good rules are reused while only the pusher is asked"
+        );
+        tokio::time::resume();
     }
 
     /// Rule absent: the pusher is never asked for, so a repository without
@@ -1585,8 +1955,9 @@ mod tests {
         let client = client_for(&server).await;
         let budget = Budget::seeded_rest_for_test(5000);
         for _ in 0..2 {
-            let out =
-                strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, HEAD)], T).await;
+            let out = strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, HEAD)], T)
+                .await
+                .unwrap();
             assert_eq!(
                 out[0].last_pusher,
                 LastPusher::Known {
@@ -1610,7 +1981,9 @@ mod tests {
         // A different head is a different question: asked again. The log
         // names OTHER's pusher only as the second entry, so it is Unknown
         // -- and never borrowed from HEAD's cached answer.
-        let out = strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, OTHER)], T).await;
+        let out = strip_pushers(&client, &budget, &[ask("strip-org/strip-one", 1, OTHER)], T)
+            .await
+            .unwrap();
         assert!(
             matches!(out[0].last_pusher, LastPusher::Unknown { .. }),
             "{out:?}"
@@ -1636,8 +2009,9 @@ mod tests {
         let client = client_for(&server).await;
         let budget = Budget::seeded_rest_for_test(5000);
         for _ in 0..2 {
-            let out =
-                strip_pushers(&client, &budget, &[ask("strip-org/strip-two", 2, HEAD)], T).await;
+            let out = strip_pushers(&client, &budget, &[ask("strip-org/strip-two", 2, HEAD)], T)
+                .await
+                .unwrap();
             assert!(
                 matches!(out[0].last_pusher, LastPusher::Unknown { .. }),
                 "{out:?}"
@@ -1670,7 +2044,9 @@ mod tests {
         let asks: Vec<PusherAsk> = (0..32)
             .map(|n| ask("strip-org/strip-three", n, &format!("{n:040}")))
             .collect();
-        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &asks, T).await;
+        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &asks, T)
+            .await
+            .unwrap();
         assert_eq!(out.len(), asks.len(), "every row answered, none dropped");
         for (i, row) in out.iter().enumerate() {
             assert_eq!(row.number, i as u64, "answers stay in the rows' order");
@@ -1719,7 +2095,8 @@ mod tests {
             &[ask("strip-org/strip-four", 4, HEAD)],
             T,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             matches!(out[0].rules, BaseRules::Declined { .. }),
             "{out:?}"
@@ -1749,7 +2126,9 @@ mod tests {
         let client = client_for(&server).await;
         let mut a = ask("strip-org/strip-five", 5, HEAD);
         a.head_repo = None;
-        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &[a], T).await;
+        let out = strip_pushers(&client, &Budget::seeded_rest_for_test(5000), &[a], T)
+            .await
+            .unwrap();
         assert!(
             matches!(out[0].last_pusher, LastPusher::Declined { .. }),
             "{out:?}"

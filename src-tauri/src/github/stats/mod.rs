@@ -64,6 +64,8 @@ pub mod board;
 pub mod budget;
 pub mod fetch;
 pub mod query;
+pub mod receipt;
+pub(crate) mod reviewer_receipts;
 pub mod scope;
 pub mod slice;
 /// The scope hierarchy #825's sidebar renders: which organisations,

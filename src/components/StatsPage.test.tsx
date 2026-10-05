@@ -74,6 +74,8 @@ const spend = {
 
 const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   viewer: "octocat",
+  window: { from: "2026-09-01", to: "2026-09-30" },
+  stream: "stats-test",
   scopeKey: "board|merged|*|org:acme",
   rows: [row()],
   total: 12,
@@ -101,7 +103,7 @@ const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   // Registered with no frame emitted yet (#1570): the state the #1115
   // "queued" tests describe, so they keep describing it. A failed
   // registration and a seeded frame are opted into by their own tests.
-  backfill: { state: "registered", lastFrame: null },
+  backfill: { state: "registered", owner: { viewer: "octocat", generation: 1 }, lastFrame: null },
   ...over,
 });
 
@@ -682,6 +684,8 @@ describe("StatsPage honesty", () => {
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
+      observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -774,6 +778,8 @@ describe("StatsPage honesty", () => {
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
+      observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -804,9 +810,11 @@ describe("StatsPage honesty", () => {
           daysCovered: 6,
           daysTotal: 30,
           backfill: {
-            state: "registered",
+            state: "registered", owner: { viewer: "octocat", generation: 1 },
             lastFrame: {
               scopeKey: "board|merged|*|org:acme",
+              owner: { viewer: "octocat", generation: 1 },
+              observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
               daysCovered: 24,
               daysTotal: 30,
               collected: 450,
@@ -821,9 +829,9 @@ describe("StatsPage honesty", () => {
     vi.mocked(useStatsBackfill).mockReturnValue(null);
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
-    // The stored frame's figures, not the board's load-time 6 of 30.
-    expect(screen.getByText(/24 of 30 days measured/)).toBeTruthy();
-    expect(screen.getByText(/450 of 500 pull requests collected/)).toBeTruthy();
+    // The seed supplies activity; only an accepted measurement supplies numbers.
+    expect(screen.getByText(/6 of 30 days measured/)).toBeTruthy();
+    expect(screen.getByText(/120 of 500 pull requests collected/)).toBeTruthy();
     expect(screen.getByText(/Collecting now/)).toBeTruthy();
     expect(screen.queryByText(/queued for collection/)).toBeNull();
   });
@@ -841,9 +849,11 @@ describe("StatsPage honesty", () => {
           daysCovered: 6,
           daysTotal: 30,
           backfill: {
-            state: "registered",
+            state: "registered", owner: { viewer: "octocat", generation: 1 },
             lastFrame: {
               scopeKey: "board|merged|*|org:widget",
+              owner: { viewer: "octocat", generation: 1 },
+              observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
               daysCovered: 24,
               daysTotal: 30,
               collected: 450,
@@ -883,7 +893,7 @@ describe("StatsPage honesty", () => {
     expect(screen.queryByText(/queued for collection/)).toBeNull();
   });
 
-  it("shows the backfill's live figures rather than the board's snapshot", () => {
+  it("keeps measured board figures while a newer activity frame awaits readback", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
       settled(
         board({
@@ -900,6 +910,8 @@ describe("StatsPage honesty", () => {
     // The worker has advanced since that board was assembled.
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
+      observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -909,11 +921,10 @@ describe("StatsPage honesty", () => {
     });
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
-    expect(screen.getByText(/400 of 500 pull requests collected/)).toBeTruthy();
-    expect(screen.getByText(/18 of 30 days measured/)).toBeTruthy();
-    // The stale snapshot figures are gone, not merely supplemented.
-    expect(screen.queryByText(/120 of 500/)).toBeNull();
-    expect(screen.queryByText(/6 of 30 days/)).toBeNull();
+    expect(screen.getByText(/120 of 500 pull requests collected/)).toBeTruthy();
+    expect(screen.getByText(/6 of 30 days measured/)).toBeTruthy();
+    expect(screen.queryByText(/400 of 500/)).toBeNull();
+    expect(screen.queryByText(/18 of 30 days/)).toBeNull();
   });
 
   /// **An unmeasured denominator never becomes a zero on the page.**
@@ -923,10 +934,12 @@ describe("StatsPage honesty", () => {
   /// render "400 of 400, complete", which is the reassuring failure.
   it("never renders an unmeasured total as a zero or as complete", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
-      settled(board({ complete: false, total: null, retrieved: 0, accumulating: true })),
+      settled(board({ complete: false, total: null, retrieved: 0, accumulated:400, accumulating: true, daysCovered:4 })),
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
+      observation: { from: "2026-09-01", to: "2026-09-30", stream: "stats-test", sequence: 1, cacheChange: 1 },
       daysCovered: 4,
       daysTotal: 30,
       collected: 400,
@@ -1292,4 +1305,13 @@ describe("partialityCaveat", () => {
     })!;
     expect(out).toContain("40 of 100 pull requests could not be retrieved");
   });
+});
+
+it.each([undefined,{viewer:"octocat",generation:2}])("renders older boards but suppresses absent or mismatched seeded owner %j",owner=>{
+ vi.mocked(useStatsBoard).mockReturnValue(settled(board({complete:false,total:500,retrieved:120,accumulating:true,daysCovered:6,daysTotal:30,backfill:{state:"registered",owner,lastFrame:{scopeKey:"board|merged|*|org:acme",owner:owner?{viewer:"octocat",generation:1}:undefined,daysCovered:24,daysTotal:30,collected:450,total:500,phase:{kind:"working"},nextTickAtMs:null}}})));
+ vi.mocked(useStatsBackfill).mockReturnValue(null);
+ render(<StatsPage/>);fireEvent.click(screen.getByRole("tab",{name:/others/i}));
+ expect(screen.queryByText(/24 of 30 days measured/)).toBeNull();
+ expect(screen.queryByText(/450 of 500 pull requests collected/)).toBeNull();
+ expect(screen.getByText(/remaining days are queued for collection/)).toBeTruthy();
 });

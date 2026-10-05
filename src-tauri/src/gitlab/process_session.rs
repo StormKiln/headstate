@@ -40,6 +40,25 @@ pub struct Owner {
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 type Owners = HashMap<(PathBuf, String), Arc<Owner>>;
 static OWNERS: LazyLock<Mutex<Owners>> = LazyLock::new(Mutex::default);
+/// Hold the current CLI ownership generation for a synchronous cache read.
+/// A disk login is never installed into this session state.
+pub(crate) fn with_known_viewer<T>(
+    program: &Path,
+    host: &str,
+    read: impl FnOnce(Option<&str>) -> T,
+) -> T {
+    let owner = OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(program.to_owned(), host.to_lowercase()))
+        .cloned();
+    if let Some(owner) = owner {
+        let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        read(state.viewer.as_deref())
+    } else {
+        read(None)
+    }
+}
 #[derive(Clone)]
 pub struct Context {
     pub owner: Arc<Owner>,
@@ -342,5 +361,77 @@ impl Drop for Permit {
             let until = Instant::now() + Duration::from_secs(5);
             s.blocked = Some(s.blocked.map_or(until, |old| old.max(until)));
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[tokio::test]
+    async fn verified_cli_owner_qualifies_offline_cache_without_new_admission() {
+        use crate::{
+            identity::{Provider, Source},
+            store::{source_cache::*, CachedList},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fixture-glab");
+        let host = "offline.example";
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: host.into(),
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        save_owned_gitlab_snapshot(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            &[],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        let read = || {
+            with_known_viewer(&program, host, |viewer| {
+                load_qualified_snapshot(&conn, &source, CachedList::Reviewing, viewer, None)
+                    .unwrap()
+            })
+        };
+        assert!(matches!(
+            read().snapshot.data,
+            SnapshotData::Withheld { .. }
+        ));
+        let context = Context::new(
+            &program,
+            host,
+            Class::Foreground,
+            Instant::now() + Duration::from_secs(5),
+        );
+        context
+            .admit(true)
+            .await
+            .unwrap()
+            .finish(Some("alice"))
+            .unwrap();
+        assert!(matches!(
+            read().snapshot.data,
+            SnapshotData::GitLabAvailable { .. }
+        ));
+        let current = Context::new(
+            &program,
+            host,
+            Class::Foreground,
+            Instant::now() + Duration::from_secs(5),
+        );
+        current
+            .admit(true)
+            .await
+            .unwrap()
+            .finish(Some("bob"))
+            .unwrap();
+        assert!(matches!(
+            read().snapshot.data,
+            SnapshotData::Withheld { .. }
+        ));
     }
 }

@@ -28,6 +28,7 @@ pub mod pr_backfill_page;
 /// follows demonstrated interest rather than everything a token can see.
 pub mod pr_backfill_scope;
 pub mod pr_history;
+pub mod pr_scope_evidence;
 /// The ledger saying which date ranges have been retrieved -- and, by the
 /// ABSENCE of a row, which have never been asked for (#1092).
 pub mod pr_slice;
@@ -37,6 +38,7 @@ mod schema;
 pub mod settings;
 pub mod source_cache;
 pub mod stats;
+pub mod stats_owner;
 
 pub use cache::{load_snapshot, load_snapshot_marked, save_snapshot, CachedList, CachedSnapshot};
 pub use schema::{open_db, StoreError};

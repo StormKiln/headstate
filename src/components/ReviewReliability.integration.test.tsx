@@ -24,7 +24,7 @@ vi.mock("../api/hooks", async original => ({ ...await original<object>(),
   useWorktrees: () => ({ repos: [], unreadable: [], isError: false }),
   useUiPrefs: () => ({ prefs: { terminal_command: "" } }),
   useClaudeSessionsForPr: () => ({ state: "done", links: [], elsewhere: [] }),
-  useReviewGates: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
 }));
 import { useReviewing } from "@/api/hooks";
 import { refreshWithState } from "@/api/sourceRefreshHooks";

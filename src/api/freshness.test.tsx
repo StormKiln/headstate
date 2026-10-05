@@ -6,6 +6,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "../fixtures/prs";
 import { useActOnPr, usePullRequests } from "./hooks";
 
+function owned(prs: typeof PR_FIXTURES) {
+  return { source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs, fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } };
+}
+
 afterEach(() => {
   cleanup();
   clearMocks();
@@ -46,7 +50,7 @@ describe("closing a pull request updates the list", () => {
     const calls: string[] = [];
     mockIPC((cmd) => {
       calls.push(cmd);
-      if (cmd === "get_cached") return stale;
+      if (cmd === "get_source_snapshot") return owned(stale);
       if (cmd === "refresh_now") return fresh;
       if (cmd === "act_on_pr") return null;
       return undefined;
@@ -70,7 +74,7 @@ describe("closing a pull request updates the list", () => {
     const calls: string[] = [];
     mockIPC((cmd) => {
       calls.push(cmd);
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       if (cmd === "refresh_now") return [];
       if (cmd === "act_on_pr") return null;
       return undefined;

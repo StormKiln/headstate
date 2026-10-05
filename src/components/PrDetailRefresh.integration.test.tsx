@@ -13,7 +13,7 @@ vi.mock("../api/hooks", async original => ({ ...await original<object>(),
   useWorktrees: () => ({ repos: [], unreadable: [], isError: false }),
   useUiPrefs: () => ({ prefs: { terminal_command: "" } }),
   useClaudeSessionsForPr: () => ({ state: "done", links: [], elsewhere: [] }),
-  useReviewGates: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
 }));
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { openUrl } from "@tauri-apps/plugin-opener";

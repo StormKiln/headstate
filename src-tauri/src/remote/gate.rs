@@ -50,6 +50,9 @@ impl PairedCerts for PairingState {
     fn pairing_window_open(&self) -> bool {
         self.pairing_open()
     }
+    fn authorized_device(&self, fp: &str) -> Option<super::context::AuthorizedDevice> {
+        self.authorized_device(fp)
+    }
     fn device(&self, sha256_fp_hex: &str) -> Option<crate::store::devices::PairedDevice> {
         self.paired_device(sha256_fp_hex)
     }
@@ -64,9 +67,9 @@ impl CommandHost for AppHost {
         &'a self,
         command: &'a str,
         args: Value,
-        device_name: &'a str,
+        context: &'a super::context::DispatchContext,
     ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>> {
-        Box::pin(surface::dispatch(&self.0, command, args, device_name))
+        Box::pin(surface::dispatch(&self.0, command, args, context))
     }
     fn notify_destructive(&self, device_name: &str, command: &str) {
         stepup::notify_destructive(&self.0, device_name, command);
@@ -411,6 +414,31 @@ pub async fn set_remote_enabled(app: AppHandle, enabled: bool) -> Result<(), Str
         log::info!("phone connections: off");
     }
     persist_enabled(&app, enabled)
+}
+
+/// Feature-only construction: same AppHost, snapshot and authorization as production.
+#[cfg(feature = "enterprise-harness")]
+pub(crate) async fn start_synthetic(
+    app: &AppHandle,
+    identity: super::identity::Identity,
+    pairing: Arc<PairingState>,
+) -> Result<(super::listener::Handle, Arc<Hub>), String> {
+    let events = Arc::new(Hub::new(snapshot_source(app)));
+    events.attach(app);
+    let handle = super::listener::start(ListenerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        identity,
+        paired: pairing.clone(),
+        revocations: pairing.subscribe_revocations(),
+        pairing,
+        host: Arc::new(AppHost(app.clone())),
+        desktop_version: "9.0.0".into(),
+        viewer_login: viewer_lookup(app),
+        events: events.clone(),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok((handle, events))
 }
 
 #[cfg(test)]

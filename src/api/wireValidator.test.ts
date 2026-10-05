@@ -22,6 +22,13 @@ function window(messages = everyRecord()): TranscriptWindow {
 }
 
 describe("generated remote contracts", () => {
+  it("accepts old-peer review gates and checks additive independent native lifetimes", () => {
+    const old = { rules: { state: "read", require_last_push_approval: true, required_review_thread_resolution: false }, last_pusher: { state: "not_needed" } };
+    expect(() => assertRemoteReply("get_review_gates", old)).not.toThrow();
+    expect(() => assertRemoteReply("get_review_gates", { ...old, rules_valid_for_ms: 545000, pusher_valid_for_ms: 0 })).not.toThrow();
+    expect(() => assertRemoteReply("get_review_gates", { ...old, rules_valid_for_ms: "new" })).toThrow(/rules_valid_for_ms/);
+  });
+
   it("checks every existing transcript record/tool union and nested failure", () => {
     const value = window();
     expect(() => assertRemoteReply("claude_transcript_page", value)).not.toThrow();

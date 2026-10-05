@@ -145,7 +145,10 @@ pub fn find_by_name(conn: &Connection, name: &str) -> Result<Vec<PairedDevice>, 
 /// no such row, which is not an error -- the user may have clicked
 /// Revoke twice.
 pub fn revoke(conn: &Connection, id: i64) -> Result<Option<PairedDevice>, StoreError> {
-    let existing = conn
+    // Deletion and access cleanup are one authoritative mutation. A failed
+    // cleanup must not hide a successful deletion from PairingState's fence.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let existing = tx
         .query_row(
             &format!("SELECT {COLUMNS} FROM {FROM} WHERE d.id = ?1"),
             [id],
@@ -153,12 +156,13 @@ pub fn revoke(conn: &Connection, id: i64) -> Result<Option<PairedDevice>, StoreE
         )
         .optional()?;
     if existing.is_some() {
-        conn.execute("DELETE FROM paired_devices WHERE id = ?1", [id])?;
-        conn.execute(
+        tx.execute("DELETE FROM paired_devices WHERE id = ?1", [id])?;
+        tx.execute(
             "DELETE FROM paired_device_access WHERE device_id = ?1",
             [id],
         )?;
     }
+    tx.commit()?;
     Ok(existing)
 }
 
