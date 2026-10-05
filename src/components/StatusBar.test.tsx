@@ -508,3 +508,20 @@ describe("selected source status", () => {
     expect(screen.queryByText(/just now/)).toBeNull();
   });
 });
+
+describe("active GitHub inventory receipt", () => {
+  const receipt = { modern: true, prs: [], error: null, coverage: "complete" as const, phase: "ready", lastReceivedAt: "2026-10-01T12:00:00Z" };
+  it("uses active reviewing failure despite healthy global polling", () => {
+    render(<StatusBar updatedAt={Date.now()} github={{ list: "reviewing", receipt: { ...receipt, error: "Review requests failed" } }} />);
+    expect(screen.getByText("Could not refresh review requests")).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+  });
+  it("qualifies partial coverage independently from a recent receipt", () => {
+    render(<StatusBar updatedAt={Date.now()} github={{ list: "reviewing", receipt: { ...receipt, coverage: { partial: { total: 236 } } } }} />);
+    expect(screen.getByText("Review requests partly checked")).toBeTruthy();
+  });
+  it("does not fabricate a provider timestamp from the query cache", () => {
+    render(<StatusBar updatedAt={Date.now()} github={{ list: "authored", receipt: { ...receipt, lastReceivedAt: undefined } }} />);
+    expect(screen.queryByText(/^Updated /)).toBeNull();
+  });
+});

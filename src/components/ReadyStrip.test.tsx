@@ -108,7 +108,7 @@ describe("ReadyStrip", () => {
       act(() => eventHandlers.get("source-poll-status")!({ payload }));
       if (stage === "changed_head" || stage === "retained_unread_without_effect") {
         await waitFor(() => expect(screen.getByText("Ready one")).toBeTruthy());
-        if (stage === "retained_unread_without_effect") expect(screen.getByText("Last known").getAttribute("title")).toMatch(/not confirmed/);
+        if (stage === "retained_unread_without_effect") expect(screen.getByText("Membership unconfirmed").getAttribute("title")).toMatch(/not confirmed/);
       } else expect(screen.queryByText("Ready one")).toBeNull();
     }
   });
@@ -200,7 +200,8 @@ describe("ReadyStrip ordering", () => {
     };
     render(<ReadyStrip prs={[at(2, "2026-09-02T00:00:00Z"), older]} onOpen={vi.fn()} />);
     expect(titlesInOrder()).toEqual(["PR 1", "PR 2"]);
-    expect(screen.getByText("Last known")).toBeTruthy();
+    expect(screen.queryByText("Ready date last known")).toBeNull();
+    expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
     expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
   });
 
@@ -221,10 +222,11 @@ describe("ReadyStrip ordering", () => {
       el.textContent?.includes("Older ready") ? "older" : "newer",
     );
     expect(fixtureTitles()).toEqual(["older", "newer"]);
-    expect(screen.getByText("Last known")).toBeTruthy();
+    expect(screen.queryByText("Ready date last known")).toBeNull();
+    expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
     await act(async () => view.rerender(<ReadyStrip prs={recovered} onOpen={vi.fn()} />));
     expect(fixtureTitles()).toEqual(["newer", "older"]);
-    expect(screen.queryByText("Last known")).toBeNull();
+    expect(screen.queryByText("Ready date last known")).toBeNull();
   });
 
   // A default nobody can see is one nobody can trust, and this list
@@ -802,14 +804,14 @@ describe("Ready stack context (#1602)", () => {
 it("keeps an omitted last-known Ready row visibly qualified", async () => {
   render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
   expect(screen.getByText("Ready one")).toBeTruthy();
-  expect(screen.getByText("Last known")).toBeTruthy();
+  expect(screen.getByText("Membership unconfirmed")).toBeTruthy();
 });
 
 describe("Ready observation status", () => {
   const longTitle = "A deliberately long pull request title that must keep its status compact without losing the complete explanation";
   const cases = [
-    { name: "retained", visible: "Last known", explanation: "Last known — not confirmed by latest refresh", observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } },
-    { name: "unknown", visible: "Unconfirmed", explanation: "Readiness could not be confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: ["ci" as const], retained_fields: [] } },
+    { name: "retained", visible: "Membership unconfirmed", explanation: "List membership is last known; not confirmed by the latest refresh", observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } },
+    { name: "unknown", visible: "Unconfirmed", explanation: "Not confirmed: checks", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: ["ci" as const], retained_fields: [] } },
     { name: "confirmed", visible: "Confirmed", explanation: "Your review is confirmed", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z", confirmed_by_read: true } } },
     { name: "pending", visible: "Pending", explanation: "Your submitted review is awaiting confirmation in the list", observation: { state: "observed" as const, last_observed_at: null, unknown_fields: [], retained_fields: [], confirmed_review: { head_oid: "head", review: "approved" as const, confirmed_at: "2026-10-01T00:00:00Z" } } },
   ];
@@ -844,7 +846,7 @@ describe("Ready observation status", () => {
     });
     const retained = { ...ready, observation: cases[0].observation };
     const view = render(<ReadyObservationStatus pr={retained} focusable />);
-    const status = screen.getByRole("button", { name: "Last known" });
+    const status = screen.getByRole("button", { name: "Membership unconfirmed" });
     status.focus();
     fireEvent.focus(status);
     fireEvent.click(status);
@@ -854,6 +856,7 @@ describe("Ready observation status", () => {
     expect(screen.getByRole("tooltip").textContent).toBe(cases[3].explanation);
     expect(screen.getByRole("tooltip").style.top).toBe("24px");
     expect(screen.getByRole("tooltip").style.transform).toBe("");
+    expect(document.activeElement).toBe(status);
     rect.mockRestore();
   });
 
@@ -861,7 +864,7 @@ describe("Ready observation status", () => {
     const item = cases[0];
     const pr = { ...ready, title: longTitle, observation: item.observation };
     render(<ReadyStrip prs={[pr]} onOpen={interactive ? vi.fn() : undefined} />);
-    const status = screen.getByText("Last known");
+    const status = screen.getByText("Membership unconfirmed");
     const explanation = document.getElementById(status.getAttribute("aria-describedby")!);
     if (interactive) {
       expect(screen.getByRole("button", { name: new RegExp(longTitle) })).toBeTruthy();

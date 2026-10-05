@@ -147,3 +147,20 @@ it("publishes the ordered attempt phase without changing accepted inventory", ()
   state.accept(update(4));
   expect(state.snapshot()).toMatchObject({ phase: "ready" });
 });
+
+it("preserves original provider time through local publications, status and cache writes", () => {
+  const state = new SourceRefreshState();
+  const original = "2026-10-01T12:00:00Z";
+  state.accept(update(1, null, { last_received_at: original }));
+  state.patchRows(prs => prs.map(pr => ({ ...pr, in_merge_queue: true })));
+  expect(state.snapshot().lastReceivedAt).toBe(original);
+  state.accept(update(2, "failed", { receipt_revision: 1, last_received_at: "2026-10-02T12:00:00Z" }));
+  expect(state.snapshot().lastReceivedAt).toBe(original);
+  // A local fact publication may carry newer rows at the same provider time.
+  state.accept(update(3, null, { last_received_at: original }));
+  expect(state.snapshot().lastReceivedAt).toBe(original);
+  state.accept(update(2, null, { last_received_at: "2026-10-03T12:00:00Z" }));
+  expect(state.snapshot().lastReceivedAt).toBe(original);
+  state.accept(update(4, null, { last_received_at: "2026-10-04T12:00:00Z" }));
+  expect(state.snapshot().lastReceivedAt).toBe("2026-10-04T12:00:00Z");
+});

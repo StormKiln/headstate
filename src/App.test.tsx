@@ -16,6 +16,8 @@ const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
 const mockReviewError = vi.fn<() => Error | null>(() => null);
 const mockReviewLoading = vi.fn<() => boolean>(() => false);
+const mockReviewPhase = vi.fn<() => string | undefined>(() => undefined);
+const mockReviewReceivedAt = vi.fn<() => string | undefined>(() => undefined);
 const mockReviewCoverage = vi.fn<() => "complete" | "unknown" | { partial: { total: number | null } } | null>(() => "complete");
 const mockAuthoredReceipt = vi.fn<() => { prs?: PullRequest[]; phase?: string; error: string | null; coverage: "complete" | "unknown" | null }>(() => ({ prs: [], error: null, coverage: "complete" }));
 const mockRefused = vi.fn<() => number>(() => 0);
@@ -25,7 +27,7 @@ const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
 
 vi.mock("./api/sourceRefreshHooks", () => ({
   usePhoneGitHubRefresh: () => undefined,
-  useSourceRefresh: (list: string) => list === "authored" ? mockAuthoredReceipt() : ({ prs: mockReviewing(), error: mockReviewError()?.message ?? null, coverage: mockReviewCoverage() }),
+  useSourceRefresh: (list: string) => list === "authored" ? mockAuthoredReceipt() : ({ phase: mockReviewPhase(), lastReceivedAt: mockReviewReceivedAt(), prs: mockReviewing(), error: mockReviewError()?.message ?? null, coverage: mockReviewCoverage() }),
 }));
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
@@ -889,4 +891,61 @@ it("qualifies an old complete Court receipt while a newer source attempt is fetc
   renderApp(); expect(screen.queryByText("Nothing needs your attention")).toBeNull();
   expect(screen.getByText(/Checking attention/)).toBeTruthy();
   mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" });
+});
+
+describe("active inventory footer wiring", () => {
+  beforeEach(() => {
+    mockPrs.mockReturnValue([]); mockReviewing.mockReturnValue([]);
+    mockReviewError.mockReturnValue(null); mockReviewCoverage.mockReturnValue("complete");
+    mockReviewPhase.mockReturnValue("ready"); mockReviewReceivedAt.mockReturnValue(undefined);
+    mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" });
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    useFilters.setState({ view: "to-review", selectedPr: null });
+  });
+  afterEach(() => {
+    mockReviewPhase.mockReturnValue(undefined); mockReviewReceivedAt.mockReturnValue(undefined);
+    mockReviewError.mockReturnValue(null); mockReviewCoverage.mockReturnValue("complete");
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  });
+  it("switches from reviewing failure to the independently accepted authored receipt", () => {
+    mockReviewError.mockReturnValue(new Error("Review queue unavailable"));
+    renderApp();
+    expect(screen.getByText("Could not refresh review requests")).toBeTruthy();
+    expect(screen.queryByText("Your PRs checked")).toBeNull();
+    act(() => { useFilters.setState({ view: "my-prs" }); });
+    expect(screen.getByText("Your PRs checked")).toBeTruthy();
+    expect(screen.queryByText("Could not refresh review requests")).toBeNull();
+  });
+  it.each(["github", "both"] as const)("follows partial, retrying and recovered reviewing receipts in %s mode", selection => {
+    useSourceSelection.setState({ selection });
+    mockReviewCoverage.mockReturnValue({ partial: { total: 236 } });
+    renderApp();
+    expect(screen.getByText(/Review requests partly checked/)).toBeTruthy();
+    mockReviewPhase.mockReturnValue("retrying");
+    act(() => useFilters.getState().setFilter("query", "synthetic"));
+    expect(screen.getByText(/Retrying review requests/)).toBeTruthy();
+    mockReviewPhase.mockReturnValue("ready"); mockReviewCoverage.mockReturnValue("complete");
+    act(() => useFilters.getState().setFilter("query", ""));
+    expect(screen.getByText(/Review requests checked/)).toBeTruthy();
+  });
+  it("keeps whole-list coverage qualified when a repository filter is selected", () => {
+    mockReviewCoverage.mockReturnValue({ partial: { total: 236 } });
+    useFilters.getState().setFilter("repo", "synthetic/repo");
+    renderApp();
+    const status = screen.getByText("Review requests partly checked");
+    expect(status.getAttribute("title")).toContain("across all repositories");
+    useFilters.getState().setFilter("repo", undefined);
+  });
+  it("withholds query-cache time when the active receipt has no provider time", () => {
+    mockDataUpdatedAt.mockReturnValue(Date.now());
+    renderApp();
+    expect(screen.queryByText(/^Updated /)).toBeNull();
+    mockDataUpdatedAt.mockReturnValue(0);
+  });
+  it("does not show a GitHub failure when GitLab alone is selected", () => {
+    mockReviewError.mockReturnValue(new Error("Review queue unavailable"));
+    useSourceSelection.setState({ selection: "gitlab" });
+    renderApp();
+    expect(screen.queryByText("Could not refresh review requests")).toBeNull();
+  });
 });

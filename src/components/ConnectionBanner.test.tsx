@@ -242,3 +242,11 @@ describe("selected provider connection status", () => {
     expect(screen.queryByText(/GitLab MRs/)).toBeNull();
   });
 });
+
+it("shows the selected reviewing receipt on a phone without a fabricated fetch time", () => {
+  stubViewport(390);
+  connection.current = { kind: "connected", desktop: "Test desktop", protocolVersion: REQUIRED_PROTOCOL_VERSION, lastPoll: new Date().toISOString() } as ConnectionState;
+  render(<ConnectionBanner updatedAt={Date.now()} github={{ list: "reviewing", receipt: { modern: true, prs: [], coverage: "complete", error: "Review refresh failed" } }} />);
+  expect(screen.getByText(/Could not refresh review requests/)).toBeTruthy();
+  expect(screen.queryByText(/PRs updated/)).toBeNull();
+});
