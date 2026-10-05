@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useSyncExternalStore } from "react";
 import type { QueryClient } from "@tanstack/react-query";
+import { retireAdvisoryDispatch } from "./advisoryDispatch";
 
 export interface Evidence<T> { value: T; expiresAt: number; observedAt: number }
 export interface DisplayEvidence<T> { value: T; freshness: "fresh" | "retained"; observedAt: number }
@@ -21,6 +22,7 @@ function createSession(qc: QueryClient) {
       if (next !== owner || reset || event.type === "removed") {
         owner = next;
         generation++;
+        retireAdvisoryDispatch(qc);
         qc.removeQueries({ predicate: query => isAdvisory(query.queryKey) });
         for (const listener of listeners) listener();
       }

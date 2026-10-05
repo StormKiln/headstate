@@ -2,6 +2,9 @@ import { Profiler, useLayoutEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { usePullRequests,useReviewing } from '../api/hooks';
+import { useReadyPushers } from '../api/useReadyPushers';
+import { useReadyStacks } from '../api/useReadyStacks';
+import { prKey } from '../lib/prIdentity';
 import { useSourceRefresh, refreshWithState } from '../api/sourceRefreshHooks';
 import { PrList } from '../components/PrList';
 import { ReadyStrip } from '../components/ReadyStrip';
@@ -17,7 +20,7 @@ if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())bou
 let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
 const probe={inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
- return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,
+ return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:query.meta?.advisorySchedule,
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
   ...(query.queryKey[0]==='stats-board'?{days:query.queryKey[3],total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,backfill:value?.backfill}:{}),
  };
@@ -41,4 +44,19 @@ export function Workload(){
   {view==='stats'?<StatsPage/>:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={reviewing.data??[]} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
  </main>;
 }
-createRoot(document.getElementById('root')!).render(<QueryClientProvider client={client}><Profiler id="root" onRender={(_id,phase,actual,base,started,at)=>boundedPush(commits,{phase,actual,base,started,at})}><Workload/></Profiler></QueryClientProvider>);
+function ReadyProgressRows({rows}:{rows:PullRequest[]}) {
+ const priority=new Set(rows.slice(0,6).map(prKey));
+ const pushers=useReadyPushers(rows,priority);
+ const stacks=useReadyStacks(rows,priority);
+ return <section aria-label="Mounted Ready hook results">{rows.map(row=><div key={prKey(row)} data-progress-number={row.number} data-progress-visible={priority.has(prKey(row))}>
+  Synthetic review {row.number}: {JSON.stringify({pusher:pushers.of(row),pusherDisplay:pushers.displayOf(row),stack:stacks.of(row),stackDisplay:stacks.displayOf(row)})}
+ </div>)}</section>;
+}
+function ReadyProgress() {
+ const reviewing=useReviewing();
+ const start=new URL(location.href).searchParams.get("role")==="paired"?76:51;
+ const rows=(reviewing.data??[]).filter(row=>row.number>=start&&row.number<start+16).sort((a,b)=>a.number-b.number);
+ const [mounted,mount]=useState(false);
+ return <main><output data-testid="ready-progress-loaded">{rows.length}</output><button disabled={rows.length!==16} onClick={()=>mount(!mounted)}>{mounted?"Unmount Ready hooks":"Mount Ready hooks"}</button>{mounted&&<ReadyProgressRows rows={rows}/>}</main>;
+}
+createRoot(document.getElementById('root')!).render(<QueryClientProvider client={client}><Profiler id="root" onRender={(_id,phase,actual,base,started,at)=>boundedPush(commits,{phase,actual,base,started,at})}>{new URL(location.href).searchParams.get('scenario')==='ready-progress'?<ReadyProgress/>:<Workload/>}</Profiler></QueryClientProvider>);

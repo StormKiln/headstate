@@ -1212,8 +1212,18 @@ async fn call(
             a.get("headOid")?,
         )
         .await),
-        "get_ready_pushers" => res(commands::get_ready_pushers(app.state(), a.get("rows")?).await),
-        "get_ready_stacks" => res(commands::get_ready_stacks(app.state(), a.get("rows")?).await),
+        "get_ready_pushers" => res(commands::get_ready_pushers_with_context(
+            app.state(),
+            a.get("rows")?,
+            context.clone(),
+        )
+        .await),
+        "get_ready_stacks" => res(commands::get_ready_stacks_with_context(
+            app.state(),
+            a.get("rows")?,
+            context.clone(),
+        )
+        .await),
         "get_viewer" => res(commands::get_viewer(app.state()).await),
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),

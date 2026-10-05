@@ -34,6 +34,15 @@ export async function startProvider() {
    for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    const responseDelay=fault.delays?.shift()??fault.delay;
    const input=req.url==='/graphql'?JSON.parse(raw):null,doc=input?parseDocument(input.query,input.variables):null;
+   const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];
+   if(queryName==='PrStack'||queryName==='PrStackUp'){
+    entry.stage=queryName==='PrStack'?'stack-down':'stack-up';
+    entry.subjects=doc.selection.filter(f=>f.name==='repository').flatMap(f=>{
+     const repo=data.repos.find(r=>r.name===f.args.name&&r.owner.login===f.args.owner);
+     const fields=f.selection.filter(s=>s.name===(queryName==='PrStack'?'pullRequest':'pullRequests'));
+     return fields.map(field=>({repo:repo?.nameWithOwner,number:queryName==='PrStack'?field.args.number:data.rows.find(r=>r.repository===repo&&r.headRefName===field.args.baseRefName)?.number}));
+    });
+   }
    if(doc){entry.aliases=doc.aliases;const names=doc.selection.map(f=>f.name);entry.operation=doc.kind==='mutation'?'review-write':names.includes('search')?'search':names.includes('node')||names.includes('nodes')?'node':names.includes('repository')?'repository':names.includes('viewer')||names.includes('organization')?'viewer':'unknown';}
    else entry.operation=req.method==='GET'?'rest-read':'rest-write';
    const historyRead=doc?.selection.some(f=>f.name==='search'&&String(f.args.query).includes('is:merged')&&f.selection.some(s=>s.name==='nodes'));if(historyRead)entry.operation='history-search';
@@ -45,6 +54,7 @@ export async function startProvider() {
     // The synthetic repository has measured-empty rulesets and no protection.
     const url=new URL(req.url,'http://127.0.0.1'),path=url.pathname;
     const repo=data.repos.find(r=>path.startsWith('/repos/'+r.nameWithOwner+'/'));
+    entry.stage=path.endsWith('/activity')?'pusher-activity':path.endsWith('/protection')?'protection':'rules';entry.subjects=[{repo:repo?.nameWithOwner,...(path.endsWith('/activity')?{number:data.rows.find(r=>r.repository===repo&&'refs/heads/'+r.headRefName===url.searchParams.get('ref'))?.number}:{})}];
     if(!repo){entry.status=404;res.writeHead(404,{'content-type':'application/json'}).end(JSON.stringify({message:'Not Found'}));return;}
     let answer=[];
     if(path.endsWith('/activity')){const row=data.rows.find(r=>r.repository===repo&&'refs/heads/'+r.headRefName===url.searchParams.get('ref'));if(row)answer=[{activity_type:'push',after:row.headRefOid,actor:{login:row.author.login}}];}

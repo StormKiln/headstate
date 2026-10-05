@@ -1380,10 +1380,26 @@ pub async fn get_ready_pushers(
     client: State<'_, GhClient>,
     rows: Vec<crate::github::gates::PusherAsk>,
 ) -> Result<Vec<crate::github::gates::RowPusher>, String> {
+    get_ready_pushers_with_context(
+        client,
+        rows,
+        crate::remote::context::DispatchContext::desktop(),
+    )
+    .await
+}
+pub(crate) async fn get_ready_pushers_with_context(
+    client: State<'_, GhClient>,
+    rows: Vec<crate::github::gates::PusherAsk>,
+    context: crate::remote::context::DispatchContext,
+) -> Result<Vec<crate::github::gates::RowPusher>, String> {
     // Names are not logged, for the reason `get_pr_detail` gives.
     crate::diag!("[diag] cmd get_ready_pushers start rows={}", rows.len());
     let started = std::time::Instant::now();
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let client = client
+        .0
+        .clone()
+        .ok_or_else(|| AUTH_ERR.to_string())?
+        .with_advisory_context(context);
     let budget = client.request_budget();
     let out =
         crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await?;
@@ -8647,7 +8663,23 @@ pub async fn get_ready_stacks(
     client: State<'_, GhClient>,
     rows: Vec<crate::github::ready_stacks::StackAsk>,
 ) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    get_ready_stacks_with_context(
+        client,
+        rows,
+        crate::remote::context::DispatchContext::desktop(),
+    )
+    .await
+}
+pub(crate) async fn get_ready_stacks_with_context(
+    client: State<'_, GhClient>,
+    rows: Vec<crate::github::ready_stacks::StackAsk>,
+    context: crate::remote::context::DispatchContext,
+) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
+    let client = client
+        .0
+        .clone()
+        .ok_or_else(|| AUTH_ERR.to_string())?
+        .with_advisory_context(context);
     crate::github::ready_stacks::ready_stacks(&client, rows).await
 }
 

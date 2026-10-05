@@ -25,6 +25,28 @@ pub struct LastKnown<V> {
     pub value: V,
     pub age_ms: u64,
 }
+/// Scheduling only. This never grants freshness or action authority.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressOutcome {
+    Deferred,
+    Partial,
+    Offered,
+    Ineligible,
+}
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Progress {
+    pub outcome: ProgressOutcome,
+    pub admitted: bool,
+}
+
+pub(super) struct Measurement<V> {
+    pub value: V,
+    pub observed_at: Instant,
+    pub valid_until: Instant,
+    pub successful: bool,
+}
+
 type Slot<V> = Arc<AsyncMutex<Receipts<V>>>;
 #[derive(Debug)]
 pub(super) struct Cache<K, V> {
@@ -108,11 +130,33 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         ttl: impl Fn(&V) -> Duration,
         work: F,
     ) -> Option<(V, Duration)> {
+        self.load_measurement(key, deadline, |_| true, async {
+            let value = work.await;
+            let lifetime = ttl(&value);
+            let observed_at = Instant::now();
+            Measurement {
+                value,
+                observed_at,
+                valid_until: observed_at + lifetime,
+                successful: lifetime > FAILURE_TTL,
+            }
+        })
+        .await
+    }
+    /// Explicit success and oldest-input time let resumed work keep its original
+    /// authority even when a successful result has less than FAILURE_TTL left.
+    pub async fn load_measurement<F: Future<Output = Measurement<V>>>(
+        &self,
+        key: K,
+        deadline: Instant,
+        reusable: impl Fn(&V) -> bool,
+        work: F,
+    ) -> Option<(V, Duration)> {
         let slot = self.slot(key)?;
         tokio::time::timeout_at(deadline, async {
             let mut receipt = slot.lock().await;
             if let Some((until, value)) = receipt.latest.as_ref() {
-                if *until > Instant::now() {
+                if *until > Instant::now() && reusable(value) {
                     #[cfg(feature = "enterprise-harness")]
                     crate::enterprise_harness::metrics::record(0, "hit", "advisory-cache", 1);
                     return (
@@ -123,15 +167,17 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             }
             #[cfg(feature = "enterprise-harness")]
             crate::enterprise_harness::metrics::record(0, "miss", "advisory-cache", 1);
-            let value = work.await;
-            let lifetime = ttl(&value);
-            // Every cache in this module uses FAILURE_TTL for inconclusive
-            // attempts; longer receipts certify an actual successful read.
-            if lifetime > FAILURE_TTL {
-                receipt.success = Some((Instant::now(), value.clone()));
+            let measured = work.await;
+            if measured.successful {
+                receipt.success = Some((measured.observed_at, measured.value.clone()));
             }
-            receipt.latest = Some((Instant::now() + lifetime, value.clone()));
-            (value, lifetime)
+            receipt.latest = Some((measured.valid_until, measured.value.clone()));
+            (
+                measured.value,
+                measured
+                    .valid_until
+                    .saturating_duration_since(Instant::now()),
+            )
         })
         .await
         .ok()
@@ -144,6 +190,7 @@ pub(super) struct Advisory {
     pub rules: Cache<(String, String), BaseRules>,
     pub pushers: Cache<(String, String, String), LastPusher>,
     pub stacks: Cache<StackKey, PrStack>,
+    pub stack_continuations: super::stack::Continuations,
     order: Mutex<(u64, HashMap<String, u64>)>,
     rotations: Mutex<HashMap<String, (Instant, usize)>>,
     batches: Mutex<HashMap<[u8; 32], Arc<Mutex<Batch>>>>,

@@ -8,6 +8,8 @@ import type { PrStack } from "@/types/pr";
 const invoke = vi.hoisted(() => vi.fn<(command: string, args?: Record<string, unknown>) => Promise<unknown>>());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import { useReadyStacks } from "./useReadyStacks";
+import * as dispatch from "./advisoryDispatch";
+import { prKey } from "@/lib/prIdentity";
 
 let qc: QueryClient;
 beforeEach(() => {
@@ -127,4 +129,68 @@ it("drops a closed owner's waiting batch while another owner's native call finis
   await advance(2);
   expect(invoke).toHaveBeenCalledTimes(2);
   expect(live.result.current.of(rows[0])).toEqual(exact);
+});
+
+it("resumes a fresh qualified partial on the next window without renewing its original authority", async () => {
+  const pr = rows[0];
+  let calls = 0;
+  invoke.mockImplementation(async () => {
+    calls++;
+    return [{ repo: pr.repo, number: pr.number, head_oid: pr.head_oid, base_ref: pr.base_ref,
+      stack: calls <= 2 ? exact : { kind: "unknown" },
+      valid_for_ms: calls === 1 ? 60_000 : calls === 2 ? 30_000 : undefined,
+      advisory_progress: { outcome: calls === 1 ? "partial" : calls === 2 ? "offered" : "deferred", admitted: calls <= 2 } }];
+  });
+  const view = renderHook(() => useReadyStacks([pr]), { wrapper });
+  await advance(2);
+  const original = view.result.current.displayOf(pr)?.observedAt;
+  expect(view.result.current.of(pr)).toEqual(exact);
+  await advance(29_990);
+  expect(calls).toBe(1);
+  await advance(12);
+  expect(calls).toBe(2);
+  expect(view.result.current.displayOf(pr)?.observedAt).toBe(original);
+  await advance(30_002);
+  expect(view.result.current.of(pr)).toEqual({ kind: "unknown" });
+  expect(view.result.current.displayOf(pr)).toMatchObject({ observedAt: original, freshness: "retained" });
+});
+
+
+it("does not retain detail priority after the coalesced detail observer unmounts", async () => {
+  const spy = vi.spyOn(dispatch, "advisoryDispatch");
+  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof rows).map(pr => ({ ...pr, valid_for_ms: 60_000, stack: exact, advisory_progress: { outcome: "offered", admitted: true } })));
+  const strip = renderHook(() => useReadyStacks(rows.slice(0, 1)), { wrapper });
+  await advance(2);
+  const detail = renderHook(() => useReadyStacks(rows.slice(0, 1), new Set(), true, "detail"), { wrapper });
+  await advance(2);
+  detail.unmount();
+  spy.mockClear();
+  await advance(60_002);
+  expect(spy.mock.calls.length).toBeGreaterThan(0);
+  expect(spy.mock.calls.every(call => call[2] === "stack")).toBe(true);
+  strip.unmount();
+  spy.mockRestore();
+});
+
+
+it("bounds recurring partial priority while healthy tail identities make useful progress", async () => {
+  const population = Array.from({ length: 12 }, (_, i) => ({ ...rows[0], number: 100 + i }));
+  const seen = new Set<number>();
+  invoke.mockImplementation(async (_command, args) => (args?.rows as typeof rows).map(pr => {
+    seen.add(pr.number);
+    const poison = pr.number === 106 || pr.number === 107;
+    return { ...pr, valid_for_ms: poison ? 5_000 : 60_000, stack: poison ? { kind: "unknown" } : exact,
+      advisory_progress: { outcome: poison ? "partial" : "offered", admitted: true } };
+  }));
+  const view = renderHook(() => useReadyStacks(population, new Set(population.slice(0, 6).map(prKey))), { wrapper });
+  await advance(5);
+  for (let cycle = 0; cycle < 6; cycle++) { await advance(30_000); await advance(5); }
+  for (const pr of population.slice(8)) {
+    expect(seen.has(pr.number)).toBe(true);
+    expect(view.result.current.displayOf(pr)).toBeDefined();
+  }
+  for (const query of qc.getQueryCache().getAll().filter(q => q.queryKey[0] === "ready-stack")) {
+    const state = query.meta?.advisorySchedule as { hasContinuation?: boolean; resumeBoostSpent?: boolean };
+    if (state?.hasContinuation) expect(state.resumeBoostSpent).toBe(true);
+  }
 });

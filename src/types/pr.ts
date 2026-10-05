@@ -4029,7 +4029,10 @@ export interface PusherAsk {
 /// -- the budget, the per-refresh cap, or no head repository to ask --
 /// and is never a verdict. `head_oid` is echoed so an answer about a head
 /// the row has since moved off is dropped rather than applied.
+/** Scheduling only; never grants data or action authority. Optional for older peers. */
+export interface AdvisoryProgress { outcome: "deferred" | "partial" | "offered" | "ineligible"; admitted: boolean }
 export interface RowPusher {
+  advisory_progress?: AdvisoryProgress;
   /** Original native remaining lifetime. Absent on older desktops. */
   last_known_pusher?: { value: LastPusher; age_ms: number };
   last_known_rules?: { value: BaseRules; age_ms: number };

@@ -8,3 +8,14 @@ test('review receipt preserves explicitly requested commit instead of inventing 
 test('activity facts match requested repository branch and current head',()=>usingProvider(async(p)=>{const response=await fetch(p.url+'/repos/synthetic-lab/repo-1/activity?ref=refs%2Fheads%2Ftopic-51&per_page=10');assert.equal(response.status,200);const [activity]=await response.json();assert.equal(activity.after,'head-51');assert.equal(activity.actor.login,p.data.rows[50].author.login);const absent=await fetch(p.url+'/repos/absent/repo-1/activity');assert.equal(absent.status,404);}));
 
 test('historical PR head and commit agree and occupy a recent closed day',()=>{for(const row of fixture().rows.filter(r=>r.state==='MERGED')){assert.equal(row.commits.nodes[0].commit.oid,row.headRefOid);assert.equal(row.mergedAt.slice(0,10),manifest.historyClosedDay);assert.ok(Date.now()-Date.parse(row.mergedAt)>0);assert.ok(Date.now()-Date.parse(row.mergedAt)<2*86400000);}});
+
+test('synthetic advisory ledger attributes actual production-shaped downward/upward/activity identities',()=>usingProvider(async(p,query)=>{
+ await query('query PrStack {repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){number headRefOid}}}');
+ await query('query PrStackUp {repository(owner:"synthetic-lab",name:"repo-1"){pullRequests(baseRefName:"topic-51",first:10){nodes{number}}}}');
+ await fetch(p.url+'/repos/synthetic-lab/repo-1/activity?ref=refs%2Fheads%2Ftopic-51');
+ assert.deepEqual(p.ledger.map(e=>({stage:e.stage,subjects:e.subjects})),[
+  {stage:'stack-down',subjects:[{repo:'synthetic-lab/repo-1',number:51}]},
+  {stage:'stack-up',subjects:[{repo:'synthetic-lab/repo-1',number:51}]},
+  {stage:'pusher-activity',subjects:[{repo:'synthetic-lab/repo-1',number:51}]},
+ ]);
+}));

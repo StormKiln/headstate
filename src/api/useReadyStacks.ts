@@ -1,9 +1,10 @@
-import { useEffect } from "react";
+import { useLayoutEffect } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { advisoryDispatch, prioritizeAdvisoryDetail } from "./advisoryDispatch";
 import { getReadyStacks } from "./tauri";
 import { useViewer } from "./hooks";
 import { useAdvisoryWindow } from "./useAdvisoryWindow";
+import { acknowledgeSchedule, isPreferred, readSchedule, scheduleMeta, useScheduleClaims } from "./advisorySchedule";
 import { advisoryGcTime, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { prIdentity, prKey } from "@/lib/prIdentity";
 import type { PrStack, PullRequest } from "@/types/pr";
@@ -19,23 +20,37 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   const owner = typeof viewer.data === "string" ? viewer.data : undefined;
   const rows = prs.filter(pr => !pr.source || (pr.source.provider === "github" && pr.source.host === "github.com"));
   const preferred = new Set(rows.filter(pr => priority.has(prKey(pr)) || rows.length <= 8).map(keyOf));
-  const demand = new Set(rows.filter(pr => preferred.has(keyOf(pr)) || !qc.getQueryData<Receipt>(["ready-stack", owner, session.generation, keyOf(pr)])?.lastKnown).map(keyOf));
-  const window = useAdvisoryWindow(rows.map(keyOf), preferred, enabled && !!owner, demand);
+  const queryKey = (key: string) => ["ready-stack", owner, session.generation, key];
+  const schedule = (key: string) => readSchedule(qc, queryKey(key));
+  const demand = new Set(rows.filter(pr => preferred.has(keyOf(pr)) || !qc.getQueryData<Receipt>(queryKey(keyOf(pr)))?.lastKnown || schedule(keyOf(pr))?.hasContinuation).map(keyOf));
+  const window = useAdvisoryWindow(rows.map(keyOf), preferred, enabled && !!owner, demand, schedule);
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });
   const keys = selected.map(pr => ["ready-stack", owner, session.generation, keyOf(pr)]);
+  const metas = keys.map(key => scheduleMeta(qc, key));
+  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: preferred.has(keyOf(pr)) })));
   useQueries({ queries: selected.map((pr, i) => ({
-    queryKey: keys[i],
+    queryKey: keys[i], meta: metas[i],
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
       let answer: Receipt;
-      try { answer = await advisoryDispatch(qc, JSON.stringify(keys[i]), consumer === "detail" ? "detail" : "stack", signal, async () => {
+      let completed = false;
+      try { answer = (await advisoryDispatch(qc, JSON.stringify(keys[i]), consumer === "detail" ? "detail" : "stack", signal, async () => {
         const started = performance.now();
         const answers = await getReadyStacks([{ ...prIdentity(pr), head_oid: pr.head_oid, base_ref: pr.base_ref }]);
-        const value = answers?.find(value => prKey(value) === prKey(pr) && value.head_oid === pr.head_oid && value.base_ref === pr.base_ref);
+        const matching = answers?.find(value => prKey(value) === prKey(pr));
+        const value = matching?.head_oid === pr.head_oid && matching.base_ref === pr.base_ref ? matching : undefined;
         const known = value?.stack.kind !== "unknown" && value ? receipt(value.stack, value.valid_for_ms, 60_000, started) : undefined;
-        return known ? { stack: known.value, expiresAt: known.expiresAt, staleFor: Math.max(0, known.expiresAt - performance.now()), lastKnown: known }
+        const result: Receipt = known ? { stack: known.value, expiresAt: known.expiresAt, staleFor: Math.max(0, known.expiresAt - performance.now()), lastKnown: known }
           : { stack: { kind: "unknown" }, expiresAt: performance.now() + 5_000, staleFor: 5_000, lastKnown: retainedReceipt(value?.last_known_stack, started) };
-      }); }
+        return { receipt: result, progress: matching?.advisory_progress };
+      }, {
+        preferred: () => isPreferred(metas[i], preferred.has(keyOf(pr))),
+        rank: () => metas[i].advisorySchedule.lastAdmittedAt ?? -1,
+        boosted: () => window.boosted.has(keyOf(pr)) && !metas[i].advisorySchedule.resumeBoostSpent,
+        current: () => session.generation === session.current(),
+        progress: value => { completed = value.receipt.stack.kind !== "unknown" && value.receipt.expiresAt > performance.now() && value.progress?.outcome === "offered"; return value.progress; },
+        acknowledge: progress => acknowledgeSchedule(metas[i], progress, window.boosted.has(keyOf(pr)), completed),
+      })).receipt; }
       catch { answer = { stack: { kind: "unknown" }, expiresAt: performance.now() + 5_000, staleFor: 5_000 }; }
       assertCurrent(signal, session.generation, session.current);
       return { ...answer, lastKnown: answer.lastKnown ?? qc.getQueryData<Receipt>(keys[i])?.lastKnown };
@@ -46,12 +61,12 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
     refetchOnWindowFocus: false,
   })) });
   const signature = JSON.stringify(keys);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const now = performance.now();
     if (consumer === "detail") prioritizeAdvisoryDetail(qc, (JSON.parse(signature) as unknown[][]).map(key => JSON.stringify(key)));
     for (const key of JSON.parse(signature) as string[][]) {
       const receipt = qc.getQueryData<Receipt>(key);
-      if (receipt && receipt.expiresAt <= now) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+      if (receipt && (receipt.expiresAt <= now || readSchedule(qc, key)?.hasContinuation)) void qc.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
     }
   }, [qc, signature, window.tick, consumer]);
   // Display qualification outlives the bounded network observer window.

@@ -537,6 +537,9 @@ impl GitHubClient {
     pub fn with_read_context(&self, mut context: super::admission::ReadContext) -> Self {
         if let Some(parent) = &self.read_context {
             context.deadline = context.deadline.min(parent.deadline);
+            if parent.advisory_context.is_some() {
+                context.advisory_context = parent.advisory_context.clone();
+            }
             if parent.first_attempt.is_some() {
                 context.first_attempt = parent.first_attempt.clone();
             }
@@ -544,6 +547,32 @@ impl GitHubClient {
                 context.attempts = parent.attempts.clone();
             }
         }
+        let mut view = self.clone();
+        view.read_context = Some(context);
+        view
+    }
+    pub(crate) fn with_advisory_context(
+        &self,
+        caller: crate::remote::context::DispatchContext,
+    ) -> Self {
+        let mut context = super::admission::ReadContext::new(
+            super::admission::ReadClass::Advisory,
+            std::time::Duration::from_secs(10),
+        );
+        context.advisory_context = Some(caller);
+        self.with_read_context(context)
+    }
+    /// Add a row-local admission observer without replacing its parent operation's
+    /// once-only observer or any deadline/allowance ownership.
+    pub(super) fn with_first_attempt(&self, callback: impl FnOnce() + Send + 'static) -> Self {
+        let mut context = self.read_context();
+        let parent = context.first_attempt.take();
+        context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
+            if let Some(parent) = parent {
+                parent.observe();
+            }
+            callback();
+        }));
         let mut view = self.clone();
         view.read_context = Some(context);
         view
@@ -2726,6 +2755,8 @@ mod tests {
             .await;
         let client = client_for(&server).await;
         let mut context = ReadContext::new(ReadClass::Advisory, std::time::Duration::from_secs(5));
+        let paired = crate::remote::context::DispatchContext::paired_for_test();
+        context.advisory_context = Some(paired.clone());
         let count = observed.clone();
         context.first_attempt = Some(FirstAttempt::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
@@ -2735,6 +2766,20 @@ mod tests {
             ReadClass::Advisory,
             std::time::Duration::from_secs(5),
         ));
+        let row_observed = Arc::new(AtomicUsize::new(0));
+        let row_count = row_observed.clone();
+        let child = child.with_first_attempt(move || {
+            row_count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            child
+                .read_context()
+                .advisory_context
+                .as_ref()
+                .unwrap()
+                .principal(),
+            paired.principal()
+        );
         child
             .rest_get("/first-stage", &client.request_budget())
             .await
@@ -2749,6 +2794,24 @@ mod tests {
             "retry and second stage both dispatched"
         );
         assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            row_observed.load(Ordering::SeqCst),
+            1,
+            "row observation composes with parent across retries"
+        );
+        let desktop =
+            client.with_advisory_context(crate::remote::context::DispatchContext::desktop());
+        assert!(
+            matches!(
+                desktop
+                    .rest_get("/late-desktop", &client.request_budget())
+                    .await,
+                Err(ClientError::NotDispatched(_))
+            ),
+            "new principal does not borrow the paired leader's remaining discovery credit"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(client.read_context().advisory_context.is_none());
         assert!(
             client.read_context().first_attempt.is_none(),
             "managed client must not retain a row observer"

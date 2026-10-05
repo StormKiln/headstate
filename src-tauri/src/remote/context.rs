@@ -64,6 +64,19 @@ impl DispatchContext {
             capability: None,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn paired_for_test() -> Self {
+        Self {
+            display_name: "synthetic paired consumer".into(),
+            capability: Some(PairingCapability::fresh()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn retire_for_test(&self) {
+        if let Some(capability) = &self.capability {
+            capability.retire();
+        }
+    }
     pub(crate) fn principal(&self) -> u64 {
         self.capability.as_ref().map_or(0, |c| c.id)
     }

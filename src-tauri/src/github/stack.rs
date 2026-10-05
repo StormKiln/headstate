@@ -17,12 +17,18 @@
 //! branch, a failed request -- and what it already found is kept and
 //! QUALIFIED ("at least"), never discarded and never printed as exact.
 
+use super::advisory::{Measurement, StackKey, FAILURE_TTL, SUCCESS_TTL};
 use super::client::GitHubClient;
 use super::model::{PrStack, StackMember};
 use super::query::{PR_STACK_QUERY, PR_STACK_UP_QUERY};
 use super::stats::Budget;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::time::Instant;
 
 /// Upward hops before the total is reported as a floor.
 ///
@@ -244,12 +250,66 @@ pub fn assemble(down: &Down, children: &[u64], up_complete: bool) -> PrStack {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Continuation {
+    down: Down,
+    children: Vec<u64>,
+    head: String,
+    hops: usize,
+    observed_at: Instant,
+    valid_until: Instant,
+}
+type ContinuationSlot = Arc<Mutex<Option<Continuation>>>;
+#[derive(Debug, Default)]
+pub(super) struct Continuations {
+    slots: Mutex<HashMap<StackKey, (Instant, ContinuationSlot)>>,
+}
+impl Continuations {
+    fn slot(&self, key: StackKey) -> Option<ContinuationSlot> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, slot)) = slots.get_mut(&key) {
+            *at = Instant::now();
+            return Some(slot.clone());
+        }
+        if slots.len() >= 512 {
+            let victim = slots
+                .iter()
+                .filter(|(_, (_, slot))| Arc::strong_count(slot) == 1)
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())?;
+            slots.remove(&victim);
+        }
+        let slot = Arc::new(Mutex::new(None));
+        slots.insert(key, (Instant::now(), slot.clone()));
+        Some(slot)
+    }
+    pub fn pending(&self, key: &StackKey) -> bool {
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots.get(key).is_some_and(|(_, slot)| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|state| state.valid_until > Instant::now())
+        })
+    }
+}
+fn unknown_measurement() -> Measurement<PrStack> {
+    let observed_at = Instant::now();
+    Measurement {
+        value: PrStack::Unknown,
+        observed_at,
+        valid_until: observed_at + FAILURE_TTL,
+        successful: false,
+    }
+}
+
 impl GitHubClient {
     /// Where `number` sits in a stack. Never an error: every failure is
     /// `PrStack::Unknown`, or a partial answer qualified as one.
     pub async fn fetch_pr_stack(&self, owner: &str, name: &str, number: u64) -> PrStack {
         self.fetch_stack_with_budget(owner, name, number, &self.request_budget(), false, None)
             .await
+            .value
     }
 
     /// Advisory list enrichment leaves the reserve for explicit detail reads.
@@ -262,7 +322,7 @@ impl GitHubClient {
         number: u64,
         budget: &Budget,
         expected: Option<(&str, &str)>,
-    ) -> PrStack {
+    ) -> Measurement<PrStack> {
         self.fetch_stack_with_budget(owner, name, number, budget, true, expected)
             .await
     }
@@ -276,98 +336,168 @@ impl GitHubClient {
         budget: &Budget,
         advisory: bool,
         expected: Option<(&str, &str)>,
-    ) -> PrStack {
+    ) -> Measurement<PrStack> {
         if advisory && !budget.permits(8) {
-            return PrStack::Unknown;
+            return unknown_measurement();
         }
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let remaining = || STACK_BUDGET.saturating_sub(started.elapsed());
-
-        let first = tokio::time::timeout(
-            remaining(),
-            self.graphql_partial_ok(&json!({
-                "query": PR_STACK_QUERY,
-                "variables": { "owner": owner, "repo": name, "number": number }
-            })),
-        )
-        .await;
-        let v = match first {
-            Ok(Ok(v)) => v,
-            // Failed or timed out: nothing is known, which is Unknown.
-            _ => return PrStack::Unknown,
+        let slot = if advisory {
+            expected.and_then(|(head, base)| {
+                self.advisory.stack_continuations.slot((
+                    format!("{owner}/{name}"),
+                    number,
+                    head.into(),
+                    base.into(),
+                ))
+            })
+        } else {
+            None
         };
-        // Record before interpreting partial/refused membership: its quota
-        // is still the latest reading and must gate subsequent advisory work.
-        budget.record(&v);
-        // A refused field is a field we did not get, so an absent
-        // `stackEntry` could be a native stack GitHub declined to describe.
-        if super::client::refused_fields_of(&v) > 0 {
-            return PrStack::Unknown;
-        }
-        if let Some((head, base)) = expected {
-            let row = &v["repository"]["pullRequest"];
-            if row["number"].as_u64() != Some(number)
-                || row["headRefOid"].as_str() != Some(head)
-                || row["baseRefName"].as_str() != Some(base)
+        let resumed = slot.as_ref().and_then(|slot| {
+            let mut saved = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if saved
+                .as_ref()
+                .is_some_and(|state| state.valid_until <= Instant::now())
             {
-                return PrStack::Unknown;
+                *saved = None;
             }
-        }
-        let Some(down) = parse_down(&v) else {
-            return PrStack::Unknown;
+            saved.clone()
+        });
+        let save = |state: Option<Continuation>| {
+            if let Some(slot) = &slot {
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = state;
+            }
         };
-        if down.native.is_some() {
-            return assemble(&down, &[], true);
-        }
-
-        let mut children = Vec::new();
-        // A fork's head branch lives in the fork; nothing here is based on
-        // it, and asking by NAME would match an unrelated branch that
-        // merely shares it.
-        let mut up_complete = down.cross_repository || down.head.is_empty();
-        let mut head = down.head.clone();
-        for _ in 0..UP_HOPS {
-            if up_complete || (advisory && !budget.permits(8)) {
+        let mut state =
+            if let Some(state) = resumed {
+                state
+            } else {
+                let first=tokio::time::timeout(remaining(), self.graphql_partial_ok(&json!({
+                "query":PR_STACK_QUERY,"variables":{"owner":owner,"repo":name,"number":number}
+            }))).await;
+                let v = match first {
+                    Ok(Ok(v)) => v,
+                    _ => return unknown_measurement(),
+                };
+                budget.record(&v);
+                if super::client::refused_fields_of(&v) > 0 {
+                    return unknown_measurement();
+                }
+                if let Some((head, base)) = expected {
+                    let row = &v["repository"]["pullRequest"];
+                    if row["number"].as_u64() != Some(number)
+                        || row["headRefOid"].as_str() != Some(head)
+                        || row["baseRefName"].as_str() != Some(base)
+                    {
+                        return unknown_measurement();
+                    }
+                }
+                let Some(down) = parse_down(&v) else {
+                    return unknown_measurement();
+                };
+                let observed_at = Instant::now();
+                Continuation {
+                    head: down.head.clone(),
+                    down,
+                    children: Vec::new(),
+                    hops: 0,
+                    observed_at,
+                    valid_until: observed_at + SUCCESS_TTL,
+                }
+            };
+        let mut complete = state.down.native.is_some()
+            || state.down.cross_repository
+            || state.down.head.is_empty();
+        let mut resumable = false;
+        while !complete && state.hops < UP_HOPS {
+            // Save only parsed, identity-checked progress BEFORE the next await,
+            // so cancellation cannot discard a successfully received prerequisite.
+            save(Some(state.clone()));
+            if advisory && !budget.permits(8) {
+                resumable = true;
                 break;
             }
-            let step = tokio::time::timeout(
-                remaining(),
-                self.graphql_partial_ok(&json!({
-                    "query": PR_STACK_UP_QUERY,
-                    "variables": { "owner": owner, "repo": name, "base": head }
-                })),
-            )
-            .await;
-            // Out of time or failed: keep what the earlier hops found, and
-            // leave the total qualified.
-            let Ok(Ok(page)) = step else { break };
+            let step=tokio::time::timeout(remaining(), self.graphql_partial_ok(&json!({
+                "query":PR_STACK_UP_QUERY,"variables":{"owner":owner,"repo":name,"base":state.head}
+            }))).await;
+            let page = match step {
+                Ok(Ok(page)) => page,
+                Ok(Err(super::client::ClientError::NotDispatched(_))) | Err(_) => {
+                    resumable = true;
+                    break;
+                }
+                Ok(Err(_)) => break,
+            };
             budget.record(&page);
+            state.hops += 1;
             match parse_up(&page) {
-                UpStep::Top => up_complete = true,
+                UpStep::Top => complete = true,
                 UpStep::Child {
                     number: child,
                     head: next,
                 } => {
-                    if child == number || children.contains(&child) || down.parents.contains(&child)
+                    if child == number
+                        || state.children.contains(&child)
+                        || state.down.parents.contains(&child)
                     {
                         break;
                     }
-                    children.push(child);
+                    state.children.push(child);
                     match next {
-                        Some(h) => head = h,
-                        None => up_complete = true,
+                        Some(head) => state.head = head,
+                        None => complete = true,
                     }
                 }
                 UpStep::Branches | UpStep::Unreadable => break,
             }
         }
-        assemble(&down, &children, up_complete)
+        if !resumable {
+            save(None);
+        }
+        let value = assemble(&state.down, &state.children, complete);
+        let successful = value != PrStack::Unknown;
+        Measurement {
+            value,
+            observed_at: state.observed_at,
+            valid_until: if successful {
+                state.valid_until
+            } else {
+                Instant::now() + FAILURE_TTL
+            },
+            successful,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_capacity_does_not_evict_pinned_leaders() {
+        let continuations = Continuations::default();
+        let key = |number| {
+            (
+                "synthetic/repo".into(),
+                number,
+                "head".into(),
+                "main".into(),
+            )
+        };
+        let mut pinned: Vec<_> = (1..=512)
+            .map(|number| continuations.slot(key(number)).unwrap())
+            .collect();
+        assert!(continuations.slot(key(513)).is_none());
+        assert!(Arc::ptr_eq(
+            &pinned[0],
+            &continuations.slot(key(1)).unwrap()
+        ));
+        pinned.pop();
+        assert!(continuations.slot(key(513)).is_some());
+        assert_eq!(continuations.slots.lock().unwrap().len(), 512);
+        assert!(!continuations.slots.lock().unwrap().contains_key(&key(512)));
+    }
 
     /// A `PR_STACK_QUERY` response for pull request 30 based on `feat-b`,
     /// with `chain` as the nested `baseRef` answer.

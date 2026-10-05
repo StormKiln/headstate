@@ -455,6 +455,8 @@ pub struct PusherAsk {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowPusher {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_progress: Option<super::advisory::Progress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pusher_valid_for_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_valid_for_ms: Option<u64>,
@@ -501,6 +503,7 @@ pub async fn strip_pushers(
     let mut out: Vec<RowPusher> = asks
         .iter()
         .map(|a| RowPusher {
+            advisory_progress: None,
             pusher_valid_for_ms: None,
             rules_valid_for_ms: None,
             last_known_pusher: None,
@@ -519,6 +522,10 @@ pub async fn strip_pushers(
             },
         })
         .collect();
+    let admitted: Vec<_> = asks
+        .iter()
+        .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .collect();
     let mut work = stream::iter(
         order
             .into_iter()
@@ -529,13 +536,13 @@ pub async fn strip_pushers(
                 let key = keys[i].clone();
                 let member = members[i].clone();
                 let batch = batch.clone();
+                let admitted = admitted[i].clone();
                 async move {
-                    let mut context = client.read_context();
                     let advisory = client.advisory.clone();
-                    context.first_attempt = Some(super::admission::FirstAttempt::new(move || {
+                    let client = client.with_first_attempt(move || {
+                        admitted.store(true, std::sync::atomic::Ordering::Release);
                         advisory.batch_offered(key, member, &batch);
-                    }));
-                    let client = client.with_read_context(context);
+                    });
                     let rules = tokio::time::timeout(
                         per_request,
                         base_rules(&client, &budget, &a.repo, &a.base),
@@ -572,7 +579,8 @@ pub async fn strip_pushers(
         out[i].rules = rules;
         out[i].last_pusher = pusher;
     }
-    for (row, ask) in out.iter_mut().zip(asks) {
+    drop(work);
+    for ((row, ask), admitted) in out.iter_mut().zip(asks).zip(&admitted) {
         let rules_key = (ask.repo.clone(), ask.base.clone());
         if let Some((rules, lifetime)) = client.advisory.rules.peek_receipt(&rules_key) {
             row.rules = rules;
@@ -587,6 +595,30 @@ pub async fn strip_pushers(
             }
             row.last_known_pusher = client.advisory.pushers.last_success(&key);
         }
+        use super::advisory::{Progress, ProgressOutcome};
+        let admitted = admitted.load(std::sync::atomic::Ordering::Acquire);
+        let rules = matches!(row.rules, BaseRules::Read { .. });
+        let pusher = matches!(row.last_pusher, LastPusher::Known { .. });
+        let eligible = valid_repo(&ask.repo)
+            && ask.number > 0
+            && !ask.base.is_empty()
+            && ask.head_repo.as_ref().is_some_and(|repo| valid_repo(repo))
+            && !ask.head_ref.is_empty()
+            && !ask.head_oid.is_empty();
+        let partial = (rules && matches!(row.last_pusher, LastPusher::Declined { .. }))
+            || (pusher && matches!(row.rules, BaseRules::Declined { .. }));
+        row.advisory_progress = Some(Progress {
+            admitted,
+            outcome: if !eligible {
+                ProgressOutcome::Ineligible
+            } else if partial {
+                ProgressOutcome::Partial
+            } else if admitted || (rules && pusher) {
+                ProgressOutcome::Offered
+            } else {
+                ProgressOutcome::Deferred
+            },
+        });
     }
     Ok(out)
 }
@@ -645,6 +677,14 @@ mod tests {
         assert!(second["rules_valid_for_ms"]
             .as_u64()
             .is_some_and(|ms| ms > 544_000 && ms <= 545_000));
+        assert_eq!(
+            first["advisory_progress"],
+            json!({"outcome":"offered", "admitted":true})
+        );
+        assert_eq!(
+            second["advisory_progress"],
+            json!({"outcome":"offered", "admitted":false})
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
