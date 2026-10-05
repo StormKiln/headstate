@@ -1330,14 +1330,57 @@ enum GithubEffect {
     Review(crate::inventory::ConfirmedReview),
     Remove(crate::github::mutate::ConfirmedRemoval),
 }
-pub fn fact_operation(app: &AppHandle) -> crate::store::github_facts::Operation {
-    app.state::<SourcePolls>().fact_operation()
+pub async fn fact_operation(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+) -> crate::store::github_facts::Operation {
+    app.state::<SourcePolls>()
+        .fact_operation_for(repo, number)
+        .await
 }
 impl SourcePolls {
-    fn fact_operation(&self) -> crate::store::github_facts::Operation {
+    #[cfg(test)]
+    async fn fact_operation(&self) -> crate::store::github_facts::Operation {
+        self.fact_operation_for("", 0).await
+    }
+    async fn fact_operation_for(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> crate::store::github_facts::Operation {
+        let mut heads_at_start = [None, None];
+        let mut receipts_at_start = [None, None];
+        for (index, list) in [CachedList::Authored, CachedList::Reviewing]
+            .into_iter()
+            .enumerate()
+        {
+            // Snapshot this identity and receipt coherently with publication.
+            // Each gate is released before taking the next; independent batch
+            // acknowledgments are not fenced by unrelated receipt revisions.
+            let _guard = self.gate(&Source::default(), list).lock_owned().await;
+            heads_at_start[index] = self
+                .2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(Source::default(), list))
+                .and_then(|(_, receipt)| {
+                    receipt
+                        .prs
+                        .iter()
+                        .find(|row| row.repo.eq_ignore_ascii_case(repo) && row.number == number)
+                })
+                .map(|row| crate::store::github_facts::HeadAtStart {
+                    id: row.id.clone(),
+                    head_oid: row.head_oid.clone(),
+                });
+            receipts_at_start[index] = self.get(&Source::default(), list).receipt_revision;
+        }
         crate::store::github_facts::Operation {
             session: self.3.clone(),
             sequence: self.6.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            heads_at_start,
+            receipts_at_start,
         }
     }
 }
@@ -1573,8 +1616,19 @@ async fn record_github_effect_at(
                     && observation.facts.iter().all(|f| {
                         (f.head_oid == row.head_oid
                             || f.updated_at.is_some_and(|version| version > row.updated_at)
-                            || (f.operation.is_some()
-                                && f.updated_at == Some(row.updated_at)
+                            || (f.operation.as_ref().is_some_and(|operation| {
+                                let index = if list == CachedList::Authored { 0 } else { 1 };
+                                operation.session == polls.3
+                                    && match &operation.heads_at_start[index] {
+                                        Some(start) => {
+                                            start.id == row.id && start.head_oid == row.head_oid
+                                        }
+                                        None => {
+                                            operation.receipts_at_start[index]
+                                                == polls.get(&source, list).receipt_revision
+                                        }
+                                    }
+                            }) && f.updated_at == Some(row.updated_at)
                                 && row
                                     .observation
                                     .as_ref()

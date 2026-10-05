@@ -34,9 +34,18 @@ impl Value {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadAtStart {
+    pub id: String,
+    pub head_oid: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     pub session: String,
     pub sequence: u64,
+    #[serde(default)]
+    pub heads_at_start: [Option<HeadAtStart>; 2],
+    #[serde(default)]
+    pub receipts_at_start: [Option<u64>; 2],
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
@@ -554,6 +563,8 @@ mod ordering_tests {
             fact.operation = Some(Operation {
                 session: "process-a".into(),
                 sequence,
+                heads_at_start: [None, None],
+                receipts_at_start: [None, None],
             });
         }
         o

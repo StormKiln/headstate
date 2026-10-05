@@ -3213,7 +3213,7 @@ async fn dequeue_uses_schema_id_and_publishes_verified_inverse_fact() {
         (PrAction::ConvertToDraft, false, true),
         (PrAction::MarkReady, false, false),
     ] {
-        let operation = polls.fact_operation();
+        let operation = polls.fact_operation().await;
         let Some(ConfirmedAction::Facts {
             viewer,
             mut observation,
@@ -3282,7 +3282,7 @@ async fn newer_detail_head_replaces_old_head_without_borrowing_old_checks() {
         "octocat/repo-1",
     );
     for fact in &mut detail.inventory_facts.as_mut().unwrap().facts {
-        fact.operation = Some(polls.fact_operation());
+        fact.operation = Some(polls.fact_operation().await);
     }
     record_github_effect_at(
         path.clone(),
@@ -3318,7 +3318,7 @@ async fn replaced_source_client_rejects_held_old_owner_fact_completion() {
     let mut proof =
         crate::store::github_facts::Observation::from_node(&raw, chrono::Utc::now()).unwrap();
     for fact in &mut proof.facts {
-        fact.operation = Some(polls.fact_operation());
+        fact.operation = Some(polls.fact_operation().await);
     }
     record_github_effect_at(
         path.clone(),
@@ -3333,7 +3333,7 @@ async fn replaced_source_client_rejects_held_old_owner_fact_completion() {
     assert!(saved(&conn)[0].is_draft);
     // A held request captures its operation before the new verified client owns the source.
     for fact in &mut proof.facts {
-        fact.operation = Some(polls.fact_operation());
+        fact.operation = Some(polls.fact_operation().await);
     }
     server.reset().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
@@ -3621,7 +3621,7 @@ async fn equal_version_later_target_head_wins_but_earlier_started_head_cannot_re
         }),
     )
     .await;
-    let earlier = polls.fact_operation();
+    let earlier = polls.fact_operation_for("octocat/repo-1", 1).await;
     let mut newer = raw.clone();
     newer["headRefOid"] = json!("equal-version-new-head");
     let mut proof =
@@ -3630,7 +3630,7 @@ async fn equal_version_later_target_head_wins_but_earlier_started_head_cannot_re
         .facts
         .retain(|f| matches!(f.value, crate::store::github_facts::Value::Queue(_)));
     for fact in &mut proof.facts {
-        fact.operation = Some(polls.fact_operation());
+        fact.operation = Some(polls.fact_operation_for("octocat/repo-1", 1).await);
     }
     record_github_effect_at(
         path.clone(),
@@ -3691,4 +3691,146 @@ async fn equal_version_later_target_head_wins_but_earlier_started_head_cannot_re
         replayed.prs[0].head_oid, "equal-version-new-head",
         "equal-version lagging list cannot undo the targeted head after restart"
     );
+}
+
+#[tokio::test]
+async fn ordinary_equal_version_new_head_fences_old_detail_started_before_publication() {
+    for cached_at_start in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary-head.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let polls = SourcePolls::default();
+        let mut old_raw = node(1, false);
+        old_raw["state"] = json!("OPEN");
+        let receipt = |raw: Value| FetchedList {
+            scan: None,
+            viewer: Some("synthetic-viewer".into()),
+            prs: crate::github::map::map_list(&json!({"authored":{"nodes":[raw]}}), "authored"),
+            total: Some(1),
+            coverage: Coverage::Complete,
+        };
+        if cached_at_start {
+            publish(&polls, &conn, Ok(receipt(old_raw.clone()))).await;
+        } else {
+            source_cache::save_owned_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Reviewing,
+                &receipt(old_raw.clone()).prs,
+                &Coverage::Complete,
+                Some("synthetic-viewer"),
+            )
+            .unwrap();
+        }
+        let held_operation = polls.fact_operation_for("octocat/repo-1", 1).await;
+        let mut newer = old_raw.clone();
+        newer["headRefOid"] = json!("ordinary-new-head");
+        let mut fresh = receipt(newer);
+        fresh.prs[0].observation.as_mut().unwrap().last_observed_at = Some(chrono::Utc::now());
+        let (attempt, _) = polls
+            .begin_attempt(Source::default(), CachedList::Reviewing)
+            .await;
+        publish_scan_attempt(&polls, &conn, &attempt, fresh)
+            .await
+            .unwrap();
+        let authoritative = saved(&conn);
+        assert_eq!(authoritative[0].head_oid, "ordinary-new-head");
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT count(*) FROM github_pr_facts", [], |r| r.get(0))
+                .unwrap(),
+            0,
+            "ordinary head has no targeted journal to provide a fence"
+        );
+        let mut delayed =
+            crate::store::github_facts::Observation::from_node(&old_raw, chrono::Utc::now())
+                .unwrap();
+        for fact in &mut delayed.facts {
+            fact.operation = Some(held_operation.clone());
+        }
+        let before_revision = polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .receipt_revision;
+        let mut emitted = 0;
+        record_github_effect_at(
+            path.clone(),
+            &polls,
+            "octocat/repo-1",
+            1,
+            "synthetic-viewer",
+            GithubEffect::Facts(delayed),
+            |_| emitted += 1,
+        )
+        .await;
+        assert_eq!(
+            emitted, 0,
+            "old detail must not publish over a newer ordinary list head; cached={cached_at_start}"
+        );
+        assert_eq!(saved(&conn), authoritative);
+        assert_eq!(
+            polls
+                .get(&Source::default(), CachedList::Reviewing)
+                .receipt_revision,
+            before_revision
+        );
+        assert_eq!(
+            polls
+                .2
+                .lock()
+                .unwrap()
+                .get(&(Source::default(), CachedList::Reviewing))
+                .unwrap()
+                .1
+                .prs,
+            authoritative
+        );
+        drop(conn);
+        assert_eq!(saved(&crate::store::open_db(&path).unwrap()), authoritative);
+
+        // A later request sees the ordinary head. Unrelated publication changes
+        // the receipt revision without invalidating this identity's authority.
+        let later = polls.fact_operation_for("octocat/repo-1", 1).await;
+        let conn = crate::store::open_db(&path).unwrap();
+        let mut same_head = old_raw.clone();
+        same_head["headRefOid"] = json!("ordinary-new-head");
+        let (attempt, _) = polls
+            .begin_attempt(Source::default(), CachedList::Reviewing)
+            .await;
+        publish_scan_attempt(&polls, &conn, &attempt, receipt(same_head))
+            .await
+            .unwrap();
+        assert_ne!(
+            polls
+                .get(&Source::default(), CachedList::Reviewing)
+                .receipt_revision,
+            later.receipts_at_start[1]
+        );
+        let mut next_head = old_raw.clone();
+        next_head["headRefOid"] = json!("later-target-head");
+        let mut observation =
+            crate::store::github_facts::Observation::from_node(&next_head, chrono::Utc::now())
+                .unwrap();
+        for fact in &mut observation.facts {
+            fact.operation = Some(later.clone());
+        }
+        record_github_effect_at(
+            path.clone(),
+            &polls,
+            "octocat/repo-1",
+            1,
+            "synthetic-viewer",
+            GithubEffect::Facts(observation),
+            |_| emitted += 1,
+        )
+        .await;
+        assert_eq!(
+            emitted, 1,
+            "later targeted head remains representable despite another receipt"
+        );
+        assert_eq!(saved(&conn)[0].head_oid, "later-target-head");
+        drop(conn);
+        assert_eq!(
+            saved(&crate::store::open_db(&path).unwrap())[0].head_oid,
+            "later-target-head"
+        );
+    }
 }

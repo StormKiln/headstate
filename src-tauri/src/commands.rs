@@ -701,7 +701,7 @@ pub async fn act_on_pr(
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let act = parse_action(&action)?;
 
-    let operation = crate::source_poll::fact_operation(&app);
+    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
     match client.mutate_pr(&id, act).await {
         Ok(effect) => {
             if let Some(effect) = effect {
@@ -1103,7 +1103,7 @@ pub async fn act_on_prs(
             let (client, id, repo, number) = (client.clone(), id.clone(), repo.clone(), *number);
             let app = app.clone();
             set.spawn(async move {
-                let operation = crate::source_poll::fact_operation(&app);
+                let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
                 let error = match client.mutate_pr(&id, act).await {
                     Ok(effect) => {
                         if let Some(effect) = effect {
@@ -1303,7 +1303,7 @@ pub async fn get_pr_detail(
         crate::poll::FETCH_TIMEOUT,
     ));
     let review_generation = crate::source_poll::review_read_generation(&app);
-    let operation = crate::source_poll::fact_operation(&app);
+    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
     let mut out = client
         .fetch_pr_detail(&repo, number)
         .await
