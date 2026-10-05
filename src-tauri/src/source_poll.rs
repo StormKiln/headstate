@@ -983,7 +983,19 @@ pub(crate) async fn fetch_github_step_at(
             }),
         });
     }
-    client.advance_scan(list, loaded, &rows, now).await
+    if continuation {
+        client
+            .advance_scan_mode(
+                list,
+                loaded,
+                &rows,
+                now,
+                crate::github::scan::ScanMode::Continue,
+            )
+            .await
+    } else {
+        client.advance_scan(list, loaded, &rows, now).await
+    }
 }
 
 /// Called with the source publication permit held, before persistence and emission.

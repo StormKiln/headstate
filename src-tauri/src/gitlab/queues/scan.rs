@@ -197,6 +197,7 @@ pub(super) async fn advance_context(
                             .any(|c| c.identity == row.identity())
                     {
                         state.candidates.push_back(Candidate {
+                            isolated: false,
                             identity: row.identity(),
                             id: row.id.to_string(),
                             head: row.head_oid.clone().unwrap_or_default(),
@@ -375,6 +376,7 @@ mod tests {
         crate::gitlab::test_support::scripted(&program, async {
             let mr = map_row(&row(7), &source()).unwrap();
             let candidate = Candidate {
+                isolated: false,
                 identity: mr.identity(),
                 id: mr.id.to_string(),
                 head: mr.head_oid.clone().unwrap(),

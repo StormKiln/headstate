@@ -1126,9 +1126,8 @@ pub(crate) fn queue_continuation_due(
     focused
         && view_needs_github
         && enabled
-        && !state.done
-        && state.started_at.is_some()
-        && now >= state.eligible_at
+        && ((!state.done && state.started_at.is_some() && now >= state.eligible_at)
+            || state.candidates.iter().any(|c| c.eligible_at <= now))
 }
 
 /// The production continuation clock and visibility dispatch boundary. The

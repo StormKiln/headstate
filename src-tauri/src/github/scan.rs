@@ -16,6 +16,14 @@ use std::{
 };
 mod partition;
 
+/// Intent is independent of the shared (list, revision) key. A finished
+/// continuation must never authorize a fresh discovery pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    Refresh,
+    Continue,
+}
+
 type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
 #[derive(Default)]
 pub(super) struct Reads(Mutex<HashMap<(bool, i64), Weak<ScanSlot>>>);
@@ -46,6 +54,17 @@ impl GitHubClient {
         previous: &[PullRequest],
         now: i64,
     ) -> Result<FetchedList, ClientError> {
+        self.advance_scan_mode(list, loaded, previous, now, ScanMode::Refresh)
+            .await
+    }
+    pub(crate) async fn advance_scan_mode(
+        &self,
+        list: CachedList,
+        loaded: Loaded,
+        previous: &[PullRequest],
+        now: i64,
+        mode: ScanMode,
+    ) -> Result<FetchedList, ClientError> {
         let _active = self.active_queue_read();
         let slot = {
             let mut reads = self.scans.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -64,7 +83,7 @@ impl GitHubClient {
             return result.clone().map_err(ClientError::shared);
         }
         let result = self
-            .advance_scan_inner(list, loaded, previous, now)
+            .advance_scan_inner(list, loaded, previous, now, mode)
             .await
             .map_err(Arc::new);
         *receipt = Some(result.clone());
@@ -76,6 +95,7 @@ impl GitHubClient {
         loaded: Loaded,
         previous: &[PullRequest],
         now: i64,
+        mode: ScanMode,
     ) -> Result<FetchedList, ClientError> {
         let client = self.with_attempt_limit(3);
         let mut state = loaded.state;
@@ -100,7 +120,7 @@ impl GitHubClient {
                 state.eligible_at = finished_at + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
             }
         }
-        if state.done && now >= state.eligible_at {
+        if mode == ScanMode::Refresh && state.done && now >= state.eligible_at {
             state.fresh_pass();
         }
         let began_at_head = state.after.is_none();
@@ -135,7 +155,12 @@ impl GitHubClient {
                             }
                             partition::accept(&mut state, &raw, &mut prs, now);
                             if state.done {
-                                seed_candidates(&mut state, previous, now);
+                                seed_candidates(
+                                    &mut state,
+                                    previous,
+                                    now,
+                                    &removals.iter().cloned().collect(),
+                                );
                                 break;
                             }
                             if state.failures > 0 {
@@ -243,7 +268,12 @@ impl GitHubClient {
                         state.completed_total = total;
                     }
                     state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
-                    seed_candidates(&mut state, previous, now);
+                    seed_candidates(
+                        &mut state,
+                        previous,
+                        now,
+                        &removals.iter().cloned().collect(),
+                    );
                     break;
                 }
                 if state.seen.len() >= 1000 || state.pages >= 39 {
@@ -252,7 +282,12 @@ impl GitHubClient {
                     state.ceiling = true;
                     state.tainted = true;
                     state.eligible_at = now + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
-                    seed_candidates(&mut state, previous, now);
+                    seed_candidates(
+                        &mut state,
+                        previous,
+                        now,
+                        &removals.iter().cloned().collect(),
+                    );
                     break;
                 }
                 if next != Some(true)
@@ -320,6 +355,9 @@ impl GitHubClient {
         }
         // A positive measurement in this step always beats a tentative negative.
         removals.retain(|id| !prs.iter().any(|r| &r.identity() == id));
+        state
+            .candidates
+            .retain(|c| !prs.iter().any(|r| r.identity() == c.identity));
         let total = state.total;
         if state.no_work && state.step_failure.is_none() {
             state.step_failure = previous_failure;
@@ -363,10 +401,17 @@ impl GitHubClient {
         now: i64,
     ) -> Vec<PrIdentity> {
         let mut batch = vec![];
-        let cap = if state.isolate { 1 } else { 4 };
+        // The first due entry owns the turn. An isolated entry gets a singleton;
+        // otherwise healthy candidates may batch without re-poisoning known failures.
+        let isolated = state
+            .candidates
+            .iter()
+            .find(|c| c.eligible_at <= now)
+            .is_some_and(|c| c.isolated);
+        let cap = if isolated { 1 } else { 4 };
         for _ in 0..state.candidates.len() {
             let c = state.candidates.pop_front().unwrap();
-            if c.eligible_at <= now && batch.len() < cap {
+            if c.eligible_at <= now && batch.len() < cap && c.isolated == isolated {
                 batch.push(c);
             } else {
                 state.candidates.push_back(c);
@@ -397,7 +442,6 @@ impl GitHubClient {
             .as_ref()
             .is_ok_and(|v| clean(v) && v["viewer"]["login"].as_str() == Some(owner));
         if !healthy {
-            state.isolate = true;
             state.tainted = true;
             state.step_failure = Some(match &raw {
                 Err(error) => scan_failure(error),
@@ -430,12 +474,14 @@ impl GitHubClient {
                     removed.push(c.identity)
                 }
                 Verdict::Absent => {
+                    c.isolated = false;
                     c.negative_at.get_or_insert(now);
                     c.failures = 0;
                     c.eligible_at = now + queue_scan::CONFIRM_DELAY;
                     state.candidates.push_back(c);
                 }
                 Verdict::Unknown => {
+                    c.isolated = true;
                     c.negative_at = None;
                     c.failures = c.failures.saturating_add(1);
                     c.eligible_at = now + queue_scan::backoff(c.failures);
@@ -467,7 +513,12 @@ fn merge_observation(rows: &mut Vec<PullRequest>, row: PullRequest) {
         rows.push(row);
     }
 }
-fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
+fn seed_candidates(
+    state: &mut State,
+    previous: &[PullRequest],
+    now: i64,
+    excluded: &HashSet<PrIdentity>,
+) {
     if previous.is_empty() {
         return;
     }
@@ -476,7 +527,8 @@ fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
         let index = (start + offset) % previous.len();
         let row = &previous[index];
         state.candidate_position = (index + 1) % previous.len();
-        if state.seen.contains(&row.identity())
+        if excluded.contains(&row.identity())
+            || state.seen.contains(&row.identity())
             || row.id.is_empty()
             || state
                 .candidates
@@ -499,6 +551,7 @@ fn seed_candidates(state: &mut State, previous: &[PullRequest], now: i64) {
             state.candidates.remove(evict);
         }
         state.candidates.push_back(Candidate {
+            isolated: false,
             identity: row.identity(),
             id: row.id.clone(),
             head: row.head_oid.clone(),
@@ -1092,7 +1145,7 @@ mod tests {
         );
         state.candidates[0].negative_at = Some(1000);
         state.candidates[1].failures = 1;
-        seed_candidates(&mut state, &previous, 1010);
+        seed_candidates(&mut state, &previous, 1010, &HashSet::new());
         assert_eq!(state.candidates.len(), 1000);
         assert!(state
             .candidates
@@ -1106,7 +1159,7 @@ mod tests {
         state.candidates[2].failures = 1;
         state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         state.fresh_pass();
-        seed_candidates(&mut state, &previous, 1100);
+        seed_candidates(&mut state, &previous, 1100, &HashSet::new());
         assert!(state
             .candidates
             .iter()
@@ -1229,6 +1282,7 @@ mod tests {
     fn candidate(number: usize) -> Candidate {
         let raw = node(number);
         Candidate {
+            isolated: false,
             identity: identity(&raw).unwrap(),
             id: raw["id"].as_str().unwrap().into(),
             head: raw["headRefOid"].as_str().unwrap().into(),

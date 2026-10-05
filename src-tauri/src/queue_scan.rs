@@ -153,6 +153,9 @@ fn deserialize_partition<'de, D: serde::Deserializer<'de>>(
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
+    /// An inconclusive direct read is retried alone until structurally healthy.
+    #[serde(default)]
+    pub isolated: bool,
     pub identity: PrIdentity,
     pub id: String,
     pub head: String,
@@ -257,7 +260,6 @@ impl State {
     }
     pub fn fresh_pass(&mut self) {
         let candidates = std::mem::take(&mut self.candidates);
-        let isolate = self.isolate;
         *self = Self {
             github_partition: self
                 .github_partition
@@ -265,7 +267,6 @@ impl State {
                 .map(|_| GithubPartition::default()),
             candidate_position: self.candidate_position,
             candidates,
-            isolate,
             coverage_valid: self.coverage_valid,
             pass_delay: self.pass_delay,
             completed_at: self.completed_at,
@@ -354,6 +355,9 @@ pub fn load(
     } else {
         State::default()
     };
+    // The legacy global latch records a batch failure, not per-identity evidence.
+    // Preserve retry/proof state and let one bounded batch establish health.
+    state.isolate = false;
     if state.github_partition.as_ref().is_some_and(|p| !p.valid()) {
         state.fresh_pass();
         state.taint_effect();
@@ -449,6 +453,7 @@ mod tests {
             ..Default::default()
         };
         state.candidates.push_back(Candidate {
+            isolated: false,
             identity: PrIdentity {
                 source: source.clone(),
                 repo: "fixture/repo".into(),
