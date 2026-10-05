@@ -3433,7 +3433,7 @@ static TABLE: &str = HIT_none_3;
 
     #[test]
     fn the_identity_change_clears_every_backfill_table() {
-        let src = include_str!("commands.rs");
+        let src = include_str!("store/stats_owner.rs");
         // The function that owns the decision, not the file: a `clear`
         // call anywhere else in `commands.rs` would satisfy a file-wide
         // scan while leaving this path broken. The `guard` skill names
@@ -3444,12 +3444,12 @@ static TABLE: &str = HIT_none_3;
         // `\nfn `, so anchoring on the `f` of the definition found the
         // function BEFORE this one. The guard caught that on its own first
         // run. The lookup is by line now, so either offset works.
-        let at = src.find("fn note_stats_viewer(").expect(
-            "note_stats_viewer not found; if the identity check moved, \
+        let at = src.find("fn capture_verified(").expect(
+            "capture_verified not found; if the identity check moved, \
              move this guard with it rather than deleting it",
-        ) + "fn note_stats_viewer(".len();
+        ) + "fn capture_verified(".len();
         let (name, body) = enclosing_fn(src, at);
-        assert_eq!(name, "note_stats_viewer");
+        assert_eq!(name, "capture_verified");
         let code: String = body
             .lines()
             .filter(|l| !is_comment(l))
@@ -3464,7 +3464,7 @@ static TABLE: &str = HIT_none_3;
         ] {
             assert!(
                 code.contains(&format!("{table}::clear(")),
-                "`note_stats_viewer` does not clear `{table}`. Every table \
+                "`capture_verified` does not clear `{table}`. Every table \
                  keyed on the RESOLVED viewer must be cleared when the \
                  identity behind `@me` changes, in this one place. Leaving \
                  `pr_slice` in particular is worse than leaving rows: it is \
@@ -3477,8 +3477,7 @@ static TABLE: &str = HIT_none_3;
         // Compare identity itself, not the number of cache rows deleted:
         // store-first scopes can retain history with an empty cache.
         assert!(
-            code.contains("let changed = previous.as_deref() != Some(viewer);")
-                && code.contains("if changed {"),
+            code.contains("if previous.as_deref() != Some(viewer) {"),
             "the clears must sit under the arm that fires on a CHANGED \
              identity; clearing on every read would drop the accumulated \
              corpus on each page load"

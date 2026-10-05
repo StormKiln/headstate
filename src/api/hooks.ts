@@ -11,7 +11,7 @@ import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
 import { clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   AlertReport,
   ClaudeMdAdviceMode,
@@ -20,6 +20,7 @@ import type {
   BranchDeleteFrame,
   BranchScanFrame,
   StatsBackfillFrame,
+  StatsOwner,
   ClaudeImported,
   ClaudeOverview,
   ClaudeCoverage,
@@ -4154,24 +4155,8 @@ export function useScopedCounts(
 /// both measurements agree the unpaged form is free, so this takes the cheap
 /// path that neither disputes.
 ///
-/// # Where the logins come from, and why they are not in the key
-///
-/// The caller passes the roster it already holds for this scope, read off
-/// `useStatsTree`'s `org.members` -- so no request is spent re-deriving a
-/// list that is on screen in the sidebar beside the board.
-///
-/// The key carries the scope and the window and deliberately NOT the member
-/// list. That is this file's standing rule, which `useStatsBoard` states as
-/// "a count in a key makes every sibling key change when one item is
-/// removed, refetching everything": a roster that gained a person would
-/// invalidate every window's cached board. The logins are an INPUT to the
-/// request rather than part of its identity -- the question is "who reviewed
-/// most in this scope and window", and that question is the same question
-/// when the roster changes. The consequence, stated because it is a real
-/// trade rather than a free win: a newly-added member does not appear until
-/// the five-minute `staleTime` lapses. Five minutes of a missing row beats
-/// re-spending every board in the cache on a roster edit, and a roster that
-/// changed mid-session is the rarer event by far.
+/// The complete canonical roster is part of the question. Changed membership
+/// gets its own result; reordering the same names keeps the existing receipt.
 ///
 /// # `enabled`
 ///
@@ -4187,17 +4172,20 @@ export function useStatsReviewers(
   enabled: boolean,
 ) {
   const loadable = scopeIsLoadable(scope);
-  return useQuery({
-    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days],
+  const roster = [...new Set(logins.map(login => login.trim().toLowerCase()).filter(Boolean))].sort();
+  const refresh = useRef(false);
+  const query = useQuery({
+    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days, roster],
     queryFn: () =>
       timeCall(
         `stats-reviewers[${scopeKey(scope!)} ${days}d n=${logins.length}]`,
-        () => statsReviewers(scope!.kind, scope!.value, days, logins),
+        () => { const force = refresh.current; refresh.current = false; return statsReviewers(scope!.kind, scope!.value, days, roster, force || undefined); },
       ),
     enabled: enabled && loadable && logins.length > 0,
     staleTime: 5 * 60 * 1000,
     retry: false,
   });
+  return { ...query, refetch: (options?: Parameters<typeof query.refetch>[0]) => { refresh.current = true; return query.refetch(options); } };
 }
 
 /// The period comparisons behind the unscoped page's delta cards.
@@ -5292,21 +5280,23 @@ export type StatsBackfillState = StatsBackfillFrame | null;
 /// A direct import works on the desktop and silently never fires on the
 /// phone, which is the failure `POLL_EVENTS` in `transport.test.ts` exists
 /// to make impossible.
-export function useStatsBackfill(scopeKey: string | undefined): StatsBackfillState {
+export function useStatsBackfill(scopeKey: string | undefined, owner?: StatsOwner): StatsBackfillState {
   const [held, setState] = useState<{ scopeKey?: string; frame: StatsBackfillFrame | null }>({
     frame: null,
   });
-  const state = held.scopeKey === scopeKey ? held.frame : null;
+  const state = held.scopeKey === scopeKey && held.frame?.owner?.viewer === owner?.viewer && held.frame?.owner?.generation === owner?.generation ? held.frame : null;
 
+  const viewer = owner?.viewer;
+  const generation = owner?.generation;
   useEffect(() => {
-    if (!scopeKey) return;
+    if (!scopeKey || viewer === undefined || generation === undefined) return;
 
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
     listen<StatsBackfillFrame>("stats-backfill-progress", (e) => {
       const f = e.payload;
       // Another scope's progress is not this page's news.
-      if (f.scopeKey !== scopeKey) return;
+      if (f.scopeKey !== scopeKey || f.owner?.viewer !== viewer || f.owner?.generation !== generation) return;
       setState({ scopeKey, frame: f });
     }).then(
       (fn) => {
@@ -5320,7 +5310,7 @@ export function useStatsBackfill(scopeKey: string | undefined): StatsBackfillSta
       safeUnlisten(unlisten);
       unlisten = undefined;
     };
-  }, [scopeKey]);
+  }, [scopeKey, viewer, generation]);
 
   return state;
 }

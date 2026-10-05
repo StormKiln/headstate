@@ -465,7 +465,8 @@ export const statsReviewers = (
   scopeValue: string | undefined,
   days: number,
   logins: string[],
-) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins });
+  refresh?: boolean,
+) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins, ...(refresh === undefined ? {} : { refresh }) });
 
 /// Repos and their worktrees, WITHOUT safety classification, and what the
 /// walk could not read.

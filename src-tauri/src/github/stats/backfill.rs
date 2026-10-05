@@ -309,6 +309,7 @@ pub trait Progress: Send + Sync {
 /// What the worker knows after a tick, in the shape the UI renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub owner: crate::store::stats_owner::StatsOwner,
     /// The scope this is about, as `StatsQuery::cache_key` spells it.
     pub scope_key: String,
     /// Days of the horizon that are covered.

@@ -200,12 +200,33 @@ pub fn record_all_with_rows(
     measured_at: DateTime<Utc>,
 ) -> Result<usize, StoreError> {
     let tx = conn.transaction()?;
-    let n =
-        super::pr_history::put_many_in(&tx, scope_key, window_from, window_to, prs, measured_at)?;
-    for row in rows {
-        put_in(&tx, scope_key, row, measured_at)?;
-    }
+    let n = record_all_with_rows_in(
+        &tx,
+        scope_key,
+        window_from,
+        window_to,
+        rows,
+        prs,
+        measured_at,
+    )?;
     tx.commit()?;
+    Ok(n)
+}
+
+pub fn record_all_with_rows_in(
+    tx: &rusqlite::Transaction<'_>,
+    scope_key: &str,
+    window_from: &str,
+    window_to: &str,
+    rows: &[SliceRow],
+    prs: &[StoredPr],
+    measured_at: DateTime<Utc>,
+) -> Result<usize, StoreError> {
+    let n =
+        super::pr_history::put_many_in(tx, scope_key, window_from, window_to, prs, measured_at)?;
+    for row in rows {
+        put_in(tx, scope_key, row, measured_at)?;
+    }
     Ok(n)
 }
 

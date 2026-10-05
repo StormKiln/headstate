@@ -330,6 +330,7 @@ pub struct GitHubClient {
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
+    pub(crate) reviewer_receipts: Arc<super::stats::reviewer_receipts::Reads>,
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
@@ -546,6 +547,11 @@ impl GitHubClient {
         view
     }
 
+    pub(crate) fn stats_deadline(&self) -> Option<tokio::time::Instant> {
+        self.read_context
+            .as_ref()
+            .map(|_| self.read_context().deadline)
+    }
     pub(crate) fn read_context(&self) -> super::admission::ReadContext {
         let mut context = self
             .read_context
@@ -594,6 +600,7 @@ impl GitHubClient {
             searches: Arc::new(Searches::default()),
             scans: Arc::default(),
             viewer: Arc::default(),
+            reviewer_receipts: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,

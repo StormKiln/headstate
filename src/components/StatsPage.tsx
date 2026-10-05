@@ -153,7 +153,8 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // uses it: two early returns sit between, and a hook after one of them
   // runs in a different order on the renders that take it. React's own
   // lint caught this; the caveat reads the value a hundred lines below.
-  const liveFrame = useStatsBackfill(boardQ.data?.scopeKey);
+  const registration = boardQ.data?.backfill;
+  const liveFrame = useStatsBackfill(boardQ.data?.scopeKey, registration?.state === "registered" ? registration.owner : undefined);
   // Seeded from the last frame the collector emitted for this scope (#1570),
   // which the board carries when the scope is registered. The events are
   // fire-and-forget, so after a scope switch the hook holds nothing until the
@@ -163,10 +164,11 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   //
   // Matched on the scope key as the hook matches its frames, so a seed can
   // never put another scope's coverage under this heading.
-  const registration = boardQ.data?.backfill;
   const seedFrame =
     registration?.state === "registered" &&
-    registration.lastFrame?.scopeKey === boardQ.data?.scopeKey
+    registration.lastFrame?.scopeKey === boardQ.data?.scopeKey &&
+    registration.lastFrame?.owner?.viewer === registration.owner?.viewer &&
+    registration.lastFrame?.owner?.generation === registration.owner?.generation
       ? registration.lastFrame
       : null;
   const backfill = liveFrame ?? seedFrame;
@@ -380,6 +382,17 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
       ) : (
         <SkeletonRow count={2} cols="sm:grid-cols-2" />
       )}
+
+      {([ ["Merged count", counts.merged?.receipt], ["Opened count", counts.opened?.receipt], ["Activity", series?.receipt], ["Reviewers", reviewersQ.data?.receipt] ] as const).map(([label, receipt]) => receipt && (receipt.reused || receipt.retained || receipt.qualification) ? (
+        <p key={label} role="status" className="text-xs text-[#8b949e]">
+          {label}: measurements from <time dateTime={receipt.fetchedAt}>{new Date(receipt.fetchedAt).toLocaleString()}</time>. {receipt.qualification}
+        </p>
+      ) : null)}
+      {series?.unmeasured?.kind === "timeout" && series.points.length > 0 && <p role="status">Activity measurements timed out. Completed days are shown; retry to measure the missing days.</p>}
+      {reviewersQ.data?.stopReason && <p role="status">
+        {reviewersQ.data.stopReason.kind === "timeout" ? "Reviewer measurements timed out. Completed measurements are shown." : "Some reviewer measurements could not be refreshed."}
+        <button type="button" onClick={() => void reviewersQ.refetch()}>Retry reviewer measurements</button>
+      </p>}
 
       {series && failedDays.kind === "total" ? (
         /* NO day was measured, so there is no chart to annotate (#1045).

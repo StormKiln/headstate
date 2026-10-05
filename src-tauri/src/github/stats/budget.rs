@@ -1376,7 +1376,7 @@ pub(crate) mod tests {
              `fetch_viewer_metered(&budget)`."
         );
         assert!(
-            region.matches("fetch_viewer_metered(&budget)").count() >= 2,
+            region.matches("stats_viewer_metered(&budget)").count() >= 3,
             "both stats commands that resolve the viewer must meter it"
         );
     }

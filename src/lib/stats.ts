@@ -118,6 +118,12 @@ export function unmeasuredMessage(
   unmeasured: Unmeasured | undefined,
   now: Date = new Date(),
 ): { message: string; canRetry: boolean } {
+  if (unmeasured?.kind === "timeout") {
+    return { message: `The activity measurements timed out. Retry to measure the ${count} missing days.`, canRetry: true };
+  }
+  if (unmeasured?.kind === "unavailable") {
+    return { message: `The activity measurements could not finish: ${unmeasured.reason}`, canRetry: true };
+  }
   if (unmeasured?.kind === "budgetExhausted") {
     const left =
       unmeasured.remaining === null

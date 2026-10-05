@@ -86,12 +86,7 @@ impl Rig {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("worker.db");
         let conn = crate::store::open_db(&db).unwrap();
-        crate::store::settings::set(
-            &conn,
-            crate::store::settings::keys::STATS_VIEWER,
-            &"fixture-viewer",
-        )
-        .unwrap();
+        crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
         let (from, to) = bf::horizon_window(chrono::Utc::now(), days).unwrap();
         let rig = Self {
             _dir: dir,
@@ -260,12 +255,7 @@ fn dense_backfill_account_switch_discards_inflight_page() {
         .await
         .unwrap();
         let conn = crate::store::open_db(&r.db).unwrap();
-        crate::store::settings::set(
-            &conn,
-            crate::store::settings::keys::STATS_VIEWER,
-            &"other-viewer",
-        )
-        .unwrap();
+        crate::store::stats_owner::capture_verified(&conn, "other-viewer").unwrap();
         crate::store::pr_backfill_page::clear(&conn).unwrap();
         assert!(matches!(
             task.await.unwrap().outcome,

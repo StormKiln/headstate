@@ -1165,6 +1165,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_reviewers" => res(commands::stats_reviewers(
+            app.clone(),
             app.state(),
             a.get("scopeKind")?,
             a.get("scopeValue")?,
@@ -1174,6 +1175,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             // list that would produce an empty leaderboard.
             a.get("logins")?,
             a.get("days")?,
+            a.get("refresh")?,
         )
         .await),
         "get_reviewing" => {

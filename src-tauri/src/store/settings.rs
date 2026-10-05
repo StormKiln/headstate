@@ -80,6 +80,7 @@ pub mod keys {
     /// is an unencrypted SQLite database beside the rest of the app's
     /// state. A login is already visible in every cache key in the same
     /// table.
+    pub const STATS_GENERATION: &str = "stats_generation";
     pub const STATS_VIEWER: &str = "stats_viewer";
 
     /// How far into `~/.claude/headstate/sessions.jsonl` the hook handoff

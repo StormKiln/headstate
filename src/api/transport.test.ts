@@ -647,7 +647,7 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // it is open — and a hook that imported Tauri's `listen` directly would
   // work on the desktop and silently never fire on the phone, which is
   // the client with no window to leave open and wait in.
-  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X")],
+  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X", { viewer: "fixture", generation: 1 })],
   // The fifteenth (#1477). A content-free nudge that a running session's
   // transcript changed: the list's "active now" set hears every one, and
   // the open transcript's follow hears its own session's. Through the seam

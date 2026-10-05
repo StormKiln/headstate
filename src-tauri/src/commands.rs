@@ -15,6 +15,7 @@ use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
 };
 use crate::github::mutate::{PrAction, ReviewVerdict};
+use crate::store::stats_owner::{self, OwnedError, StatsOwner};
 use crate::store::{open_db, settings, CachedList, CachedSnapshot};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -4857,9 +4858,30 @@ pub async fn stats_count(
     measure: String,
     days: i64,
 ) -> Result<crate::github::stats::Outcome, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    stats_count_for_client(
+        &client,
+        db_path(&app),
+        subject,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await
+}
+
+async fn stats_count_for_client(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    subject: Option<String>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<crate::github::stats::Outcome, String> {
     use crate::github::stats::{Measure, Scope, Slice, StatsQuery, Subject};
 
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let client = client.with_bulk_reads();
     let days = clamp_days(days);
 
@@ -4916,7 +4938,7 @@ pub async fn stats_count(
     // served to whichever asked second. `fetch_viewer_metered` is one cheap
     // request and its result never changes for a session.
     let viewer = client
-        .fetch_viewer_metered(&budget)
+        .stats_viewer_metered(&budget)
         .await
         .map_err(|e| e.to_string())?;
     // `Kind::Count`, not a bare query key: #836 put boards and series in
@@ -4927,34 +4949,33 @@ pub async fn stats_count(
     // `stats_cache_read` rather than an inline `open_db`, since #1090: the
     // viewer note and the cache query are SQLite on an async runtime
     // worker, and this command's `async fn` signature hid that.
-    let db = db_path(&app);
+    let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
     let hit = stats_cache_read(
         db.clone(),
-        viewer.clone(),
+        owner.clone(),
         key.clone(),
         window.from.clone(),
         window.to.clone(),
         now,
     )
     .await?;
-    if let Some(payload) = hit {
-        if let Ok(mut cached) = serde_json::from_str::<crate::github::stats::Outcome>(&payload) {
-            crate::diag!("[diag] cmd stats_count cache hit total={}", cached.total);
-            // A cache HIT still cost the viewer lookup, so it reports that
-            // rather than the spend of the load that originally filled the
-            // row. Stating a stale figure would be worse than either: a user
-            // reading "9 points" on a request that spent 1 cannot tell
-            // caching is working, and the number is not about this call at
-            // all. Overwritten rather than added to, because the cached
-            // value's requests happened in a different hour.
-            cached.spend = budget.snapshot();
-            return Ok(cached);
+    let mut fallback = hit.and_then(|hit| {
+        let mut cached =
+            serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload).ok()?;
+        cached.receipt = Some(crate::github::stats::receipt::StatsReceipt {
+            fetched_at: hit.fetched_at,
+            reused: true,
+            retained: !hit.complete,
+            qualification: None,
+            owner: owner.clone(),
+        });
+        cached.spend = budget.snapshot();
+        Some(cached)
+    });
+    if let Some(cached) = &fallback {
+        if cached.is_complete() && cached.receipt.as_ref().is_some_and(|r| !r.retained) {
+            return Ok(cached.clone());
         }
-        // A payload that will not parse is a shape change across an
-        // upgrade. Dropped and re-fetched rather than erroring: the
-        // cache is an optimisation and must never be able to break the
-        // feature it accelerates.
-        log::warn!("discarding an unreadable stats cache row");
     }
 
     // REFUSE before spending, so a load cannot be the thing that starves
@@ -4968,6 +4989,15 @@ pub async fn stats_count(
     // most recent reading rather than on the process-wide one alone (#843).
     let projected = u64::try_from(days).unwrap_or(u64::MAX) / 5 + 8;
     if !budget.permits(projected) {
+        if let Some(mut old) = fallback.take() {
+            if let Some(receipt) = &mut old.receipt {
+                receipt.retained = true;
+                receipt.qualification = Some(
+                    "Saved measurements shown; the GitHub budget is too low to retry yet.".into(),
+                );
+            }
+            return Ok(old);
+        }
         return Err(format!(
             "GitHub budget too low for this scope (needs about {projected} points, \
              keeping {} in reserve for background refresh)",
@@ -4977,7 +5007,7 @@ pub async fn stats_count(
 
     crate::diag!("[diag] cmd stats_count start days={days}");
     let started = std::time::Instant::now();
-    let out = crate::github::stats::load_count(&client, &q, window.clone(), &budget)
+    let mut out = crate::github::stats::load_count(&client, &q, window.clone(), &budget)
         .await
         .map_err(|e| e.to_string());
     crate::diag!(
@@ -4996,7 +5026,32 @@ pub async fn stats_count(
         }
     );
 
-    if let Ok(o) = &out {
+    let pure = out.clone();
+    match (&mut out, fallback) {
+        (Ok(fresh), old) => {
+            let mut receipt =
+                crate::github::stats::receipt::StatsReceipt::measured(now, owner.clone());
+            if let Some(old) = old {
+                if crate::github::stats::receipt::retain_count(fresh, &old) {
+                    receipt.fetched_at = old.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now);
+                    receipt.retained = true;
+                    receipt.qualification = Some("Some saved measurements are shown because the retry did not measure everything.".into());
+                }
+            }
+            fresh.receipt = Some(receipt);
+        }
+        (Err(error), Some(mut old)) => {
+            old.spend = budget.snapshot();
+            if let Some(receipt) = &mut old.receipt {
+                receipt.retained = true;
+                receipt.qualification =
+                    Some(format!("Saved measurements shown; retry failed: {error}"));
+            }
+            out = Ok(old);
+        }
+        _ => {}
+    }
+    if let Ok(o) = &mut out {
         // Cached on success only. A failed load has nothing worth
         // remembering, and a partial one is stored WITH its partiality
         // (`complete`) so it cannot be read back as a confident number.
@@ -5005,17 +5060,30 @@ pub async fn stats_count(
             // COMMITS, which is an `fsync`. `stats_cache_put` carries the
             // "never fail the command over a cache" reasoning that used to
             // live inline here.
-            stats_cache_put(
+            let wrote = stats_cache_put(
                 db,
+                owner.clone(),
                 key,
                 window.from.clone(),
                 window.to.clone(),
                 o.total,
-                o.is_complete(),
+                o.is_complete() && o.receipt.as_ref().is_some_and(|r| !r.retained),
                 payload,
+                o.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now),
                 now,
             )
             .await;
+            if let Err(OwnedError::Superseded) = wrote {
+                let mut fetched = pure.map_err(|_| OwnedError::Superseded.to_string())?;
+                if !(fetched.total > 0 || fetched.is_complete()) {
+                    return Err(OwnedError::Superseded.to_string());
+                }
+                let mut receipt =
+                    crate::github::stats::receipt::StatsReceipt::measured(now, owner.clone());
+                receipt.qualification = Some("The active account changed during this load; these original-account measurements were not saved.".into());
+                fetched.receipt = Some(receipt);
+                *o = fetched;
+            }
         }
     }
     out
@@ -5171,37 +5239,30 @@ fn parse_scope_request(
 /// Check the verified account before reading shared stats storage. Identity,
 /// cache, history, ledger and registrations change atomically. Failure stops
 /// the read: a board's all-authors key does not itself isolate accounts.
+#[cfg(test)]
 fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) -> Result<(), String> {
-    let previous: Option<String> =
-        crate::store::settings::get(conn, crate::store::settings::keys::STATS_VIEWER)
-            .map_err(|e| e.to_string())?;
-    if previous.as_deref() == Some(viewer) {
-        return Ok(());
-    }
-    // A transition reserves the writer before rereading identity. Deferred
-    // read-to-write upgrades return BUSY immediately under concurrent loads,
-    // even with busy_timeout; unchanged-viewer reads need no reservation.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
-    let previous: Option<String> =
-        crate::store::settings::get(&tx, crate::store::settings::keys::STATS_VIEWER)
-            .map_err(|e| e.to_string())?;
-    let changed = previous.as_deref() != Some(viewer);
-    if changed {
-        // Clear even when the whole-window cache is empty: a store-first
-        // board may have history and coverage without any cache row.
-        crate::store::stats::clear(&tx).map_err(|e| e.to_string())?;
-        crate::store::pr_history::clear(&tx).map_err(|e| e.to_string())?;
-        crate::store::pr_slice::clear(&tx).map_err(|e| e.to_string())?;
-        crate::store::pr_backfill_scope::clear(&tx).map_err(|e| e.to_string())?;
-        crate::store::pr_backfill_page::clear(&tx).map_err(|e| e.to_string())?;
-    }
-    crate::store::stats::note_viewer(&tx, viewer).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    if changed {
-        forget_backfill_frames();
-    }
-    Ok(())
+    stats_owner::capture_verified(conn, viewer)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+async fn capture_stats_owner(db: std::path::PathBuf, viewer: String) -> Result<StatsOwner, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db).map_err(|e| e.to_string())?;
+        stats_owner::capture_verified(&conn, &viewer).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn check_stats_owner(db: std::path::PathBuf, owner: StatsOwner) -> Result<(), OwnedError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&db)?;
+        let tx = conn.transaction()?;
+        stats_owner::require_current(&tx, &owner)
+    })
+    .await
+    .map_err(|e| OwnedError::Task(e.to_string()))?
 }
 
 /// Note the viewer and read the cached row, off the async runtime (#1090).
@@ -5221,26 +5282,21 @@ fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) -> Result<(), St
 /// keeps clippy quiet: a `rusqlite::Connection` held across an await in a
 /// `Send` future is exactly the shape the runtime cannot move.
 ///
-/// Returns the payload TEXT rather than a parsed value, because the three
-/// commands deserialise into three different types and the parse is
-/// microseconds of CPU with no I/O in it.
+/// Returns the stored payload and original receipt age together. Commands
+/// deserialize their own answer types after the owner-checked snapshot closes.
 async fn stats_cache_read(
     db: std::path::PathBuf,
-    viewer: String,
+    owner: StatsOwner,
     key: String,
     from: String,
     to: String,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<crate::store::stats::Cached>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| e.to_string())?;
-        // Before any read: if the token now belongs to someone else, the
-        // rows in this table are the previous user's (#840).
-        note_stats_viewer(&conn, &viewer)?;
-        Ok(crate::store::stats::get(&conn, &key, &from, &to, now)
-            .ok()
-            .flatten()
-            .map(|hit| hit.payload))
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        stats_owner::require_current(&tx, &owner).map_err(|e| e.to_string())?;
+        crate::store::stats::get(&tx, &key, &from, &to, now).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -5248,15 +5304,13 @@ async fn stats_cache_read(
 
 /// Write one answer to `stats_cache`, off the async runtime (#1090).
 ///
-/// Failure is LOGGED, never returned, for the reason each call site
-/// already gave in its own words: the answer is correct whether or not it
-/// was cached, and failing a stats load because a cache could not be
-/// written would turn an optimisation into a liability. A panicked join
-/// is folded into the same outcome, since it means the same thing to the
-/// caller -- the row is not there.
+/// Supersession is distinct from an ordinary cache failure: callers may
+/// return a fresh original-client measurement, but must discard retained
+/// storage data and qualify the result when its captured owner has changed.
 #[allow(clippy::too_many_arguments)]
 async fn stats_cache_put(
     db: std::path::PathBuf,
+    owner: StatsOwner,
     key: String,
     from: String,
     to: String,
@@ -5264,18 +5318,19 @@ async fn stats_cache_put(
     complete: bool,
     payload: String,
     now: chrono::DateTime<chrono::Utc>,
-) {
-    let wrote = tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| e.to_string())?;
-        crate::store::stats::put(&conn, &key, &from, &to, total, complete, &payload, now)
-            .map_err(|e| e.to_string())
+    maintenance_now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), OwnedError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&db)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        stats_owner::require_current(&tx, &owner)?;
+        crate::store::stats::put(&tx, &key, &from, &to, total, complete, &payload, now)?;
+        crate::store::stats::prune_answers(&tx, maintenance_now, (&key, &from, &to))?;
+        tx.commit()?;
+        Ok(())
     })
-    .await;
-    match wrote {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("could not cache the stats answer: {e}"),
-        Err(e) => log::warn!("the stats cache write task failed: {e}"),
-    }
+    .await
+    .map_err(|e| OwnedError::Task(e.to_string()))?
 }
 
 /// Upper bound on what a board load will spend, in rate-limit points.
@@ -5350,18 +5405,24 @@ const MAX_PROBE_ROUNDS: u64 = 4;
 /// the reason the page shows instead.
 async fn note_scope_seen(
     db: std::path::PathBuf,
+    owner: StatsOwner,
     registration: crate::store::pr_backfill_scope::BackfillScope,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&db).map_err(|e| {
+        let mut conn = open_db(&db).map_err(|e| {
             log::warn!("could not open the database to register this scope for backfill: {e}");
             "the local database could not be opened".to_string()
         })?;
-        crate::store::pr_backfill_scope::note_seen(&conn, &registration, now).map_err(|e| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        stats_owner::require_current(&tx, &owner).map_err(|e| e.to_string())?;
+        crate::store::pr_backfill_scope::note_seen(&tx, &registration, now).map_err(|e| {
             log::warn!("could not register this scope for backfill: {e}");
             e.to_string()
         })?;
+        tx.commit().map_err(|e| e.to_string())?;
         crate::diag!(
             "[diag] backfill scope registered kind={} horizon={}",
             registration.scope_kind,
@@ -5387,10 +5448,15 @@ async fn note_scope_seen(
 /// whole time would be showing, so a scope switch lands on it at once
 /// rather than on the generic queued line -- the worker may have been
 /// collecting this scope for an hour.
-fn backfill_registration(outcome: Result<(), String>, scope_key: &str) -> BackfillRegistration {
+fn backfill_registration(
+    outcome: Result<(), String>,
+    owner: &StatsOwner,
+    scope_key: &str,
+) -> BackfillRegistration {
     match outcome {
         Ok(()) => BackfillRegistration::Registered(BackfillRegistered {
-            last_frame: last_backfill_frame(scope_key),
+            owner: owner.clone(),
+            last_frame: last_backfill_frame(owner, scope_key),
         }),
         Err(reason) => BackfillRegistration::Failed(BackfillRegistrationFailed { reason }),
     }
@@ -5530,30 +5596,9 @@ async fn stats_board_for_client(
         .await
         .map_err(|e| e.to_string())?;
 
-    // A board has no subject, so `cache_key` fills the subject slot with
-    // `*` and the key reads `board|merged|*|org:X`. `Kind::Board` is what
-    // keeps that out of the whole-scope COUNT's row, which is the same
-    // string bar the prefix.
-    //
-    // Note what this means and why it is safe: unlike `stats_count`'s key,
-    // this one does NOT carry the viewer's login -- there is no subject for
-    // it to be resolved into. Two accounts on one machine share this
-    // database (`Subject::cache_key`'s doc records that as a real case), so
-    // in principle one could read a board row the other wrote, and a
-    // `StatsBoard` payload carries the viewer it was split into Mine and
-    // Others against -- which would put the reader's own work under
-    // "Others" and show "no activity" for Mine.
-    //
-    // `note_stats_viewer` below is what closes it, and it has to run before
-    // the read for exactly this reason: a changed identity drops every row
-    // in the table, so the only rows this read can find were written by the
-    // account now asking. That ordering is load-bearing rather than tidy.
-    //
-    // The alternative -- putting the viewer in the key -- was rejected: it
-    // would give every account its own copy of an answer that is identical
-    // for all of them (a board is about everyone in the scope), so the
-    // second user would pay the full ~45-point load to recompute a
-    // leaderboard already on disk.
+    // Board keys describe the question, including its kind. The captured
+    // durable owner separately qualifies every shared read and write, even
+    // when the question has no subject or names somebody other than viewer.
     let q = crate::github::stats::StatsQuery::new(None, req.scope.clone(), measure);
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
@@ -5581,26 +5626,22 @@ async fn stats_board_for_client(
         measure: measure_name.to_string(),
         horizon_days: crate::github::stats::backfill::HORIZON_DAYS.max(clamp_days(days) as u32),
     };
+    let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
     let hit = stats_cache_read(
         db.clone(),
-        viewer.clone(),
+        owner.clone(),
         key.clone(),
         req.window.from.clone(),
         req.window.to.clone(),
         now,
     )
     .await?;
-    // AFTER `stats_cache_read`, and that is load-bearing (#1570). The read
-    // runs `note_stats_viewer`, and a changed identity clears
-    // `pr_backfill_scope` -- so a registration made before it was wiped on
-    // the very load that made it, while this command went on to report it
-    // as registered. Registering after the identity check means the row
-    // the outcome describes is the row that is there.
-    //
-    // It is still before the cache-hit return below, which is #1109's
-    // requirement. The invariant that guards #1109 holds both orderings.
+    // Register after the foreground ownership capture has retired any
+    // incompatible state, and before a cached answer can return (#1109).
+    // Registration checks the same captured generation in its transaction.
     let backfill = backfill_registration(
-        note_scope_seen(db.clone(), registration, now).await,
+        note_scope_seen(db.clone(), owner.clone(), registration, now).await,
+        &owner,
         &q.cache_key(&viewer),
     );
     if matches!(backfill, BackfillRegistration::Registered(_)) {
@@ -5608,6 +5649,7 @@ async fn stats_board_for_client(
     }
     if let Some(board) = stored_stats_board(
         db.clone(),
+        owner.clone(),
         q.cache_key(&viewer),
         req.window.from.clone(),
         req.window.to.clone(),
@@ -5615,6 +5657,7 @@ async fn stats_board_for_client(
     .await?
     {
         return Ok(StatsBoard {
+            owner: Some(owner.clone()),
             scope_key: q.cache_key(&viewer),
             viewer,
             board,
@@ -5622,7 +5665,7 @@ async fn stats_board_for_client(
         });
     }
     if let Some(payload) = hit {
-        if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload) {
+        if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload.payload) {
             crate::diag!(
                 "[diag] cmd stats_board cache hit authors={} complete={}",
                 cached.board.rows.len(),
@@ -5633,6 +5676,7 @@ async fn stats_board_for_client(
             // The field is not deserialised at all (`skip_deserializing`),
             // so a stale row cannot carry an old "registered" through.
             cached.backfill = backfill;
+            cached.owner = Some(owner.clone());
             return Ok(cached);
         }
         // Same handling as `stats_count`'s: a payload that will not parse
@@ -5689,10 +5733,13 @@ async fn stats_board_for_client(
     // `put_many`, `prune` and `load` over the accumulated corpus -- and
     // inside a synchronous `.map()` on an async chain every byte of that
     // ran on a runtime worker.
-    let out = match out {
+    let mut pure_board = None;
+    let mut out = match out {
         Ok(loaded) => {
+            pure_board = Some(loaded.board.clone());
             let board = accumulate_board(
                 db.clone(),
+                owner.clone(),
                 scope_key.clone(),
                 req.window.from.clone(),
                 req.window.to.clone(),
@@ -5701,6 +5748,7 @@ async fn stats_board_for_client(
             )
             .await;
             Ok(StatsBoard {
+                owner: Some(owner.clone()),
                 viewer: viewer.clone(),
                 scope_key: scope_key.clone(),
                 board,
@@ -5739,7 +5787,7 @@ async fn stats_board_for_client(
         }
     );
 
-    if let Ok(b) = &out {
+    if let Ok(b) = &mut out {
         // Cached on success only, and the board's OWN `complete` flag goes
         // into the `complete` column -- a partial roster must not read
         // back as a confident one. `store::stats::get` is what bounds an
@@ -5751,8 +5799,9 @@ async fn stats_board_for_client(
         // against (see `StatsBoard`).
         if let Ok(payload) = serde_json::to_string(b) {
             // Off the runtime since #1090; see `stats_cache_put`.
-            stats_cache_put(
+            let wrote = stats_cache_put(
                 db,
+                owner.clone(),
                 key,
                 req.window.from.clone(),
                 req.window.to.clone(),
@@ -5764,8 +5813,18 @@ async fn stats_board_for_client(
                 b.board.complete,
                 payload,
                 now,
+                now,
             )
             .await;
+            if let Err(OwnedError::Superseded) = wrote {
+                if let Some(pure) = pure_board {
+                    if pure.retrieved == 0 && !pure.complete {
+                        return Err(OwnedError::Superseded.to_string());
+                    }
+                    b.board = pure;
+                }
+                b.backfill = BackfillRegistration::Failed(BackfillRegistrationFailed { reason: "The active account changed during this load. These measurements belong to the original account and were not saved.".into() });
+            }
         }
     }
     out
@@ -5776,6 +5835,7 @@ async fn stats_board_for_client(
 /// progress made by the worker since the preceding click.
 async fn stored_stats_board(
     db: std::path::PathBuf,
+    owner: StatsOwner,
     scope_key: String,
     from: String,
     to: String,
@@ -5783,6 +5843,7 @@ async fn stored_stats_board(
     tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        stats_owner::require_current(&tx, &owner).map_err(|e| e.to_string())?;
         let coverage = crate::store::pr_slice::coverage(&tx, &scope_key, &from, &to)
             .map_err(|e| e.to_string())?;
         if coverage.days_covered() == 0 {
@@ -5842,6 +5903,7 @@ async fn stored_stats_board(
 /// is created and dropped inside the closure.
 async fn accumulate_board(
     db: std::path::PathBuf,
+    owner: StatsOwner,
     scope_key: String,
     window_start: String,
     window_end: String,
@@ -5850,7 +5912,15 @@ async fn accumulate_board(
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(&db, &scope_key, &window_start, &window_end, loaded, now)
+        accumulate_board_blocking(
+            &db,
+            &owner,
+            &scope_key,
+            &window_start,
+            &window_end,
+            loaded,
+            now,
+        )
     })
     .await
     // A panicked join means the accumulation did not happen. The
@@ -5863,6 +5933,7 @@ async fn accumulate_board(
 /// The blocking half of [`accumulate_board`].
 fn accumulate_board_blocking(
     db: &std::path::Path,
+    owner: &StatsOwner,
     scope_key: &str,
     window_start: &str,
     window_end: &str,
@@ -5876,6 +5947,12 @@ fn accumulate_board_blocking(
         log::warn!("could not open the database to accumulate PR stats");
         return board;
     };
+    let Ok(tx) = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) else {
+        return board;
+    };
+    if stats_owner::require_current(&tx, owner).is_err() {
+        return board;
+    }
     // Written BEFORE the read, so this load's own pages are part of the
     // answer it returns rather than only of the next one's -- and, since
     // #1103, so are its CLAIMS about the days those pages came from. The
@@ -5886,8 +5963,8 @@ fn accumulate_board_blocking(
     // One transaction over both, for the reason `record_all_with_rows`
     // gives: a ledger row without its evidence is a claim nothing
     // revisits.
-    if let Err(e) = crate::store::pr_slice::record_all_with_rows(
-        &mut conn,
+    if let Err(e) = crate::store::pr_slice::record_all_with_rows_in(
+        &tx,
         scope_key,
         window_start,
         window_end,
@@ -5900,7 +5977,7 @@ fn accumulate_board_blocking(
     }
     // Bounded here rather than on a schedule: this is the only site that
     // grows the table, so it is the only one that needs to bound it.
-    match pr_history::prune(&conn) {
+    match pr_history::prune(&tx) {
         Ok(0) => {}
         Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
         Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
@@ -5911,7 +5988,7 @@ fn accumulate_board_blocking(
     // existed to repair the first being wiped by an identity change on the
     // same load -- an ordering `stats_board` no longer has -- and a second
     // outcome would be one more that could disagree with the reported one.
-    let Ok(stored) = pr_history::load(&conn, scope_key, window_start, window_end) else {
+    let Ok(stored) = pr_history::load(&tx, scope_key, window_start, window_end) else {
         log::warn!("could not read accumulated pull requests back");
         return board;
     };
@@ -5920,7 +5997,7 @@ fn accumulate_board_blocking(
     // the rest". A window with no ledger rows reports `None` for its
     // total, and the board carries that through as a `None` rather than
     // defaulting it -- see `Board::from_stored`.
-    let coverage = crate::store::pr_slice::coverage(&conn, scope_key, window_start, window_end)
+    let coverage = crate::store::pr_slice::coverage(&tx, scope_key, window_start, window_end)
         .unwrap_or_default();
     crate::diag!(
         "[diag] stats accumulate fetched={} stored={} claimed={} days={}/{} ledger_total={:?}",
@@ -5931,6 +6008,9 @@ fn accumulate_board_blocking(
         crate::github::stats::backfill::days_between(window_start, window_end),
         coverage.total
     );
+    if tx.commit().is_err() {
+        return board;
+    }
     crate::github::stats::Board::from_stored(
         &stored,
         &board,
@@ -5951,6 +6031,8 @@ fn accumulate_board_blocking(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StatsOwner>,
     pub viewer: String,
     /// The key this board's stored rows and ledger entries are filed
     /// under (#1093).
@@ -6009,6 +6091,7 @@ impl Default for BackfillRegistration {
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BackfillRegistered {
+    pub owner: StatsOwner,
     /// `None` until the worker has emitted a frame for this scope since the
     /// app started. Never a zeroed frame: "0 of 30 days" is a measurement,
     /// and nothing has measured this scope yet.
@@ -6070,9 +6153,28 @@ pub async fn stats_series(
     scope_value: Option<String>,
     days: i64,
 ) -> Result<crate::github::stats::Series, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    stats_series_for_client(
+        &client,
+        db_path(&app),
+        subject,
+        scope_kind,
+        scope_value,
+        days,
+    )
+    .await
+}
+
+async fn stats_series_for_client(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    subject: Option<String>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    days: i64,
+) -> Result<crate::github::stats::Series, String> {
     use crate::github::stats::{Measure, StatsQuery, Subject};
 
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let client = client.with_bulk_reads();
     let subject = match subject {
         // An empty string is a caller mistake, not a request for everyone:
@@ -6087,22 +6189,6 @@ pub async fn stats_series(
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
     let budget = client.request_budget();
-    // One request per `ALIAS_CHUNK` days, at the measured 1 point each,
-    // plus slack. Far cheaper than a board, and gated anyway: the check
-    // exists for the case where something else has already spent the
-    // budget down to the reserve, which is independent of how cheap this
-    // particular call is.
-    let projected = u64::try_from(clamp_days(days)).unwrap_or(u64::MAX)
-        / crate::github::stats::query::ALIAS_CHUNK as u64
-        + 2;
-    if !budget.permits(projected) {
-        return Err(format!(
-            "GitHub budget too low for this chart (needs about {projected} points, \
-             keeping {} in reserve for background refresh)",
-            crate::github::stats::budget::RESERVE
-        ));
-    }
-
     // `Measure::Merged` names the query's DEFAULT measure and is
     // immediately overridden per alias by `series_query`, which asks for
     // both. Passed rather than defaulted inside the document builder so
@@ -6127,35 +6213,67 @@ pub async fn stats_series(
     // line, so "this person in this org" and "the whole org" are different
     // charts and must not share a row.
     let viewer = client
-        .fetch_viewer_metered(&budget)
+        .stats_viewer_metered(&budget)
         .await
         .map_err(|e| e.to_string())?;
     let key = crate::store::stats::key(crate::store::stats::Kind::Series, &q.cache_key(&viewer));
     // Off the runtime since #1090; see `stats_cache_read`.
-    let db = db_path(&app);
+    let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
     let hit = stats_cache_read(
         db.clone(),
-        viewer.clone(),
+        owner.clone(),
         key.clone(),
         req.window.from.clone(),
         req.window.to.clone(),
         now,
     )
     .await?;
-    if let Some(payload) = hit {
-        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Series>(&payload) {
-            crate::diag!(
-                "[diag] cmd stats_series cache hit points={}",
-                cached.points.len()
-            );
-            return Ok(cached);
+    let mut fallback = hit.and_then(|hit| {
+        let mut cached = serde_json::from_str::<crate::github::stats::Series>(&hit.payload).ok()?;
+        cached.receipt = Some(crate::github::stats::receipt::StatsReceipt {
+            fetched_at: hit.fetched_at,
+            reused: true,
+            retained: !hit.complete,
+            qualification: None,
+            owner: owner.clone(),
+        });
+        cached.spend = budget.snapshot();
+        Some(cached)
+    });
+    if let Some(cached) = &fallback {
+        if cached.is_complete() && cached.receipt.as_ref().is_some_and(|r| !r.retained) {
+            return Ok(cached.clone());
         }
-        log::warn!("discarding an unreadable stats series cache row");
+    }
+
+    // One request per `ALIAS_CHUNK` days, at the measured 1 point each,
+    // plus slack. Far cheaper than a board, and gated anyway: the check
+    // exists for the case where something else has already spent the
+    // budget down to the reserve, which is independent of how cheap this
+    // particular call is.
+    let projected = u64::try_from(clamp_days(days)).unwrap_or(u64::MAX)
+        / crate::github::stats::query::ALIAS_CHUNK as u64
+        + 2;
+    if !budget.permits(projected) {
+        if let Some(mut old) = fallback.take() {
+            if let Some(receipt) = &mut old.receipt {
+                receipt.retained = true;
+                receipt.qualification = Some(
+                    "Saved measurements shown; the GitHub budget is too low to retry yet.".into(),
+                );
+            }
+            return Ok(old);
+        }
+        return Err(format!(
+            "GitHub budget too low for this chart (needs about {projected} points, \
+             keeping {} in reserve for background refresh)",
+            crate::github::stats::budget::RESERVE
+        ));
     }
 
     crate::diag!("[diag] cmd stats_series start kind={scope_kind} days={days}");
     let started = std::time::Instant::now();
-    let out = crate::github::stats::load_series(&client, &q, &req.days, &budget)
+    let mut out = crate::github::stats::load_series(&client, &q, &req.days, &budget)
         .await
         .map_err(|e| e.to_string());
     crate::diag!(
@@ -6180,6 +6298,7 @@ pub async fn stats_series(
                     }) => format!(
                         "budget exhausted (remaining={remaining:?} under the {reserve}-point reserve; no request was issued)"
                     ),
+                    Some(reason) => format!("{reason:?}"),
                     None => "GitHub did not answer".to_string(),
                 }
             ),
@@ -6195,22 +6314,60 @@ pub async fn stats_series(
         }
     );
 
-    if let Ok(series) = &out {
+    let pure = out.clone();
+    match (&mut out, fallback) {
+        (Ok(fresh), old) => {
+            let mut receipt =
+                crate::github::stats::receipt::StatsReceipt::measured(now, owner.clone());
+            if let Some(old) = old {
+                if crate::github::stats::receipt::retain_series(fresh, &old) {
+                    receipt.fetched_at = old.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now);
+                    receipt.retained = true;
+                    receipt.qualification = Some("Some saved measurements are shown because the retry did not measure everything.".into());
+                }
+            }
+            fresh.receipt = Some(receipt);
+        }
+        (Err(error), Some(mut old)) => {
+            old.spend = budget.snapshot();
+            if let Some(receipt) = &mut old.receipt {
+                receipt.retained = true;
+                receipt.qualification =
+                    Some(format!("Saved measurements shown; retry failed: {error}"));
+            }
+            out = Ok(old);
+        }
+        _ => {}
+    }
+    if let Ok(series) = &mut out {
         if let Ok(payload) = serde_json::to_string(series) {
             // See the doc above for why `total` is the merged sum.
             let total = series.points.iter().map(|p| p.merged).sum();
             // Off the runtime since #1090; see `stats_cache_put`.
-            stats_cache_put(
+            let wrote = stats_cache_put(
                 db,
+                owner.clone(),
                 key,
                 req.window.from.clone(),
                 req.window.to.clone(),
                 total,
-                series.is_complete(),
+                series.is_complete() && series.receipt.as_ref().is_some_and(|r| !r.retained),
                 payload,
+                series.receipt.as_ref().map(|r| r.fetched_at).unwrap_or(now),
                 now,
             )
             .await;
+            if let Err(OwnedError::Superseded) = wrote {
+                let mut fetched = pure.map_err(|_| OwnedError::Superseded.to_string())?;
+                if !(!fetched.points.is_empty()) {
+                    return Err(OwnedError::Superseded.to_string());
+                }
+                let mut receipt =
+                    crate::github::stats::receipt::StatsReceipt::measured(now, owner.clone());
+                receipt.qualification = Some("The active account changed during this load; these original-account measurements were not saved.".into());
+                fetched.receipt = Some(receipt);
+                *series = fetched;
+            }
         }
     }
     out
@@ -6236,9 +6393,8 @@ pub async fn stats_series(
 /// waves and so costs roughly two chunks of wall clock rather than ten --
 /// comfortably inside `LOAD_TIMEOUT`.
 ///
-/// The truncation this DOES impose is visible rather than silent: the caller
-/// sees fewer rows than it sent logins, and `Reviewers::unmeasured` names
-/// every login that did not come back for any other reason.
+/// An oversized canonical roster is rejected explicitly; a cache key never
+/// silently represents only a prefix of the requested population.
 const MAX_REVIEWER_LOGINS: usize = 100;
 
 /// The reviews-GIVEN leaderboard: who reviewed the most in a scope (#826).
@@ -6290,17 +6446,41 @@ const MAX_REVIEWER_LOGINS: usize = 100;
 /// independent of how cheap this particular call is.
 #[tauri::command]
 pub async fn stats_reviewers(
+    app: AppHandle,
     client: State<'_, GhClient>,
     scope_kind: String,
     scope_value: Option<String>,
     logins: Vec<String>,
     days: i64,
+    refresh: Option<bool>,
+) -> Result<crate::github::stats::Reviewers, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    stats_reviewers_for_client(
+        &client,
+        db_path(&app),
+        scope_kind,
+        scope_value,
+        logins,
+        days,
+        refresh.unwrap_or(false),
+    )
+    .await
+}
+
+async fn stats_reviewers_for_client(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    scope_kind: String,
+    scope_value: Option<String>,
+    logins: Vec<String>,
+    days: i64,
+    refresh: bool,
 ) -> Result<crate::github::stats::Reviewers, String> {
     use crate::github::stats::{Measure, StatsQuery};
 
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let client = client.with_bulk_reads();
     let now = chrono::Utc::now();
+    let scope_value = scope_value.map(|value| value.trim().to_ascii_lowercase());
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
     // Deduplicated and emptied-out before anything is spent. A repeated
@@ -6309,29 +6489,27 @@ pub async fn stats_reviewers(
     // which is worse than a missing row because it looks like data. An empty
     // or blank entry would build `reviewed-by: ` and match everything in
     // scope, attributing the whole window to a nameless row.
-    let mut seen = std::collections::HashSet::new();
-    let logins: Vec<String> = logins
+    let logins: std::collections::BTreeSet<String> = logins
         .into_iter()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && seen.insert(l.clone()))
-        .take(MAX_REVIEWER_LOGINS)
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
         .collect();
+    if logins.len() > MAX_REVIEWER_LOGINS {
+        return Err(format!(
+            "At most {MAX_REVIEWER_LOGINS} reviewers can be measured at once."
+        ));
+    }
+    let logins: Vec<String> = logins.into_iter().collect();
     if logins.is_empty() {
         return Err("no reviewer logins to count".into());
     }
 
     let budget = client.request_budget();
-    // One request per `ALIAS_CHUNK` logins at 1 point each, plus slack.
-    let projected =
-        (logins.len() as u64).div_ceil(crate::github::stats::query::ALIAS_CHUNK as u64) + 1;
-    if !budget.permits(projected) {
-        return Err(format!(
-            "GitHub budget too low for this leaderboard (needs about {projected} points, \
-             keeping {} in reserve for background refresh)",
-            crate::github::stats::budget::RESERVE
-        ));
-    }
-
+    let viewer = client
+        .stats_viewer_metered(&budget)
+        .await
+        .map_err(|e| e.to_string())?;
+    let owner = capture_stats_owner(db.clone(), viewer).await?;
     // No SUBJECT at all, which is the same rule `stats_board` follows and
     // for the same reason: a leaderboard asks "who, among everyone here",
     // and an author qualifier would narrow it to one person's pull requests
@@ -6345,34 +6523,42 @@ pub async fn stats_reviewers(
     // which moves a reviewer up the board for a PR that may never merge.
     let q = StatsQuery::new(None, req.scope, Measure::Merged);
 
-    crate::diag!(
-        "[diag] cmd stats_reviewers start kind={scope_kind} people={} days={days}",
-        logins.len()
-    );
-    let started = std::time::Instant::now();
-    let out = crate::github::stats::load_reviewers(&client, &q, &logins, &req.window, &budget)
-        .await
-        .map_err(|e| e.to_string());
-    crate::diag!(
-        "[diag] cmd stats_reviewers end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            // Counts and flags, never a login: this is a public repo and the
-            // privacy rule applies to the diagnostic log too, which is the
-            // same rule `stats_board`'s line above follows. A reviewer board
-            // is the one place this feature could leak a roster.
-            Ok(r) => format!(
-                "ok rows={} unmeasured={} refused={} complete={} points={}",
-                r.rows.len(),
-                r.unmeasured.len(),
-                r.refused_fields,
-                r.is_complete(),
-                r.spend.points
-            ),
-            Err(e) => format!("err: {e}"),
+    let loaded = client
+        .reviewer_receipts
+        .get(
+            &client,
+            db.clone(),
+            owner.clone(),
+            q,
+            req.window,
+            logins,
+            refresh,
+        )
+        .await?;
+    let mut result = loaded.answer;
+    let identity_spend = budget.snapshot();
+    result.spend.points += identity_spend.points;
+    result.spend.requests += identity_spend.requests;
+    result.spend.unmetered += identity_spend.unmetered;
+    result.spend.remaining = match (result.spend.remaining, identity_spend.remaining) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if matches!(
+        check_stats_owner(db, owner).await,
+        Err(OwnedError::Superseded)
+    ) {
+        let mut fresh = loaded
+            .fresh
+            .filter(|value| !value.rows.is_empty())
+            .ok_or_else(|| OwnedError::Superseded.to_string())?;
+        fresh.spend = result.spend;
+        if let Some(receipt) = &mut fresh.receipt {
+            receipt.qualification = Some("The active account changed during this load; these original-account measurements were not saved.".into());
         }
-    );
-    out
+        result = fresh;
+    }
+    Ok(result)
 }
 
 /// Whether we have a usable GitHub client. `state` is computed once at
@@ -8436,6 +8622,116 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn delayed_bulk_board_cannot_publish_after_stats_owner_changes() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        async fn fixture(
+            viewer: &str,
+        ) -> (
+            MockServer,
+            crate::github::client::GitHubClient,
+            serde_json::Value,
+        ) {
+            let server = MockServer::start().await;
+            let mut data = serde_json::json!({"viewer":{"login":viewer}});
+            for i in 0..20 {
+                data[format!("s{i}")] = serde_json::json!({"issueCount":0,"nodes":[]});
+            }
+            let response = serde_json::json!({"data":data});
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                .mount(&server)
+                .await;
+            let client = crate::github::client::GitHubClient::new(
+                octocrab::Octocrab::builder()
+                    .base_uri(server.uri())
+                    .unwrap()
+                    .personal_token("synthetic")
+                    .build()
+                    .unwrap(),
+            );
+            client
+                .stats_viewer_metered(&client.request_budget())
+                .await
+                .unwrap();
+            (server, client, response)
+        }
+        let (old_server, old_client, response) = fixture("old-viewer").await;
+        let (_new_server, new_client, _) = fixture("new-viewer").await;
+        old_server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(500))
+                    .set_body_json(response),
+            )
+            .mount(&old_server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stats.db");
+        let load_db = db.clone();
+        let old = tokio::spawn(async move {
+            super::stats_board_for_client(
+                &old_client,
+                load_db,
+                &tokio::sync::Notify::new(),
+                "org".into(),
+                Some("fixture-org".into()),
+                "merged".into(),
+                7,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while old_server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let fresh = super::stats_board_for_client(
+            &new_client,
+            db.clone(),
+            &tokio::sync::Notify::new(),
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            7,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.viewer, "new-viewer");
+        assert!(
+            !old.is_finished(),
+            "new client must establish ownership before old HTTP completes"
+        );
+        let old_result = old.await.unwrap().unwrap();
+        assert_eq!(old_result.viewer, "old-viewer");
+        assert!(old_result.board.complete);
+        let conn = super::open_db(&db).unwrap();
+        let owner = crate::store::settings::get::<String>(
+            &conn,
+            crate::store::settings::keys::STATS_VIEWER,
+        )
+        .unwrap();
+        assert_eq!(owner.as_deref(), Some("new-viewer"));
+        let again = super::stats_board_for_client(
+            &new_client,
+            db.clone(),
+            &tokio::sync::Notify::new(),
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            7,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again.viewer, "new-viewer",
+            "late old-client payload must not be served by the current client's cache"
+        );
+    }
+
     /// Serialises the tests that CLEAR the remembered frames against the
     /// ones that read one back. Keys keep the others apart; a clear is the
     /// one operation a key cannot scope.
@@ -8825,6 +9121,7 @@ mod tests {
             // Coverage for a different measure or scope must never be reused.
             assert!(super::stored_stats_board(
                 db.clone(),
+                crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap(),
                 "opened|*|org:fixture-org".into(),
                 "2026-01-01".into(),
                 "2026-12-31".into()
@@ -8853,6 +9150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("stats.db");
         let mut conn = super::open_db(&db).unwrap();
+        let owner = crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
         let key = "merged|*|org:fixture-partial";
         let prs: Vec<_> = (0..1000)
             .map(|n| crate::store::pr_history::StoredPr {
@@ -8887,6 +9185,7 @@ mod tests {
         .unwrap();
         let board = super::stored_stats_board(
             db.clone(),
+            owner.clone(),
             key.into(),
             "2026-09-01".into(),
             "2026-09-07".into(),
@@ -8905,19 +9204,30 @@ mod tests {
             "the ledger preserves the measured range while missing days remain uncovered"
         );
         assert!(!board.complete);
-        let whole_day =
-            super::stored_stats_board(db, key.into(), "2026-09-01".into(), "2026-09-01".into())
-                .await
-                .unwrap()
-                .unwrap();
+        let whole_day = super::stored_stats_board(
+            db,
+            owner,
+            key.into(),
+            "2026-09-01".into(),
+            "2026-09-01".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(whole_day.total, Some(2000));
         assert!(!whole_day.complete);
     }
 
     /// A frame for a scope key no other test uses. The remembered frames
     /// are process-wide, so each test owns its key rather than sharing one.
+    fn frame_owner() -> crate::store::stats_owner::StatsOwner {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        crate::store::stats_owner::capture_verified(&conn, "frame-fixture").unwrap()
+    }
     fn frame_for(scope_key: &str, days_covered: usize) -> super::StatsBackfillFrame {
         super::StatsBackfillFrame {
+            owner: frame_owner(),
             scope_key: scope_key.to_string(),
             days_covered,
             days_total: 30,
@@ -8943,7 +9253,11 @@ mod tests {
         // it: the page would render the frame's progress and hide the
         // failure behind it.
         super::remember_backfill_frame(&frame_for(key, 12));
-        let r = super::backfill_registration(Err("database error: disk I/O error".into()), key);
+        let r = super::backfill_registration(
+            Err("database error: disk I/O error".into()),
+            &frame_owner(),
+            key,
+        );
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(
             json,
@@ -8960,7 +9274,7 @@ mod tests {
         super::remember_backfill_frame(&frame_for(key, 6));
         // The LAST frame, not the first.
         super::remember_backfill_frame(&frame_for(key, 18));
-        let r = super::backfill_registration(Ok(()), key);
+        let r = super::backfill_registration(Ok(()), &frame_owner(), key);
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["state"], "registered");
         assert_eq!(json["lastFrame"]["scopeKey"], key);
@@ -8973,10 +9287,10 @@ mod tests {
     #[test]
     fn a_registered_scope_with_no_frame_carries_null() {
         let key = "board|merged|*|org:acme-1570-none";
-        let r = super::backfill_registration(Ok(()), key);
+        let r = super::backfill_registration(Ok(()), &frame_owner(), key);
         assert_eq!(
             serde_json::to_value(&r).unwrap(),
-            serde_json::json!({ "state": "registered", "lastFrame": null })
+            serde_json::json!({ "state": "registered", "owner": frame_owner(), "lastFrame": null })
         );
     }
 
@@ -8984,7 +9298,8 @@ mod tests {
     #[test]
     fn a_registered_scope_does_not_carry_another_scopes_frame() {
         super::remember_backfill_frame(&frame_for("board|merged|*|org:acme-1570-a", 9));
-        let r = super::backfill_registration(Ok(()), "board|merged|*|org:acme-1570-b");
+        let r =
+            super::backfill_registration(Ok(()), &frame_owner(), "board|merged|*|org:acme-1570-b");
         assert_eq!(
             serde_json::to_value(&r).unwrap()["lastFrame"],
             serde_json::Value::Null
@@ -9043,9 +9358,9 @@ mod tests {
         let _clear = FRAMES_CLEAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let key = "board|merged|*|org:acme-1570-forget";
         super::remember_backfill_frame(&frame_for(key, 3));
-        assert!(super::last_backfill_frame(key).is_some());
+        assert!(super::last_backfill_frame(&frame_owner(), key).is_some());
         super::forget_backfill_frames();
-        assert!(super::last_backfill_frame(key).is_none());
+        assert!(super::last_backfill_frame(&frame_owner(), key).is_none());
     }
 
     /// `worktree-removal-progress` is forwarded to the phone, so its
@@ -9807,7 +10122,7 @@ mod tests {
                  other, because `put` is INSERT OR REPLACE"
             );
             assert!(
-                body.contains("note_stats_viewer("),
+                body.contains("capture_stats_owner("),
                 "{name} must note the viewer (#840), or a token swap \
                  leaves the previous user's rows forever"
             );
@@ -9862,7 +10177,7 @@ mod tests {
             .find("\nasync fn stats_cache_put(")
             .unwrap_or(helper.len())];
         let note = helper
-            .find("note_stats_viewer(")
+            .find("stats_owner::require_current(")
             .expect("stats_cache_read must note the viewer (#840)");
         let read = helper
             .find("store::stats::get(")
@@ -10674,6 +10989,7 @@ pub const STATS_BACKFILL_PROGRESS: &str = "stats-backfill-progress";
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBackfillFrame {
+    pub owner: StatsOwner,
     pub scope_key: String,
     pub days_covered: usize,
     pub days_total: usize,
@@ -10699,6 +11015,7 @@ pub struct StatsBackfillFrame {
 /// listening.
 pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backfill::Report) {
     let frame = StatsBackfillFrame {
+        owner: report.owner.clone(),
         scope_key: report.scope_key.clone(),
         days_covered: report.days_covered,
         days_total: report.days_total,
@@ -10724,27 +11041,39 @@ pub fn emit_stats_backfill(app: &AppHandle, report: &crate::github::stats::backf
 /// Bounded by the registered scopes, which are the only keys the worker
 /// emits for, and cleared with them on an identity change.
 fn backfill_frames(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), StatsBackfillFrame>>
+{
     static FRAMES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, StatsBackfillFrame>>,
+        std::sync::Mutex<std::collections::HashMap<(StatsOwner, String), StatsBackfillFrame>>,
     > = std::sync::OnceLock::new();
     FRAMES.get_or_init(Default::default)
 }
 
 fn remember_backfill_frame(frame: &StatsBackfillFrame) {
     if let Ok(mut frames) = backfill_frames().lock() {
-        frames.insert(frame.scope_key.clone(), frame.clone());
+        if frames.len() >= 256 {
+            frames.clear();
+        }
+        frames.insert(
+            (frame.owner.clone(), frame.scope_key.clone()),
+            frame.clone(),
+        );
     }
 }
 
 /// The last frame emitted for `scope_key`, or `None` when none has been.
-fn last_backfill_frame(scope_key: &str) -> Option<StatsBackfillFrame> {
-    backfill_frames().lock().ok()?.get(scope_key).cloned()
+fn last_backfill_frame(owner: &StatsOwner, scope_key: &str) -> Option<StatsBackfillFrame> {
+    backfill_frames()
+        .lock()
+        .ok()?
+        .get(&(owner.clone(), scope_key.to_string()))
+        .cloned()
 }
 
 /// Drop every remembered frame. The identity change clears the tables
 /// the frames describe, and a frame left behind would seed a page with
 /// coverage that no longer exists.
+#[cfg(test)]
 fn forget_backfill_frames() {
     if let Ok(mut frames) = backfill_frames().lock() {
         frames.clear();
@@ -11343,3 +11672,7 @@ pub async fn get_gitlab_detail(
         .await
         .map_err(|issue| format!("GitLab detail unavailable ({issue:?})."))
 }
+
+#[cfg(test)]
+#[path = "stats_receipt_tests.rs"]
+mod stats_receipt_tests;

@@ -101,7 +101,7 @@ const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   // Registered with no frame emitted yet (#1570): the state the #1115
   // "queued" tests describe, so they keep describing it. A failed
   // registration and a seeded frame are opted into by their own tests.
-  backfill: { state: "registered", lastFrame: null },
+  backfill: { state: "registered", owner: { viewer: "octocat", generation: 1 }, lastFrame: null },
   ...over,
 });
 
@@ -682,6 +682,7 @@ describe("StatsPage honesty", () => {
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -774,6 +775,7 @@ describe("StatsPage honesty", () => {
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -804,9 +806,10 @@ describe("StatsPage honesty", () => {
           daysCovered: 6,
           daysTotal: 30,
           backfill: {
-            state: "registered",
+            state: "registered", owner: { viewer: "octocat", generation: 1 },
             lastFrame: {
               scopeKey: "board|merged|*|org:acme",
+              owner: { viewer: "octocat", generation: 1 },
               daysCovered: 24,
               daysTotal: 30,
               collected: 450,
@@ -841,9 +844,10 @@ describe("StatsPage honesty", () => {
           daysCovered: 6,
           daysTotal: 30,
           backfill: {
-            state: "registered",
+            state: "registered", owner: { viewer: "octocat", generation: 1 },
             lastFrame: {
               scopeKey: "board|merged|*|org:widget",
+              owner: { viewer: "octocat", generation: 1 },
               daysCovered: 24,
               daysTotal: 30,
               collected: 450,
@@ -900,6 +904,7 @@ describe("StatsPage honesty", () => {
     // The worker has advanced since that board was assembled.
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
       daysCovered: 18,
       daysTotal: 30,
       collected: 400,
@@ -927,6 +932,7 @@ describe("StatsPage honesty", () => {
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
+      owner: { viewer: "octocat", generation: 1 },
       daysCovered: 4,
       daysTotal: 30,
       collected: 400,

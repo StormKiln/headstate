@@ -1,6 +1,10 @@
 //! Durable, bounded search continuations (#1626). A dense day previously
 //! repeated its first page forever. Attempts also rotate dates within a scope.
-use super::{pr_history, pr_slice, settings, StoreError};
+use super::{
+    pr_history, pr_slice,
+    stats_owner::{self, StatsOwner},
+    StoreError,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -31,26 +35,17 @@ impl Page {
     }
 }
 
-fn identity(conn: &Connection, viewer: &str) -> Result<(), String> {
-    let current: Option<String> =
-        settings::get(conn, settings::keys::STATS_VIEWER).map_err(|e| e.to_string())?;
-    if current.as_deref() != Some(viewer) {
-        return Err("stats account changed; discarded background page".into());
-    }
-    Ok(())
-}
-
 /// Reservations commit before network work: cancellation/failure still yields
-/// to other dates. The only worker is sequential; history is never claimed here.
-pub fn select(
-    conn: &mut Connection,
-    viewer: &str,
+/// to other dates. This selects work without claiming history coverage.
+pub fn select_in(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &StatsOwner,
     key: &str,
     dates: &[String],
     limit: usize,
 ) -> Result<Vec<Page>, String> {
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    identity(&tx, viewer)?;
+    stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
+    let viewer = owner.viewer();
     // Retain only this scope's still-uncovered dates. Old horizons and
     // days completed by the foreground do not accumulate orphan cursors.
     let old_days: Vec<String> = {
@@ -115,28 +110,27 @@ pub fn select(
         let payload = serde_json::to_string(page).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO pr_backfill_page(viewer,scope_key,day,payload,attempted) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(viewer,scope_key,day) DO UPDATE SET payload=excluded.payload,attempted=excluded.attempted",params![viewer,key,page.day,payload,order]).map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(selected)
 }
 
 /// Persist usable rows even when the page cannot support a cursor/coverage
 /// claim. Each returned bool says whether this page's contract was sound.
-pub fn commit(
-    conn: &mut Connection,
-    viewer: &str,
+pub fn commit_in(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &StatsOwner,
     key: &str,
     pages: &[Page],
     map: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<(usize, bool), String> {
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    identity(&tx, viewer)?;
+    stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
+    let viewer = owner.viewer();
     let mut written = 0;
     let mut valid = true;
     for (i, previous) in pages.iter().enumerate() {
         // A foreground load may have completed this day while we fetched it.
-        let coverage = pr_slice::coverage(&tx, key, &previous.day, &previous.day)
-            .map_err(|e| e.to_string())?;
+        let coverage =
+            pr_slice::coverage(tx, key, &previous.day, &previous.day).map_err(|e| e.to_string())?;
         if coverage.days_covered() == 1 && !coverage.partial {
             continue;
         }
@@ -152,7 +146,7 @@ pub fn commit(
         let slices =
             crate::github::stats::backfill::day_slices(std::slice::from_ref(&previous.day));
         let rows = crate::github::stats::Board::retrieved_prs(&one, &slices);
-        written += pr_history::put_many_in(&tx, key, &previous.day, &previous.day, &rows, now)
+        written += pr_history::put_many_in(tx, key, &previous.day, &previous.day, &rows, now)
             .map_err(|e| e.to_string())?;
         let mut page = previous.clone();
         let count = alias["issueCount"].as_u64();
@@ -202,7 +196,7 @@ pub fn commit(
                 pr_slice::SliceState::Refused
             };
             pr_slice::put(
-                &tx,
+                tx,
                 key,
                 &pr_slice::SliceRow {
                     from: page.day.clone(),
@@ -219,7 +213,7 @@ pub fn commit(
                 // Remove obsolete observations from a discarded pass only
                 // once a full current pass proves the day's membership.
                 if !capped {
-                    for old in pr_history::load(&tx, key, &page.day, &page.day)
+                    for old in pr_history::load(tx, key, &page.day, &page.day)
                         .map_err(|e| e.to_string())?
                     {
                         if !page.ids.contains(&(old.repo.clone(), old.number)) {
@@ -251,8 +245,45 @@ pub fn commit(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok((written, valid))
+}
+
+#[cfg(test)]
+fn select(
+    conn: &mut Connection,
+    viewer: &str,
+    key: &str,
+    dates: &[String],
+    limit: usize,
+) -> Result<Vec<Page>, String> {
+    let owner = stats_owner::current_for_verified(conn, viewer)
+        .map_err(|e| e.to_string())?
+        .ok_or("stats account changed")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let pages = select_in(&tx, &owner, key, dates, limit)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(pages)
+}
+#[cfg(test)]
+fn commit(
+    conn: &mut Connection,
+    viewer: &str,
+    key: &str,
+    pages: &[Page],
+    map: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<(usize, bool), String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let owner = stats_owner::current_for_verified(&tx, viewer)
+        .map_err(|e| e.to_string())?
+        .ok_or("stats account changed")?;
+    let result = commit_in(&tx, &owner, key, pages, map, now)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 
 fn valid_node(n: &serde_json::Value, day: &str) -> bool {
@@ -288,7 +319,7 @@ mod tests {
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
-        settings::set(&conn, settings::keys::STATS_VIEWER, &"a").unwrap();
+        stats_owner::capture_verified(&conn, "a").unwrap();
         conn
     }
     fn page() -> serde_json::Value {
