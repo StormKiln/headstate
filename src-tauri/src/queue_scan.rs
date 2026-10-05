@@ -173,6 +173,9 @@ pub struct State {
     pub candidate_position: usize,
     #[serde(default)]
     pub coverage_valid: bool,
+    /// One bounded repair traversal after a local authoritative effect.
+    #[serde(default)]
+    pub local_repair_pending: bool,
     #[serde(default = "default_pass_delay")]
     pub pass_delay: i64,
     /// Last validated traversal, not an atomic membership snapshot.
@@ -217,6 +220,7 @@ impl Default for State {
             github_partition: None,
             candidate_position: 0,
             coverage_valid: false,
+            local_repair_pending: false,
             pass_delay: default_pass_delay(),
             completed_at: None,
             completed_total: None,
@@ -275,11 +279,42 @@ impl State {
         };
     }
     pub fn taint_effect(&mut self) {
+        self.invalidate_proof();
+        self.local_repair_pending = true;
+        if self.local_repair_ready() {
+            if let Some(finished) = self.finished_at {
+                self.eligible_at = finished + self.completed_pass_delay();
+            }
+        }
+    }
+    fn invalidate_proof(&mut self) {
         self.receipt_id = None;
         self.tainted = true;
         self.coverage_valid = false;
         for c in &mut self.candidates {
             c.negative_at = None;
+        }
+    }
+    pub(crate) fn local_repair_ready(&self) -> bool {
+        self.local_repair_pending
+            && self.done
+            && !self.coverage_valid
+            && !self.ceiling
+            && self.failures == 0
+            && self.step_failure.is_none()
+            && self
+                .github_partition
+                .as_ref()
+                .is_none_or(|p| p.blocked.is_empty())
+    }
+    pub fn local_repair_due(&self, now: i64) -> bool {
+        self.local_repair_ready() && now >= self.eligible_at
+    }
+    pub fn completed_pass_delay(&self) -> i64 {
+        if self.local_repair_ready() {
+            15
+        } else {
+            self.pass_delay.max(CONFIRM_DELAY)
         }
     }
     pub fn failure(&mut self, now: i64) {
@@ -360,7 +395,8 @@ pub fn load(
     state.isolate = false;
     if state.github_partition.as_ref().is_some_and(|p| !p.valid()) {
         state.fresh_pass();
-        state.taint_effect();
+        // Corrupt metadata is not a local action and earns no expedited repair.
+        state.invalidate_proof();
     }
     Ok(Loaded { revision, state })
 }
@@ -446,6 +482,37 @@ mod tests {
     use super::*;
     use crate::store::source_cache::{save_owned_source_snapshot, snapshot_owner, Coverage};
     #[test]
+    fn local_repair_is_defaulted_durable_and_consumed_once() {
+        let mut state = State {
+            done: true,
+            finished_at: Some(1000),
+            eligible_at: 1300,
+            pass_delay: 300,
+            ..State::default()
+        };
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("local_repair_pending");
+        assert!(
+            !serde_json::from_value::<State>(legacy)
+                .unwrap()
+                .local_repair_pending
+        );
+        for _ in 0..10 {
+            state.taint_effect();
+        }
+        assert_eq!(state.eligible_at, 1015);
+        let mut restored: State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(restored.local_repair_pending && restored.local_repair_due(1015));
+        restored.fresh_pass();
+        assert!(!restored.local_repair_pending && !restored.done && !restored.coverage_valid);
+        assert_eq!(restored.pass_delay, 300);
+    }
+
+    #[test]
     fn malformed_partition_resets_only_traversal_not_candidate_or_inventory_ownership() {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
@@ -492,6 +559,10 @@ mod tests {
                 PartitionPhase::LowerBound
             );
             assert!(!recovered.coverage_valid);
+            assert!(
+                !recovered.local_repair_pending,
+                "malformed provider metadata is not a local effect"
+            );
             assert_eq!(recovered.completed_at, Some(1));
             assert_eq!(recovered.candidates.len(), 1);
             assert_eq!(recovered.candidates[0].negative_at, None);

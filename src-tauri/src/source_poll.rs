@@ -1473,11 +1473,45 @@ pub async fn record_confirmed_removal(
     record_github_effect(app, repo, number, &viewer, GithubEffect::Remove(effect)).await;
 }
 
+// Ordering metadata still advances for every accepted acquisition. Only changed
+// values or newly qualified fields invalidate an otherwise useful traversal.
+fn same_targeted_inventory_facts(
+    before: &[crate::github::model::PullRequest],
+    after: &[crate::github::model::PullRequest],
+) -> bool {
+    use crate::inventory::ReadinessField::{Draft, Head, Queue, Review};
+    let knowledge = |row: &crate::github::model::PullRequest| {
+        row.observation.as_ref().map(|o| {
+            (
+                o.state,
+                [Head, Draft, Queue, Review].map(|field| {
+                    (
+                        !o.unknown_fields.contains(&field),
+                        !o.retained_fields.contains(&field),
+                    )
+                }),
+            )
+        })
+    };
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(a, b)| {
+            a.id == b.id
+                && a.repo == b.repo
+                && a.number == b.number
+                && a.head_oid == b.head_oid
+                && a.is_draft == b.is_draft
+                && a.in_merge_queue == b.in_merge_queue
+                && a.review == b.review
+                && knowledge(a) == knowledge(b)
+        })
+}
+
 fn persist_github_effect(
     conn: &rusqlite::Connection,
     source: &Source,
     list: CachedList,
     receipt: &FetchedList,
+    taint: bool,
 ) -> Result<(), crate::store::StoreError> {
     let tx = conn.unchecked_transaction()?;
     if crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
@@ -1502,12 +1536,14 @@ fn persist_github_effect(
             receipt.viewer.as_deref(),
         )?;
     }
-    crate::queue_scan::taint(
-        &tx,
-        source,
-        list,
-        receipt.viewer.as_deref().unwrap_or_default(),
-    )?;
+    if taint {
+        crate::queue_scan::taint(
+            &tx,
+            source,
+            list,
+            receipt.viewer.as_deref().unwrap_or_default(),
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1673,6 +1709,18 @@ async fn record_github_effect_at(
                     {
                         return Ok(None);
                     }
+                    let absent_before = if !has_row {
+                        crate::store::github_facts::load(
+                            &tx,
+                            list,
+                            &owner,
+                            &repo,
+                            number,
+                            &observation.id,
+                        )?
+                    } else {
+                        None
+                    };
                     let changed = crate::store::github_facts::accept(
                         &tx,
                         list,
@@ -1684,6 +1732,7 @@ async fn record_github_effect_at(
                     if !changed {
                         return Ok(None);
                     }
+                    let before = next.prs.clone();
                     crate::store::github_facts::apply_targeted(
                         &tx,
                         list,
@@ -1699,7 +1748,32 @@ async fn record_github_effect_at(
                         &next.coverage,
                         &owner,
                     )?;
-                    crate::queue_scan::taint(&tx, &Source::default(), list, &owner)?;
+                    // A reopened terminal identity has no row payload yet. Its
+                    // changed durable facts still require a membership repair.
+                    let absent_changed = if !has_row {
+                        let after = crate::store::github_facts::load(
+                            &tx,
+                            list,
+                            &owner,
+                            &repo,
+                            number,
+                            &observation.id,
+                        )?;
+                        let semantic = |value: Option<&crate::store::github_facts::Observation>| {
+                            value.map(|o| {
+                                o.facts
+                                    .iter()
+                                    .map(|f| (f.head_oid.clone(), f.value.clone()))
+                                    .collect::<Vec<_>>()
+                            })
+                        };
+                        semantic(absent_before.as_ref()) != semantic(after.as_ref())
+                    } else {
+                        false
+                    };
+                    if absent_changed || !same_targeted_inventory_facts(&before, &next.prs) {
+                        crate::queue_scan::taint(&tx, &Source::default(), list, &owner)?;
+                    }
                     tx.commit()?;
                     Ok(Some(next))
                 },
@@ -1771,7 +1845,7 @@ async fn record_github_effect_at(
         let saved_source = source.clone();
         let persisted = tauri::async_runtime::spawn_blocking(move || {
             let conn = crate::store::open_db(&path)?;
-            persist_github_effect(&conn, &saved_source, list, &saved)
+            persist_github_effect(&conn, &saved_source, list, &saved, changed)
         })
         .await;
         if !matches!(persisted, Ok(Ok(()))) {
@@ -3316,7 +3390,7 @@ printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
                 confirmed_by_read: false,
             },
         );
-        persist_github_effect(&conn, &source, list, &accepted).unwrap();
+        persist_github_effect(&conn, &source, list, &accepted, true).unwrap();
         let checkpoint = crate::queue_scan::load(&conn, &source, list, "fixture").unwrap();
         assert_eq!(checkpoint.state.after.as_deref(), Some("synthetic-tail"));
         assert!(checkpoint.state.receipt_id.is_none());

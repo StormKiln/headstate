@@ -114,7 +114,7 @@ impl Observation {
     }
 }
 
-fn load(
+pub(crate) fn load(
     conn: &Connection,
     list: CachedList,
     owner: &str,
