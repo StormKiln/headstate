@@ -110,7 +110,7 @@ export async function runEnterpriseSoak({pages,provider,result,out,profile,nativ
 
 // Separate current-session tail qualification, never a continuation of a failed soak.
 export async function runEnterpriseTail({pages,provider,result,nativeCall}){
- result.tail={scope:'new native/browser session; copied synthetic warm profile; not a soak continuation',startedAt:new Date().toISOString()};
+ result.tail={scope:`new native/browser session; ${result.warm?'copied synthetic warm':'fresh synthetic'} profile; not a soak continuation`,startedAt:new Date().toISOString()};
  await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();
  await pages[0].getByRole('button',{name:/Synthetic review 53(?:\D|$)/}).first().click();
  await pages[0].getByText('Synthetic description 53',{exact:false}).waitFor();
