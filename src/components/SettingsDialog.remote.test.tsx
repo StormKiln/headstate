@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const setRemote = vi.fn<(enabled: boolean) => Promise<void>>(() => Promise.resolve());
@@ -90,15 +90,31 @@ describe("phone connections setting", () => {
   // reason must reach the user rather than the box silently staying
   // where it was.
   it("shows the backend's error when the change is refused", async () => {
-    setRemote.mockImplementationOnce(() =>
-      Promise.reject("could not listen on 0.0.0.0:41919: address already in use"),
-    );
+    let refuse!: (reason: string) => void;
+    const pending = new Promise<void>((_, reject) => { refuse = reject; });
+    setRemote.mockReturnValueOnce(pending);
     show();
+    const phone = screen.getByRole("button", { name: /^phone$/i });
+    fireEvent.click(phone);
+    expect(phone.getAttribute("aria-current")).toBe("page");
+    expect(box().closest(".hidden")).toBeNull();
     fireEvent.click(box());
-    expect(await screen.findByRole("alert")).toHaveProperty(
+    expect(setRemote).toHaveBeenCalledExactlyOnceWith(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(box()).toHaveProperty("checked", false);
+
+    // This test owns the backend promise. Flush its actual rejection and
+    // React's catch-driven render before querying, rather than polling the
+    // entire dialog against an unrelated one-second arrival deadline.
+    await act(async () => {
+      refuse("could not listen on 0.0.0.0:41919: address already in use");
+    });
+    expect(screen.getByRole("alert")).toHaveProperty(
       "textContent",
       "could not listen on 0.0.0.0:41919: address already in use",
     );
+    expect(box()).toHaveProperty("checked", false);
+    expect(setRemote).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it("names the port, so the user knows what was opened", () => {
