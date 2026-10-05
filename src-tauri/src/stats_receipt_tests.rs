@@ -1946,12 +1946,35 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
     )
     .unwrap();
     let complete = read(owner.clone(), 1).await.unwrap();
-    assert!(
-        complete.measurement.complete,
-        "current full durable evidence replaces a prior foreground refusal"
+    assert!(!complete.measurement.complete);
+    assert_eq!(complete.measurement.retrieved, 5);
+    assert!(!complete.measurement.accumulating);
+    assert_eq!(
+        complete.measurement.total, None,
+        "smaller complete history cannot prove that useful foreground rows disappeared"
     );
-    assert_eq!(complete.measurement.accumulated, 1);
-    assert_eq!(complete.measurement.total, Some(1));
+    let mut compatible = materialized.clone();
+    compatible.board.retrieved = 1;
+    compatible.board.rows[0].prs = 1;
+    compatible.board.repo_counts[0].merged = 1;
+    crate::store::stats::put(
+        &conn,
+        &cache_key,
+        &day,
+        &day,
+        250,
+        false,
+        &serde_json::to_string(&compatible).unwrap(),
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let equal = read(owner.clone(), 1).await.unwrap();
+    assert!(
+        equal.measurement.complete,
+        "compatible full durable evidence clears old foreground refusal"
+    );
+    assert_eq!(equal.measurement.accumulated, 1);
+    assert_eq!(equal.measurement.total, Some(1));
     assert_eq!(p.calls.load(Ordering::SeqCst), calls);
     let bob = stats_owner::capture_verified(&conn, "synthetic-other-viewer").unwrap();
     assert!(read(owner, 1)
@@ -1960,4 +1983,91 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
         .contains("account changed"));
     assert!(read(bob, 1).await.unwrap_err().contains("owner changed"));
     assert_eq!(p.calls.load(Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
+async fn cached_board_retains_foreground_after_concurrent_empty_commit_supersedes_accumulation() {
+    use crate::store::{pr_scope_evidence, pr_slice};
+    let p = provider("synthetic-retention-viewer", 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("stats.db");
+    p.client
+        .stats_viewer_metered(&p.client.request_budget())
+        .await
+        .unwrap();
+    p.blocked.store(true, Ordering::SeqCst);
+    let client = p.client.clone();
+    let path = db.clone();
+    let normal = tokio::spawn(async move {
+        stats_board_for_client(
+            &client,
+            path,
+            &tokio::sync::Notify::new(),
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            1,
+        )
+        .await
+        .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), p.arrived.notified())
+        .await
+        .unwrap();
+    // The actual normal command passed its store-first lookup and reserved
+    // evidence before its provider request. Commit competing empty evidence
+    // using the same atomic store operations as the worker, then release HTTP.
+    let mut conn = open_db(&db).unwrap();
+    let owner = stats_owner::capture_verified(&conn, "synthetic-retention-viewer").unwrap();
+    let day = (chrono::Utc::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let scope = "merged|*|org:fixture-org";
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    pr_scope_evidence::reserve(&tx, scope).unwrap();
+    pr_slice::record_all_with_rows_in(
+        &tx,
+        scope,
+        &day,
+        &day,
+        &[pr_slice::SliceRow {
+            from: day.clone(),
+            to: day.clone(),
+            state: pr_slice::SliceState::Complete,
+            issue_count: 0,
+            retrieved: 0,
+            refused_fields: 0,
+        }],
+        &[],
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    p.blocked.store(false, Ordering::SeqCst);
+    p.release.notify_one();
+    let measured = normal.await.unwrap();
+    assert_eq!(measured.board.retrieved, 1);
+    assert!(
+        !measured.board.accumulating,
+        "the competing commit must supersede actual foreground accumulation"
+    );
+    let calls = p.calls.load(Ordering::SeqCst);
+    let read = stats_board_cached_for_client(
+        &p.client,
+        db,
+        owner,
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(
+        read.measurement.rows, measured.board.rows,
+        "older complete-empty evidence cannot erase useful unsaved foreground rows"
+    );
 }

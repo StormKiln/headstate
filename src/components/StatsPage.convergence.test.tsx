@@ -16,10 +16,10 @@ const scopeKey="merged|*|org:synthetic-lab";
 const window={from:"2026-09-05",to:"2026-10-04"};
 const spend={points:0,requests:0,unmetered:0,remaining:null,resetAt:null};
 function measurement(count=50,complete=false,total:number|null=250) { return {rows:[{login:owner.viewer,prs:count,additions:count,deletions:0,changedFiles:count,reviewsReceived:0,cycleTimeHours:[]}],total,retrieved:50,complete,truncatedSlices:[],refusedFields:0,slices:1,rounds:1,spend,slowest:[],largest:[],repoCounts:[{repo:`synthetic-lab/${complete?'finished':'initial'}`,merged:count}],accumulated:count,accumulating:true,daysCovered:complete?30:0,daysTotal:30}; }
-function mount(initial=measurement(), strict=false) {
+function mount(initial=measurement(), strict=false, pending?:Promise<unknown>) {
  const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
  seam.call.mockImplementation((name:string)=>{
-  if(name==='stats_board')return Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',...initial,backfill:{state:'registered',owner,lastFrame:null}});
+  if(name==='stats_board')return pending??Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',...initial,backfill:{state:'registered',owner,lastFrame:null}});
   if(name==='stats_board_cached')return Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',measurement:measurement(250,true)});
   if(name==='stats_tree')return Promise.resolve({viewer:owner.viewer,orgs:[],repos:[]});
   return new Promise(()=>{});
@@ -70,4 +70,19 @@ it("does not overwrite a newer partial local measurement with the older progress
  await waitFor(()=>expect(qc.getQueryData<{accumulated:number}>(['stats-board','org:synthetic-lab','merged',30])?.accumulated).toBe(150));
  expect(screen.queryByText(/\b50 of 250 pull requests collected/)).toBeNull();
  expect(screen.getByText(/150 of 250 pull requests collected/)).toBeTruthy();qc.clear();
+});
+
+it("reconciles final progress received before the initial normal board settles exactly once",async()=>{
+ let release!:(value:unknown)=>void;
+ const pending=new Promise(resolve=>{release=resolve;});
+ const qc=mount(measurement(),false,pending);
+ await waitFor(()=>expect(seam.callbacks.get('stats-backfill-progress')?.size).toBeGreaterThan(0));
+ const payload={owner,scopeKey,daysCovered:30,daysTotal:30,collected:250,total:250,phase:{kind:'converged'},nextTickAtMs:null,observation:{...window,stream:'synthetic-stream',sequence:1,cacheChange:1}};
+ await act(async()=>{for(const callback of seam.callbacks.get('stats-backfill-progress')??[])callback({payload});});
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(0);
+ await act(async()=>release({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',...measurement(),backfill:{state:'registered',owner,lastFrame:null}}));
+ await screen.findByText('synthetic-lab/finished');
+ await act(async()=>{for(const callback of seam.callbacks.get('stats-backfill-progress')??[])callback({payload});});
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board')).toHaveLength(1);
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(1);qc.clear();
 });

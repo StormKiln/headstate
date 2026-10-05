@@ -1413,9 +1413,7 @@ async fn board_inner(
         .then(|| plan.total())
         .filter(|total| *total >= board.retrieved);
     board.total_verified = board.total.is_some();
-    if !board.total_verified {
-        board.complete = false;
-    }
+    board.complete &= board.total == Some(board.retrieved);
     // An irreducible slice cannot be divided further, so its nodes are a
     // sample BY CONSTRUCTION -- before any request was made. Folded in here
     // rather than left to the node-count comparison in the mapper, which
@@ -1514,6 +1512,52 @@ mod tests {
             })
             .map(|a| a.trim().to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn completed_count_plan_does_not_make_shrunken_detail_population_complete() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let _permits = crate::github::stats::budget::READ_PERMIT_TEST_LOCK
+            .lock()
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let doc = body["query"].as_str().unwrap();
+                let aliases = aliases_in(doc);
+                let response = if doc.contains("nodes {") {
+                    detail_body(&aliases)
+                } else {
+                    let data: serde_json::Map<String, serde_json::Value> = aliases
+                        .iter()
+                        .map(|alias| (alias.clone(), json!({"issueCount": 2})))
+                        .collect();
+                    json!({"data": data})
+                };
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .mount(&server)
+            .await;
+        let client = mock_client(&server).await;
+        let _observed = crate::github::stats::budget::scoped::enter(50_000);
+        let loaded = super::load_board_within(
+            &client,
+            &Scope::Org("acme".into()),
+            super::super::scope::Measure::Merged,
+            Slice::new("2026-07-01", "2026-07-01"),
+            &Budget::new(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.board.retrieved, 1);
+        assert_eq!(loaded.board.total, Some(2));
+        assert!(loaded.board.total_verified);
+        assert!(
+            !loaded.board.complete,
+            "earlier count proof cannot complete a later smaller population"
+        );
     }
 
     /// A probe answer: a count over the subdivision threshold for every

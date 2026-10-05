@@ -70,3 +70,38 @@ it('remembers an unsupported backend across different questions until ownership 
  const other=renderHook(()=>useStatsBoardRefresh(a.qc,otherKey,{...question,scopeValue:'other'},true));await flush();
  expect(seam.cached).toHaveBeenCalledTimes(1);expect(other.result.current.unsupported).toBe(true);
 });
+it('keeps one unresolved cache command across repeated all-observer remounts',async()=>{
+ const old=deferred<StatsBoardReadback>(), current=deferred<StatsBoardReadback>();
+ seam.cached.mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+ const a=setup();await flush();a.unmount();
+ for(let i=0;i<3;i++){const temporary=renderHook(()=>useStatsBoardRefresh(a.qc,key,question,true));await flush();temporary.unmount();}
+ const latest=renderHook(()=>useStatsBoardRefresh(a.qc,key,question,true));await flush();
+ expect(seam.cached).toHaveBeenCalledTimes(1);
+ await act(async()=>old.resolve(reply(99)));await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(1);
+ expect(seam.cached).toHaveBeenCalledTimes(2);
+ await act(async()=>current.resolve(reply(8)));await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(8);
+ expect(seam.cached).toHaveBeenCalledTimes(2);latest.unmount();
+});
+it('retains useful foreground-only rows against a smaller same-window complete cache receipt',async()=>{
+ seam.cached.mockResolvedValue(reply(0,{complete:true,total:0}));
+ const a=setup(board(5,{accumulating:false}));await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.retrieved).toBe(5);
+ expect(a.result.current.retained).toBe(true);
+ seam.cached.mockResolvedValue(reply(5,{complete:true,total:5}));await emit(1);await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.accumulating).toBe(true);
+ expect(a.qc.getQueryData<StatsBoard>(key)?.complete).toBe(true);
+});
+it('accepts a smaller new-window measurement at the ordinary UTC rollover',async()=>{
+ vi.useFakeTimers();vi.setSystemTime(new Date('2026-09-08T23:59:59.000Z'));
+ seam.cached.mockResolvedValue(reply(0,{complete:true,total:0}));
+ const a=setup(board(5,{accumulating:false}));await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.retrieved).toBe(5);
+ seam.cached.mockResolvedValue(reply(0,{complete:false,total:null,window:{from:'2026-09-02',to:'2026-09-08'}}));
+ await act(async()=>{await vi.advanceTimersByTimeAsync(1010);});await flush();
+ expect(seam.cached).toHaveBeenCalledTimes(2);
+ expect(a.qc.getQueryData<StatsBoard>(key)?.window?.to).toBe('2026-09-08');
+ expect(a.qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(0);
+ expect(a.result.current.retained).toBe(false);
+});

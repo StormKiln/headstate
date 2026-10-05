@@ -71,6 +71,7 @@ class Controller {
   private highWater = 0;
   private cacheChange = -1;
   private foreignHandshake = false;
+  private initialHint?: StatsBackfillFrame;
   private retiredStreams = new Set<string>();
   constructor(private qc: QueryClient, private key: readonly unknown[]) {}
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
@@ -90,7 +91,17 @@ class Controller {
   }
   private frame = (frame: StatsBackfillFrame) => {
     const board = this.board(), observation = frame.observation;
-    if (!board || !observation || !sameOwner(board.owner, frame.owner) || frame.scopeKey !== board.scopeKey || this.retired) return;
+    if (!observation || this.retired) return;
+    if (!board) {
+      // A final event can precede the initial normal reply. Keep one bounded
+      // hint, not its numeric authority; the eventual exact-question read is
+      // owner-checked by the native command. Dirty work waits for that reply.
+      if (!this.initialHint) this.request();
+      const previous = this.initialHint?.observation;
+      if (!previous || previous.stream !== observation.stream || observation.sequence > previous.sequence) this.initialHint = frame;
+      return;
+    }
+    if (!sameOwner(board.owner, frame.owner) || frame.scopeKey !== board.scopeKey || this.retired) return;
     this.adopt(board);
     if (board.window && (observation.to < board.window.from || observation.from > board.window.to)) return;
     if (observation.stream !== this.stream) {
@@ -131,8 +142,9 @@ class Controller {
       const measured = {...current,...answer.measurement,owner:answer.owner,viewer:answer.viewer,scopeKey:answer.scopeKey,window:answer.window,stream:answer.stream};
       // Backfill registration belongs to the normal load, not this readback.
       // Weaker same-window evidence cannot erase useful foreground-only rows.
-      const retain = sameWindow(current.window, answer.window) && !measured.complete && population(current) > 0
-        && (!current.accumulating || population(measured) < population(current));
+      const retain = sameWindow(current.window, answer.window) && population(current) > 0
+        && ((!current.accumulating && (!measured.complete || population(measured) < population(current)))
+          || (!measured.complete && population(measured) < population(current)));
       const next = retain ? {...current,stream:answer.stream,window:answer.window} : measured;
       this.qc.setQueryData(this.key, next);
       this.adopt(next); this.applied = dirty; this.attempts = 0; succeeded = true;
@@ -150,9 +162,12 @@ class Controller {
         this.retryTimer = setTimeout(() => { this.retryTimer=undefined; this.schedule(); },delay);
       }
     } finally {
-      if (!this.retired && epoch === this.epoch) {
-        this.inFlight=false; this.publish({...this.status,refreshing:false});
-        if ((succeeded && this.dirty > this.applied) || this.dirty > dirty || this.normalVersion !== normalVersion) this.schedule();
+      this.inFlight=false;
+      if (!this.retired) {
+        // The old observer generation owns the pending command until settlement.
+        // Its answer is fenced above; a remounted observer gets one trailing read.
+        this.publish({...this.status,refreshing:false});
+        if (epoch !== this.epoch || (succeeded && this.dirty > this.applied) || this.dirty > dirty || this.normalVersion !== normalVersion) this.schedule();
       }
     }
   }
@@ -179,7 +194,11 @@ class Controller {
       if(event.query.queryHash!==this.qc.defaultQueryOptions({queryKey:this.key}).queryHash)return;
       if(event.type==='removed'){this.retire();return;}
       const board=this.board();
-      if(board){this.adopt(board);if(board.backfill.state==='registered'&&board.backfill.lastFrame)this.frame(board.backfill.lastFrame);}
+      if(board){
+        this.adopt(board);
+        const hint=this.initialHint;this.initialHint=undefined;
+        if(hint)this.frame(hint);
+        if(board.backfill.state==='registered'&&board.backfill.lastFrame)this.frame(board.backfill.lastFrame);}
       this.schedule();
     });
     const existing=this.board();
@@ -188,7 +207,7 @@ class Controller {
     this.stop=()=>{closed=true;for(const fn of unlisteners)safeUnlisten(fn);unsubscribe();document.removeEventListener('visibilitychange',visible);clearTimeout(this.retryTimer);clearTimeout(this.midnight);};
     return ()=>this.disconnect();
   }
-  private disconnect(){if(--this.users===0){this.stop?.();this.stop=undefined;this.epoch++;this.inFlight=false;}}
+  private disconnect(){if(--this.users===0){this.stop?.();this.stop=undefined;this.epoch++;}}
   retire(){this.retired=true;this.epoch++;this.stop?.();this.stop=undefined;clearTimeout(this.retryTimer);clearTimeout(this.midnight);}
 }
 export function useStatsBoardRefresh(qc:QueryClient,key:readonly unknown[],question:Question,enabled:boolean){

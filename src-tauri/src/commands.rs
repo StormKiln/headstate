@@ -6089,21 +6089,25 @@ fn stored_board_snapshot(
     // A successful weak history read is not authority to erase a useful
     // foreground-only measurement whose accumulation failed or was superseded.
     // No row union or count-based claim of newer evidence is invented.
-    if !assembled.complete {
-        if let Some(mut cached) = cached {
-            let population = if cached.accumulating {
-                cached.accumulated
-            } else {
-                cached.retrieved
-            };
-            if (!cached.accumulating && population > 0) || population > assembled.accumulated {
-                if let Some(total) = coverage.window_total {
-                    cached.total = (total >= population).then_some(total);
-                    cached.total_verified = cached.total.is_some();
-                    cached.complete = false;
-                }
-                return Ok(cached);
+    if let Some(mut cached) = cached {
+        let population = if cached.accumulating {
+            cached.accumulated
+        } else {
+            cached.retrieved
+        };
+        // A competing empty/shorter complete commit can predate the useful
+        // foreground response whose accumulation lost the evidence CAS. Full
+        // coverage alone proves no chronology between those measurements.
+        let foreground_loss = !cached.accumulating
+            && population > 0
+            && (!assembled.complete || population > assembled.accumulated);
+        if foreground_loss || (!assembled.complete && population > assembled.accumulated) {
+            if let Some(total) = coverage.window_total {
+                cached.total = (total >= population).then_some(total);
+                cached.total_verified = cached.total.is_some();
+                cached.complete = false;
             }
+            return Ok(cached);
         }
     }
     Ok(assembled)
