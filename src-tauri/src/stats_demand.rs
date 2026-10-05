@@ -105,6 +105,18 @@ impl Registry {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
         Self::gc(&mut inner, owner, now);
         let _guard = context.guard()?;
+        // Another observer of the same live scope inherits its queue position,
+        // including legacy-to-modern takeover. A fully reopened/new scope
+        // joins at the current turn, behind already waiting work. No tombstone
+        // map or durable stale registration is needed to retain this bound.
+        let worked = inner
+            .leases
+            .iter()
+            .filter(|lease| lease.scope.scope_key == scope.scope_key)
+            .map(|lease| lease.worked)
+            .max()
+            .unwrap_or(inner.turn);
+
         if legacy {
             if let Some(lease) = inner.leases.iter_mut().find(|l| {
                 l.legacy
@@ -158,7 +170,7 @@ impl Registry {
             scope,
             until: now + TTL,
             sequence: 0,
-            worked: 0,
+            worked,
             legacy,
         });
         Ok(Receipt {
@@ -300,6 +312,78 @@ mod tests {
             horizon_days: days,
         }
     }
+    #[test]
+    fn repeated_handle_churn_cannot_starve_a_continuously_renewed_scope() {
+        for legacy_replacement in [false, true] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::migrate(&conn).unwrap();
+            let owner = stats_owner::capture_verified(&conn, "fixture").unwrap();
+            let registry = Registry::default();
+            let context = DispatchContext::desktop();
+            let start = Instant::now();
+            let wall = chrono::Utc::now();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let mut a = registry
+                .acquire(
+                    &tx,
+                    &owner,
+                    &context,
+                    scope("a", 1),
+                    start,
+                    legacy_replacement,
+                )
+                .unwrap();
+            let b = registry
+                .acquire(&tx, &owner, &context, scope("b", 1), start, false)
+                .unwrap();
+            for expected in ["a", "b"] {
+                assert_eq!(
+                    registry
+                        .pick(&tx, &owner, start, wall)
+                        .unwrap()
+                        .unwrap()
+                        .scope
+                        .scope_value,
+                    expected
+                );
+            }
+            let mut last_b = 0;
+            for turn in 1..=12 {
+                let now = start + Duration::from_secs(60 * turn);
+                registry
+                    .update(&tx, &context, &b.handle, turn, false, now)
+                    .unwrap();
+                if legacy_replacement {
+                    // Modern takeover removes the legacy handle. Subsequent
+                    // iterations model another legacy view followed by takeover.
+                    if turn > 1 {
+                        registry
+                            .update(&tx, &context, &a.handle, 1, true, now)
+                            .unwrap();
+                        registry
+                            .acquire(&tx, &owner, &context, scope("a", 1), now, true)
+                            .unwrap();
+                    }
+                } else {
+                    registry
+                        .update(&tx, &context, &a.handle, 1, true, now)
+                        .unwrap();
+                }
+                a = registry
+                    .acquire(&tx, &owner, &context, scope("a", 1), now, false)
+                    .unwrap();
+                let selected = registry.pick(&tx, &owner, now, wall).unwrap().unwrap();
+                // Never commit the pages: failed/cancelled work must also yield.
+                if selected.scope.scope_value == "b" {
+                    last_b = turn;
+                }
+                assert!(turn-last_b<2,"B missed its two-turn opportunity under churn (legacy={legacy_replacement}, turn={turn})");
+            }
+        }
+    }
+
     #[test]
     fn fifty_live_complete_scopes_are_skipped_within_one_local_selection() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();

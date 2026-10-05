@@ -243,6 +243,13 @@ fn dense_backfill_dates_and_scopes_get_turns() {
         );
         r.register("other", 1);
         r.tick().await;
+        // A new scope joins behind already waiting demand instead of resetting
+        // priority to zero. With two eligible scopes its bound is two turns.
+        assert_eq!(
+            crate::store::pr_history::count(&conn, "merged|*|org:other", &r.to, &r.to).unwrap(),
+            0
+        );
+        r.tick().await;
         assert_eq!(
             crate::store::pr_history::count(&conn, "merged|*|org:other", &r.to, &r.to).unwrap(),
             50

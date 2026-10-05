@@ -865,3 +865,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pr_history_eviction_tests.rs"]
+mod eviction_tests;
