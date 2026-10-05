@@ -321,7 +321,7 @@ fn independent_repository_and_linked_worktree_are_discovered_without_builds() {
                 "-c",
                 "user.name=Fixture",
                 "-c",
-                "user.email=fixture@example.invalid",
+                "user.email=fixture@users.noreply.github.com",
             ])
             .args(args)
             .output()
@@ -644,7 +644,7 @@ fn linked_worktrees_require_cross_volume_selection_and_enumerate_common_director
                 "-c",
                 "user.name=Fixture",
                 "-c",
-                "user.email=fixture@example.invalid",
+                "user.email=fixture@users.noreply.github.com",
             ])
             .args(args)
             .output()
