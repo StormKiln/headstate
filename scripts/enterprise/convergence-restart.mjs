@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {joinHeldReviewing} from './convergence-join.mjs';
 import {readFile,writeFile,readdir} from 'node:fs/promises';
 import {resolve,dirname} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -41,7 +42,9 @@ export async function runConvergenceRestart({pages,provider,result,out,profile,s
   const started=performance.now();let matched=false;while(performance.now()-started<convergencePolicy.localPropagationMs){try{await capture('mounted-persisted-cache');matched=true;break;}catch{await delay(100);}}assert.ok(matched,'both real clients render converged retained cache');
   await control('start');const holdStart=performance.now();while(!provider.heldCount&&performance.now()-holdStart<convergencePolicy.inventoryMs)await delay(100);
   const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.ok(held.length,'restart must materialize an actual stale provider page');
-  await capture('stale-page-held');evidence.stalePublication=await releaseWithPublication({pages,provider,profile,expected:state.expected});
+  await capture('stale-page-held');
+  evidence.joined=await joinHeldReviewing({page:pages[0],provider,profile,inventoryMs:convergencePolicy.inventoryMs,joinMs:convergencePolicy.localPropagationMs});
+  evidence.stalePublication=await releaseWithPublication({pages,provider,profile,expected:state.expected,requestId:evidence.joined.requestId,joined:evidence.joined});
   evidence.freshTraversal=await waitForFreshTraversal({pages,provider,profile,consumption:evidence.stalePublication,expected:state.expected});
   evidence.pass=true;result.samples.push({role:'desktop'},{role:'paired'});result.convergenceRestart={pass:true};
  }finally{provider.release();await writeFile(resolve(out,'convergence-restart.json'),JSON.stringify(evidence,null,2));}

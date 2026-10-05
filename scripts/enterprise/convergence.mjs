@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {joinHeldReviewing} from './convergence-join.mjs';
 import {assertConsumption,assertRecovery,consumptionLineage} from './convergence-consumption.mjs';
 
 export const convergencePolicy=Object.freeze({inventoryMs:180000,localPropagationMs:10000,failureCycleMs:180000,meaning:'Synthetic diagnostic ceilings, not a field SLA; optional advisory freshness is excluded'});
@@ -15,7 +16,7 @@ export function assertConverged(observed,expected){assert.deepEqual(observed.inv
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const snapshot=page=>page.evaluate(()=>({at:performance.now(),wallTime:Date.now(),inventory:window.__enterprise.inventory(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),footer:document.querySelector('[data-testid="inventory-footer"]')?.textContent,commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&['get_pr_detail','act_on_pr'].includes(e.name))}));
 
-export async function releaseWithPublication({pages,provider,profile,expected,requestId,ceilingMs=convergencePolicy.localPropagationMs}){
+export async function releaseWithPublication({pages,provider,profile,expected,requestId,joined,ceilingMs=convergencePolicy.localPropagationMs}){
  const held=provider.ledger.filter(entry=>entry.held&&!entry.released);assert.equal(held.length,1);
  const releasedAt=Date.now(),releasedMono=performance.now();provider.release();
  let lastError;
@@ -26,6 +27,7 @@ export async function releaseWithPublication({pages,provider,profile,expected,re
    for(const completion of calls){
     if(requestId&&completion.args.requestId!==requestId)continue;
     let lineage;try{lineage=consumptionLineage(events,completion.callId,held[0].id);}catch{continue;}
+    if(joined){assert.equal(lineage.commandId,joined.commandId);assert.equal(lineage.slotId,joined.slotId);}
     const clients=await Promise.all(pages.map(snapshot));
     const proof=assertConsumption({requestId:completion.args.requestId,commandId:completion.callId,held:held[0],lineage,completion,expected,clients,releasedAt,elapsedMs:performance.now()-releasedMono,ceilingMs});
     return {releasedAt,releasedMono,elapsedMs:performance.now()-releasedMono,held,clients,...proof};
@@ -82,14 +84,12 @@ export async function runConvergence({pages,provider,result,out,profile,control}
   evidence.phases.push({name:reason,number,clickAt,receipt,settlementMs:2000,primaryAcquisitions,propagationMs:await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration),provider:provider.ledger.slice(before)});
   await capture(reason);
  };
- let heldRequestId;
- const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldRequestId});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,profile,consumption,expected})});};
+ let heldJoin;
+ const releaseOldSearch=async()=>{const consumption=await releaseWithPublication({pages,provider,profile,expected,requestId:heldJoin.requestId,joined:heldJoin});evidence.phases.push({name:'held-page-processed',...consumption});await save();evidence.phases.push({name:'subsequent-fresh-traversal',...await waitForFreshTraversal({pages,provider,profile,consumption,expected})});};
  const holdOldSearch=async()=>{
   provider.fault.holdSearch={list:'reviewing',after:null,remaining:1};
-  heldRequestId=await pages[0].evaluate(()=>{const offset=window.__enterprise.telemetry.length;void window.__enterprise.refreshReviewing().catch(()=>{});const started=window.__enterprise.telemetry.slice(offset).filter(e=>e.kind==='call-start'&&e.name==='get_reviewing');if(started.length!==1)throw Error('one actual reviewing invocation required');return started[0].args.requestId;});
-  assert.equal(typeof heldRequestId,'string');
-  await waitUntil(()=>provider.heldCount>0,convergencePolicy.inventoryMs,'no real materialized reviewing search was held');
-  assert.ok(provider.ledger.some(entry=>entry.held&&!entry.released&&entry.searches?.some(search=>search.query.includes('review-requested:@me'))));
+  heldJoin=await joinHeldReviewing({page:pages[0],provider,profile,inventoryMs:convergencePolicy.inventoryMs,joinMs:convergencePolicy.localPropagationMs});
+  evidence.phases.push({name:'manual-refresh-joined-held-scan',...heldJoin});await save();
  };
  const action=async(number,label,expectation,reason)=>{
   await open(number);const offset=await pages[0].evaluate(()=>window.__enterprise.telemetry.length);const before=provider.ledger.length;
