@@ -14,7 +14,8 @@ import '../index.css';
 const commits:{phase:string;actual:number;base:number;started:number;at:number}[]=[];
 const longTasks:{at:number;duration:number}[]|null=PerformanceObserver.supportedEntryTypes.includes('longtask')?[]:null;
 if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())boundedPush(longTasks,{at:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});
-const probe={inventory:()=>({authored:(client.getQueryData<PullRequest[]>(['prs'])??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(client.getQueryData<PullRequest[]>(['reviewing'])??[]).map(row=>`${row.repo}/${row.number}`).sort()}),querySummary:()=>client.getQueryCache().getAll().map(query=>{
+let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
+const probe={inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
  return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
@@ -28,6 +29,8 @@ useFilters.getState().setStatsScope('org','synthetic-lab',undefined);
 export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
+  // Observe exactly what the production hooks render, including retained startup data.
+  renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;
   if(authored.data?.length===50&&reviewing.data?.length===150&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
  },[authored.data,reviewing.data]);
