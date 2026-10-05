@@ -213,6 +213,9 @@ impl Reads {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::Reads;
+    pub(crate) fn cached(reads: &Reads) -> usize {
+        reads.0.lock().unwrap().receipts.len()
+    }
     pub(crate) fn live(reads: &Reads) -> (usize, usize) {
         let state = reads.0.lock().unwrap();
         (

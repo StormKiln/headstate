@@ -465,10 +465,29 @@ async fn canceled_reviewer_producer_does_not_cancel_another_waiter() {
         .stats_viewer_metered(&p.client.request_budget())
         .await
         .unwrap();
-    p.calls.store(0, Ordering::SeqCst);
-    p.blocked.store(true, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    // This test measures shared-flight cancellation, not cold schema/owner
+    // initialization. Complete real setup before starting its five-second
+    // arrival bound; do not preload any reviewer measurement or flight.
+    capture_stats_owner(db.clone(), "alice".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        1,
+        "only the priming viewer request"
+    );
+    assert_eq!(
+        crate::github::stats::reviewer_receipts::test_support::live(&p.client.reviewer_receipts),
+        (0, 0)
+    );
+    assert_eq!(
+        crate::github::stats::reviewer_receipts::test_support::cached(&p.client.reviewer_receipts),
+        0
+    );
+    p.calls.store(0, Ordering::SeqCst);
+    p.blocked.store(true, Ordering::SeqCst);
     let load = |client: GitHubClient, path| async move {
         stats_reviewers_for_client(
             &client,
@@ -481,10 +500,15 @@ async fn canceled_reviewer_producer_does_not_cancel_another_waiter() {
         )
         .await
     };
-    let first = tokio::spawn(load(p.client.clone(), db.clone()));
-    tokio::time::timeout(std::time::Duration::from_secs(5), p.arrived.notified())
-        .await
-        .unwrap();
+    let mut first = tokio::spawn(load(p.client.clone(), db.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            _ = p.arrived.notified() => {},
+            result = &mut first => panic!("reviewer producer finished before blocked provider arrival: {result:?}"),
+        }
+    })
+    .await
+    .expect("reviewer provider did not arrive after completed database setup");
     let second = tokio::spawn(load(p.client.clone(), db));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while crate::github::stats::reviewer_receipts::test_support::live(
