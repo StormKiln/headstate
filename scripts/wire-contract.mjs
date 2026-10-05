@@ -128,9 +128,9 @@ export function generate(root = process.cwd(), overrides = {}) {
   const originalRead = host.readFile.bind(host);
   host.readFile = path => overrides[resolve(path)] ?? originalRead(path);
   if (parsed.errors.length) throw new Error("Invalid TypeScript configuration");
-  const apiPath = resolve(root, "src/api/tauri.ts");
+  const apiPaths = ["src/api/tauri.ts", "src/api/diskInventory.ts"].map(path => resolve(root, path));
   const mapPath = resolve(root, "src/api/wireTypes.ts");
-  const program = ts.createProgram([apiPath, mapPath], parsed.options, host);
+  const program = ts.createProgram([...apiPaths, mapPath], parsed.options, host);
   const checker = program.getTypeChecker();
   const builder = schemaBuilder(checker);
   const wanted = surfaces(root, overrides);
@@ -170,13 +170,13 @@ export function generate(root = process.cwd(), overrides = {}) {
       for (const name of names(n.arguments[0])) {
         if (wanted.commands.includes(name)) {
           add(name, checker.getTypeFromTypeNode(n.typeArguments[0]));
-          origins.set(name, `${apiPath}:${n.getSourceFile().getLineAndCharacterOfPosition(n.getStart()).line + 1}`);
+          origins.set(name, `${n.getSourceFile().fileName}:${n.getSourceFile().getLineAndCharacterOfPosition(n.getStart()).line + 1}`);
         }
       }
     }
     ts.forEachChild(n, visit);
   }
-  visit(program.getSourceFile(apiPath));
+  for (const apiPath of apiPaths) visit(program.getSourceFile(apiPath));
   const map = program.getSourceFile(mapPath);
   for (const declaration of map.statements) {
     if (!ts.isInterfaceDeclaration(declaration)) continue;

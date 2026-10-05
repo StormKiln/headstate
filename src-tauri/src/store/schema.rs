@@ -1312,6 +1312,8 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(list,owner,repo,number,node_id)
     );
     CREATE TABLE github_pr_fact_owner (list INTEGER PRIMARY KEY, owner TEXT NOT NULL);",
+    // 42: bounded disk observations shared by accounting and growth.
+    crate::store::disk_observations::MIGRATION_SQL,
 ];
 
 /// The only legacy repairs supported here are scripts that were already

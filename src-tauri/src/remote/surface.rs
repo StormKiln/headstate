@@ -218,6 +218,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    ("disk_inventory_status", Class::Read),
+    ("disk_inventory_history", Class::Read),
+    ("disk_inventory_settings", Class::Read),
+    ("set_disk_inventory_settings", Class::Local),
+    ("start_disk_inventory", Class::Local),
+    ("cancel_disk_inventory", Class::Local),
     // Read: what a previous scan already found, so a cold start paints
     // rows instead of a blank page (#1152). Same class as the scan
     // above -- it returns the same information, just earlier -- and it
@@ -1267,6 +1273,13 @@ async fn call(
         "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
+        "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
+        "disk_inventory_history" => {
+            res(crate::disk_inventory::commands::disk_inventory_history(app.clone()).await)
+        }
+        "disk_inventory_settings" => {
+            res(crate::disk_inventory::commands::disk_inventory_settings(app.clone()).await)
+        }
         "read_cached_scan" => res(commands::read_cached_scan(app.clone(), a.get("kind")?).await),
         "size_artifacts" => res(commands::size_artifacts(a.get("paths")?).await),
         "scan_venvs" => res(commands::scan_venvs(app.clone()).await),

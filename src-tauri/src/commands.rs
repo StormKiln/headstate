@@ -2009,7 +2009,7 @@ async fn permit_from(
 ///
 /// The only way a command should reach the blocking pool for a scan;
 /// `every_filesystem_scan_takes_a_permit` holds the walks to it.
-async fn scan_blocking<T, F>(walk: F) -> Result<T, String>
+pub(crate) async fn scan_blocking<T, F>(walk: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
