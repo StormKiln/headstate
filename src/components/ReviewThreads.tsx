@@ -72,24 +72,13 @@ export function ReviewThreads({ threads, total, repo, number, actionsDisabled = 
         </span>
       </h2>
       <div className="flex flex-col gap-2 p-3">
-        {actionable.map((t) => (
-          <ThreadCard key={t.id} thread={t} repo={repo} number={number} actionsDisabled={actionsDisabled} />
-        ))}
-        {settled.map((t) => (
-          // FORCED OPEN when the list is truncated, settled or not. A
-          // settled thread normally collapses because it is history -- but
-          // once threads are missing, "resolved" is only known about the
-          // ones that arrived, and a wall of collapsed cards above a
-          // truncation notice is exactly the reassuring-looking view the
-          // issue is about. Same reasoning as the Checks panel opening
-          // when capped (#790): a collapsed summary is least trustworthy
-          // precisely when the data behind it is incomplete.
+        {[...actionable, ...settled].map((t) => (
           <ThreadCard
-            key={t.id}
+            key={JSON.stringify([repo.toLowerCase(), number, t.id])}
             thread={t}
             repo={repo}
             number={number}
-            forceOpen={truncated}
+            forceOpen={truncated && !isActionable(t)}
             actionsDisabled={actionsDisabled}
           />
         ))}
@@ -142,12 +131,12 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
   const unresolve = useUnresolveThread();
   const sendReply = useReplyToThread();
 
-  const run = (p: Promise<void>, ok: string, bad: string) => {
+  const run = (p: Promise<void>, ok: string, bad: string, submitted?: string) => {
     setBusy(true);
     p.then(
       () => {
         setBusy(false);
-        setReply("");
+        if (submitted !== undefined) setReply(current => current === submitted ? "" : current);
         toast.success(ok);
       },
       (e: unknown) => {
@@ -250,6 +239,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
                     sendReply(thread.id, repo, number, reply),
                     "Replied",
                     `Could not reply on ${repo}#${number}`,
+                    reply,
                   )
                 }
                 className="rounded border border-[#30363d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#161b22] disabled:opacity-50"

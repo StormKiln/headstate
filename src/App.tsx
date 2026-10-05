@@ -511,7 +511,9 @@ export default function App() {
   // so the two views share every component instead of duplicating them.
   const source = view === "to-review" ? reviewing : prs;
   const gitlabQueue = view === "to-review" ? gitlabReviewing : gitlabAuthored;
-  const githubReceipt = useSourceRefresh(view === "to-review" ? "reviewing" : "authored");
+  const authoredReceipt = useSourceRefresh("authored");
+  const reviewingReceipt = useSourceRefresh("reviewing");
+  const githubReceipt = view === "to-review" ? reviewingReceipt : authoredReceipt;
   const githubCoverage = githubReceipt.coverage ?? "unknown";
   const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
@@ -760,6 +762,18 @@ export default function App() {
               <CourtStrip
                 authored={scopedForStrip}
                 reviewing={scopedReviewing}
+                availability={{
+                  authored: {
+                    status: authoredReceipt.error || isError || pollError ? "failed" : (authoredReceipt.prs === undefined || authoredReceipt.phase === "fetching" || authoredReceipt.phase === "retrying") ? "pending" : "available",
+                    coverage: authoredReceipt.coverage ?? null,
+                    retained: authoredReceipt.fetchedAt !== undefined || !!authoredReceipt.staleSecs,
+                  },
+                  reviewing: {
+                    status: reviewingReceipt.error || reviewingError ? "failed" : (reviewingReceipt.prs === undefined || reviewingReceipt.phase === "fetching" || reviewingReceipt.phase === "retrying") ? "pending" : "available",
+                    coverage: reviewingReceipt.coverage ?? null,
+                    retained: reviewingReceipt.fetchedAt !== undefined || !!reviewingReceipt.staleSecs,
+                  },
+                }}
                 onSelect={(court) =>
                   applyPreset(
                     court === "mine"

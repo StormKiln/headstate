@@ -137,3 +137,13 @@ it("counts new observations separately from retained inventory", () => {
   const prs = [...rows(1), { ...rows(2)[0], observation: { state: "retained" as const, last_observed_at: null, unknown_fields: [], retained_fields: [] } }];
   expect(receiptAdvisory({ prs, error: null, modern: true, coverage: { partial: { total: 2 } } }, "missing")).toBe(1);
 });
+
+it("publishes the ordered attempt phase without changing accepted inventory", () => {
+  const state = new SourceRefreshState();
+  state.accept(update(1, null, { coverage: "complete" }));
+  state.accept(update(3, null, { phase: "fetching", prs: null, receipt_revision: null }));
+  state.accept(update(2, null, { prs: null, receipt_revision: null }));
+  expect(state.snapshot()).toMatchObject({ prs: rows(1), coverage: "complete", phase: "fetching" });
+  state.accept(update(4));
+  expect(state.snapshot()).toMatchObject({ phase: "ready" });
+});

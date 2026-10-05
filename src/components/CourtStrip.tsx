@@ -1,7 +1,10 @@
 import { prKey } from "@/lib/prIdentity";
 import { CheckCircle2 } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
+import type { SourceCoverage } from "@/api/sourceRefresh";
 import { splitByCourt } from "@/lib/court";
+
+type Availability = { status: "pending" | "failed" | "available"; coverage: SourceCoverage | null; retained?: boolean };
 
 /// The glance: whose court is the ball in, right now.
 ///
@@ -19,7 +22,9 @@ export function CourtStrip({
   authored,
   reviewing,
   onSelect,
+  availability,
 }: {
+  availability: { authored: Availability; reviewing: Availability };
   authored: PullRequest[];
   reviewing: PullRequest[];
   /// Open the list scoped to one court. A card that cannot be acted on
@@ -40,6 +45,17 @@ export function CourtStrip({
   const total = new Set(
     [...authored, ...reviewing].map((pr) => prKey(pr)),
   ).size;
+
+  const inventories = [availability.authored, availability.reviewing];
+  const complete = inventories.every(value => value.status === "available" && value.coverage === "complete" && !value.retained);
+  if (mine.length === 0 && !complete) {
+    const pending = inventories.some(value => value.status === "pending");
+    const failed = inventories.some(value => value.status === "failed");
+    return <section role="status" className="mb-4 rounded-md border border-[#30363d] px-4 py-3 text-sm text-[#8b949e]">
+      {pending ? "Checking attention across your pull requests." : failed && total === 0 ? "Attention summary unavailable; completeness is unconfirmed." : "No attention needed in known results; completeness is unconfirmed."}
+      {total > 0 ? ` ${total} known open${theirs.length > 0 ? ` · ${theirs.length} waiting on others` : ""}.` : ""}
+    </section>;
+  }
 
   if (mine.length === 0) {
     return (
@@ -87,7 +103,7 @@ export function CourtStrip({
           three parts sat on different baselines and read as a
           rendering bug rather than as context -- and they are one
           sentence. */}
-      <span className="text-sm text-[#8b949e]">of {total} open</span>
+      <span className="text-sm text-[#8b949e]">of {total} {complete ? "open" : "known open · completeness is unconfirmed"}</span>
     </section>
   );
 }

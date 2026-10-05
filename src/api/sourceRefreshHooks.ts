@@ -60,7 +60,7 @@ function adoptOwner(qc: QueryClient, owner: string | undefined) {
 function entry(qc: QueryClient, list: List): Entry {
   let lists = entries.get(qc);
   if (!lists) { lists = {}; entries.set(qc, lists); }
-  return lists[list] ??= { state: new SourceRefreshState((rows, session) => acceptDetailFacts(qc, rows, session)), users: 0 };
+  return lists[list] ??= { state: new SourceRefreshState(receipt => acceptDetailFacts(qc, { ...receipt, list })), users: 0 };
 }
 function observe(qc: QueryClient, list: List, value: Entry) {
   if (value.users++ > 0) return;

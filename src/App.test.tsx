@@ -17,6 +17,7 @@ const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
 const mockReviewError = vi.fn<() => Error | null>(() => null);
 const mockReviewLoading = vi.fn<() => boolean>(() => false);
 const mockReviewCoverage = vi.fn<() => "complete" | "unknown" | { partial: { total: number | null } } | null>(() => "complete");
+const mockAuthoredReceipt = vi.fn<() => { prs?: PullRequest[]; phase?: string; error: string | null; coverage: "complete" | "unknown" | null }>(() => ({ prs: [], error: null, coverage: "complete" }));
 const mockRefused = vi.fn<() => number>(() => 0);
 const mockShortfall = vi.fn<() => number | null>(() => 0);
 const mockTruncation = vi.fn<() => number | null | undefined>(() => undefined);
@@ -24,7 +25,7 @@ const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
 
 vi.mock("./api/sourceRefreshHooks", () => ({
   usePhoneGitHubRefresh: () => undefined,
-  useSourceRefresh: () => ({ prs: mockReviewing(), error: mockReviewError()?.message ?? null, coverage: mockReviewCoverage() }),
+  useSourceRefresh: (list: string) => list === "authored" ? mockAuthoredReceipt() : ({ prs: mockReviewing(), error: mockReviewError()?.message ?? null, coverage: mockReviewCoverage() }),
 }));
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
@@ -83,7 +84,7 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false, dataUpdatedAt: mockDataUpdatedAt() }),
+  usePullRequests: () => ({ data: mockPrs(), staleSecs: null, isSuccess: true, isLoading: false, dataUpdatedAt: mockDataUpdatedAt() }),
   usePollError: () => null,
   useStoreError: () => ({ message: null, dismiss: () => {} }),
   clearPollError: () => {},
@@ -112,7 +113,7 @@ vi.mock("./api/hooks", () => ({
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
   useStatsTree: () => ({ data: mockStatsTree(), isPending: false, error: null }),
-  useReviewing: () => ({ data: mockReviewing(), isLoading: mockReviewLoading(), isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
+  useReviewing: () => ({ data: mockReviewing(), staleSecs: null, isLoading: mockReviewLoading(), isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing()?.length ?? 0 }),
   // PrDetailView's hooks: App's mock replaces the whole module, so
@@ -837,4 +838,55 @@ describe("notification click in the assembled shell", () => {
     expect(useFilters.getState().selectedPr).toBeNull();
   });
 
+});
+
+
+describe("Court inventory availability", () => {
+  beforeEach(() => {
+    mockPrs.mockReturnValue([]); mockReviewing.mockReturnValue([]);
+    mockReviewError.mockReturnValue(null); mockReviewCoverage.mockReturnValue("complete");
+    mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" });
+    useFilters.setState({ view: "my-prs", selectedPr: null });
+  });
+  afterEach(() => mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" }));
+  it.each(["authored", "reviewing"])("requires independently accepted %s inventory", list => {
+    if (list === "authored") mockAuthoredReceipt.mockReturnValue({ error: null, coverage: null });
+    else { mockReviewing.mockReturnValue(undefined); mockReviewCoverage.mockReturnValue(null); }
+    renderApp();
+    expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+    expect(screen.queryByText("0 open")).toBeNull();
+    expect(screen.getByText(/Checking attention/)).toBeTruthy();
+  });
+  it("accepts the complete empty pair", () => {
+    renderApp(); expect(screen.getByText("Nothing needs your attention")).toBeTruthy();
+  });
+  it.each(["unknown", { partial: { total: 4 } }] as const)("qualifies %j reviewing beside complete authored", coverage => {
+    mockReviewCoverage.mockReturnValue(coverage); renderApp();
+    expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+    expect(screen.getByText(/completeness is unconfirmed/)).toBeTruthy();
+  });
+  it("qualifies a failed latest refresh despite complete retained inventory", () => {
+    mockReviewError.mockReturnValue(new Error("newer refresh failed")); renderApp();
+    expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+    expect(screen.getByText(/completeness is unconfirmed/)).toBeTruthy();
+  });
+});
+
+it.each(["github", "both"] as const)("keeps GitHub Court confidence independent of GitLab with %s selected", async selection => {
+  mockPrs.mockReturnValue([]); mockReviewing.mockReturnValue([]); mockReviewError.mockReturnValue(null);
+  mockReviewCoverage.mockReturnValue("complete"); mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" });
+  useFilters.setState({ view: "my-prs", selectedPr: null });
+  useSourceSelection.setState({ selection, repoKey: null, query: "" });
+  renderApp(); expect(await screen.findByText("Nothing needs your attention")).toBeTruthy();
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+});
+
+it("qualifies an old complete Court receipt while a newer source attempt is fetching", () => {
+  mockPrs.mockReturnValue([]); mockReviewing.mockReturnValue([]); mockReviewError.mockReturnValue(null); mockReviewCoverage.mockReturnValue("complete");
+  mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete", phase: "fetching" });
+  useFilters.setState({ view: "my-prs", selectedPr: null });
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  renderApp(); expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+  expect(screen.getByText(/Checking attention/)).toBeTruthy();
+  mockAuthoredReceipt.mockReturnValue({ prs: [], error: null, coverage: "complete" });
 });

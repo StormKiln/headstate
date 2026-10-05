@@ -549,3 +549,19 @@ it("validates comment IDs on current replies while accepting old ID-less desktop
   }
   expect(() => assertRemoteReply("get_pr_detail", { ...legacy, comments: [{ ...reportComment, id: 123 }] })).toThrow(/id/);
 });
+
+it("preserves a thread draft across a new head but isolates a known account change", async () => {
+  const discussion = { id: "RT_same", path: "synthetic.ts", line: 1, is_resolved: false, is_outdated: false, viewer_can_reply: true, viewer_can_resolve: true, viewer_can_unresolve: true, comments: [], comment_count: 0 };
+  const base = { ...detail(), review_threads: [discussion], review_threads_total: 1 };
+  qc.setQueryData(key, base); qc.setQueryData(["viewer"], "reviewer");
+  mount();
+  const box = screen.getByRole("textbox", { name: /Reply to the conversation/ }) as HTMLTextAreaElement;
+  fireEvent.change(box, { target: { value: "account-specific unsent draft" } }); box.focus();
+  await act(async () => qc.setQueryData(key, { ...base, head_oid: "new-head", review_threads: [{ ...discussion, is_outdated: true }] }));
+  expect(screen.getByRole("textbox", { name: /Reply to the conversation/ })).toBe(box);
+  expect(box.value).toBe("account-specific unsent draft"); expect(document.activeElement).toBe(box);
+  await act(async () => qc.setQueryData(["viewer"], "another-reviewer"));
+  expect(box.isConnected).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: /synthetic.ts/ }));
+  expect((screen.getByRole("textbox", { name: /Reply to the conversation/ }) as HTMLTextAreaElement).value).toBe("");
+});

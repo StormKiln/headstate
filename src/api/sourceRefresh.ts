@@ -19,8 +19,9 @@ export type SourceStatus = {
   coverage?: SourceCoverage | null;
 };
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
+export type ProviderReceipt = { rows: PullRequest[]; session?: string; coverage?: SourceCoverage | null };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-type Snapshot = { prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
+type Snapshot = { phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
@@ -44,6 +45,7 @@ export class SourceRefreshState {
   private providerAt: string | undefined;
   private retired = false;
   private value: Snapshot = { prs: undefined, error: null, modern: false };
+  private phase: string | undefined;
   private backendError: string | null = null;
   private legacyStatusError = false;
   private transportError: { id: string; message: string } | null = null;
@@ -57,9 +59,9 @@ export class SourceRefreshState {
   private order = 0;
   private requests = new Map<string, Request>();
   private listeners = new Set<() => void>();
-  private onProviderRows?: (rows: PullRequest[], session: string | undefined) => void;
+  private onProviderRows?: (receipt: ProviderReceipt) => void;
 
-  constructor(onProviderRows?: (rows: PullRequest[], session: string | undefined) => void) {
+  constructor(onProviderRows?: (receipt: ProviderReceipt) => void) {
     this.onProviderRows = onProviderRows;
   }
 
@@ -70,11 +72,11 @@ export class SourceRefreshState {
   };
   private publish(prs = this.value.prs, fromProvider = false) {
     const providerAge = this.providerAt ? Math.max(0, Math.floor((Date.now() - Date.parse(this.providerAt)) / 1000)) : 0;
-    this.value = { staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
+    this.value = { phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
     for (const listener of this.listeners) listener();
     // Display patches and status-only publications are not provider evidence.
     // Deliver the accepted rows themselves, never a later patched snapshot.
-    if (fromProvider && prs !== undefined) this.onProviderRows?.(prs, this.session);
+    if (fromProvider && prs !== undefined) this.onProviderRows?.({ rows: prs, session: this.session, coverage: this.coverage });
   }
   start(id: string): Request {
     const request = { id, order: ++this.order, rows: this.rowEpoch, status: this.statusEpoch, completed: false, session: this.session };
@@ -90,6 +92,7 @@ export class SourceRefreshState {
     const modern = update.session !== undefined && update.revision !== undefined;
     if (!modern) {
       if (this.session !== undefined) return;
+      this.phase = update.phase;
       if (update.phase !== "fetching") this.statusEpoch++;
       this.backendError = update.phase === "retrying" ? null : update.error;
       this.legacyStatusError = update.error !== null;
@@ -110,6 +113,7 @@ export class SourceRefreshState {
     }
     if (update.revision! > this.revision) {
       this.revision = update.revision!;
+      this.phase = update.phase;
       this.backendError = update.phase === "retrying" ? null : update.error;
       this.statusEpoch++;
     }
@@ -133,6 +137,7 @@ export class SourceRefreshState {
     this.retained = undefined;
     this.providerReceipt = true;
     this.providerAt = undefined;
+    this.phase = "ready";
     this.rowEpoch++;
     if (!this.legacyStatusError) this.backendError = null;
     this.publish(prs, true);

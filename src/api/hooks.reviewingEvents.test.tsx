@@ -23,7 +23,7 @@ vi.mock("./transport", () => ({
 import { useActOnPr, usePollError, usePullRequests, useRefreshRequested, useReviewing, useReviewPr, useReviewShortfall, useTruncation } from "./hooks";
 import { PR_FIXTURES } from "../fixtures/prs";
 
-const pr = (number: number) => ({ number, title: `PR ${number}` }) as PullRequest;
+const pr = (number: number) => ({ ...PR_FIXTURES[0], repo: "synthetic/project", number, title: `PR ${number}` }) as PullRequest;
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(["viewer"], "fixture");

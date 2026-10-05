@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { PR_FIXTURES } from "../fixtures/prs";
+import { CourtStrip } from "../components/CourtStrip";
 import * as hooks from "./sourceRefreshHooks";
 import { listen } from "./transport";
 import { refreshSource } from "./tauri";
@@ -177,4 +178,29 @@ it("same-running-desktop re-pair recovers rows and detail facts while old reads 
   expect(detailNeedsRevalidation(qc, row.repo, row.number)).toBe(true);
   act(() => oldCallback({ payload: frame(3) } as never));
   expect(hook.result.current.prs?.[0].head_oid).toBe("head-2");
+});
+
+it("retires the mounted Court all-clear immediately and restores it only after a new complete pair", async () => {
+  const qc = new QueryClient();
+  function Summary() {
+    const authored = hooks.useSourceRefresh("authored"); const reviewing = hooks.useSourceRefresh("reviewing");
+    const availability = (snapshot: typeof authored) => ({ status: snapshot.error ? "failed" as const : snapshot.prs === undefined ? "pending" as const : "available" as const, coverage: snapshot.coverage ?? null, retained: snapshot.fetchedAt !== undefined || !!snapshot.staleSecs });
+    return <CourtStrip authored={authored.prs ?? []} reviewing={reviewing.prs ?? []} availability={{ authored: availability(authored), reviewing: availability(reviewing) }} onSelect={() => {}} />;
+  }
+  render(<QueryClientProvider client={qc}><Summary /></QueryClientProvider>);
+  await act(async () => {});
+  const callbacks = () => vi.mocked(listen).mock.calls.filter(c => c[0] === "source-poll-status").map(c => c[1]);
+  const old = callbacks();
+  const frame = (list: string, revision: number) => ({ payload: { source: { provider: "github", host: "github.com" }, list, session: "desktop", owner: "synthetic-viewer", revision, receipt_revision: revision, phase: "ready", error: null, prs: [], coverage: "complete" } });
+  act(() => { for (const fn of old) for (const list of ["authored", "reviewing"]) fn(frame(list, 1) as never); });
+  expect(screen.getByText("Nothing needs your attention")).toBeTruthy();
+  act(() => hooks.retireSourceOwnership(qc));
+  expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+  act(() => { for (const fn of old) for (const list of ["authored", "reviewing"]) fn(frame(list, 2) as never); });
+  expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+  act(() => { for (const fn of callbacks()) fn(frame("authored", 3) as never); });
+  expect(screen.queryByText("Nothing needs your attention")).toBeNull();
+  act(() => { for (const fn of callbacks()) fn(frame("reviewing", 3) as never); });
+  expect(screen.getByText("Nothing needs your attention")).toBeTruthy();
+  expect(refreshSource).not.toHaveBeenCalled(); qc.clear();
 });

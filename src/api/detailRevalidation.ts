@@ -1,16 +1,22 @@
 import type { Query, QueryClient } from "@tanstack/react-query";
 import type { PrDetail, PullRequest, ReadinessField, RowObservation } from "../types/pr";
+import type { ProviderReceipt } from "./sourceRefresh";
 import { reviewAccountGeneration } from "./reviewOperations";
 
 type Facts = Record<string, string>;
-interface Target { revision: number; facts: Facts }
+interface Target { revision: number; facts: Facts; probe?: boolean }
 interface State { facts: Facts; observed: Facts; initial: boolean; revision: number; required?: Target; reading?: number; account: number; session: number }
-interface Source { session?: string; generation: number; retired: Set<string> }
+type Member = Pick<PullRequest, "repo" | "number">;
+interface Source { session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
+const memberKey = (row: Member) => JSON.stringify([row.repo.toLowerCase(), row.number]);
 const states = new WeakMap<Query, State>();
 const sources = new WeakMap<QueryClient, Source>();
 export const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
 export const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
-const detailQuery = (qc: QueryClient, repo: string, number: number) => qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+const detailQuery = (qc: QueryClient, repo: string, number: number) => qc.getQueryCache().find({
+  queryKey: ["pr-detail"], exact: false,
+  predicate: query => typeof query.queryKey[1] === "string" && query.queryKey[1].toLowerCase() === repo.toLowerCase() && query.queryKey[2] === number,
+});
 const ordered = (values: unknown[]) => JSON.stringify(values.map(v => JSON.stringify(v)).sort());
 function facts(row: PullRequest): Facts {
   const observation = row.observation;
@@ -41,7 +47,7 @@ function baseline(detail: PrDetail | undefined): Facts {
 function source(qc: QueryClient): Source {
   let value = sources.get(qc);
   if (value) return value;
-  value = { generation: 0, retired: new Set() }; sources.set(qc, value);
+  value = { generation: 0, retired: new Set(), account: reviewAccountGeneration(qc), membership: {} }; sources.set(qc, value);
   // Query-owned targets disappear with their query. A single subscription per
   // client reconciles actual fetch successes, never optimistic/manual patches.
   qc.getQueryCache().subscribe(event => {
@@ -86,13 +92,21 @@ function request(qc: QueryClient, query: Query) {
 }
 /** Only accepted source rows call this. Receipt time and mutation acknowledgments
  * are deliberately absent from the fingerprint; neither is a provider fact. */
-export function acceptDetailFacts(qc: QueryClient, rows: PullRequest[], session?: string) {
+export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, list }: ProviderReceipt & { list: "authored" | "reviewing" }) {
   const src = source(qc);
   if (session !== undefined && src.retired.has(session)) return;
   if (session !== undefined && session !== src.session) {
     if (src.session !== undefined) { src.retired.add(src.session); src.generation++; }
     src.session = session;
+    src.membership = {};
   }
+  const account = reviewAccountGeneration(qc);
+  if (src.account !== account) { src.membership = {}; src.account = account; }
+  const previous = src.membership[list] ?? new Map<string, Member>();
+  const observed = new Map(rows.filter(row => row.observation?.state !== "retained").map(row => [memberKey(row), { repo: row.repo, number: row.number }]));
+  const present = new Set(rows.map(memberKey));
+  const missing = coverage === "complete" ? [...previous].filter(([id]) => !present.has(id)).map(([, row]) => row) : [];
+  src.membership[list] = coverage === "complete" ? new Map([...previous].filter(([id]) => present.has(id)).concat([...observed])) : new Map([...previous, ...observed]);
   for (const row of rows) {
     const query = detailQuery(qc, row.repo, row.number);
     if (!query) continue;
@@ -111,6 +125,21 @@ export function acceptDetailFacts(qc: QueryClient, rows: PullRequest[], session?
     if (!changed) continue;
     state.required = { revision: ++state.revision, facts: { ...state.observed } };
     // Inactive details need a stale marker, but no provider command.
+    void qc.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
+    request(qc, query);
+  }
+  for (const row of missing) {
+    const query = detailQuery(qc, row.repo, row.number);
+    if (!query) continue;
+    let state = current(qc, query);
+    if (!state) {
+      state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: false, revision: 0, account, session: src.generation };
+      states.set(query, state);
+    }
+    // Two inventories can lose the same PR while one probe is pending. Its
+    // result observes state without predicting CLOSED or MERGED from absence.
+    if (state.required?.probe) continue;
+    state.required = { revision: ++state.revision, facts: {}, probe: true };
     void qc.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
     request(qc, query);
   }
@@ -136,6 +165,7 @@ export function retireDetailOwnership(qc: QueryClient, resetSessions = false) {
   if (resetSessions) src.retired.clear();
   else if (src.session) src.retired.add(src.session);
   src.session = undefined;
+  src.membership = {};
   src.generation++;
   reviewReconciliations.delete(qc);
 }
