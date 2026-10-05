@@ -509,3 +509,299 @@ fn fixed_metadata_child_does_not_wait_for_descendant_inherited_pipe() {
     assert_eq!(bytes, b"fixture");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
+
+#[test]
+fn discovery_rejects_foreign_child_before_probes_but_explicit_root_allows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let foreign = root.join("foreign");
+    std::fs::create_dir_all(foreign.join(".cargo")).unwrap();
+    std::fs::write(
+        foreign.join(".cargo/config.toml"),
+        "[build]\ntarget-dir='output'\n",
+    )
+    .unwrap();
+    std::fs::create_dir(foreign.join("output")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    for explicit in [false, true] {
+        let mut probes = Vec::new();
+        let mut roots = vec![root.display().to_string()];
+        if explicit {
+            roots.push(foreign.display().to_string());
+        }
+        let found = discovery::discover_with(
+            &[],
+            &Settings {
+                external_roots: roots,
+                additional_locations: false,
+            },
+            &stop,
+            Instant::now(),
+            (
+                |path, _| {
+                    Ok(if path.starts_with(&foreign) {
+                        "foreign"
+                    } else {
+                        "parent"
+                    }
+                    .into())
+                },
+                |path, kind| probes.push((path.to_path_buf(), kind.to_owned())),
+            ),
+        );
+        if explicit {
+            assert!(probes
+                .iter()
+                .any(|(path, kind)| path == &foreign && kind == "read_dir"));
+        } else {
+            assert!(
+                !probes.iter().any(|(path, _)| path.starts_with(&foreign)),
+                "foreign probes={probes:?}"
+            );
+            assert!(found
+                .coverage
+                .iter()
+                .any(|c| c.reason.contains("filesystem")));
+            assert!(!found.roots.contains(&foreign));
+        }
+    }
+}
+
+#[test]
+fn partial_history_across_scopes_cannot_evict_complete_baseline() {
+    use crate::store::disk_observations as history;
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(history::MIGRATION_SQL).unwrap();
+    let first = observation();
+    history::save(&mut conn, &first).unwrap();
+    for i in 0..256 {
+        let mut partial = first.clone();
+        partial.id = format!("partial-{i}");
+        partial.finished_at = 1000 + i;
+        partial.status = "partial".into();
+        partial.volume.id = format!("scope-{}", i % 9);
+        let _ = history::save(&mut conn, &partial);
+    }
+    assert!(
+        history::latest(&conn, "stable").unwrap().is_some(),
+        "global partial pressure removed baseline"
+    );
+    assert!(history::history(&conn).unwrap().len() <= 256);
+}
+
+#[test]
+fn partial_history_byte_pressure_preserves_complete_baseline_and_refuses_unsaved_current() {
+    use crate::store::disk_observations as history;
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(history::MIGRATION_SQL).unwrap();
+    let mut first = observation();
+    first.configuration = "x".repeat(7 * 1024 * 1024);
+    history::save(&mut conn, &first).unwrap();
+    let mut second = first.clone();
+    second.id = "other-complete".into();
+    second.volume.id = "other".into();
+    second.finished_at += 1;
+    history::save(&mut conn, &second).unwrap();
+    let mut partial = first.clone();
+    partial.id = "partial".into();
+    partial.finished_at += 2;
+    partial.status = "partial".into();
+    assert!(
+        history::save(&mut conn, &partial).is_err(),
+        "partial that cannot fit must explicitly refuse persistence"
+    );
+    assert!(history::latest(&conn, "stable").unwrap().is_some());
+    assert!(history::latest(&conn, "other").unwrap().is_some());
+    assert!(partial.locations[0].allocated.is_some());
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT SUM(length(CAST(payload AS BLOB))) FROM disk_observations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes <= 16 * 1024 * 1024);
+}
+
+#[test]
+fn linked_worktrees_require_cross_volume_selection_and_enumerate_common_directory_once() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let linked1 = root.join("foreign-one");
+    let linked2 = root.join("foreign-two");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"]);
+    git(&["commit", "--allow-empty", "-m", "fixture", "--quiet"]);
+    for linked in [&linked1, &linked2] {
+        git(&["worktree", "add", "--detach", linked.to_str().unwrap()]);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    for explicit in [false, true] {
+        let mut roots = vec![repo.display().to_string()];
+        if explicit {
+            roots.extend([linked1.display().to_string(), linked2.display().to_string()]);
+        }
+        let mut probes = Vec::new();
+        let found = discovery::discover_with(
+            &[],
+            &Settings {
+                external_roots: roots,
+                additional_locations: false,
+            },
+            &stop,
+            Instant::now(),
+            (
+                |path, _| {
+                    Ok(
+                        if path.starts_with(&linked1) || path.starts_with(&linked2) {
+                            "foreign"
+                        } else {
+                            "parent"
+                        }
+                        .into(),
+                    )
+                },
+                |path, kind| probes.push((path.to_path_buf(), kind.to_owned())),
+            ),
+        );
+        assert_eq!(
+            probes.iter().filter(|(_, kind)| kind == "git").count(),
+            1,
+            "one actual listing per common directory"
+        );
+        for linked in [&linked1, &linked2] {
+            assert_eq!(found.roots.contains(linked), explicit);
+            if !explicit {
+                assert!(!probes.iter().any(|(path, _)| path.starts_with(linked)));
+            }
+        }
+        if !explicit {
+            assert!(found
+                .coverage
+                .iter()
+                .any(|c| c.reason.contains("filesystem")));
+        }
+    }
+}
+
+#[test]
+fn configured_cargo_target_on_another_volume_requires_explicit_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    let target = root.join("foreign-target");
+    std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(
+        repo.join(".cargo/config.toml"),
+        format!("[build]\ntarget-dir={:?}\n", target.display().to_string()),
+    )
+    .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    for explicit in [false, true] {
+        let mut roots = vec![repo.display().to_string()];
+        if explicit {
+            roots.push(target.display().to_string());
+        }
+        let found = discovery::discover_with(
+            &[],
+            &Settings {
+                external_roots: roots,
+                additional_locations: false,
+            },
+            &stop,
+            Instant::now(),
+            (
+                |path, _| {
+                    Ok(if path.starts_with(&target) {
+                        "foreign"
+                    } else {
+                        "parent"
+                    }
+                    .into())
+                },
+                |_, _| {},
+            ),
+        );
+        assert_eq!(found.roots.contains(&target), explicit);
+        assert_eq!(
+            found
+                .locations
+                .iter()
+                .any(|l| l.path == target.display().to_string()),
+            explicit
+        );
+    }
+}
+
+#[test]
+fn same_scope_partial_byte_pressure_prunes_partial_before_its_complete_baseline() {
+    use crate::store::disk_observations as history;
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(history::MIGRATION_SQL).unwrap();
+    let mut first = observation();
+    first.configuration = "x".repeat(7 * 1024 * 1024);
+    history::save(&mut conn, &first).unwrap();
+    for i in 0..2 {
+        let mut partial = first.clone();
+        partial.id = format!("large-partial-{i}");
+        partial.finished_at += i + 1;
+        partial.status = "partial".into();
+        history::save(&mut conn, &partial).unwrap();
+    }
+    assert_eq!(history::latest(&conn, "stable").unwrap().unwrap().id, "one");
+    let saved = history::history(&conn).unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(saved.iter().any(|o| o.id == "large-partial-1"));
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT SUM(length(CAST(payload AS BLOB))) FROM disk_observations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes <= 16 * 1024 * 1024);
+    let mut newer = first.clone();
+    newer.id = "new-complete".into();
+    newer.volume.id = "another-scope".into();
+    newer.finished_at += 3;
+    history::save(&mut conn, &newer).unwrap();
+    assert!(history::latest(&conn, "stable").unwrap().is_some());
+    assert!(history::latest(&conn, "another-scope").unwrap().is_some());
+    let mut newest = newer.clone();
+    newest.id = "newest-complete".into();
+    newest.volume.id = "third-scope".into();
+    newest.finished_at += 1;
+    history::save(&mut conn, &newest).unwrap();
+    assert!(
+        history::latest(&conn, "stable").unwrap().is_none(),
+        "only competing newer complete baselines retire an old complete baseline"
+    );
+    assert!(history::latest(&conn, "another-scope").unwrap().is_some());
+    assert!(history::latest(&conn, "third-scope").unwrap().is_some());
+}

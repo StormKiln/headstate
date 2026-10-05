@@ -14,10 +14,40 @@ pub fn save(conn: &mut Connection, observation: &Observation) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
     tx.execute("INSERT OR REPLACE INTO disk_observations(id,scope_id,observed_at,complete,payload) VALUES (?1,?2,?3,?4,?5)", params![observation.id, observation.volume.id, observation.finished_at, observation.status == "complete", payload]).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM disk_observations WHERE scope_id=?1 AND id NOT IN (SELECT id FROM disk_observations WHERE scope_id=?1 ORDER BY observed_at DESC,id DESC LIMIT 31) AND id NOT IN (SELECT id FROM disk_observations WHERE scope_id=?1 AND complete=1 ORDER BY observed_at DESC,id DESC LIMIT 1)", [&observation.volume.id]).map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM disk_observations WHERE id NOT IN (SELECT id FROM disk_observations ORDER BY observed_at DESC,id DESC LIMIT 256)", []).map_err(|e| e.to_string())?;
-    // Bound both row count and serialized bytes, including old large observations.
-    // If the global bound retires a baseline, the next comparison reports no baseline.
-    tx.execute("DELETE FROM disk_observations WHERE id IN (SELECT id FROM (SELECT id, SUM(length(CAST(payload AS BLOB))) OVER (ORDER BY observed_at DESC,id DESC) AS cumulative_bytes FROM disk_observations) WHERE cumulative_bytes > 16777216)", []).map_err(|e| e.to_string())?;
+    // Reserve each scope's newest complete baseline before spending global
+    // capacity on partial or older observations. Only competing complete
+    // baselines can retire an old baseline when their own budget is exceeded.
+    let candidates = {
+        let mut statement = tx.prepare("SELECT id, length(CAST(payload AS BLOB)) FROM (SELECT id,payload,observed_at,complete,ROW_NUMBER() OVER (PARTITION BY scope_id ORDER BY complete DESC,observed_at DESC,id DESC) AS scope_rank FROM disk_observations) ORDER BY CASE WHEN complete=1 AND scope_rank=1 THEN 0 ELSE 1 END,observed_at DESC,id DESC").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let (mut count, mut bytes, mut current_saved) = (0usize, 0i64, false);
+    for (id, size) in candidates {
+        if count < 256
+            && bytes
+                .checked_add(size)
+                .is_some_and(|total| total <= 16 * 1024 * 1024)
+        {
+            count += 1;
+            bytes += size;
+            current_saved |= id == observation.id;
+        } else {
+            tx.execute("DELETE FROM disk_observations WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if !current_saved {
+        // Roll back, leaving prior history intact; the controller still publishes
+        // the current useful measurement with this explicit persistence refusal.
+        return Err("History capacity is reserved for complete baselines; the current measurement was not saved.".into());
+    }
     tx.commit().map_err(|e| e.to_string())
 }
 pub fn latest(conn: &Connection, scope: &str) -> Result<Option<Observation>, String> {

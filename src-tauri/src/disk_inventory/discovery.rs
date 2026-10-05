@@ -139,6 +139,28 @@ pub fn discover(
     stop: &Arc<AtomicBool>,
     started: Instant,
 ) -> Discovery {
+    discover_with(
+        repository_roots,
+        settings,
+        stop,
+        started,
+        (
+            |path, metadata| platform::file_facts(path, metadata).map(|facts| facts.volume),
+            |_, _| {},
+        ),
+    )
+}
+
+pub(super) fn discover_with(
+    repository_roots: &[String],
+    settings: &Settings,
+    stop: &Arc<AtomicBool>,
+    started: Instant,
+    (mut volume_for, mut observe): (
+        impl FnMut(&Path, &std::fs::Metadata) -> Result<String, String>,
+        impl FnMut(&Path, &str),
+    ),
+) -> Discovery {
     let mut map = BTreeMap::new();
     let mut coverage = vec![];
     let mut roots = BTreeSet::new();
@@ -181,11 +203,31 @@ pub fn discover(
             });
         }
     }
-    let mut stack: Vec<_> = roots.iter().map(|p| (p.clone(), 0usize)).collect();
+    let mut selected = BTreeMap::new();
+    for root in &roots {
+        match std::fs::symlink_metadata(root)
+            .map_err(|e| e.to_string())
+            .and_then(|metadata| volume_for(root, &metadata))
+        {
+            Ok(device) => {
+                selected.insert(root.clone(), device);
+            }
+            Err(reason) => coverage.note(Coverage {
+                affects_completeness: true,
+                path: root.display().to_string(),
+                reason,
+            }),
+        }
+    }
+    let mut stack: Vec<_> = selected
+        .iter()
+        .map(|(p, device)| (p.clone(), 0usize, device.clone()))
+        .collect();
     let mut seen = BTreeSet::new();
     let mut repos = BTreeSet::new();
     let mut entries_seen = 0usize;
-    while let Some((path, depth)) = stack.pop() {
+    let mut worktree_records = 0usize;
+    while let Some((path, depth, device)) = stack.pop() {
         if stop.load(Ordering::Relaxed)
             || started.elapsed().as_secs() >= 120
             || entries_seen >= 50_000
@@ -201,6 +243,18 @@ pub fn discover(
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
+        let current_device = std::fs::symlink_metadata(&canonical)
+            .map_err(|e| e.to_string())
+            .and_then(|m| volume_for(&canonical, &m));
+        if current_device.as_ref().ok() != Some(&device) {
+            coverage.note(Coverage {
+                affects_completeness: true,
+                path: canonical.display().to_string(),
+                reason: "Another filesystem begins here or the selected scope became unavailable"
+                    .into(),
+            });
+            continue;
+        }
         if !seen.insert(canonical.clone()) {
             continue;
         }
@@ -212,68 +266,98 @@ pub fn discover(
             });
             continue;
         }
-        if canonical.join(".git").exists() && repos.len() >= 256 && !repos.contains(&canonical) {
-            coverage.note(Coverage {
-                affects_completeness: true,
-                path: canonical.display().to_string(),
-                reason: "Repository metadata discovery reached its 256-checkout limit".into(),
-            });
-        }
-        if canonical.join(".git").exists() && repos.len() < 256 && repos.insert(canonical.clone()) {
-            add(
-                &mut map,
-                &canonical,
-                "Repository files",
-                vec!["Git checkout discovered".into()],
-                Some(&canonical),
-                &mut coverage,
-            );
-            let args = [
-                std::ffi::OsStr::new("--no-optional-locks"),
-                std::ffi::OsStr::new("-c"),
-                std::ffi::OsStr::new("core.fsmonitor=false"),
-                std::ffi::OsStr::new("-c"),
-                std::ffi::OsStr::new("core.hooksPath=/dev/null"),
-                std::ffi::OsStr::new("-C"),
-                canonical.as_os_str(),
-                std::ffi::OsStr::new("worktree"),
-                std::ffi::OsStr::new("list"),
-                std::ffi::OsStr::new("--porcelain"),
-                std::ffi::OsStr::new("-z"),
-            ];
-            match process::read("git", &args, None, stop) {
-                Ok(bytes) => {
-                    if bytes.split(|b| *b == 0).count() > 1024 {
-                        coverage.note(Coverage { affects_completeness:true,path:canonical.display().to_string(),reason:"Linked worktree metadata exceeded 1,024 records; remaining locations are unknown".into() });
-                    }
-                    for record in bytes.split(|b| *b == 0).take(1024) {
-                        if let Some(path) = record.strip_prefix(b"worktree ") {
-                            let worktree =
-                                PathBuf::from(String::from_utf8_lossy(path).into_owned());
-                            add(
-                                &mut map,
-                                &worktree,
-                                "Repository files",
-                                vec!["Listed linked worktree".into()],
-                                Some(&canonical),
-                                &mut coverage,
-                            );
-                            if let Ok(worktree) = worktree.canonicalize() {
-                                roots.insert(worktree.clone());
-                                stack.push((worktree, 0));
+        let common = git_common_dir(
+            &canonical,
+            &device,
+            &selected,
+            &mut volume_for,
+            &mut coverage,
+        );
+        if let Some(common) = common.filter(|common| !repos.contains(common)) {
+            if repos.len() >= 256 || worktree_records >= 1024 {
+                coverage.note(Coverage { affects_completeness:true,path:canonical.display().to_string(),reason:"Repository metadata discovery reached its 256-common-directory or 1,024-total-record limit".into() });
+            } else {
+                repos.insert(common);
+                add(
+                    &mut map,
+                    &canonical,
+                    "Repository files",
+                    vec!["Git checkout discovered".into()],
+                    Some(&canonical),
+                    &mut coverage,
+                );
+                let args = [
+                    std::ffi::OsStr::new("--no-optional-locks"),
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new("core.fsmonitor=false"),
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new("core.hooksPath=/dev/null"),
+                    std::ffi::OsStr::new("-C"),
+                    canonical.as_os_str(),
+                    std::ffi::OsStr::new("worktree"),
+                    std::ffi::OsStr::new("list"),
+                    std::ffi::OsStr::new("--porcelain"),
+                    std::ffi::OsStr::new("-z"),
+                ];
+                observe(&canonical, "git");
+                match process::read("git", &args, None, stop) {
+                    Ok(bytes) => {
+                        for record in bytes.split(|b| *b == 0).filter(|record| !record.is_empty()) {
+                            if worktree_records >= 1024 {
+                                coverage.note(Coverage { affects_completeness:true,path:canonical.display().to_string(),reason:"Linked worktree metadata exceeded 1,024 total records; remaining locations are unknown".into() });
+                                break;
+                            }
+                            worktree_records += 1;
+                            if let Some(path) = record.strip_prefix(b"worktree ") {
+                                let worktree =
+                                    PathBuf::from(String::from_utf8_lossy(path).into_owned());
+                                let Some((worktree, worktree_device)) = admit_derived(
+                                    &worktree,
+                                    &device,
+                                    &selected,
+                                    &mut volume_for,
+                                    &mut coverage,
+                                ) else {
+                                    continue;
+                                };
+                                add(
+                                    &mut map,
+                                    &worktree,
+                                    "Repository files",
+                                    vec!["Listed linked worktree".into()],
+                                    Some(&canonical),
+                                    &mut coverage,
+                                );
+                                if let Ok(worktree) = worktree.canonicalize() {
+                                    roots.insert(worktree.clone());
+                                    stack.push((worktree, 0, worktree_device));
+                                }
                             }
                         }
                     }
+                    Err(reason) => coverage.note(Coverage {
+                        affects_completeness: true,
+                        path: canonical.display().to_string(),
+                        reason,
+                    }),
                 }
-                Err(reason) => coverage.note(Coverage {
-                    affects_completeness: true,
-                    path: canonical.display().to_string(),
-                    reason,
-                }),
             }
         }
+        let cargo = canonical.join(".cargo");
+        let cargo_allowed = std::fs::symlink_metadata(&cargo).is_ok()
+            && admit_derived(&cargo, &device, &selected, &mut volume_for, &mut coverage).is_some();
         for name in ["config.toml", "config"] {
-            let config = canonical.join(".cargo").join(name);
+            if !cargo_allowed {
+                break;
+            }
+            let config = cargo.join(name);
+            if std::fs::symlink_metadata(&config).is_ok()
+                && admit_derived(&config, &device, &selected, &mut volume_for, &mut coverage)
+                    .is_none()
+            {
+                continue;
+            }
+            observe(&config, "config");
             let target = match declared_target(&config) {
                 Ok(target) => target,
                 Err(reason) => {
@@ -291,6 +375,11 @@ pub fn discover(
                 } else {
                     canonical.join(target)
                 };
+                let Some((target, _)) =
+                    admit_derived(&target, &device, &selected, &mut volume_for, &mut coverage)
+                else {
+                    continue;
+                };
                 add(
                     &mut map,
                     &target,
@@ -304,6 +393,7 @@ pub fn discover(
                 }
             }
         }
+        observe(&canonical, "read_dir");
         let entries = match std::fs::read_dir(&canonical) {
             Ok(e) => e,
             Err(e) => {
@@ -363,6 +453,26 @@ pub fn discover(
             if !metadata.is_dir() {
                 continue;
             }
+            match volume_for(&child, &metadata) {
+                Ok(child_device) if child_device == device => {}
+                Ok(_) => {
+                    coverage.note(Coverage {
+                        affects_completeness: true,
+                        path: child.display().to_string(),
+                        reason: "Another filesystem begins here; select this location separately"
+                            .into(),
+                    });
+                    continue;
+                }
+                Err(reason) => {
+                    coverage.note(Coverage {
+                        affects_completeness: true,
+                        path: child.display().to_string(),
+                        reason,
+                    });
+                    continue;
+                }
+            }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name == ".git" {
@@ -372,6 +482,7 @@ pub fn discover(
                 name.as_ref(),
                 "target" | "node_modules" | ".terraform" | "dist" | "build" | "bin" | "obj"
             );
+            observe(&child, "signature");
             if candidate || cargo_signature(&child) {
                 let (category, evidence) = if cargo_signature(&child) {
                     (
@@ -404,7 +515,7 @@ pub fn discover(
         }
         children.sort();
         for child in children.into_iter().rev() {
-            stack.push((child, depth + 1));
+            stack.push((child, depth + 1, device.clone()));
         }
     }
     Discovery {
@@ -433,11 +544,133 @@ fn declared_target(config: &Path) -> Result<Option<PathBuf>, String> {
     if raw.len() > 1024 * 1024 {
         return Err("Cargo configuration grew beyond its 1 MiB read limit".into());
     }
-    let value = toml::from_str::<toml::Value>(&raw)
-        .map_err(|e| format!("Cargo configuration could not be read: {e}"))?;
+    let value = toml::from_str::<toml::Value>(&raw).map_err(|_| {
+        "Cargo configuration could not be parsed; target directory is unknown".to_string()
+    })?;
     Ok(value
         .get("build")
         .and_then(|v| v.get("target-dir"))
         .and_then(|v| v.as_str())
         .map(PathBuf::from))
+}
+
+fn admit_derived(
+    path: &Path,
+    origin: &str,
+    selected: &BTreeMap<PathBuf, String>,
+    volume_for: &mut impl FnMut(&Path, &std::fs::Metadata) -> Result<String, String>,
+    coverage: &mut Vec<Coverage>,
+) -> Option<(PathBuf, String)> {
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if platform::is_link(&metadata) {
+            return Err("Symbolic link not followed during derived-location discovery".into());
+        }
+        let canonical = path.canonicalize().map_err(|e| e.to_string())?;
+        let device = volume_for(&canonical, &metadata)?;
+        if device != origin
+            && !selected
+                .iter()
+                .any(|(root, scope)| canonical.starts_with(root) && scope == &device)
+        {
+            return Err("Another filesystem begins here; select this location separately".into());
+        }
+        Ok((canonical, device))
+    })();
+    match result {
+        Ok(value) => Some(value),
+        Err(reason) => {
+            coverage.note(Coverage {
+                affects_completeness: true,
+                path: path.display().to_string(),
+                reason,
+            });
+            None
+        }
+    }
+}
+fn git_common_dir(
+    repo: &Path,
+    origin: &str,
+    selected: &BTreeMap<PathBuf, String>,
+    volume_for: &mut impl FnMut(&Path, &std::fs::Metadata) -> Result<String, String>,
+    coverage: &mut Vec<Coverage>,
+) -> Option<PathBuf> {
+    let marker = repo.join(".git");
+    let metadata = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            coverage.note(Coverage {
+                affects_completeness: true,
+                path: marker.display().to_string(),
+                reason: error.to_string(),
+            });
+            return None;
+        }
+    };
+    let (marker, _) = admit_derived(&marker, origin, selected, volume_for, coverage)?;
+    let git_dir = if metadata.is_dir() {
+        marker
+    } else {
+        let raw = metadata_or_note(small_metadata(&marker), &marker, coverage)?;
+        let pointer = metadata_or_note(
+            raw.trim()
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| "Git checkout location metadata is unrecognized".into()),
+            &marker,
+            coverage,
+        )?;
+        let path = PathBuf::from(pointer);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo.join(path)
+        };
+        admit_derived(&path, origin, selected, volume_for, coverage)?.0
+    };
+    let common_marker = git_dir.join("commondir");
+    if !common_marker.exists() {
+        return Some(git_dir);
+    }
+    let (common_marker, _) = admit_derived(&common_marker, origin, selected, volume_for, coverage)?;
+    let raw = metadata_or_note(small_metadata(&common_marker), &common_marker, coverage)?;
+    let path = PathBuf::from(raw.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    };
+    admit_derived(&path, origin, selected, volume_for, coverage).map(|(path, _)| path)
+}
+fn small_metadata(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(16 * 1024 + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    if text.len() > 16 * 1024 {
+        return Err("Git location metadata exceeded16KiB".into());
+    }
+    Ok(text)
+}
+
+fn metadata_or_note<T>(
+    result: Result<T, String>,
+    path: &Path,
+    coverage: &mut Vec<Coverage>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(reason) => {
+            coverage.note(Coverage {
+                affects_completeness: true,
+                path: path.display().to_string(),
+                reason,
+            });
+            None
+        }
+    }
 }
