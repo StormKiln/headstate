@@ -11,3 +11,11 @@ test('opaque principal observations are not operation scopes in reconciliation',
  const events=[{seq:1,id:900,operation:'advisory-share',stage:'demand',code:0},{seq:2,id:900,operation:'advisory-share',stage:'allocated',code:8},{seq:3,id:900,operation:'advisory-share',stage:'debit',code:1}];
  assert.equal(reconcile(events,[]).unfinished.length,0);
 });
+import {usefulPublications,assertCompletionDeadline} from './ready-completion.mjs';
+test('retained or expired presence cannot satisfy useful completion, and late complete cannot pass',()=>{
+ const expected=[51],retained=usefulPublications([{number:51,freshPusher:false,freshRules:false,freshStack:false}],expected);
+ assert.throws(()=>assertCompletionDeadline(retained,expected,899000,900000));
+ const valid=usefulPublications([{number:51,freshPusher:true,freshRules:true,freshStack:false},{number:51,freshStack:true}],expected);
+ assert.doesNotThrow(()=>assertCompletionDeadline(valid,expected,899000,900000));
+ assert.throws(()=>assertCompletionDeadline(valid,expected,900001,900000));
+});

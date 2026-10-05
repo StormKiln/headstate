@@ -18,19 +18,33 @@ const commits:{phase:string;actual:number;base:number;started:number;at:number}[
 const longTasks:{at:number;duration:number}[]|null=PerformanceObserver.supportedEntryTypes.includes('longtask')?[]:null;
 if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())boundedPush(longTasks,{at:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});
 let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
-const probe={inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
+const advisoryPublications:{at:number;wallTime:number;kind:string;identity:unknown;number:number;owner:unknown;generation:unknown;freshPusher:boolean;freshRules:boolean;freshStack:boolean}[]=[];
+const probe={advisoryPublications,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
  const schedule=query.meta?.advisorySchedule as {claims?:Map<string,boolean>;lastAdmittedAt?:number;hasContinuation?:boolean;resumeBoostSpent?:boolean}|undefined;
- const freshness=(field:string)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
+ const freshness=(field:string,usable:boolean)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:usable&&evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
  return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:schedule?{lastAdmittedAt:schedule.lastAdmittedAt,hasContinuation:schedule.hasContinuation,resumeBoostSpent:schedule.resumeBoostSpent,preferred:[...(schedule.claims?.values()??[])].some(Boolean)}:undefined,
-  evidence:{pusher:freshness('pusher'),rules:freshness('rules'),stack:freshness('lastKnown')},
+  evidence:{pusher:freshness('pusher',(value?.row as {last_pusher?:{state:string}}|undefined)?.last_pusher?.state==='known'),rules:freshness('rules',(value?.row as {rules?:{state:string}}|undefined)?.rules?.state==='read'),stack:freshness('lastKnown',(value?.stack as {kind:string}|undefined)?.kind==='none')},
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
-  ...(query.queryKey[0]==='stats-board'?{days:query.queryKey[3],total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
+  ...(query.queryKey[0]==='stats-board'?{owner:value?.owner,viewer:value?.viewer,scopeKey:value?.scopeKey,days:query.queryKey[3],daysCovered:value?.daysCovered,daysTotal:value?.daysTotal,total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
 }),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
 declare global {interface Window {__enterprise:typeof probe}}
 window.__enterprise=probe;
 const client=new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false}}});
+// Read-only post-publication witnesses. Presence of retained last-known data is
+// not evidence that this generation ever published usable unexpired authority.
+client.getQueryCache().subscribe(event=>{
+ if(event.type!=='updated'||event.action.type!=='success')return;
+ const query=event.query,kind=String(query.queryKey[0]);
+ if(!['ready-pushers','ready-stack'].includes(kind))return;
+ const value=query.state.data as {row?:{last_pusher:{state:string};rules:{state:string}};stack?:{kind:string};pusher?:{expiresAt:number};rules?:{expiresAt:number};lastKnown?:{expiresAt:number}}|undefined;
+ const at=performance.now(),identity=JSON.parse(String(query.queryKey[3]));
+ boundedPush(advisoryPublications,{at,wallTime:Date.now(),kind,identity,number:JSON.parse(identity[0])[3],owner:query.queryKey[1],generation:query.queryKey[2],
+  freshPusher:value?.row?.last_pusher.state==='known'&&(value.pusher?.expiresAt??0)>at,
+  freshRules:value?.row?.rules.state==='read'&&(value.rules?.expiresAt??0)>at,
+  freshStack:value?.stack?.kind==='none'&&(value.lastKnown?.expiresAt??0)>at});
+});
 useFilters.getState().setStatsScope('org','synthetic-lab',undefined);
 export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');

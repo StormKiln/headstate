@@ -14,6 +14,14 @@ export function advisoryPeriods(events){
  }
  return periods;
 }
+export function usefulPublications(publications,expected){
+ const set=new Set(expected);
+ return Object.fromEntries([['pushers','freshPusher'],['rules','freshRules'],['stacks','freshStack']].map(([family,field])=>[family,[...new Set(publications.filter(p=>set.has(p.number)&&p[field]).map(p=>p.number))].sort((a,b)=>a-b)]));
+}
+export function assertCompletionDeadline(coverage,expected,elapsedMs,ceilingMs){
+ assert.ok(elapsedMs<=ceilingMs,'first qualifying observation must be inside the declared deadline');
+ for(const family of ['pushers','rules','stacks'])assert.deepEqual(coverage[family],expected,'every identity needs an actually fresh post-publication witness');
+}
 export async function runReadyCompletion({pages,provider,result,out,control,nativeCall}){
  const began=performance.now(),ceilingMs=900000,expected=Array.from({length:16},(_,i)=>51+i);
  const evidence={ceilingMs,clock:'real30s selection / real60s Stats',layout:'desktop production ReadyStrip16; paired production Stats after brief disjoint Ready interest',expected,setup:[],snapshots:[],periods:[]};
@@ -46,12 +54,11 @@ export async function runReadyCompletion({pages,provider,result,out,control,nati
   await pages[0].getByRole('button',{name:'To Review',exact:true}).click();
   const mounted=performance.now();let lastMoved=-1;
   while(performance.now()-began<ceilingMs){
-   await delay(15000);
+   await delay(Math.min(15000,Math.max(0,ceilingMs-(performance.now()-began))));
    const minute=Math.floor((performance.now()-mounted)/60000);
    if(minute!==lastMoved){const rows=pages[0].locator('[data-advisory-key]');await rows.nth((minute*8)%16).scrollIntoViewIfNeeded();lastMoved=minute;}
-   const ui=await pages[0].evaluate(()=>({queries:window.__enterprise.querySummary(),commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name.startsWith('get_ready_')),identities:[...document.querySelectorAll('[data-advisory-key]')].map(n=>Number(JSON.parse(n.getAttribute('data-advisory-key'))[3])).sort((a,b)=>a-b)}));
-   const measured=(kind,field)=>[...new Set(ui.queries.filter(q=>q.kind===kind&&expected.includes(q.syntheticNumber)&&q[field]).map(q=>q.syntheticNumber))].sort((a,b)=>a-b);
-   const snapshot={elapsedMs:performance.now()-began,mountedMs:performance.now()-mounted,minute,ui,pushers:measured('ready-pushers','measuredPusher'),rules:measured('ready-pushers','measuredRules'),stacks:measured('ready-stack','measuredStack'),providerReceipts:provider.ledger.length};
+   const ui=await pages[0].evaluate(()=>({queries:window.__enterprise.querySummary(),publications:window.__enterprise.advisoryPublications,commands:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name.startsWith('get_ready_')),identities:[...document.querySelectorAll('[data-advisory-key]')].map(n=>Number(JSON.parse(n.getAttribute('data-advisory-key'))[3])).sort((a,b)=>a-b)}));
+   const snapshot={elapsedMs:performance.now()-began,mountedMs:performance.now()-mounted,minute,ui,...usefulPublications(ui.publications,expected),providerReceipts:provider.ledger.length};
    evidence.snapshots.push(snapshot);evidence.periods=advisoryPeriods(await events());await save();
    console.log(JSON.stringify({readyCompletionMs:snapshot.elapsedMs,pushers:snapshot.pushers.length,rules:snapshot.rules.length,stacks:snapshot.stacks.length}));
    assert.deepEqual(ui.identities,expected,'exact mounted16 production rows');
@@ -64,7 +71,7 @@ export async function runReadyCompletion({pages,provider,result,out,control,nati
   const target=provider.ledger.filter(e=>['stack-down','stack-up'].includes(e.stage)&&e.subjects?.some(s=>s.number===51));
   evidence.expiredStage={target,firstDownAt:firstDown.at,subsequentDown:target.find(e=>e.stage==='stack-down'&&e.at-firstDown.at>=60000)};
   evidence.lastPairedDemandNs=lastPaired;evidence.soloEight=solo;evidence.elapsedMs=performance.now()-began;await save();
-  for(const ids of [last?.pushers,last?.rules,last?.stacks])assert.deepEqual(ids,expected,'all16 useful identities finish under declared900s inclusive ceiling');
+  assertCompletionDeadline(last,expected,last.elapsedMs,ceilingMs);
   assert.ok(Number.isFinite(lastPaired)&&solo,'paired interest expires and desktop actually debits its solo8');
   assert.ok(evidence.expiredStage.subsequentDown&&target.some(e=>e.stage==='stack-up'&&e.at>=evidence.expiredStage.subsequentDown.at),'expired first leg is fetched again before useful completion');
   for(const period of evidence.periods){assert.ok(Object.values(period.debits).reduce((a,b)=>a+b,0)<=8);for(const [principal,count]of Object.entries(period.debits))assert.ok(count<=period.allocations[principal]);}

@@ -1,4 +1,4 @@
-"""Read-only, identity-free synthetic profile evidence. No SQL mutations."""
+"""Read-only synthetic-only profile evidence (marker required). No SQL mutations."""
 import json, pathlib, sqlite3, sys, datetime
 profile = pathlib.Path(sys.argv[1]).resolve()
 assert (profile / '.enterprise-synthetic').is_file()
@@ -24,5 +24,6 @@ for key, days, measure in db.execute('SELECT scope_key,horizon_days,measure FROM
     for start, end in db.execute("SELECT slice_from,slice_to FROM pr_slice WHERE scope_key=? AND state='complete'", (key,)):
         first, last = datetime.date.fromisoformat(start[:10]), datetime.date.fromisoformat(end[:10])
         covered.update(str(first + datetime.timedelta(days=i)) for i in range((last-first).days+1))
-    result['historyCoverage'].append({'horizonDays': days, 'measure': measure, 'coveredRequiredDays': len(required & covered), 'missingRequiredDays': len(required-covered)})
+    result['historyCoverage'].append({'scope': key, 'horizonDays': days, 'measure': measure, 'coveredRequiredDays': len(required & covered), 'missingRequiredDays': len(required-covered)})
+result['historyIdentities'] = [{'scope':scope,'repo':repo,'number':number,'day':day,'author':author} for scope,repo,number,day,author in db.execute('SELECT scope_key,repo,number,merged_at,author FROM pr_history ORDER BY scope_key,repo,number')]
 print(json.dumps(result))

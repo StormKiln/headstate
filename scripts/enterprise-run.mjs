@@ -1,3 +1,4 @@
+import {runEnterpriseSoak,mountedReadyIdentities} from './enterprise/final-acceptance.mjs';
 import {runReadyCompletion} from './enterprise/ready-completion.mjs';
 import {runStatsConvergence} from './enterprise/stats-convergence.mjs';
 import {runReadyProgress,runDualReadyProgress} from './enterprise/ready-progress.mjs';
@@ -5,8 +6,9 @@ import assert from 'node:assert/strict';import {createServer} from 'node:http';i
 const out=resolve(process.argv[2]);const engineName=process.argv[3]??'chromium';await mkdir(out,{recursive:true});assert.equal((await readdir(out)).length,0,'refuse to overwrite retained run artifacts');const mode=process.argv[4]??'gate';const profile=resolve(out,'profile');const warm=!!process.argv[5];if(warm)await cp(resolve(process.argv[5]),profile,{recursive:true,errorOnExist:true,force:false});await mkdir(profile,{recursive:true});const ready=resolve(out,'ready.json'),secret=randomBytes(32).toString('hex');
 const fingerprint=createHash('sha256').update(execFileSync('git',['diff','HEAD','--no-ext-diff']));for(const file of execFileSync('git',['ls-files','--others','--exclude-standard'],{encoding:'utf8'}).trim().split('\n').filter(Boolean))fingerprint.update(file).update(readFileSync(file));
 const binary=process.env.ENTERPRISE_DRIVER??resolve('src-tauri/target/debug/enterprise-driver');
+const browserAssets=[];async function hashAssets(directory){for(const entry of (await readdir(directory,{withFileTypes:true})).sort((a,b)=>a.name.localeCompare(b.name))){const path=resolve(directory,entry.name);if(entry.isDirectory())await hashAssets(path);else if(entry.isFile())browserAssets.push({path:path.slice(resolve('dist-harness-enterprise').length+1),sha256:createHash('sha256').update(await readFile(path)).digest('hex')});}}await hashAssets(resolve('dist-harness-enterprise'));
 const provider=await startProvider();if(mode==='offline')provider.fault.mode='offline';
-await writeFile(resolve(out,'metadata.json'),JSON.stringify({seed:9001,engine:engineName,mode,warm,build:'debug native + React profiling production browser',strictMode:false,commit:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),dirty:execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim().length>0,patchHash:fingerprint.digest('hex'),sourceTree:execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),nativeBinarySha256:createHash('sha256').update(readFileSync(binary)).digest('hex'),platform:process.platform,architecture:process.arch,osRelease:os.release(),cpu:os.cpus()[0].model,cores:os.cpus().length,memoryBytes:os.totalmem(),cadenceSeconds:60,excluded:['packaged Tauri IPC/WKWebView','installed mobile Rust proxy and lifecycle','real GitHub cost and enterprise SLA'],startedAt:new Date().toISOString()},null,2));const config=resolve(out,'private-config.json');await writeFile(config,JSON.stringify({profile,provider:provider.url,bridge_secret:secret,ready}),{mode:0o600});await writeFile(resolve(out,'manifest.json'),JSON.stringify(manifest,null,2));
+await writeFile(resolve(out,'metadata.json'),JSON.stringify({seed:9001,engine:engineName,mode,warm,browserAssets,build:'debug native + React profiling production browser',strictMode:false,commit:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),dirty:execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim().length>0,patchHash:fingerprint.digest('hex'),sourceTree:execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),nativeBinarySha256:createHash('sha256').update(readFileSync(binary)).digest('hex'),platform:process.platform,architecture:process.arch,osRelease:os.release(),cpu:os.cpus()[0].model,cores:os.cpus().length,memoryBytes:os.totalmem(),cadenceSeconds:60,excluded:['packaged Tauri IPC/WKWebView','installed mobile Rust proxy and lifecycle','real GitHub cost and enterprise SLA'],startedAt:new Date().toISOString()},null,2));const config=resolve(out,'private-config.json');await writeFile(config,JSON.stringify({profile,provider:provider.url,bridge_secret:secret,ready}),{mode:0o600});await writeFile(resolve(out,'manifest.json'),JSON.stringify(manifest,null,2));
 const child=spawn(binary,[config],{stdio:['ignore','pipe','pipe']});child.stdout.pipe(createWriteStream(resolve(out,'native.stdout')));child.stderr.pipe(createWriteStream(resolve(out,'native.stderr')));let exit;const exited=new Promise(r=>child.once('exit',(code,signal)=>{exit={code,signal};r(exit);}));const delay=ms=>new Promise(r=>setTimeout(r,ms));let bridge,proxy,browser,closing=false;const contexts=[],pages=[];const result={engine:engineName,scope:'native-connected production queues and detail',pass:false,mode,warm,samples:[],errors:[],expectedFailures:[],phases:[],quotaModel:{graphqlCapacity:5000,restCapacity:5000,costPerReceivedDocument:1,windowSeconds:120,meaning:'synthetic accounting only; not GitHub query cost'}};
 const nativeCall=(role,command,args={})=>fetch(`${bridge}/call/${role}/${command}`,{method:'POST',headers:{'x-enterprise-secret':secret,'content-type':'application/json'},body:JSON.stringify(args)});
 const control=async action=>{const r=await fetch(`${bridge}/control/${action}`,{method:'POST',headers:{'x-enterprise-secret':secret}});assert.equal(r.status,200);return r.json();};
@@ -33,6 +35,7 @@ try {
   await page.getByTestId('counts').filter({hasText:'Authored 50 / Reviewing 150'}).waitFor({timeout:120000});
   if(mode!=='offline')await page.getByRole('heading',{name:/Ready for review \(150\)/}).waitFor({timeout:30000});
   const inventory=await page.evaluate(()=>window.__enterprise.inventory());const open=provider.data.rows.filter(r=>r.state==='OPEN');assert.deepEqual(inventory.authored,open.filter(r=>r.author.login==='synthetic-viewer').map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort());assert.deepEqual(inventory.reviewing,open.filter(r=>r.reviewRequests.nodes.some(q=>q.requestedReviewer.login==='synthetic-viewer')).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort());
+  if(mode!=='offline')assert.deepEqual(await mountedReadyIdentities(page),inventory.reviewing,'exact mounted production Ready inventory');
   result.samples.push({role:i?'paired':'desktop',firstUsefulQueue:await page.evaluate(()=>window.__enterprise.firstUsefulQueue),fullQueue:await page.evaluate(()=>window.__enterprise.fullQueue)});
   await page.screenshot({path:resolve(out,`queue-${i}.png`),fullPage:false});
   const detailStart=await page.evaluate(()=>performance.now());
@@ -233,40 +236,7 @@ try {
   await pages[0].getByRole('button',{name:'Approved',exact:true}).first().waitFor();
   result.phases.push({name:'foreground-approval-during-held-production-backfill',applied:true,exercised:true,converged:true,pendingMs,confirmedMs:performance.now()-started});provider.fault.delay=0;provider.release();
  }
- if(mode==='soak'){
-  await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();
-  const start=performance.now();result.soak={minimumMs:1800000,checkpoints:[],obligations:{externalClose:false,historyMeasured:false,advisoryObserved:false,reviewGuidanceObserved:false}};
-  provider.fault.closed=[200];provider.fault.merged=[199];
-  // Real cadence only. No wake/refetch loop during the measured soak.
-  for(let tick=0;tick<540;tick++){
-   await delay(5000);
-   if(tick%12===0){
-    const db=JSON.parse(execFileSync('python3',['scripts/enterprise/inspect-profile.py',profile],{encoding:'utf8'}));
-    const rows=pages[0].locator('[data-advisory-key]');const rowCount=await rows.count();if(rowCount)await rows.nth((Math.floor(tick/12)*8)%rowCount).scrollIntoViewIfNeeded();
-    const ui=await pages[0].evaluate(()=>({counts:document.querySelector('[data-testid="counts"]')?.textContent,pusherStatus:document.querySelector('[data-my-pushes-status]')?.textContent,queries:window.__enterprise.querySummary(),lost:window.__enterprise.measurement.lost}));
-    const stats=await pages[1].evaluate(()=>window.__enterprise.querySummary().filter(q=>q.kind==='stats-board'));
-    assert.equal(ui.lost,false);assert.equal(db.integrity,'ok');
-    const measured=(kind,field)=>new Set(ui.queries.filter(q=>q.kind===kind&&q.syntheticNumber>=51&&q.syntheticNumber<=198&&q[field]).map(q=>q.syntheticNumber)).size;const checked=measured('ready-pushers','measuredPusher');
-    result.soak.obligations.externalClose=ui.counts==='Authored 50 / Reviewing 148';
-    result.soak.obligations.historyMeasured=db.historyCoverage.length>0&&db.historyCoverage.every(scope=>scope.missingRequiredDays===0)&&db.counts.pr_history>=250;
-    const rules=measured('ready-pushers','measuredRules');const stacks=measured('ready-stack','measuredStack');
-    result.soak.obligations.advisoryObserved=checked>=148;result.soak.obligations.reviewGuidanceObserved=rules>=148&&stacks>=148;
-    const checkpoint={elapsedMs:performance.now()-start,db,counts:ui.counts,pusherStatus:ui.pusherStatus,observedPushers:checked,observedRules:rules,observedStacks:stacks,stats,providerReceipts:provider.ledger.length};
-    result.soak.checkpoints.push(checkpoint);await writeFile(resolve(out,'soak-progress.json'),JSON.stringify(result.soak,null,2));
-    if(checkpoint.elapsedMs>=result.soak.minimumMs&&Object.values(result.soak.obligations).every(Boolean))break;
-   }
-  }
-  result.soak.elapsedMs=performance.now()-start;assert.ok(result.soak.elapsedMs>=result.soak.minimumMs);
-  const boardQuery=await pages[1].evaluate(()=>window.__enterprise.querySummary().find(q=>q.kind==='stats-board'));
-  const beforeCache=provider.ledger.length;
-  for(let n=0;n<5;n++){const r=await nativeCall('paired','stats_board',{scopeKind:'org',scopeValue:'synthetic-lab',measure:'merged',days:boardQuery.days});assert.equal(r.status,200);const board=(await r.json()).wire;assert.equal(board.complete,true);assert.equal(board.total,250);}
-  assert.equal(provider.ledger.length,beforeCache,'five independently complete warm boards cause zero provider requests');result.soak.completeCacheReads=5;
-  await pages[1].getByRole('button',{name:'To Review',exact:true}).click();await pages[1].getByText('Synthetic description 52',{exact:false}).waitFor();
-  await delay(3000);const beforeUnchanged=await pages[1].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.name==='get_pr_detail'&&e.kind==='call').length);
-  await delay(125000);const afterUnchanged=await pages[1].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.name==='get_pr_detail'&&e.kind==='call').length);
-  assert.equal(afterUnchanged,beforeUnchanged,'unchanged scheduled receipts do not repeatedly retrieve settled active detail');result.soak.unchangedDetailWindowMs=125000;
-  assert.ok(Object.values(result.soak.obligations).every(Boolean),'soak obligations must converge; 45 minute explicit ceiling reports failure rather than silently passing');
- }
+ if(mode==='soak')await runEnterpriseSoak({pages,provider,result,out,profile,nativeCall});
  }
  for(const [i,page] of pages.entries()) {
   const failed=await page.evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.ok===false&&e.name!=='diag_log'));
