@@ -12,8 +12,11 @@ export function replayWarmFixture(data,original,writes,actions){
  assert.equal(writes.length,3);assert.ok(writes.every(r=>r.operation==='review-write'&&r.status===200&&r.terminal==='response-sent'));
  assert.deepEqual(actions.map(a=>a.request.number).sort((a,b)=>a-b),[51,52,53]);
  for(const action of actions){
-  const ask=action.request,receipt=action.response.value?.receipt,row=data.rows.find(r=>r.number===ask.number);
-  assert.equal(action.status,200);assert.equal(action.response.value.outcome,'acknowledged');
+  assert.ok(action.role==='desktop'||action.role==='paired','verified trace role');
+  const envelope=action.role==='desktop'?'value':'wire',other=action.role==='desktop'?'wire':'value';
+  assert.ok(Object.hasOwn(action.response,envelope),'expected role-specific response envelope');assert.equal(Object.hasOwn(action.response,other),false,'reject ambiguous or wrong-role envelope');
+  const value=action.response[envelope],ask=action.request,receipt=value?.receipt,row=data.rows.find(r=>r.number===ask.number);
+  assert.equal(action.status,200);assert.equal(value?.outcome,'acknowledged');assert.ok(receipt,'acknowledged receipt');
   assert.equal(ask.expected_viewer,'synthetic-viewer');assert.equal(ask.verdict,'approve');assert.equal(ask.expected_head,row.headRefOid);assert.equal(ask.repo,row.repository.nameWithOwner);assert.equal(ask.id,row.id);
   assert.equal(receipt.number,row.number);assert.equal(receipt.repo,ask.repo);assert.equal(receipt.pr_id,row.id);assert.equal(receipt.actor,ask.expected_viewer);assert.equal(receipt.commit_oid,row.headRefOid);assert.equal(receipt.state,'APPROVED');
   const review={id:receipt.review_id,state:receipt.state,submittedAt:receipt.submitted_at,author:{login:receipt.actor},commit:{oid:receipt.commit_oid},pullRequest:row};
@@ -26,14 +29,14 @@ export function replayWarmFixture(data,original,writes,actions){
  // Preserve the original close/merge day, not a new mutation receipt.
  const at=new Date(original.soak.checkpoints[0].stats.window.to+'T00:00:00Z');at.setUTCDate(at.getUTCDate()+1);
  for(const [row,state] of [[merged,'MERGED'],[closed,'CLOSED']]){row.state=state;row.closedAt=at.toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}
- return {source,eligible,approved:original.soak.approved,window:last.stats.window,meaning:'simulator replay of verified prior actions/closures; no current-session write evidence'};
+ return {source,eligible,approved:original.soak.approved,actionLineage:actions.map(a=>({role:a.role,number:a.request.number,callId:a.response.callId,head:a.request.expected_head})),window:last.stats.window,meaning:'simulator replay of verified prior actions/closures; no current-session write evidence'};
 }
 export async function loadWarmReplay(inheritedProfile,copiedProfile,provider){
  assert.ok(inheritedProfile,'tail-warm requires an explicitly inherited profile');const dir=dirname(resolve(inheritedProfile));
  const bytes=await Promise.all(['result.json','provider.json','metadata.json'].map(n=>readFile(resolve(dir,n))));const [original,ledger,metadata]=bytes.map(b=>JSON.parse(b));
  const actions=[],hashes=Object.fromEntries(['result.json','provider.json','metadata.json'].map((n,i)=>[n,createHash('sha256').update(bytes[i]).digest('hex')]));
  for(const role of [0,1]){const archive=resolve(dir,`trace-${role}.zip`);hashes[`trace-${role}.zip`]=createHash('sha256').update(await readFile(archive)).digest('hex');const get=name=>execFileSync('unzip',['-p',archive,name],{maxBuffer:32*1024*1024});
-  for(const line of get('trace.network').toString().trim().split('\n')){const s=JSON.parse(line).snapshot;if(s.request.url.endsWith('/review_pr_at_head'))actions.push({request:JSON.parse(get(s.request.postData._file)).request,response:JSON.parse(get(s.response.content._file)),status:s.response.status});}
+  for(const line of get('trace.network').toString().trim().split('\n')){const s=JSON.parse(line).snapshot;if(s.request.url.endsWith('/review_pr_at_head'))actions.push({role:role===0?'desktop':'paired',request:JSON.parse(get(s.request.postData._file)).request,response:JSON.parse(get(s.response.content._file)),status:s.response.status});}
  }
  const state=replayWarmFixture(provider.data,original,ledger.filter(e=>e.operation==='review-write'),actions);
  const yesterday=new Date();yesterday.setUTCDate(yesterday.getUTCDate()-1);assert.equal(state.window.to,yesterday.toISOString().slice(0,10),'same closed-day question as persisted completed board');
