@@ -102,6 +102,7 @@ pub struct SourcePolls(
     String,
     Mutex<GitLabReceipts>,
     Mutex<HashMap<PollKey, u64>>,
+    std::sync::atomic::AtomicU64,
 );
 impl Default for SourcePolls {
     fn default() -> Self {
@@ -112,6 +113,7 @@ impl Default for SourcePolls {
             format!("{}:{}", std::process::id(), chrono::Utc::now().to_rfc3339()),
             Mutex::default(),
             Mutex::default(),
+            std::sync::atomic::AtomicU64::new(0),
         )
     }
 }
@@ -1148,6 +1150,7 @@ fn reconcile_github_snapshot(
             }
         }
         let committed = crate::queue_scan::commit(conn, source, list, owner, scan, |tx| {
+            crate::store::github_facts::apply(tx, list, owner, &mut result.prs)?;
             if scan.state.step_failure.is_some() && !scan.state.received {
                 return crate::store::source_cache::save_owned_source_failure(
                     tx,
@@ -1173,6 +1176,23 @@ fn reconcile_github_snapshot(
                 "The queue changed during this step. Its newer progress was retained.",
             ));
         }
+    } else {
+        let mut save = || -> Result<(), crate::store::StoreError> {
+            let tx = conn.unchecked_transaction()?;
+            crate::store::github_facts::apply(&tx, list, owner, &mut result.prs)?;
+            crate::store::source_cache::save_owned_source_snapshot(
+                &tx,
+                source,
+                list,
+                &result.prs,
+                &result.coverage,
+                Some(owner),
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        save()
+            .map_err(|_| inventory_failure("Saved pull request facts could not be reconciled."))?;
     }
     Ok(result)
 }
@@ -1304,10 +1324,22 @@ fn reconcile_gitlab_snapshot_current(
 }
 
 enum GithubEffect {
+    Facts(crate::store::github_facts::Observation),
     ReviewReadback(Box<crate::github::model::PrDetail>, [u64; 2]),
     QualifyReview(crate::github::mutate::SubmittedReview),
     Review(crate::inventory::ConfirmedReview),
     Remove(crate::github::mutate::ConfirmedRemoval),
+}
+pub fn fact_operation(app: &AppHandle) -> crate::store::github_facts::Operation {
+    app.state::<SourcePolls>().fact_operation()
+}
+impl SourcePolls {
+    fn fact_operation(&self) -> crate::store::github_facts::Operation {
+        crate::store::github_facts::Operation {
+            session: self.3.clone(),
+            sequence: self.6.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        }
+    }
 }
 pub fn review_read_generation(app: &AppHandle) -> [u64; 2] {
     let polls = app.state::<SourcePolls>();
@@ -1352,6 +1384,29 @@ pub async fn record_confirmed_review(
 ) {
     record_github_effect(app, repo, number, viewer, GithubEffect::Review(effect)).await;
 }
+pub async fn record_confirmed_action(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    action: crate::github::mutate::ConfirmedAction,
+    operation: crate::store::github_facts::Operation,
+) {
+    match action {
+        crate::github::mutate::ConfirmedAction::Removal(effect) => {
+            record_confirmed_removal(app, repo, number, effect).await
+        }
+        crate::github::mutate::ConfirmedAction::Facts {
+            viewer,
+            mut observation,
+        } => {
+            for fact in &mut observation.facts {
+                fact.operation = Some(operation.clone());
+            }
+            record_github_effect(app, repo, number, &viewer, GithubEffect::Facts(observation)).await
+        }
+    }
+}
+
 pub async fn record_confirmed_removal(
     app: &AppHandle,
     repo: &str,
@@ -1369,14 +1424,28 @@ fn persist_github_effect(
     receipt: &FetchedList,
 ) -> Result<(), crate::store::StoreError> {
     let tx = conn.unchecked_transaction()?;
-    crate::store::source_cache::save_owned_source_snapshot(
-        &tx,
-        source,
-        list,
-        &receipt.prs,
-        &receipt.coverage,
-        receipt.viewer.as_deref(),
-    )?;
+    if crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
+        == receipt.viewer.as_deref()
+        && receipt.viewer.is_some()
+    {
+        crate::store::source_cache::save_owned_source_failure(
+            &tx,
+            source,
+            list,
+            &receipt.prs,
+            &receipt.coverage,
+            receipt.viewer.as_deref().unwrap_or_default(),
+        )?;
+    } else {
+        crate::store::source_cache::save_owned_source_snapshot(
+            &tx,
+            source,
+            list,
+            &receipt.prs,
+            &receipt.coverage,
+            receipt.viewer.as_deref(),
+        )?;
+    }
     crate::queue_scan::taint(
         &tx,
         source,
@@ -1472,7 +1541,98 @@ async fn record_github_effect_at(
                 coverage,
             }
         };
+        let observation = match &effect {
+            GithubEffect::Facts(observation) => Some(observation.clone()),
+            GithubEffect::ReviewReadback(detail, generations) => {
+                let index = if list == CachedList::Authored { 0 } else { 1 };
+                if detail
+                    .inventory_facts
+                    .as_ref()
+                    .is_none_or(|o| o.facts.iter().any(|f| f.operation.is_none()))
+                    && !polls.readback_is_current(&source, list, generations[index])
+                {
+                    continue;
+                }
+                detail.inventory_facts.clone()
+            }
+            _ => None,
+        };
+        let mut facts_changed = false;
+        if let Some(observation) = observation {
+            // Positive replacement identity/head evidence cannot be changed by
+            // an older per-PR response. Terminal journal entries also permit a
+            // later targeted reopen even though no open row remains.
+            let has_row = receipt
+                .prs
+                .iter()
+                .any(|row| row.repo.eq_ignore_ascii_case(repo) && row.number == number);
+            let matches = receipt.prs.iter().any(|row| {
+                row.repo.eq_ignore_ascii_case(repo)
+                    && row.number == number
+                    && row.id == observation.id
+                    && observation.facts.iter().all(|f| {
+                        (f.head_oid == row.head_oid
+                            || f.updated_at.is_some_and(|version| version > row.updated_at))
+                            && f.updated_at.is_none_or(|version| version >= row.updated_at)
+                    })
+            });
+            let path = path.clone();
+            let repo = repo.to_owned();
+            let owner = viewer.to_owned();
+            let mut next = receipt.clone();
+            let saved = tauri::async_runtime::spawn_blocking(
+                move || -> Result<_, crate::store::StoreError> {
+                    let conn = crate::store::open_db(&path)?;
+                    let tx = conn.unchecked_transaction()?;
+                    // If membership is absent, accept only an identity already
+                    // journaled by this owner, never invent a new open row.
+                    if !matches
+                        && (has_row
+                            || !crate::store::github_facts::contains(
+                                &tx,
+                                list,
+                                &owner,
+                                &repo,
+                                number,
+                                &observation.id,
+                            )?)
+                    {
+                        return Ok(None);
+                    }
+                    let changed = crate::store::github_facts::accept(
+                        &tx,
+                        list,
+                        &owner,
+                        &repo,
+                        number,
+                        &observation,
+                    )?;
+                    if !changed {
+                        return Ok(None);
+                    }
+                    crate::store::github_facts::apply(&tx, list, &owner, &mut next.prs)?;
+                    crate::store::source_cache::save_owned_source_failure(
+                        &tx,
+                        &Source::default(),
+                        list,
+                        &next.prs,
+                        &next.coverage,
+                        &owner,
+                    )?;
+                    crate::queue_scan::taint(&tx, &Source::default(), list, &owner)?;
+                    tx.commit()?;
+                    Ok(Some(next))
+                },
+            )
+            .await;
+            match saved {
+                Ok(Ok(Some(next))) => { receipt = next; facts_changed = true; }
+                Ok(Ok(None)) => {}
+                _ => emit(Err("New pull request facts could not be saved. The detail remains available; saved lists may be older.")),
+            }
+        }
         let changed = match &effect {
+            GithubEffect::Facts(..) => false,
             GithubEffect::QualifyReview(submitted) => {
                 let mut changed = false;
                 for row in &mut receipt.prs {
@@ -1498,13 +1658,12 @@ async fn record_github_effect_at(
             }
             GithubEffect::ReviewReadback(detail, generations) => {
                 let index = if list == CachedList::Authored { 0 } else { 1 };
-                if !polls.readback_is_current(&source, list, generations[index]) {
-                    continue;
-                }
                 let mut changed = false;
-                for row in &mut receipt.prs {
-                    if row.repo == repo && row.number == number && row.id == detail.id {
-                        changed |= crate::inventory::reconcile_detail_review(row, detail);
+                if polls.readback_is_current(&source, list, generations[index]) {
+                    for row in &mut receipt.prs {
+                        if row.repo == repo && row.number == number && row.id == detail.id {
+                            changed |= crate::inventory::reconcile_detail_review(row, detail);
+                        }
                     }
                 }
                 changed
@@ -1522,7 +1681,7 @@ async fn record_github_effect_at(
                 crate::inventory::apply_github_removal(&mut receipt.prs, repo, number, effect)
             }
         };
-        if !changed {
+        if !changed && !facts_changed {
             continue;
         }
         // The effect itself advances generation before any old request can publish.

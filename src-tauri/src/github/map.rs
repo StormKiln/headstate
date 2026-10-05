@@ -140,6 +140,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
     let created_at = ts(pr, "createdAt");
 
     PrDetail {
+        inventory_facts: crate::store::github_facts::Observation::from_node(pr, chrono::Utc::now()),
         id: pr["id"].as_str().unwrap_or_default().to_string(),
         number: pr["number"].as_u64().unwrap_or(0),
         title: pr["title"].as_str().unwrap_or_default().to_string(),

@@ -3063,3 +3063,404 @@ async fn stalled_body_retains_shared_receipt_and_durable_continuation(status: &'
     );
     server.await.unwrap();
 }
+
+// A detail's queue fact must reach both owned inventories before another scan.
+#[tokio::test]
+async fn detail_fact_publication_is_durable_without_a_local_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("detail-facts.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let mut raw = node(1, false);
+    raw["isInMergeQueue"] = json!(false);
+    raw["updatedAt"] = json!("2026-10-01T10:00:00Z");
+    let rows =
+        crate::github::map::map_list(&json!({"authored":{"nodes":[raw.clone()]}}), "authored");
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        source_cache::save_owned_source_snapshot(
+            &conn,
+            &Source::default(),
+            list,
+            &rows,
+            &Coverage::Complete,
+            Some("synthetic-viewer"),
+        )
+        .unwrap();
+        polls.begin_attempt(Source::default(), list).await;
+    }
+    raw["state"] = json!("OPEN");
+    raw["isInMergeQueue"] = json!(true);
+    raw["mergeQueueEntry"] = json!({"state":"QUEUED"});
+    raw["updatedAt"] = json!("2026-10-01T11:00:00Z");
+    let detail = crate::github::map::map_detail(
+        &json!({"repository":{"pullRequest":raw}}),
+        "octocat/repo-1",
+    );
+    let mut publications = Vec::new();
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::ReviewReadback(Box::new(detail), [0, 0]),
+        |event| publications.push(event.unwrap()),
+    )
+    .await;
+    assert_eq!(
+        publications.len(),
+        2,
+        "detail knowledge must publish to both lists"
+    );
+    for update in publications {
+        assert!(update.prs.unwrap()[0].in_merge_queue);
+    }
+    drop(conn);
+    let restarted = crate::store::open_db(&path).unwrap();
+    assert!(saved(&restarted)[0].in_merge_queue);
+}
+
+#[tokio::test]
+async fn concurrent_distinct_pr_actions_both_publish_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("batch-facts.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let rows = crate::github::map::map_list(
+        &json!({"authored":{"nodes":[node(1,false),node(2,false)]}}),
+        "authored",
+    );
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        source_cache::save_owned_source_snapshot(
+            &conn,
+            &Source::default(),
+            list,
+            &rows,
+            &Coverage::Complete,
+            Some("synthetic-viewer"),
+        )
+        .unwrap();
+        polls.begin_attempt(Source::default(), list).await;
+    }
+    // Both commands captured the same list generation before either completed.
+    for n in 1..=2 {
+        let mut raw = node(n, false);
+        raw["isDraft"] = json!(true);
+        let mut observation =
+            crate::store::github_facts::Observation::from_node(&raw, chrono::Utc::now()).unwrap();
+        observation
+            .facts
+            .retain(|f| matches!(f.value, crate::store::github_facts::Value::Draft(_)));
+        record_github_effect_at(
+            path.clone(),
+            &polls,
+            &format!("octocat/repo-{n}"),
+            n as u64,
+            "synthetic-viewer",
+            GithubEffect::Facts(observation),
+            |event| assert!(event.is_ok()),
+        )
+        .await;
+    }
+    assert!(
+        saved(&conn).iter().all(|row| row.is_draft),
+        "both independently acknowledged writes must survive"
+    );
+}
+
+#[tokio::test]
+async fn dequeue_uses_schema_id_and_publishes_verified_inverse_fact() {
+    use crate::github::mutate::{ConfirmedAction, PrAction};
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(|request:&wiremock::Request|{
+        let body:Value=request.body_json().unwrap();let query=body["query"].as_str().unwrap();
+        if !query.contains("mutation(") {return ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}}));}
+        let mut row=node(1,false);row["state"]=json!("OPEN");row["updatedAt"]=json!("2026-10-01T11:00:00Z");
+        let (field,payload)=if query.contains("dequeuePullRequest") {
+            if !query.contains("input: { id: $id }") { return ResponseTemplate::new(200).set_body_json(json!({"errors":[{"message":"Unknown argument pullRequestId; required id missing"}]})); }
+            row["isInMergeQueue"]=json!(false);("dequeuePullRequest",json!({"mergeQueueEntry":{"state":"QUEUED","pullRequest":row}}))
+        } else if query.contains("enqueuePullRequest") {
+            row["isInMergeQueue"]=json!(true);row["mergeQueueEntry"]=json!({"state":"QUEUED"});("enqueuePullRequest",json!({"mergeQueueEntry":{"state":"QUEUED","pullRequest":row}}))
+        } else if query.contains("convertPullRequestToDraft") {row["isDraft"]=json!(true);("convertPullRequestToDraft",json!({"pullRequest":row}))}
+        else {row["isDraft"]=json!(false);("markPullRequestReadyForReview",json!({"pullRequest":row}))};
+        ResponseTemplate::new(200).set_body_json(json!({"data":{field:payload}}))
+    }).mount(&server).await;
+    let client = github_client(&server);
+    client.fetch_viewer().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mutations.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let mut raw = node(1, false);
+    raw["isDraft"] = json!(false);
+    raw["isInMergeQueue"] = json!(false);
+    let rows = crate::github::map::map_list(&json!({"authored":{"nodes":[raw]}}), "authored");
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        source_cache::save_owned_source_snapshot(
+            &conn,
+            &Source::default(),
+            list,
+            &rows,
+            &Coverage::Complete,
+            Some("synthetic-viewer"),
+        )
+        .unwrap();
+        polls.begin_attempt(Source::default(), list).await;
+    }
+    for (action, queued, draft) in [
+        (PrAction::Enqueue, true, false),
+        (PrAction::Dequeue, false, false),
+        (PrAction::ConvertToDraft, false, true),
+        (PrAction::MarkReady, false, false),
+    ] {
+        let operation = polls.fact_operation();
+        let Some(ConfirmedAction::Facts {
+            viewer,
+            mut observation,
+        }) = client.mutate_pr("PR_1", action).await.unwrap()
+        else {
+            panic!("semantic action proof missing");
+        };
+        for fact in &mut observation.facts {
+            fact.operation = Some(operation.clone());
+        }
+        let mut frames = Vec::new();
+        record_github_effect_at(
+            path.clone(),
+            &polls,
+            "octocat/repo-1",
+            1,
+            &viewer,
+            GithubEffect::Facts(observation),
+            |event| frames.push(event.unwrap()),
+        )
+        .await;
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            let row = &frame.prs.unwrap()[0];
+            assert_eq!(row.in_merge_queue, queued);
+            assert_eq!(row.is_draft, draft);
+        }
+        let restarted = crate::store::open_db(&path).unwrap();
+        let row = &saved(&restarted)[0];
+        assert_eq!((row.in_merge_queue, row.is_draft), (queued, draft));
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        5,
+        "four writes plus ownership read, no read solely for propagation"
+    );
+}
+
+#[tokio::test]
+async fn newer_detail_head_replaces_old_head_without_borrowing_old_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("head-facts.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let rows =
+        crate::github::map::map_list(&json!({"authored":{"nodes":[node(1,false)]}}), "authored");
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        source_cache::save_owned_source_snapshot(
+            &conn,
+            &Source::default(),
+            list,
+            &rows,
+            &Coverage::Complete,
+            Some("synthetic-viewer"),
+        )
+        .unwrap();
+        polls.begin_attempt(Source::default(), list).await;
+    }
+    let mut raw = node(1, true);
+    raw["state"] = json!("OPEN");
+    raw["updatedAt"] = json!("2026-10-01T12:00:00Z");
+    raw["isInMergeQueue"] = json!(true);
+    raw["mergeQueueEntry"] = json!({"state":"QUEUED"});
+    let mut detail = crate::github::map::map_detail(
+        &json!({"repository":{"pullRequest":raw}}),
+        "octocat/repo-1",
+    );
+    for fact in &mut detail.inventory_facts.as_mut().unwrap().facts {
+        fact.operation = Some(polls.fact_operation());
+    }
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::ReviewReadback(Box::new(detail), [0, 0]),
+        |event| assert!(event.is_ok()),
+    )
+    .await;
+    let row = &saved(&conn)[0];
+    assert_eq!(row.head_oid, "head-1-new");
+    assert!(row.in_merge_queue);
+    assert!(row
+        .observation
+        .as_ref()
+        .unwrap()
+        .unknown_fields
+        .contains(&crate::inventory::ReadinessField::Ci));
+}
+
+#[tokio::test]
+async fn replaced_source_client_rejects_held_old_owner_fact_completion() {
+    let (server, client) = stable_queue(1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owner-facts.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    let mut raw = node(1, false);
+    raw["isDraft"] = json!(true);
+    let mut proof =
+        crate::store::github_facts::Observation::from_node(&raw, chrono::Utc::now()).unwrap();
+    for fact in &mut proof.facts {
+        fact.operation = Some(polls.fact_operation());
+    }
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Facts(proof.clone()),
+        |event| assert!(event.is_ok()),
+    )
+    .await;
+    assert!(saved(&conn)[0].is_draft);
+    // A held request captures its operation before the new verified client owns the source.
+    for fact in &mut proof.facts {
+        fact.operation = Some(polls.fact_operation());
+    }
+    server.reset().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+        "viewer":{"login":"replacement-viewer"}, "authored":{"issueCount":1,"nodes":[node(1,false)],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+    }}))).mount(&server).await;
+    let replacement = github_client(&server);
+    assert_eq!(
+        replacement.fetch_viewer().await.unwrap(),
+        "replacement-viewer"
+    );
+    let result = replacement
+        .advance_scan(
+            CachedList::Reviewing,
+            queue_scan::load(
+                &conn,
+                &Source::default(),
+                CachedList::Reviewing,
+                "replacement-viewer",
+            )
+            .unwrap(),
+            &[],
+            1200,
+        )
+        .await
+        .unwrap();
+    publish(&polls, &conn, Ok(result)).await;
+    let before = saved(&conn);
+    assert!(!before[0].is_draft);
+    let revision = polls
+        .get(&Source::default(), CachedList::Reviewing)
+        .receipt_revision;
+    let mut emitted = 0;
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Facts(proof),
+        |_| emitted += 1,
+    )
+    .await;
+    assert_eq!(emitted, 0);
+    assert_eq!(saved(&conn), before);
+    assert_eq!(
+        polls
+            .get(&Source::default(), CachedList::Reviewing)
+            .receipt_revision,
+        revision
+    );
+    assert_eq!(
+        source_cache::snapshot_owner(&conn, &Source::default(), CachedList::Reviewing)
+            .unwrap()
+            .as_deref(),
+        Some("replacement-viewer")
+    );
+    drop(conn);
+    assert_eq!(saved(&crate::store::open_db(&path).unwrap()), before);
+}
+
+#[tokio::test]
+async fn terminal_detail_then_newer_positive_list_reopens_without_stale_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reopen-facts.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    let polls = SourcePolls::default();
+    let mut raw = node(1, false);
+    raw["state"] = json!("OPEN");
+    raw["updatedAt"] = json!("2026-10-01T10:00:00Z");
+    let receipt = |raw: Value| FetchedList {
+        scan: None,
+        viewer: Some("synthetic-viewer".into()),
+        prs: crate::github::map::map_list(&json!({"authored":{"nodes":[raw]}}), "authored"),
+        total: Some(1),
+        coverage: Coverage::Complete,
+    };
+    publish(&polls, &conn, Ok(receipt(raw.clone()))).await;
+    let mut terminal = raw.clone();
+    terminal["state"] = json!("CLOSED");
+    terminal["updatedAt"] = json!("2026-10-01T11:00:00Z");
+    let proof =
+        crate::store::github_facts::Observation::from_node(&terminal, chrono::Utc::now()).unwrap();
+    record_github_effect_at(
+        path.clone(),
+        &polls,
+        "octocat/repo-1",
+        1,
+        "synthetic-viewer",
+        GithubEffect::Facts(proof),
+        |event| assert!(event.is_ok()),
+    )
+    .await;
+    assert!(saved(&conn).is_empty());
+    drop(conn);
+    let conn = crate::store::open_db(&path).unwrap();
+    let stale = reconcile_github_snapshot(
+        &conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        receipt(raw.clone()),
+        None,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    assert!(stale.prs.is_empty());
+    let mut reopened = raw.clone();
+    reopened["updatedAt"] = json!("2026-10-01T12:00:00Z");
+    let fresh = reconcile_github_snapshot(
+        &conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        receipt(reopened),
+        None,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    assert_eq!(fresh.prs.len(), 1);
+    let late = reconcile_github_snapshot(
+        &conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        receipt(raw),
+        None,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    assert_eq!(
+        late.prs.len(),
+        1,
+        "a newer acknowledged reopen supersedes the terminal floor"
+    );
+    assert_eq!(saved(&conn), late.prs);
+}

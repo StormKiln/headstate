@@ -76,7 +76,10 @@ function source(qc: QueryClient): Source {
     const target = state.required;
     if (!target) return;
     const overtaken = target.revision > (state.reading ?? -1);
-    if (!overtaken && data && matches(target.facts)) {
+    // Native detail reconciliation may remove the row before this same command
+    // returns. Its positive terminal response already answers the absence probe.
+    const terminalReadback = target.probe && (data?.state === "CLOSED" || data?.state === "MERGED");
+    if (terminalReadback || (!overtaken && data && matches(target.facts))) {
       state.required = undefined;
     } else if (overtaken) {
       // Let TanStack finish the current retryer before asking for the single
@@ -150,6 +153,7 @@ export function beginDetailRead(qc: QueryClient, repo: string, number: number) {
   if (state) state.reading = state.revision;
   return source(qc).generation;
 }
+export function detailSourceGeneration(qc: QueryClient) { return source(qc).generation; }
 export function detailReadIsCurrent(qc: QueryClient, generation: number) { return source(qc).generation === generation; }
 export function detailNeedsRevalidation(qc: QueryClient, repo: string, number: number) {
   const query = detailQuery(qc, repo, number);

@@ -488,3 +488,19 @@ it("marks all inactive aliases stale without transport and consumes only the rev
   expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(true);
   expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
 });
+
+it.each(["CLOSED", "MERGED"])("consumes native removal emitted before the %s detail command returns without another read", async state => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  await inventory([]);
+  await act(async () => finish({ ...detail, state }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});

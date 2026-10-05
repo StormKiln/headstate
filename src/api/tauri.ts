@@ -569,7 +569,7 @@ export const actOnPr = (
   repo: string,
   number: number,
   action: PrActionName,
-) => call<void>("act_on_pr", { id, repo, number, action });
+) => call<{ inventory_managed: boolean } | void>("act_on_pr", { id, repo, number, action, inventoryManaged: true });
 
 /// One worktree's outcome in a bulk removal. `error` is null on success.
 export interface RemovalOutcome {
@@ -910,6 +910,7 @@ export const updatePrBranch = (
 ) => call<void>("update_pr_branch", { id, repo, number, expectedHead });
 /// One pull request's outcome in a batch. `error` is null on success.
 export interface BatchOutcome {
+  inventory_managed?: boolean;
   repo: string;
   number: number;
   error: string | null;

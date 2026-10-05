@@ -245,9 +245,8 @@ impl PrAction {
     /// exception -- see `verify`.
     fn result_selection(self) -> &'static str {
         match self {
-            PrAction::Enqueue => "mergeQueueEntry { state }",
-            PrAction::Merge | PrAction::Close => "pullRequest { id headRefOid state }",
-            _ => "clientMutationId",
+            PrAction::Enqueue | PrAction::Dequeue => "mergeQueueEntry { state pullRequest { id headRefOid updatedAt state isDraft isInMergeQueue mergeQueueEntry { state } } }",
+            _ => "pullRequest { id headRefOid updatedAt state isDraft isInMergeQueue mergeQueueEntry { state } }",
         }
     }
 
@@ -404,12 +403,21 @@ fn confirmed_review_receipt(
 }
 
 /// Internal proof for removing an owned cached row; not a transport-success flag.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConfirmedRemoval {
     pub viewer: String,
     pub id: String,
     pub head_oid: String,
 }
+#[derive(Debug, Clone)]
+pub enum ConfirmedAction {
+    Removal(ConfirmedRemoval),
+    Facts {
+        viewer: String,
+        observation: crate::store::github_facts::Observation,
+    },
+}
+
 fn confirmed_removal(
     data: &serde_json::Value,
     id: &str,
@@ -510,10 +518,15 @@ impl GitHubClient {
         &self,
         id: &str,
         action: PrAction,
-    ) -> Result<Option<ConfirmedRemoval>, ClientError> {
+    ) -> Result<Option<ConfirmedAction>, ClientError> {
         let query = format!(
-            "mutation($id: ID!) {{ {}(input: {{ pullRequestId: $id }}) {{ {} }} }}",
+            "mutation($id: ID!) {{ {}(input: {{ {}: $id }}) {{ {} }} }}",
             action.field(),
+            if action == PrAction::Dequeue {
+                "id"
+            } else {
+                "pullRequestId"
+            },
             action.result_selection()
         );
         let data = match self
@@ -531,7 +544,42 @@ impl GitHubClient {
             Err(e) => return Err(e),
         };
         action.verify(&data[action.field()])?;
-        Ok(confirmed_removal(&data, id, action, self.known_viewer()))
+        let payload = &data[action.field()];
+        let node = if matches!(action, PrAction::Enqueue | PrAction::Dequeue) {
+            &payload["mergeQueueEntry"]["pullRequest"]
+        } else {
+            &payload["pullRequest"]
+        };
+        if let Some(viewer) = self.known_viewer() {
+            if node["id"].as_str() == Some(id) {
+                if let Some(mut observation) =
+                    crate::store::github_facts::Observation::from_node(node, chrono::Utc::now())
+                {
+                    use crate::store::github_facts::Value;
+                    // Only the acknowledged action is write authority; unrelated
+                    // fields in the payload can still be provider-lagged.
+                    observation
+                        .facts
+                        .retain(|fact| match (&fact.value, action) {
+                            (Value::Queue(true), PrAction::Enqueue)
+                            | (Value::Queue(false), PrAction::Dequeue)
+                            | (Value::Draft(true), PrAction::ConvertToDraft)
+                            | (Value::Draft(false), PrAction::MarkReady) => true,
+                            (Value::State(state), PrAction::Merge) => state == "merged",
+                            (Value::State(state), PrAction::Close) => state == "closed",
+                            (Value::State(state), PrAction::Reopen) => state == "open",
+                            _ => false,
+                        });
+                    if !observation.facts.is_empty() {
+                        return Ok(Some(ConfirmedAction::Facts {
+                            viewer: viewer.into(),
+                            observation,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(confirmed_removal(&data, id, action, self.known_viewer()).map(ConfirmedAction::Removal))
     }
 
     /// Submit a review on a pull request.
@@ -931,24 +979,22 @@ mod tests {
     /// it. The answer is in `mergeQueueEntry`, which must be requested.
     #[test]
     fn enqueue_asks_for_the_field_that_proves_it_worked() {
-        assert_eq!(
-            PrAction::Enqueue.result_selection(),
-            "mergeQueueEntry { state }"
-        );
-        for action in [PrAction::Merge, PrAction::Close] {
-            assert_eq!(
-                action.result_selection(),
-                "pullRequest { id headRefOid state }"
-            );
-        }
-        // Other actions retain their existing legacy receipt contract.
-        for a in [
+        for action in [
+            PrAction::Enqueue,
+            PrAction::Dequeue,
+            PrAction::Merge,
+            PrAction::Close,
             PrAction::Reopen,
             PrAction::ConvertToDraft,
             PrAction::MarkReady,
-            PrAction::Dequeue,
         ] {
-            assert_eq!(a.result_selection(), "clientMutationId");
+            let selection = action.result_selection();
+            for field in ["id", "headRefOid", "updatedAt", "state"] {
+                assert!(selection.contains(field));
+            }
+            if matches!(action, PrAction::Enqueue | PrAction::Dequeue) {
+                assert!(selection.starts_with("mergeQueueEntry { state pullRequest"));
+            }
         }
     }
 

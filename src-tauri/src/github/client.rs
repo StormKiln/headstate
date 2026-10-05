@@ -1735,6 +1735,10 @@ impl GitHubClient {
             "variables": { "owner": owner, "repo": name, "number": number }
         });
         let mut v = self.graphql_partial_ok(&body).await?;
+        let acquired_at = chrono::Utc::now();
+        if let Some(viewer) = map_viewer(&v).filter(|v| !v.is_empty()) {
+            let _ = self.viewer.set(viewer);
+        }
         let pr = &v["repository"]["pullRequest"];
         if pr["number"].as_u64() != Some(number)
             || pr["id"].as_str().is_none_or(str::is_empty)
@@ -1774,6 +1778,11 @@ impl GitHubClient {
             .collect_detail_checks(&mut v, owner, name, number)
             .await;
         let mut detail = map_detail(&v, repo);
+        if let Some(observation) = &mut detail.inventory_facts {
+            for fact in &mut observation.facts {
+                fact.observed_at = acquired_at;
+            }
+        }
         detail.checks_coverage = Some(coverage);
         detail.stack = self
             .peek_advisory_stack(repo, number, &detail.head_oid, &detail.base_ref)

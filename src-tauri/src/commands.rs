@@ -674,6 +674,18 @@ pub async fn get_cycle_trend(client: State<'_, GhClient>) -> Result<CycleTrend, 
 /// to confirm silently gets the destructive path anyway. What this DOES
 /// guarantee is that every write is logged with repo, number and action,
 /// so "did I merge that?" has an answer.
+#[derive(Debug, serde::Serialize)]
+pub struct PrActionOutcome {
+    pub inventory_managed: bool,
+}
+impl PrActionOutcome {
+    pub(crate) fn for_request(inventory_managed: Option<bool>) -> Option<Self> {
+        inventory_managed.unwrap_or(false).then_some(Self {
+            inventory_managed: true,
+        })
+    }
+}
+
 #[tauri::command]
 pub async fn act_on_pr(
     app: AppHandle,
@@ -683,21 +695,24 @@ pub async fn act_on_pr(
     repo: String,
     number: u64,
     action: String,
-) -> Result<(), String> {
+    inventory_managed: Option<bool>,
+) -> Result<Option<PrActionOutcome>, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let act = parse_action(&action)?;
 
+    let operation = crate::source_poll::fact_operation(&app);
     match client.mutate_pr(&id, act).await {
         Ok(effect) => {
             if let Some(effect) = effect {
-                crate::source_poll::record_confirmed_removal(&app, &repo, number, effect).await;
+                crate::source_poll::record_confirmed_action(&app, &repo, number, effect, operation)
+                    .await;
             }
             log::info!("{repo}#{number} {}", act.describe());
             // Refresh promptly rather than waiting out the poll interval:
             // the list would otherwise keep showing a PR as open for up
             // to two minutes after merging it.
             waker.0.notify_one();
-            Ok(())
+            Ok(PrActionOutcome::for_request(inventory_managed))
         }
         Err(e) => {
             log::warn!("{repo}#{number} could not be {}: {e}", act.describe());
@@ -1049,6 +1064,7 @@ fn parse_action(action: &str) -> Result<PrAction, String> {
 /// a lone "done" would hide the rejections.
 #[derive(Debug, serde::Serialize)]
 pub struct BatchOutcome {
+    pub inventory_managed: bool,
     pub repo: String,
     pub number: u64,
     pub error: Option<String>,
@@ -1086,11 +1102,12 @@ pub async fn act_on_prs(
             let (client, id, repo, number) = (client.clone(), id.clone(), repo.clone(), *number);
             let app = app.clone();
             set.spawn(async move {
+                let operation = crate::source_poll::fact_operation(&app);
                 let error = match client.mutate_pr(&id, act).await {
                     Ok(effect) => {
                         if let Some(effect) = effect {
-                            crate::source_poll::record_confirmed_removal(
-                                &app, &repo, number, effect,
+                            crate::source_poll::record_confirmed_action(
+                                &app, &repo, number, effect, operation,
                             )
                             .await;
                         }
@@ -1103,6 +1120,7 @@ pub async fn act_on_prs(
                     }
                 };
                 BatchOutcome {
+                    inventory_managed: true,
                     repo,
                     number,
                     error,
@@ -1284,10 +1302,18 @@ pub async fn get_pr_detail(
         crate::poll::FETCH_TIMEOUT,
     ));
     let review_generation = crate::source_poll::review_read_generation(&app);
-    let out = client
+    let operation = crate::source_poll::fact_operation(&app);
+    let mut out = client
         .fetch_pr_detail(&repo, number)
         .await
         .map_err(|e| e.to_string());
+    if let Ok(detail) = &mut out {
+        if let Some(observation) = &mut detail.inventory_facts {
+            for fact in &mut observation.facts {
+                fact.operation = Some(operation.clone());
+            }
+        }
+    }
     if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
         crate::source_poll::record_review_readback(&app, detail, viewer, review_generation).await;
     }

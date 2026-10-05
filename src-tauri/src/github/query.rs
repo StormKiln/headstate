@@ -525,6 +525,7 @@ pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
 /// comment already claimed and that the field is free.
 pub const PR_DETAIL_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
+  viewer { login }
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {

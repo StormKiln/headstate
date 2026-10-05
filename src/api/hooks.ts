@@ -1,7 +1,7 @@
 import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
 import { useStatsDemand } from "./useStatsDemand";
 import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
-import { useDetailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
+import { useDetailSourceGeneration, detailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
@@ -500,13 +500,14 @@ function patchListRows(
   repo: string,
   number: number,
   patch: Partial<PullRequest>,
+  identity?: { id: string; head_oid: string },
 ): void {
   for (const key of LIST_KEYS) {
     // Update the same rows the hooks render, even if query-cache GC removed
     // their mirrored entry. Cached-only rows stay cached; do not invent a live
     // receipt for a confirmed local mutation.
     const apply = (items: PullRequest[]) => items.some((p) => p.repo === repo && p.number === number)
-      ? items.map((p) => p.repo === repo && p.number === number ? { ...p, ...patch } : p)
+      ? items.map((p) => p.repo === repo && p.number === number && (!identity || (p.id === identity.id && p.head_oid === identity.head_oid)) ? { ...p, ...patch } : p)
       : items;
     const patched = patchSourceRows(qc, key[0] === "prs" ? "authored" : "reviewing", apply);
     const rows = patched ?? qc.getQueryData<PullRequest[]>(key);
@@ -546,6 +547,15 @@ function listPatchFor(action: PrActionName): Partial<PullRequest> | undefined {
   }
 }
 
+// A completion belongs to the account and connection that dispatched it.
+function captureActionOwnership(qc: QueryClient) {
+  const owner = qc.getQueryData<string>(["viewer"]);
+  const account = reviewAccountGeneration(qc);
+  const source = detailSourceGeneration(qc);
+  return () => owner === qc.getQueryData<string>(["viewer"])
+    && account === reviewAccountGeneration(qc) && detailReadIsCurrent(qc, source);
+}
+
 /// Apply an action to a pull request, then refresh what it affected.
 ///
 /// The list row is patched only AFTER the mutation resolves, never
@@ -578,14 +588,24 @@ export function useActOnPr() {
     repo: string,
     number: number,
     action: PrActionName,
-  ) =>
-    actOnPr(id, repo, number, action).then(async () => {
+  ) => {
+    const current = captureActionOwnership(qc);
+    const row = cachedRow(qc, repo, number);
+    return actOnPr(id, repo, number, action).then(async (outcome) => {
+      if (!current()) return;
+      if (outcome?.inventory_managed) {
+        // Native receipts already update every cache. Preserve one source of
+        // truth, including successful idempotent writes without field proof.
+        void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+        return;
+      }
       const patch = listPatchFor(action);
-      if (patch !== undefined) patchListRows(qc, repo, number, patch);
+      if (patch !== undefined && row?.id === id) patchListRows(qc, repo, number, patch, row);
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
     });
+  };
 }
 
 /// Merge or queue a native GitHub stack (#1468), then bring the detail
@@ -2378,8 +2398,11 @@ export function useUpdatePrBranch() {
 /// itself could not run.
 export function useActOnPrs() {
   const qc = useQueryClient();
-  return (prs: [string, string, number][], action: PrActionName) =>
-    actOnPrs(prs, action).then(async (outcomes) => {
+  return (prs: [string, string, number][], action: PrActionName) => {
+    const current = captureActionOwnership(qc);
+    const identities = prs.map(([id, repo, number]) => ({ id, repo, number, row: cachedRow(qc, repo, number) }));
+    return actOnPrs(prs, action).then(async (outcomes) => {
+      if (!current() || outcomes.every(o => o.inventory_managed)) return outcomes;
       // Per OUTCOME, not per requested pull request (#1276). A batch
       // fails partially as its normal case -- that is why `actOnPrs`
       // returns an outcome each instead of throwing on the first
@@ -2390,13 +2413,15 @@ export function useActOnPrs() {
       const patch = listPatchFor(action);
       if (patch !== undefined) {
         for (const o of outcomes) {
-          if (o.error === null) patchListRows(qc, o.repo, o.number, patch);
+          const target = identities.find(p => p.repo === o.repo && p.number === o.number);
+          if (!o.inventory_managed && o.error === null && target?.row?.id === target?.id) patchListRows(qc, o.repo, o.number, patch, target?.row);
         }
       }
       void qc.invalidateQueries({ queryKey: ["reviewing"] });
       await refreshPrs(qc);
       return outcomes;
     });
+  };
 }
 
 /// Enable or cancel "merge when green".

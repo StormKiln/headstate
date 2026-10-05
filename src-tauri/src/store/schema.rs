@@ -1305,6 +1305,13 @@ const MIGRATIONS: &[&str] = &[
         scope_key TEXT PRIMARY KEY NOT NULL,
         revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0)
     );",
+    // 41: targeted PR facts outlive lagging inventory pages, including removals.
+    "CREATE TABLE github_pr_facts (
+        list INTEGER NOT NULL, owner TEXT NOT NULL, repo TEXT NOT NULL,
+        number INTEGER NOT NULL, node_id TEXT NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY(list,owner,repo,number,node_id)
+    );
+    CREATE TABLE github_pr_fact_owner (list INTEGER PRIMARY KEY, owner TEXT NOT NULL);",
 ];
 
 /// The only legacy repairs supported here are scripts that were already

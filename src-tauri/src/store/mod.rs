@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod devices;
+pub mod github_facts;
 pub mod gitlab_stats;
 pub mod health;
 pub mod pr_backfill_page;

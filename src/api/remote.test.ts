@@ -36,6 +36,12 @@ describe("remote transport: commands", () => {
     await expect(remote.call("save_markdown", {markdown: "# masked"})).resolves.toBe("presented");
     expect(tauri.invoke).toHaveBeenCalledExactlyOnceWith("save_markdown", {markdown: "# masked"});
   });
+  it.each([undefined, null, { inventory_managed: true }])("accepts old and opted-in modern action replies once: %j", async (reply) => {
+    tauri.invoke.mockResolvedValueOnce(reply);
+    await expect(remote.call("act_on_pr", { id: "PR_1", repo: "synthetic/repo", number: 1, action: "enqueue", inventoryManaged: true })).resolves.toEqual(reply);
+    expect(tauri.invoke).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects a malformed remote reply before the caller receives it", async () => {
     tauri.invoke.mockResolvedValueOnce([{ number: 1347 }]);
     await expect(remote.call("get_cached")).rejects.toThrow(/get_cached.*incompatible|incompatible.*get_cached/);
