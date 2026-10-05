@@ -41,3 +41,13 @@ test('browser recovery projection deduplicates metadata without changing positiv
   }
  }finally{globalThis.window=original;}
 });
+
+test('finite provider recovery allowance does not widen held traversal or local consumption',async()=>{
+ const {convergencePolicy}=await import('./convergence.mjs');
+ assert.equal(convergencePolicy.failureCycleMs,180000);assert.equal(convergencePolicy.failureRecoveryMs,240000);
+ assert.equal(convergencePolicy.inventoryMs,180000);assert.equal(convergencePolicy.localPropagationMs,10000);
+ const f=recoveryFixture();f.ceilingMs=convergencePolicy.inventoryMs;f.elapsedMs=180001;
+ assert.throws(()=>assertRecovery(f),/original recovery ceiling/);
+ const local=fixture();local.ceilingMs=convergencePolicy.localPropagationMs;local.elapsedMs=10001;
+ assert.throws(()=>assertConsumption(local),/local ceiling/);
+});

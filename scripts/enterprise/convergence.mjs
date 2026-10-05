@@ -5,7 +5,7 @@ import {prepareActionThenHold,holdReadiness} from './convergence-action.mjs';
 import {joinHeldReviewing} from './convergence-join.mjs';
 import {assertConsumption,assertRecovery,consumptionLineage} from './convergence-consumption.mjs';
 
-export const convergencePolicy=Object.freeze({inventoryMs:180000,localPropagationMs:10000,failureCycleMs:180000,meaning:'Synthetic diagnostic ceilings, not a field SLA; optional advisory freshness is excluded'});
+export const convergencePolicy=Object.freeze({inventoryMs:180000,localPropagationMs:10000,failureCycleMs:180000,failureRecoveryMs:240000,meaning:'Synthetic diagnostic ceilings, not a field SLA; optional advisory freshness is excluded'});
 const key=number=>`synthetic-lab/repo-${(number-1)%50+1}/${number}`;
 export function initialConvergenceExpected(){return {authored:Array.from({length:50},(_,i)=>key(i+1)).sort(),reviewing:Array.from({length:236},(_,i)=>key(i+51)).sort(),ready:Array.from({length:130},(_,i)=>key(i+51)).sort(),changes:[]};}
 export function changeExpected(expected,number,{member,ready},reason){
@@ -85,7 +85,7 @@ export async function runConvergence({pages,provider,result,out,profile,control}
  const evidence={policy:convergencePolicy,expected:structuredClone(expected),phases:[],checkpoints:[],exclusions:['Updater/settings controls: mounted fragment is the same production GitHub inventory footer','Restart requires convergence-restart with this successful run profile; account replacement and newer-head/reopen authority require complementary native full-path tests']};
  const save=()=>writeFile(resolve(out,'convergence.json'),JSON.stringify(evidence,null,2));
  const capture=async name=>{const value={name,at:performance.now(),providerCount:provider.ledger.length,clients:await Promise.all(pages.map(snapshot))};evidence.checkpoints.push(value);await save();return value;};
- const waitUntil=async(test,ceilingMs,message)=>{const start=performance.now();while(performance.now()-start<ceilingMs){if(await test())return;await delay(100);}throw Error(message);};
+ const waitUntil=async(test,ceilingMs,message,start=performance.now())=>{while(performance.now()-start<ceilingMs){if(await test())return;await delay(100);}throw Error(message);};
  const population=async(ceilingMs=convergencePolicy.localPropagationMs)=>waitUntil(async()=>{const states=await Promise.all(pages.map(snapshot));try{for(const state of states)assertConverged(state,expected);return true;}catch{return false;}},ceilingMs,'actual mounted inventory/Ready did not match independent expected identities');
  const open=async(number,page=pages[0])=>{const back=page.getByRole('button',{name:'Back to list',exact:true});if(await back.count())await back.click();await page.getByRole('button',{name:new RegExp(`Synthetic review ${number}(?:\\D|$)`)}).first().click();await page.getByText(`Synthetic description ${number}`,{exact:false}).waitFor();};
  const providerRow=number=>{const row=provider.data.rows.find(row=>row.number===number);assert.ok(row);return row;};
@@ -166,8 +166,17 @@ export async function runConvergence({pages,provider,result,out,profile,control}
    assertConverged(failed.clients[0],expected);assertConverged(failed.clients[1],expected);
    const continuity=await pages[0].evaluate(()=>{const n=window.__convergenceDraft;return {connected:n?.isConnected,focused:document.activeElement===n,value:n?.value,start:n?.selectionStart,end:n?.selectionEnd,direction:n?.selectionDirection,disclosure:[...document.querySelectorAll('details')].some(d=>d.open&&d.querySelector('summary')?.textContent==='Open report')};});
    assert.deepEqual(continuity,{connected:true,focused:true,value:'Retained convergence backward draft',start:3,end:17,direction:'backward',disclosure:true});
+   const recovery={name:`finite-failure-recovery-clock-${cycle}`,boundMs:convergencePolicy.failureRecoveryMs,pass:false,failedSnapshotAt:failed.at,failedClientAt:failed.clients[0].at,failedClientWallTime:failed.clients[0].wallTime,failedSourceLastReceivedAt:failed.clients[0].source?.lastReceivedAt,meaning:'240s synthetic diagnostic ceiling includes finite provider backoff, remaining pages and a clean traversal; not a worst-case bound or SLA'};
+   evidence.phases.push(recovery);
    provider.fault.failSearch=undefined;
-   await waitUntil(async()=>{const current=await sourceStatus(pages[0]);return current.phase==='ready'&&current.coverage==='complete';},convergencePolicy.failureCycleMs,'finite failed pass did not recover');
+   recovery.faultClearedAt=performance.now();recovery.faultClearedWallTime=Date.now();
+   recovery.waitStartedAt=performance.now();
+   try{
+    await waitUntil(async()=>{const current=await sourceStatus(pages[0]);return current.phase==='ready'&&current.coverage==='complete';},recovery.boundMs,'finite failed pass did not recover',recovery.waitStartedAt);
+    recovery.pass=performance.now()-recovery.waitStartedAt<=recovery.boundMs;
+    assert.ok(recovery.pass,'finite failed pass completed beyond recovery ceiling');
+   }finally{recovery.waitEndedAt=performance.now();recovery.elapsedMs=recovery.waitEndedAt-recovery.waitStartedAt;}
+
    await population();evidence.phases.push({name:`failure-recovery-${cycle}`,unchanged,continuity,provider:provider.ledger.slice(ledgerStart)});await capture(`recovered-${cycle}`);
   }
   evidence.expected=structuredClone(expected);evidence.pass=true;result.convergence={pass:true,reviewing:expected.reviewing.length,ready:expected.ready.length};
