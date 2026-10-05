@@ -28,7 +28,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });
   const keys = selected.map(pr => ["ready-stack", owner, session.generation, keyOf(pr)]);
   const metas = keys.map(key => scheduleMeta(qc, key));
-  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: preferred.has(keyOf(pr)) })));
+  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: window.preferred.has(keyOf(pr)) })));
   useQueries({ queries: selected.map((pr, i) => ({
     queryKey: keys[i], meta: metas[i],
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
@@ -44,7 +44,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
           : { stack: { kind: "unknown" }, expiresAt: performance.now() + 5_000, staleFor: 5_000, lastKnown: retainedReceipt(value?.last_known_stack, started) };
         return { receipt: result, progress: matching?.advisory_progress };
       }, {
-        preferred: () => isPreferred(metas[i], preferred.has(keyOf(pr))),
+        preferred: () => isPreferred(metas[i], window.preferred.has(keyOf(pr))),
         rank: () => metas[i].advisorySchedule.lastAdmittedAt ?? -1,
         boosted: () => window.boosted.has(keyOf(pr)) && !metas[i].advisorySchedule.resumeBoostSpent,
         current: () => session.generation === session.current(),

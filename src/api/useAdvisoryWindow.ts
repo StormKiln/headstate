@@ -17,7 +17,7 @@ function clock() {
     },
   };
 }
-interface WindowState { canonical: string; tick: number; selected: string[]; boosted: ReadonlySet<string> }
+interface WindowState { canonical: string; tick: number; selected: string[]; preferred: ReadonlySet<string>; boosted: ReadonlySet<string> }
 function select(canonical: string, tick: number, priority: ReadonlySet<string>, demand: ReadonlySet<string>, read: (key: string) => AdvisorySchedule | undefined): WindowState {
   const identities: string[] = JSON.parse(canonical);
   const all = identities.filter(key => demand.has(key) && !read(key)?.ineligible);
@@ -31,7 +31,7 @@ function select(canonical: string, tick: number, priority: ReadonlySet<string>, 
   // Spare capacity is safe for small populations; the actual dispatcher, not
   // this array order, owns visible/tail/family admission fairness.
   const selected = [...new Set([...preferred, ...fair, ...all])].slice(0, 8);
-  return { canonical, tick, selected, boosted: new Set(boost ? [boost] : []) };
+  return { canonical, tick, selected, preferred: new Set(selected.filter(key => priority.has(key))), boosted: new Set(boost ? [boost] : []) };
 }
 /** Removing observers cancels queued JS demand, not already dispatched native
  * HTTP. The native batch remains governed by its original deadline. */
@@ -55,13 +55,26 @@ export function useAdvisoryWindow(keys: string[], priority: ReadonlySet<string>,
     const added = JSON.parse(canonical) as string[];
     const replacements = added.filter(key => !before.includes(key));
     const live = new Set(added);
-    const selected = before.length === 0 ? select(canonical, tick, priority, demand, read).selected : window.selected.map(key => live.has(key) ? key : replacements.shift()).filter((key): key is string => !!key);
-    setWindow({ ...window, canonical, selected });
+    if (before.length === 0) setWindow(select(canonical, tick, priority, demand, read));
+    else {
+      // A new exact identity inherits only its vacated slot's classification
+      // until the next tick. Live scrolling cannot reclassify surviving slots;
+      // continuation boosts never transfer to a different identity.
+      const preferred = new Set<string>();
+      const selected = window.selected.flatMap(key => {
+        const next = live.has(key) ? key : replacements.shift();
+        if (!next) return [];
+        if (window.preferred.has(key)) preferred.add(next);
+        return [next];
+      });
+      setWindow({ ...window, canonical, selected, preferred,
+        boosted: new Set(selected.filter(key => window.boosted.has(key))) });
+    }
   }
   useEffect(() => {
     const change = () => setVisible(document.visibilityState !== "hidden");
     document.addEventListener("visibilitychange", change);
     return () => document.removeEventListener("visibilitychange", change);
   }, []);
-  return { selected: enabled && visible ? window.selected : [], boosted: window.boosted, tick, visible };
+  return { selected: enabled && visible ? window.selected : [], preferred: window.preferred, boosted: window.boosted, tick, visible };
 }

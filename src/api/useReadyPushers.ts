@@ -34,7 +34,7 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });
   const keys = selected.map(pr => ["ready-pushers", owner, session.generation, keyOf(pr)]);
   const metas = keys.map(key => scheduleMeta(qc, key));
-  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: preferred.has(keyOf(pr)) })));
+  useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: window.preferred.has(keyOf(pr)) })));
   const queries = useQueries({ queries: selected.map((pr, i) => ({
     queryKey: keys[i], meta: metas[i], queryFn: async ({ signal }: { signal: AbortSignal }): Promise<Receipt> => {
       let answer: Answer;
@@ -51,7 +51,7 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
         const answers = await getReadyPushers([ask]);
         return { started, row: answers?.find(value => value.repo === ask.repo && value.number === ask.number && value.head_oid === ask.head_oid && value.base === ask.base && value.head_ref === ask.head_ref && value.head_repo === ask.head_repo) ?? unreadable() };
       }, {
-        preferred: () => isPreferred(metas[i], preferred.has(keyOf(pr))),
+        preferred: () => isPreferred(metas[i], window.preferred.has(keyOf(pr))),
         rank: () => metas[i].advisorySchedule.lastAdmittedAt ?? -1,
         boosted: () => window.boosted.has(keyOf(pr)) && !metas[i].advisorySchedule.resumeBoostSpent,
         current: () => session.generation === session.current(),

@@ -45,3 +45,21 @@ it("skips locally ineligible debt without increasing the finite eight-row window
   expect(view.result.current.selected.filter(key => !priority.has(key))).toEqual(["08", "09"]);
   expect(view.result.current.selected).toHaveLength(8);
 });
+
+it("replacement identities inherit only their vacated slot until the next window", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  const view = renderHook(({ population, preferred }) => useAdvisoryWindow(population, preferred, true), {
+    wrapper, initialProps: { population: keys, preferred: priority },
+  });
+  const changed = [...keys.slice(1), "12"];
+  const moved = new Set(["01", "02", "03", "04", "06", "07"]);
+  view.rerender({ population: changed, preferred: moved });
+  expect(view.result.current.selected).toEqual(["12", "01", "02", "03", "04", "05", "06", "07"]);
+  expect([...view.result.current.preferred]).toEqual(["12", "01", "02", "03", "04", "05"]);
+  expect(view.result.current.boosted.has("12")).toBe(false);
+  await tick();
+  expect([...view.result.current.preferred].sort()).toEqual([...moved].sort());
+  expect(view.result.current.selected).toHaveLength(8);
+});
