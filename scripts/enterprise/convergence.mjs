@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {prepareActionThenHold} from './convergence-action.mjs';
 import {joinHeldReviewing} from './convergence-join.mjs';
 import {assertConsumption,assertRecovery,consumptionLineage} from './convergence-consumption.mjs';
 
@@ -91,9 +92,11 @@ export async function runConvergence({pages,provider,result,out,profile,control}
   heldJoin=await joinHeldReviewing({page:pages[0],provider,profile,inventoryMs:convergencePolicy.inventoryMs,joinMs:convergencePolicy.localPropagationMs});
   evidence.phases.push({name:'manual-refresh-joined-held-scan',...heldJoin});await save();
  };
- const action=async(number,label,expectation,reason)=>{
-  await open(number);const offset=await pages[0].evaluate(()=>window.__enterprise.telemetry.length);const before=provider.ledger.length;
-  await pages[0].getByRole('button',{name:label,exact:true}).first().click({timeout:convergencePolicy.inventoryMs});
+ const action=async(number,label,expectation,reason,{alreadyOpen=false}={})=>{
+  if(!alreadyOpen)await open(number);const offset=await pages[0].evaluate(()=>window.__enterprise.telemetry.length);const before=provider.ledger.length;
+  const button=pages[0].getByRole('button',{name:label,exact:true}).first();
+  if(alreadyOpen){assert.equal(await button.isEnabled(),true,'queue readiness must remain valid during held work');await button.click({timeout:1000});}
+  else await button.click({timeout:convergencePolicy.inventoryMs});
   await pages[0].waitForFunction(({number,offset})=>window.__enterprise.telemetry.slice(offset).some(e=>e.name==='act_on_pr'&&e.ok&&e.args?.number===number),{number,offset},{timeout:30000});
   const receipt=await pages[0].evaluate(({number,offset})=>window.__enterprise.telemetry.slice(offset).find(e=>e.name==='act_on_pr'&&e.ok&&e.args?.number===number),{number,offset});
   changeExpected(expected,number,expectation,reason);await population(Math.max(1,convergencePolicy.localPropagationMs-(await pages[0].evaluate(at=>performance.now()-at,receipt.at+receipt.duration))));
@@ -111,8 +114,12 @@ export async function runConvergence({pages,provider,result,out,profile,control}
   await freshRead(54,{state:'CLOSED',closedAt:new Date().toISOString()},{member:false,ready:false},'fresh-detail-closed');
   await releaseOldSearch();await population();await capture('old-search-after-detail-did-not-resurrect');
   assert.equal(expected.reviewing.length,234);assert.equal(expected.ready.length,126);
-  await holdOldSearch();
-  await action(55,'Add to merge queue',{member:true,ready:false},'acknowledged-enqueue');
+  await prepareActionThenHold({
+   prepare:async()=>{const started=performance.now();await open(55);const detailOpenedAt=performance.now();const button=pages[0].getByRole('button',{name:'Add to merge queue',exact:true}).first();await waitUntil(()=>button.isEnabled(),Math.max(1,convergencePolicy.inventoryMs-(performance.now()-started)),'queue action prerequisites did not become enabled before hold');assert.ok(performance.now()-started<=convergencePolicy.inventoryMs,'prerequisite bound includes opening detail');const preparation={name:'queue-action-prerequisite',number:55,elapsedMs:performance.now()-started,guidanceMs:performance.now()-detailOpenedAt,boundMs:convergencePolicy.inventoryMs,meaning:'Actual enabled control before hold; cold advisory wait is separate from write and propagation latency'};evidence.phases.push(preparation);await save();return preparation;},
+   hold:holdOldSearch,
+   verify:async()=>assert.equal(await pages[0].getByRole('button',{name:'Add to merge queue',exact:true}).first().isEnabled(),true,'queue readiness expired while waiting for natural held acquisition'),
+  });
+  await action(55,'Add to merge queue',{member:true,ready:false},'acknowledged-enqueue',{alreadyOpen:true});
   await action(56,'Convert to draft',{member:true,ready:false},'acknowledged-draft');
   await releaseOldSearch();await population();await capture('old-search-after-actions-did-not-requalify');
   await action(55,'Remove from merge queue',{member:true,ready:true},'acknowledged-dequeue');
