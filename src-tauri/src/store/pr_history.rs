@@ -381,19 +381,33 @@ pub fn clear(conn: &Connection) -> Result<usize, StoreError> {
 /// what leaves is what nothing has looked at recently, and a re-visited
 /// scope re-accumulates at the measured ~1 point per 250 pull requests.
 pub fn prune(conn: &Connection) -> Result<usize, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let removed = prune_in(&tx)?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+pub fn prune_in(conn: &rusqlite::Transaction<'_>) -> Result<usize, StoreError> {
     let total = total_rows(conn)?;
     if total <= MAX_ROWS {
         return Ok(0);
     }
-    // Trim past the limit by a batch, so this does not run on every
-    // subsequent insert.
     let excess = total - MAX_ROWS + PRUNE_BATCH;
-    Ok(conn.execute(
-        "DELETE FROM pr_history WHERE rowid IN (
-             SELECT rowid FROM pr_history ORDER BY stored_at ASC, rowid ASC LIMIT ?1
-         )",
-        params![excess as i64],
-    )?)
+    // Select once. This temporary relation lives only within the caller's
+    // immediate write transaction, so proof revocation and deletion agree.
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS stats_prune_victims(rowid INTEGER PRIMARY KEY,scope_key TEXT NOT NULL,day TEXT NOT NULL); DELETE FROM stats_prune_victims;")?;
+    conn.execute("INSERT INTO stats_prune_victims SELECT rowid,scope_key,merged_at FROM pr_history ORDER BY stored_at,rowid LIMIT ?1", [excess as i64])?;
+    conn.execute_batch("INSERT INTO pr_scope_evidence(scope_key,revision)
+        SELECT DISTINCT scope_key,1 FROM stats_prune_victims WHERE true
+        ON CONFLICT(scope_key) DO UPDATE SET revision=revision+1;
+        DELETE FROM pr_slice WHERE EXISTS(SELECT 1 FROM stats_prune_victims v WHERE v.scope_key=pr_slice.scope_key AND v.day BETWEEN pr_slice.slice_from AND pr_slice.slice_to);
+        DELETE FROM pr_backfill_page WHERE EXISTS(SELECT 1 FROM stats_prune_victims v WHERE v.scope_key=pr_backfill_page.scope_key AND v.day=pr_backfill_page.day);")?;
+    let removed = conn.execute(
+        "DELETE FROM pr_history WHERE rowid IN (SELECT rowid FROM stats_prune_victims)",
+        [],
+    )?;
+    conn.execute("DELETE FROM stats_prune_victims", [])?;
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -761,6 +775,71 @@ mod tests {
         .unwrap();
         assert_eq!(clear(&conn).unwrap(), 2);
         assert_eq!(total_rows(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn pruning_revokes_overlapping_proofs_and_preserves_measured_empty_days() {
+        let conn = db();
+        conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200001)
+            INSERT INTO pr_history(scope_key,slice_from,slice_to,repo,number,merged_at,title,url,author,cycle_time_hours,size,additions,deletions,changed_files,reviews_received,stored_at)
+            SELECT CASE WHEN x<=150 THEN 'victim' ELSE 'other' END,'2026-01-01','2026-01-31','fixture/repo',x,'2026-01-15','fixture','https://example.test/pr','fixture',1,1,1,0,1,0,printf('%09d',x) FROM n;").unwrap();
+        for (key, from, to, count, state) in [
+            (
+                "victim",
+                "2026-01-15",
+                "2026-01-15",
+                150,
+                super::super::pr_slice::SliceState::Complete,
+            ),
+            (
+                "victim",
+                "2026-01-01",
+                "2026-01-31",
+                150,
+                super::super::pr_slice::SliceState::Irreducible,
+            ),
+            (
+                "victim",
+                "2026-02-01",
+                "2026-02-01",
+                0,
+                super::super::pr_slice::SliceState::Complete,
+            ),
+        ] {
+            super::super::pr_slice::put(
+                &conn,
+                key,
+                &super::super::pr_slice::SliceRow {
+                    from: from.into(),
+                    to: to.into(),
+                    state,
+                    issue_count: count,
+                    retrieved: count,
+                    refused_fields: 0,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(prune(&conn).unwrap(), 20001);
+        assert_eq!(total_rows(&conn).unwrap(), 180000);
+        assert_eq!(
+            count(&conn, "victim", "2026-01-15", "2026-01-15").unwrap(),
+            0
+        );
+        assert_eq!(
+            super::super::pr_slice::uncovered_days(&conn, "victim", "2026-01-15", "2026-01-15")
+                .unwrap(),
+            vec!["2026-01-15"]
+        );
+        assert!(super::super::pr_slice::uncovered_days(
+            &conn,
+            "victim",
+            "2026-02-01",
+            "2026-02-01"
+        )
+        .unwrap()
+        .is_empty());
     }
 
     /// The bound is stated rather than assumed, which is #1004's explicit

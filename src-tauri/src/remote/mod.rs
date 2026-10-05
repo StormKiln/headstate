@@ -7,6 +7,7 @@
 //!
 //! See `docs/superpowers/specs/2026-09-05-mobile-companion-design.md`.
 
+pub mod context;
 pub mod discovery;
 pub mod error_kind;
 pub mod events;

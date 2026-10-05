@@ -2301,3 +2301,9 @@ export function saveMarkdown(markdown: string): Promise<ExportOutcome> {
   }
   return call<ExportOutcome>('save_markdown', {markdown});
 }
+
+export type StatsDemandRequest =
+  | { op: "acquire"; scopeKind: string; scopeValue?: string; measure: "merged" | "opened"; days: number }
+  | { op: "renew" | "release"; handle: string; sequence: number };
+export interface StatsDemandReceipt { handle: string; owner: import("../types/pr").StatsOwner }
+export const statsDemand = (request: StatsDemandRequest) => call<StatsDemandReceipt>("stats_demand", { request });

@@ -1105,6 +1105,22 @@ mod tests {
         // Other reads are attempted and fail honestly.
         let err = c.call("get_stats", json!({})).await.unwrap_err();
         assert!(err.starts_with("octocat's laptop is unreachable:"), "{err}");
+        let err = c
+            .call(
+                "stats_demand",
+                json!({"request":{"op":"renew","handle":"fixture","sequence":1}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("octocat's laptop is unreachable:"),
+            "ephemeral read interest attempts recovery: {err}"
+        );
+        let err = c
+            .call("set_view_needs_github", json!({"needs":true}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("actions are disabled"));
     }
 
     #[tokio::test]
@@ -1322,6 +1338,12 @@ mod tests {
             err.starts_with("octocat's laptop runs an older Headstate"),
             "{err}"
         );
+
+        let err = c
+            .call("stats_demand", json!({"request":{"op":"acquire"}}))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("octocat's laptop runs an older Headstate"));
 
         // The refusal happens on the PHONE: nothing was sent to a
         // desktop that cannot answer it correctly. Asserting on the

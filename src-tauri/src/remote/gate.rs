@@ -50,6 +50,9 @@ impl PairedCerts for PairingState {
     fn pairing_window_open(&self) -> bool {
         self.pairing_open()
     }
+    fn authorized_device(&self, fp: &str) -> Option<super::context::AuthorizedDevice> {
+        self.authorized_device(fp)
+    }
     fn device(&self, sha256_fp_hex: &str) -> Option<crate::store::devices::PairedDevice> {
         self.paired_device(sha256_fp_hex)
     }
@@ -64,9 +67,9 @@ impl CommandHost for AppHost {
         &'a self,
         command: &'a str,
         args: Value,
-        device_name: &'a str,
+        context: &'a super::context::DispatchContext,
     ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>> {
-        Box::pin(surface::dispatch(&self.0, command, args, device_name))
+        Box::pin(surface::dispatch(&self.0, command, args, context))
     }
     fn notify_destructive(&self, device_name: &str, command: &str) {
         stepup::notify_destructive(&self.0, device_name, command);

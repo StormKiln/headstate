@@ -1299,6 +1299,12 @@ const MIGRATIONS: &[&str] = &[
         binding TEXT PRIMARY KEY NOT NULL,
         owner TEXT NOT NULL
     );",
+    // Scope evidence survives deletion of cursors/history. Every reservation
+    // and eviction advances this CAS; old asynchronous pages cannot revive it.
+    "CREATE TABLE pr_scope_evidence (
+        scope_key TEXT PRIMARY KEY NOT NULL,
+        revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0)
+    );",
 ];
 
 /// The only legacy repairs supported here are scripts that were already

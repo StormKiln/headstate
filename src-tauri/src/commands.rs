@@ -5462,6 +5462,8 @@ async fn note_scope_seen(
     owner: StatsOwner,
     registration: crate::store::pr_backfill_scope::BackfillScope,
     now: chrono::DateTime<chrono::Utc>,
+    demand: std::sync::Arc<crate::stats_demand::Registry>,
+    context: crate::remote::context::DispatchContext,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db).map_err(|e| {
@@ -5476,6 +5478,14 @@ async fn note_scope_seen(
             log::warn!("could not register this scope for backfill: {e}");
             e.to_string()
         })?;
+        demand.acquire(
+            &tx,
+            &owner,
+            &context,
+            registration.clone(),
+            std::time::Instant::now(),
+            true,
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         crate::diag!(
             "[diag] backfill scope registered kind={} horizon={}",
@@ -5591,9 +5601,34 @@ pub async fn stats_board(
     measure: String,
     days: i64,
 ) -> Result<StatsBoard, String> {
+    stats_board_with_context(
+        app,
+        client,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+        crate::remote::context::DispatchContext::desktop(),
+    )
+    .await
+}
+
+pub(crate) async fn stats_board_with_context(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+    context: crate::remote::context::DispatchContext,
+) -> Result<StatsBoard, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    stats_board_for_client(
+    stats_board_with_demand(
         &client,
+        app.state::<std::sync::Arc<crate::stats_demand::Registry>>()
+            .inner()
+            .clone(),
+        context,
         db_path(&app),
         &app.state::<crate::poll::BackfillWaker>().0,
         scope_kind,
@@ -5604,8 +5639,36 @@ pub async fn stats_board(
     .await
 }
 
+#[cfg(test)]
 async fn stats_board_for_client(
     client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    waker: &tokio::sync::Notify,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoard, String> {
+    stats_board_with_demand(
+        client,
+        std::sync::Arc::new(crate::stats_demand::Registry::default()),
+        crate::remote::context::DispatchContext::desktop(),
+        db,
+        waker,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await
+}
+
+// Captured owner, evidence, and caller authority stay explicit across awaits.
+#[allow(clippy::too_many_arguments)]
+async fn stats_board_with_demand(
+    client: &crate::github::client::GitHubClient,
+    demand: std::sync::Arc<crate::stats_demand::Registry>,
+    context: crate::remote::context::DispatchContext,
     db: std::path::PathBuf,
     waker: &tokio::sync::Notify,
     scope_kind: String,
@@ -5678,7 +5741,7 @@ async fn stats_board_for_client(
         // rather than a guess at it.
         scope_value: scope_value_for_backfill.clone(),
         measure: measure_name.to_string(),
-        horizon_days: crate::github::stats::backfill::HORIZON_DAYS.max(clamp_days(days) as u32),
+        horizon_days: clamp_days(days) as u32,
     };
     let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
     let hit = stats_cache_read(
@@ -5694,7 +5757,15 @@ async fn stats_board_for_client(
     // incompatible state, and before a cached answer can return (#1109).
     // Registration checks the same captured generation in its transaction.
     let backfill = backfill_registration(
-        note_scope_seen(db.clone(), owner.clone(), registration, now).await,
+        note_scope_seen(
+            db.clone(),
+            owner.clone(),
+            registration,
+            now,
+            demand,
+            context,
+        )
+        .await,
         &owner,
         &q.cache_key(&viewer),
     );
@@ -5777,6 +5848,24 @@ async fn stats_board_for_client(
     // as not accumulating, instead of an error where they used to get a
     // partial answer.
     let scope_key = q.cache_key(&viewer);
+    let evidence = {
+        let db = db.clone();
+        let owner = owner.clone();
+        let key = scope_key.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
+            let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            stats_owner::require_current(&tx, &owner).map_err(|e| e.to_string())?;
+            let revision = crate::store::pr_scope_evidence::reserve(&tx, &key)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(revision)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+    };
     let out = crate::github::stats::board::load_board_accumulating(
         client, &req.scope, measure, window, &budget,
     )
@@ -5795,6 +5884,7 @@ async fn stats_board_for_client(
                 db.clone(),
                 owner.clone(),
                 scope_key.clone(),
+                evidence,
                 req.window.from.clone(),
                 req.window.to.clone(),
                 loaded,
@@ -5956,10 +6046,13 @@ async fn stored_stats_board(
 /// PATH rather than an `AppHandle` is what lets the whole body move: the
 /// `Connection` then never has to be `Send` across an `.await`, because it
 /// is created and dropped inside the closure.
+// Captured owner, evidence, and caller authority stay explicit across awaits.
+#[allow(clippy::too_many_arguments)]
 async fn accumulate_board(
     db: std::path::PathBuf,
     owner: StatsOwner,
     scope_key: String,
+    evidence: Option<i64>,
     window_start: String,
     window_end: String,
     loaded: crate::github::stats::board::LoadedBoard,
@@ -5971,6 +6064,7 @@ async fn accumulate_board(
             &db,
             &owner,
             &scope_key,
+            evidence,
             &window_start,
             &window_end,
             loaded,
@@ -5986,10 +6080,13 @@ async fn accumulate_board(
 }
 
 /// The blocking half of [`accumulate_board`].
+// Captured owner, evidence, and caller authority stay explicit across awaits.
+#[allow(clippy::too_many_arguments)]
 fn accumulate_board_blocking(
     db: &std::path::Path,
     owner: &StatsOwner,
     scope_key: &str,
+    evidence: Option<i64>,
     window_start: &str,
     window_end: &str,
     loaded: crate::github::stats::board::LoadedBoard,
@@ -6006,6 +6103,11 @@ fn accumulate_board_blocking(
         return board;
     };
     if stats_owner::require_current(&tx, owner).is_err() {
+        return board;
+    }
+    if evidence.is_none_or(|revision| {
+        crate::store::pr_scope_evidence::require(&tx, scope_key, revision).is_err()
+    }) {
         return board;
     }
     // Written BEFORE the read, so this load's own pages are part of the
@@ -6032,10 +6134,13 @@ fn accumulate_board_blocking(
     }
     // Bounded here rather than on a schedule: this is the only site that
     // grows the table, so it is the only one that needs to bound it.
-    match pr_history::prune(&tx) {
+    match pr_history::prune_in(&tx) {
         Ok(0) => {}
         Ok(n) => log::info!("pruned {n} accumulated pull requests past the bound"),
-        Err(e) => log::warn!("could not prune accumulated pull requests: {e}"),
+        Err(e) => {
+            log::warn!("could not prune accumulated pull requests: {e}");
+            return board;
+        }
     }
     // No registration here since #1570. `stats_board` registers the scope
     // once, after the identity check and before either return, and reports
@@ -8999,7 +9104,7 @@ mod tests {
             );
         }
         let board = source
-            .split("async fn stats_board_for_client(")
+            .split("async fn stats_board_with_demand(")
             .nth(1)
             .unwrap()
             .split("let measure =")
@@ -9027,7 +9132,12 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(
-                arm.contains(&format!("commands::{name}(")),
+                if name == "stats_board" {
+                    arm.contains("commands::stats_board_with_context(")
+                        && arm.contains("context.clone()")
+                } else {
+                    arm.contains(&format!("commands::{name}("))
+                },
                 "remote {name} must use the tested command boundary"
             );
         }
@@ -11770,3 +11880,118 @@ pub async fn get_gitlab_detail(
 #[cfg(test)]
 #[path = "stats_receipt_tests.rs"]
 mod stats_receipt_tests;
+
+/// Bounded ephemeral read interest; renewal/release perform only local work.
+#[tauri::command]
+pub async fn stats_demand(
+    app: AppHandle,
+    request: crate::stats_demand::Request,
+) -> Result<crate::stats_demand::Receipt, String> {
+    stats_demand_with_context(
+        app,
+        request,
+        crate::remote::context::DispatchContext::desktop(),
+    )
+    .await
+}
+
+pub(crate) async fn stats_demand_with_context(
+    app: AppHandle,
+    request: crate::stats_demand::Request,
+    context: crate::remote::context::DispatchContext,
+) -> Result<crate::stats_demand::Receipt, String> {
+    use crate::stats_demand::Request;
+    let registry = app
+        .state::<std::sync::Arc<crate::stats_demand::Registry>>()
+        .inner()
+        .clone();
+    let db = db_path(&app);
+    let acquisition = if let Request::Acquire {
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    } = &request
+    {
+        if !(1..=90).contains(days)
+            || scope_kind.len() > 16
+            || scope_value.as_ref().is_some_and(|v| v.len() > 256)
+            || measure != "merged"
+        {
+            return Err("invalid stats demand".into());
+        }
+        let req = parse_scope_request(scope_kind, scope_value.clone(), *days, chrono::Utc::now())?;
+        let client = app.state::<GhClient>().0.clone().ok_or(AUTH_ERR)?;
+        let viewer = client
+            .stats_viewer_metered(&client.request_budget())
+            .await
+            .map_err(|e| e.to_string())?;
+        let scope = crate::store::pr_backfill_scope::BackfillScope {
+            scope_key: crate::github::stats::StatsQuery::new(
+                None,
+                req.scope,
+                crate::github::stats::Measure::Merged,
+            )
+            .cache_key(&viewer),
+            scope_kind: scope_kind.clone(),
+            scope_value: scope_value.clone().unwrap_or_default(),
+            measure: measure.clone(),
+            horizon_days: *days as u32,
+        };
+        let owner = {
+            let db = db.clone();
+            tauri::async_runtime::spawn_blocking(move || -> Result<StatsOwner, String> {
+                let conn = open_db(&db).map_err(|e| e.to_string())?;
+                stats_owner::current_for_verified(&conn, &viewer)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "load stats to establish the current account".into())
+            })
+            .await
+            .map_err(|e| e.to_string())??
+        };
+        Some((owner, scope))
+    } else {
+        None
+    };
+    let receipt = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let receipt = match request {
+            Request::Acquire { .. } => {
+                let (owner, scope) = acquisition.ok_or("missing acquisition")?;
+                registry.acquire(
+                    &tx,
+                    &owner,
+                    &context,
+                    scope,
+                    std::time::Instant::now(),
+                    false,
+                )?
+            }
+            Request::Renew { handle, sequence } => registry.update(
+                &tx,
+                &context,
+                &handle,
+                sequence,
+                false,
+                std::time::Instant::now(),
+            )?,
+            Request::Release { handle, sequence } => registry.update(
+                &tx,
+                &context,
+                &handle,
+                sequence,
+                true,
+                std::time::Instant::now(),
+            )?,
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(receipt)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    app.state::<crate::poll::BackfillWaker>().0.notify_one();
+    Ok(receipt)
+}

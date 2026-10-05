@@ -205,6 +205,16 @@ impl<H: CommandHost> Desktop<H> {
     /// Steps 2-4: the phone posts `/v1/pair`, the desktop asks the
     /// user, the user approves. Returns what the phone received.
     async fn pair(&mut self, phone: &Phone, device_name: &str) -> PairOutcome {
+        self.pair_with_policy(phone, device_name, SameName::Undecided)
+            .await
+    }
+
+    async fn pair_with_policy(
+        &mut self,
+        phone: &Phone,
+        device_name: &str,
+        same_name: SameName,
+    ) -> PairOutcome {
         let issued = self.issue_qr();
         let token = BASE64URL.decode(&issued.token).unwrap();
         let req = PairRequest {
@@ -236,9 +246,7 @@ impl<H: CommandHost> Desktop<H> {
             .respond(
                 &self.conn,
                 event.request_id,
-                PairDecision::Approve {
-                    same_name: SameName::Undecided,
-                },
+                PairDecision::Approve { same_name },
             )
             .unwrap();
 
@@ -682,7 +690,7 @@ impl CommandHost for SlowSizer {
         &'a self,
         _command: &'a str,
         _args: Value,
-        _device_name: &'a str,
+        _context: &'a super::context::DispatchContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -994,7 +1002,7 @@ impl CommandHost for TranscriptHost {
         &'a self,
         command: &'a str,
         _args: Value,
-        _device_name: &'a str,
+        _context: &'a super::context::DispatchContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -1284,7 +1292,7 @@ impl CommandHost for FindHost {
         &'a self,
         command: &'a str,
         args: Value,
-        _device_name: &'a str,
+        _context: &'a super::context::DispatchContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -1421,4 +1429,262 @@ async fn only_the_call_route_is_compressed() {
     assert_eq!(hello.json()["protocol_version"], 2);
 
     desktop.handle.stop().await;
+}
+
+#[tokio::test]
+async fn actual_listener_preserves_distinct_and_irreversibly_retired_pairing_contexts() {
+    let mut desktop = desktop().await;
+    let first = Phone::new();
+    let second = Phone::new();
+    let one = desktop.pair(&first, "synthetic same name").await;
+    desktop
+        .pair_with_policy(&second, "synthetic same name", SameName::KeepBoth)
+        .await;
+    for phone in [&first, &second] {
+        assert_eq!(
+            desktop
+                .call(
+                    phone,
+                    "stats_demand",
+                    &[],
+                    Some(r#"{"request":{"op":"acquire","principal":"forged","days":7}}"#)
+                )
+                .await
+                .status,
+            200
+        );
+    }
+    let contexts = desktop.host.contexts.lock().unwrap().clone();
+    assert_ne!(contexts[0].principal(), contexts[1].principal());
+    assert_eq!(contexts[0].display_name, contexts[1].display_name);
+    desktop
+        .pairing
+        .revoke(&desktop.conn, one.device_id)
+        .unwrap();
+    assert!(contexts[0].guard().is_err());
+    assert!(contexts[1].guard().is_ok());
+    desktop
+        .pair_with_policy(&first, "synthetic same name", SameName::KeepBoth)
+        .await;
+    assert_eq!(
+        desktop
+            .call(&first, "stats_demand", &[], Some("{}"))
+            .await
+            .status,
+        200
+    );
+    let fresh = desktop
+        .host
+        .contexts
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_ne!(fresh.principal(), contexts[0].principal());
+    assert!(contexts[0].guard().is_err());
+    // Exercise the actual registry with capabilities admitted by the mTLS
+    // listener. A newly paired same certificate cannot renew its old handle.
+    let owner = crate::store::stats_owner::capture_verified(&desktop.conn, "fixture").unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(
+        &desktop.conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    let registry = crate::stats_demand::Registry::default();
+    let scope = crate::store::pr_backfill_scope::BackfillScope {
+        scope_key: "merged|*|org:fixture".into(),
+        scope_kind: "org".into(),
+        scope_value: "fixture".into(),
+        measure: "merged".into(),
+        horizon_days: 7,
+    };
+    assert!(registry
+        .acquire(
+            &tx,
+            &owner,
+            &contexts[0],
+            scope.clone(),
+            std::time::Instant::now(),
+            false
+        )
+        .is_err());
+    let lease = registry
+        .acquire(
+            &tx,
+            &owner,
+            &contexts[1],
+            scope,
+            std::time::Instant::now(),
+            false,
+        )
+        .unwrap();
+    assert!(registry
+        .update(
+            &tx,
+            &fresh,
+            &lease.handle,
+            1,
+            true,
+            std::time::Instant::now()
+        )
+        .is_err());
+    assert!(registry
+        .update(
+            &tx,
+            &contexts[1],
+            &lease.handle,
+            1,
+            false,
+            std::time::Instant::now()
+        )
+        .is_ok());
+}
+
+#[tokio::test]
+async fn privacy_write_with_failed_reload_refuses_real_listener_before_host_dispatch() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+    let other = Phone::new();
+    let target = desktop.pair(&phone, "synthetic target").await;
+    let other = desktop.pair(&other, "synthetic other").await;
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, target.device_id, true, true)
+        .unwrap();
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, other.device_id, true, true)
+        .unwrap();
+    let before = desktop
+        .pairing
+        .authorized_device(&phone.fingerprint())
+        .unwrap()
+        .context();
+    desktop.conn.execute_batch(&format!("CREATE TRIGGER fail_policy_reload AFTER UPDATE ON paired_device_access WHEN new.device_id={} BEGIN UPDATE paired_device_access SET transcripts_allowed='unreadable' WHERE device_id={}; END;",target.device_id,other.device_id)).unwrap();
+    desktop
+        .pairing
+        .set_transcript_access(&desktop.conn, target.device_id, false, false)
+        .unwrap();
+    assert!(crate::store::devices::list(&desktop.conn).is_err());
+    let after = desktop
+        .pairing
+        .authorized_device(&phone.fingerprint())
+        .unwrap()
+        .context();
+    assert_eq!(before.principal(), after.principal());
+    assert!(before.guard().is_ok());
+    let reply = desktop
+        .call(&phone, "claude_transcript_page", &[], Some("{} "))
+        .await;
+    assert_eq!(reply.status, 403);
+    assert!(desktop.host.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        desktop
+            .call(&phone, "stats_demand", &[], Some("{}"))
+            .await
+            .status,
+        200
+    );
+}
+
+struct HeldDemandHost {
+    registry: Arc<crate::stats_demand::Registry>,
+    db: std::path::PathBuf,
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl CommandHost for HeldDemandHost {
+    fn dispatch<'a>(
+        &'a self,
+        _command: &'a str,
+        _args: Value,
+        context: &'a super::context::DispatchContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RemoteError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.started.notify_one();
+            self.resume.notified().await;
+            let mut conn = crate::store::open_db(&self.db).map_err(|e| {
+                RemoteError::Command(crate::remote::error_kind::CommandError::classify(
+                    e.to_string(),
+                ))
+            })?;
+            let owner = crate::store::stats_owner::current_for_verified(&conn, "fixture")
+                .unwrap()
+                .unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let lease = self
+                .registry
+                .acquire(
+                    &tx,
+                    &owner,
+                    context,
+                    crate::store::pr_backfill_scope::BackfillScope {
+                        scope_key: "merged|*|org:fixture".into(),
+                        scope_kind: "org".into(),
+                        scope_value: "fixture".into(),
+                        measure: "merged".into(),
+                        horizon_days: 1,
+                    },
+                    std::time::Instant::now(),
+                    false,
+                )
+                .map_err(|e| {
+                    RemoteError::Command(crate::remote::error_kind::CommandError::classify(e))
+                })?;
+            tx.commit().unwrap();
+            Ok(serde_json::to_value(lease).unwrap())
+        })
+    }
+    fn notify_destructive(&self, _device_name: &str, _command: &str) {}
+}
+
+#[tokio::test]
+async fn revoke_fences_a_request_already_admitted_by_the_real_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("demand.db");
+    crate::store::stats_owner::capture_verified(&crate::store::open_db(&db).unwrap(), "fixture")
+        .unwrap();
+    let host = Arc::new(HeldDemandHost {
+        registry: Arc::new(crate::stats_demand::Registry::default()),
+        db,
+        started: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let hub = Arc::new(Hub::new(Arc::new(|| Box::pin(async { Some("[]".into()) }))));
+    let mut desktop = desktop_on(host.clone(), hub).await;
+    let phone = Phone::new();
+    let paired = desktop.pair(&phone, "synthetic held phone").await;
+    let (addr, fp, cert) = (desktop.addr, desktop.fp.clone(), phone.cert.clone());
+    let pending = tokio::spawn(async move {
+        request(
+            addr,
+            Some(&cert),
+            &fp,
+            "POST",
+            "/v1/call/stats_demand",
+            &[],
+            Some("{}"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), host.started.notified())
+        .await
+        .unwrap();
+    desktop
+        .pairing
+        .revoke(&desktop.conn, paired.device_id)
+        .unwrap();
+    host.resume.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Ok(reply) = result {
+        assert_ne!(reply.status, 200);
+    }
+    assert!(!host.registry.has_live_interest(std::time::Instant::now()));
 }

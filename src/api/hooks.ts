@@ -1,3 +1,4 @@
+import { useStatsDemand } from "./useStatsDemand";
 import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { useDetailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
@@ -3991,6 +3992,7 @@ export function useStatsBoard(
   enabled: boolean,
 ) {
   const loadable = scopeIsLoadable(scope);
+  useStatsDemand(scope?.kind,scope?.value,measure,days,enabled && loadable);
   return useQuery({
     queryKey: [
       "stats-board",

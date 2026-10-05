@@ -16,6 +16,8 @@ const CAP: usize = crate::github::stats::slice::SEARCH_CAP as usize;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Page {
     version: u32,
+    #[serde(default)]
+    revision: i64,
     pub day: String,
     pub after: Option<String>,
     total: Option<u64>,
@@ -26,6 +28,7 @@ impl Page {
     fn new(day: String) -> Self {
         Self {
             version: VERSION,
+            revision: 0,
             day,
             after: None,
             total: None,
@@ -46,28 +49,8 @@ pub fn select_in(
 ) -> Result<Vec<Page>, String> {
     stats_owner::require_current(tx, owner).map_err(|e| e.to_string())?;
     let viewer = owner.viewer();
-    // Retain only this scope's still-uncovered dates. Old horizons and
-    // days completed by the foreground do not accumulate orphan cursors.
-    let old_days: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT day FROM pr_backfill_page WHERE viewer=?1 AND scope_key=?2")
-            .map_err(|e| e.to_string())?;
-        let days = stmt
-            .query_map(params![viewer, key], |r| r.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        days
-    };
-    for day in old_days {
-        if !dates.contains(&day) {
-            tx.execute(
-                "DELETE FROM pr_backfill_page WHERE viewer=?1 AND scope_key=?2 AND day=?3",
-                params![viewer, key, day],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
+    // A narrower live horizon is not permission to discard stored progress.
+    let revision = super::pr_scope_evidence::reserve(tx, key)?;
     let mut candidates = Vec::new();
     for day in dates {
         let row: Option<(String, i64)> = tx.query_row(
@@ -105,7 +88,14 @@ pub fn select_in(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    let selected: Vec<Page> = candidates.into_iter().take(limit).map(|(_, p)| p).collect();
+    let selected: Vec<Page> = candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, mut p)| {
+            p.revision = revision;
+            p
+        })
+        .collect();
     for page in &selected {
         let payload = serde_json::to_string(page).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO pr_backfill_page(viewer,scope_key,day,payload,attempted) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(viewer,scope_key,day) DO UPDATE SET payload=excluded.payload,attempted=excluded.attempted",params![viewer,key,page.day,payload,order]).map_err(|e| e.to_string())?;
@@ -128,6 +118,7 @@ pub fn commit_in(
     let mut written = 0;
     let mut valid = true;
     for (i, previous) in pages.iter().enumerate() {
+        super::pr_scope_evidence::require(tx, key, previous.revision)?;
         // A foreground load may have completed this day while we fetched it.
         let coverage =
             pr_slice::coverage(tx, key, &previous.day, &previous.day).map_err(|e| e.to_string())?;
@@ -328,6 +319,35 @@ mod tests {
             "createdAt":"2026-09-01T00:00:00Z","mergedAt":"2026-09-01T01:00:00Z","additions":1,"deletions":0,"changedFiles":1,"reviews":{"totalCount":0}
         }]}})
     }
+    #[test]
+    fn superseded_reservation_cannot_publish_history_or_coverage() {
+        let mut conn = db();
+        let dates = vec!["2026-09-01".into()];
+        let stale = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        let _newer = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        let result = commit(&mut conn, "a", "fixture", &stale, &page(), Utc::now());
+        assert!(
+            result.is_err(),
+            "a dispatched page must retain its reservation authority"
+        );
+        assert_eq!(pr_history::total_rows(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn narrowing_the_horizon_preserves_unrequested_continuations() {
+        let mut conn = db();
+        let dates = vec!["2026-09-01".into()];
+        let pages = select(&mut conn, "a", "fixture", &dates, 1).unwrap();
+        commit(&mut conn, "a", "fixture", &pages, &page(), Utc::now()).unwrap();
+        select(&mut conn, "a", "fixture", &["2026-09-02".into()], 1).unwrap();
+        assert_eq!(
+            select(&mut conn, "a", "fixture", &dates, 1).unwrap()[0]
+                .after
+                .as_deref(),
+            Some("next")
+        );
+    }
+
     #[test]
     fn dense_pages_roll_back_history_cursor_and_ledger_together() {
         let mut conn = db();

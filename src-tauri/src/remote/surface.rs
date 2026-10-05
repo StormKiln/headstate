@@ -130,6 +130,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the property that makes exposing the expensive path safe rather
     // than a second set of limits to keep in sync.
     ("stats_board", Class::Read),
+    // Ephemeral bounded read interest, including mobile read recovery.
+    ("stats_demand", Class::Read),
     // The scoped daily activity series (#826). A Read, and the cheap half
     // of a scope page: count-only searches, no nodes.
     ("stats_series", Class::Read),
@@ -1059,11 +1061,12 @@ pub async fn dispatch(
     app: &AppHandle,
     command: &str,
     args: Value,
-    device_name: &str,
+    context: &super::context::DispatchContext,
 ) -> Result<Value, RemoteError> {
+    let device_name = &context.display_name;
     let class = admit(command)?;
     log::info!("remote: {device_name} called {command} ({class:?})");
-    let result = call(app, command, Args::new(command, args)?).await;
+    let result = call(app, command, Args::new(command, args)?, context).await;
     if let Err(e) = &result {
         log::warn!("remote: {command} for {device_name} failed: {e}");
     }
@@ -1078,7 +1081,12 @@ pub async fn dispatch(
 /// `State<'_, T>` Tauri injects into the command; `AppHandle` arguments
 /// get a clone of `app`. Argument keys are the camelCase names the
 /// webview sends, so `repo_path` on the Rust side is `"repoPath"` here.
-async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, RemoteError> {
+async fn call(
+    app: &AppHandle,
+    command: &str,
+    a: Args<'_>,
+    context: &super::context::DispatchContext,
+) -> Result<Value, RemoteError> {
     match command {
         // ---- read -------------------------------------------------------
         "background_panicked" => ok(commands::background_panicked()),
@@ -1146,13 +1154,20 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // about everyone in the scope, and a subject qualifier would render
         // a leaderboard with one name on it. The viewer's login comes back
         // IN the answer so the caller can split Mine from Others.
-        "stats_board" => res(commands::stats_board(
+        "stats_demand" => res(commands::stats_demand_with_context(
+            app.clone(),
+            a.get("request")?,
+            context.clone(),
+        )
+        .await),
+        "stats_board" => res(commands::stats_board_with_context(
             app.clone(),
             app.state(),
             a.get("scopeKind")?,
             a.get("scopeValue")?,
             a.get("measure")?,
             a.get("days")?,
+            context.clone(),
         )
         .await),
         "stats_series" => res(commands::stats_series(

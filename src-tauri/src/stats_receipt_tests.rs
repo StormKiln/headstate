@@ -1556,12 +1556,17 @@ async fn retirement_after_owned_board_snapshot_refuses_late_registration_and_pub
         measure: "merged".into(),
         horizon_days: 90,
     };
-    assert!(
-        note_scope_seen(db.clone(), owner.clone(), registration, now)
-            .await
-            .unwrap_err()
-            .contains("account changed")
-    );
+    assert!(note_scope_seen(
+        db.clone(),
+        owner.clone(),
+        registration,
+        now,
+        std::sync::Arc::new(crate::stats_demand::Registry::default()),
+        crate::remote::context::DispatchContext::desktop()
+    )
+    .await
+    .unwrap_err()
+    .contains("account changed"));
     assert!(stored_stats_board(
         db.clone(),
         owner.clone(),
@@ -1714,6 +1719,8 @@ async fn ordinary_failed_series_retry_preserves_latest_reason_age_and_spend() {
 
 #[test]
 fn latest_attempt_metadata_does_not_downgrade_complete_measurements_or_replay_spend() {
+    let _observed = crate::github::stats::budget::observed_test_lock();
+    let _restore = crate::github::stats::budget::RestoreObserved::capture();
     use crate::github::stats::{receipt, Budget, Outcome};
     let dir = tempfile::tempdir().unwrap();
     let conn = open_db(&dir.path().join("stats.db")).unwrap();

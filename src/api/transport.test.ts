@@ -465,6 +465,7 @@ const ROWS: Row[] = [
   // No `subject` at all, which is the board's defining property: it asks
   // about everyone in the scope. A subject here would render a leaderboard
   // with one name on it.
+  row(api.statsDemand, [{op:"renew",handle:"fixture",sequence:1}], "stats_demand", {request:{op:"renew",handle:"fixture",sequence:1}}),
   row(api.statsBoard, ["org", "acme", "merged", 30], "stats_board", {
     scopeKind: "org",
     scopeValue: "acme",

@@ -35,7 +35,7 @@
 //!     stepup::verify(&device, &command, &args, header, Utc::now().timestamp(), &nonces)
 //!         .map_err(|e| (e.http_status(), e.to_string()))?;
 //! }
-//! let out = surface::dispatch(&app, &command, args, &device.name).await?;
+//! let out = surface::dispatch(&app, &command, args, &context).await?;
 //! if class == Class::Destructive {
 //!     stepup::notify_destructive(&app, &device.name, &command);
 //! }

@@ -1637,7 +1637,14 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
         loop {
             wait_backfill_tick(&waker, last_started).await;
             last_started = Some(tokio::time::Instant::now());
-            let tick = backfill_tick(crate::commands::db_path(&app), &client).await;
+            let tick = backfill_tick(
+                crate::commands::db_path(&app),
+                &client,
+                app.state::<Arc<crate::stats_demand::Registry>>()
+                    .inner()
+                    .clone(),
+            )
+            .await;
             match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
@@ -1746,7 +1753,11 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 ///
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
-async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Tick {
+async fn backfill_tick(
+    db: std::path::PathBuf,
+    client: &Arc<GitHubClient>,
+    demand: Arc<crate::stats_demand::Registry>,
+) -> Tick {
     use crate::github::stats::backfill::{self as bf, TickOutcome};
 
     // The gate, BEFORE any request. `None` means skip -- deliberately the
@@ -1756,6 +1767,9 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
     if client.has_interactive_reads() {
         crate::diag!("[diag] stats backfill deferred: user-facing read active");
         return TickOutcome::ForegroundBusy.into();
+    }
+    if !demand.has_live_interest(std::time::Instant::now()) {
+        return TickOutcome::NoScope.into();
     }
     let observed = client.observed_remaining();
     if !bf::affordable(observed, bf::TICK_PROJECTION) {
@@ -1802,36 +1816,19 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
             else {
                 return Ok(None);
             };
-            let Some(scope) =
-                crate::store::pr_backfill_scope::next_to_work(&tx).map_err(|e| e.to_string())?
-            else {
+            let Some(pick) = demand.pick(&tx, &owner, std::time::Instant::now(), now)? else {
                 return Ok(None);
             };
-            let Some((from, to)) = bf::horizon_window(now, scope.horizon_days) else {
-                return Ok(None);
-            };
-            let uncovered =
-                crate::store::pr_slice::uncovered_days(&tx, &scope.scope_key, &from, &to)
-                    .map_err(|e| e.to_string())?;
-            let pages = crate::store::pr_backfill_page::select_in(
-                &tx,
-                &owner,
-                &scope.scope_key,
-                &uncovered,
-                bf::GROUP_SLICES,
-            )?;
-            let coverage = crate::store::pr_slice::coverage(&tx, &scope.scope_key, &from, &to)
-                .map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-            Ok(Some((
-                owner,
+            let crate::stats_demand::Pick {
                 scope,
                 from,
                 to,
                 uncovered,
                 pages,
-                coverage.partial,
-            )))
+                partial,
+            } = pick;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(Some((owner, scope, from, to, uncovered, pages, partial)))
         })
         .await
     };
@@ -1914,7 +1911,7 @@ async fn backfill_tick(db: std::path::PathBuf, client: &Arc<GitHubClient>) -> Ti
                 .map_err(|e| e.to_string())?;
             let (rows, valid) =
                 crate::store::pr_backfill_page::commit_in(&tx, &owner, &key, &pages, &map, now)?;
-            crate::store::pr_history::prune(&tx).map_err(|e| e.to_string())?;
+            crate::store::pr_history::prune_in(&tx).map_err(|e| e.to_string())?;
             let coverage = crate::store::pr_slice::coverage(&tx, &key, &from, &to)
                 .map_err(|e| e.to_string())?;
             let remaining = crate::store::pr_slice::uncovered_days(&tx, &key, &from, &to)
@@ -2140,11 +2137,39 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 1,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
             let mut client = new_client();
             client.fetch_viewer().await.unwrap();
             let before = server.received_requests().await.unwrap().len();
             for (pass, expected) in [50, 100, 120].into_iter().enumerate() {
-                let tick = super::backfill_tick(db.clone(), &client).await;
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
                 assert_eq!(
                     crate::store::pr_history::count(&conn, key, &day, &day).unwrap(),
                     expected
@@ -2164,8 +2189,164 @@ mod tests {
             assert_eq!(server.received_requests().await.unwrap().len(), before + 4);
             let before = server.received_requests().await.unwrap().len();
             assert!(matches!(
-                super::backfill_tick(db, &client).await.outcome,
-                bf::TickOutcome::Complete
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+        });
+    }
+
+    #[test]
+    fn fifty_stale_scopes_do_not_delay_the_active_dense_day() {
+        use crate::github::stats::{backfill as bf, budget};
+        let _observed = budget::observed_test_lock();
+        let _restore = budget::RestoreObserved::capture();
+        budget::note_remaining(5000);
+        tauri::async_runtime::block_on(async {
+            let _permits = budget::READ_PERMIT_TEST_LOCK.lock().await;
+            let server = wiremock::MockServer::start().await;
+            let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string();
+            let reply_day = day.clone();
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    let doc = body["query"].as_str().unwrap();
+                    if !doc.contains("search(") {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"viewer":{"login":"fixture-viewer"},"rateLimit":{"remaining":5000}}}));
+                    }
+                    let offset = if doc.contains("after: \"100\"") {100} else if doc.contains("after: \"50\"") {50} else {0};
+                    let end = (offset + 50).min(120);
+                    let nodes: Vec<_> = (offset..end).map(|n| serde_json::json!({
+                        "number":n+1,"title":"fixture","url":"https://example.com/pr",
+                        "repository":{"nameWithOwner":"fixture/repo"},"author":{"login":"fixture-author"},
+                        "createdAt":format!("{reply_day}T00:00:00Z"),"mergedAt":format!("{reply_day}T01:00:00Z"),
+                        "additions":1,"deletions":0,"changedFiles":1,"reviews":{"totalCount":0}
+                    })).collect();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"s0":{
+                        "issueCount":120,"nodes":nodes,"pageInfo":{"hasNextPage":end<120,"endCursor":end.to_string()}
+                    }}}))
+                }).mount(&server).await;
+            let new_client = || {
+                std::sync::Arc::new(crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(server.uri())
+                        .unwrap()
+                        .personal_token("fixture-token".to_string())
+                        .build()
+                        .unwrap(),
+                ))
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("dense.db");
+            let conn = crate::store::open_db(&db).unwrap();
+            crate::store::stats_owner::capture_verified(&conn, "fixture-viewer").unwrap();
+            let key = "merged|*|org:fixture";
+            crate::store::pr_backfill_scope::note_seen(
+                &conn,
+                &crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: key.into(),
+                    scope_kind: "org".into(),
+                    scope_value: "fixture".into(),
+                    measure: "merged".into(),
+                    horizon_days: 1,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            for i in 0..50 {
+                let stale = crate::store::pr_backfill_scope::BackfillScope {
+                    scope_key: format!("merged|*|org:stale-{i}"),
+                    scope_kind: "org".into(),
+                    scope_value: format!("stale-{i}"),
+                    measure: "merged".into(),
+                    horizon_days: 1,
+                };
+                crate::store::pr_backfill_scope::note_seen(
+                    &conn,
+                    &stale,
+                    chrono::Utc::now() - chrono::Duration::days(7),
+                )
+                .unwrap();
+                crate::store::pr_backfill_scope::note_worked(
+                    &conn,
+                    &stale.scope_key,
+                    chrono::Utc::now() - chrono::Duration::days(7),
+                )
+                .unwrap();
+                crate::store::pr_slice::put(
+                    &conn,
+                    &stale.scope_key,
+                    &crate::store::pr_slice::SliceRow {
+                        from: day.clone(),
+                        to: day.clone(),
+                        state: crate::store::pr_slice::SliceState::Complete,
+                        issue_count: 0,
+                        retrieved: 0,
+                        refused_fields: 0,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            }
+            crate::store::pr_backfill_scope::note_worked(&conn, key, chrono::Utc::now()).unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 1,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            let mut client = new_client();
+            client.fetch_viewer().await.unwrap();
+            let before = server.received_requests().await.unwrap().len();
+            for (pass, expected) in [50, 100, 120].into_iter().enumerate() {
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
+                assert_eq!(
+                    crate::store::pr_history::count(&conn, key, &day, &day).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    matches!(tick.outcome, bf::TickOutcome::Complete),
+                    pass == 2,
+                    "{:?}",
+                    tick.outcome
+                );
+                if pass == 0 {
+                    // A fresh client/process must resume the durable cursor.
+                    client = new_client();
+                    client.fetch_viewer().await.unwrap();
+                }
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), before + 4);
+            let before = server.received_requests().await.unwrap().len();
+            assert!(matches!(
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
             ));
             assert_eq!(server.received_requests().await.unwrap().len(), before);
         });
@@ -2253,11 +2434,39 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap();
+            let demand = std::sync::Arc::new(crate::stats_demand::Registry::default());
+            {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let owner = crate::store::stats_owner::current_for_verified(&tx, "fixture-viewer")
+                    .unwrap()
+                    .unwrap();
+                demand
+                    .acquire(
+                        &tx,
+                        &owner,
+                        &crate::remote::context::DispatchContext::desktop(),
+                        crate::store::pr_backfill_scope::BackfillScope {
+                            scope_key: key.to_string(),
+                            scope_kind: "org".into(),
+                            scope_value: "fixture".into(),
+                            measure: "merged".into(),
+                            horizon_days: 30,
+                        },
+                        std::time::Instant::now(),
+                        false,
+                    )
+                    .unwrap();
+                tx.commit().unwrap();
+            }
             let (from, to) = bf::horizon_window(chrono::Utc::now(), 30).unwrap();
             client.fetch_viewer().await.unwrap();
             let ticks = 30usize.div_ceil(bf::GROUP_SLICES);
             for pass in 1..=ticks {
-                let tick = super::backfill_tick(db.clone(), &client).await;
+                let tick = super::backfill_tick(db.clone(), &client, demand.clone()).await;
                 assert!(
                     !matches!(tick.outcome, bf::TickOutcome::Failed(_)),
                     "{:?}",
@@ -2279,8 +2488,10 @@ mod tests {
             let issued = server.received_requests().await.unwrap().len();
             assert_eq!(issued, ticks + 1);
             assert!(matches!(
-                super::backfill_tick(db, &client).await.outcome,
-                bf::TickOutcome::Complete
+                super::backfill_tick(db, &client, demand.clone())
+                    .await
+                    .outcome,
+                bf::TickOutcome::NoScope
             ));
             assert_eq!(server.received_requests().await.unwrap().len(), issued);
         });
