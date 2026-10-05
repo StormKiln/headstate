@@ -46,7 +46,24 @@ export interface DiagnosticBundle {
   poll: PollReport;
   graphqlRemaining: number | null;
   restRemaining: number | null;
+  admission?: AdmissionSnapshot | null;
   diagnosticsOn: boolean;
   logTail: string | null;
   logNote: string | null;
+}
+
+export interface QuotaSnapshot {
+  remaining: number | null;
+  resetUnixSecs: number | null;
+  evidenceAgeMs: number | null;
+  primaryCooldownMs: number;
+  reserveCooldownMs: number;
+  recoveryProbe: boolean;
+}
+
+export interface AdmissionSnapshot {
+  capturedAtUnixMs: number;
+  graphql: QuotaSnapshot;
+  rest: QuotaSnapshot;
+  secondaryCooldownMs: number;
 }

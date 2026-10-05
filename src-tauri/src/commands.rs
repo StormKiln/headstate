@@ -150,9 +150,16 @@ pub fn clamp_days(days: i64) -> i64 {
     days.clamp(1, 90)
 }
 
+pub(crate) fn profile_dir(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
+    #[cfg(feature = "enterprise-harness")]
+    if let Some(profile) = app.try_state::<crate::enterprise_harness::Profile>() {
+        return Ok(profile.0.clone());
+    }
+    app.path().app_data_dir()
+}
+
 pub fn db_path(app: &AppHandle) -> std::path::PathBuf {
-    app.path()
-        .app_data_dir()
+    profile_dir(app)
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join("headstate.db")
 }
@@ -2596,7 +2603,11 @@ pub async fn diagnostic_bundle(app: AppHandle) -> crate::report::DiagnosticBundl
         .app_log_dir()
         .ok()
         .map(|d| d.join("headstate.log"));
-    crate::report::bundle(version, interval, log_file).await
+    crate::report::bundle(version, interval, log_file, || {
+        app.try_state::<GhClient>()
+            .and_then(|state| state.0.as_ref().map(|client| client.admission_snapshot()))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -5791,6 +5802,8 @@ async fn stats_board_with_demand(
     }
     if let Some(payload) = hit {
         if let Ok(mut cached) = serde_json::from_str::<StatsBoard>(&payload.payload) {
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::metrics::record(0, "hit", "stats-cache", 1);
             crate::diag!(
                 "[diag] cmd stats_board cache hit authors={} complete={}",
                 cached.board.rows.len(),

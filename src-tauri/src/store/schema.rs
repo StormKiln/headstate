@@ -1378,6 +1378,8 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
 }
 
 pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
+    #[cfg(feature = "enterprise-harness")]
+    crate::enterprise_harness::metrics::db_open(path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }

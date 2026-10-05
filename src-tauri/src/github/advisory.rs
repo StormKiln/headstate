@@ -113,12 +113,16 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             let mut receipt = slot.lock().await;
             if let Some((until, value)) = receipt.latest.as_ref() {
                 if *until > Instant::now() {
+                    #[cfg(feature = "enterprise-harness")]
+                    crate::enterprise_harness::metrics::record(0, "hit", "advisory-cache", 1);
                     return (
                         value.clone(),
                         until.saturating_duration_since(Instant::now()),
                     );
                 }
             }
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::metrics::record(0, "miss", "advisory-cache", 1);
             let value = work.await;
             let lifetime = ttl(&value);
             // Every cache in this module uses FAILURE_TTL for inconclusive

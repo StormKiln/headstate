@@ -218,6 +218,7 @@ function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
 /// is for deciding and acting; reviewing code belongs in GitHub or an
 /// editor, and the header's GitHub link covers the rest.
 export function PrDetailView({
+  localTools = true,
   repo,
   number,
   onBack,
@@ -225,6 +226,7 @@ export function PrDetailView({
   repo: string;
   number: number;
   onBack: () => void;
+  localTools?: boolean;
 }) {
   // `isPlaceholderData` is true while this is the clicked row's own data
   // standing in for the fetch (#790). `isLoading` is false in that state
@@ -465,7 +467,7 @@ export function PrDetailView({
 
           `compact` on the desktop's one-line bar only; the phone's
           second line wraps, so it has room for the full reason. */}
-      {!isError && <PrClaudifyButton pr={pr} compact={!isMobile} />}
+      {localTools && !isError && <PrClaudifyButton pr={pr} compact={!isMobile} />}
     </>
   );
 

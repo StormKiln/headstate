@@ -584,3 +584,32 @@ bench-transcript-native:
 	@test -n "$(BENCH_TRANSCRIPT_OUT)" -a -n "$(BENCH_NATIVE_OUT)" || (echo "Set BENCH_TRANSCRIPT_OUT and a fresh BENCH_NATIVE_OUT"; exit 2)
 	python3 scripts/transcript-native-bench.test.py
 	python3 scripts/transcript-native-bench.py "$(BENCH_TRANSCRIPT_OUT)" --out "$(BENCH_NATIVE_OUT)"
+
+# Opt-in synthetic native integration. The driver never runs normal app setup.
+.PHONY: enterprise-driver enterprise-ui test-enterprise-contracts enterprise-run
+enterprise-driver:
+	cd src-tauri && cargo build --features enterprise-harness --bin enterprise-driver
+enterprise-ui:
+	yarn vite build --config vite.harness-enterprise.config.ts
+test-enterprise-contracts:
+	node --test scripts/enterprise/*.test.mjs
+	cd src-tauri && cargo test --features enterprise-harness --lib enterprise_metrics_count_preheader_attempts_and_retry_separately_from_spend -- --ignored
+# OUT is a new retained artifact directory; ENGINE is chromium or webkit.
+# MODE is gate, fault, baseline, crash, offline or soak. PROFILE is only for restart.
+enterprise-run:
+	node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" "$(or $(MODE),gate)" $(if $(PROFILE),"$(PROFILE)")
+
+.PHONY: enterprise-baseline enterprise-compare
+enterprise-baseline:
+	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
+	node scripts/enterprise-baseline.mjs "$(OUT)"
+enterprise-compare:
+	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
+	ENTERPRISE_BASELINE=scripts/enterprise/baseline.json node scripts/enterprise-baseline.mjs "$(OUT)"
+
+# Real browser regression for unchanged Stats countdown chart animation (#1708).
+.PHONY: check-activity-chart
+check-activity-chart:
+	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
+	yarn vite build -c vite.harness.config.ts
+	node scripts/check-activity-chart.mjs "$(OUT)" "$(or $(ENGINE),chromium)"

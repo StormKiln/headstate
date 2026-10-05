@@ -10,6 +10,8 @@ pub mod cleanup;
 pub mod commands;
 pub mod diag;
 pub mod docker;
+#[cfg(feature = "enterprise-harness")]
+pub mod enterprise_harness;
 pub mod github;
 pub mod gitlab;
 pub mod health;

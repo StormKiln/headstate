@@ -19,5 +19,5 @@
 
     "strict": true
   },
-  "include": ["vite.config.ts", "vite.harness.config.ts", "vite.harness-worktrees.config.ts"]
+  "include": ["vite.config.ts", "vite.harness.config.ts", "vite.harness-worktrees.config.ts", "vite.harness-enterprise.config.ts"]
 }

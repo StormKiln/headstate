@@ -582,6 +582,10 @@ impl GitHubClient {
             .map_or(usize::MAX, |a| a.remaining())
     }
 
+    pub(crate) fn admission_snapshot(&self) -> super::admission::AdmissionSnapshot {
+        self.read_transport.admission.snapshot()
+    }
+
     pub(crate) fn request_budget(&self) -> super::stats::Budget {
         super::stats::Budget::with_transport(self.read_transport.clone())
     }
@@ -1244,12 +1248,16 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._post(path, None::<&()>)
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
             self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
@@ -1274,6 +1282,8 @@ impl GitHubClient {
                 .await
                 .map_err(write_error)?;
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(())
         })
         .await
@@ -1296,12 +1306,16 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._post(path, Some(body))
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
             self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
@@ -1328,6 +1342,8 @@ impl GitHubClient {
                 .map_err(write_error)?;
             let value = serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(value)
         })
         .await
@@ -1390,12 +1406,16 @@ impl GitHubClient {
             .write(super::admission::Bucket::Rest)?;
         let _epoch = MutationEpoch::new(&self.searches.generation);
         tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self
                 .octocrab
                 ._put(path, Some(body))
                 .await
                 .map_err(write_error)?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
             self.read_transport.observe_headers(
                 super::admission::Bucket::Rest,
@@ -1421,6 +1441,8 @@ impl GitHubClient {
             // PUT's non-success JSON is a semantic answer consumed by its caller.
             self.read_transport.observe_rest_body(&value, retry);
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok((status, value))
         })
         .await
@@ -1458,8 +1480,12 @@ impl GitHubClient {
         let _epoch = MutationEpoch::new(&self.searches.generation);
         let started = std::time::Instant::now();
         let posted = tokio::time::timeout(SEARCH_BUDGET, async {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("write-submitted", 0);
             let response = self.octocrab._post("/graphql", Some(body)).await?;
             let status = response.status().as_u16();
+            #[cfg(feature = "enterprise-harness")]
+            metric.mark("headers", u64::from(status));
             let retry = super::read_transport::response_retry(response.headers());
             self.read_transport.observe_headers(
                 super::admission::Bucket::Graphql,
@@ -1482,6 +1508,8 @@ impl GitHubClient {
                 <serde_json::Value as octocrab::FromResponse>::from_response(response).await?;
             self.read_transport.observe_graphql(&value, retry);
             admission.complete();
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("body-complete");
             Ok(value)
         })
         .await;

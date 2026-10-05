@@ -31,6 +31,8 @@ type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
 #[derive(Default)]
 pub(super) struct Reads(Mutex<HashMap<(bool, i64), Weak<ScanSlot>>>);
 struct ScanSlot {
+    #[cfg(feature = "enterprise-harness")]
+    metric: crate::enterprise_harness::metrics::Scope,
     state: Mutex<SlotState>,
     live: tokio::sync::watch::Sender<Option<LiveRead>>,
     completed: tokio::sync::Notify,
@@ -47,6 +49,8 @@ struct SlotState {
 impl ScanSlot {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "enterprise-harness")]
+            metric: crate::enterprise_harness::metrics::Scope::new("scan-slot", 0),
             state: Mutex::new(SlotState::default()),
             live: tokio::sync::watch::channel(None).0,
             completed: tokio::sync::Notify::new(),
@@ -158,6 +162,13 @@ impl GitHubClient {
                 }
                 let id = state.next_id;
                 state.next_id += 1;
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::metrics::record(
+                    slot.metric.id(),
+                    "caller",
+                    "scan-slot",
+                    state.callers.len() as u64,
+                );
                 state.callers.insert(id, (context.clone(), mode));
                 slot.publish_demand(&state);
                 if state.task.is_none() && state.receipt.is_none() {
@@ -194,6 +205,11 @@ impl GitHubClient {
                     }));
                     let client = self.with_scan_context(operation).with_attempt_limit(3);
                     let task = tokio::spawn(async move {
+                        #[cfg(feature = "enterprise-harness")]
+                        let mut metric =
+                            crate::enterprise_harness::metrics::Scope::new("scan-producer", 0);
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.mark("slot", shared.metric.id());
                         let mut changes = shared.live.subscribe();
                         let run = async {
                             loop {
@@ -244,6 +260,8 @@ impl GitHubClient {
                             }
                         };
                         let result = run.await.map_err(Arc::new);
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.finish(if result.is_ok() { "receipt" } else { "failed" });
                         shared
                             .state
                             .lock()

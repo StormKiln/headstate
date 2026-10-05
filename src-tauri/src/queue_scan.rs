@@ -392,7 +392,11 @@ pub fn commit(
     next: &Commit,
     save_rows: impl FnOnce(&Connection) -> Result<(), StoreError>,
 ) -> Result<bool, StoreError> {
+    #[cfg(feature = "enterprise-harness")]
+    let mut metric = crate::enterprise_harness::metrics::Scope::new("queue-transaction", 0);
     let tx = conn.unchecked_transaction()?;
+    #[cfg(feature = "enterprise-harness")]
+    metric.mark("acquired", 0);
     let provider = serde_json::to_value(source.provider)?;
     let revision: i64 = tx
         .query_row(
@@ -403,13 +407,19 @@ pub fn commit(
         .optional()?
         .unwrap_or(0);
     if revision != next.expected_revision {
+        #[cfg(feature = "enterprise-harness")]
+        metric.finish("cas-rejected");
         return Ok(false);
     }
     tx.execute("INSERT INTO queue_scan(provider,host,list,owner,revision,payload) VALUES(?1,?2,?3,?4,?5,?6)
         ON CONFLICT(provider,host,list) DO UPDATE SET owner=excluded.owner,revision=excluded.revision,payload=excluded.payload",
         params![provider.as_str(),source.host,list.id(),owner,revision+1,serde_json::to_string(&next.state)?])?;
     save_rows(&tx)?;
+    #[cfg(feature = "enterprise-harness")]
+    crate::enterprise_harness::metrics::before_queue_commit();
     tx.commit()?;
+    #[cfg(feature = "enterprise-harness")]
+    metric.finish("committed");
     Ok(true)
 }
 /// Called inside the confirmed-effect snapshot transaction; preserve the tail.

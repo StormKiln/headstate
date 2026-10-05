@@ -708,7 +708,7 @@ fn emit_store_error(app: &AppHandle, msg: String) {
 /// what makes the foreground query look slow"; this is the half of that
 /// which was measurable and unnecessary.
 async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(dir) = crate::commands::profile_dir(app) else {
         return NotifyPrefs::default();
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -763,7 +763,7 @@ async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
     let prs = &result.prs;
     let coverage = result.coverage.clone();
     let owner = result.viewer.clone();
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(dir) = crate::commands::profile_dir(app) else {
         return;
     };
     let owned: Vec<PullRequest> = prs.to_vec();
@@ -795,7 +795,7 @@ async fn persist_and_emit(
     already_saved: bool,
 ) {
     if !already_saved {
-        match app.path().app_data_dir() {
+        match crate::commands::profile_dir(app) {
             Ok(dir) => {
                 let owned: Vec<PullRequest> = prs.to_vec();
                 let written = tauri::async_runtime::spawn_blocking(move || {
@@ -865,7 +865,7 @@ fn active_recheck_client(app: &AppHandle, captured: &Arc<GitHubClient>) -> bool 
 /// #22: one delayed supplemental refresh of at most three captured Checking
 /// identities. This task never schedules another recheck or advances a scan.
 fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, capture: source_poll::CheckingCapture) {
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         tokio::time::sleep(RECHECK_DELAY).await;
         // Keep the original managed Arc, not a newly wrapped read-context clone.
         {
@@ -1243,14 +1243,14 @@ pub fn spawn(
     view_needs_github: Arc<AtomicBool>,
     github_source_enabled: Arc<AtomicBool>,
 ) {
-    tauri::async_runtime::spawn(continue_queues(
+    spawn_worker(continue_queues(
         app.clone(),
         client.clone(),
         focused.clone(),
         view_needs_github.clone(),
         github_source_enabled.clone(),
     ));
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
         // Whether a tick has ever completed, so `newly_appeared` has
         // something real to compare against (#789).
@@ -1627,7 +1627,7 @@ pub struct BackfillWaker(pub Arc<Notify>);
 /// mid-tick leave no stuck row: there is no `pending` state to be stuck
 /// in.
 pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Notify>) {
-    tauri::async_runtime::spawn(async move {
+    spawn_worker(async move {
         // The first tick waits a full interval unless a Stats click nudges
         // it. Startup is the busiest moment the app has -- the poll
         // loop's first tick, the window's first render and whatever the
@@ -1637,6 +1637,8 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
         loop {
             wait_backfill_tick(&waker, last_started).await;
             last_started = Some(tokio::time::Instant::now());
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric = crate::enterprise_harness::metrics::Scope::new("backfill-tick", 0);
             let tick = backfill_tick(
                 crate::commands::db_path(&app),
                 &client,
@@ -1645,6 +1647,10 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
                     .clone(),
             )
             .await;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("complete");
+            #[cfg(feature = "enterprise-harness")]
+            drop(metric);
             match &tick.outcome {
                 crate::github::stats::backfill::TickOutcome::Advanced { days, prs } => {
                     crate::diag!("[diag] stats backfill advanced {days} days, {prs} pull requests");
@@ -1807,6 +1813,9 @@ async fn backfill_tick(
         let db = db.clone();
         let viewer = viewer.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<Option<_>, String> {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric =
+                crate::enterprise_harness::metrics::Scope::new("backfill-transaction", 0);
             let mut conn = open_db(&db).map_err(|e| e.to_string())?;
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1828,6 +1837,8 @@ async fn backfill_tick(
                 partial,
             } = pick;
             tx.commit().map_err(|e| e.to_string())?;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("committed");
             Ok(Some((owner, scope, from, to, uncovered, pages, partial)))
         })
         .await
@@ -1905,6 +1916,9 @@ async fn backfill_tick(
         let from = from.clone();
         let to = to.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            #[cfg(feature = "enterprise-harness")]
+            let mut metric =
+                crate::enterprise_harness::metrics::Scope::new("backfill-transaction", 0);
             let mut conn = open_db(&db).map_err(|e| e.to_string())?;
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1919,6 +1933,8 @@ async fn backfill_tick(
             crate::store::pr_backfill_scope::note_worked(&tx, &key, now)
                 .map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
+            #[cfg(feature = "enterprise-harness")]
+            metric.finish("committed");
             Ok((rows, valid, coverage, remaining.is_empty()))
         })
         .await
@@ -3812,3 +3828,12 @@ mod tests {
 #[cfg(test)]
 #[path = "poll_backfill_tests.rs"]
 mod backfill_tests;
+
+/// Keep the production worker future unchanged while the isolated driver owns shutdown.
+fn spawn_worker(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let task = tauri::async_runtime::spawn(future);
+    #[cfg(feature = "enterprise-harness")]
+    crate::enterprise_harness::track_worker(task);
+    #[cfg(not(feature = "enterprise-harness"))]
+    drop(task);
+}

@@ -132,6 +132,29 @@ struct Quota {
     reserve_until: Option<Instant>,
     probing: bool,
     revision: u64,
+    observed_at: Option<Instant>,
+}
+/// Read-only account admission evidence captured under one lock. No identity or inputs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaSnapshot {
+    pub remaining: Option<u64>,
+    pub reset_unix_secs: Option<u64>,
+    pub evidence_age_ms: Option<u64>,
+    pub primary_cooldown_ms: u64,
+    pub reserve_cooldown_ms: u64,
+    pub recovery_probe: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionSnapshot {
+    pub captured_at_unix_ms: u64,
+    pub graphql: QuotaSnapshot,
+    pub rest: QuotaSnapshot,
+    pub secondary_cooldown_ms: u64,
+}
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 #[derive(Debug)]
 struct State {
@@ -173,6 +196,8 @@ pub(super) struct Attempt<'a> {
     pub(super) deadline: Option<Instant>,
     _total: Option<SemaphorePermit<'a>>,
     _background: Option<SemaphorePermit<'a>>,
+    #[cfg(feature = "enterprise-harness")]
+    metric: crate::enterprise_harness::metrics::Scope,
 }
 impl Attempt<'_> {
     pub fn complete(&mut self) {
@@ -181,6 +206,8 @@ impl Attempt<'_> {
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "enterprise-harness")]
+        self.metric.finish("released");
         if let Some((revision, secondary_revision, primary_recovery)) = self.probe {
             let mut state = self
                 .admission
@@ -277,6 +304,16 @@ impl Admission {
             deadline: None,
             _total: None,
             _background: None,
+            #[cfg(feature = "enterprise-harness")]
+            metric: crate::enterprise_harness::metrics::Scope::new(
+                "admitted",
+                match class {
+                    Some(ReadClass::Foreground) => 0,
+                    Some(ReadClass::Background) => 1,
+                    Some(ReadClass::Advisory) => 2,
+                    None => 3,
+                },
+            ),
         })
     }
     pub async fn read(
@@ -367,6 +404,35 @@ impl Admission {
             .max()
             .unwrap_or(0)
     }
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let cooldown = |until: Option<Instant>| {
+            until.map_or(0, |until| millis(until.saturating_duration_since(now)))
+        };
+        let quota = |q: &Quota| QuotaSnapshot {
+            remaining: if q.reset.is_some_and(|at| seconds_until(at) == 0)
+                || q.unknown_until.is_some_and(|at| at <= now)
+            {
+                None
+            } else {
+                q.remaining
+            },
+            reset_unix_secs: q.reset,
+            evidence_age_ms: q
+                .observed_at
+                .map(|at| millis(now.saturating_duration_since(at))),
+            primary_cooldown_ms: cooldown(q.blocked),
+            reserve_cooldown_ms: cooldown(q.reserve_until),
+            recovery_probe: q.probing,
+        };
+        AdmissionSnapshot {
+            captured_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+            graphql: quota(&state.quotas[0]),
+            rest: quota(&state.quotas[1]),
+            secondary_cooldown_ms: cooldown(state.secondary),
+        }
+    }
     pub fn remaining(&self, bucket: Bucket) -> Option<u64> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let quota = &state.quotas[bucket as usize];
@@ -393,6 +459,7 @@ impl Admission {
         }
         if reset.is_some() && reset != quota.reset {
             quota.remaining = None;
+            quota.observed_at = None;
             quota.reserve_until = None;
         }
         if let Some(reset) = reset {
@@ -410,6 +477,11 @@ impl Admission {
             if quota.probing && reset.is_none() && quota.reset.is_none() {
                 quota.remaining = None;
                 quota.reserve_until = None;
+            }
+            // A higher out-of-order same-window value does not refresh the
+            // age of the lower, retained constraint.
+            if quota.remaining.is_none_or(|old| remaining <= old) {
+                quota.observed_at = Some(Instant::now());
             }
             quota.remaining = Some(quota.remaining.map_or(remaining, |old| old.min(remaining)));
             if matches!(bucket, Bucket::Rest) && quota.remaining.is_some_and(|r| r <= 500) {

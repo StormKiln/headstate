@@ -5,6 +5,7 @@ license = "Apache-2.0"
 description = "Your work. Your pull requests. One clear status."
 repository = "https://github.com/StormKiln/headstate"
 edition = "2021"
+default-run = "headstate"
 
 [lib]
 name = "headstate_lib"
@@ -396,3 +397,12 @@ wiremock = "0.6"
 # inside a clippy invocation that already happens.
 [lints.clippy]
 float_cmp = "deny"
+
+[features]
+default = []
+enterprise-harness = []
+
+[[bin]]
+name = "enterprise-driver"
+path = "src/bin/enterprise-driver.rs"
+required-features = ["enterprise-harness"]

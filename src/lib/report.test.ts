@@ -176,6 +176,21 @@ describe("unknowns are stated, never blank and never zero", () => {
     expect(text(failed, "os")).toContain("could not be read");
   });
 
+  it("qualifies admission evidence and preserves a measured zero", () => {
+    const quota = { remaining: 0, resetUnixSecs: 1234, evidenceAgeMs: 1200,
+      primaryCooldownMs: 5000, reserveCooldownMs: 0, recoveryProbe: false };
+    const b = bundle({ graphqlRemaining: 0, restRemaining: null, admission: {
+      capturedAtUnixMs: 123000, graphql: quota,
+      rest: { ...quota, remaining: null, evidenceAgeMs: null }, secondaryCooldownMs: 2000,
+    } });
+    const budget = text(sectionsOf(ctx, ready(b)), "budget");
+    expect(budget).toContain("0 points");
+    expect(budget).toContain("evidence age 1200ms");
+    expect(budget).toContain("primary cooldown 5000ms");
+    expect(budget).toContain("Shared secondary cooldown: 2000ms");
+    expect(budget).toContain("REST: unknown");
+  });
+
   it("says unknown for null figures inside a bundle", () => {
     const b = bundle({
       graphqlRemaining: null,

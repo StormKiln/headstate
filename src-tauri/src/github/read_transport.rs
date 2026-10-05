@@ -199,6 +199,8 @@ impl ReadTransport {
         mut context: ReadContext,
     ) -> Result<Value, ClientError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "enterprise-harness")]
+        let mut logical = crate::enterprise_harness::metrics::Scope::new("logical-read", id);
         let mut log = RequestLog {
             id,
             operation,
@@ -221,6 +223,13 @@ impl ReadTransport {
             .unwrap_or(Err(ClientError::Timeout(READ_BUDGET.as_secs())))
         };
         log.outcome = if result.is_ok() { "ok" } else { "failed" };
+        #[cfg(feature = "enterprise-harness")]
+        logical.finish(match &result {
+            Ok(_) => "complete",
+            Err(ClientError::Timeout(_)) => "deadline",
+            Err(ClientError::RateLimited(_) | ClientError::NotDispatched(_)) => "refused",
+            Err(_) => "failed",
+        });
         result
     }
 
@@ -233,7 +242,23 @@ impl ReadTransport {
         context: ReadContext,
     ) -> Result<Value, ClientError> {
         for attempt in 1..=2 {
-            let mut permit = self.admission.read(read.bucket(), context.clone()).await?;
+            #[cfg(feature = "enterprise-harness")]
+            let mut queue = crate::enterprise_harness::metrics::Scope::new("read-queue", attempt);
+            #[cfg(feature = "enterprise-harness")]
+            queue.mark("logical", id);
+            let admitted = self.admission.read(read.bucket(), context.clone()).await;
+            #[cfg(feature = "enterprise-harness")]
+            if let Err(error) = &admitted {
+                queue.finish(match error {
+                    ClientError::Timeout(_) => "deadline",
+                    _ => "refused",
+                });
+            }
+            let mut permit = admitted?;
+            #[cfg(feature = "enterprise-harness")]
+            queue.finish("admitted");
+            #[cfg(feature = "enterprise-harness")]
+            drop(queue);
             let started = Instant::now();
             let request_deadline = permit
                 .deadline
@@ -249,16 +274,34 @@ impl ReadTransport {
                 )
                 .min(Instant::now() + READ_BUDGET);
             let request = async {
+                #[cfg(feature = "enterprise-harness")]
+                let mut metric = crate::enterprise_harness::metrics::Scope::new(
+                    "read-submitted",
+                    match read {
+                        Read::Graphql(body) => crate::enterprise_harness::metrics::aliases(body),
+                        Read::Rest { .. } => 0,
+                    },
+                );
+                #[cfg(feature = "enterprise-harness")]
+                metric.mark("logical", id);
+                #[cfg(feature = "enterprise-harness")]
+                metric.mark("attempt", attempt);
                 let response = match read {
                     Read::Graphql(body) => client._post("/graphql", Some(body)).await,
                     Read::Rest { path, .. } => client._get(path).await,
                 };
                 // Headers, refused-body decoding and successful-body decoding
                 // are one admitted request, with one frozen deadline/permit.
-                match response {
-                    Err(error) => Err(map_error(error)),
+                let result = match response {
+                    Err(error) => {
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.mark("preheader-failure", 0);
+                        Err(map_error(error))
+                    }
                     Ok(response) => {
                         let status = response.status().as_u16();
+                        #[cfg(feature = "enterprise-harness")]
+                        metric.mark("headers", u64::from(status));
                         crate::diag!("[diag] provider read id={} operation={} attempt={} status={} headers_ms={}", id, operation, attempt, status, started.elapsed().as_millis());
                         let header_number = |name| {
                             response
@@ -285,17 +328,23 @@ impl ReadTransport {
                         // Still decode refused bodies: they may carry independent
                         // secondary evidence alongside primary header exhaustion.
                         if status >= 500 {
+                            #[cfg(feature = "enterprise-harness")]
+                            metric.mark("body-not-consumed", u64::from(status));
                             Err(ClientError::NotJson(format!("HTTP {status} response")))
                         } else {
                             match octocrab::map_github_error(response).await {
                                 Ok(response) => {
                                     match Value::from_response(response).await.map_err(map_error) {
                                         Ok(value) => {
+                                            #[cfg(feature = "enterprise-harness")]
+                                            metric.mark("body-decoded", 0);
                                             if matches!(read, Read::Graphql(_)) {
                                                 self.observe_graphql(&value, retry_after);
                                                 if graphql_exhausted(&value)
                                                     && value.get("data").is_none_or(Value::is_null)
                                                 {
+                                                    #[cfg(feature = "enterprise-harness")]
+                                                    metric.finish("refused-body");
                                                     return Err(ClientError::RateLimited(
                                                         "provider retry deadline is active".into(),
                                                     ));
@@ -303,10 +352,23 @@ impl ReadTransport {
                                             }
                                             Ok(value)
                                         }
-                                        Err(error) => Err(error),
+                                        Err(error) => {
+                                            #[cfg(feature = "enterprise-harness")]
+                                            metric.mark("body-decode-failed", 0);
+                                            Err(error)
+                                        }
                                     }
                                 }
                                 Err(error) => {
+                                    #[cfg(feature = "enterprise-harness")]
+                                    metric.mark(
+                                        if matches!(&error, octocrab::Error::GitHub { .. }) {
+                                            "error-body-consumed"
+                                        } else {
+                                            "error-body-failed"
+                                        },
+                                        u64::from(status),
+                                    );
                                     if self.observe_error(read.bucket(), &error, retry_after)
                                         || refused
                                     {
@@ -325,7 +387,14 @@ impl ReadTransport {
                             }
                         }
                     }
-                }
+                };
+                #[cfg(feature = "enterprise-harness")]
+                metric.finish(if result.is_ok() {
+                    "body-complete"
+                } else {
+                    "failed"
+                });
+                result
             };
             let result = tokio::time::timeout_at(request_deadline, request)
                 .await
@@ -413,6 +482,354 @@ mod admission_tests {
             .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
             .build()
             .unwrap()
+    }
+
+    #[cfg(feature = "enterprise-harness")]
+    #[tokio::test]
+    #[ignore = "process-owned recorder; run this isolated opt-in measurement test explicitly"]
+    async fn enterprise_metrics_count_preheader_attempts_and_retry_separately_from_spend() {
+        use super::super::client::GitHubClient;
+        use crate::enterprise_harness::metrics;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native.ndjson");
+        metrics::start(&path).unwrap();
+        let server = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let base = GitHubClient::new(client(&server).await);
+        let budget = base.request_budget();
+        base.rest_get("/synthetic", &budget).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        metrics::record(0, "phase", "test", 2);
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+        let failed = GitHubClient::new(
+            Octocrab::builder()
+                .base_uri(format!("http://{addr}"))
+                .unwrap()
+                .personal_token("synthetic")
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .unwrap(),
+        );
+        let spent = failed.request_budget();
+        assert!(failed.rest_get("/synthetic", &spent).await.is_err());
+        assert_eq!(spent.rest_requests(), 0);
+        // A refused write and a caller cancelled behind all four read slots do not submit.
+        let refused_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "60")
+                    .set_body_json(serde_json::json!({"message":"secondary rate limit"})),
+            )
+            .expect(1)
+            .mount(&refused_server)
+            .await;
+        let refused = GitHubClient::new(client(&refused_server).await);
+        assert!(refused
+            .rest_get("/limit", &refused.request_budget())
+            .await
+            .is_err());
+        metrics::record(0, "phase", "test", 3);
+        assert!(refused.rest_post("/refused-write").await.is_err());
+        let queued = ReadTransport::default();
+        let queued_crab = client(&server).await;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                queued
+                    .admission
+                    .read(
+                        Bucket::Rest,
+                        ReadContext::new(
+                            super::super::admission::ReadClass::Foreground,
+                            Duration::from_secs(30),
+                        ),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let queued_budget = base.request_budget();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            queued.get(
+                &queued_crab,
+                "/cancelled",
+                &queued_budget,
+                ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    Duration::from_secs(30)
+                )
+            )
+        )
+        .await
+        .is_err());
+        drop(held);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        metrics::record(0, "phase", "test", 4);
+        // Headers alone are not a completed body. The actual socket stalls mid-body.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let crab = Octocrab::builder()
+            .base_uri(format!("http://{addr}"))
+            .unwrap()
+            .personal_token("synthetic")
+            .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+            .build()
+            .unwrap();
+        let transport = ReadTransport::default();
+        assert!(transport
+            .get(
+                &crab,
+                "/stalled",
+                &queued_budget,
+                ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    Duration::from_millis(100)
+                )
+            )
+            .await
+            .is_err());
+        stalled.abort();
+        let _ = stalled.await;
+        metrics::finish();
+        assert!(!metrics::lost());
+        let rows: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let submissions: Vec<_> = rows
+            .iter()
+            .filter(|r| r["operation"] == "read-submitted" && r["stage"] == "begin")
+            .collect();
+        assert_eq!(
+            submissions.len(),
+            6,
+            "two retry submissions, two preheader failures, one refusal and one stalled body"
+        );
+        assert_eq!(rows.iter().filter(|r| r["stage"] == "headers").count(), 4);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "body-complete")
+                .count(),
+            1
+        );
+        let phase3 = rows
+            .iter()
+            .position(|r| r["operation"] == "test" && r["code"] == 3)
+            .unwrap();
+        let phase4 = rows
+            .iter()
+            .position(|r| r["operation"] == "test" && r["code"] == 4)
+            .unwrap();
+        assert!(!rows[phase3..phase4].iter().any(|r| r["stage"] == "begin"
+            && r["operation"]
+                .as_str()
+                .is_some_and(|o| o.ends_with("submitted"))));
+        assert!(rows[phase3..phase4]
+            .iter()
+            .any(|r| r["operation"] == "read-queue" && r["stage"] == "cancelled"));
+        assert!(rows[phase4..]
+            .iter()
+            .any(|r| r["operation"] == "read-submitted" && r["stage"] == "cancelled"));
+        assert!(!rows[phase4..].iter().any(|r| r["stage"] == "body-complete"));
+        for begin in submissions {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["id"] == begin["id"]
+                        && ["failed", "body-complete", "cancelled"]
+                            .contains(&r["stage"].as_str().unwrap_or("")))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_bundle_reports_production_rest_receipt_without_provider_calls() {
+        use super::super::client::GitHubClient;
+        let server = MockServer::start().await;
+        let base = GitHubClient::new(client(&server).await);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "4321")
+                    .insert_header(
+                        "x-ratelimit-reset",
+                        (chrono::Utc::now().timestamp() + 3600).to_string(),
+                    )
+                    .set_body_json(serde_json::json!({"ok":true})),
+            )
+            .mount(&server)
+            .await;
+        base.rest_get("/synthetic", &base.request_budget())
+            .await
+            .unwrap();
+        let bundle = crate::report::bundle("synthetic".into(), None, None, || {
+            Some(base.admission_snapshot())
+        })
+        .await;
+        assert_eq!(bundle.rest_remaining, Some(4321));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_rest_refusal_keeps_primary_and_secondary_evidence_for_reads_and_writes() {
+        use super::super::client::GitHubClient;
+        for write in [false, true] {
+            let server = MockServer::start().await;
+            let base = GitHubClient::new(client(&server).await);
+            Mock::given(method(if write { "PUT" } else { "GET" }))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .insert_header("x-ratelimit-remaining", "0")
+                        .insert_header(
+                            "x-ratelimit-reset",
+                            (chrono::Utc::now().timestamp() + 3600).to_string(),
+                        )
+                        .insert_header("retry-after", "120")
+                        .set_body_json(serde_json::json!({"message":"secondary rate limit"})),
+                )
+                .mount(&server)
+                .await;
+            if write {
+                let _ = base
+                    .rest_put("/synthetic", &serde_json::json!({}), &base.request_budget())
+                    .await;
+            } else {
+                assert!(base
+                    .rest_get("/synthetic", &base.request_budget())
+                    .await
+                    .is_err());
+            }
+            let bundle = crate::report::bundle("synthetic".into(), None, None, || {
+                Some(base.admission_snapshot())
+            })
+            .await;
+            assert_eq!(bundle.rest_remaining, Some(0));
+            let quota = bundle.admission.unwrap();
+            assert!(quota.rest.primary_cooldown_ms > 0);
+            assert!(quota.secondary_cooldown_ms > 0);
+            assert!(quota.rest.evidence_age_ms.is_some());
+            assert_eq!(quota.graphql.remaining, None);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_graphql_old_window_does_not_refresh_evidence_and_expired_reset_is_unknown()
+    {
+        let server = MockServer::start().await;
+        let transport = ReadTransport::default();
+        let crab = client(&server).await;
+        let reset = chrono::Utc::now().timestamp() + 3600;
+        for (remaining, window) in [(900, reset), (12, reset - 1800)] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data":{"rateLimit":{"remaining":remaining,"resetAt":
+                        chrono::DateTime::from_timestamp(window, 0).unwrap().to_rfc3339()}}
+                })))
+                .mount(&server)
+                .await;
+            transport
+                .post(&crab, &serde_json::json!({"query":"synthetic"}))
+                .await
+                .unwrap();
+            assert_eq!(transport.admission.snapshot().graphql.remaining, Some(900));
+        }
+        let age = transport
+            .admission
+            .snapshot()
+            .graphql
+            .evidence_age_ms
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // A rejected old observation must preserve the accepted evidence age.
+        assert!(
+            transport
+                .admission
+                .snapshot()
+                .graphql
+                .evidence_age_ms
+                .unwrap()
+                >= age + 10_000
+        );
+        tokio::time::resume();
+        let expired = ReadTransport::default();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data":{"rateLimit":{"remaining":7,"resetAt":
+                    chrono::DateTime::from_timestamp(reset - 7200, 0).unwrap().to_rfc3339()}}
+            })))
+            .mount(&server)
+            .await;
+        expired
+            .post(&crab, &serde_json::json!({"query":"synthetic"}))
+            .await
+            .unwrap();
+        assert_eq!(expired.admission.snapshot().graphql.remaining, None);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_unknown_reset_expires_and_account_replacement_is_isolated() {
+        use super::super::client::GitHubClient;
+        let server = MockServer::start().await;
+        let old = GitHubClient::new(client(&server).await);
+        let active = GitHubClient::new(client(&server).await);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "4321")
+                    .set_body_json(serde_json::json!({"ok":true})),
+            )
+            .mount(&server)
+            .await;
+        old.rest_get("/synthetic", &old.request_budget())
+            .await
+            .unwrap();
+        assert_eq!(old.admission_snapshot().rest.remaining, Some(4321));
+        let replacement = crate::report::bundle("synthetic".into(), None, None, || {
+            Some(active.admission_snapshot())
+        })
+        .await;
+        assert_eq!(replacement.rest_remaining, None);
+        let absent = crate::report::bundle("synthetic".into(), None, None, || None).await;
+        assert!(absent.admission.is_none());
+        assert_eq!(absent.graphql_remaining, None);
+        assert_eq!(absent.rest_remaining, None);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(old.admission_snapshot().rest.remaining, None);
+        assert!(old.admission_snapshot().rest.evidence_age_ms.unwrap() >= 61_000);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let serialized = serde_json::to_string(&replacement).unwrap();
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("/synthetic"));
     }
 
     #[tokio::test]
