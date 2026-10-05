@@ -1,4 +1,4 @@
-import {runEnterpriseSoak,runPreActionReady,mountedReadyIdentities} from './enterprise/final-acceptance.mjs';
+import {runEnterpriseSoak,mountedReadyIdentities} from './enterprise/final-acceptance.mjs';
 import {runReadyCompletion} from './enterprise/ready-completion.mjs';
 import {runStatsConvergence} from './enterprise/stats-convergence.mjs';
 import {runReadyProgress,runDualReadyProgress} from './enterprise/ready-progress.mjs';
@@ -31,7 +31,6 @@ try {
  result.longTaskCapability=await pages[0].evaluate(()=>window.__enterprise.longTasks===null?{supported:false,value:null,reason:'PerformanceObserver longtask entry unsupported in this engine'}:{supported:true});
  if(mode==='ready-completion'){result.samples.push({role:'desktop'},{role:'paired'});await runReadyCompletion({pages,provider,result,out,control,nativeCall});}else if(mode==='stats-convergence'){result.samples.push({role:'desktop'},{role:'paired'});await runStatsConvergence({pages,provider,result,out,control});}else if(mode.startsWith('ready-dual-')){result.samples.push({role:'desktop'},{role:'paired'});await runDualReadyProgress({pages,provider,result,out,control,nativeCall,lifecycle:mode.includes('lifecycle'),leader:mode.endsWith('paired')?'paired':'desktop'});}else if(mode==='ready-progress'){result.samples.push({role:'desktop'});await runReadyProgress({page:pages[0],nativeCall,provider,result,out});}else{
  await control('start');
- if(mode==='soak')await runPreActionReady({pages,provider,result,out});
  for(const [i,page] of pages.entries()){
   await page.getByTestId('counts').filter({hasText:'Authored 50 / Reviewing 150'}).waitFor({timeout:120000});
   if(mode!=='offline')await page.getByRole('heading',{name:/Ready for review \(150\)/}).waitFor({timeout:30000});

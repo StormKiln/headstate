@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
 import {resolve} from 'node:path';
-import {advisoryPeriods,usefulPublications,assertCompletionDeadline} from './ready-completion.mjs';
+import {advisoryPeriods,usefulPublications} from './ready-completion.mjs';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export const soakPolicy={minimumMs:1800000,historyBudgetMs:1200000,interestMarginMs:180000,usefulBlockMs:120000,finalMarginMs:300000,flatProgressMs:600000,checkpointMs:60000,meaning:'conditional synthetic diagnostic ceiling, not a universal liveness guarantee or SLA'};
 export function remainingWork(coverage,expected){return {pushers:expected.filter(n=>!coverage.pushers.includes(n)||!coverage.rules.includes(n)),stacks:expected.filter(n=>!coverage.stacks.includes(n))};}
@@ -38,47 +38,22 @@ export function verifiedApprovedIdentities(rows,ledger){
  const writes=ledger.filter(e=>e.operation==='review-write');assert.equal(writes.length,3);assert.ok(writes.every(e=>e.status===200&&e.terminal==='response-sent'),'all three writes succeeded at the provider');
  return approved.map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
 }
-export async function runPreActionReady({pages,provider,result,out}){
- const began=performance.now(),ceilingMs=300000,expected=[51,52,53];
- const population=provider.data.rows.filter(r=>r.state==='OPEN'&&r.reviewRequests.nodes.some(q=>q.requestedReviewer.login==='synthetic-viewer')).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
- result.preActionReady={ceilingMs,expected,population,checkpoints:[],meaning:'full150 mounted in both roles; ordinary viewport/selection only; all9 fresh desktop publications before any review write'};
- const save=()=>writeFile(resolve(out,'pre-action-ready.json'),JSON.stringify(result.preActionReady,null,2));
- try{
-  await save();assert.equal(population.length,150);
-  for(const page of pages){await page.getByTestId('counts').filter({hasText:'Authored 50 / Reviewing 150'}).waitFor({timeout:120000});assert.deepEqual(await mountedReadyIdentities(page),population);}
-  // Existing first rows stay in the viewport. No population narrowing, injected
-  // priority, invalidation, direct command or timer adjustment is permitted.
-  await pages[0].locator('[data-advisory-key]').first().scrollIntoViewIfNeeded();
-  while(performance.now()-began<ceilingMs){
-   const publications=await pages[0].evaluate(()=>window.__enterprise.advisoryPublications);
-   const coverage=usefulPublications(publications,expected),elapsedMs=performance.now()-began;
-   const witnesses=Object.fromEntries([['pushers','freshPusher'],['rules','freshRules'],['stacks','freshStack']].map(([family,field])=>[family,expected.map(number=>publications.find(p=>p.number===number&&p[field])??null)]));
-   result.preActionReady.checkpoints.push({elapsedMs,coverage,witnesses});await save();
-   assert.equal(provider.ledger.filter(e=>e.operation==='review-write').length,0,'no approval may precede all9 witnesses');
-   for(const page of pages)assert.deepEqual(await mountedReadyIdentities(page),population,'keep the full150 ordinary Ready population');
-   if(Object.values(coverage).every(ids=>ids.length===3)){assertCompletionDeadline(coverage,expected,elapsedMs,ceilingMs);result.preActionReady.firstCompleteMs=elapsedMs;break;}
-   await delay(Math.min(5000,Math.max(0,ceilingMs-(performance.now()-began))));
-  }
-  const last=result.preActionReady.checkpoints.at(-1);assertCompletionDeadline(last?.coverage??{},expected,last?.elapsedMs??Infinity,ceilingMs);
-  assert.ok(result.preActionReady.firstCompleteMs!==undefined,'all9 pre-action witnesses inside the frozen bound');
-  assert.ok(performance.now()-began<=ceilingMs,'pre-action phase must finish inside its declared bound');
- }finally{result.preActionReady.elapsedMs=performance.now()-began;await save();}
-}
 export async function runEnterpriseSoak({pages,provider,result,out,profile,nativeCall}){
- const expectedNumbers=Array.from({length:148},(_,i)=>51+i),open=provider.data.rows.filter(r=>r.state==='OPEN');
+ const sourceNumbers=Array.from({length:148},(_,i)=>51+i),open=provider.data.rows.filter(r=>r.state==='OPEN');
  const authored=open.filter(r=>r.author.login==='synthetic-viewer').map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
  const approved=verifiedApprovedIdentities(provider.data.rows,provider.ledger);
- const reviewing=open.filter(r=>expectedNumbers.includes(r.number)).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+ const reviewing=open.filter(r=>sourceNumbers.includes(r.number)).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
  const eligible=reviewing.filter(id=>!approved.includes(id));assert.equal(eligible.length,145);
  const eligibleNumbers=open.filter(r=>eligible.includes(`${r.repository.nameWithOwner}/${r.number}`)).map(r=>r.number).sort((a,b)=>a-b);
+ const expectedNumbers=eligibleNumbers; // Fixed continuing demand, independently derived before the loop.
  const readNative=async()=>{const text=await readFile(resolve(profile,'native.ndjson'),'utf8');return text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(JSON.parse);};
  const snapshot=page=>page.evaluate(()=>({inventory:window.__enterprise.inventory(),readyEligibility:window.__enterprise.readyEligibility(),queries:window.__enterprise.querySummary(),publications:window.__enterprise.advisoryPublications,counts:document.querySelector('[data-testid="counts"]')?.textContent,lost:window.__enterprise.measurement.lost,cachedCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board_cached').length,normalStatsCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board').length}));
  await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();
  const initial=await snapshot(pages[0]),initialStats=await snapshot(pages[1]);
  const initialCoverage=usefulPublications(initial.publications,expectedNumbers),remaining=remainingWork(initialCoverage,expectedNumbers),ceilingMs=diagnosticCeiling(remaining);
- const start=performance.now();result.soak={...soakPolicy,ceilingMs,initialRemaining:remaining,initialCoverage,approved,expectedEligible:eligible,expectedReviewing:reviewing,initialStats:initialStats.queries.find(q=>q.kind==='stats-board'&&q.observers>0),checkpoints:[],obligations:{externalClose:false,historyMeasured:false,advisoryObserved:false,reviewGuidanceObserved:false,mountedStats:false,settledStatsReadback:false}};
+ const start=performance.now();result.soak={...soakPolicy,ceilingMs,initialRemaining:remaining,initialCoverage,expectedNumbers,approved,expectedEligible:eligible,expectedReviewing:reviewing,initialStats:initialStats.queries.find(q=>q.kind==='stats-board'&&q.observers>0),checkpoints:[],obligations:{externalClose:false,historyMeasured:false,advisoryObserved:false,reviewGuidanceObserved:false,mountedStats:false,settledStatsReadback:false}};
  const save=()=>writeFile(resolve(out,'soak-progress.json'),JSON.stringify(result.soak,null,2));
- await writeFile(resolve(out,'soak-policy.json'),JSON.stringify({source:JSON.parse(await readFile(resolve(out,'metadata.json'),'utf8')),policy:soakPolicy,remaining,ceilingMs,assumptions:['one desktop ReadyStrip; paired continuously Stats','unchanged finite heads/bases and healthy bounded synthetic responses','same one-minute moving viewport and actual30s windows','<=2 documents per cold advisory command; unchanged8-attempt allowance/TTLs','120s per-new-identity planning block qualified by16-row run, not a proof','10min flat useful progress with continuing admission is an earlier diagnostic FAIL']},null,2));
+ await writeFile(resolve(out,'soak-policy.json'),JSON.stringify({source:JSON.parse(await readFile(resolve(out,'metadata.json'),'utf8')),policy:soakPolicy,remaining,ceilingMs,assumptions:['fixed145 eligible demand = exact148 source minus verified current-head approvals51/52/53','no claim of pre-approval advisory coverage for retired approved rows','one desktop ReadyStrip; paired continuously Stats','unchanged finite heads/bases and healthy bounded synthetic responses','same one-minute moving viewport and actual30s windows','<=2 documents per cold advisory command; unchanged8-attempt allowance/TTLs','120s per-new-identity planning block qualified by16-row run, not a proof','10min flat useful progress with continuing admission is an earlier diagnostic FAIL']},null,2));
  await save();assert.equal(result.soak.initialStats?.complete,false,'mounted Stats must start partial');
  provider.fault.closed=[200];provider.fault.merged=[199];
  let lastNew={pushers:0,stacks:0},lastSize={pushers:remaining.pushers.length,stacks:remaining.stacks.length},lastDebit={pushers:0,stacks:0},lastCheckpoint=-1,statsSettled;

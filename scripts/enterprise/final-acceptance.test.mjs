@@ -40,3 +40,12 @@ test('eligible exclusions require exactly three independently successful current
  row.reviews.nodes[0].commit.oid=row.headRefOid;
  rows.find(r=>r.number===54).reviews.nodes=[{author:{login:'synthetic-viewer'},state:'APPROVED',commit:{oid:'head-54'}}];assert.throws(()=>verifiedApprovedIdentities(rows,ledger));
 });
+
+test('fixed continuing145 population cannot waive a missing useful identity',async()=>{
+ const {usefulPublications,assertCompletionDeadline}=await import('./ready-completion.mjs');
+ const expected=Array.from({length:145},(_,i)=>54+i);
+ const receipts=expected.map(number=>({number,freshPusher:true,freshRules:true,freshStack:true}));
+ assert.doesNotThrow(()=>assertCompletionDeadline(usefulPublications(receipts,expected),expected,1800000,diagnosticCeiling({pushers:expected,stacks:expected})));
+ assert.throws(()=>assertCompletionDeadline(usefulPublications(receipts.slice(1),expected),expected,1800000,diagnosticCeiling({pushers:expected,stacks:expected})));
+ assert.deepEqual(remainingWork(usefulPublications(receipts.slice(1),expected),expected),{pushers:[54],stacks:[54]});
+});
