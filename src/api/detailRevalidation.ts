@@ -13,9 +13,12 @@ const states = new WeakMap<Query, State>();
 const sources = new WeakMap<QueryClient, Source>();
 export const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
 export const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
-const detailQuery = (qc: QueryClient, repo: string, number: number) => qc.getQueryCache().find({
-  queryKey: ["pr-detail"], exact: false,
-  predicate: query => typeof query.queryKey[1] === "string" && query.queryKey[1].toLowerCase() === repo.toLowerCase() && query.queryKey[2] === number,
+// Read lifecycle belongs to the caller's actual cache entry. Normalized source
+// identity can name several independently observed aliases of that entry.
+const detailQuery = (qc: QueryClient, repo: string, number: number) => qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+const detailAliases = (qc: QueryClient, repo: string, number: number) => qc.getQueryCache().findAll({
+  queryKey: ["pr-detail"],
+  predicate: query => query.queryKey.length === 3 && typeof query.queryKey[1] === "string" && query.queryKey[1].toLowerCase() === repo.toLowerCase() && query.queryKey[2] === number,
 });
 const ordered = (values: unknown[]) => JSON.stringify(values.map(v => JSON.stringify(v)).sort());
 function facts(row: PullRequest): Facts {
@@ -107,9 +110,7 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
   const present = new Set(rows.map(memberKey));
   const missing = coverage === "complete" ? [...previous].filter(([id]) => !present.has(id)).map(([, row]) => row) : [];
   src.membership[list] = coverage === "complete" ? new Map([...previous].filter(([id]) => present.has(id)).concat([...observed])) : new Map([...previous, ...observed]);
-  for (const row of rows) {
-    const query = detailQuery(qc, row.repo, row.number);
-    if (!query) continue;
+  for (const row of rows) for (const query of detailAliases(qc, row.repo, row.number)) {
     let state = current(qc, query);
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: query.state.data === undefined, revision: 0, account: reviewAccountGeneration(qc), session: src.generation };
@@ -128,9 +129,7 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
     void qc.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
     request(qc, query);
   }
-  for (const row of missing) {
-    const query = detailQuery(qc, row.repo, row.number);
-    if (!query) continue;
+  for (const row of missing) for (const query of detailAliases(qc, row.repo, row.number)) {
     let state = current(qc, query);
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: false, revision: 0, account, session: src.generation };
