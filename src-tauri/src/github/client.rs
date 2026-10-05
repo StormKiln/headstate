@@ -326,6 +326,7 @@ fn server_gave_up(e: &ClientError) -> bool {
 #[derive(Clone)]
 pub struct GitHubClient {
     octocrab: Octocrab,
+    credential: Option<Arc<(String, std::path::PathBuf)>>,
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
@@ -564,12 +565,49 @@ impl GitHubClient {
     pub fn new(octocrab: Octocrab) -> Self {
         Self {
             octocrab,
+            credential: None,
             searches: Arc::new(Searches::default()),
             scans: Arc::default(),
             viewer: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
+        }
+    }
+
+    /// Bind the exact immutable token used by Octocrab; never expose this digest.
+    pub(crate) fn with_credential(mut self, token: &str, path: std::path::PathBuf) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for part in [
+            "headstate-snapshot-credential-v1",
+            "github",
+            "github.com",
+            token.trim(),
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        self.credential = Some(Arc::new((
+            digest
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            path,
+        )));
+        self
+    }
+    pub(crate) fn credential_binding(&self) -> Option<&str> {
+        self.credential.as_ref().map(|v| v.0.as_str())
+    }
+    fn persist_verified_viewer(&self, viewer: &str) {
+        if let Some(binding) = &self.credential {
+            if let Ok(conn) = crate::store::open_db(&binding.1) {
+                // Failure withholds offline data next launch; never invent identity.
+                let _ =
+                    crate::store::source_cache::save_verified_binding(&conn, &binding.0, viewer);
+            }
         }
     }
 
@@ -1012,6 +1050,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            self.persist_verified_viewer(&viewer);
             let _ = self.viewer.set(viewer);
         }
         // Counted from THIS response, not from shared state. A global
@@ -1610,8 +1649,11 @@ impl GitHubClient {
                 if let Some((remaining, _)) = map_rate_limit(&v) {
                     crate::github::stats::budget::note_remaining(remaining);
                 }
-                map_viewer(&v)
-                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+                let viewer = map_viewer(&v)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
+                self.persist_verified_viewer(&viewer);
+                Ok(viewer)
             }),
         )
         .await
@@ -1645,7 +1687,11 @@ impl GitHubClient {
         // Recorded BEFORE the login is extracted, so a response that answered
         // but carried no login still counts the point it spent.
         budget.record(&v);
-        map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+        let viewer = map_viewer(&v)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
+        self.persist_verified_viewer(&viewer);
+        Ok(viewer)
     }
 
     pub async fn stats_viewer_metered(
@@ -1714,6 +1760,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
+            self.persist_verified_viewer(&viewer);
             let _ = self.viewer.set(viewer);
         }
         // How long GitHub took, and what it was asked for. A slow
@@ -2565,6 +2612,86 @@ mod tests {
             client.read_context().first_attempt.is_none(),
             "managed client must not retain a row observer"
         );
+    }
+
+    #[tokio::test]
+    async fn verified_credential_survives_offline_restart_without_hydrating_live_viewer() {
+        use crate::store::{source_cache::*, CachedList};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"alice"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        save_owned_source_snapshot(
+            &conn,
+            &Default::default(),
+            CachedList::Authored,
+            &[],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("fixture-token-a", path.clone());
+        assert!(matches!(
+            load_qualified_snapshot(
+                &conn,
+                &Default::default(),
+                CachedList::Authored,
+                None,
+                client.credential_binding()
+            )
+            .unwrap()
+            .snapshot
+            .data,
+            SnapshotData::Withheld { .. }
+        ));
+        assert_eq!(client.fetch_viewer().await.unwrap(), "alice");
+        let restarted = client_for(&server)
+            .await
+            .with_credential("fixture-token-a", path.clone());
+        assert_eq!(restarted.known_viewer(), None);
+        let saved = load_qualified_snapshot(
+            &conn,
+            &Default::default(),
+            CachedList::Authored,
+            restarted.known_viewer(),
+            restarted.credential_binding(),
+        )
+        .unwrap();
+        assert!(matches!(saved.ownership, Ownership::CredentialBound { .. }));
+        assert!(matches!(
+            saved.snapshot.data,
+            SnapshotData::Available { .. }
+        ));
+        assert_eq!(restarted.known_viewer(), None);
+        let changed = client_for(&server)
+            .await
+            .with_credential("fixture-token-b", path);
+        assert!(matches!(
+            load_qualified_snapshot(
+                &conn,
+                &Default::default(),
+                CachedList::Authored,
+                None,
+                changed.credential_binding()
+            )
+            .unwrap()
+            .snapshot
+            .data,
+            SnapshotData::Withheld { .. }
+        ));
+        let wire = serde_json::to_string(&saved).unwrap();
+        assert!(!wire.contains("fixture-token"));
+        assert!(!wire.contains(restarted.credential_binding().unwrap()));
     }
 
     #[tokio::test]

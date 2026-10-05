@@ -112,10 +112,13 @@ export const getCached = () => call<PullRequest[]>("get_cached");
 export type SourceList = "authored" | "reviewing";
 export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
 export type SourceSnapshot = {
+  session?: string | null;
   source: Source;
   list: SourceList;
+  ownership?: { state: "live_verified" | "credential_bound"; owner: string } | { state: "unverified" | "different_account" } | { state: "saved_desktop"; owner: string; desktop: string };
   data:
     | { state: "missing" | "unreadable" }
+    | { state: "withheld"; reason: string }
     | { state: "available"; prs: PullRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage }
     | { state: "git_lab_available"; mrs: MergeRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage };
 };

@@ -367,3 +367,12 @@ printf 'HTTP/2 200\n\n{"username":"octocat","diagnostic":"SENSITIVE"}'"#,
         assert_eq!(state.host, "gitlab.example");
     }
 }
+
+/// No provider request: qualify a cache against the CLI session's verified owner.
+pub(crate) fn with_known_viewer<T>(host: &str, read: impl FnOnce(Option<&str>) -> T) -> T {
+    if let Some(program) = find_glab() {
+        super::process_session::with_known_viewer(&program, host, read)
+    } else {
+        read(None)
+    }
+}

@@ -8,7 +8,7 @@ import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
-import { clearAuthoredError, patchSourceRows, readAuthored, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
+import { clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
@@ -176,7 +176,6 @@ import {
   sizeWorktrees,
   repoTree,
   repoFile,
-  getCachedReviewing,
   countReviewing,
   getStats,
   cancelUpdateRun,
@@ -223,7 +222,8 @@ export function usePullRequests(enabled = true) {
     enabled,
     staleTime: Infinity,
   });
-  return { ...query, data: source.prs ?? query.data };
+  const retainedAt = source.fetchedAt ? Date.parse(source.fetchedAt.includes("T") ? source.fetchedAt : `${source.fetchedAt.replace(" ", "T")}Z`) : undefined;
+  return { ...query, data: source.prs ?? query.data, dataUpdatedAt: retainedAt ?? query.dataUpdatedAt, staleSecs: source.staleSecs ?? null, savedOwner: source.savedOwner };
 }
 
 /// `Stats`'s five derived fields always come back zero from the Rust layer
@@ -405,7 +405,6 @@ export function useViewCadence(view: string): void {
 const SCAN_ARTIFACTS_FN = timed("scan_artifacts", scanArtifacts);
 const SCAN_VENVS_FN = timed("scan_venvs", scanVenvs);
 
-const CACHED_REVIEWING_FN = timed("reviewing-cached", getCachedReviewing);
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
 
 
@@ -4895,7 +4894,7 @@ export function useReviewing(enabled = true) {
   // requests in ~7s against ~21s-then-truncate.
   const cached = useQuery({
     queryKey: ["reviewing-cached"],
-    queryFn: CACHED_REVIEWING_FN,
+    queryFn: () => readRetained(qc, "reviewing"),
     enabled,
     // Read once per mount. The live query is what keeps the view
     // current; re-reading the cache would only ever show older data.
@@ -4934,7 +4933,7 @@ export function useReviewing(enabled = true) {
 
   // Only meaningful while the CACHE is what is on screen: once live data
   // arrives it is current by definition, whatever the disk said.
-  const staleSecs = live.data === undefined ? (cached.data?.stale_secs ?? null) : null;
+  const staleSecs = source.staleSecs ?? (live.data === undefined ? (cached.data?.stale_secs ?? null) : null);
 
   // Provider status and command transport outcomes are reconciled separately;
   // TanStack's last promise completion cannot replace a newer publication.
@@ -4960,10 +4959,11 @@ export function useReviewing(enabled = true) {
     // blocked".
     isRefreshing: live.isFetching,
     /// Whether what is on screen came from disk rather than GitHub.
-    isFromCache: live.data === undefined && cached.data !== undefined,
+    isFromCache: source.fetchedAt !== undefined || (live.data === undefined && cached.data !== undefined),
     /// How old the shown rows are, when they are too old to present as
     /// current. `null` means either fresh or live -- no marker needed.
     staleSecs,
+    savedOwner: source.savedOwner,
   };
 }
 

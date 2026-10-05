@@ -1294,6 +1294,11 @@ const MIGRATIONS: &[&str] = &[
         owner TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL,
         PRIMARY KEY(provider,host,list)
     );",
+    // Verified immutable credentials are private backend evidence, never settings.
+    "CREATE TABLE snapshot_credentials (
+        binding TEXT PRIMARY KEY NOT NULL,
+        owner TEXT NOT NULL
+    );",
 ];
 
 /// The only legacy repairs supported here are scripts that were already

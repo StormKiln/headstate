@@ -11,7 +11,7 @@ import { stubViewport } from "./test-utils";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
 
-const cacheReadAt = vi.hoisted(() => ({ value: 0 }));
+const cacheReadAt = vi.hoisted(() => ({ value: 0, savedOwner: undefined as string | undefined }));
 
 // The shell talks to Tauri on mount. Stub the command surface so these
 // tests exercise the layout, not the backend -- the same set App.test
@@ -31,7 +31,7 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
+  usePullRequests: () => ({ savedOwner: cacheReadAt.savedOwner, staleSecs: cacheReadAt.savedOwner ? 86400 : null, data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
   usePollError: () => null,
   useStoreError: () => ({ message: null, dismiss: () => {} }),
   clearPollError: () => {},
@@ -151,6 +151,8 @@ afterEach(() => {
   useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
   clearMocks();
   cacheReadAt.value = 0;
+  cacheReadAt.savedOwner = undefined;
+  useFilters.setState({ selectedPr: null, checked: [] });
   stubViewport(null);
   connection.current = { kind: "local" };
 });
@@ -189,6 +191,18 @@ describe("App shell on a phone", () => {
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
       stale: false,
     };
+  });
+
+  it("qualifies saved-owner phone rows and prevents list, bulk and detail actions after reconnect", async () => {
+    cacheReadAt.savedOwner = "alice";
+    useFilters.setState({ checked: ["octocat/api#1"] });
+    renderApp();
+    expect(screen.getByText(/Saved snapshot for alice from the paired desktop/)).toBeTruthy();
+    expect(screen.getByText(/Showing a saved list from/)).toBeTruthy();
+    expect(screen.queryByText(/1 selected/)).toBeNull();
+    fireEvent.click(screen.getByText(PR_FIXTURES[0].title));
+    expect(await screen.findByText(/Refresh from the paired desktop to verify the current account/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Approve/ })).toBeNull();
   });
 
   it("shows a settled GitLab host error when the desktop cannot answer", async () => {

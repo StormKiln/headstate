@@ -15,6 +15,10 @@ import {
   useStats,
 } from "./hooks";
 
+function owned(prs: typeof PR_FIXTURES) {
+  return { source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs, fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } };
+}
+
 afterEach(() => {
   // Unmount every hook (which runs its `listen().then(unlisten)` cleanup)
   // before tearing down the mocked Tauri IPC internals -- otherwise a
@@ -45,7 +49,7 @@ function makeWrapper() {
 describe("usePullRequests", () => {
   it("returns the cached snapshot without calling refresh_now when non-empty", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       if (cmd === "refresh_now") throw new Error("should not be called");
       return undefined;
     }, { shouldMockEvents: true });
@@ -57,29 +61,29 @@ describe("usePullRequests", () => {
     // commit, so polling a boolean flag can observe a render that is
     // already stale by the time the next microtask runs. Waiting on the
     // actual value removes the race.
-    await waitFor(() => expect(result.current.data).toEqual(PR_FIXTURES));
+    await waitFor(() => expect(result.current.data).toMatchObject(PR_FIXTURES));
   });
 
   it("falls back to refresh_now when the cache is empty (first launch or first poll pending)", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return [];
+      if (cmd === "get_source_snapshot") return { data: { state: "missing" } };
       if (cmd === "refresh_now") return PR_FIXTURES;
       return undefined;
     }, { shouldMockEvents: true });
 
     const { result } = renderHook(() => usePullRequests(), { wrapper: makeWrapper() });
 
-    await waitFor(() => expect(result.current.data).toEqual(PR_FIXTURES));
+    await waitFor(() => expect(result.current.data).toMatchObject(PR_FIXTURES));
   });
 
   it("updates query data when prs-updated fires", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       return undefined;
     }, { shouldMockEvents: true });
 
     const { result } = renderHook(() => usePullRequests(), { wrapper: makeWrapper() });
-    await waitFor(() => expect(result.current.data).toEqual(PR_FIXTURES));
+    await waitFor(() => expect(result.current.data).toMatchObject(PR_FIXTURES));
 
     const updated = [PR_FIXTURES[0]];
     await emit("prs-updated", updated);
@@ -89,12 +93,12 @@ describe("usePullRequests", () => {
 
   it("removes its listener on unmount without throwing", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       return undefined;
     }, { shouldMockEvents: true });
 
     const { result, unmount } = renderHook(() => usePullRequests(), { wrapper: makeWrapper() });
-    await waitFor(() => expect(result.current.data).toEqual(PR_FIXTURES));
+    await waitFor(() => expect(result.current.data).toMatchObject(PR_FIXTURES));
 
     expect(() => unmount()).not.toThrow();
     // Emitting after unmount must not throw or hang the test -- if teardown
@@ -158,7 +162,7 @@ describe("useRefreshRequested", () => {
     const calls: string[] = [];
     mockIPC((cmd) => {
       calls.push(cmd);
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       if (cmd === "refresh_now") return [PR_FIXTURES[0]];
       return undefined;
     }, { shouldMockEvents: true });
@@ -182,7 +186,7 @@ describe("useRefreshRequested", () => {
 
   it("surfaces a failed tray refresh instead of swallowing it", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       if (cmd === "refresh_now") throw new Error("rate limit exceeded");
       return undefined;
     }, { shouldMockEvents: true });
@@ -202,7 +206,7 @@ describe("useRefreshRequested", () => {
 
   it("clears a stale error banner once a refresh succeeds", async () => {
     mockIPC((cmd) => {
-      if (cmd === "get_cached") return PR_FIXTURES;
+      if (cmd === "get_source_snapshot") return owned(PR_FIXTURES);
       if (cmd === "refresh_now") return [PR_FIXTURES[0]];
       return undefined;
     }, { shouldMockEvents: true });

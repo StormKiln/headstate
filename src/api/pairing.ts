@@ -6,6 +6,7 @@ import {
   scan,
   Format,
 } from "@tauri-apps/plugin-barcode-scanner";
+import { retireSourceOwnership } from "./sourceRefreshHooks";
 import { call } from "./transport";
 
 /// The phone's side of pairing: scanning a desktop's QR, pasting one,
@@ -107,6 +108,7 @@ export function usePairFromQr() {
     mutationFn: ({ payload, deviceName }: { payload: string; deviceName?: string }) =>
       pairFromQr(payload, deviceName),
     onSuccess: async () => {
+      retireSourceOwnership(client);
       await client.resetQueries();
     },
   });
@@ -124,6 +126,7 @@ export function useUnpair() {
   return useMutation({
     mutationFn: unpair,
     onSuccess: async () => {
+      retireSourceOwnership(client);
       await client.resetQueries();
     },
   });

@@ -15,9 +15,7 @@ use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
 };
 use crate::github::mutate::{PrAction, ReviewVerdict};
-use crate::store::{
-    load_snapshot, load_snapshot_marked, open_db, settings, CachedList, CachedSnapshot,
-};
+use crate::store::{open_db, settings, CachedList, CachedSnapshot};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -198,19 +196,22 @@ pub fn diag_log(line: String) {
 /// than a spinner. Never talks to GitHub.
 #[tauri::command]
 pub fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Distinguishes a cold
-    // cache (n=0, so the UI must wait on a live fetch) from a warm one,
-    // which is the difference between "slow query" and "slow paint".
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    let out = load_snapshot(&conn, CachedList::Authored).map_err(|e| e.to_string());
-    crate::diag!(
-        "[diag] cmd get_cached {}",
-        match &out {
-            Ok(v) => format!("ok n={}", v.len()),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+    let snapshot = get_source_snapshot(
+        app,
+        crate::identity::Source::default(),
+        CachedList::Authored,
+    )?;
+    match snapshot.snapshot.data {
+        crate::store::source_cache::SnapshotData::Available {
+            prs,
+            stale_secs: None,
+            ..
+        } => Ok(prs),
+        crate::store::source_cache::SnapshotData::Available { .. }
+        | crate::store::source_cache::SnapshotData::Missing => Ok(vec![]),
+        crate::store::source_cache::SnapshotData::Withheld { reason } => Err(reason),
+        _ => Err("The saved snapshot could not be read.".into()),
+    }
 }
 
 /// A user-initiated, out-of-band fetch (e.g. a manual refresh button).
@@ -272,13 +273,35 @@ pub fn get_source_snapshot(
     app: AppHandle,
     source: crate::identity::Source,
     list: CachedList,
-) -> Result<crate::store::source_cache::SourceSnapshot, String> {
+) -> Result<crate::store::source_cache::OwnedSourceSnapshot, String> {
     if source.provider == crate::identity::Provider::Gitlab {
         require_gitlab_host(&app, &source.host)?;
     }
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    crate::store::source_cache::load_source_snapshot(&conn, &source, list)
-        .map_err(|e| e.to_string())
+    if source.provider == crate::identity::Provider::Gitlab {
+        return crate::gitlab::auth::with_known_viewer(&source.host, |viewer| {
+            crate::store::source_cache::load_qualified_snapshot(&conn, &source, list, viewer, None)
+        })
+        .map_err(|e| e.to_string());
+    }
+    let client = app.state::<GhClient>();
+    let github = (source == crate::identity::Source::default())
+        .then_some(client.0.as_deref())
+        .flatten();
+    let mut snapshot = crate::store::source_cache::load_qualified_snapshot(
+        &conn,
+        &source,
+        list,
+        github.and_then(|c| c.known_viewer()),
+        github.and_then(|c| c.credential_binding()),
+    )
+    .map_err(|e| e.to_string())?;
+    snapshot.session = Some(
+        app.state::<crate::source_poll::SourcePolls>()
+            .session_id()
+            .to_owned(),
+    );
+    Ok(snapshot)
 }
 
 /// Persist the desktop's selected network sources independently of auth.
@@ -4728,16 +4751,18 @@ pub async fn count_reviewing(client: State<'_, GhClient>) -> Result<u64, String>
 /// stop the user staring at nothing is to have something to show.
 #[tauri::command]
 pub fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    let out = load_snapshot_marked(&conn, CachedList::Reviewing).map_err(|e| e.to_string());
-    crate::diag!(
-        "[diag] cmd get_cached_reviewing {}",
-        match &out {
-            Ok(v) => format!("ok n={} stale={:?}", v.prs.len(), v.stale_secs),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+    let snapshot = get_source_snapshot(
+        app,
+        crate::identity::Source::default(),
+        CachedList::Reviewing,
+    )?;
+    match snapshot.snapshot.data {
+        crate::store::source_cache::SnapshotData::Available {
+            prs, stale_secs, ..
+        } => Ok(CachedSnapshot { prs, stale_secs }),
+        crate::store::source_cache::SnapshotData::Withheld { reason } => Err(reason),
+        _ => Err("No readable saved reviewing snapshot is available.".into()),
+    }
 }
 
 #[tauri::command]

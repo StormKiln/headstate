@@ -49,7 +49,7 @@ describe("background reviewing publications", () => {
     const pending = new Promise<PullRequest[]>((yes, no) => { resolve = yes; reject = no; });
     ipc.call.mockImplementation((command: string) => {
       if (command === "get_reviewing") return pending;
-      if (command === "get_cached_reviewing") return Promise.resolve({ prs: [], stale_secs: null });
+      if (command === "get_source_snapshot") return Promise.resolve({ prs: [], stale_secs: null });
       return Promise.resolve(undefined);
     });
     const { result } = renderHook(() => ({ queue: useReviewing(), short: useReviewShortfall() }), { wrapper: wrapper() });
@@ -163,7 +163,7 @@ describe("background reviewing publications", () => {
     await waitFor(() => expect(result.current.data?.[0].number).toBe(1));
     act(() => emit("reviewing-updated", [pr(2)]));
     await waitFor(() => expect(result.current.data?.[0].number).toBe(2));
-    expect(ipc.call.mock.calls.filter(([name]) => name === "get_cached_reviewing")).toHaveLength(1);
+    expect(ipc.call.mock.calls.filter(([name]) => name === "get_source_snapshot")).toHaveLength(1);
     unmount();
     expect(ipc.listeners.has("reviewing-updated")).toBe(false);
   });
@@ -245,7 +245,7 @@ describe("background reviewing publications", () => {
     let reject!: (error: Error) => void;
     const pending = new Promise<PullRequest[]>((_, no) => { reject = no; });
     ipc.call.mockImplementation((command: string) => {
-      if (command === "get_cached") return Promise.resolve([row]);
+      if (command === "get_source_snapshot") return Promise.resolve({ source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs: [row], fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } });
       if (command === "refresh_now") return pending;
       if (command === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "fixture", commit_oid: row.head_oid, submitted_at: null, pr_id: "id", repo: "o/r", number: 1 } });
       return Promise.resolve(undefined);
@@ -277,7 +277,7 @@ describe("background reviewing publications", () => {
   });
 
   it("adopts the versioned reconnect snapshot without a further poll or command", async () => {
-    ipc.call.mockImplementation(() => Promise.resolve([pr(1)]));
+    ipc.call.mockImplementation(() => Promise.resolve({ source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs: [pr(1)], fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } }));
     const { result } = renderHook(() => ({ rows: usePullRequests(), error: usePollError() }), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.rows.data?.[0].number).toBe(1));
     const frame = { source: { provider: "github", host: "github.com" }, list: "authored", session: "desktop", revision: 2,
@@ -292,7 +292,7 @@ describe("background reviewing publications", () => {
     });
     expect(result.current.rows.data?.[0].number).toBe(3);
     expect(result.current.error).toBeNull();
-    expect(ipc.call.mock.calls.map(([command]) => command)).toEqual(["get_cached"]);
+    expect(ipc.call.mock.calls.map(([command]) => command)).toEqual(["get_source_snapshot"]);
   });
 
   it.each([

@@ -25,6 +25,9 @@ pub enum Coverage {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SnapshotData {
     Missing,
+    Withheld {
+        reason: String,
+    },
     Unreadable,
     Available {
         prs: Vec<PullRequest>,
@@ -45,6 +48,104 @@ pub struct SourceSnapshot {
     pub source: Source,
     pub list: CachedList,
     pub data: SnapshotData,
+}
+
+/// Only qualified snapshots cross command boundaries. Binding bytes never do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnedSourceSnapshot {
+    pub session: Option<String>,
+    #[serde(flatten)]
+    pub snapshot: SourceSnapshot,
+    pub ownership: Ownership,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Ownership {
+    LiveVerified { owner: String },
+    CredentialBound { owner: String },
+    Unverified,
+    DifferentAccount,
+}
+
+pub(crate) fn save_verified_binding(
+    conn: &Connection,
+    binding: &str,
+    owner: &str,
+) -> Result<(), StoreError> {
+    if owner.is_empty() {
+        return Ok(());
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT owner FROM snapshot_credentials WHERE binding=?1",
+            [binding],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.as_deref() == Some(owner) {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO snapshot_credentials(binding,owner) VALUES (?1,?2)
+        ON CONFLICT(binding) DO UPDATE SET owner=excluded.owner",
+        params![binding, owner],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn load_qualified_snapshot(
+    conn: &Connection,
+    source: &Source,
+    list: CachedList,
+    viewer: Option<&str>,
+    binding: Option<&str>,
+) -> Result<OwnedSourceSnapshot, StoreError> {
+    // A read transaction keeps the binding, owner and decoded payload on the
+    // same SQLite snapshot even when another connection publishes a receipt.
+    let tx = conn.unchecked_transaction()?;
+    let owner: Option<(Option<String>, Option<String>)> = tx.query_row(
+        "SELECT s.owner,c.owner FROM snapshot s LEFT JOIN snapshot_credentials c ON c.binding=?4
+         WHERE s.provider=?1 AND s.host=?2 AND s.id=?3",
+        params![serde_json::to_value(source.provider)?.as_str(), source.host, list.id(), binding],
+        |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let mut snapshot = load_source_snapshot(&tx, source, list)?;
+    let ownership = match owner {
+        Some((Some(owner), bound)) if !owner.is_empty() => {
+            if let Some(viewer) = viewer {
+                if owner.eq_ignore_ascii_case(viewer) {
+                    Ownership::LiveVerified { owner }
+                } else {
+                    Ownership::DifferentAccount
+                }
+            } else if bound
+                .as_deref()
+                .is_some_and(|v| owner.eq_ignore_ascii_case(v))
+            {
+                Ownership::CredentialBound { owner }
+            } else {
+                Ownership::Unverified
+            }
+        }
+        _ => Ownership::Unverified,
+    };
+    if !matches!(
+        ownership,
+        Ownership::LiveVerified { .. } | Ownership::CredentialBound { .. }
+    ) && !matches!(
+        snapshot.data,
+        SnapshotData::Missing | SnapshotData::Unreadable
+    ) {
+        snapshot.data = SnapshotData::Withheld { reason: match ownership {
+            Ownership::DifferentAccount => "The saved snapshot belongs to a different account. Refresh to load this account.".into(),
+            _ => "The saved snapshot's account could not be verified. Connect once to verify this credential.".into(),
+        } };
+    }
+    tx.commit()?;
+    Ok(OwnedSourceSnapshot {
+        session: None,
+        snapshot,
+        ownership,
+    })
 }
 
 pub fn save_source_snapshot(
@@ -290,6 +391,154 @@ mod tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn qualified_warm_read_does_not_reserve_a_wal_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let reader = crate::store::open_db(&path).unwrap();
+        save_owned_source_snapshot(
+            &reader,
+            &Source::default(),
+            CachedList::Authored,
+            &[],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        save_verified_binding(&reader, "fixture-binding", "alice").unwrap();
+        let writer = crate::store::open_db(&path).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE snapshot SET owner='bob'")
+            .unwrap();
+        reader
+            .busy_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        save_verified_binding(&reader, "fixture-binding", "alice").unwrap();
+        let snapshot = load_qualified_snapshot(
+            &reader,
+            &Source::default(),
+            CachedList::Authored,
+            None,
+            Some("fixture-binding"),
+        )
+        .unwrap();
+        assert!(
+            matches!(snapshot.ownership, Ownership::CredentialBound { owner } if owner == "alice")
+        );
+        assert!(matches!(
+            snapshot.snapshot.data,
+            SnapshotData::Available { .. }
+        ));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+    #[test]
+    fn qualified_receipts_keep_hour_boundary_corruption_and_missing_distinct() {
+        let conn = db();
+        let read = || {
+            load_qualified_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+                Some("alice"),
+                None,
+            )
+            .unwrap()
+        };
+        assert!(matches!(read().snapshot.data, SnapshotData::Missing));
+        save_owned_source_snapshot(
+            &conn,
+            &Source::default(),
+            CachedList::Authored,
+            &[],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        for age in [3599, 3600, 3601, 86400] {
+            let at = (chrono::Utc::now() - chrono::Duration::seconds(age))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            conn.execute("UPDATE snapshot SET fetched_at=?1", [&at])
+                .unwrap();
+            let SnapshotData::Available {
+                prs,
+                fetched_at,
+                stale_secs,
+                ..
+            } = read().snapshot.data
+            else {
+                panic!("retained")
+            };
+            assert!(prs.is_empty());
+            assert_eq!(fetched_at, at);
+            assert_eq!(stale_secs.is_some(), age > 3600);
+        }
+        conn.execute("UPDATE snapshot SET payload='broken'", [])
+            .unwrap();
+        assert!(matches!(read().snapshot.data, SnapshotData::Unreadable));
+        conn.execute("UPDATE snapshot SET payload='[]',coverage='broken'", [])
+            .unwrap();
+        assert!(matches!(read().snapshot.data, SnapshotData::Unreadable));
+    }
+
+    #[test]
+    fn owned_restart_receipts_distinguish_accounts_empty_and_retained_age() {
+        let conn = db();
+        let source = Source::default();
+        for rows in [vec![], vec![sample(source.clone()); 150]] {
+            save_owned_source_snapshot(
+                &conn,
+                &source,
+                CachedList::Authored,
+                &rows,
+                &Coverage::Complete,
+                Some("alice"),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE snapshot SET fetched_at=datetime('now','-1 day')",
+                [],
+            )
+            .unwrap();
+            let read = |viewer, binding| {
+                load_qualified_snapshot(&conn, &source, CachedList::Authored, viewer, binding)
+                    .unwrap()
+            };
+            assert!(matches!(
+                read(None, None).snapshot.data,
+                SnapshotData::Withheld { .. }
+            ));
+            assert!(matches!(
+                read(Some("bob"), None).snapshot.data,
+                SnapshotData::Withheld { .. }
+            ));
+            let SnapshotData::Available {
+                prs, stale_secs, ..
+            } = read(Some("alice"), None).snapshot.data
+            else {
+                panic!("same owner retained")
+            };
+            assert_eq!(prs.len(), rows.len());
+            assert!(stale_secs.unwrap() >= 86400);
+            save_verified_binding(&conn, "binding-a", "alice").unwrap();
+            assert!(matches!(
+                read(None, Some("binding-a")).snapshot.data,
+                SnapshotData::Available { .. }
+            ));
+            assert!(matches!(
+                read(None, Some("binding-b")).snapshot.data,
+                SnapshotData::Withheld { .. }
+            ));
+            assert!(matches!(
+                read(Some("bob"), Some("binding-a")).snapshot.data,
+                SnapshotData::Withheld { .. }
+            ));
+            assert!(!serde_json::to_string(&read(None, Some("binding-a")))
+                .unwrap()
+                .contains("binding-a"));
+        }
+    }
+
     #[test]
     fn verified_gitlab_actions_survive_partial_omission_but_unverified_does_not_patch() {
         use crate::gitlab::actions::{Action, ActionRequest, Outcome, Receipt};

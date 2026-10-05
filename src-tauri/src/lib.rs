@@ -41,7 +41,7 @@ use commands::{AuthState, GhClient};
 use github::client::GitHubClient;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Whether the main window is currently focused. Shared with `poll::spawn`
 /// so the background loop can pick FOCUSED vs BACKGROUND cadence; managed as
@@ -519,7 +519,7 @@ pub fn run() {
                 Ok(token) => {
                     match tauri::async_runtime::block_on(async { auth::build_client(&token) }) {
                         Ok(octocrab) => {
-                            let client = Arc::new(GitHubClient::new(octocrab));
+                            let client = Arc::new(GitHubClient::new(octocrab).with_credential(&token, commands::db_path(&handle)));
                             (
                                 AuthState {
                                     ok: true,
@@ -1069,9 +1069,18 @@ pub fn run() {
                 // or failed lookup cannot delay startup.
                 {
                     let c = client.clone();
+                    let identity_app = handle.clone();
                     tauri::async_runtime::spawn(async move {
                         match c.fetch_viewer().await {
-                            Ok(login) => log::info!("signed in as {login}"),
+                            Ok(login) => {
+                                log::info!("signed in as {login}");
+                                for list in [store::CachedList::Authored, store::CachedList::Reviewing] {
+                                    let mut update = identity_app.state::<source_poll::SourcePolls>()
+                                        .snapshot(&identity::Source::default(), list).await;
+                                    update.owner = Some(login.clone());
+                                    let _ = identity_app.emit("source-poll-status", update);
+                                }
+                            },
                             Err(e) => log::warn!("could not read the signed-in account: {e}"),
                         }
                     });

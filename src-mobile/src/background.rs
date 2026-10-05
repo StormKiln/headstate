@@ -160,13 +160,21 @@ impl Desktop for Companion {
     }
 
     fn get_cached(&self) -> DesktopFuture<String> {
-        let client = self.client();
+        let current = self.snapshot_desktop();
         Box::pin(async move {
-            let list = client?
-                .call("get_cached", &json!({}), None)
+            let (client, desktop, pairing_epoch) = current?;
+            let receipt = client
+                .call(
+                    "get_source_snapshot",
+                    &json!({"source":{"provider":"github","host":"github.com"},"list":"authored"}),
+                    None,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
-            serde_json::to_string(&list).map_err(|e| e.to_string())
+            serde_json::to_string(
+                &json!({"desktop":desktop,"pairing_epoch":pairing_epoch,"receipt":receipt}),
+            )
+            .map_err(|e| e.to_string())
         })
     }
 
@@ -417,7 +425,11 @@ impl Refresher for BackgroundRefresh {
             // can never cost the user a fresh list.
             sink.save(&prs)?;
             if let Some(notifier) = notifier {
-                notify_pass(&desktop, &notifier, &prs).await;
+                let wrapped: serde_json::Value = serde_json::from_str(&prs).unwrap_or_default();
+                let rows = wrapped["receipt"]["data"]["prs"]
+                    .as_array()
+                    .map(|rows| serde_json::to_string(rows).unwrap_or_default());
+                notify_pass(&desktop, &notifier, rows.as_deref().unwrap_or(&prs)).await;
             }
             Ok(())
         })
@@ -1307,8 +1319,8 @@ mod tests {
     async fn the_wired_refresher_goes_through_the_seam_and_never_opens_the_stream() {
         let (server, store, _rec, c) = paired().await;
         server.reply(
-            "/v1/call/get_cached",
-            Reply::json(200, serde_json::from_str(LIST).unwrap()),
+            "/v1/call/get_source_snapshot",
+            Reply::json(200, json!({"session":"fixture-session","source":{"provider":"github","host":"github.com"},"list":"authored", "ownership":{"state":"live_verified","owner":"alice"},"data":{"state":"available","prs":serde_json::from_str::<serde_json::Value>(LIST).unwrap(),"fetched_at":"2026-01-01T00:00:00Z","stale_secs":86400,"coverage":"complete"}})),
         );
         let before = server.requests().len();
         let streams = |s: &TestServer| {
@@ -1332,17 +1344,27 @@ mod tests {
             made,
             vec![
                 ("GET".to_string(), "/v1/hello".to_string()),
-                ("POST".to_string(), "/v1/call/get_cached".to_string()),
+                (
+                    "POST".to_string(),
+                    "/v1/call/get_source_snapshot".to_string()
+                ),
             ]
         );
         assert_eq!(streams(&server), 1, "no stream opened by the window");
-        let snap = events::cached_snapshot(store.as_ref()).unwrap().unwrap();
+        let snap = events::offline_receipt(store.as_ref(), &server.fp, "authored")
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(snap.prs.get()).unwrap(),
+            snap["data"]["prs"],
             serde_json::from_str::<serde_json::Value>(LIST).unwrap()
         );
-        let fresh = c.connection_state().last_poll.unwrap();
-        assert!(fresh > stale, "mark_poll: {stale} -> {fresh}");
+        assert_eq!(snap["data"]["fetched_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(snap["ownership"]["state"], "saved_desktop");
+        assert_eq!(
+            c.connection_state().last_poll.unwrap(),
+            stale,
+            "a disk read is not a provider poll"
+        );
         assert_eq!(c.connection_state().state, State::Connected);
     }
 

@@ -322,6 +322,8 @@ export default function App() {
   }, [gitlabViewer]);
   const {
     data: prs = [],
+    staleSecs: authoredStaleSecs,
+    savedOwner: authoredSavedOwner,
     isLoading,
     isError,
     error,
@@ -480,6 +482,7 @@ export default function App() {
     isRefreshing: reviewingRefreshing,
     isFromCache: reviewingFromCache,
     staleSecs: reviewingStaleSecs,
+    savedOwner: reviewingSavedOwner,
   } = reviewingQuery;
   // DIAGNOSTIC LOGGING (Settings > diagnostic log).
   useReviewingDiag({
@@ -971,7 +974,7 @@ export default function App() {
                 GitHub repository filter. A GitLab or Both list can retain
                 cached GitHub rows, but must not offer those hidden rows
                 as a review request for the selected source. */}
-            {view === "my-prs" && selection !== "gitlab" ? (
+            {view === "my-prs" && selection !== "gitlab" && !authoredSavedOwner ? (
               // scopedRepo skips the wizard's "which repositories?" step:
               // selecting a repo in the sidebar already answers it.
               <NudgeWizard prs={source} scopedRepo={filters.repo} />
@@ -1034,7 +1037,10 @@ export default function App() {
               identity={selectedPr}
               mr={[...(gitlabAuthored.rows ?? []), ...(gitlabReviewing.rows ?? [])].find((mr) => prKey(mr) === prKey(selectedPr))}
               onBack={() => selectPr(null)}
-            /> : <PrDetailView
+            /> : (authoredSavedOwner || reviewingSavedOwner) ? <div>
+              <button type="button" onClick={() => selectPr(null)}>Back to saved list</button>
+              <p>Saved snapshot for {authoredSavedOwner ?? reviewingSavedOwner}. Refresh from the paired desktop to verify the current account before opening details or taking actions.</p>
+            </div> : <PrDetailView
               repo={selectedPr.repo}
               number={selectedPr.number}
               onBack={() => selectPr(null)}
@@ -1176,6 +1182,7 @@ export default function App() {
         ) : selection !== "github" ? (
           <div className="p-4">
             {selection === "both" ? githubOverview : null}
+            {(view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner) ? <p role="status">Saved snapshot for {view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner} from the paired desktop. Current account unverified; read-only.</p> : null}
             <SourceQueue
               selection={selection}
               github={source}
@@ -1186,9 +1193,9 @@ export default function App() {
               gitlabError={gitlabHost.isError ? "Could not read the configured GitLab host. Check the desktop connection or Settings." : gitlabQueue.error}
               githubCoverage={githubCoverage}
               gitlabCoverage={gitlabQueue.coverage}
-              githubStaleSecs={view === "to-review" ? reviewingStaleSecs : null}
+              githubStaleSecs={view === "to-review" ? reviewingStaleSecs : authoredStaleSecs}
               gitlabStaleSecs={gitlabQueue.staleSecs}
-              canWriteGitHub={view === "my-prs"}
+              canWriteGitHub={view === "my-prs" && !authoredSavedOwner}
               onOpen={selectPr}
               onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refreshGitHubFromGesture())}
               onRefreshGitLab={() => { if (gitlabHost.isError) void gitlabHost.refetch(); else void gitlabQueue.refresh(); }}
@@ -1197,11 +1204,13 @@ export default function App() {
         ) : (
           <div className="p-4">
             {githubOverview}
+            {(view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner) ? <p role="status" className="mb-3 text-xs text-[#d29922]">Saved snapshot for {view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner} from the paired desktop. Current account unverified; read-only.</p> : null}
+            {view === "my-prs" && authoredStaleSecs != null ? <p className="mb-3 text-xs text-[#d29922]">Showing a saved list from {relativeSeconds(authoredStaleSecs)}.</p> : null}
             <FilterBar prs={source} />
             {/* Fed the UNFILTERED list on purpose: selection is keyed by
                 repo#number, so narrowing a filter after selecting must
                 not shrink the batch out from under the user. */}
-            {view === "my-prs" ? <BulkBar prs={source} /> : null}
+            {view === "my-prs" && !authoredSavedOwner ? <BulkBar prs={source} /> : null}
             {(view === "to-review" ? reviewingLoading : isLoading) ? (
               // `get_cached` returns `[]` both for "never polled" and for
               // "authenticated, first poll (~3s) still in flight" -- an
@@ -1244,8 +1253,8 @@ export default function App() {
                 // it has to be unfiltered too (#745).
                 fetched={source.length}
                 onOpen={(pr) => selectPr(prIdentity(pr))}
-                canWrite={view === "my-prs"}
-                selectable={view === "my-prs"}
+                canWrite={view === "my-prs" && !authoredSavedOwner}
+                selectable={view === "my-prs" && !authoredSavedOwner}
                 // A poll failure with a SUCCESSFUL but empty cache read
                 // is the fresh-install case: `isError` above covers a
                 // rejected query, and this covers "the query returned
