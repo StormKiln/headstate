@@ -99,6 +99,117 @@ async fn provider(viewer: &str, value: u64) -> Provider {
         server,
     }
 }
+// Barrier tests measure in-flight ownership/cancellation, not cold schema
+// initialization. Prepare the real verified owner without measuring Stats.
+async fn prepare_stats_barrier(p: &Provider, db: &std::path::Path) {
+    let viewer = p
+        .client
+        .stats_viewer_metered(&p.client.request_budget())
+        .await
+        .unwrap();
+    let owner = capture_stats_owner(db.to_path_buf(), viewer.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        owner.generation(),
+        1,
+        "fixture must start at its first owner"
+    );
+    let conn = open_db(db).unwrap();
+    assert_eq!(
+        stats_owner::current_for_verified(&conn, &viewer)
+            .unwrap()
+            .unwrap(),
+        owner
+    );
+    assert_eq!(
+        crate::store::stats::count(&conn).unwrap(),
+        0,
+        "setup must not preload Stats measurements"
+    );
+    for table in [
+        "pr_history",
+        "pr_slice",
+        "pr_backfill_scope",
+        "pr_backfill_page",
+        "pr_scope_evidence",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "setup must leave {table} empty");
+    }
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        1,
+        "only the verified viewer request during setup"
+    );
+    assert_eq!(
+        crate::github::stats::reviewer_receipts::test_support::live(&p.client.reviewer_receipts),
+        (0, 0)
+    );
+    assert_eq!(
+        crate::github::stats::reviewer_receipts::test_support::cached(&p.client.reviewer_receipts),
+        0
+    );
+}
+
+async fn wait_for_stats_arrival<T: std::fmt::Debug>(
+    arrived: &tokio::sync::Notify,
+    producer: &mut tokio::task::JoinHandle<T>,
+    phase: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            result = producer => Err(format!("{phase}: producer ended before blocked provider arrival: {result:?}")),
+            _ = arrived.notified() => Ok(()),
+        }
+    }).await.map_err(|_| format!("{phase}: provider arrival timed out after completed fixture setup"))?
+}
+
+#[tokio::test(start_paused = true)]
+async fn stats_arrival_guard_reports_early_completion_and_panic() {
+    for panic in [false, true] {
+        let arrived = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        let mut producer = tokio::spawn(async move {
+            assert!(!panic, "controlled stats producer panic");
+        });
+        let error = wait_for_stats_arrival(&arrived, &mut producer, "controlled")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("producer ended before blocked provider arrival"),
+            "{error}"
+        );
+        if panic {
+            assert!(error.contains("controlled stats producer panic"));
+        }
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stats_arrival_guard_preserves_five_second_limit_and_stored_notification() {
+    let arrived = tokio::sync::Notify::new();
+    let mut producer = tokio::spawn(std::future::pending::<()>());
+    arrived.notify_one();
+    wait_for_stats_arrival(&arrived, &mut producer, "stored notification")
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let error = wait_for_stats_arrival(&arrived, &mut producer, "missing notification")
+        .await
+        .unwrap_err();
+    assert!(error.contains("provider arrival timed out"));
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+    producer.abort();
+    assert!(producer.await.unwrap_err().is_cancelled());
+}
+
 async fn series(p: &Provider, db: std::path::PathBuf) -> crate::github::stats::Series {
     stats_series_for_client(
         &p.client,
@@ -140,10 +251,11 @@ async fn board_owner_aba_rejects_old_generation_with_nonempty_data() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    prepare_stats_barrier(&a, &db).await;
     a.blocked.store(true, Ordering::SeqCst);
     let old_client = a.client.clone();
     let old_db = db.clone();
-    let old = tokio::spawn(async move {
+    let mut old = tokio::spawn(async move {
         stats_board_for_client(
             &old_client,
             old_db,
@@ -156,9 +268,13 @@ async fn board_owner_aba_rejects_old_generation_with_nonempty_data() {
         .await
         .unwrap()
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), a.arrived.notified())
-        .await
-        .unwrap();
+    wait_for_stats_arrival(
+        &a.arrived,
+        &mut old,
+        "board_owner_aba_rejects_old_generation_with_nonempty_data",
+    )
+    .await
+    .unwrap();
     let load = |client: GitHubClient, db| async move {
         stats_board_for_client(
             &client,
@@ -392,10 +508,11 @@ async fn count_and_series_late_owner_never_overwrite_current_receipts() {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("stats.db");
+        prepare_stats_barrier(&a, &db).await;
         a.blocked.store(true, Ordering::SeqCst);
         let client = a.client.clone();
         let path = db.clone();
-        let old = tokio::spawn(async move {
+        let mut old = tokio::spawn(async move {
             if is_series {
                 let r = stats_series_for_client(
                     &client,
@@ -423,9 +540,13 @@ async fn count_and_series_late_owner_never_overwrite_current_receipts() {
                 (r.total, r.receipt.unwrap())
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), a.arrived.notified())
-            .await
-            .unwrap();
+        wait_for_stats_arrival(
+            &a.arrived,
+            &mut old,
+            "count_and_series_late_owner_never_overwrite_current_receipts",
+        )
+        .await
+        .unwrap();
         let load = || async {
             if is_series {
                 let r = stats_series_for_client(
@@ -467,25 +588,7 @@ async fn canceled_reviewer_producer_does_not_cancel_another_waiter() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
-    // This test measures shared-flight cancellation, not cold schema/owner
-    // initialization. Complete real setup before starting its five-second
-    // arrival bound; do not preload any reviewer measurement or flight.
-    capture_stats_owner(db.clone(), "alice".into())
-        .await
-        .unwrap();
-    assert_eq!(
-        p.calls.load(Ordering::SeqCst),
-        1,
-        "only the priming viewer request"
-    );
-    assert_eq!(
-        crate::github::stats::reviewer_receipts::test_support::live(&p.client.reviewer_receipts),
-        (0, 0)
-    );
-    assert_eq!(
-        crate::github::stats::reviewer_receipts::test_support::cached(&p.client.reviewer_receipts),
-        0
-    );
+    prepare_stats_barrier(&p, &db).await;
     p.calls.store(0, Ordering::SeqCst);
     p.blocked.store(true, Ordering::SeqCst);
     let load = |client: GitHubClient, path| async move {
@@ -501,14 +604,9 @@ async fn canceled_reviewer_producer_does_not_cancel_another_waiter() {
         .await
     };
     let mut first = tokio::spawn(load(p.client.clone(), db.clone()));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        tokio::select! {
-            _ = p.arrived.notified() => {},
-            result = &mut first => panic!("reviewer producer finished before blocked provider arrival: {result:?}"),
-        }
-    })
-    .await
-    .expect("reviewer provider did not arrive after completed database setup");
+    wait_for_stats_arrival(&p.arrived, &mut first, "reviewer cancellation")
+        .await
+        .unwrap();
     let second = tokio::spawn(load(p.client.clone(), db));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while crate::github::stats::reviewer_receipts::test_support::live(
@@ -747,9 +845,10 @@ async fn reviewer_active_key_capacity_refuses_without_detached_work() {
         .stats_viewer_metered(&p.client.request_budget())
         .await
         .unwrap();
-    p.blocked.store(true, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    prepare_stats_barrier(&p, &db).await;
+    p.blocked.store(true, Ordering::SeqCst);
     let mut tasks = Vec::new();
     for n in 0..16 {
         let client = p.client.clone();
@@ -773,6 +872,10 @@ async fn reviewer_active_key_capacity_refuses_without_detached_work() {
         )
         .0 < 16
         {
+            if let Some(index) = tasks.iter().position(tokio::task::JoinHandle::is_finished) {
+                let result = tasks.swap_remove(index).await;
+                panic!("reviewer capacity producer ended before all sixteen flights were held: {result:?}");
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -823,8 +926,9 @@ async fn reviewer_timeout_retains_completed_wave_in_command_reply() {
     p.tail.store(true, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    prepare_stats_barrier(&p, &db).await;
     let client = p.client.clone();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         stats_reviewers_for_client(
             &client,
             db,
@@ -836,9 +940,13 @@ async fn reviewer_timeout_retains_completed_wave_in_command_reply() {
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), p.arrived.notified())
-        .await
-        .unwrap();
+    wait_for_stats_arrival(
+        &p.arrived,
+        &mut task,
+        "reviewer_timeout_retains_completed_wave_in_command_reply",
+    )
+    .await
+    .unwrap();
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(60)).await;
     let result = task.await.unwrap().unwrap();
@@ -1342,11 +1450,12 @@ async fn same_owner_late_partial_cannot_downgrade_complete_command_receipts() {
         let fast = provider("alice", 22).await;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("stats.db");
+        prepare_stats_barrier(&slow, &db).await;
         slow.partial.store(true, Ordering::SeqCst);
         slow.blocked.store(true, Ordering::SeqCst);
         let client = slow.client.clone();
         let path = db.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             if is_series {
                 stats_series_for_client(
                     &client,
@@ -1372,9 +1481,13 @@ async fn same_owner_late_partial_cannot_downgrade_complete_command_receipts() {
                 .map(|_| ())
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), slow.arrived.notified())
-            .await
-            .unwrap();
+        wait_for_stats_arrival(
+            &slow.arrived,
+            &mut task,
+            "same_owner_late_partial_cannot_downgrade_complete_command_receipts",
+        )
+        .await
+        .unwrap();
         let age = if is_series {
             series(&fast, db.clone()).await.receipt.unwrap().fetched_at
         } else {
@@ -1406,13 +1519,14 @@ async fn same_owner_complementary_series_publications_merge_inside_transaction()
     let fast = provider("alice", 22).await;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    prepare_stats_barrier(&slow, &db).await;
     slow.partial.store(true, Ordering::SeqCst);
     slow.blocked.store(true, Ordering::SeqCst);
     fast.partial.store(true, Ordering::SeqCst);
     fast.only.store(1, Ordering::SeqCst);
     let client = slow.client.clone();
     let path = db.clone();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         stats_series_for_client(
             &client,
             path,
@@ -1424,9 +1538,13 @@ async fn same_owner_complementary_series_publications_merge_inside_transaction()
         .await
         .unwrap()
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), slow.arrived.notified())
-        .await
-        .unwrap();
+    wait_for_stats_arrival(
+        &slow.arrived,
+        &mut task,
+        "same_owner_complementary_series_publications_merge_inside_transaction",
+    )
+    .await
+    .unwrap();
     let early = series(&fast, db.clone()).await;
     assert_eq!(early.points.len(), 1);
     slow.blocked.store(false, Ordering::SeqCst);
@@ -2015,6 +2133,7 @@ async fn cached_board_retains_foreground_after_concurrent_empty_commit_supersede
     let p = provider("synthetic-retention-viewer", 1).await;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
+    prepare_stats_barrier(&p, &db).await;
     p.client
         .stats_viewer_metered(&p.client.request_budget())
         .await
@@ -2022,7 +2141,7 @@ async fn cached_board_retains_foreground_after_concurrent_empty_commit_supersede
     p.blocked.store(true, Ordering::SeqCst);
     let client = p.client.clone();
     let path = db.clone();
-    let normal = tokio::spawn(async move {
+    let mut normal = tokio::spawn(async move {
         stats_board_for_client(
             &client,
             path,
@@ -2035,9 +2154,13 @@ async fn cached_board_retains_foreground_after_concurrent_empty_commit_supersede
         .await
         .unwrap()
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), p.arrived.notified())
-        .await
-        .unwrap();
+    wait_for_stats_arrival(
+        &p.arrived,
+        &mut normal,
+        "cached_board_retains_foreground_after_concurrent_empty_commit_supersedes_accumulation",
+    )
+    .await
+    .unwrap();
     // The actual normal command passed its store-first lookup and reserved
     // evidence before its provider request. Commit competing empty evidence
     // using the same atomic store operations as the worker, then release HTTP.
