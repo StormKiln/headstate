@@ -218,17 +218,25 @@ pub fn scan_receipt(receipt: &str, slot: u64) {
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if receipts.len() >= 100000 {
-        LOST.store(true, Ordering::SeqCst);
-        return;
-    }
-    if receipts
-        .insert(receipt.to_owned(), slot)
-        .is_some_and(|old| old != slot)
-    {
+    if !insert_scan_receipt(&mut receipts, receipt, slot) {
         LOST.store(true, Ordering::SeqCst);
     }
 }
+fn insert_scan_receipt(
+    receipts: &mut std::collections::HashMap<String, u64>,
+    receipt: &str,
+    slot: u64,
+) -> bool {
+    if let Some(existing) = receipts.get(receipt) {
+        return *existing == slot;
+    }
+    if receipts.len() >= 100000 {
+        return false;
+    }
+    receipts.insert(receipt.to_owned(), slot);
+    true
+}
+
 pub fn accepted_scan(receipt: &str, revision: u64) {
     let receipts = SCAN_RECEIPTS
         .get_or_init(Mutex::default)
@@ -237,4 +245,24 @@ pub fn accepted_scan(receipt: &str, revision: u64) {
     if let Some(slot) = receipts.get(receipt) {
         record(*slot, "accepted-reviewing", "scan-slot", revision);
     }
+}
+
+#[cfg(test)]
+pub fn receipt_slot(receipt: &str) -> Option<u64> {
+    SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(receipt)
+        .copied()
+}
+
+#[cfg(test)]
+#[test]
+fn conflicting_scan_producer_is_rejected_without_overwriting_provenance() {
+    let mut receipts = std::collections::HashMap::new();
+    assert!(insert_scan_receipt(&mut receipts, "synthetic-receipt", 1));
+    assert!(insert_scan_receipt(&mut receipts, "synthetic-receipt", 1));
+    assert!(!insert_scan_receipt(&mut receipts, "synthetic-receipt", 2));
+    assert_eq!(receipts.get("synthetic-receipt"), Some(&1));
 }

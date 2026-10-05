@@ -278,6 +278,7 @@ impl GitHubClient {
                             .as_ref()
                             .ok()
                             .and_then(|r| r.scan.as_ref())
+                            .filter(|scan| !scan.state.no_work)
                             .and_then(|scan| scan.state.receipt_id.as_deref())
                         {
                             crate::enterprise_harness::metrics::scan_receipt(
@@ -1926,6 +1927,53 @@ mod tests {
         assert_eq!(result.state.pages, 1);
         assert_eq!(result.state.after.as_deref(), Some("cursor-25"));
         assert!(result.state.eligible_at > 3000);
+    }
+    #[cfg(feature = "enterprise-harness")]
+    #[tokio::test]
+    async fn no_work_scan_keeps_original_observer_receipt_producer() {
+        let server = MockServer::start().await;
+        let client = client(&server);
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}))).mount(&server).await;
+        client.fetch_viewer().await.unwrap();
+        let produced = client
+            .advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 111,
+                    state: State::default(),
+                },
+                &[],
+                1000,
+            )
+            .await
+            .unwrap();
+        let state = produced.scan.unwrap().state;
+        assert!(!state.no_work);
+        let receipt = state.receipt_id.clone().unwrap();
+        let original = crate::enterprise_harness::metrics::receipt_slot(&receipt).unwrap();
+        server.reset().await;
+        let refused = client
+            .with_attempt_limit(0)
+            .advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 112,
+                    state,
+                },
+                &[],
+                1100,
+            )
+            .await
+            .unwrap();
+        let state = refused.scan.unwrap().state;
+        assert!(state.no_work);
+        assert_eq!(state.receipt_id.as_deref(), Some(receipt.as_str()));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            crate::enterprise_harness::metrics::receipt_slot(&receipt),
+            Some(original)
+        );
+        assert!(!crate::enterprise_harness::metrics::lost());
     }
     #[tokio::test]
     async fn explicit_expired_cursor_restarts_only_traversal_and_keeps_inventory_qualified() {
