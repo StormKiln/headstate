@@ -326,7 +326,7 @@ fn server_gave_up(e: &ClientError) -> bool {
 #[derive(Clone)]
 pub struct GitHubClient {
     octocrab: Octocrab,
-    credential: Option<Arc<(String, std::path::PathBuf)>>,
+    credential: Option<Arc<CredentialBinding>>,
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
@@ -335,6 +335,26 @@ pub struct GitHubClient {
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
     read_class: super::admission::ReadClass,
+}
+
+struct CredentialBinding {
+    digest: String,
+    path: std::path::PathBuf,
+    // No queued database jobs: clones share one running best-effort save.
+    persistence: Arc<tokio::sync::Semaphore>,
+    confirmed: std::sync::Mutex<Option<String>>,
+}
+
+struct AbortQueuedBinding {
+    abort: tokio::task::AbortHandle,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for AbortQueuedBinding {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.abort.abort();
+    }
 }
 
 // Client-local: separate accounts never share a result. Only callers which
@@ -625,27 +645,91 @@ impl GitHubClient {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part.as_bytes());
         }
-        self.credential = Some(Arc::new((
-            digest
+        self.credential = Some(Arc::new(CredentialBinding {
+            digest: digest
                 .finalize()
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect(),
             path,
-        )));
+            persistence: Arc::new(tokio::sync::Semaphore::new(1)),
+            confirmed: std::sync::Mutex::new(None),
+        }));
         self
     }
     pub(crate) fn credential_binding(&self) -> Option<&str> {
-        self.credential.as_ref().map(|v| v.0.as_str())
+        self.credential.as_ref().map(|v| v.digest.as_str())
     }
-    fn persist_verified_viewer(&self, viewer: &str) {
-        if let Some(binding) = &self.credential {
-            if let Ok(conn) = crate::store::open_db(&binding.1) {
-                // Failure withholds offline data next launch; never invent identity.
-                let _ =
-                    crate::store::source_cache::save_verified_binding(&conn, &binding.0, viewer);
-            }
+    async fn persist_verified_viewer(&self, viewer: &str) {
+        self.persist_viewer_binding(viewer, false).await;
+    }
+    async fn persist_viewer_binding(&self, viewer: &str, only_if_unsaved: bool) {
+        let Some(binding) = self.credential.clone() else {
+            return;
+        };
+        let confirmed = || {
+            binding
+                .confirmed
+                .lock()
+                .expect("credential persistence state")
+                .as_deref()
+                .is_some_and(|saved| only_if_unsaved || saved == viewer)
+        };
+        if confirmed() {
+            return;
         }
+        let deadline = self.read_context().deadline;
+        if deadline <= tokio::time::Instant::now() {
+            return;
+        }
+        let Ok(permit) = binding.persistence.clone().try_acquire_owned() else {
+            return;
+        };
+        // A running newer save may have completed between the fast path and
+        // acquiring its permit. Cached retries never replace confirmed identity.
+        if confirmed() {
+            return;
+        }
+        let viewer = viewer.to_owned();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_cancelled = cancelled.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if deadline <= tokio::time::Instant::now()
+                || job_cancelled.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            if let Ok(conn) = crate::store::open_db(&binding.path) {
+                // Persistence is best-effort, not a reason to hold a verified network
+                // answer behind another writer. Never queue a write past its caller.
+                if deadline <= tokio::time::Instant::now()
+                    || job_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || conn.busy_timeout(std::time::Duration::ZERO).is_err()
+                {
+                    return;
+                }
+                if crate::store::source_cache::save_verified_binding(
+                    &conn,
+                    &binding.digest,
+                    &viewer,
+                )
+                .is_ok()
+                {
+                    *binding
+                        .confirmed
+                        .lock()
+                        .expect("credential persistence state") = Some(viewer);
+                }
+            }
+        });
+        // Aborts a queued blocking job on cancellation/deadline; a running job keeps
+        // the single permit, its immutable binding, and its own deadline checks.
+        let _abort = AbortQueuedBinding {
+            abort: task.abort_handle(),
+            cancelled,
+        };
+        let _ = tokio::time::timeout_at(deadline, task).await;
     }
 
     /// Run a GraphQL document, keeping `data` on a PARTIAL success.
@@ -1087,7 +1171,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(REVIEW_REQUESTED, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
-            self.persist_verified_viewer(&viewer);
+            self.persist_verified_viewer(&viewer).await;
             let _ = self.viewer.set(viewer);
         }
         // Counted from THIS response, not from shared state. A global
@@ -1691,6 +1775,12 @@ impl GitHubClient {
     /// accumulator to report into and use this; everything in a stats load
     /// uses [`Self::fetch_viewer_metered`] instead.
     pub async fn fetch_viewer(&self) -> Result<String, ClientError> {
+        if let Some(viewer) = self.viewer.get() {
+            // A later normal call can recover a transiently refused save without
+            // another provider request. Successful persistence is binding-local.
+            self.persist_viewer_binding(viewer, true).await;
+            return Ok(viewer.clone());
+        }
         tokio::time::timeout_at(
             self.read_context().deadline,
             self.viewer.get_or_try_init(|| async {
@@ -1703,7 +1793,7 @@ impl GitHubClient {
                 let viewer = map_viewer(&v)
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
-                self.persist_verified_viewer(&viewer);
+                self.persist_verified_viewer(&viewer).await;
                 Ok(viewer)
             }),
         )
@@ -1741,7 +1831,7 @@ impl GitHubClient {
         let viewer = map_viewer(&v)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
-        self.persist_verified_viewer(&viewer);
+        self.persist_verified_viewer(&viewer).await;
         Ok(viewer)
     }
 
@@ -1811,7 +1901,7 @@ impl GitHubClient {
         let started = std::time::Instant::now();
         let v = self.search_with_budget(AUTHORED_OPEN, budget).await?;
         if let Some(viewer) = map_viewer(&v).filter(|viewer| !viewer.is_empty()) {
-            self.persist_verified_viewer(&viewer);
+            self.persist_verified_viewer(&viewer).await;
             let _ = self.viewer.set(viewer);
         }
         // How long GitHub took, and what it was asked for. A slow
@@ -2743,6 +2833,327 @@ mod tests {
         let wire = serde_json::to_string(&saved).unwrap();
         assert!(!wire.contains("fixture-token"));
         assert!(!wire.contains(restarted.credential_binding().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn credential_binding_persistence_respects_viewer_deadline() {
+        use std::time::{Duration, Instant};
+        let artifact =
+            std::env::var_os("HEADSTATE_CREDENTIAL_PROBE_DIR").map(std::path::PathBuf::from);
+        let temporary = tempfile::tempdir().unwrap();
+        let root = artifact.as_deref().unwrap_or_else(|| temporary.path());
+        std::fs::create_dir_all(root).unwrap();
+        let mut observations = Vec::new();
+        for metered in [false, true] {
+            for existing in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let path = root.join(format!("binding-{metered}-{existing}.db"));
+                let conn = crate::store::open_db(&path).unwrap();
+                let client = client_for(&server)
+                    .await
+                    .with_credential("synthetic-binding-probe", path.clone());
+                if existing {
+                    crate::store::source_cache::save_verified_binding(
+                        &conn,
+                        client.credential_binding().unwrap(),
+                        "synthetic-viewer",
+                    )
+                    .unwrap();
+                }
+                drop(conn);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let writer_path = path.clone();
+                let writer = std::thread::spawn(move || {
+                    let conn = crate::store::open_db(&writer_path).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(700));
+                    conn.execute_batch("ROLLBACK").unwrap();
+                });
+                ready_rx.recv().unwrap();
+                let started = Instant::now();
+                let timer = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    started.elapsed().as_millis()
+                });
+                let managed_client = client.clone();
+                let client = client.with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    Duration::from_millis(50),
+                ));
+                let result = if metered {
+                    client
+                        .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                        .await
+                } else {
+                    client.fetch_viewer().await
+                };
+                let elapsed = started.elapsed().as_millis();
+                let timer_elapsed = timer.await.unwrap();
+                writer.join().unwrap();
+                // A contended best-effort save must not become a late queued write.
+                let conn = crate::store::open_db(&path).unwrap();
+                let saved: i64 = conn
+                    .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                if !metered {
+                    assert_eq!(
+                        managed_client.fetch_viewer().await.unwrap(),
+                        "synthetic-viewer"
+                    );
+                    let recovered: i64 = conn
+                        .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(recovered, 1, "normal cached viewer call retries a transiently refused save without new HTTP");
+                }
+                observations.push(json!({"metered":metered,"alreadyBound":existing,
+                    "elapsedMs":elapsed,"timerMs":timer_elapsed,"success":result.is_ok(),
+                    "providerReceipts":server.received_requests().await.unwrap().len(),"bindingSaved":saved==1}));
+            }
+        }
+        let evidence = serde_json::to_string_pretty(&observations).unwrap();
+        println!("credential binding probe: {evidence}");
+        if artifact.is_some() {
+            std::fs::write(root.join("result.json"), &evidence).unwrap();
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|row| row["elapsedMs"].as_u64().unwrap() < 250
+                    && row["timerMs"].as_u64().unwrap() < 250
+                    && row["bindingSaved"] == row["alreadyBound"]
+                    && row["success"] == true),
+            "50ms viewer budget and concurrent runtime timer must not wait for the held writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_binding_cached_identity_does_not_overwrite_newer_verified_binding() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path);
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-old-login"}}})),
+            )
+            .mount(&server)
+            .await;
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-old-login");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-current-login"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            client
+                .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                .await
+                .unwrap(),
+            "synthetic-current-login"
+        );
+        // This test preserves the existing cached-viewer semantics. A retry for
+        // that older cache entry must not roll back newer durable verification.
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-old-login");
+        let owner: String = conn
+            .query_row("SELECT owner FROM snapshot_credentials", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "synthetic-current-login");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_binding_confirmed_save_does_not_reopen_database_on_cached_viewer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        drop(crate::store::open_db(&path).unwrap());
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path.clone());
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        // Preserve the DB under another name: any attempted reopen would recreate
+        // the original path. A confirmed binding needs neither DB nor HTTP work.
+        std::fs::rename(&path, dir.path().join("retained.db")).unwrap();
+        for _ in 0..10 {
+            assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        }
+        assert!(!path.exists());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_binding_failed_save_keeps_durable_owner_and_cached_verified_viewer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let client = client_for(&server)
+            .await
+            .with_credential("synthetic-token", path);
+        crate::store::source_cache::save_verified_binding(
+            &conn,
+            client.credential_binding().unwrap(),
+            "synthetic-previous",
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER refuse_binding BEFORE UPDATE ON snapshot_credentials BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END").unwrap();
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        let owner: String = conn
+            .query_row("SELECT owner FROM snapshot_credentials", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "synthetic-previous");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn credential_binding_queued_job_is_bounded_cancelled_and_never_publishes_late() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("binding.db");
+            let conn = crate::store::open_db(&path).unwrap();
+            let client = client_for(&server)
+                .await
+                .with_credential("synthetic-old", path.clone());
+            let gate = client.credential.as_ref().unwrap().persistence.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let pending_client = client.clone();
+            let pending = tokio::spawn(async move {
+                pending_client
+                    .persist_verified_viewer("synthetic-old-viewer")
+                    .await;
+            });
+            while gate.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            // All overlapping callers skip rather than enqueue another blocking job.
+            for _ in 0..100 {
+                client.persist_verified_viewer("synthetic-old-viewer").await;
+                assert_eq!(gate.available_permits(), 0);
+            }
+            pending.abort();
+            let _ = pending.await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while gate.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "aborted queued job cannot publish after its caller retires"
+            );
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let short = client.with_read_context(super::super::admission::ReadContext::new(
+                super::super::admission::ReadClass::Foreground,
+                std::time::Duration::from_millis(30),
+            ));
+            let started = std::time::Instant::now();
+            short.persist_verified_viewer("synthetic-old-viewer").await;
+            assert!(started.elapsed() < std::time::Duration::from_millis(250));
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while gate.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "deadline also retires queued persistence without a late write"
+            );
+            let replacement = client_for(&server)
+                .await
+                .with_credential("synthetic-new", path);
+            replacement
+                .persist_verified_viewer("synthetic-new-viewer")
+                .await;
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT binding,owner FROM snapshot_credentials")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(
+                    replacement.credential_binding().unwrap().into(),
+                    "synthetic-new-viewer".into()
+                )]
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        });
     }
 
     #[tokio::test]
