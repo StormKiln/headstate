@@ -1186,6 +1186,232 @@ async fn coalesced_adoption_cannot_settle_an_independent_newer_failure() {
     }
 }
 
+// Separate the virtual cadence assertion from real HTTP/SQLite completion.
+// Entry must occur before another real 15-second sleep can rescue a missed tick.
+#[derive(Debug, PartialEq)]
+struct ContinuationEvent {
+    list: CachedList,
+    logical_now: i64,
+    entered: bool,
+    at: tokio::time::Instant,
+}
+async fn continuation_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ContinuationEvent>,
+    worker: &mut tokio::task::JoinHandle<()>,
+    list: CachedList,
+    logical_now: i64,
+    entered: bool,
+    not_before: tokio::time::Instant,
+) -> Result<tokio::time::Instant, String> {
+    // Completion includes the existing 30s request context plus a 5s SQLite
+    // busy allowance. This is a diagnostic watchdog, not a new product SLA.
+    let limit = Duration::from_secs(if entered { 3 } else { 35 });
+    let deadline = not_before + limit;
+    let event = tokio::select! {
+        // A timely queued event remains valid if the test task is polled late.
+        // Worker failure wins; then event timestamps decide before the watchdog.
+        biased;
+        result = worker => return Err(format!("continuation worker ended before expected event: {result:?}")),
+        event = rx.recv() => event.ok_or_else(|| "continuation event channel closed".to_string())?,
+        _ = tokio::time::sleep_until(deadline) => return Err(format!("continuation {} timed out: list={list:?} logical_now={logical_now}", if entered { "entry" } else { "completion" })),
+    };
+    if event.list != list
+        || event.logical_now != logical_now
+        || event.entered != entered
+        || event.at < not_before
+        || event.at > deadline
+    {
+        return Err(format!("unexpected continuation event: {event:?}; expected list={list:?} logical_now={logical_now} entered={entered} not_before={not_before:?} deadline={deadline:?}"));
+    }
+    Ok(event.at)
+}
+async fn continuation_round(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ContinuationEvent>,
+    worker: &mut tokio::task::JoinHandle<()>,
+    logical_now: i64,
+    tick: tokio::time::Instant,
+) -> Result<(), String> {
+    let mut phase_start = tick;
+    for list in [CachedList::Authored, CachedList::Reviewing] {
+        let entered = continuation_event(rx, worker, list, logical_now, true, phase_start).await?;
+        phase_start = continuation_event(rx, worker, list, logical_now, false, entered).await?;
+    }
+    Ok(())
+}
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_rejects_missing_tick_before_next_wake() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        tx.send(ContinuationEvent {
+            list: CachedList::Authored,
+            logical_now: 1015,
+            entered: true,
+            at: tokio::time::Instant::now(),
+        })
+        .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let error = continuation_event(
+        &mut rx,
+        &mut worker,
+        CachedList::Authored,
+        1015,
+        true,
+        start,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("entry timed out"), "{error}");
+    assert_eq!(start.elapsed(), Duration::from_secs(3));
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_rejects_wrong_identity_phase_and_out_of_window_event() {
+    let start = tokio::time::Instant::now();
+    for (list, logical_now, entered, at) in [
+        (CachedList::Reviewing, 1015, true, start),
+        (CachedList::Authored, 1030, true, start),
+        (CachedList::Authored, 1015, false, start),
+        (
+            CachedList::Authored,
+            1015,
+            true,
+            start - Duration::from_secs(1),
+        ),
+        (
+            CachedList::Authored,
+            1015,
+            true,
+            start + Duration::from_secs(4),
+        ),
+    ] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ContinuationEvent {
+            list,
+            logical_now,
+            entered,
+            at,
+        })
+        .unwrap();
+        let mut worker = tokio::spawn(std::future::pending::<()>());
+        let error = continuation_event(
+            &mut rx,
+            &mut worker,
+            CachedList::Authored,
+            1015,
+            true,
+            start,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unexpected continuation event"), "{error}");
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_uses_event_time_when_observed_after_deadline() {
+    for entered in [true, false] {
+        for timely in [true, false] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let start = tokio::time::Instant::now();
+            let limit = Duration::from_secs(if entered { 3 } else { 35 });
+            let at = start
+                + if timely {
+                    limit
+                } else {
+                    limit + Duration::from_millis(1)
+                };
+            tx.send(ContinuationEvent {
+                list: CachedList::Authored,
+                logical_now: 1015,
+                entered,
+                at,
+            })
+            .unwrap();
+            let mut worker = tokio::spawn(std::future::pending::<()>());
+            tokio::time::advance(limit + Duration::from_secs(1)).await;
+            let result = continuation_event(
+                &mut rx,
+                &mut worker,
+                CachedList::Authored,
+                1015,
+                entered,
+                start,
+            )
+            .await;
+            if timely {
+                assert_eq!(result.unwrap(), at);
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("unexpected continuation event"));
+            }
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_reports_worker_failure_without_waiting() {
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async { panic!("controlled worker failure") });
+    let error = continuation_event(
+        &mut rx,
+        &mut worker,
+        CachedList::Authored,
+        1015,
+        true,
+        start,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("worker ended") && error.contains("controlled worker failure"),
+        "{error}"
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuation_phase_guard_allows_io_after_verified_entry() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut worker = tokio::spawn(async move {
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            tx.send(ContinuationEvent {
+                list,
+                logical_now: 1015,
+                entered: true,
+                at: tokio::time::Instant::now(),
+            })
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(3200)).await;
+            tx.send(ContinuationEvent {
+                list,
+                logical_now: 1015,
+                entered: false,
+                at: tokio::time::Instant::now(),
+            })
+            .unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+    continuation_round(&mut rx, &mut worker, 1015, start)
+        .await
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_millis(6400));
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
 /// This drives the same sleeping dispatcher and persisted fetch path used by
 /// poll::spawn, rather than calling advance_scan at a list of timestamps.
 #[tokio::test(start_paused = true)]
@@ -1215,7 +1441,7 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
     .unwrap();
     publish(&polls, &conn, Ok(first)).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker = tokio::spawn(crate::poll::run_queue_continuations(
+    let mut worker = tokio::spawn(crate::poll::run_queue_continuations(
         focused.clone(),
         needed.clone(),
         enabled.clone(),
@@ -1231,6 +1457,14 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
                 let now = now.clone();
                 let tx = tx.clone();
                 async move {
+                    let dispatch_now = now.load(Ordering::SeqCst);
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: true,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                     // The production fetch adapter rechecks the durable owner,
                     // continuation eligibility and attempt limit at dispatch.
                     let scoped = client.with_read_context(ReadContext::new(
@@ -1244,14 +1478,20 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
                         list,
                         Duration::from_secs(30),
                         true,
-                        || (120, now.load(Ordering::SeqCst)),
+                        || (120, dispatch_now),
                     )
                     .await
                     .unwrap();
                     let permit = polls.success_publication(&attempt).await.unwrap();
                     let result = reconcile_github_at(path, &polls, &permit, result).await;
                     polls.complete(permit, result, |_| {});
-                    tx.send(list).unwrap();
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: false,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                 }
             }
         },
@@ -1289,16 +1529,14 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
         for _ in 0..5 {
             let before = server.received_requests().await.unwrap().len();
             now.fetch_add(15, Ordering::SeqCst);
+            let tick = tokio::time::Instant::now() + Duration::from_secs(15);
             tokio::time::advance(Duration::from_secs(15)).await;
             // Real sockets and blocking SQLite are allowed to complete. Virtual
             // time drives the timer; it does not stand in for provider completion.
             tokio::time::resume();
-            for _ in 0..2 {
-                tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            }
+            continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+                .await
+                .unwrap();
             tokio::time::pause();
             assert!(server.received_requests().await.unwrap().len() - before <= 3);
             if pass > 0 {
@@ -1334,14 +1572,12 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
     // Even well after the next-pass deadline, the continuation timer must
     // not start a fresh scan. Only an ordinary/foreground refresh can do so.
     now.fetch_add(3600, Ordering::SeqCst);
+    let tick = tokio::time::Instant::now() + Duration::from_secs(15);
     tokio::time::advance(Duration::from_secs(15)).await;
     tokio::time::resume();
-    for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
+    continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+        .await
+        .unwrap();
     assert_eq!(server.received_requests().await.unwrap().len(), before);
     assert_eq!(saved(&conn), rows);
     assert_eq!(
@@ -2132,7 +2368,7 @@ async fn completed_discovery_continuations_drain_terminal_inventory_within_budge
         Arc::new(AtomicBool::new(true)),
     ];
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker = tokio::spawn(crate::poll::run_queue_continuations(
+    let mut worker = tokio::spawn(crate::poll::run_queue_continuations(
         flags[0].clone(),
         flags[1].clone(),
         flags[2].clone(),
@@ -2147,20 +2383,26 @@ async fn completed_discovery_continuations_drain_terminal_inventory_within_budge
                 let now = now.clone();
                 let tx = tx.clone();
                 async move {
+                    let dispatch_now = now.load(Ordering::SeqCst);
+                    tx.send(ContinuationEvent {
+                        list,
+                        logical_now: dispatch_now,
+                        entered: true,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                     let scoped = client.with_read_context(ReadContext::new(
                         ReadClass::Background,
                         Duration::from_secs(30),
                     ));
-                    durable_terminal_step(
-                        path,
-                        &polls,
-                        &scoped,
+                    durable_terminal_step(path, &polls, &scoped, list, dispatch_now, true).await;
+                    tx.send(ContinuationEvent {
                         list,
-                        now.load(Ordering::SeqCst),
-                        true,
-                    )
-                    .await;
-                    tx.send(list).unwrap();
+                        logical_now: dispatch_now,
+                        entered: false,
+                        at: tokio::time::Instant::now(),
+                    })
+                    .unwrap();
                 }
             }
         },
@@ -2177,14 +2419,12 @@ async fn completed_discovery_continuations_drain_terminal_inventory_within_budge
     }
     for round in 1..=39 {
         now.store(1000 + round * 15, Ordering::SeqCst);
+        let tick = tokio::time::Instant::now() + Duration::from_secs(15);
         tokio::time::advance(Duration::from_secs(15)).await;
         tokio::time::resume();
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        }
+        continuation_round(&mut rx, &mut worker, now.load(Ordering::SeqCst), tick)
+            .await
+            .unwrap();
         tokio::time::pause();
         let conn = crate::store::open_db(&path).unwrap();
         for list in [CachedList::Authored, CachedList::Reviewing] {
