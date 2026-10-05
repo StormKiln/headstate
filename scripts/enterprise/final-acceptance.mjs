@@ -107,3 +107,32 @@ export async function runEnterpriseSoak({pages,provider,result,out,profile,nativ
   await save();
  }finally{result.soak.totalWithFinalPhaseMs=performance.now()-start;await save();}
 }
+
+// Separate current-session tail qualification, never a continuation of a failed soak.
+export async function runEnterpriseTail({pages,provider,result,nativeCall}){
+ result.tail={scope:'new native/browser session; copied synthetic warm profile; not a soak continuation',startedAt:new Date().toISOString()};
+ await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();
+ await pages[0].getByRole('button',{name:/Synthetic review 53(?:\D|$)/}).first().click();
+ await pages[0].getByText('Synthetic description 53',{exact:false}).waitFor();
+ await pages[0].getByRole('button',{name:'Approve',exact:true}).first().click();
+ await pages[0].getByRole('button',{name:'Approved',exact:true}).first().waitFor();
+ const approved=verifiedApprovedIdentities(provider.data.rows,provider.ledger);result.tail.approved=approved;
+ provider.fault.closed=[200];provider.fault.merged=[199];
+ for(const page of pages)await page.waitForFunction(()=>window.__enterprise.inventory().reviewing.length===148,null,{timeout:120000});
+ const source=Array.from({length:148},(_,i)=>{const n=i+51;return `synthetic-lab/repo-${(n-1)%50+1}/${n}`;}).sort();
+ const eligible=source.filter(id=>!approved.includes(id));assert.equal(eligible.length,145);
+ for(const page of pages){const ui=await page.evaluate(()=>({inventory:window.__enterprise.inventory(),eligible:window.__enterprise.readyEligibility()}));assert.deepEqual(ui.inventory.reviewing,source);assert.deepEqual(ui.eligible,eligible);}
+ await pages[1].waitForFunction(()=>window.__enterprise.querySummary().some(q=>q.kind==='stats-board'&&q.observers>0&&q.complete&&q.total===250),null,{timeout:120000});
+ const before=provider.ledger.length;result.tail.completeCacheReads=[];
+ for(let i=0;i<5;i++){
+  const response=await nativeCall('paired','stats_board',{scopeKind:'org',scopeValue:'synthetic-lab',measure:'merged',days:30});assert.equal(response.status,200);
+  const reply=await response.json();assert.equal(reply.wire.complete,true);assert.equal(reply.wire.total,250);result.tail.completeCacheReads.push({callId:reply.callId,total:reply.wire.total,complete:reply.wire.complete});
+ }
+ assert.equal(provider.ledger.length,before,'five warm native boards issue zero additional provider requests');result.tail.cacheProviderBefore=before;result.tail.cacheProviderAfter=provider.ledger.length;
+ await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();assert.deepEqual(await mountedReadyIdentities(pages[0]),eligible);result.tail.desktopDOM=await mountedReadyIdentities(pages[0]);
+ await pages[1].getByRole('button',{name:'To Review',exact:true}).click();await pages[1].getByText('Synthetic description 52',{exact:false}).waitFor();await delay(3000);
+ const detailCalls=()=>pages[1].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='get_pr_detail').length);
+ const countBefore=await detailCalls();const started=performance.now();await delay(125000);assert.equal(await detailCalls(),countBefore);result.tail.unchangedDetail={elapsedMs:performance.now()-started,before:countBefore,after:await detailCalls()};
+ await pages[1].getByRole('button',{name:'Back to list',exact:true}).click();assert.deepEqual(await mountedReadyIdentities(pages[1]),eligible);result.tail.pairedDOM=await mountedReadyIdentities(pages[1]);
+ result.tail.completedAt=new Date().toISOString();
+}

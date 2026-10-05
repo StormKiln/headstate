@@ -194,3 +194,37 @@ it("bounds recurring partial priority while healthy tail identities make useful 
     if (state?.hasContinuation) expect(state.resumeBoostSpent).toBe(true);
   }
 });
+
+it.each([8, 9])("retains an8ms conclusive receipt after %ims transport without granting freshness, then refreshes on the ordinary window", async (latency) => {
+  const pr = rows[0];
+  let calls = 0;
+  const publications: { at: number; expiresAt: number }[] = [];
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type === "updated" && event.action.type === "success" && event.query.queryKey[0] === "ready-stack") {
+      const data = event.query.state.data as { expiresAt: number };
+      publications.push({ at: performance.now(), expiresAt: data.expiresAt });
+    }
+  });
+  invoke.mockImplementation(async () => {
+    calls++;
+    if (calls === 1) await new Promise(resolve => setTimeout(resolve, latency));
+    return [{ ...pr, stack: { kind: "none" }, valid_for_ms: calls === 1 ? 8 : 60_000,
+      last_known_stack: { value: { kind: "none" }, age_ms: calls === 1 ? 59_991 : 0 },
+      advisory_progress: { outcome: "offered", admitted: true } }];
+  });
+  const view = renderHook(() => useReadyStacks([pr], new Set([prKey(pr)])), { wrapper });
+  await advance(latency + 2);
+  expect(calls).toBe(1);
+  expect(publications).toHaveLength(1);
+  expect(publications[0].expiresAt).toBeLessThanOrEqual(publications[0].at);
+  expect(view.result.current.of(pr)).toBeUndefined();
+  expect(view.result.current.displayOf(pr)).toMatchObject({ value: { kind: "none" }, freshness: "retained" });
+  await advance(29_000);
+  expect(calls).toBe(1);
+  await advance(1_000);
+  expect(calls).toBe(2);
+  expect(publications).toHaveLength(2);
+  expect(view.result.current.of(pr)).toEqual({ kind: "none" });
+  expect(view.result.current.displayOf(pr)?.freshness).toBe("fresh");
+  unsubscribe();
+});
