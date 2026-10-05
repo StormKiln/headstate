@@ -70,7 +70,16 @@ test('dequeue consumes schema id and rejects enqueue-style pullRequestId',async(
 });
 
 test('ledger distinguishes primary detail identity from check continuations and stack reads',()=>usingProvider(async(p,query)=>{
- await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id body reviews(first:1){nodes{id}} reviewThreads(first:1){nodes{id}}}}}');
+ await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id body latestReviews(first:1){nodes{id}} reviewThreads(first:1){nodes{id}}}}}');
  await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id reviews(first:1){nodes{id}}}}}');
  assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);assert.deepEqual(p.ledger[1].primaryDetails,[]);
+}));
+
+test('actual native PR_DETAIL_QUERY is one primary acquisition with exact identity',()=>usingProvider(async(p)=>{
+ const {readFile}=await import('node:fs/promises');
+ const source=await readFile(new URL('../../src-tauri/src/github/query.rs',import.meta.url),'utf8');
+ const query=source.split('pub const PR_DETAIL_QUERY: &str = r#"')[1].split('"#;')[0];
+ const response=await fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query,variables:{owner:'synthetic-lab',repo:'repo-1',number:51}})});
+ assert.equal(response.status,200);const body=await response.json();assert.equal(body.data.repository.pullRequest.number,51);
+ assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);
 }));
