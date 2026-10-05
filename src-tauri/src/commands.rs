@@ -1361,7 +1361,12 @@ const STRIP_PER_REQUEST: std::time::Duration = std::time::Duration::from_secs(10
 /// checked -- so the strip never mistakes "we did not ask" for "we could
 /// not tell" (#1050).
 ///
-/// Never an `Err` for a GitHub failure; `Err` is only "no client".
+/// Multirow calls share a continuation context keyed by logical membership.
+/// At most 512 recent contexts are admitted per account; an additional distinct
+/// batch returns an actionable error before provider work. Retrying the same
+/// batch retains its cursor; five idle minutes may retire it. Singleton callers
+/// need no context. Response shape and successful observation caches are unchanged.
+/// `Err` is authentication or context admission, never a GitHub read failure.
 #[tauri::command]
 pub async fn get_ready_pushers(
     client: State<'_, GhClient>,
@@ -1372,7 +1377,8 @@ pub async fn get_ready_pushers(
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
     let budget = client.request_budget();
-    let out = crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await;
+    let out =
+        crate::github::gates::strip_pushers(&client, &budget, &rows, STRIP_PER_REQUEST).await?;
     crate::diag!(
         "[diag] cmd get_ready_pushers end {}ms rest_requests={}",
         started.elapsed().as_millis(),

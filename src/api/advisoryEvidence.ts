@@ -5,7 +5,7 @@ export interface Evidence<T> { value: T; expiresAt: number; observedAt: number }
 export interface DisplayEvidence<T> { value: T; freshness: "fresh" | "retained"; observedAt: number }
 // Capacity, not elapsed browsing time, bounds retained display memory.
 export const advisoryGcTime = Infinity;
-const isAdvisory = (key: readonly unknown[]) => key[0] === "ready-stack" || key[0] === "ready-pushers";
+const isAdvisory = (key: readonly unknown[]) => key[0] === "ready-stack" || key[0] === "ready-pushers" || key[0] === "review-gates";
 
 // Only session control lives outside query state. Query reset/removal owns all
 // evidence, including last successes. A login round trip is a new generation.

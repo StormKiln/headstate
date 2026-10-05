@@ -1,4 +1,5 @@
-import { beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
+import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
+import { useDetailSourceGeneration, beginDetailRead, detailReadIsCurrent, detailNeedsRevalidation, resumeDetailRevalidation, reviewReconciliations, reviewKey } from "./detailRevalidation";
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
@@ -40,6 +41,7 @@ import type {
   HealthSample,
   NetProcess,
   PrDetail,
+  ReviewGates,
   PullRequest,
   Upstream,
   Venv,
@@ -2612,27 +2614,52 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
 ///
 /// Keyed on the head commit, so a push re-asks who pushed. The rules half
 /// is cached per (repo, base) on the Rust side, so re-asking is cheap.
+interface GateReceipt {
+  value: ReviewGates;
+  rules?: Evidence<ReviewGates["rules"]>;
+  pusher?: Evidence<ReviewGates["last_pusher"]>;
+  nextRead: number;
+  staleFor: number;
+}
 export function useReviewGates(pr: PrDetail | undefined, isPlaceholder: boolean) {
-  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined;
-  return useQuery({
-    queryKey: [
-      "review-gates",
-      pr?.repo,
-      pr?.base_ref,
-      pr?.head_repo ?? null,
-      pr?.head_ref,
-      pr?.head_oid,
-    ],
-    queryFn: () => {
+  const qc = useQueryClient();
+  const session = useAdvisorySession(qc);
+  const sourceGeneration = useDetailSourceGeneration(qc);
+  const viewer = useViewer();
+  const visible = useSyncExternalStore(subscribeVisibility, documentVisible, () => true);
+  const ready = pr !== undefined && !isPlaceholder && pr.head_repo !== undefined && !!viewer.data;
+  const query = useQuery({
+    queryKey: ["review-gates", viewer.data, session.generation, sourceGeneration,
+      pr?.repo, pr?.base_ref, pr?.head_repo ?? null, pr?.head_ref, pr?.head_oid],
+    queryFn: async ({ signal }): Promise<GateReceipt> => {
       const p = pr as PrDetail;
-      return getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+      const started = performance.now();
+      const value = await getReviewGates(p.repo, p.base_ref, p.head_repo ?? null, p.head_ref, p.head_oid);
+      assertCurrent(signal, session.generation, session.current);
+      if (!detailReadIsCurrent(qc, sourceGeneration)) throw new DOMException("Connection retired", "AbortError");
+      const rules = value.rules.state === "read" ? receipt(value.rules, value.rules_valid_for_ms, 600_000, started) : undefined;
+      const pusher = value.last_pusher.state === "known" ? receipt(value.last_pusher, value.pusher_valid_for_ms, 60_000, started) : undefined;
+      const expiry = Math.min(rules?.expiresAt ?? 0, value.last_pusher.state === "not_needed" ? Infinity : pusher?.expiresAt ?? 0);
+      // One selected query, never a row interval. Inconclusive reads retry at
+      // most twice a minute; original successful receipts keep their own TTLs.
+      const nextRead = Math.max(performance.now() + 30_000, expiry);
+      return { value, rules, pusher, nextRead, staleFor: Math.max(0, expiry - performance.now()) };
     },
-    enabled: ready,
-    staleTime: 60_000,
-    // The command folds every GitHub failure into a state; a rejection is
-    // only "no client", which a retry cannot fix.
-    retry: 0,
+    enabled: ready && visible,
+    staleTime: query => query.state.data?.staleFor ?? 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchInterval: query => query.state.fetchStatus === "fetching" ? false : query.state.status === "error" ? 30_000 : Math.max(1, (query.state.data?.nextRead ?? performance.now() + 30_000) - performance.now()),
   });
+  const value = query.data;
+  useEvidenceExpiry(() => [value?.rules?.expiresAt, value?.pusher?.expiresAt].filter((at): at is number => at !== undefined), ready);
+  const data: ReviewGates | undefined = value && { ...value.value,
+    rules: value.value.rules.state === "read" && display(value.rules)?.freshness !== "fresh"
+      ? { state: "declined", reason: "Policy needs revalidation" } : value.value.rules,
+    last_pusher: value.value.last_pusher.state === "known" && display(value.pusher)?.freshness !== "fresh"
+      ? { state: "declined", reason: "Pusher needs revalidation" } : value.value.last_pusher,
+  };
+  return { ...query, data };
 }
 
 export { useReadyPushers } from "./useReadyPushers";

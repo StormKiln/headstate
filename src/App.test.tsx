@@ -124,7 +124,7 @@ vi.mock("./api/hooks", () => ({
   useCommentOnPr: () => () => Promise.resolve(),
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
-  useReviewGates: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
   // #1576: nothing checked yet, which hides nothing.
   useReadyPushers: () => ({
     of: () => ({ pusher: { state: "pending" }, rule: "unread" }),

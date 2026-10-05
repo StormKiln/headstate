@@ -88,6 +88,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             age_ms: at.elapsed().as_millis() as u64,
         })
     }
+    #[cfg(test)]
     pub async fn load<F: Future<Output = V>>(
         &self,
         key: K,
@@ -141,7 +142,83 @@ pub(super) struct Advisory {
     pub stacks: Cache<StackKey, PrStack>,
     order: Mutex<(u64, HashMap<String, u64>)>,
     rotations: Mutex<HashMap<String, (Instant, usize)>>,
+    batches: Mutex<HashMap<[u8; 32], Arc<Mutex<Batch>>>>,
 }
+// Contexts are never evicted while admitted or recently demanded. The extra
+// registry has an explicit overload result instead of silently losing progress.
+const BATCH_IDLE: Duration = Duration::from_secs(300);
+#[derive(Debug)]
+pub(super) struct Batch {
+    demanded: Instant,
+    cursor: Option<String>,
+}
+impl Advisory {
+    pub fn batch(&self, members: &[String]) -> Result<Option<Arc<Mutex<Batch>>>, String> {
+        if members.len() < 2 {
+            return Ok(None);
+        }
+        use sha2::{Digest, Sha256};
+        let mut sorted = members.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let key: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&sorted).expect("string members")).into();
+        let mut batches = self.batches.lock().unwrap_or_else(|e| e.into_inner());
+        batches.retain(|_, batch| {
+            Arc::strong_count(batch) > 1
+                || batch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .demanded
+                    .elapsed()
+                    < BATCH_IDLE
+        });
+        if let Some(batch) = batches.get(&key) {
+            batch.lock().unwrap_or_else(|e| e.into_inner()).demanded = Instant::now();
+            return Ok(Some(batch.clone()));
+        }
+        if batches.len() >= CAPACITY {
+            return Err("Too many active advisory batches (512). Retry this batch after an idle batch has had five minutes to retire.".into());
+        }
+        let batch = Arc::new(Mutex::new(Batch {
+            demanded: Instant::now(),
+            cursor: None,
+        }));
+        batches.insert(key, batch.clone());
+        Ok(Some(batch))
+    }
+    pub fn batch_order(
+        &self,
+        keys: &[String],
+        members: &[String],
+        batch: &Option<Arc<Mutex<Batch>>>,
+    ) -> Vec<usize> {
+        let cursor = batch.as_ref().and_then(|batch| {
+            batch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cursor
+                .clone()
+        });
+        let Some(cursor) = cursor else {
+            return self.order(keys);
+        };
+        let mut indices: Vec<_> = (0..keys.len()).collect();
+        indices.sort_by(|a, b| {
+            (members[*a] <= cursor, &members[*a]).cmp(&(members[*b] <= cursor, &members[*b]))
+        });
+        indices
+    }
+    pub fn batch_offered(&self, key: String, member: String, batch: &Option<Arc<Mutex<Batch>>>) {
+        self.offered(key);
+        if let Some(batch) = batch {
+            let mut batch = batch.lock().unwrap_or_else(|e| e.into_inner());
+            batch.cursor = Some(member);
+            batch.demanded = Instant::now();
+        }
+    }
+}
+
 impl Advisory {
     pub fn rotation(&self, key: String, len: usize) -> usize {
         if len == 0 {

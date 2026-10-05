@@ -3983,6 +3983,9 @@ type LastPusher =
   | { state: "unknown"; reason: string };
 
 export interface ReviewGates {
+  /** Original native cache lifetime; absent on older paired desktops. */
+  rules_valid_for_ms?: number;
+  pusher_valid_for_ms?: number;
   rules: BaseRules;
   last_pusher: LastPusher;
 }

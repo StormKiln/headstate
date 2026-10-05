@@ -975,7 +975,7 @@ export const wireGraph: WireGraph = {
   {"t":"union","of":[769,770,771],"tag":"kind","cases":[["unknown",769],["none",770],["stacked",771]]},
   {"t":"union","of":[3,798]},
   {"t":"object","props":[["value",796,false],["age_ms",37,false]]},
-  {"t":"object","props":[["rules",790,false],["last_pusher",780,false]]},
+  {"t":"object","props":[["rules_valid_for_ms",83,true],["pusher_valid_for_ms",83,true],["rules",790,false],["last_pusher",780,false]]},
   {"t":"union","of":[0,801]},
   {"t":"object","props":[["request_id",10,false],["update",802,false]]},
   {"t":"object","props":[["source",803,false],["list",72,false],["owner",42,true],["last_received_at",42,true],["phase",75,false],["error",9,false],["session",63,true],["revision",83,true],["receipt_revision",84,true],["completed_request",42,true],["prs",85,true],["coverage",86,true]]},

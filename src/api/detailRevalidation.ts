@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import type { Query, QueryClient } from "@tanstack/react-query";
 import type { PrDetail, PullRequest, ReadinessField, RowObservation } from "../types/pr";
 import type { ProviderReceipt } from "./sourceRefresh";
@@ -7,7 +8,7 @@ type Facts = Record<string, string>;
 interface Target { revision: number; facts: Facts; probe?: boolean }
 interface State { facts: Facts; observed: Facts; initial: boolean; revision: number; required?: Target; reading?: number; account: number; session: number }
 type Member = Pick<PullRequest, "repo" | "number">;
-interface Source { session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
+interface Source { listeners: Set<() => void>; session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
 const memberKey = (row: Member) => JSON.stringify([row.repo.toLowerCase(), row.number]);
 const states = new WeakMap<Query, State>();
 const sources = new WeakMap<QueryClient, Source>();
@@ -50,7 +51,7 @@ function baseline(detail: PrDetail | undefined): Facts {
 function source(qc: QueryClient): Source {
   let value = sources.get(qc);
   if (value) return value;
-  value = { generation: 0, retired: new Set(), account: reviewAccountGeneration(qc), membership: {} }; sources.set(qc, value);
+  value = { listeners: new Set(), generation: 0, retired: new Set(), account: reviewAccountGeneration(qc), membership: {} }; sources.set(qc, value);
   // Query-owned targets disappear with their query. A single subscription per
   // client reconciles actual fetch successes, never optimistic/manual patches.
   qc.getQueryCache().subscribe(event => {
@@ -99,7 +100,7 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
   const src = source(qc);
   if (session !== undefined && src.retired.has(session)) return;
   if (session !== undefined && session !== src.session) {
-    if (src.session !== undefined) { src.retired.add(src.session); src.generation++; }
+    if (src.session !== undefined) { src.retired.add(src.session); src.generation++; for (const listener of src.listeners) listener(); }
     src.session = session;
     src.membership = {};
   }
@@ -166,5 +167,12 @@ export function retireDetailOwnership(qc: QueryClient, resetSessions = false) {
   src.session = undefined;
   src.membership = {};
   src.generation++;
+  for (const listener of src.listeners) listener();
   reviewReconciliations.delete(qc);
+}
+
+/** Selected advisory reads use the same source generation as detail reads. */
+export function useDetailSourceGeneration(qc: QueryClient) {
+  const src = source(qc);
+  return useSyncExternalStore(listener => { src.listeners.add(listener); return () => { src.listeners.delete(listener); }; }, () => src.generation);
 }

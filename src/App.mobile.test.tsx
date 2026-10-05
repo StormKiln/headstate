@@ -71,7 +71,7 @@ vi.mock("./api/hooks", () => ({
   useCommentOnPr: () => () => Promise.resolve(),
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
-  useReviewGates: () => ({ data: undefined }),
+  useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
   useCycleTrend: () => ({ data: undefined }),
   usePeriods: () => ({
     data: {
