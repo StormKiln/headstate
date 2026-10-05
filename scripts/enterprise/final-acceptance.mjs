@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
 import {resolve} from 'node:path';
-import {advisoryPeriods,usefulPublications} from './ready-completion.mjs';
+import {advisoryPeriods,usefulPublications,assertCompletionDeadline} from './ready-completion.mjs';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export const soakPolicy={minimumMs:1800000,historyBudgetMs:1200000,interestMarginMs:180000,usefulBlockMs:120000,finalMarginMs:300000,flatProgressMs:600000,checkpointMs:60000,meaning:'conditional synthetic diagnostic ceiling, not a universal liveness guarantee or SLA'};
 export function remainingWork(coverage,expected){return {pushers:expected.filter(n=>!coverage.pushers.includes(n)||!coverage.rules.includes(n)),stacks:expected.filter(n=>!coverage.stacks.includes(n))};}
@@ -32,16 +32,51 @@ export function assertStatsMeasurement(board,dom,history,now=Date.now()){
  assert.deepEqual(board.repoCounts.map(r=>[r.repo,r.merged]).sort(),[...repos].sort());assert.deepEqual(board.rows.map(r=>[r.login,r.prs]).sort(),[...authors].sort());
  assert.deepEqual(dom.repos.map(r=>[r.repo,r.count]).sort(),[...repos].sort());assert.ok(dom.repos.every(r=>r.share==='2%'));assert.equal(dom.completeHint,true);assert.equal(dom.impossibleHint,false);
 }
+export function verifiedApprovedIdentities(rows,ledger){
+ const approved=rows.filter(r=>r.reviews.nodes.some(v=>v.author.login==='synthetic-viewer'&&v.state==='APPROVED'&&v.commit.oid===r.headRefOid));
+ assert.deepEqual(approved.map(r=>r.number).sort((a,b)=>a-b),[51,52,53],'exact three successful current-head approvals');
+ const writes=ledger.filter(e=>e.operation==='review-write');assert.equal(writes.length,3);assert.ok(writes.every(e=>e.status===200&&e.terminal==='response-sent'),'all three writes succeeded at the provider');
+ return approved.map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+}
+export async function runPreActionReady({pages,provider,result,out}){
+ const began=performance.now(),ceilingMs=300000,expected=[51,52,53];
+ const population=provider.data.rows.filter(r=>r.state==='OPEN'&&r.reviewRequests.nodes.some(q=>q.requestedReviewer.login==='synthetic-viewer')).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+ result.preActionReady={ceilingMs,expected,population,checkpoints:[],meaning:'full150 mounted in both roles; ordinary viewport/selection only; all9 fresh desktop publications before any review write'};
+ const save=()=>writeFile(resolve(out,'pre-action-ready.json'),JSON.stringify(result.preActionReady,null,2));
+ try{
+  await save();assert.equal(population.length,150);
+  for(const page of pages){await page.getByTestId('counts').filter({hasText:'Authored 50 / Reviewing 150'}).waitFor({timeout:120000});assert.deepEqual(await mountedReadyIdentities(page),population);}
+  // Existing first rows stay in the viewport. No population narrowing, injected
+  // priority, invalidation, direct command or timer adjustment is permitted.
+  await pages[0].locator('[data-advisory-key]').first().scrollIntoViewIfNeeded();
+  while(performance.now()-began<ceilingMs){
+   const publications=await pages[0].evaluate(()=>window.__enterprise.advisoryPublications);
+   const coverage=usefulPublications(publications,expected),elapsedMs=performance.now()-began;
+   const witnesses=Object.fromEntries([['pushers','freshPusher'],['rules','freshRules'],['stacks','freshStack']].map(([family,field])=>[family,expected.map(number=>publications.find(p=>p.number===number&&p[field])??null)]));
+   result.preActionReady.checkpoints.push({elapsedMs,coverage,witnesses});await save();
+   assert.equal(provider.ledger.filter(e=>e.operation==='review-write').length,0,'no approval may precede all9 witnesses');
+   for(const page of pages)assert.deepEqual(await mountedReadyIdentities(page),population,'keep the full150 ordinary Ready population');
+   if(Object.values(coverage).every(ids=>ids.length===3)){assertCompletionDeadline(coverage,expected,elapsedMs,ceilingMs);result.preActionReady.firstCompleteMs=elapsedMs;break;}
+   await delay(Math.min(5000,Math.max(0,ceilingMs-(performance.now()-began))));
+  }
+  const last=result.preActionReady.checkpoints.at(-1);assertCompletionDeadline(last?.coverage??{},expected,last?.elapsedMs??Infinity,ceilingMs);
+  assert.ok(result.preActionReady.firstCompleteMs!==undefined,'all9 pre-action witnesses inside the frozen bound');
+  assert.ok(performance.now()-began<=ceilingMs,'pre-action phase must finish inside its declared bound');
+ }finally{result.preActionReady.elapsedMs=performance.now()-began;await save();}
+}
 export async function runEnterpriseSoak({pages,provider,result,out,profile,nativeCall}){
  const expectedNumbers=Array.from({length:148},(_,i)=>51+i),open=provider.data.rows.filter(r=>r.state==='OPEN');
  const authored=open.filter(r=>r.author.login==='synthetic-viewer').map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+ const approved=verifiedApprovedIdentities(provider.data.rows,provider.ledger);
  const reviewing=open.filter(r=>expectedNumbers.includes(r.number)).map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
+ const eligible=reviewing.filter(id=>!approved.includes(id));assert.equal(eligible.length,145);
+ const eligibleNumbers=open.filter(r=>eligible.includes(`${r.repository.nameWithOwner}/${r.number}`)).map(r=>r.number).sort((a,b)=>a-b);
  const readNative=async()=>{const text=await readFile(resolve(profile,'native.ndjson'),'utf8');return text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(JSON.parse);};
- const snapshot=page=>page.evaluate(()=>({inventory:window.__enterprise.inventory(),queries:window.__enterprise.querySummary(),publications:window.__enterprise.advisoryPublications,counts:document.querySelector('[data-testid="counts"]')?.textContent,lost:window.__enterprise.measurement.lost,cachedCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board_cached').length,normalStatsCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board').length}));
+ const snapshot=page=>page.evaluate(()=>({inventory:window.__enterprise.inventory(),readyEligibility:window.__enterprise.readyEligibility(),queries:window.__enterprise.querySummary(),publications:window.__enterprise.advisoryPublications,counts:document.querySelector('[data-testid="counts"]')?.textContent,lost:window.__enterprise.measurement.lost,cachedCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board_cached').length,normalStatsCalls:window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='stats_board').length}));
  await pages[0].getByRole('button',{name:'Back to list',exact:true}).click();
  const initial=await snapshot(pages[0]),initialStats=await snapshot(pages[1]);
  const initialCoverage=usefulPublications(initial.publications,expectedNumbers),remaining=remainingWork(initialCoverage,expectedNumbers),ceilingMs=diagnosticCeiling(remaining);
- const start=performance.now();result.soak={...soakPolicy,ceilingMs,initialRemaining:remaining,initialCoverage,initialStats:initialStats.queries.find(q=>q.kind==='stats-board'&&q.observers>0),checkpoints:[],obligations:{externalClose:false,historyMeasured:false,advisoryObserved:false,reviewGuidanceObserved:false,mountedStats:false,settledStatsReadback:false}};
+ const start=performance.now();result.soak={...soakPolicy,ceilingMs,initialRemaining:remaining,initialCoverage,approved,expectedEligible:eligible,expectedReviewing:reviewing,initialStats:initialStats.queries.find(q=>q.kind==='stats-board'&&q.observers>0),checkpoints:[],obligations:{externalClose:false,historyMeasured:false,advisoryObserved:false,reviewGuidanceObserved:false,mountedStats:false,settledStatsReadback:false}};
  const save=()=>writeFile(resolve(out,'soak-progress.json'),JSON.stringify(result.soak,null,2));
  await writeFile(resolve(out,'soak-policy.json'),JSON.stringify({source:JSON.parse(await readFile(resolve(out,'metadata.json'),'utf8')),policy:soakPolicy,remaining,ceilingMs,assumptions:['one desktop ReadyStrip; paired continuously Stats','unchanged finite heads/bases and healthy bounded synthetic responses','same one-minute moving viewport and actual30s windows','<=2 documents per cold advisory command; unchanged8-attempt allowance/TTLs','120s per-new-identity planning block qualified by16-row run, not a proof','10min flat useful progress with continuing admission is an earlier diagnostic FAIL']},null,2));
  await save();assert.equal(result.soak.initialStats?.complete,false,'mounted Stats must start partial');
@@ -59,15 +94,17 @@ export async function runEnterpriseSoak({pages,provider,result,out,profile,nativ
    const db=JSON.parse(execFileSync('python3',['scripts/enterprise/inspect-profile.py',profile],{encoding:'utf8'}));
    const displayed=await mountedReadyIdentities(pages[0]);
    const exact=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
-   result.soak.obligations.externalClose=exact(ui.inventory.authored,authored)&&exact(paired.inventory.authored,authored)&&exact(ui.inventory.reviewing,reviewing)&&exact(paired.inventory.reviewing,reviewing)&&exact(displayed,reviewing);
+   const sourceClosed=exact(ui.inventory.authored,authored)&&exact(paired.inventory.authored,authored)&&exact(ui.inventory.reviewing,reviewing)&&exact(paired.inventory.reviewing,reviewing);
+   result.soak.obligations.externalClose=sourceClosed&&exact(ui.readyEligibility,eligible)&&exact(paired.readyEligibility,eligible)&&exact(displayed,eligible);
    result.soak.obligations.advisoryObserved=owed.pushers.length===0;result.soak.obligations.reviewGuidanceObserved=owed.stacks.length===0;
    const history=provider.data.rows.filter(r=>r.state==='MERGED'&&r.mergedAt.slice(0,10)>=board?.window?.from&&r.mergedAt.slice(0,10)<=board?.window?.to);
    const actualHistory=db.historyIdentities.filter(r=>r.scope===board?.scopeKey&&r.day.slice(0,10)>=board?.window?.from&&r.day.slice(0,10)<=board?.window?.to).map(r=>`${r.repo}/${r.number}`).sort();
    const expectedHistory=history.map(r=>`${r.repository.nameWithOwner}/${r.number}`).sort();
    result.soak.obligations.historyMeasured=history.length===250&&exact(actualHistory,expectedHistory)&&db.historyCoverage.some(s=>s.scope===board?.scopeKey&&s.horizonDays===30&&s.missingRequiredDays===0);
    const elapsedMs=performance.now()-start;
-   const checkpoint={elapsedMs,owed,coverage,displayEvidence:displayEvidence(ui.queries,expectedNumbers),inventory:{desktop:ui.inventory,paired:paired.inventory,displayed},queries:ui.queries,stats:board,statsDOM:dom,db,providerReceipts:provider.ledger.length,advisoryDebits:debits.length,nativePeriods:advisoryPeriods(native),cachedCalls:paired.cachedCalls};
+   const checkpoint={elapsedMs,owed,coverage,displayEvidence:displayEvidence(ui.queries,eligibleNumbers),inventory:{desktop:ui.inventory,paired:paired.inventory,displayed,desktopEligible:ui.readyEligibility,pairedEligible:paired.readyEligibility},queries:ui.queries,stats:board,statsDOM:dom,db,providerReceipts:provider.ledger.length,advisoryDebits:debits.length,nativePeriods:advisoryPeriods(native),cachedCalls:paired.cachedCalls};
    result.soak.checkpoints.push(checkpoint);await save();
+   if(sourceClosed){assert.deepEqual(ui.readyEligibility,eligible,'production selector matches fixed approval-derived eligibility');assert.deepEqual(paired.readyEligibility,eligible);assert.deepEqual(displayed,eligible,'actual Ready DOM has exactly145 eligible rows, not148 source rows');}
    assertAdvisoryPeriods(checkpoint.nativePeriods);
    assert.equal(ui.lost||paired.lost,false);assert.equal(db.integrity,'ok');assert.equal(dom.impossibleHint,false);assert.equal(paired.normalStatsCalls,initialStats.normalStatsCalls,'automatic cache bridge cannot fall back to normal provider board loads');
    if(board?.complete){
@@ -91,7 +128,7 @@ export async function runEnterpriseSoak({pages,provider,result,out,profile,nativ
   await pages[1].getByRole('button',{name:'To Review',exact:true}).click();await pages[1].getByText('Synthetic description 52',{exact:false}).waitFor();await delay(3000);
   const detailCalls=()=>pages[1].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.name==='get_pr_detail').length);
   const countBefore=await detailCalls();await delay(125000);assert.equal(await detailCalls(),countBefore);result.soak.unchangedDetailWindowMs=125000;
-  await pages[1].getByRole('button',{name:'Back to list',exact:true}).click();assert.deepEqual(await mountedReadyIdentities(pages[1]),reviewing,'actual paired final Ready inventory');
+  await pages[1].getByRole('button',{name:'Back to list',exact:true}).click();assert.deepEqual(await mountedReadyIdentities(pages[1]),eligible,'actual paired final Ready eligible inventory');
   await save();
  }finally{result.soak.totalWithFinalPhaseMs=performance.now()-start;await save();}
 }

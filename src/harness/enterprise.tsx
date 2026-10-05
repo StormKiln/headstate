@@ -5,6 +5,7 @@ import { usePullRequests,useReviewing } from '../api/hooks';
 import { useReadyPushers } from '../api/useReadyPushers';
 import { useReadyStacks } from '../api/useReadyStacks';
 import { prKey } from '../lib/prIdentity';
+import { readyForReview } from '../lib/derive';
 import { useSourceRefresh, refreshWithState } from '../api/sourceRefreshHooks';
 import { PrList } from '../components/PrList';
 import { ReadyStrip } from '../components/ReadyStrip';
@@ -18,8 +19,9 @@ const commits:{phase:string;actual:number;base:number;started:number;at:number}[
 const longTasks:{at:number;duration:number}[]|null=PerformanceObserver.supportedEntryTypes.includes('longtask')?[]:null;
 if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())boundedPush(longTasks,{at:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});
 let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
+let renderedReadyEligibility:string[]=[];
 const advisoryPublications:{at:number;wallTime:number;kind:string;identity:unknown;number:number;owner:unknown;generation:unknown;freshPusher:boolean;freshRules:boolean;freshStack:boolean}[]=[];
-const probe={advisoryPublications,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
+const probe={advisoryPublications,readyEligibility:()=>renderedReadyEligibility,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
  const schedule=query.meta?.advisorySchedule as {claims?:Map<string,boolean>;lastAdmittedAt?:number;hasContinuation?:boolean;resumeBoostSpent?:boolean}|undefined;
  const freshness=(field:string,usable:boolean)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:usable&&evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
@@ -51,6 +53,7 @@ export function Workload(){
  useLayoutEffect(()=>{
   // Observe exactly what the production hooks render, including retained startup data.
   renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
+  renderedReadyEligibility=(reviewing.data??[]).filter(readyForReview).map(row=>`${row.repo}/${row.number}`).sort();
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;
   if(authored.data?.length===50&&reviewing.data?.length===150&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
  },[authored.data,reviewing.data]);
