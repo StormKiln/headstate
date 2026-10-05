@@ -457,12 +457,11 @@ impl SourcePolls {
             status.settled_phase = Some(status.phase.clone());
         }
         #[cfg(feature = "enterprise-harness")]
-        if current
-            && !state.no_work
+        if !state.no_work
             && !published
             && attempt.list == CachedList::Reviewing
-            && matches!(status.phase, Phase::Ready)
-            && status.error.is_none()
+            && matches!(status.coverage, Some(Coverage::Complete))
+            && state.step_failure.is_none()
         {
             if let (Some(receipt), Some(revision)) =
                 (state.receipt_id.as_deref(), status.receipt_revision)
@@ -2445,6 +2444,59 @@ mod tests {
                         .is_some_and(|o| o.confirmed_review.is_some())));
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "enterprise-harness")]
+    #[tokio::test]
+    async fn observer_marks_accepted_complete_receipt_independent_of_pending_attempt() {
+        use crate::enterprise_harness::metrics;
+        for (complete, no_work) in [(true, false), (false, false), (true, true)] {
+            let polls = SourcePolls::default();
+            let source = Source::default();
+            let (older, _) = polls
+                .begin_attempt(source.clone(), CachedList::Reviewing)
+                .await;
+            let (newer, _) = polls
+                .begin_attempt(source.clone(), CachedList::Reviewing)
+                .await;
+            let slot = metrics::Scope::new("scan-slot", 0);
+            let identity = crate::queue_scan::new_receipt_id();
+            metrics::scan_receipt(&identity, slot.id());
+            let mut data = receipt(1);
+            data.coverage = if complete {
+                Coverage::Complete
+            } else {
+                Coverage::Partial { total: Some(2) }
+            };
+            data.scan = Some(crate::queue_scan::Commit {
+                expected_revision: 0,
+                state: crate::queue_scan::State {
+                    receipt_id: Some(identity),
+                    no_work,
+                    received: true,
+                    done: true,
+                    coverage_valid: complete,
+                    ..Default::default()
+                },
+                removals: vec![],
+            });
+            let permit = polls.success_publication(&older).await.unwrap();
+            polls.complete(permit, Ok(data.clone()), |_| {});
+            let status = polls.get(&source, CachedList::Reviewing);
+            assert_eq!(status.phase, Phase::Fetching);
+            let expected = if complete && !no_work {
+                vec![status.receipt_revision.unwrap()]
+            } else {
+                vec![]
+            };
+            assert_eq!(metrics::accepted_revisions(slot.id()), expected);
+            // A coalesced current settlement cannot mint a second acceptance.
+            let permit = polls.success_publication(&newer).await.unwrap();
+            polls.complete(permit, Ok(data), |_| {});
+            assert_eq!(metrics::accepted_revisions(slot.id()), expected);
+            assert!(polls.success_publication(&older).await.is_none());
+            assert_eq!(metrics::accepted_revisions(slot.id()), expected);
         }
     }
 

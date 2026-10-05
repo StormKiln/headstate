@@ -244,6 +244,8 @@ pub fn accepted_scan(receipt: &str, revision: u64) {
         .unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = receipts.get(receipt) {
         record(*slot, "accepted-reviewing", "scan-slot", revision);
+        #[cfg(test)]
+        ACCEPTED_SCANS.lock().unwrap().push((*slot, revision));
     }
 }
 
@@ -265,4 +267,16 @@ fn conflicting_scan_producer_is_rejected_without_overwriting_provenance() {
     assert!(insert_scan_receipt(&mut receipts, "synthetic-receipt", 1));
     assert!(!insert_scan_receipt(&mut receipts, "synthetic-receipt", 2));
     assert_eq!(receipts.get("synthetic-receipt"), Some(&1));
+}
+
+#[cfg(test)]
+static ACCEPTED_SCANS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub fn accepted_revisions(slot: u64) -> Vec<u64> {
+    ACCEPTED_SCANS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, revision)| (*id == slot).then_some(*revision))
+        .collect()
 }
