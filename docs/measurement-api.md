@@ -293,8 +293,10 @@ hide transitions and actual dropped-page rows are observed without starting read
 Evicted rows describe dropped page entries, not unique lifetime messages. The mounted
 viewer observes its bounded window and input-array residency at React effect/commit.
 `raf_proxy` is elapsed time to two browser animation callbacks after that commit;
-it is neither compositor paint nor CPU/heap. Hidden/unmounted/changed windows cancel
-pending callbacks. Client observations are unlinked: no request ID, session path,
+it is neither compositor paint nor CPU/heap. An actual hidden transition permanently
+censors the current sample even if rows stay identical across resume. Only a new
+visible window commit starts a new sample. Unmounted/changed windows cancel pending
+callbacks. Client observations are unlinked: no request ID, session path,
 message ID, or retired host operation is fabricated. Exact duplicate suppression and
 shared event quotas coalesce/refuse repeats with the foundation's loss accounting.
 
@@ -310,7 +312,9 @@ previously documented lifecycle boundary.
 
 Five specifically named companion commands (`get_phone_measurement_prefs`,
 `set_phone_measurement_prefs`, `phone_measurement_status`, `record_phone_measurements`,
-`export_phone_measurements`) use CLIENT_COMMANDS and work without pairing. The actual
+`export_phone_measurements`) are companion-only registrations using CLIENT_COMMANDS
+and work without pairing. They are intentionally absent from the desktop command
+surface and its companion mirror; desktop forwarding refuses them as unknown. The actual
 “This phone” panel is mounted in General settings and on the unpaired screen. It
 loads local status on mount/control/export, not a polling timer. Status/control
 failure remains unavailable; disabled capture can still share retained history.

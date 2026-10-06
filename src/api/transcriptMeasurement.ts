@@ -16,9 +16,18 @@ export function useTranscriptWindowMeasurement(rows:number,resident:number,revis
     void publishClientMeasurements([{...base,phase:"render"}]).catch(()=>{});
     if(typeof requestAnimationFrame!=="function")return;
     const start=performance.now();let second:number|undefined;
-    const first=requestAnimationFrame(()=>{second=requestAnimationFrame(()=>{
-      if(document.visibilityState!=="hidden")void publishClientMeasurements([{...base,phase:"raf_proxy",elapsed_ms:Math.max(0,Math.round(performance.now()-start))}]).catch(()=>{});
-    });});
-    return()=>{cancelAnimationFrame(first);if(second!==undefined)cancelAnimationFrame(second);};
+    let canceled=false;
+    const first=requestAnimationFrame(()=>{
+      if(canceled)return;
+      second=requestAnimationFrame(()=>{
+        if(!canceled&&document.visibilityState!=="hidden")void publishClientMeasurements([{...base,phase:"raf_proxy",elapsed_ms:Math.max(0,Math.round(performance.now()-start))}]).catch(()=>{});
+      });
+    });
+    const cancel=()=>{canceled=true;cancelAnimationFrame(first);if(second!==undefined)cancelAnimationFrame(second);};
+    // Visibility can change without changing the mounted rows or their identity.
+    // Censor that interval permanently; only a new visible commit starts a sample.
+    const visibility=()=>{if(document.visibilityState==="hidden")cancel();};
+    document.addEventListener("visibilitychange",visibility);
+    return()=>{cancel();document.removeEventListener("visibilitychange",visibility);};
   },[enabled,rows,resident,revision]);
 }

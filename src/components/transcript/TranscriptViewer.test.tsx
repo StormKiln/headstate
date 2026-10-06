@@ -454,3 +454,55 @@ it("observes the actual bounded mounted window and two-frame proxy without calli
  expect(renderEvent.rows).toBeLessThanOrEqual(WINDOW_SIZE+WINDOW_SLACK);
  expect(JSON.stringify(events)).not.toContain("t149");view.unmount();
 });
+
+describe("transcript measurement visible intervals", () => {
+  it.each([0, 1])("censors a mounted sample hidden after %i animation callbacks, even after identical-prop resume", async framesBeforeHide => {
+    const pending = new Map<number, FrameRequestCallback>();
+    let id = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation(callback => { pending.set(++id, callback); return id; });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(key => { pending.delete(key); });
+    const visibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    const setVisibility = (value: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    const frame = async () => { await act(async () => {
+      const callbacks = [...pending.values()]; pending.clear();
+      callbacks.forEach(callback => callback(performance.now()));
+    }); };
+    const qc = new QueryClient(); qc.setQueryData(["ui-prefs"], { diagnostic_logging: true });
+    const messages = conversation(3);
+    const element = (rows = messages) => <QueryClientProvider client={qc}><TranscriptViewer messages={rows} renderMessage={renderOne}/></QueryClientProvider>;
+    measurementRecords.mockClear(); setVisibility("visible");
+    const view = render(element());
+    try {
+      for (let i = 0; i < framesBeforeHide; i++) await frame();
+      act(() => setVisibility("hidden"));
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      act(() => setVisibility("visible"));
+      view.rerender(element());
+      await frame(); await frame();
+      const proxies = () => measurementRecords.mock.calls.flatMap(call => (call as unknown as [{phase:string;elapsed_ms?:number}[]])[0]).filter(event => event.phase === "raf_proxy");
+      expect(proxies()).toEqual([]);
+      // Only a new accepted visible window commit can begin a new sample.
+      view.rerender(element([...messages]));
+      await frame(); await frame();
+      expect(proxies()).toHaveLength(1);
+      expect(proxies()[0].elapsed_ms).toBeLessThan(60_000);
+      // A changed window cancels its predecessor, then can finish its own sample.
+      view.rerender(element([...messages]));
+      await frame();
+      view.rerender(element(conversation(4)));
+      await frame(); await frame();
+      expect(proxies()).toHaveLength(2);
+      // Unmount must also cancel a new in-progress sample.
+      view.rerender(element([...messages])); view.unmount();
+      await frame(); await frame();
+      expect(proxies()).toHaveLength(2);
+    } finally {
+      view.unmount(); request.mockRestore(); cancel.mockRestore();
+      if (visibility) Object.defineProperty(document, "visibilityState", visibility);
+      else delete (document as unknown as Record<string, unknown>).visibilityState;
+    }
+  });
+});

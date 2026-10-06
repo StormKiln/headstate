@@ -63,11 +63,6 @@ pub enum Class {
 /// diff against the design document is a line-by-line comparison.
 pub const SURFACE: &[(&str, Class)] = &[
     ("save_markdown", Class::Local),
-    ("get_phone_measurement_prefs", Class::Local),
-    ("set_phone_measurement_prefs", Class::Local),
-    ("phone_measurement_status", Class::Local),
-    ("record_phone_measurements", Class::Local),
-    ("export_phone_measurements", Class::Local),
     // read: no side effects on GitHub or disk.
     // Read: the phone asking whether the DESKTOP's background work died
     // is a question about state, not an action on the machine. The
@@ -1880,6 +1875,20 @@ mod tests {
             RemoteError::Command(CommandError::classify("m")).http_status(),
             500
         );
+    }
+
+    #[test]
+    fn companion_measurement_commands_are_unknown_to_desktop_forwarding() {
+        for name in [
+            "get_phone_measurement_prefs",
+            "set_phone_measurement_prefs",
+            "phone_measurement_status",
+            "record_phone_measurements",
+            "export_phone_measurements",
+        ] {
+            assert_eq!(class_of(name), None);
+            assert_eq!(admit(name), Err(RemoteError::Unknown(name.to_string())));
+        }
     }
 
     #[test]
