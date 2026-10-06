@@ -3145,6 +3145,7 @@ async fn detail_fact_publication_is_durable_without_a_local_review() {
     assert!(receipt_ids.iter().all(|id| recorder.is_live_receipt(id)));
     let export = dir.path().canonicalize().unwrap().join("report.jsonl");
     recorder.export_to(export.clone()).await.unwrap();
+    crate::measurement::preserve_test_export("queue-detail-fact", &export);
     let events: Vec<serde_json::Value> = std::fs::read_to_string(export)
         .unwrap()
         .lines()

@@ -6,20 +6,47 @@ virtualization choice in the viewer-shell issue (#1479) and the memory window
 in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
-**Status.** The fixtures, the Rust read bench, the receive-side parse bench
-and the browser harness are in place. The 8.2 run below measures twelve
-production windows, plus follow/growth in Chromium, and estimates B5 from
-historical real-text compression ratios. A bounded own-PID WKWebView runner
-is available but its locked/occluded execution produced no timing samples. Nothing is
-yet confirmed in WKWebView, and every phone figure is still **not
-measured**, not "passing". The 8.1 corrections and retest below cover exact
-paint timing, grown-file reads, idle controls, large-page mounting, and
-retention during eviction. The dated 2026-09-27 tables are historical.
+**Status (9.2).** The original locked/occluded native run was unavailable,
+but it is no longer the latest native evidence: twelve later visible owned-process
+WKWebView runs produced qualified open/append proxies. They do not certify native
+budgets or physical-phone performance. The 9.2 additions measure indexed position
+reads and mounted Chromium control proxies; the field journal records native
+read/client/RAF layers without claiming physical paint. Follow the
+[9.2 owner field guide](release-9.2-field-testing.md). #1487 remains open.
 
-## Current 8.2 results — 2026-10-01
+## Later visible native evidence and 9.2 position measurements
+
+The preserved 8.2 `native-unlocked-results.md` records three fresh owned-process
+runs for each of four synthetic fixtures on Apple M2 Max/macOS26.6.2 at1280×800.
+All retained visible-window and stable host/WebContent PID qualification. Open
+DOM-ready/double-rAF medians were **160,156,145,70ms** (1k,10k,70MiB,huge-result);
+one opening reached **306ms**. Append medians were **96,97,92,47ms**. OS caches
+were not cleared; the harness was already running. These are paint-opportunity
+proxies, not compositor presentation or an application-startup measurement.
+WebContent RSS baseline/open/idle ranges were separately attributed; whole-process
+RSS/footprint is not JS heap or transcript allocations. The earlier zero-sample
+run below remains historical evidence, not a statement that no native samples exist.
+
+For9.2, release-profile position reads measured24 synthetic cases (four preserved
+files ×start/middle/end ×no-index/ready-index), seven warm acquisitions each.
+Ready-index12/12 succeeded, medians **0.828–21.671ms**; no-index11/12 succeeded,
+medians **0.822–21.860ms**. Huge-result middle correctly refused bounded alignment
+in **0.039ms**. Maximum held reads were466945 bytes; oversized-record streaming
+still reached21185083 bytes. No-index means no position index, not cold OS storage.
+The24 mounted Chromium desktop/phone-layout control cases made exactlyone position
+request each; control-to-two-frame proxy was **30.0–124.8ms**, one sample/case,
+using preloaded real native indexed payloads. This excludes native/network/decode
+delivery, is not Element Timing, and is not WKWebView or a physical iPhone.
+Raw evidence is retained in the release workspace's
+`artifacts/release-9.2-build/scrubber-position-measurements-final/` and associated
+`scrubber-*-final.log` files. No new physical-device measurements are claimed here.
+Exact native CPU/heap/presentation, older navigation/eviction and physical-phone/LAN
+budgets remain unmeasured. The historical tables below retain their original scope.
+
+## Historical 8.2 results — 2026-10-01
 
 The [full measured tables and method](transcript-performance-8.2-results.md)
-are the current production-window baseline. One opening sample per window,
+are the historical 8.2 production-window baseline. One opening sample per window,
 Apple M2 Max/macOS 26.6.2, Chromium headless shell 153; timings exclude app
 startup/native transport and use mock IPC with actual production payloads.
 No competing build ran during measurement. These results retain the bounded
@@ -33,7 +60,7 @@ viewer/eviction design; they do not establish WKWebView or phone acceptance.
 | B4 idle/visibility/nudge | 656–685B/read; 1.45–2.54ms script/read in measured read phases; zero idle row mutations/long tasks; zero hidden/same-size-nudge reads; new-byte nudge 3.4ms | mock IPC serialization included; status work is nonzero; hidden state simulated for the production hook |
 | B4 growth/retention | live readers appended 3,240/3,245 messages, retained 25/40 and 34/55 growth pages; parked readers detached at page 21/31 and rejoined | all four page-granular residency checks pass; at most 300 DOM rows mounted; subsequent growth spans explicitly synthetic |
 | B5 <150KB compressed | 2.7–57.2KB at historical worst ratio; 5.7–120.7KB uncompressed JSON | estimate across twelve windows, not measured LAN bytes; over-budget estimates now fail the driver |
-| Native desktop / physical phone | unavailable / unmeasured | owned native window hidden/occluded; no valid native timing samples, no device acceptance |
+| Original native run / physical phone | unavailable / unmeasured | original owned window hidden/occluded; later visible proxies are summarized above; no device acceptance |
 
 The unchanged Rust reader was separately measured in release mode: newest
 page medians **1.08, 1.07, 0.94, 20.82ms** for 1k, 10k, 70MiB and 5MiB-result
@@ -48,10 +75,10 @@ or native receive latency.
 `make bench-transcript-native` now provides a [bounded own-PID WKWebView
 probe](../scripts/transcript-native/README.md), with separate host/WebContent
 RSS and physical-footprint samples and open/append/idle paint-opportunity
-proxies. Actual compiled execution returned **exit 3, unavailable**, because
+proxies. The original compiled execution returned **exit 3, unavailable**, because
 the window was hidden/occluded/inactive; zero samples were accepted. It never
 substitutes host RSS for renderer memory or compositor timing for double-rAF.
-A successful future proxy run still does not certify native budgets. Exact
+The later successful visible proxy runs above still do not certify native budgets. Exact
 heap/CPU/presentation, native older navigation/eviction and all physical-phone
 measurements remain outstanding under the checklists below. #1487's device
 acceptance is therefore not declared complete.

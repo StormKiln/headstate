@@ -1,3 +1,4 @@
+import { preserveMeasurement } from "../scripts/measurement-evidence.mjs";
 import { GitLabViewerProvider } from "./api/authAvailability";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -937,6 +938,7 @@ describe("active inventory footer wiring", () => {
       footer_location: "desktop_footer", footer: "needs_checking",
     })]));
     expect(JSON.stringify(measurements.mock.calls)).not.toContain("PRIVATE");
+    preserveMeasurement("mounted-ready", measurements.mock.calls.flatMap(call=>call[0]));
     act(() => useFilters.getState().setFilter("repo", undefined));
     await waitFor(() => expect(measurements).toHaveBeenCalledWith([expect.objectContaining({
       inventory_count: 4, eligible_count: 3, visible_count: 3, selection: "all_repositories",

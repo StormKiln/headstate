@@ -1,4 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { observationStatus } from "../lib/rowObservation";
+import { readyAge } from "../lib/readyAge";
 import type { SourceRefreshSnapshot } from "./sourceRefresh";
 import type { PullRequest } from "../types/pr";
 import type { ClientMeasurement, MeasurementReference } from "../types/measurement";
@@ -29,6 +31,16 @@ export function ReviewMeasurementProvider({ enabled, receipt, selected, snapshot
 export function useReviewPresentation(footer: Review["footer"], footer_location: Review["footer_location"]) {
   const { enabled, present } = useContext(Context);
   useEffect(() => { if (enabled) present({ footer, footer_location }); }, [enabled, present, footer, footer_location]);
+}
+
+/** The mounted Ready qualifier, shared with its cost measurement. Display evidence is read-only. */
+export function readyMeasurementLastKnown(pr: PullRequest,
+  stack: { freshness: "fresh" | "retained"; value: { kind: string } } | undefined,
+  pusher: { freshness: "fresh" | "retained"; value: { pusher: { state: string } } } | undefined, now: Date) {
+  return observationStatus(pr)?.label === "Readiness last known"
+    || (pr.observation?.ready_at_state === "retained" && readyAge(pr.ready_at, now).since !== null)
+    || (stack?.freshness === "retained" && stack.value.kind === "stacked")
+    || (pusher?.freshness === "retained" && pusher.value.pusher.state === "viewer");
 }
 
 /** Bounded pure observations of arrays the view already owns. No demand-producing calls. */

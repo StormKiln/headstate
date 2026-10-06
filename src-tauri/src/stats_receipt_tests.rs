@@ -2037,6 +2037,7 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
     );
     let exported = journal.path().canonicalize().unwrap().join("report.jsonl");
     recorder.export_to(exported.clone()).await.unwrap();
+    crate::measurement::preserve_test_export("stats-cache-only", &exported);
     let events = std::fs::read_to_string(exported).unwrap();
     assert!(
         events.contains("\"kind\":\"stats_progress\""),
@@ -2431,4 +2432,102 @@ async fn measurement_registration_and_commit_failures_do_not_change_useful_stats
         assert!(text.contains("\"outcome\":\"accepted\""));
         assert!(!text.contains("synthetic refusal"));
     }
+}
+
+#[tokio::test]
+#[ignore = "manual synthetic producer cost measurement; preserves fixture, samples and exports"]
+async fn task6d_stats_cache_producer_cost() {
+    use crate::measurement::{Config, Platform, Recorder, Role};
+    use crate::store::pr_history;
+    let root = std::path::PathBuf::from(
+        std::env::var("HEADSTATE_MEASUREMENT_SMOKE").expect("artifact directory required"),
+    )
+    .canonicalize()
+    .unwrap();
+    let recorder = Arc::new(
+        Recorder::new(Config {
+            directory: root.join("stats-cost-journal"),
+            epoch: [92; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap(),
+    );
+    let p = provider_measured("synthetic-cache-viewer", 1, Some(recorder.clone())).await;
+    let db = root.join("stats-cost.db");
+    assert!(
+        !db.exists(),
+        "preserve previous measurement; use a new directory"
+    );
+    let mut conn = open_db(&db).unwrap();
+    let owner = stats_owner::capture_verified(&conn, "synthetic-cache-viewer").unwrap();
+    p.client
+        .stats_viewer_metered(&p.client.request_budget())
+        .await
+        .unwrap();
+    let calls = p.calls.load(Ordering::SeqCst);
+    let read = || {
+        stats_board_cached_for_client(
+            &p.client,
+            db.clone(),
+            owner.clone(),
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            7,
+        )
+    };
+    let empty = read().await.unwrap();
+    let rows: Vec<_> = (1..=236)
+        .map(|number| pr_history::StoredPr {
+            repo: "fixture/repo".into(),
+            number,
+            merged_at: empty.window.to.clone(),
+            title: "synthetic".into(),
+            url: "https://example.test/pr".into(),
+            author: format!("synthetic-author-{}", number % 8),
+            cycle_time_hours: 1.0,
+            size: 3,
+            additions: 2,
+            deletions: 1,
+            changed_files: 1,
+            reviews_received: 1,
+        })
+        .collect();
+    pr_history::put_many(
+        &mut conn,
+        &empty.scope_key,
+        &empty.window.to,
+        &empty.window.to,
+        &rows,
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let before = stats_store_snapshot(&conn);
+    let mut results = Vec::new();
+    for (block, enabled) in [false, true, true, false].into_iter().enumerate() {
+        recorder.set_enabled(enabled);
+        let mut samples = Vec::new();
+        for _ in 0..60 {
+            let start = std::time::Instant::now();
+            let board = read().await.unwrap();
+            samples.push(start.elapsed().as_micros() as u64);
+            assert_eq!(board.measurement.accumulated, 236);
+        }
+        let export = root.join(format!("stats-cost-{block}.jsonl"));
+        let receipt = recorder.export_to(export).await.unwrap();
+        results.push(json!({"block":block,"enabled":enabled,"microseconds_per_read":samples,"export_records":receipt.records,"export_bytes":receipt.bytes,"incomplete":receipt.incomplete}));
+    }
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        calls,
+        "measurement must not add provider work"
+    );
+    assert_eq!(
+        stats_store_snapshot(&conn),
+        before,
+        "readback must not register/reserve/mutate product data"
+    );
+    std::fs::write(root.join("stats-producer-cost.json"),serde_json::to_vec_pretty(&json!({"method":"Actual cached Stats readback, 236 stored synthetic PRs, eight authors, 7-day window; warm filesystem, off/on/on/off; diagnostic dedup and quotas retained. No physical-device or general enterprise latency claim.","debug_assertions":cfg!(debug_assertions),"provider_calls_setup":calls,"provider_calls_after":p.calls.load(Ordering::SeqCst),"results":results})).unwrap()).unwrap();
 }

@@ -1,3 +1,4 @@
+import { preserveMeasurement } from "../../scripts/measurement-evidence.mjs";
 import { StrictMode } from "react";
 import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -101,6 +102,7 @@ it("observes the actual mounted Stats publication without adding a provider requ
  expect(batches.flatMap(c=>c[1].batch)).toContainEqual(expect.objectContaining({observation:'mounted',rows:1,outcome:'accepted'}));
  expect(JSON.stringify(batches)).not.toContain('synthetic-viewer');
  expect(JSON.stringify(batches)).not.toContain('synthetic-lab');
+ preserveMeasurement("mounted-stats", batches.flatMap(c=>c[1].batch));
  qc.clear();
 });
 

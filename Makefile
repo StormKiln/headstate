@@ -391,6 +391,8 @@ lint-deps:
 	# because a fix that quietened the noise by checking less would be
 	# worse than the bug.
 	python3 scripts/install-dependencies.test.py
+	python3 scripts/measurement-report.test.py
+	node --test scripts/measurement-evidence.test.mjs
 	python3 scripts/ci-command.test.py
 	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
@@ -612,3 +614,8 @@ check-activity-chart:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	yarn vite build -c vite.harness.config.ts
 	node scripts/check-activity-chart.mjs "$(OUT)" "$(or $(ENGINE),chromium)"
+
+.PHONY: analyze-measurements
+analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
+analyze-measurements:
+	@python3 scripts/measurement-report.py "$$MEASUREMENT_INPUT"

@@ -791,6 +791,14 @@ mod tests {
             assemble_measured(&idle, &registry, &failures, now(), Some(&r));
             let path = root.join("report");
             r.export_to(path.clone()).await.unwrap();
+            crate::measurement::preserve_test_export(
+                if hook_first {
+                    "hook-valid-first"
+                } else {
+                    "sample-valid-first"
+                },
+                &path,
+            );
             let text = std::fs::read_to_string(path).unwrap();
             assert!(text.contains("\"delta_ms\":-30000"));
             assert!(text.contains("out_of_window"));
@@ -850,6 +858,14 @@ mod tests {
             assemble_measured(&idle, &registry, &failures, now(), Some(&r));
             let path = root.join("report");
             r.export_to(path.clone()).await.unwrap();
+            crate::measurement::preserve_test_export(
+                if hook_first {
+                    "hook-missing-first"
+                } else {
+                    "sample-missing-first"
+                },
+                &path,
+            );
             let text = std::fs::read_to_string(path).unwrap();
             assert!(DateTime::parse_from_rfc3339(&failures["synthetic-session"].at).is_ok());
             let comparisons: Vec<serde_json::Value> = text

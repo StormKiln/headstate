@@ -800,3 +800,13 @@ impl Drop for Recorder {
 }
 #[cfg(test)]
 mod tests;
+
+/// Opt-in synthetic smoke artifacts; never compiled into the product.
+#[cfg(test)]
+pub(crate) fn preserve_test_export(name: &str, path: &std::path::Path) {
+    if let Ok(root) = std::env::var("HEADSTATE_MEASUREMENT_SMOKE") {
+        let root = std::path::PathBuf::from(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::copy(path, root.join(format!("{name}.jsonl"))).unwrap();
+    }
+}

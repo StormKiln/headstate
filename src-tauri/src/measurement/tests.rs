@@ -1100,3 +1100,46 @@ async fn recent_phone_export_empty_history_is_a_valid_bounded_frame() {
     assert!(lines[0]["omitted_prefix"]["oldest_wall_ms"].is_null());
     assert!(!receipt.incomplete);
 }
+
+#[tokio::test]
+#[ignore = "manual synthetic UI-to-native export smoke; requires preserved mounted producer inputs"]
+async fn task6d_mounted_producers_export_smoke() {
+    let root = std::path::PathBuf::from(
+        std::env::var("HEADSTATE_MEASUREMENT_SMOKE").expect("artifact directory required"),
+    )
+    .canonicalize()
+    .unwrap();
+    let r = Recorder::new(Config {
+        directory: root.join("client-journal"),
+        epoch: [91; 16],
+        role: Role::Desktop,
+        platform: Platform::Macos,
+        build: "synthetic".into(),
+    })
+    .unwrap();
+    let mut batch = Vec::new();
+    for name in ["mounted-ready", "mounted-stats", "mounted-transcript"] {
+        let bytes = std::fs::read(root.join(format!("{name}.json"))).unwrap();
+        assert!(bytes.len() <= 16 * 1024);
+        let observations: Vec<ClientMeasurement> = serde_json::from_slice(&bytes).unwrap();
+        assert!(!observations.is_empty());
+        batch.extend(observations);
+    }
+    assert!(batch.len() <= 32);
+    r.client_events(batch.clone()).unwrap();
+    let disabled = root.join("client-disabled.jsonl");
+    r.export_to(disabled.clone()).await.unwrap();
+    assert_eq!(r.status().durable_records, 0);
+    r.set_enabled(true);
+    r.client_events(batch).unwrap();
+    let path = root.join("mounted-client.jsonl");
+    r.export_to(path.clone()).await.unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    for kind in ["mounted_review", "stats_view", "transcript_view"] {
+        assert!(text.contains(kind));
+    }
+    for secret in ["PRIVATE", "synthetic-lab", "synthetic-viewer", "t149"] {
+        assert!(!text.contains(secret));
+    }
+    assert!(r.status().durable_records > 0);
+}
