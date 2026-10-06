@@ -31,6 +31,7 @@ pub mod packages;
 pub mod panic_hook;
 pub mod poll;
 mod project_menu;
+mod queue_measurement;
 pub mod redact;
 pub mod release_notes;
 pub mod remote;

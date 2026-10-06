@@ -698,28 +698,37 @@ pub async fn act_on_pr(
     action: String,
     inventory_managed: Option<bool>,
 ) -> Result<Option<PrActionOutcome>, String> {
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let act = parse_action(&action)?;
+    crate::queue_measurement::run(
+        crate::measurement_desktop::recorder(),
+        crate::measurement::OperationClass::Action,
+        async {
+            let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+            let act = parse_action(&action)?;
 
-    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
-    match client.mutate_pr(&id, act).await {
-        Ok(effect) => {
-            if let Some(effect) = effect {
-                crate::source_poll::record_confirmed_action(&app, &repo, number, effect, operation)
-                    .await;
+            let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
+            match client.mutate_pr(&id, act).await {
+                Ok(effect) => {
+                    if let Some(effect) = effect {
+                        crate::source_poll::record_confirmed_action(
+                            &app, &repo, number, effect, operation,
+                        )
+                        .await;
+                    }
+                    log::info!("{repo}#{number} {}", act.describe());
+                    // Refresh promptly rather than waiting out the poll interval:
+                    // the list would otherwise keep showing a PR as open for up
+                    // to two minutes after merging it.
+                    waker.0.notify_one();
+                    Ok(PrActionOutcome::for_request(inventory_managed))
+                }
+                Err(e) => {
+                    log::warn!("{repo}#{number} could not be {}: {e}", act.describe());
+                    Err(e.to_string())
+                }
             }
-            log::info!("{repo}#{number} {}", act.describe());
-            // Refresh promptly rather than waiting out the poll interval:
-            // the list would otherwise keep showing a PR as open for up
-            // to two minutes after merging it.
-            waker.0.notify_one();
-            Ok(PrActionOutcome::for_request(inventory_managed))
-        }
-        Err(e) => {
-            log::warn!("{repo}#{number} could not be {}: {e}", act.describe());
-            Err(e.to_string())
-        }
-    }
+        },
+    )
+    .await
 }
 
 /// Merge, or add to the merge queue, a native GitHub stack up to and
@@ -1284,49 +1293,57 @@ pub async fn get_pr_detail(
     repo: String,
     number: u64,
 ) -> Result<PrDetail, String> {
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
-    // command for the reason `get_reviewing` gives: without it the log
-    // holds the individual POSTs and no total, so a 30-second click
-    // could not be attributed to the command at all -- and the gap
-    // between the summed POSTs and this elapsed time is exactly where
-    // octocrab's rate-limit wait hides, which nothing else records.
-    // The repository and number are NOT logged: the diagnostic log is
-    // something a user pastes into an issue, and a private repository's
-    // name is not ours to put in it.
-    crate::diag!("[diag] cmd get_pr_detail start");
-    let started = std::time::Instant::now();
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    // The scoped client owns one deadline and can return completed check pages
-    // when a continuation expires; an outer timeout would discard that progress.
-    let client = client.with_read_context(crate::github::admission::ReadContext::new(
-        crate::github::admission::ReadClass::Foreground,
-        crate::poll::FETCH_TIMEOUT,
-    ));
-    let review_generation = crate::source_poll::review_read_generation(&app);
-    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
-    let mut out = client
-        .fetch_pr_detail(&repo, number)
-        .await
-        .map_err(|e| e.to_string());
-    if let Ok(detail) = &mut out {
-        if let Some(observation) = &mut detail.inventory_facts {
-            for fact in &mut observation.facts {
-                fact.operation = Some(operation.clone());
+    crate::queue_measurement::run(
+        crate::measurement_desktop::recorder(),
+        crate::measurement::OperationClass::Detail,
+        async {
+            // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
+            // command for the reason `get_reviewing` gives: without it the log
+            // holds the individual POSTs and no total, so a 30-second click
+            // could not be attributed to the command at all -- and the gap
+            // between the summed POSTs and this elapsed time is exactly where
+            // octocrab's rate-limit wait hides, which nothing else records.
+            // The repository and number are NOT logged: the diagnostic log is
+            // something a user pastes into an issue, and a private repository's
+            // name is not ours to put in it.
+            crate::diag!("[diag] cmd get_pr_detail start");
+            let started = std::time::Instant::now();
+            let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+            // The scoped client owns one deadline and can return completed check pages
+            // when a continuation expires; an outer timeout would discard that progress.
+            let client = client.with_read_context(crate::github::admission::ReadContext::new(
+                crate::github::admission::ReadClass::Foreground,
+                crate::poll::FETCH_TIMEOUT,
+            ));
+            let review_generation = crate::source_poll::review_read_generation(&app);
+            let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
+            let mut out = client
+                .fetch_pr_detail(&repo, number)
+                .await
+                .map_err(|e| e.to_string());
+            if let Ok(detail) = &mut out {
+                if let Some(observation) = &mut detail.inventory_facts {
+                    for fact in &mut observation.facts {
+                        fact.operation = Some(operation.clone());
+                    }
+                }
             }
-        }
-    }
-    if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
-        crate::source_poll::record_review_readback(&app, detail, viewer, review_generation).await;
-    }
-    crate::diag!(
-        "[diag] cmd get_pr_detail end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(d) => format!("ok checks={}/{}", d.checks.len(), d.checks_total),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+            if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
+                crate::source_poll::record_review_readback(&app, detail, viewer, review_generation)
+                    .await;
+            }
+            crate::diag!(
+                "[diag] cmd get_pr_detail end {}ms {}",
+                started.elapsed().as_millis(),
+                match &out {
+                    Ok(d) => format!("ok checks={}/{}", d.checks.len(), d.checks_total),
+                    Err(e) => format!("err: {e}"),
+                }
+            );
+            out
+        },
+    )
+    .await
 }
 
 /// Whether the viewer's approval can count, and whether conversations must

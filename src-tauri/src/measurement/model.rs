@@ -18,7 +18,8 @@ closed!(Domain {
     Stats,
     StopFailure,
     Transcript,
-    Client
+    Client,
+    ReadTransport
 });
 closed!(List {
     Authored,
@@ -48,6 +49,7 @@ closed!(Acceptance {
     NoWork,
     Unknown
 });
+closed!(OperationClass { Detail, Action });
 closed!(Stage {
     Started,
     Submitted,
@@ -224,6 +226,8 @@ pub enum ClientMeasurement {
 pub enum Event {
     QueueReceipt {
         owner: OpaqueId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<OpaqueId>,
         list: List,
         operation: Option<OpaqueId>,
         revision: u64,
@@ -235,6 +239,8 @@ pub enum Event {
         outcome: Acceptance,
     },
     Operation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_class: Option<OperationClass>,
         operation: OpaqueId,
         parent: Option<OpaqueId>,
         domain: Domain,
@@ -299,8 +305,14 @@ impl Event {
     pub(super) fn handles(&self) -> Vec<&OpaqueId> {
         match self {
             Self::QueueReceipt {
-                owner, operation, ..
-            } => std::iter::once(owner).chain(operation.iter()).collect(),
+                owner,
+                receipt,
+                operation,
+                ..
+            } => std::iter::once(owner)
+                .chain(receipt.iter())
+                .chain(operation.iter())
+                .collect(),
             Self::Operation {
                 operation, parent, ..
             } => std::iter::once(operation).chain(parent.iter()).collect(),
@@ -350,8 +362,37 @@ pub struct Loss {
     pub deferred_aggregate_gaps: u64,
     pub rotated_out: u64,
     pub rotated_bytes: u64,
-    pub by_domain: [u64; 5],
+    #[serde(deserialize_with = "domain_counts")]
+    pub by_domain: [u64; 6],
 }
+fn domain_counts<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<[u64; 6], D::Error> {
+    struct Counts;
+    impl<'de> serde::de::Visitor<'de> for Counts {
+        type Value = [u64; 6];
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("five legacy or six domain counts")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = [0; 6];
+            for (i, value) in out.iter_mut().enumerate() {
+                match seq.next_element()? {
+                    Some(n) => *value = n,
+                    None if i == 5 => return Ok(out),
+                    None => return Err(serde::de::Error::invalid_length(i, &self)),
+                }
+            }
+            if seq.next_element::<u64>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(7, &self));
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_seq(Counts)
+}
+
 impl Loss {
     pub fn incomplete(&self) -> bool {
         self.dropped > 0

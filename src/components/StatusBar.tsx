@@ -1,3 +1,4 @@
+import { useReviewPresentation } from "../api/reviewMeasurement";
 import { toast } from "sonner";
 import { useActiveFilters } from "@/store/filters";
 import { ExternalLink } from "./ExternalLink";
@@ -156,6 +157,12 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   // go: with it, "Up to date" and the timestamp each broke onto two
   // lines.
   const isMobile = useIsMobile();
+  useReviewPresentation(isMobile || selection === "gitlab" ? "hidden" : showReceipt && github
+    ? githubQueueSummary(github).measurement
+    : ({ panicked: "background_stopped", authUnavailable: "auth_unavailable", authUnknown: "auth_unknown",
+      fetching: "checking", retrying: "retrying", failed: "load_failed", stale: "refresh_failed", ok: "legacy_up_to_date" } as const)[status],
+    isMobile || selection === "gitlab" ? "hidden" : "desktop_footer");
+
 
   // From the built binary, not package.json: the release workflow stamps
   // the version from the git tag at build time and never commits it, so

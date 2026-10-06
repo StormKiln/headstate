@@ -383,13 +383,28 @@ impl Recorder {
         s.live.insert(id.id, HandleKind::Receipt);
         Some(id)
     }
+    /// Only live, capture-qualified row references may cross the wire.
+    pub fn is_live_receipt(&self, id: &OpaqueId) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let state = self.state.lock().unwrap();
+        self.valid(&state, id) && state.live.get(&id.id) == Some(&HandleKind::Receipt)
+    }
     fn typed_handles(&self, s: &State, event: &Event) -> bool {
         let is = |id: &OpaqueId, kind| self.valid(s, id) && s.live.get(&id.id) == Some(&kind);
         match event {
             Event::QueueReceipt {
-                owner, operation, ..
+                owner,
+                receipt,
+                operation,
+                ..
             } => {
                 is(owner, HandleKind::Owner)
+                    && receipt.as_ref().is_none_or(|v| {
+                        is(v, HandleKind::Receipt)
+                            && s.operations.get(&v.id) == Some(&Some(owner.id))
+                    })
                     && operation
                         .as_ref()
                         .is_none_or(|v| is(v, HandleKind::Operation))

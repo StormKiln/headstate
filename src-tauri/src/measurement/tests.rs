@@ -29,6 +29,7 @@ fn fixture(caps: Caps) -> (tempfile::TempDir, Recorder, Arc<TestClock>) {
 }
 fn event(owner: &OpaqueId, revision: u64) -> Event {
     Event::QueueReceipt {
+        receipt: None,
         owner: owner.clone(),
         list: List::Reviewing,
         operation: None,
@@ -366,6 +367,7 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
     assert!(!Recorder::record(
         &r,
         Event::Operation {
+            operation_class: None,
             operation,
             parent: Some(owner),
             domain: Domain::Queue,
@@ -815,4 +817,33 @@ async fn fix1_concurrent_success_keeps_only_new_delta_deferred_and_reuses_comple
         ..delta
     });
     assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
+}
+
+#[test]
+fn queue_receipt_reference_must_belong_to_its_live_owner_and_old_records_remain_readable() {
+    let (_dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("owner-A")).unwrap();
+    let other = r.intern(Key::Owner("owner-B")).unwrap();
+    let receipt = r.receipt_reference(&owner).unwrap();
+    let mut observation = event(&other, 1);
+    if let Event::QueueReceipt { receipt: value, .. } = &mut observation {
+        *value = Some(receipt.clone());
+    }
+    assert!(!r.record(observation));
+    let legacy = serde_json::to_value(event(&owner, 1)).unwrap();
+    assert!(legacy.get("receipt").is_none());
+    assert!(serde_json::from_value::<Event>(legacy).is_ok());
+    assert!(r.is_live_receipt(&receipt));
+    r.retire(&owner);
+    assert!(!r.is_live_receipt(&receipt));
+}
+
+#[test]
+fn legacy_five_domain_loss_remains_readable_after_shared_transport_classification() {
+    let loss: Loss = serde_json::from_value(serde_json::json!({"by_domain":[1,2,3,4,5]})).unwrap();
+    assert_eq!(loss.by_domain, [1, 2, 3, 4, 5, 0]);
+    assert!(
+        serde_json::from_value::<Loss>(serde_json::json!({"by_domain":[0,0,0,0,0,0,0]})).is_err()
+    );
 }

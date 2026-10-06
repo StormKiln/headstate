@@ -1,3 +1,4 @@
+import type { ClientMeasurement } from "../types/measurement";
 import type { SourceRefreshSnapshot } from "../api/sourceRefresh";
 
 export interface GitHubQueueStatus { list: "authored" | "reviewing"; receipt: SourceRefreshSnapshot }
@@ -16,18 +17,20 @@ export function githubQueueSummary({ list, receipt }: GitHubQueueStatus) {
   const saved = receipt.fetchedAt !== undefined;
   if (saved) notes.push("Showing a saved inventory");
   let text: string;
+  let measurement: Extract<ClientMeasurement, { kind: "mounted_review" }>["footer"];
   let warning = true;
   if (receipt.error || receipt.phase === "failed" || receipt.phase === "not_asked") {
+    measurement = rows === undefined ? "load_failed" : "refresh_failed";
     text = `Could not ${rows === undefined ? "load" : "refresh"} ${object}`;
     if (receipt.error) notes.unshift(receipt.error);
-  } else if (receipt.phase === "retrying") text = `Retrying ${object}…`;
-  else if (receipt.phase === "fetching") text = `Checking ${object}…`;
-  else if (rows === undefined) text = `${subject} not checked`;
-  else if (typeof receipt.coverage === "object" && receipt.coverage !== null) text = `${subject} partly checked`;
-  else if (receipt.coverage !== "complete") text = `${subject} coverage unknown`;
-  else if (saved || receipt.staleSecs || membership || readiness) text = `${subject} need checking`;
-  else { text = `${subject} checked`; warning = false; }
+  } else if (receipt.phase === "retrying") { text = `Retrying ${object}…`; measurement = "retrying"; }
+  else if (receipt.phase === "fetching") { text = `Checking ${object}…`; measurement = "checking"; }
+  else if (rows === undefined) { text = `${subject} not checked`; measurement = "not_checked"; }
+  else if (typeof receipt.coverage === "object" && receipt.coverage !== null) { text = `${subject} partly checked`; measurement = "partly_checked"; }
+  else if (receipt.coverage !== "complete") { text = `${subject} coverage unknown`; measurement = "coverage_unknown"; }
+  else if (saved || receipt.staleSecs || membership || readiness) { text = `${subject} need checking`; measurement = "needs_checking"; }
+  else { text = `${subject} checked`; warning = false; measurement = "checked"; }
   const timestamp = receipt.lastReceivedAt;
   const updatedAt = timestamp && Number.isFinite(Date.parse(timestamp)) ? Date.parse(timestamp) : undefined;
-  return { text, warning, explanation: [text, ...notes].join(". "), updatedAt };
+  return { measurement, text, warning, explanation: [text, ...notes].join(". "), updatedAt };
 }

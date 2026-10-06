@@ -631,6 +631,16 @@ impl GitHubClient {
             .map_or(usize::MAX, |a| a.remaining())
     }
 
+    pub(crate) fn measurement_recorder(&self) -> Option<&crate::measurement::Recorder> {
+        self.read_transport.recorder()
+    }
+    #[cfg(test)]
+    pub(crate) fn with_measurement(mut self, recorder: Arc<crate::measurement::Recorder>) -> Self {
+        Arc::get_mut(&mut self.read_transport)
+            .expect("inject recorder before sharing the client")
+            .measurement = Some(recorder);
+        self
+    }
     pub(crate) fn admission_snapshot(&self) -> super::admission::AdmissionSnapshot {
         self.read_transport.admission.snapshot()
     }
@@ -3614,6 +3624,71 @@ mod tests {
             .await
             .is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn measurement_action_acknowledgment_distinguishes_confirmed_and_uncertain_with_one_write(
+    ) {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        for confirmed in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Arc::new(
+                Recorder::new(Config {
+                    directory: dir.path().canonicalize().unwrap().join("journal"),
+                    epoch: [47; 16],
+                    role: Role::Desktop,
+                    platform: Platform::Macos,
+                    build: "synthetic".into(),
+                })
+                .unwrap(),
+            );
+            recorder.set_enabled(true);
+            let server = MockServer::start().await;
+            let node = if confirmed {
+                json!({"id":"PRIVATE_PR", "headRefOid":"PRIVATE_HEAD", "state":"OPEN",
+                "updatedAt":"2026-10-01T00:00:00Z", "isInMergeQueue":true, "mergeQueueEntry":{"state":"QUEUED"}})
+            } else {
+                serde_json::Value::Null
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+                    "enqueuePullRequest":{"mergeQueueEntry":{"state":"QUEUED", "pullRequest":node}}
+                }})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client_for(&server).await.with_measurement(recorder.clone());
+            client.viewer.set("PRIVATE_OWNER".into()).unwrap();
+            let result = client
+                .mutate_pr("PRIVATE_PR", super::super::mutate::PrAction::Enqueue)
+                .await
+                .unwrap();
+            assert_eq!(result.is_some(), confirmed);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+            recorder.export_to(path.clone()).await.unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(!text.contains("PRIVATE"));
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter_map(|v| v.get("event").cloned())
+                .collect();
+            let ack = events
+                .iter()
+                .find(|e| e["stage"] == "acknowledged")
+                .unwrap();
+            assert_eq!(ack["operation_class"], "action");
+            assert_eq!(
+                ack["outcome"],
+                if confirmed { "success" } else { "unknown" }
+            );
+            assert_eq!(events.iter().filter(|e| e["stage"] == "started").count(), 1);
+            assert_eq!(
+                events.iter().filter(|e| e["stage"] == "completed").count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

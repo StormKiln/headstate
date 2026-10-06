@@ -6,7 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -86,6 +86,31 @@ const ready: PullRequest = {
 };
 
 describe("ReadyStrip", () => {
+  it("keeps receipt metadata with source rows despite an independently shared query array", async () => {
+    let observed: ReturnType<typeof useSourceRefresh> | undefined;
+    let cache: QueryClient | undefined;
+    function FromSource() {
+      cache = useQueryClient();
+      observed = useSourceRefresh("reviewing");
+      return <ReadyStrip prs={observed.prs ?? []} />;
+    }
+    render(<FromSource />);
+    await waitFor(() => expect(eventHandlers.has("source-poll-status")).toBe(true));
+    const token = { epoch: "a".repeat(32), capture: 1, id: 2 };
+    const payload = { source: { provider: "github", host: "github.com" }, list: "reviewing", owner: "synthetic",
+      session: "measurement-session", revision: 1, receipt_revision: 1, phase: "ready", error: null,
+      prs: [{ ...ready }], coverage: "complete", measurement_receipt: token };
+    await act(async () => eventHandlers.get("source-poll-status")?.({ payload }));
+    const first = cache!.getQueryData(["reviewing"]);
+    await act(async () => eventHandlers.get("source-poll-status")?.({ payload: {
+      ...payload, revision: 2, receipt_revision: 2, prs: [{ ...ready }], measurement_receipt: { ...token, id: 3 },
+    } }));
+    expect(cache!.getQueryData(["reviewing"])).toBe(first);
+    expect(observed!.prs).not.toBe(first);
+    expect(observed!.measurementReceipt?.id).toBe(3);
+    await act(async () => eventHandlers.get("source-poll-status")?.({ payload: { ...payload, revision: 3, receipt_revision: 2, phase: "fetching", prs: null } }));
+    expect(observed!.measurementReceipt?.id).toBe(3);
+  });
   it("keeps unread-head transport receipts out of Ready until a positively changed head", async () => {
     function FromSource() {
       const state = useSourceRefresh("reviewing");

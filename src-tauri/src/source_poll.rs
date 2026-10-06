@@ -7,6 +7,8 @@ use crate::{
     store::{source_cache::Coverage, CachedList},
 };
 use serde::Serialize;
+#[path = "source_poll_measurement.rs"]
+mod observation;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -91,6 +93,8 @@ pub struct Update {
     pub session: String,
     pub completed_request: Option<String>,
     pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_receipt: Option<crate::measurement::OpaqueId>,
     pub prs: Option<Vec<crate::github::model::PullRequest>>,
     pub mrs: Option<Vec<crate::gitlab::queues::MergeRequest>>,
 }
@@ -103,6 +107,7 @@ pub struct SourcePolls(
     Mutex<GitLabReceipts>,
     Mutex<HashMap<PollKey, u64>>,
     std::sync::atomic::AtomicU64,
+    observation::Observer,
 );
 impl Default for SourcePolls {
     fn default() -> Self {
@@ -114,6 +119,7 @@ impl Default for SourcePolls {
             Mutex::default(),
             Mutex::default(),
             std::sync::atomic::AtomicU64::new(0),
+            observation::Observer::default(),
         )
     }
 }
@@ -204,6 +210,7 @@ impl SourcePolls {
             status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
             status.clone()
         };
+        self.observe_measurement(&status, crate::measurement::Acceptance::Accepted);
         emit(status);
     }
 
@@ -298,6 +305,10 @@ impl SourcePolls {
     async fn success_publication(&self, attempt: &Attempt) -> Option<Publication> {
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
         if self.before_mutation(attempt) {
+            self.observe_measurement(
+                &self.get(&attempt.source, attempt.list),
+                crate::measurement::Acceptance::RejectedOlder,
+            );
             return None;
         }
         let newer_success = if attempt.source.provider == crate::identity::Provider::Gitlab {
@@ -313,6 +324,12 @@ impl SourcePolls {
                 .get(&(attempt.source.clone(), attempt.list))
                 .is_some_and(|(generation, _)| *generation > attempt.generation)
         };
+        if newer_success {
+            self.observe_measurement(
+                &self.get(&attempt.source, attempt.list),
+                crate::measurement::Acceptance::RejectedOlder,
+            );
+        }
         (!newer_success).then_some(Publication {
             attempt: attempt.clone(),
             _guard: guard,
@@ -352,11 +369,23 @@ impl SourcePolls {
             }
             Err(error) => Err(error),
         };
+        let no_work = scan_state.as_ref().is_some_and(|s| s.no_work);
+        let successful = status_result.is_ok();
         let status = match (scan_state, status_result) {
             (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage),
             (_, result) => self.finish(attempt, result),
         };
         if let Some(status) = status {
+            self.observe_measurement(
+                &status,
+                if no_work {
+                    crate::measurement::Acceptance::NoWork
+                } else if successful {
+                    crate::measurement::Acceptance::Accepted
+                } else {
+                    crate::measurement::Acceptance::Unknown
+                },
+            );
             emit(status);
         }
         // The publication permit remains held through both status mutation and emission.
@@ -553,7 +582,9 @@ impl SourcePolls {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(status.source.clone(), status.list))
             .map(|(_, receipt)| receipt.mrs.clone());
+        let measurement_receipt = self.7.reference(&status);
         Update {
+            measurement_receipt,
             status,
             session: self.3.clone(),
             completed_request,
@@ -979,6 +1010,11 @@ pub(crate) async fn fetch_github_step_at(
     let (interval_secs, now) = timing();
     loaded.state.pass_delay = crate::poll::clamp_interval(interval_secs) as i64;
     if continuation && !crate::poll::queue_continuation_due(&loaded.state, now, true, true, true) {
+        crate::queue_measurement::aggregate(
+            client.measurement_recorder(),
+            crate::measurement::AggregateKind::NotIssued,
+            crate::measurement::WorkClass::Unknown,
+        );
         loaded.state.no_work = true;
         return Ok(FetchedList {
             viewer: Some(viewer),
@@ -1043,13 +1079,26 @@ pub(crate) async fn reconcile_github_at(
         .unwrap_or_else(|e| e.into_inner())
         .get(&(source.clone(), list))
         .map(|(_, receipt)| receipt.clone());
-    tauri::async_runtime::spawn_blocking(move || {
+    let (result, decision) = tauri::async_runtime::spawn_blocking(move || {
         let conn = crate::store::open_db(&path)
             .map_err(|_| inventory_failure("The saved inventory could not be read."))?;
-        reconcile_github_snapshot(&conn, &source, list, result, previous)
+        let mut decision = None;
+        let result = reconcile_github_snapshot_observed(
+            &conn,
+            &source,
+            list,
+            result,
+            previous,
+            &mut decision,
+        );
+        Ok::<_, Failure>((result, decision))
     })
     .await
-    .map_err(|_| inventory_failure("The inventory refresh could not be completed."))?
+    .map_err(|_| inventory_failure("The inventory refresh could not be completed."))??;
+    if let Some(decision) = decision {
+        polls.observe_measurement(&polls.get(&publication.attempt.source, list), decision);
+    }
+    result
 }
 
 fn inventory_failure(message: &str) -> Failure {
@@ -1063,18 +1112,30 @@ fn inventory_failure(message: &str) -> Failure {
 /// Publication preparation is shared by foreground, background and recheck.
 /// Never guess ownership from disk: an unverified response is an error, not a
 /// replacement receipt. The caller completes that failure without saving rows.
+#[cfg(test)]
 fn reconcile_github_snapshot(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    list: CachedList,
+    result: FetchedList,
+    previous: Option<FetchedList>,
+) -> Result<FetchedList, Failure> {
+    reconcile_github_snapshot_observed(conn, source, list, result, previous, &mut None)
+}
+fn reconcile_github_snapshot_observed(
     conn: &rusqlite::Connection,
     source: &Source,
     list: CachedList,
     mut result: FetchedList,
     previous: Option<FetchedList>,
+    decision: &mut Option<crate::measurement::Acceptance>,
 ) -> Result<FetchedList, Failure> {
     let owner = result
         .viewer
         .as_deref()
         .filter(|viewer| !viewer.is_empty())
         .ok_or_else(|| {
+            *decision = Some(crate::measurement::Acceptance::RejectedOwnership);
             inventory_failure(
                 "The account could not be confirmed. Showing the last known inventory.",
             )
@@ -1122,6 +1183,7 @@ fn reconcile_github_snapshot(
         let loaded = crate::queue_scan::load(conn, source, list, owner)
             .map_err(|_| inventory_failure("The queue checkpoint could not be read."))?;
         if loaded.revision != scan.expected_revision {
+            *decision = Some(crate::measurement::Acceptance::RejectedCas);
             return Err(inventory_failure(
                 "The queue changed during this step. Its newer progress was retained.",
             ));
@@ -1185,6 +1247,7 @@ fn reconcile_github_snapshot(
         })
         .map_err(|_| inventory_failure("The queue progress could not be saved."))?;
         if !committed {
+            *decision = Some(crate::measurement::Acceptance::RejectedCas);
             return Err(inventory_failure(
                 "The queue changed during this step. Its newer progress was retained.",
             ));
@@ -1780,7 +1843,10 @@ async fn record_github_effect_at(
             )
             .await;
             match saved {
-                Ok(Ok(Some(next))) => { receipt = next; facts_changed = true; }
+                Ok(Ok(Some(next))) => {
+                    crate::queue_measurement::mark(polls.7.recorder(), crate::measurement::Stage::Published, crate::measurement::Outcome::Success);
+                    receipt = next; facts_changed = true;
+                }
                 Ok(Ok(None)) => {}
                 _ => emit(Err("New pull request facts could not be saved. The detail remains available; saved lists may be older.")),
             }
@@ -1865,6 +1931,7 @@ async fn record_github_effect_at(
             status.coverage = Some(receipt.coverage);
             status.phase = Phase::Unknown;
             status.settled_generation = generation;
+            polls.observe_measurement(status, crate::measurement::Acceptance::Accepted);
             let update = polls.update(status.clone(), None);
             emit(Ok(update));
         }
@@ -2034,6 +2101,134 @@ mod tests {
             total: Some(1),
             coverage: Coverage::Complete,
         }
+    }
+
+    #[tokio::test]
+    async fn measurement_observes_real_acceptance_and_rejects_older_publication() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::new(Config {
+                directory: dir.path().canonicalize().unwrap().join("journal"),
+                epoch: [42; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let mut polls = SourcePolls::default();
+        polls.7.recorder = Some(recorder.clone());
+        let source = Source::default();
+        let old = attempt(&polls, &source, CachedList::Reviewing);
+        let current = attempt(&polls, &source, CachedList::Reviewing);
+        let mut rows = receipt(1);
+        rows.viewer = Some("PRIVATE_OWNER".into());
+        let publication = polls.success_publication(&current).await.unwrap();
+        polls.complete(publication, Ok(rows), |_| {});
+        assert!(polls.success_publication(&old).await.is_none());
+        let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+        recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("PRIVATE_OWNER"));
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|v| v.get("event").cloned())
+            .collect();
+        assert_eq!(
+            events.iter().filter(|e| e["outcome"] == "accepted").count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["outcome"] == "rejected_older")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_receipt_follows_rows_no_work_and_owner_retirement() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::new(Config {
+                directory: dir.path().canonicalize().unwrap().join("journal"),
+                epoch: [46; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let mut polls = SourcePolls::default();
+        polls.7.recorder = Some(recorder.clone());
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let first = attempt(&polls, &source, list);
+        let mut rows = receipt(1);
+        rows.viewer = Some("owner-A".into());
+        polls.complete(
+            polls.success_publication(&first).await.unwrap(),
+            Ok(rows.clone()),
+            |_| {},
+        );
+        let reference = polls
+            .snapshot(&source, list)
+            .await
+            .measurement_receipt
+            .unwrap();
+        let next = attempt(&polls, &source, list);
+        assert_eq!(
+            polls.snapshot(&source, list).await.measurement_receipt,
+            Some(reference.clone())
+        );
+        rows.scan = Some(crate::queue_scan::Commit {
+            expected_revision: 0,
+            state: crate::queue_scan::State {
+                no_work: true,
+                ..Default::default()
+            },
+            removals: vec![],
+        });
+        polls.complete(
+            polls.success_publication(&next).await.unwrap(),
+            Ok(rows),
+            |_| {},
+        );
+        assert_eq!(
+            polls.snapshot(&source, list).await.measurement_receipt,
+            Some(reference.clone())
+        );
+        let next = attempt(&polls, &source, list);
+        let mut rows = receipt(2);
+        rows.viewer = Some("owner-B".into());
+        polls.complete(
+            polls.success_publication(&next).await.unwrap(),
+            Ok(rows),
+            |_| {},
+        );
+        assert!(!recorder.is_live_receipt(&reference));
+        assert_ne!(
+            polls.snapshot(&source, list).await.measurement_receipt,
+            Some(reference)
+        );
+        recorder.set_enabled(false);
+        assert!(polls
+            .snapshot(&source, list)
+            .await
+            .measurement_receipt
+            .is_none());
+        recorder.set_enabled(true);
+        assert!(polls
+            .snapshot(&source, list)
+            .await
+            .measurement_receipt
+            .is_none());
     }
 
     #[tokio::test]

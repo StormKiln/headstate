@@ -1,7 +1,8 @@
 # Measurement foundation API (schema 1)
 
-This is the desktop foundation, not proof that any product domain is instrumented.
-Task 6 adds real producers, the analyzer and independent phone-local adapters.
+The foundation now includes Task 6A desktop To Review producers described below.
+Stats, StopFailure, transcript, the analyzer and independent phone-local adapters remain
+separate subsequent slices.
 A successful export is not a performance or convergence pass.
 
 ## Construction and ownership
@@ -60,8 +61,8 @@ handle where a receipt/scope reference is required. Foreign phone references rem
 unlinked; phone-local producers must omit them rather than forging local ownership.
 Missing readings remain null/absent. MountedReview separates inventory, Ready eligible,
 visible, membership-retained, retained-readiness, readiness-unknown, actual Last-known
-and optional-advisory counts, plus actual footer location/state. Its production
-predicates and bounded count traversal remain Task 6 work.
+and optional-advisory counts, plus actual footer location/state. Task 6A wires its production
+predicates and bounded count traversal as described below.
 
 ## Bounds and loss
 
@@ -131,3 +132,41 @@ A complete file can still have incomplete observation coverage. The analyzer mus
 exact lineage across loss, malformed/truncated records, unsupported schemas or mismatched
 header/trailer/count. No cross-device monotonic subtraction; epoch changes are explicit
 restart discontinuities. No journal bytes or destination path pass through JavaScript.
+
+## Task 6A production observations
+
+Native queue observations are explicitly scoped to GitHub; GitLab native queue state is
+not measured. `QueueReceipt.receipt` is optional and distinct from `operation`; the core
+validates its receipt kind, current capture, liveness and matching owner. SourcePolls
+creates a reference only at an accepted row publication, retains it across status-only
+updates, and retires it when rows or ownership change. The optional wire field is
+`measurement_receipt`. Cached seed, replay without a live reference, and local row patches
+remain unlinked. The frontend carries the reference with the accepted source rows, never
+with an independently cached row array solely because its status revision advanced.
+
+`Operation.operation_class` is optional `detail` or `action`. Actual awaited command
+scopes emit start/completion and retire their handle, including cancellation and early
+errors. Completed success means the command returned successfully. Action acknowledgment
+is success only for an actual confirmed effect; successful but unconfirmed outcomes are
+unknown. Published marks an accepted fact transaction. Awaited list publications inherit
+the task-local operation; spawned work does not, and later background scans are unlinked.
+No rejected attempt identity is inferred from the current receipt recorded at rejection.
+
+`Domain::ReadTransport` contains shared account-client read transport aggregates, which
+may include supporting or Stats reads. They are not a To Review-only population.
+Admitted/refused and logical canceled/completed reads use existing decisions; completed
+is not a claim of provider success. Advisory and live demand whose priority can change
+are classified unknown. Queue aggregates separately observe existing cache reuse,
+coalescing, not-issued and normal continuation/hidden/no-work decisions. No new demand,
+request, database scan or timer is introduced. Legacy five-domain loss arrays remain
+readable; the new sixth entry is shared read transport.
+
+The opt-in desktop Ready panel records selected/all inventory, eligible and visible
+lengths plus one pure traversal of at most 4096 selected rows for membership retention,
+readiness retention/unknown and its actual Last known predicates. Above the cap those
+row qualifiers are absent. Optional advisory count remains absent. The displayed desktop
+footer branch is bound to the same source frame before an observation is sent. This is a
+React commit observation, not a paint or user-perceived latency measurement. GitLab-only,
+main-list rows and the phone ConnectionBanner are not measured by this slice; a hidden
+desktop footer is explicitly hidden. Phone capture remains off/unimplemented until 6C.
+Recording failure, stale references and budget loss cannot change product success.

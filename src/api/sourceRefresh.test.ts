@@ -164,3 +164,28 @@ it("preserves original provider time through local publications, status and cach
   state.accept(update(4, null, { last_received_at: "2026-10-04T12:00:00Z" }));
   expect(state.snapshot().lastReceivedAt).toBe("2026-10-04T12:00:00Z");
 });
+
+
+describe("accepted measurement receipt lineage", () => {
+  it("keeps the accepted row token through status/old replies and clears unproven patches", () => {
+    const state = new SourceRefreshState();
+    const token = { epoch: "a".repeat(32), capture: 1, id: 2 };
+    state.accept({ ...update(4), measurement_receipt: token });
+    expect(state.snapshot()).toHaveProperty("measurementReceipt", token);
+    state.accept({ ...update(5), phase: "fetching", receipt_revision: 4, prs: null });
+    state.accept({ ...update(3), measurement_receipt: { ...token, id: 1 } });
+    expect(state.snapshot()).toHaveProperty("measurementReceipt", token);
+    state.patchRows(prs => [...prs]);
+    expect(state.snapshot()).toHaveProperty("measurementReceipt", undefined);
+    state.accept({ ...update(6), measurement_receipt: token });
+    state.retire();
+    expect(state.snapshot().measurementReceipt).toBeUndefined();
+  });
+  it("does not carry an old owner/session token into unlinked new rows", () => {
+    const state = new SourceRefreshState();
+    state.accept({ ...update(1), measurement_receipt: { epoch: "a".repeat(32), capture: 1, id: 2 } });
+    state.accept({ ...update(1), session: "replacement", prs: rows(2) });
+    expect(state.snapshot().measurementReceipt).toBeUndefined();
+    expect(state.snapshot().prs).toEqual(rows(2));
+  });
+});
