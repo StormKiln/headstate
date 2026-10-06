@@ -78,6 +78,11 @@ budget defers emission. A summary is attempted on a subsequent aggregate update 
 60 seconds; no new product polling timer is introduced. Still-deferred totals are
 included as bounded header metadata at export, explicitly not timestamped exact events.
 Re-enabling another capture clears old pending totals with an explicit dropped count.
+A bounded durable marker records whether deferred totals remain unpersisted. If the
+process restarts, `deferred_aggregate_gaps` reports that omission and marks coverage
+incomplete; it does not invent the number of lost events. Same-process disabled exports
+still contain their actual deferred totals. In-flight summaries retain their aggregate
+slot; admission and total subtraction are atomic with export snapshots.
 Dedup/coalescing is disclosed separately from dropped/invalid data.
 
 Writer flushes every 5 seconds or 128 records and on control barriers. This is not a
@@ -92,7 +97,11 @@ Eight 16 MiB segments retain at most 128 MiB; one replacement temporarily permit
 engineering cap, not a guaranteed number of days. Actual retained interval, rotation
 and loss are visible. The reader bounds each line, rejects unknown versions/fields or
 invalid references and omits malformed/truncated records with explicit accounting.
-Files use create-new staging, symlink refusal and 0600 permissions where supported.
+Restart reconciliation compares surviving files with prior durable segment metadata.
+Missing/shortened durable data increments `durable_gap_segments`, known missing
+`durable_gap_records` and `durable_gap_bytes`, and makes coverage incomplete. Extra
+flushed records beyond the manifest remain usable; recorded rotation is not counted
+again as an unexplained gap. Files use create-new staging, symlink refusal and 0600 permissions where supported.
 An unclosed capture found after restart is explicitly qualified as an unknown tail
 (`unclean_capture`), not an invented number of lost records. Writer failure latches unavailable; there is no retry spin or operation failure coupling.
 

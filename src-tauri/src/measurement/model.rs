@@ -344,6 +344,10 @@ pub struct Loss {
     pub writer: u64,
     pub malformed: u64,
     pub unclean_capture: u64,
+    pub durable_gap_records: u64,
+    pub durable_gap_bytes: u64,
+    pub durable_gap_segments: u64,
+    pub deferred_aggregate_gaps: u64,
     pub rotated_out: u64,
     pub rotated_bytes: u64,
     pub by_domain: [u64; 5],
@@ -359,6 +363,8 @@ impl Loss {
             || self.writer > 0
             || self.malformed > 0
             || self.unclean_capture > 0
+            || self.durable_gap_segments > 0
+            || self.deferred_aggregate_gaps > 0
             || self.rotated_out > 0
     }
 }

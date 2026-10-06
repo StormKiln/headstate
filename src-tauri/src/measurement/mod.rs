@@ -5,7 +5,7 @@ pub mod model;
 mod writer;
 pub use model::*;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -97,6 +97,12 @@ enum HandleKind {
     Operation,
     Receipt,
 }
+struct Prepared {
+    event: Event,
+    fingerprint: Vec<u8>,
+    mono: u64,
+    wall: u64,
+}
 struct State {
     capture: u64,
     active: bool,
@@ -112,6 +118,7 @@ struct State {
     failures: usize,
     routine: usize,
     aggregates: HashMap<AggregateKey, (u64, u64)>,
+    aggregate_inflight: HashSet<AggregateKey>,
     last_clock: (u64, u64),
 }
 impl State {
@@ -131,6 +138,7 @@ impl State {
             failures: 0,
             routine: 0,
             aggregates: HashMap::new(),
+            aggregate_inflight: HashSet::new(),
             last_clock: (0, 0),
         }
     }
@@ -143,6 +151,7 @@ struct Shared {
     status: Mutex<JournalStatus>,
     loss: Mutex<Loss>,
     lifecycle: Mutex<Lifecycle>,
+    deferred_pending: AtomicBool,
 }
 pub struct Recorder {
     config: Config,
@@ -181,6 +190,7 @@ impl Recorder {
             status: Mutex::new(JournalStatus::default()),
             loss: Mutex::new(Loss::default()),
             lifecycle: Mutex::new(Lifecycle::default()),
+            deferred_pending: AtomicBool::new(false),
         });
         let (data, receiver) = mpsc::sync_channel(caps.data);
         let (control, controls) = mpsc::sync_channel(caps.control);
@@ -220,6 +230,8 @@ impl Recorder {
             // Unflushed aggregates cannot leak into another capture.
             self.shared.loss.lock().unwrap().dropped += s.aggregates.len() as u64;
             s.aggregates.clear();
+            s.aggregate_inflight.clear();
+            self.shared.deferred_pending.store(false, Ordering::Release);
             s.transitions = 0;
             s.failures = 0;
             s.routine = 0;
@@ -422,8 +434,15 @@ impl Recorder {
         self.record_for(event, None)
     }
     fn record_for(&self, event: Event, expected_capture: Option<u64>) -> bool {
-        if !self.enabled() {
+        let Some(prepared) = self.prepare(event) else {
             return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        self.admit(&mut state, prepared, expected_capture)
+    }
+    fn prepare(&self, event: Event) -> Option<Prepared> {
+        if !self.enabled() {
+            return None;
         }
         let (mono, wall) = self.clock.now();
         // Serialize outside the admission lock; conservative maximum envelope
@@ -441,10 +460,24 @@ impl Recorder {
         let encoded = serde_json::to_vec(&preview).unwrap_or_default();
         if encoded.len() + 1 > MAX_RECORD {
             self.refuse(event.domain(), true);
-            return false;
+            return None;
         }
         let fingerprint = serde_json::to_vec(&event).unwrap_or_default();
-        let mut s = self.state.lock().unwrap();
+        Some(Prepared {
+            event,
+            fingerprint,
+            mono,
+            wall,
+        })
+    }
+    fn admit(&self, s: &mut State, prepared: Prepared, expected_capture: Option<u64>) -> bool {
+        let Prepared {
+            event,
+            fingerprint,
+            mono,
+            wall,
+        } = prepared;
+        let domain = event.domain();
         if !self.enabled() {
             return false;
         }
@@ -452,7 +485,7 @@ impl Recorder {
             self.shared.loss.lock().unwrap().dropped += 1;
             return false;
         }
-        if !self.typed_handles(&s, &event) || event.handles().iter().any(|h| !self.valid(&s, h)) {
+        if !self.typed_handles(s, &event) || event.handles().iter().any(|h| !self.valid(s, h)) {
             self.shared.loss.lock().unwrap().stale_handle += 1;
             return false;
         }
@@ -502,7 +535,7 @@ impl Recorder {
                 true
             }
             Err(_) => {
-                self.refuse(preview.event.domain(), false);
+                self.refuse(domain, false);
                 false
             }
         }
@@ -517,6 +550,9 @@ impl Recorder {
         l.by_domain[domain as usize] += 1;
     }
     pub fn aggregate(&self, delta: AggregateDelta) {
+        self.aggregate_with(delta, || {})
+    }
+    fn aggregate_with(&self, delta: AggregateDelta, after_prepare: impl FnOnce()) {
         if !self.enabled() {
             return;
         }
@@ -536,30 +572,44 @@ impl Recorder {
         if old.checked_add(delta.count).is_none() {
             self.shared.loss.lock().unwrap().overflow += 1
         }
-        if now.saturating_sub(start) < 60000 {
+        self.shared.deferred_pending.store(true, Ordering::Release);
+        if now.saturating_sub(start) < 60000 || s.aggregate_inflight.contains(&key) {
             return;
         }
         let capture = s.capture;
-        let (count, start) = s.aggregates.remove(&key).unwrap();
+        let (count, start) = s.aggregates[&key];
+        // Keep the slot and total reserved while serialization runs outside the
+        // lock. Concurrent updates merge here and cannot dispatch this key twice.
+        s.aggregate_inflight.insert(key);
         drop(s);
-        if !self.record_for(
-            Event::Aggregate {
-                domain: delta.domain,
-                metric: delta.metric,
-                work: delta.work,
-                count,
-                interval_ms: now.saturating_sub(start),
-                coalesced: true,
-            },
-            Some(capture),
-        ) {
-            let mut s = self.state.lock().unwrap();
-            if self.enabled() && s.capture == capture {
-                let entry = s.aggregates.entry(key).or_insert((0, start));
-                entry.0 = entry.0.saturating_add(count);
-                entry.1 = entry.1.min(start);
+        after_prepare();
+        let prepared = self.prepare(Event::Aggregate {
+            domain: delta.domain,
+            metric: delta.metric,
+            work: delta.work,
+            count,
+            interval_ms: now.saturating_sub(start),
+            coalesced: true,
+        });
+        let mut s = self.state.lock().unwrap();
+        if s.capture == capture {
+            let accepted = prepared.is_some_and(|event| self.admit(&mut s, event, Some(capture)));
+            s.aggregate_inflight.remove(&key);
+            if accepted {
+                let entry = s.aggregates.get_mut(&key).expect("reserved aggregate slot");
+                entry.0 = entry.0.saturating_sub(count);
+                entry.1 = now;
+                if entry.0 == 0 {
+                    s.aggregates.remove(&key);
+                }
             }
+            // Admission and subtraction are atomic with export snapshots: a
+            // count cannot appear in both an accepted record and deferred totals.
+            self.shared
+                .deferred_pending
+                .store(!s.aggregates.is_empty(), Ordering::Release);
         }
+        drop(s);
         self.shared.loss.lock().unwrap().coalesced += 1;
     }
     /// Checked narrowing for measured populations. Overflow is unavailable,

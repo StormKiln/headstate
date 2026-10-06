@@ -564,3 +564,255 @@ async fn restart_of_unclosed_capture_marks_unknown_tail_instead_of_inventing_zer
     assert_eq!(restarted.status().loss.unclean_capture, 1);
     assert!(restarted.export_to(path).await.unwrap().incomplete);
 }
+
+async fn closed_two_records() -> (tempfile::TempDir, Config, PathBuf) {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("PRIVATE_FIX_OWNER")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    assert!(Recorder::record(&r, event(&owner, 2)));
+    r.set_enabled(false);
+    let report = dir.path().canonicalize().unwrap().join("report");
+    assert_eq!(r.export_to(report).await.unwrap().records, 2);
+    let config = r.config.clone();
+    drop(r);
+    let segment = writer::segment_path(&config.directory, 0);
+    (dir, config, segment)
+}
+#[tokio::test]
+async fn fix1_closed_valid_line_truncation_is_an_explicit_durable_gap() {
+    let (dir, config, segment) = closed_two_records().await;
+    let bytes = std::fs::read(&segment).unwrap();
+    let first = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    std::fs::write(segment, &bytes[..first]).unwrap();
+    let r = Recorder::new(config).unwrap();
+    let result = r
+        .export_to(dir.path().canonicalize().unwrap().join("after"))
+        .await
+        .unwrap();
+    assert_eq!(result.records, 1);
+    assert_eq!(r.status().loss.durable_gap_records, 1);
+    assert_eq!(
+        r.status().loss.durable_gap_bytes,
+        (bytes.len() - first) as u64
+    );
+    assert_eq!(r.status().loss.durable_gap_segments, 1);
+    assert!(
+        result.incomplete,
+        "a shortened closed journal must not claim complete coverage"
+    );
+}
+#[tokio::test]
+async fn fix1_missing_closed_segment_is_an_explicit_durable_gap() {
+    let (dir, config, segment) = closed_two_records().await;
+    std::fs::remove_file(segment).unwrap();
+    let r = Recorder::new(config).unwrap();
+    let result = r
+        .export_to(dir.path().canonicalize().unwrap().join("after"))
+        .await
+        .unwrap();
+    assert_eq!(result.records, 0);
+    assert_eq!(r.status().loss.durable_gap_records, 2);
+    assert_eq!(r.status().loss.durable_gap_segments, 1);
+    assert!(
+        result.incomplete,
+        "missing durable rows must not look like a measured zero"
+    );
+}
+#[tokio::test]
+async fn fix1_clean_disabled_restart_preserves_deferred_totals_or_durable_omission() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    assert!(r.intern(Key::Owner("PRIVATE_DEFERRED_OWNER")).is_some());
+    for _ in 0..2000 {
+        r.aggregate(AggregateDelta {
+            domain: Domain::Queue,
+            metric: AggregateKind::NoWork,
+            work: WorkClass::Background,
+            count: 1,
+        });
+    }
+    r.set_enabled(false);
+    let path = dir.path().canonicalize().unwrap().join("before");
+    r.export_to(path.clone()).await.unwrap();
+    let before = std::fs::read_to_string(path).unwrap();
+    assert!(before.contains("\"count\":2000"));
+    let config = r.config.clone();
+    drop(r);
+    let r = Recorder::new(config.clone()).unwrap();
+    let path = dir.path().canonicalize().unwrap().join("after");
+    let result = r.export_to(path.clone()).await.unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+    assert!(
+        after.contains("\"count\":2000") || result.incomplete,
+        "clean disabled restart cannot silently erase deferred totals"
+    );
+    assert!(!after.contains("PRIVATE"));
+    assert_eq!(r.status().loss.deferred_aggregate_gaps, 1);
+    assert_eq!(result.records, 0);
+    assert!(result.incomplete);
+    drop(r);
+    for entry in std::fs::read_dir(&config.directory).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_DEFERRED_OWNER"));
+    }
+    let r = Recorder::new(config).unwrap();
+    r.export_to(dir.path().canonicalize().unwrap().join("again"))
+        .await
+        .unwrap();
+    assert_eq!(r.status().loss.deferred_aggregate_gaps, 1);
+}
+#[test]
+fn fix1_inflight_aggregate_reserves_its_slot_during_refusal_and_merges_concurrent_delta() {
+    let (_dir, r, clock) = fixture(Caps {
+        aggregates: 1,
+        routine_per_minute: 0,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let delta = AggregateDelta {
+        domain: Domain::Queue,
+        metric: AggregateKind::NoWork,
+        work: WorkClass::Background,
+        count: 2,
+    };
+    r.aggregate(delta);
+    clock.0.store(60001, Ordering::Relaxed);
+    let (entered, wait) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let r = &r;
+        scope.spawn(move || {
+            r.aggregate_with(AggregateDelta { count: 3, ..delta }, || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            })
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        r.aggregate(AggregateDelta {
+            metric: AggregateKind::Candidates,
+            count: 1,
+            ..delta
+        });
+        r.aggregate(AggregateDelta { count: 4, ..delta });
+        release.send(()).unwrap();
+    });
+    let state = r.state.lock().unwrap();
+    assert_eq!(
+        state.aggregates.len(),
+        1,
+        "an in-flight refusal must not restore beyond the declared cap"
+    );
+    assert_eq!(
+        state.aggregates[&(Domain::Queue, AggregateKind::NoWork, WorkClass::Background)].0,
+        9
+    );
+    assert_eq!(
+        state.aggregates[&(Domain::Queue, AggregateKind::NoWork, WorkClass::Background)].1,
+        1
+    );
+}
+#[tokio::test]
+async fn fix1_extra_flushed_records_beyond_manifest_are_retained_without_false_gap() {
+    use std::io::Write;
+    let (dir, config, segment) = closed_two_records().await;
+    let content = std::fs::read_to_string(&segment).unwrap();
+    let mut extra: serde_json::Value =
+        serde_json::from_str(content.lines().last().unwrap()).unwrap();
+    extra["seq"] = 3.into();
+    extra["event"]["revision"] = 3.into();
+    extra["event"]["receipt_revision"] = 3.into();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(segment)
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(&extra).unwrap()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let r = Recorder::new(config).unwrap();
+    let result = r
+        .export_to(dir.path().canonicalize().unwrap().join("after"))
+        .await
+        .unwrap();
+    assert_eq!(result.records, 3);
+    assert!(!result.incomplete);
+    assert_eq!(r.status().loss.durable_gap_records, 0);
+}
+#[tokio::test]
+async fn fix1_recorded_rotation_and_repeated_restart_do_not_double_count_gaps() {
+    let (dir, r, _) = fixture(Caps {
+        segments: 2,
+        segment_bytes: 1024,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    for n in 0..8 {
+        assert!(Recorder::record(&r, event(&owner, n)));
+    }
+    r.set_enabled(false);
+    let path = dir.path().canonicalize().unwrap().join("report");
+    r.export_to(path.clone()).await.unwrap();
+    let loss = r.status().loss;
+    let config = r.config.clone();
+    drop(r);
+    let r = Recorder::new(config.clone()).unwrap();
+    r.export_to(path.clone()).await.unwrap();
+    assert_eq!(r.status().loss.durable_gap_segments, 0);
+    assert_eq!(r.status().loss.rotated_out, loss.rotated_out);
+    drop(r);
+    let r = Recorder::new(config).unwrap();
+    r.export_to(path).await.unwrap();
+    assert_eq!(r.status().loss.durable_gap_segments, 0);
+    assert_eq!(r.status().loss.rotated_out, loss.rotated_out);
+}
+#[tokio::test]
+async fn fix1_concurrent_success_keeps_only_new_delta_deferred_and_reuses_completed_slot() {
+    let (dir, r, clock) = fixture(Caps {
+        aggregates: 1,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let delta = AggregateDelta {
+        domain: Domain::Queue,
+        metric: AggregateKind::Candidates,
+        work: WorkClass::Background,
+        count: 2,
+    };
+    r.aggregate(delta);
+    clock.0.store(60001, Ordering::Relaxed);
+    let (entered, wait) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let r = &r;
+        scope.spawn(move || {
+            r.aggregate_with(AggregateDelta { count: 3, ..delta }, || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            })
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        r.aggregate(AggregateDelta { count: 4, ..delta });
+        release.send(()).unwrap();
+    });
+    let path = dir.path().canonicalize().unwrap().join("report");
+    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 1);
+    let text = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["deferred"][0]["count"], 4);
+    assert_eq!(lines[1]["event"]["count"], 5);
+    assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
+    clock.0.store(120001, Ordering::Relaxed);
+    r.aggregate(AggregateDelta { count: 0, ..delta });
+    assert!(r.state.lock().unwrap().aggregates.is_empty());
+    r.aggregate(AggregateDelta {
+        metric: AggregateKind::NoWork,
+        ..delta
+    });
+    assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
+}

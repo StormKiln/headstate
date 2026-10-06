@@ -21,6 +21,7 @@ export type ClientMeasurement = {
 export interface MeasurementLoss {
   dropped: number; invalid: number; cardinality: number; stale_handle: number; budget: number;
   coalesced: number; clock_anomaly: number; overflow: number; writer: number; malformed: number; unclean_capture: number;
+  durable_gap_records: number; durable_gap_bytes: number; durable_gap_segments: number; deferred_aggregate_gaps: number;
   rotated_out: number; rotated_bytes: number; by_domain: number[];
 }
 export interface MeasurementStatus {

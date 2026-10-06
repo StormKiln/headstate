@@ -46,6 +46,8 @@ struct Manifest {
     segments: Vec<Segment>,
     loss: Loss,
     lifecycle: Lifecycle,
+    #[serde(default)]
+    deferred_pending: bool,
 }
 pub(super) struct Writer {
     pub config: Config,
@@ -107,6 +109,10 @@ impl Writer {
                 return Err(ExportError::Unavailable);
             }
         }
+        if manifest.deferred_pending {
+            manifest.loss.deferred_aggregate_gaps =
+                manifest.loss.deferred_aggregate_gaps.saturating_add(1);
+        }
         if manifest.lifecycle.active_capture.is_some() {
             manifest.loss.unclean_capture = manifest.loss.unclean_capture.saturating_add(1);
         }
@@ -141,7 +147,7 @@ impl Writer {
             .iter()
             .map(|s| (s.number, s.malformed))
             .collect();
-        manifest.segments.clear();
+        let previous = std::mem::take(&mut manifest.segments);
         for n in numbers {
             let path = segment_path(&config.directory, n);
             if fs::metadata(&path)
@@ -198,6 +204,19 @@ impl Writer {
                 .map_err(|_| ExportError::Unavailable)?
                 .len();
             manifest.segments.push(seg);
+        }
+        for old in previous {
+            let current = manifest.segments.iter().find(|s| s.number == old.number);
+            let records = old.records.saturating_sub(current.map_or(0, |s| s.records));
+            let bytes = old.bytes.saturating_sub(current.map_or(0, |s| s.bytes));
+            if current.is_none() || records > 0 || bytes > 0 {
+                manifest.loss.durable_gap_segments =
+                    manifest.loss.durable_gap_segments.saturating_add(1);
+                manifest.loss.durable_gap_records =
+                    manifest.loss.durable_gap_records.saturating_add(records);
+                manifest.loss.durable_gap_bytes =
+                    manifest.loss.durable_gap_bytes.saturating_add(bytes);
+            }
         }
         *shared.loss.lock().unwrap() = manifest.loss;
         let mut writer = Self {
@@ -290,6 +309,7 @@ impl Writer {
             segments: self.segments.clone(),
             loss: self.shared.loss.lock().unwrap().clone(),
             lifecycle: self.shared.lifecycle.lock().unwrap().clone(),
+            deferred_pending: self.shared.deferred_pending.load(Ordering::Acquire),
         };
         let data = serde_json::to_vec(&manifest)?;
         if data.len() >= 65536 {
