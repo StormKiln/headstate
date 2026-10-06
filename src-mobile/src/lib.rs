@@ -36,6 +36,7 @@
 //! of connection state is also emitted as the `connection-state` event
 //! with the same object `connection_state` returns.
 
+// Platform-neutral core only; phone preference/share adapters land separately.
 pub mod background;
 mod client;
 mod companion;
@@ -43,6 +44,8 @@ mod connection;
 pub mod discovery;
 mod events;
 mod keys;
+#[path = "../../src-tauri/src/measurement/mod.rs"]
+pub mod measurement;
 /// The constants this crate shares with the desktop, asserted against the
 /// desktop's own source (#854). Test-only.
 #[cfg(test)]

@@ -1,0 +1,566 @@
+use super::*;
+use std::future::Future;
+use std::sync::atomic::AtomicU64;
+struct TestClock(AtomicU64, AtomicU64);
+impl Clock for TestClock {
+    fn now(&self) -> (u64, u64) {
+        (
+            self.0.load(Ordering::Relaxed),
+            self.1.load(Ordering::Relaxed),
+        )
+    }
+}
+fn fixture(caps: Caps) -> (tempfile::TempDir, Recorder, Arc<TestClock>) {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock(AtomicU64::new(1), AtomicU64::new(1000)));
+    let recorder = Recorder::with_clock(
+        Config {
+            directory: dir.path().canonicalize().unwrap().join("journal"),
+            epoch: [7; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "9.2.0-test".into(),
+        },
+        caps,
+        clock.clone(),
+    )
+    .unwrap();
+    (dir, recorder, clock)
+}
+fn event(owner: &OpaqueId, revision: u64) -> Event {
+    Event::QueueReceipt {
+        owner: owner.clone(),
+        list: List::Reviewing,
+        operation: None,
+        revision,
+        receipt_revision: Some(revision),
+        phase: Phase::Ready,
+        coverage: Coverage::Partial,
+        rows: 130,
+        receipt_age_ms: None,
+        outcome: Acceptance::Accepted,
+    }
+}
+#[test]
+fn persisted_opt_in_opens_admission_and_disable_closes_it() {
+    let (_dir, r, _) = fixture(Caps::default());
+    assert!(!r.enabled());
+    assert!(r.intern(Key::Owner("PRIVATE_OWNER")).is_none());
+    assert!(r.state.lock().unwrap().keys.is_empty());
+    r.set_enabled(true);
+    assert!(r.enabled());
+    r.set_enabled(false);
+    assert!(!r.enabled());
+}
+#[tokio::test]
+async fn private_keys_never_leave_memory_and_disabled_retained_export_is_complete() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let id = r
+        .intern(Key::Owner("PRIVATE_OWNER/repo#12345 secret"))
+        .unwrap();
+    assert!(Recorder::record(&r, event(&id, 1)));
+    assert!(!Recorder::record(&r, event(&id, 1)));
+    r.set_enabled(false);
+    let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+    let receipt = r.export_to(path.clone()).await.unwrap();
+    assert_eq!(receipt.records, 1);
+    assert!(!receipt.incomplete);
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("PRIVATE_OWNER"));
+    assert!(!text.contains("repo#12345"));
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["records"], 1);
+    assert_eq!(records[1]["event"]["rows"], 130);
+    assert_eq!(records[2]["complete"], true);
+    assert_eq!(r.status().durable_records, 1);
+    assert_eq!(r.status().loss.coalesced, 1);
+}
+#[test]
+fn capture_parent_retirement_and_capacity_do_not_alias_or_exhaust_operation_lifetime() {
+    let (_dir, r, _) = fixture(Caps {
+        keys: 2,
+        operations: 2,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let operation = r.next_operation(Some(&owner)).unwrap();
+    let child = r.next_operation(Some(&operation)).unwrap();
+    assert!(r.next_operation(None).is_none());
+    r.retire(&owner);
+    assert!(r.next_operation(Some(&child)).is_none());
+    assert!(!Recorder::record(&r, event(&owner, 1)));
+    for _ in 0..5000 {
+        let op = r.next_operation(None).unwrap();
+        r.retire(&op);
+    }
+    r.set_enabled(false);
+    r.set_enabled(true);
+    let new = r.intern(Key::Owner("a")).unwrap();
+    assert_ne!(owner, new);
+    assert!(!Recorder::record(&r, event(&owner, 2)));
+    assert!(Recorder::record(&r, event(&new, 2)));
+}
+#[test]
+fn interner_key_bytes_and_slots_refuse_without_reuse() {
+    let (_dir, r, _) = fixture(Caps {
+        keys: 1,
+        key_bytes: 50,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    assert!(r.intern(Key::Owner(&"p".repeat(60))).is_none());
+    let a = r.intern(Key::Owner("a")).unwrap();
+    assert_eq!(r.intern(Key::Owner("a")), Some(a));
+    assert!(r.intern(Key::Session("b")).is_none());
+    assert_eq!(r.status().loss.cardinality, 2);
+}
+#[test]
+fn quotas_are_independent_clock_regression_is_visible_and_parent_is_validated() {
+    let (_dir, r, clock) = fixture(Caps {
+        transitions_per_minute: 1,
+        failures_per_minute: 1,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let session = r.intern(Key::Session("s")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    assert!(!Recorder::record(&r, event(&owner, 2)));
+    assert!(Recorder::record(
+        &r,
+        Event::StopFailureMatch {
+            session,
+            observed_boundary: None,
+            observation: FailureObservation::IngestedHook,
+            delta_ms: None,
+            observed_lag_ms: None,
+            hook_age_ms: None,
+            outcome: MatchOutcome::Unpaired
+        }
+    ));
+    clock.0.store(60001, Ordering::Relaxed);
+    clock.1.store(900, Ordering::Relaxed);
+    assert!(Recorder::record(&r, event(&owner, 3)));
+    assert_eq!(r.status().loss.budget, 1);
+    assert_eq!(r.status().loss.clock_anomaly, 1);
+}
+#[tokio::test]
+async fn rotation_restart_and_malformed_tail_are_qualified_without_copying_private_bytes() {
+    let (dir, r, _) = fixture(Caps {
+        segments: 2,
+        segment_bytes: 1024,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    for n in 0..8 {
+        assert!(Recorder::record(&r, event(&owner, n)));
+    }
+    let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+    let result = r.export_to(path.clone()).await.unwrap();
+    assert!(result.records < 8);
+    assert!(result.incomplete);
+    assert!(r.status().rotated_out > 0);
+    let config = r.config.clone();
+    drop(r);
+    let journal = &config.directory;
+    let last = std::fs::read_dir(journal)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("segment-"))
+        .max_by_key(|e| e.file_name())
+        .unwrap()
+        .path();
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(last)
+        .unwrap()
+        .write_all(b"PRIVATE_BROKEN_TAIL")
+        .unwrap();
+    let r = Recorder::new(config).unwrap();
+    let result = r.export_to(path.clone()).await.unwrap();
+    assert!(result.incomplete);
+    assert!(!std::fs::read_to_string(path)
+        .unwrap()
+        .contains("PRIVATE_BROKEN"));
+}
+#[test]
+fn malformed_unknown_fields_and_old_optional_client_counts_remain_distinct() {
+    let old =
+        r#"{"kind":"stats_view","scope":null,"outcome":"unknown","elapsed_ms":null,"rows":null}"#;
+    let parsed: ClientMeasurement = serde_json::from_str(old).unwrap();
+    assert!(matches!(
+        parsed,
+        ClientMeasurement::StatsView { rows: None, .. }
+    ));
+    assert!(serde_json::from_str::<ClientMeasurement>(
+        &old.replace("\"rows\":null", "\"rows\":null,\"private\":\"SECRET\"")
+    )
+    .is_err());
+    assert!(serde_json::from_str::<ClientMeasurement>(
+        &old.replace("\"rows\":null", "\"rows\":-1")
+    )
+    .is_err());
+}
+#[tokio::test]
+async fn destination_refusal_preserves_original_and_writer_remains_usable() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let destination = dir.path().canonicalize().unwrap().join("folder");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("keep"), "keep").unwrap();
+    assert_eq!(
+        r.export_to(destination.clone()).await.unwrap_err(),
+        ExportError::Destination
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("keep")).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        r.export_to(dir.path().canonicalize().unwrap().join("okay"))
+            .await
+            .unwrap()
+            .records,
+        1
+    );
+}
+fn pause(r: &Recorder) -> std::sync::mpsc::Sender<()> {
+    let (entered, wait) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    r.control
+        .send(writer::Control::Pause {
+            entered,
+            release: held,
+        })
+        .unwrap();
+    wait.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    release
+}
+#[tokio::test]
+async fn saturated_writer_counts_loss_disable_is_immediate_and_refused_sequence_never_stalls_cutoff(
+) {
+    let (dir, r, _) = fixture(Caps {
+        data: 1,
+        control: 1,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let release = pause(&r);
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    assert!(!Recorder::record(&r, event(&owner, 2)));
+    r.set_enabled(false);
+    assert!(!r.enabled());
+    assert!(!Recorder::record(&r, event(&owner, 3)));
+    r.set_enabled(true);
+    assert!(!Recorder::record(&r, event(&owner, 4)));
+    release.send(()).unwrap();
+    let path = dir.path().canonicalize().unwrap().join("report");
+    let mut result = r.export_to(path.clone()).await;
+    for _ in 0..5 {
+        if !matches!(result, Err(ExportError::Busy)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        result = r.export_to(path.clone()).await;
+    }
+    let result = result.unwrap();
+    assert_eq!(result.records, 1);
+    assert!(result.incomplete);
+    assert_eq!(r.status().durable_seq, 1);
+}
+#[tokio::test]
+async fn export_freezes_cutoff_and_loss_even_when_later_producers_overflow() {
+    let (dir, r, _) = fixture(Caps {
+        data: 1,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let release = pause(&r);
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let path = dir.path().canonicalize().unwrap().join("report");
+    let export = r.export_to(path.clone());
+    tokio::pin!(export);
+    assert!(matches!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
+        std::task::Poll::Pending
+    ));
+    assert!(!Recorder::record(&r, event(&owner, 2)));
+    release.send(()).unwrap();
+    let result = export.await.unwrap();
+    assert_eq!(result.records, 1);
+    assert!(
+        !result.incomplete,
+        "post-cutoff loss belongs to a later report"
+    );
+    assert_eq!(r.status().loss.dropped, 1);
+}
+#[tokio::test]
+async fn writer_failure_is_latched_without_affecting_producer_caller() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let release = pause(&r);
+    std::fs::create_dir(r.config.directory.join("segment-0.jsonl")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    release.send(()).unwrap();
+    assert_eq!(
+        r.export_to(dir.path().canonicalize().unwrap().join("report"))
+            .await
+            .unwrap_err(),
+        ExportError::Unavailable
+    );
+    assert_eq!(r.status().writer_state, WriterState::Unavailable);
+    assert!(!Recorder::record(&r, event(&owner, 2)));
+}
+#[tokio::test]
+async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let scope = r
+        .intern(Key::StatsScope {
+            owner: "a",
+            scope: "PRIVATE_SCOPE",
+            from_day: 1,
+            to_day: 7,
+        })
+        .unwrap();
+    let operation = r.next_operation(Some(&owner)).unwrap();
+    let receipt = r.receipt_reference(&owner).unwrap();
+    assert!(!Recorder::record(
+        &r,
+        Event::Client {
+            observation: ClientMeasurement::StatsView {
+                scope: Some(owner.clone()),
+                outcome: StatsOutcome::Accepted,
+                elapsed_ms: None,
+                rows: Some(0)
+            }
+        }
+    ));
+    assert!(Recorder::record(
+        &r,
+        Event::Client {
+            observation: ClientMeasurement::StatsView {
+                scope: Some(scope.clone()),
+                outcome: StatsOutcome::Accepted,
+                elapsed_ms: None,
+                rows: Some(0)
+            }
+        }
+    ));
+    r.retire(&owner);
+    assert!(!Recorder::record(
+        &r,
+        Event::Operation {
+            operation,
+            parent: Some(owner),
+            domain: Domain::Queue,
+            stage: Stage::Completed,
+            outcome: Outcome::Success,
+            elapsed_ms: None,
+            affected_fields: 0
+        }
+    ));
+    assert!(r.next_operation(Some(&receipt)).is_none());
+    assert!(!Recorder::record(
+        &r,
+        Event::Client {
+            observation: ClientMeasurement::StatsView {
+                scope: Some(scope),
+                outcome: StatsOutcome::Accepted,
+                elapsed_ms: None,
+                rows: None
+            }
+        }
+    ));
+    let saved = r
+        .export_to(dir.path().canonicalize().unwrap().join("report"))
+        .await
+        .unwrap();
+    assert_eq!(saved.records, 1);
+    assert!(saved.incomplete);
+}
+#[tokio::test]
+async fn routine_budget_retains_deferred_totals_and_separate_failure_budget() {
+    let (dir, r, clock) = fixture(Caps {
+        routine_per_minute: 1,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    for metric in [AggregateKind::Read, AggregateKind::CacheReuse] {
+        r.aggregate(AggregateDelta {
+            domain: Domain::Transcript,
+            metric,
+            work: WorkClass::Foreground,
+            count: 2,
+        });
+    }
+    clock.0.store(60001, Ordering::Relaxed);
+    for metric in [AggregateKind::Read, AggregateKind::CacheReuse] {
+        r.aggregate(AggregateDelta {
+            domain: Domain::Transcript,
+            metric,
+            work: WorkClass::Foreground,
+            count: 3,
+        });
+    }
+    assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
+    clock.0.store(120001, Ordering::Relaxed);
+    r.aggregate(AggregateDelta {
+        domain: Domain::Transcript,
+        metric: AggregateKind::CacheReuse,
+        work: WorkClass::Foreground,
+        count: 4,
+    });
+    let path = dir.path().canonicalize().unwrap().join("report");
+    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 2);
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("\"count\":9"));
+}
+#[test]
+fn client_batch_cap_counts_refusal_but_opt_out_retains_nothing() {
+    let (_dir, r, _) = fixture(Caps::default());
+    let event = ClientMeasurement::StatsView {
+        scope: None,
+        outcome: StatsOutcome::Unknown,
+        elapsed_ms: None,
+        rows: None,
+    };
+    assert!(r.client_events(vec![event.clone(); 33]).is_ok());
+    assert_eq!(r.status().invalid, 0);
+    r.set_enabled(true);
+    assert!(r.client_events(vec![event; 33]).is_err());
+    assert_eq!(r.status().invalid, 1);
+}
+#[cfg(unix)]
+#[test]
+fn journal_and_export_symlinks_are_refused() {
+    use std::os::unix::fs::symlink;
+    let (dir, r, _) = fixture(Caps::default());
+    let config = r.config.clone();
+    drop(r);
+    let link = dir.path().canonicalize().unwrap().join("link");
+    symlink(&config.directory, &link).unwrap();
+    assert!(Recorder::new(Config {
+        directory: link,
+        ..config
+    })
+    .is_err());
+}
+#[tokio::test]
+async fn bounded_barrier_timeout_and_busy_never_publish_a_canceled_destination() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let release = pause(&r);
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let path = dir.path().canonicalize().unwrap().join("report");
+    {
+        let first = r.export_to(path.clone());
+        tokio::pin!(first);
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            r.export_to(dir.path().canonicalize().unwrap().join("second"))
+                .await
+                .unwrap_err(),
+            ExportError::Busy
+        );
+        assert_eq!(first.await.unwrap_err(), ExportError::Timeout);
+    }
+    assert!(!path.exists());
+    release.send(()).unwrap();
+    drop(r);
+    assert!(!path.exists());
+}
+#[tokio::test]
+async fn lifecycle_and_deferred_counts_survive_disabled_export_without_claiming_exact_events() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    for _ in 0..2000 {
+        r.aggregate(AggregateDelta {
+            domain: Domain::Queue,
+            metric: AggregateKind::NoWork,
+            work: WorkClass::Background,
+            count: 1,
+        });
+    }
+    assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
+    r.set_enabled(false);
+    let path = dir.path().canonicalize().unwrap().join("report");
+    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 0);
+    let text = std::fs::read_to_string(path).unwrap();
+    let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(header["deferred"][0]["count"], 2000);
+    assert_eq!(header["lifecycle"]["captures_closed"], 1);
+    assert_eq!(
+        header["lifecycle"]["active_capture"],
+        serde_json::Value::Null
+    );
+    assert_eq!(r.measured_count(u64::MAX), None);
+}
+#[tokio::test]
+async fn queued_flush_controls_cannot_write_post_export_cutoff_records_into_snapshot() {
+    let (dir, r, _) = fixture(Caps {
+        data: 2,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    let release = pause(&r);
+    r.control
+        .send(writer::Control::Flush { cutoff: 0 })
+        .unwrap();
+    r.control
+        .send(writer::Control::Flush { cutoff: 0 })
+        .unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let path = dir.path().canonicalize().unwrap().join("report");
+    let export = r.export_to(path.clone());
+    tokio::pin!(export);
+    assert!(matches!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
+        std::task::Poll::Pending
+    ));
+    assert!(Recorder::record(&r, event(&owner, 2)));
+    release.send(()).unwrap();
+    assert_eq!(
+        export.await.unwrap().records,
+        1,
+        "later accepted record must remain outside the frozen export"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("\"revision\":2"));
+}
+#[tokio::test]
+async fn restart_of_unclosed_capture_marks_unknown_tail_instead_of_inventing_zero_loss() {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let path = dir.path().canonicalize().unwrap().join("report");
+    assert!(!r.export_to(path.clone()).await.unwrap().incomplete);
+    let config = r.config.clone();
+    drop(r);
+    // An active capture in the durable manifest provides no proof that all
+    // admitted records reached disk before process termination.
+    let restarted = Recorder::new(config).unwrap();
+    assert_eq!(restarted.status().loss.unclean_capture, 1);
+    assert!(restarted.export_to(path).await.unwrap().incomplete);
+}

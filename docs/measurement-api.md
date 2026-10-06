@@ -1,0 +1,124 @@
+# Measurement foundation API (schema 1)
+
+This is the desktop foundation, not proof that any product domain is instrumented.
+Task 6 adds real producers, the analyzer and independent phone-local adapters.
+A successful export is not a performance or convergence pass.
+
+## Construction and ownership
+
+The shared `measurement` module has no Tauri, provider, SQLite or networking dependency.
+`Recorder::new(Config { directory, epoch: [u8;16], role, platform, build })` starts one
+writer. The shell supplies a secure random process epoch and an app-owned directory.
+Initialization/entropy failure leaves diagnostics unavailable without failing startup.
+Desktop `measurement_desktop` owns a `OnceLock<Recorder>` and binds the persisted
+`ui.diagnostic_logging` preference at startup and after successful preference saves.
+The companion compiles the same core; it has **no capture preference, adapter or
+measurement UI yet**. Desktop commands are `Local` in both surface tables.
+
+`enabled()` is an atomic fast path. `set_enabled(false)` immediately closes admission,
+clears private keys/live handles, and requests a best-effort flush without waiting for
+IO. Accepted records retain their original capture and drain in order. Re-enable
+increments capture; handles never alias a prior epoch/capture. Reserved lifecycle
+metadata records opened/closed captures even when no data records exist.
+
+Native producer methods:
+
+- `intern(Key::Owner(private_incarnation))`, `intern(Key::Session(private_incarnation))`;
+  `intern(Key::StatsScope { owner, scope, from_day, to_day })` requires that the matching
+  Owner key already be live. Include the real source/owner incarnation in native keys,
+  not just a mutable login string. Private keys remain in memory only.
+- `next_operation(parent: Option<&OpaqueId>)` creates a monotonic handle without
+  consuming a lifetime key entry. Use an actual owner/session parent when known.
+  `retire(&id)` invalidates the handle and descendant scope/operation/receipt handles.
+  Complete operations must be retired by their real producer; no timer invents completion.
+- `receipt_reference(&owner)` issues a bounded live reference for an actual accepted
+  publication. Only issue it at that transition, attach it optionally to those rows,
+  and retire the old reference when the rows are replaced. Task 6 owns the wire seam.
+  Status-only updates must retain the row reference. Never synthesize one from a timestamp.
+- `record(Event) -> bool` accepts only closed native events. False includes disabled,
+  duplicate, invalid/stale handle, rate budget or queue refusal; these are not provider
+  outcomes. The bool must never influence product read/write success.
+- `aggregate(AggregateDelta { domain, metric, work, count })` coalesces counters.
+  Values are totals, not event timestamps or averaged latency percentiles.
+- `measured_count(u64) -> Option<u32>` performs checked narrowing. Overflow becomes
+  unavailable and is counted while capture is enabled; zero remains a measured zero.
+- `status() -> JournalStatus` reads published state without writer IO.
+- `export_to(PathBuf).await` is for **trusted local shell adapters only**. One export
+  at a time; the desktop shell owns its native save dialog, including cancellation.
+
+Types are in `measurement/model.rs`; no generic text or JSON-map producer API exists.
+QueueReceipt, Operation, StatsProgress, StopFailureMatch and Transcript are separate
+native variants. Stats counts and elapsed are optional, and `covered_days` is not
+complete days. StopFailure uses optional `observed_boundary` (capture-local sampled
+ordinal), `FailureObservation` provenance, and explicit unpaired/ambiguous/censored
+outcomes. It never invents a true turn identity or an unbiased latency population.
+
+`ClientMeasurement` is the only client-input union: MountedReview, StatsView,
+TranscriptView. Optional native references are checked for epoch/capture/liveness
+**and kind**. A client cannot intern private keys, mint ownership, or use an owner
+handle where a receipt/scope reference is required. Foreign phone references remain
+unlinked; phone-local producers must omit them rather than forging local ownership.
+Missing readings remain null/absent. MountedReview separates inventory, Ready eligible,
+visible, membership-retained, retained-readiness, readiness-unknown, actual Last-known
+and optional-advisory counts, plus actual footer location/state. Its production
+predicates and bounded count traversal remain Task 6 work.
+
+## Bounds and loss
+
+Production caps: 4096 private keys/1 MiB key bytes; 1024 active parent correlations;
+1024 data records; 8 control requests; 1024 encoded bytes including newline per record;
+32 client records/16 KiB per batch. Producers use bounded `try_send`, no disk IO.
+The exact-duplicate cache keeps the most recent 128 event encodings per capture.
+Event quotas use monotonic minute windows: 120 transitions/client observations,
+independent 60 StopFailure observations, and 12 routine summaries. Queue bursts
+cannot consume the StopFailure allowance. Overflow/refusal/loss is explicit.
+
+128 aggregate keys retain cumulative counts and their original start when the routine
+budget defers emission. A summary is attempted on a subsequent aggregate update after
+60 seconds; no new product polling timer is introduced. Still-deferred totals are
+included as bounded header metadata at export, explicitly not timestamped exact events.
+Re-enabling another capture clears old pending totals with an explicit dropped count.
+Dedup/coalescing is disclosed separately from dropped/invalid data.
+
+Writer flushes every 5 seconds or 128 records and on control barriers. This is not a
+crash-loss guarantee under scheduler/IO stalls. Status exposes only durable records.
+The export barrier has a 5-second bound; failure returns Timeout and the queued writer
+must not publish its destination. Streaming after an accepted durable barrier does not
+block product producers. Export and rotation run serially on that one writer.
+
+Eight 16 MiB segments retain at most 128 MiB; one replacement temporarily permits
+144 MiB. One export temporary is bounded by 129 MiB: combined payload working space
+273 MiB, plus manifest below 64 KiB and filesystem allocation overhead. This is an
+engineering cap, not a guaranteed number of days. Actual retained interval, rotation
+and loss are visible. The reader bounds each line, rejects unknown versions/fields or
+invalid references and omits malformed/truncated records with explicit accounting.
+Files use create-new staging, symlink refusal and 0600 permissions where supported.
+An unclosed capture found after restart is explicitly qualified as an unknown tail
+(`unclean_capture`), not an invented number of lost records. Writer failure latches unavailable; there is no retry spin or operation failure coupling.
+
+## Commands, UI and file shape
+
+`measurement_status`, `measurement_export`, `measurement_client_events` are desktop
+local-only commands. Typed wrappers live in `src/api/tauri.ts`; the shared input/output
+interfaces live in `src/types/measurement.ts`. Local commands are deliberately excluded
+from the generated remote schema. Existing remote clients cannot export or write this
+journal. Old unsupported commands remain errors, never an empty successful capture.
+
+The actual desktop Settings General panel mounts `MeasurementExport`, refreshes status
+on opening/preference change/explicit action, and uses the native picker. It can save
+retained captures while logging is off. No periodic status timer and no automatic send.
+The existing detailed timing log and its repository/PR privacy disclosure are unchanged.
+
+Export JSONL:
+
+1. `kind: header`, schema/build/platform/role, `cutoff_epoch` + `cutoff_seq`, actual
+   first/last durable wall clocks, record count, retained epoch/capture counts, caps,
+   immutable loss snapshot, current-epoch lifecycle and deferred aggregate metadata.
+2. Validated schema-1 envelopes with epoch/capture/seq, monotonic and wall clocks,
+   role and closed `event`.
+3. `kind: trailer`, schema, matching cutoff/count, `complete: true`, and incomplete flag.
+
+A complete file can still have incomplete observation coverage. The analyzer must refuse
+exact lineage across loss, malformed/truncated records, unsupported schemas or mismatched
+header/trailer/count. No cross-device monotonic subtraction; epoch changes are explicit
+restart discontinuities. No journal bytes or destination path pass through JavaScript.

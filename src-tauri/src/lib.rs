@@ -24,6 +24,8 @@ pub mod identity;
 mod invariants;
 pub mod inventory;
 mod markdown_export;
+pub mod measurement;
+mod measurement_desktop;
 mod notification_navigation;
 pub mod packages;
 pub mod panic_hook;
@@ -310,6 +312,9 @@ pub fn run() {
             commands::refresh_source,
             commands::set_source_selection,
             commands::read_log_tail,
+            commands::measurement_status,
+            commands::measurement_export,
+            commands::measurement_client_events,
             commands::diagnostic_bundle,
             commands::reveal_log,
             commands::pull_checkout,
@@ -513,7 +518,10 @@ pub fn run() {
             // reading it first means a user who left diagnostics on
             // captures the startup sequence too -- which is where the
             // v3.5.3 log proved most useful.
-            crate::diag::set_enabled(crate::commands::read_ui_prefs(&handle).diagnostic_logging);
+            crate::measurement_desktop::initialize(&handle);
+            let diagnostics = crate::commands::read_ui_prefs(&handle).diagnostic_logging;
+            crate::diag::set_enabled(diagnostics);
+            crate::measurement_desktop::set_enabled(diagnostics);
 
             // `read_token` shells out via `std::process::Command`, which
             // blocks -- fine here, because `setup` is a plain synchronous

@@ -1,3 +1,4 @@
+import type { MeasurementStatus, MeasurementExportReceipt, ClientMeasurement } from "../types/measurement";
 import type { TranscriptWatch } from "../types/transcript";
 /// Typed wrappers around the Tauri command surface in
 /// `src-tauri/src/commands.rs`. Every command returns `Result<T, String>` on
@@ -2312,3 +2313,7 @@ export type StatsDemandRequest =
   | { op: "renew" | "release"; handle: string; sequence: number };
 export interface StatsDemandReceipt { handle: string; owner: import("../types/pr").StatsOwner }
 export const statsDemand = (request: StatsDemandRequest) => call<StatsDemandReceipt>("stats_demand", { request });
+
+export const measurementStatus = () => call<MeasurementStatus>("measurement_status");
+export const exportMeasurements = () => call<MeasurementExportReceipt>("measurement_export");
+export const recordClientMeasurements = (batch: ReadonlyArray<ClientMeasurement>) => call<void>("measurement_client_events", { batch });

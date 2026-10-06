@@ -542,6 +542,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the phone because the poll its banner reports runs on the desktop,
     // and every part is already a Read on its own (`build_target`,
     // `tool_versions`, `read_log_tail`, `get_poll_interval`).
+    ("measurement_status", Class::Local),
+    ("measurement_export", Class::Local),
+    ("measurement_client_events", Class::Local),
     ("diagnostic_bundle", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the DESKTOP's file

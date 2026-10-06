@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
+import { MeasurementExport } from "./MeasurementExport";
 import { ToolVersions } from "./ToolVersions";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
@@ -388,6 +389,7 @@ export function SettingsDialog({
               </button>
             </>
           ) : null}
+          {!IS_MOBILE_BUILD && section === "general" ? <MeasurementExport diagnosticLogging={ui?.diagnostic_logging ?? false} /> : null}
           {autostartError ? (
             <p role="alert" className="text-xs text-[#f85149]">
               {autostartError}

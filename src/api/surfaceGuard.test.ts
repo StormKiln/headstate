@@ -102,6 +102,8 @@ describe("the remote surface's frontend half", () => {
     // `claude_hooks_status`, a `Class::Read`, which is why it is absent from
     // this list and visible on both builds.
     const DESKTOP_ONLY_WRAPPERS = [
+      // Mounted only in the desktop-build General panel; recording is not wired on phones.
+      "measurementStatus", "exportMeasurements", "recordClientMeasurements",
       "takeNotificationPr",
       "claudeInstallHooks",
       // Opens a terminal WINDOW on the desktop (#1126). The phone

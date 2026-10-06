@@ -4719,6 +4719,7 @@ pub fn set_ui_prefs(app: AppHandle, prefs: crate::poll::UiPrefs) -> Result<(), S
     // just ticked the box to capture a problem should get the log for
     // the problem they are currently reproducing, not the next one.
     crate::diag::set_enabled(prefs.diagnostic_logging);
+    crate::measurement_desktop::set_enabled(prefs.diagnostic_logging);
     log::info!(
         "ui: {} view(s) hidden, close_hides_to_tray={}, diagnostics={}",
         prefs.hidden_views.len(),
@@ -12380,4 +12381,25 @@ pub(crate) async fn stats_demand_with_context(
     .map_err(|e| e.to_string())??;
     app.state::<crate::poll::BackfillWaker>().0.notify_one();
     Ok(receipt)
+}
+
+/// Desktop-local typed measurement status. No journal contents or private path.
+#[tauri::command]
+pub fn measurement_status() -> crate::measurement::JournalStatus {
+    crate::measurement_desktop::status()
+}
+#[tauri::command]
+pub async fn measurement_export(
+    window: tauri::WebviewWindow,
+) -> Result<crate::measurement::ExportReceipt, String> {
+    crate::measurement_desktop::export(window).await
+}
+#[tauri::command]
+pub fn measurement_client_events(
+    batch: Vec<crate::measurement::ClientMeasurement>,
+) -> Result<(), String> {
+    if let Some(recorder) = crate::measurement_desktop::recorder() {
+        recorder.client_events(batch).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
