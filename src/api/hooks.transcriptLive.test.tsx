@@ -1,3 +1,5 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 /// #1476: `useClaudeTranscriptLive` binds the follow (`transcriptFollow.ts`,
 /// tested on its own) to a path, to liveness and to the document's
 /// visibility. What is tested here is that binding. Generic fixtures.
@@ -54,6 +56,8 @@ function book(path: string, pages: number): RemoteTranscriptWindow[] {
   return out;
 }
 
+const phoneRecords=vi.hoisted(()=>vi.fn(()=>Promise.resolve()));
+vi.mock("./phoneMeasurements",async importOriginal=>({...await importOriginal<object>(),recordPhoneMeasurements:phoneRecords}));
 const books = vi.hoisted(() => new Map<string, unknown[]>());
 const pageRead = vi.hoisted(() =>
   vi.fn<(
@@ -198,4 +202,19 @@ describe("saved-position fallback lifecycle", () => {
     else if (change !== "unmount") expect(result.current.messages?.[0].id).toMatch(/^\/b\.jsonl#/);
     unmount();
   });
+});
+
+it("records actual phone page/follow/hidden observations locally without adding reads or host identities",async()=>{
+ books.set("/synthetic-private.jsonl",book("/synthetic-private.jsonl",1));
+ const qc=new QueryClient();qc.setQueryData(["phone-measurement-prefs"],{enabled:true});
+ phoneRecords.mockClear();
+ const wrapper=({children}:{children:ReactNode})=><QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+ const view=renderHook(()=>useClaudeTranscriptLive("/synthetic-private.jsonl",{liveness:LIVE}),{wrapper});
+ await settle();expect(pageRead).toHaveBeenCalledTimes(1);
+ const events=()=>phoneRecords.mock.calls.flatMap(call=>(call as unknown as [unknown[]])[0]);
+ expect(events()).toContainEqual(expect.objectContaining({kind:"transcript_view",phase:"page",rows:PAGE}));
+ setVisibility("hidden");await settle();
+ expect(events()).toContainEqual(expect.objectContaining({phase:"hidden",resident_rows:PAGE}));
+ expect(pageRead).toHaveBeenCalledTimes(1);expect(JSON.stringify(events())).not.toContain("synthetic-private");
+ view.unmount();
 });

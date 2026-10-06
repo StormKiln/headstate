@@ -291,7 +291,59 @@ pub enum Liveness {
     /// establishing that, because one of them is a crash.
     Dead { why: String },
     /// The check could not be completed. NOT a shade of `Dead`.
-    Unknown { why: String },
+    Unknown {
+        why: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        possible_processes: Option<PossibleProcesses>,
+    },
+}
+
+/// Display evidence only: neither a session identity nor process-control authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PossibleProcess {
+    pub pid: u32,
+    pub cwd: Option<String>,
+    pub cwd_truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PossibleProcesses {
+    pub candidates: Vec<PossibleProcess>,
+    pub total: usize,
+}
+impl PossibleProcesses {
+    fn from_matches(matches: &[&UnnamedSession]) -> Self {
+        let mut ordered = matches.to_vec();
+        ordered.sort_by(|a, b| (a.pid, &a.cwd).cmp(&(b.pid, &b.cwd)));
+        Self {
+            total: ordered.len(),
+            candidates: ordered
+                .into_iter()
+                .take(8)
+                .map(|candidate| {
+                    let mut cwd = candidate
+                        .cwd
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    let mut cwd_truncated = false;
+                    if let Some(path) = &mut cwd {
+                        if path.len() > 1024 {
+                            let mut end = 1024;
+                            while !path.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            path.truncate(end);
+                            cwd_truncated = true;
+                        }
+                    }
+                    PossibleProcess {
+                        pid: candidate.pid,
+                        cwd,
+                        cwd_truncated,
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Liveness {
@@ -975,16 +1027,16 @@ pub fn derive_at<P: ProcessProbe>(
     if !matches!(verdict, Liveness::Dead { .. }) {
         return verdict;
     }
-    let could_be: Vec<&str> = unnamed
+    let could_be: Vec<&UnnamedSession> = unnamed
         .sessions
         .iter()
         .filter(|u| u.could_be(cwd))
-        .map(|u| u.line.as_str())
         .collect();
     if could_be.is_empty() {
         return verdict;
     }
     Liveness::Unknown {
+        possible_processes: Some(PossibleProcesses::from_matches(&could_be)),
         why: format!(
             "{} Claude Code session{} that did not record which session {} could be this one \
              ({}), so it cannot be called stopped",
@@ -995,7 +1047,11 @@ pub fn derive_at<P: ProcessProbe>(
             } else {
                 "they are"
             },
-            could_be.join("; ")
+            could_be
+                .iter()
+                .map(|u| u.line.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
     }
 }
@@ -1013,6 +1069,7 @@ fn from_records<P: ProcessProbe>(
     // partially-read map is not evidence of anything.
     if let Some(why) = &registry.failure {
         return Liveness::Unknown {
+            possible_processes: None,
             why: format!("could not read the live session registry: {why}"),
         };
     }
@@ -1020,6 +1077,7 @@ fn from_records<P: ProcessProbe>(
     if let Some(entry) = registry.entries.get(session_id) {
         let Some(text) = entry.proc_start.as_deref() else {
             return Liveness::Unknown {
+                possible_processes: None,
                 why: format!(
                     "the registry lists pid {} for this session but no start time, so a \
                      recycled pid could not be told from the original",
@@ -1029,6 +1087,7 @@ fn from_records<P: ProcessProbe>(
         };
         let Some(recorded) = parse_proc_start(text) else {
             return Liveness::Unknown {
+                possible_processes: None,
                 why: format!(
                     "could not read the recorded start time {text:?} for pid {}",
                     entry.pid
@@ -1037,6 +1096,7 @@ fn from_records<P: ProcessProbe>(
         };
         return match probe.start_time(entry.pid) {
             Err(why) => Liveness::Unknown {
+                possible_processes: None,
                 why: format!(
                     "could not check whether pid {} is running: {why}",
                     entry.pid
@@ -1090,6 +1150,7 @@ fn from_records<P: ProcessProbe>(
     // these sessions read as "could not tell".
     if !registry.unreadable.is_empty() {
         return Liveness::Unknown {
+            possible_processes: None,
             why: format!(
                 "{} live-session record(s) in the registry could not be read, so this session \
                  not appearing among the rest is not evidence that it is gone",
@@ -1152,6 +1213,7 @@ fn from_records<P: ProcessProbe>(
 
     let Some(recorded) = run.pid_start_time.as_deref().and_then(parse_run_start) else {
         return Liveness::Unknown {
+            possible_processes: None,
             why: format!(
                 "pid {} was recorded for this session without a start time we can compare, so a \
                  recycled pid could not be told from the original",
@@ -1161,6 +1223,7 @@ fn from_records<P: ProcessProbe>(
     };
     match probe.start_time(run.pid) {
         Err(why) => Liveness::Unknown {
+            possible_processes: None,
             why: format!("could not check whether pid {} is running: {why}", run.pid),
         },
         Ok(None) => Liveness::Dead {
@@ -1363,7 +1426,9 @@ mod tests {
     fn a_probe_that_could_not_look_is_unknown_and_never_dead() {
         let got = derive(&cannot_look(), &registry_with(None), "s1", &[]);
         match &got {
-            Liveness::Unknown { why } => assert!(why.contains("Operation not permitted"), "{why}"),
+            Liveness::Unknown { why, .. } => {
+                assert!(why.contains("Operation not permitted"), "{why}")
+            }
             other => panic!("a failed probe must not read as {other:?}"),
         }
         assert!(!got.is_running());
@@ -1411,7 +1476,7 @@ mod tests {
         r.entries.get_mut("s1").unwrap().proc_start = Some("2026-09-11T09:43:48Z".into());
         let got = derive(&alive(PROC_START_EPOCH), &r, "s1", &[]);
         match got {
-            Liveness::Unknown { why } => assert!(why.contains("2026-09-11T09:43:48Z"), "{why}"),
+            Liveness::Unknown { why, .. } => assert!(why.contains("2026-09-11T09:43:48Z"), "{why}"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -1552,7 +1617,7 @@ mod tests {
         }];
         let got = derive(&gone(), &registry, "s1", &ended);
         match &got {
-            Liveness::Unknown { why } => assert!(
+            Liveness::Unknown { why, .. } => assert!(
                 why.contains("could not be read"),
                 "the reason must name the unreadable record: {why}"
             ),
@@ -1597,7 +1662,7 @@ mod tests {
             .push("whatever: could not list an entry".into());
         let got = derive(&gone(), &r, "s1", &[]);
         match got {
-            Liveness::Unknown { why } => assert!(why.contains("could not be read"), "{why}"),
+            Liveness::Unknown { why, .. } => assert!(why.contains("could not be read"), "{why}"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -1980,13 +2045,97 @@ mod tests {
             ("orphaned entry", &orphaned, &[][..]),
         ] {
             match at(&probe, reg, "s1", Some(WIDGET), runs) {
-                Liveness::Unknown { why } => {
+                Liveness::Unknown { why, .. } => {
                     assert!(why.contains("pid 4242"), "{what}: must name the pid: {why}");
                     assert!(why.contains(WIDGET), "{what}: and where it runs: {why}");
                 }
                 other => panic!("{what}: a live unnamed session here must not read as {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn possible_process_evidence_is_structured_without_promoting_unknown() {
+        let probe = table(&[(4242, PROC_START_EPOCH, WIDGET)]);
+        let reg = key_only_registry(Some(PROC_START));
+        let value = serde_json::to_value(at(&probe, &reg, "s1", Some(WIDGET), &[])).unwrap();
+        assert_eq!(value["state"], "unknown");
+        assert_eq!(value["possible_processes"]["total"], 1);
+        assert_eq!(value["possible_processes"]["candidates"][0]["pid"], 4242);
+        assert_eq!(value["possible_processes"]["candidates"][0]["cwd"], WIDGET);
+        assert_eq!(
+            value["possible_processes"]["candidates"][0]["cwd_truncated"],
+            false
+        );
+    }
+
+    #[test]
+    fn possible_process_display_bounds_do_not_limit_matching_or_change_authority() {
+        let probe = table(&[]);
+        let mut unnamed = Unnamed::default();
+        for pid in (1..=9).rev() {
+            unnamed.sessions.push(UnnamedSession {
+                pid,
+                cwd: Some(PathBuf::from(format!("/{}", "界".repeat(600)))),
+                line: format!("possible pid {pid}"),
+                confirmed_start: None,
+            });
+        }
+        let value = derive_at(&probe, &Registry::default(), &unnamed, "s", None, &[]);
+        let Liveness::Unknown {
+            possible_processes: Some(e),
+            ..
+        } = value
+        else {
+            panic!("must hedge")
+        };
+        assert_eq!(e.total, 9);
+        assert_eq!(e.candidates.len(), 8);
+        assert_eq!(e.candidates[0].pid, 1);
+        assert!(e
+            .candidates
+            .iter()
+            .all(|c| c.cwd_truncated && c.cwd.as_ref().unwrap().len() <= 1024));
+        // Missing cwd is truly unknown, even though this row has a cwd.
+        unnamed.sessions = vec![UnnamedSession {
+            pid: 99,
+            cwd: None,
+            line: "unchecked".into(),
+            confirmed_start: None,
+        }];
+        let unknown = derive_at(
+            &probe,
+            &Registry::default(),
+            &unnamed,
+            "s",
+            Some(WIDGET),
+            &[],
+        );
+        assert!(!unknown.is_running());
+        let value = serde_json::to_value(&unknown).unwrap();
+        assert!(value["possible_processes"]["candidates"][0]["cwd"].is_null());
+        assert_eq!(value["possible_processes"]["total"], 1);
+        unnamed.named.insert("s".into(), 100);
+        assert!(matches!(
+            derive_at(
+                &probe,
+                &Registry::default(),
+                &unnamed,
+                "s",
+                Some(WIDGET),
+                &[]
+            ),
+            Liveness::Running { pid: 100, .. }
+        ));
+        let old: Liveness =
+            serde_json::from_value(serde_json::json!({"state":"unknown","why":"old host"}))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::json!({"state":"unknown","why":"old host"})
+        );
+        let round: Liveness = serde_json::from_value(value).unwrap();
+        assert_eq!(unknown, round);
     }
 
     /// The narrowing: a `.key`-only session in ANOTHER folder does not
@@ -2428,7 +2577,7 @@ mod tests {
             // variant either is Running or carries a reason.
             match state {
                 Liveness::Running { .. } => {}
-                Liveness::Dead { why } | Liveness::Unknown { why } => {
+                Liveness::Dead { why } | Liveness::Unknown { why, .. } => {
                     assert!(!why.is_empty(), "every non-running state states a reason")
                 }
             }

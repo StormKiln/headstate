@@ -519,67 +519,93 @@ impl GitHubClient {
         id: &str,
         action: PrAction,
     ) -> Result<Option<ConfirmedAction>, ClientError> {
-        let query = format!(
-            "mutation($id: ID!) {{ {}(input: {{ {}: $id }}) {{ {} }} }}",
-            action.field(),
-            if action == PrAction::Dequeue {
-                "id"
-            } else {
-                "pullRequestId"
-            },
-            action.result_selection()
-        );
-        let data = match self
-            .graphql_mutation_data(&json!({
-                "query": query,
-                "variables": { "id": id }
-            }))
-            .await
-        {
-            Ok(data) => data,
-            // Asking for a state that already holds is not a failure --
-            // see `is_already_satisfied` for why only this one refusal
-            // is forgiven.
-            Err(e) if action.is_already_satisfied(&e) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        action.verify(&data[action.field()])?;
-        let payload = &data[action.field()];
-        let node = if matches!(action, PrAction::Enqueue | PrAction::Dequeue) {
-            &payload["mergeQueueEntry"]["pullRequest"]
-        } else {
-            &payload["pullRequest"]
-        };
-        if let Some(viewer) = self.known_viewer() {
-            if node["id"].as_str() == Some(id) {
-                if let Some(mut observation) =
-                    crate::store::github_facts::Observation::from_node(node, chrono::Utc::now())
-                {
-                    use crate::store::github_facts::Value;
-                    // Only the acknowledged action is write authority; unrelated
-                    // fields in the payload can still be provider-lagged.
-                    observation
-                        .facts
-                        .retain(|fact| match (&fact.value, action) {
-                            (Value::Queue(true), PrAction::Enqueue)
-                            | (Value::Queue(false), PrAction::Dequeue)
-                            | (Value::Draft(true), PrAction::ConvertToDraft)
-                            | (Value::Draft(false), PrAction::MarkReady) => true,
-                            (Value::State(state), PrAction::Merge) => state == "merged",
-                            (Value::State(state), PrAction::Close) => state == "closed",
-                            (Value::State(state), PrAction::Reopen) => state == "open",
-                            _ => false,
-                        });
-                    if !observation.facts.is_empty() {
-                        return Ok(Some(ConfirmedAction::Facts {
-                            viewer: viewer.into(),
-                            observation,
-                        }));
+        crate::queue_measurement::run(
+            self.measurement_recorder(),
+            crate::measurement::OperationClass::Action,
+            async {
+                let result = async {
+                    let query = format!(
+                        "mutation($id: ID!) {{ {}(input: {{ {}: $id }}) {{ {} }} }}",
+                        action.field(),
+                        if action == PrAction::Dequeue {
+                            "id"
+                        } else {
+                            "pullRequestId"
+                        },
+                        action.result_selection()
+                    );
+                    let data = match self
+                        .graphql_mutation_data(&json!({
+                            "query": query,
+                            "variables": { "id": id }
+                        }))
+                        .await
+                    {
+                        Ok(data) => data,
+                        // Asking for a state that already holds is not a failure --
+                        // see `is_already_satisfied` for why only this one refusal
+                        // is forgiven.
+                        Err(e) if action.is_already_satisfied(&e) => return Ok(None),
+                        Err(e) => return Err(e),
+                    };
+                    action.verify(&data[action.field()])?;
+                    let payload = &data[action.field()];
+                    let node = if matches!(action, PrAction::Enqueue | PrAction::Dequeue) {
+                        &payload["mergeQueueEntry"]["pullRequest"]
+                    } else {
+                        &payload["pullRequest"]
+                    };
+                    if let Some(viewer) = self.known_viewer() {
+                        if node["id"].as_str() == Some(id) {
+                            if let Some(mut observation) =
+                                crate::store::github_facts::Observation::from_node(
+                                    node,
+                                    chrono::Utc::now(),
+                                )
+                            {
+                                use crate::store::github_facts::Value;
+                                // Only the acknowledged action is write authority; unrelated
+                                // fields in the payload can still be provider-lagged.
+                                observation
+                                    .facts
+                                    .retain(|fact| match (&fact.value, action) {
+                                        (Value::Queue(true), PrAction::Enqueue)
+                                        | (Value::Queue(false), PrAction::Dequeue)
+                                        | (Value::Draft(true), PrAction::ConvertToDraft)
+                                        | (Value::Draft(false), PrAction::MarkReady) => true,
+                                        (Value::State(state), PrAction::Merge) => state == "merged",
+                                        (Value::State(state), PrAction::Close) => state == "closed",
+                                        (Value::State(state), PrAction::Reopen) => state == "open",
+                                        _ => false,
+                                    });
+                                if !observation.facts.is_empty() {
+                                    return Ok(Some(ConfirmedAction::Facts {
+                                        viewer: viewer.into(),
+                                        observation,
+                                    }));
+                                }
+                            }
+                        }
                     }
+                    Ok(confirmed_removal(&data, id, action, self.known_viewer())
+                        .map(ConfirmedAction::Removal))
                 }
-            }
-        }
-        Ok(confirmed_removal(&data, id, action, self.known_viewer()).map(ConfirmedAction::Removal))
+                .await;
+                if let Ok(effect) = &result {
+                    crate::queue_measurement::mark(
+                        self.measurement_recorder(),
+                        crate::measurement::Stage::Acknowledged,
+                        if effect.is_some() {
+                            crate::measurement::Outcome::Success
+                        } else {
+                            crate::measurement::Outcome::Unknown
+                        },
+                    );
+                }
+                result
+            },
+        )
+        .await
     }
 
     /// Submit a review on a pull request.

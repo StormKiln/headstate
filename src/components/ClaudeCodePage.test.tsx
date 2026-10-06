@@ -1,3 +1,4 @@
+import { stubViewport } from "@/test-utils";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -4498,4 +4499,30 @@ describe("the transcript viewer", () => {
     const header = within(screen.getByTestId("transcript-tab")).getByTestId("transcript-header");
     expect(within(header).getByText("Running, no transcript yet")).toBeTruthy();
   });
+});
+
+it("renders possible processes in the desktop session column and selected detail badge", () => {
+  state.list = listOf([session({ name: "Structured uncertain", liveness: { state: "unknown", why: "uncertain", possible_processes: {
+    candidates: [{ pid: 4242, cwd: null, cwd_truncated: false }], total: 2,
+  } } })]);
+  renderView();
+  open("Structured uncertain");
+  expect(screen.getAllByText("May be running · 2 possible processes").length).toBeGreaterThanOrEqual(2);
+  expect(screen.getAllByText(/pid 4242 · folder unknown/).length).toBeGreaterThan(0);
+});
+
+
+it("opens bounded possible process details on a narrow desktop without adding controls", () => {
+  stubViewport(390);
+  try {
+    state.list = listOf([session({ name: "Narrow uncertain", liveness: { state: "unknown", why: "uncertain", possible_processes: {
+      candidates: [{ pid: 42, cwd: null, cwd_truncated: false }], total: 1,
+    } } })]);
+    render(<ClaudeCodePage />);
+    expect(screen.getByText("May be running · pid 42")).toBeTruthy();
+    expect(screen.queryByText(/pid 42 · folder unknown/)).toBeNull();
+    open("Narrow uncertain");
+    expect(screen.getByText(/pid 42 · folder unknown/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Stop/ })).toBeNull();
+  } finally { cleanup(); stubViewport(null); }
 });

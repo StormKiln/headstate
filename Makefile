@@ -233,9 +233,7 @@ deny:
 # the point, since a local run that differed would not reproduce what CI
 # saw.
 test-race:
-	cd src-tauri && for i in 1 2 3; do \
-		cargo test --lib -- --test-threads=8 || { echo "FAILED ON ITERATION $$i"; exit 1; }; \
-	done
+	python3 scripts/test-rust-ci.py race
 
 # Mutation testing, ONE MODULE AT A TIME and never in CI (#893).
 #
@@ -393,7 +391,10 @@ lint-deps:
 	# because a fix that quietened the noise by checking less would be
 	# worse than the bug.
 	python3 scripts/install-dependencies.test.py
+	python3 scripts/measurement-report.test.py
+	node --test scripts/measurement-evidence.test.mjs
 	python3 scripts/ci-command.test.py
+	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
@@ -613,3 +614,8 @@ check-activity-chart:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	yarn vite build -c vite.harness.config.ts
 	node scripts/check-activity-chart.mjs "$(OUT)" "$(or $(ENGINE),chromium)"
+
+.PHONY: analyze-measurements
+analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
+analyze-measurements:
+	@python3 scripts/measurement-report.py "$$MEASUREMENT_INPUT"

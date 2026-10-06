@@ -1,3 +1,4 @@
+import { useStatsMeasurement } from "../api/statsMeasurement";
 import { useState } from "react";
 import {
   type StatsScope,
@@ -214,6 +215,7 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable, boardQ.data?.owner ?? (registration?.state === "registered" ? registration.owner : undefined));
 
   const board = boardQ.data;
+  useStatsMeasurement(board, boardQ.refresh?.retained || boardQ.refresh?.error ? "retained" : "accepted");
   const series = seriesQ.data;
 
   // A half-written selection: a kind with no value, which `scopeIsLoadable`

@@ -1,3 +1,5 @@
+import { useMeasurementsEnabled } from "./api/clientMeasurements";
+import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
 import { listen } from "./api/transport";
 import { takeNotificationPr } from "./api/tauri";
@@ -383,6 +385,7 @@ export default function App() {
   // already does with the same value, so the two agree in the uncertain
   // case as well as the settled ones.
   const { prefs } = useUiPrefs();
+  const measurementEnabled = useMeasurementsEnabled();
   const claudeCodeOff = !prefs?.claude_integrations_enabled;
   const view =
     (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView)) ||
@@ -882,6 +885,9 @@ export default function App() {
     // nothing above it can push the status bar past the window's edge.
     // `index.css` sizes `html`, `body` and `#root` to the viewport and
     // stops the document itself from scrolling.
+    <ReviewMeasurementProvider enabled={IS_MOBILE_BUILD ? measurementEnabled : prefs?.diagnostic_logging === true}
+      snapshot={githubReceipt} selected={!!filters.repo || !!sourceRepoKey}
+      receipt={reviewingQuery.data === reviewingReceipt.prs ? reviewingReceipt.measurementReceipt : undefined}>
     <div className="flex h-full flex-col bg-[#0d1117] text-[#e6edf3] px-safe">
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
@@ -1287,5 +1293,6 @@ export default function App() {
           window's status rather than the list's. */}
       <StatusBar github={{ list: view === "to-review" ? "reviewing" : "authored", receipt: githubReceipt }} updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
     </div>
+    </ReviewMeasurementProvider>
   );
 }

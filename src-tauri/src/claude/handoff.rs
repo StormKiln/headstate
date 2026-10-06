@@ -571,7 +571,12 @@ fn transcript_exists(session_id: &str) -> Option<bool> {
 /// the point: the importer overwrites `cwd` from disk, this side never
 /// overwrites it at all, so a stale hook value cannot survive a rescan
 /// and cannot displace a good one in the meantime.
-fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Result<(), String> {
+fn write_record_observed(
+    conn: &Connection,
+    rec: &Record,
+    start_time: Option<i64>,
+    inserted: &mut Option<usize>,
+) -> Result<(), String> {
     let Some(session_id) = rec.session_id.as_deref() else {
         return Ok(());
     };
@@ -630,58 +635,62 @@ fn write_record(conn: &Connection, rec: &Record, start_time: Option<i64>) -> Res
             .as_ref()
             .and(rec.permission_summary.as_deref())
             .and_then(|s| super::hook::permission_text(s, super::hook::TEXT_FIELD_CAP));
-        conn.execute(
-            // OR IGNORE against (session_id, event, at) for the reason
-            // the start-record insert below uses it: `consume` can
-            // re-read records after a rotation-then-crash, and a
-            // re-read must be a no-op rather than a doubled count.
-            //
-            // Migration 15's partial unique index on
-            // (session_id, event, tool_use_id) does the OTHER half for
-            // the two tool events, and it is a different question: this
-            // key collapses a re-read of one record, that one collapses
-            // RETRIES of one tool call, which arrive as separate records
-            // at separate instants carrying the same id (#1063).
-            "INSERT OR IGNORE INTO claude_hook_event
+        let rows = conn
+            .execute(
+                // OR IGNORE against (session_id, event, at) for the reason
+                // the start-record insert below uses it: `consume` can
+                // re-read records after a rotation-then-crash, and a
+                // re-read must be a no-op rather than a doubled count.
+                //
+                // Migration 15's partial unique index on
+                // (session_id, event, tool_use_id) does the OTHER half for
+                // the two tool events, and it is a different question: this
+                // key collapses a re-read of one record, that one collapses
+                // RETRIES of one tool call, which arrive as separate records
+                // at separate instants carrying the same id (#1063).
+                "INSERT OR IGNORE INTO claude_hook_event
                 (session_id, event, at, trigger_kind, agent_id, agent_type,
                  notification_type, error_type, tool_name, failure_detail,
                  tool_use_id, permission_summary)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                session_id,
-                event,
-                ts,
-                rec.trigger,
-                rec.agent_id,
-                // An EMPTY agent_type is stored as NULL, not as "". The
-                // hook passes the payload through verbatim and
-                // `SubagentStop` writes `agent_type: b ?? ""` -- so an
-                // empty string is Claude Code's way of saying it did not
-                // have one. Storing it as a value would render a blank
-                // chip that looks like a real agent type; NULL reaches
-                // the "not recorded" arm that already exists.
-                rec.agent_type.as_deref().filter(|t| !t.is_empty()),
-                rec.notification_type,
-                f.error_type,
-                if permission {
-                    tool.as_deref()
-                } else {
-                    f.tool_name
-                },
-                // Same empty-is-absent rule as `agent_type` above, and
-                // #1064 needs it by name: a denial whose `denial_reason`
-                // arrived as "" must reach the "not recorded" arm rather
-                // than render as a blank reason that looks recorded.
-                f.detail.filter(|d| !d.is_empty()),
-                // NULL rather than "" when there is no tool call, because
-                // migration 15's unique index is PARTIAL on
-                // `tool_use_id IS NOT NULL`: two distinct `StopFailure`
-                // records must not collide on a shared sentinel.
-                rec.tool_use_id.as_deref().filter(|t| !t.is_empty()),
-                summary,
-            ],
-        )
-        .map_err(|e| format!("{session_id}: could not store the {event}: {e}"))?;
+                rusqlite::params![
+                    session_id,
+                    event,
+                    ts,
+                    rec.trigger,
+                    rec.agent_id,
+                    // An EMPTY agent_type is stored as NULL, not as "". The
+                    // hook passes the payload through verbatim and
+                    // `SubagentStop` writes `agent_type: b ?? ""` -- so an
+                    // empty string is Claude Code's way of saying it did not
+                    // have one. Storing it as a value would render a blank
+                    // chip that looks like a real agent type; NULL reaches
+                    // the "not recorded" arm that already exists.
+                    rec.agent_type.as_deref().filter(|t| !t.is_empty()),
+                    rec.notification_type,
+                    f.error_type,
+                    if permission {
+                        tool.as_deref()
+                    } else {
+                        f.tool_name
+                    },
+                    // Same empty-is-absent rule as `agent_type` above, and
+                    // #1064 needs it by name: a denial whose `denial_reason`
+                    // arrived as "" must reach the "not recorded" arm rather
+                    // than render as a blank reason that looks recorded.
+                    f.detail.filter(|d| !d.is_empty()),
+                    // NULL rather than "" when there is no tool call, because
+                    // migration 15's unique index is PARTIAL on
+                    // `tool_use_id IS NOT NULL`: two distinct `StopFailure`
+                    // records must not collide on a shared sentinel.
+                    rec.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                    summary,
+                ],
+            )
+            .map_err(|e| format!("{session_id}: could not store the {event}: {e}"))?;
+        if event == "StopFailure" {
+            *inserted = Some(rows);
+        }
         return Ok(());
     }
 
@@ -834,6 +843,22 @@ pub fn consume(
     offset: Offset,
     registry: &std::collections::HashMap<u32, i64>,
 ) -> Result<Consumed, String> {
+    consume_measured(
+        conn,
+        path,
+        offset,
+        registry,
+        crate::measurement_desktop::recorder(),
+    )
+}
+
+pub(super) fn consume_measured(
+    conn: &mut Connection,
+    path: &Path,
+    offset: Offset,
+    registry: &std::collections::HashMap<u32, i64>,
+    recorder: Option<&crate::measurement::Recorder>,
+) -> Result<Consumed, String> {
     let Some((lines, new_offset, restarted)) = read_new(path, offset)? else {
         // No file: the hook is not installed, or has not fired yet. Not a
         // failure, and the offset stays where it was so an installation
@@ -881,11 +906,16 @@ pub fn consume(
         .transaction()
         .map_err(|e| format!("could not begin a transaction: {e}"))?;
     let mut sessions = std::collections::HashSet::new();
+    let mut observations = Vec::new();
+    let mut excluded = 0u64;
     for rec in &records {
         let Some(sid) = rec.session_id.as_deref() else {
             // No id, no identity, no row. Counted rather than dropped
             // silently: it means a hook fired for a session we cannot
             // name, which is worth someone seeing.
+            if rec.point_event() == Some("StopFailure") {
+                excluded += 1;
+            }
             out.without_session_id += 1;
             continue;
         };
@@ -895,6 +925,9 @@ pub fn consume(
             // stored as an observed one, and 0 is not a pid on any
             // platform -- storing it would put a row in the table whose
             // liveness check would ask the OS about process zero.
+            if rec.point_event() == Some("StopFailure") {
+                excluded += 1;
+            }
             out.without_pid += 1;
             continue;
         }
@@ -906,17 +939,52 @@ pub fn consume(
             // throw away every correctly-reported new session.
             out.unvalidated += 1;
         }
-        match write_record(&tx, rec, registry.get(&rec.ppid).copied()) {
+        let mut inserted = None;
+        match write_record_observed(&tx, rec, registry.get(&rec.ppid).copied(), &mut inserted) {
             Ok(()) => {
+                if recorder.is_some_and(|r| r.enabled()) {
+                    if let Some(rows) = inserted {
+                        if observations.len() < 512 {
+                            observations.push((
+                                sid,
+                                rec.ts
+                                    .as_deref()
+                                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                                    .map(|t| t.timestamp_millis()),
+                                rows > 0,
+                            ));
+                        } else {
+                            excluded += 1;
+                        }
+                    }
+                }
                 out.runs += 1;
                 sessions.insert(sid.to_owned());
             }
-            Err(e) => out.write_failures.push(e),
+            Err(e) => {
+                if rec.point_event() == Some("StopFailure") {
+                    excluded += 1;
+                }
+                out.write_failures.push(e)
+            }
         }
     }
     out.sessions = sessions.len();
-    tx.commit()
-        .map_err(|e| format!("could not commit the handoff records: {e}"))?;
+    if let Err(e) = tx.commit() {
+        if let Some(r) = recorder {
+            r.failure_count(
+                crate::measurement::AggregateKind::Declined,
+                observations.len() as u64 + excluded,
+            );
+        }
+        return Err(format!("could not commit the handoff records: {e}"));
+    }
+    if let Some(r) = recorder {
+        r.failure_count(crate::measurement::AggregateKind::Declined, excluded);
+        for (sid, at, inserted) in observations {
+            r.failure_hook(sid, at, inserted);
+        }
+    }
 
     // AFTER the commit. See the module docs: the reverse order loses the
     // window on a crash, this order re-reads a stored record and the
@@ -2018,5 +2086,81 @@ mod tests {
              BUMPING, not about ignoring a bump"
         );
         assert_eq!(got.runs, 0);
+    }
+    #[tokio::test]
+    async fn committed_stop_failure_ingestion_is_measured_without_private_text() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let recorder = Recorder::new(Config {
+            directory: root.join("journal"),
+            epoch: [52; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap();
+        recorder.set_enabled(true);
+        let mut conn = db();
+        let path = root.join("handoff");
+        let line=r#"{"v":1,"event":"StopFailure","session_id":"SYNTHETIC_PRIVATE_SESSION","ppid":123,"ts":"2026-10-06T10:00:00Z","error_message":"SYNTHETIC_PRIVATE_TEXT"}"#.to_string();
+        write_file(&path, std::slice::from_ref(&line));
+        consume_measured(&mut conn, &path, Offset(0), &no_registry(), Some(&recorder)).unwrap();
+        write_file(&path, &[line]);
+        consume_measured(&mut conn, &path, Offset(0), &no_registry(), Some(&recorder)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let report = root.join("report");
+        recorder.export_to(report.clone()).await.unwrap();
+        let text = std::fs::read_to_string(report).unwrap();
+        assert!(
+            text.contains("ingested_hook"),
+            "committed ingestion absent: {text}"
+        );
+        assert!(text.contains("duplicate"));
+        assert!(!text.contains("SYNTHETIC_PRIVATE"));
+    }
+    #[tokio::test]
+    async fn failed_hook_commit_never_records_committed_ingestion_and_missing_time_stays_unknown() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        for fail_commit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let r = Recorder::new(Config {
+                directory: root.join("journal"),
+                epoch: [54; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap();
+            r.set_enabled(true);
+            let mut conn = db();
+            let path = root.join("handoff");
+            if fail_commit {
+                conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE diagnostic_parent(id INTEGER PRIMARY KEY); CREATE TABLE diagnostic_child(id INTEGER REFERENCES diagnostic_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER diagnostic_fail AFTER INSERT ON claude_hook_event BEGIN INSERT INTO diagnostic_child VALUES(1); END;").unwrap();
+            }
+            write_file(
+                &path,
+                &[r#"{"v":1,"event":"StopFailure","session_id":"synthetic","ppid":12}"#.into()],
+            );
+            let result = consume_measured(&mut conn, &path, Offset(0), &no_registry(), Some(&r));
+            assert_eq!(result.is_err(), fail_commit);
+            let report = root.join("report");
+            r.export_to(report.clone()).await.unwrap();
+            let text = std::fs::read_to_string(report).unwrap();
+            if fail_commit {
+                assert!(!text.contains("ingested_hook"));
+                assert!(text.contains("declined"));
+            } else {
+                assert!(text.contains("ingested_hook"));
+                assert!(text.contains("clock_anomaly"));
+                assert!(text.contains("\"hook_age_ms\":null"));
+            }
+        }
     }
 }

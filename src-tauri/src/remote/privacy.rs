@@ -777,6 +777,14 @@ static SHAPES: LazyLock<Vec<Shape>> = LazyLock::new(|| {
 /// before anything is replaced, so a key inside an assignment
 /// (`API_KEY=sk-...`) is one pill, not a marker nested in a marker.
 pub fn mask_text(text: &str) -> (Cow<'_, str>, usize) {
+    if !may_contain_secret(text) {
+        return (Cow::Borrowed(text), 0);
+    }
+    mask_text_regex(text)
+}
+
+// Original ordered regex/overlap engine, shared by the test oracle without a copy.
+fn mask_text_regex(text: &str) -> (Cow<'_, str>, usize) {
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
     for (priority, shape) in SHAPES.iter().enumerate() {
         for caps in shape.re.captures_iter(text) {
@@ -817,6 +825,32 @@ pub fn mask_text(text: &str) -> (Cow<'_, str>, usize) {
     out.push_str(&text[at..]);
     (Cow::Owned(out), merged.len())
 }
+
+/// Necessary conditions only: false positives still use the original engine.
+/// PEM/sk/Slack/GitLab require `-`; GitHub/Stripe/npm require `_`;
+/// assignments, headers and URL passwords require `:` or `=`. The only
+/// remaining shapes start with AKIA/ASIA, AIza, eyJ or ASCII-folded Bearer.
+/// This scans bytes without allocation; no word-boundary or keep policy is
+/// approximated here. Tests pin every ordered regex and its trigger witness.
+fn may_contain_secret(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, byte)| match byte {
+        b'-' | b'_' | b':' | b'=' => true,
+        b'A' => {
+            let tail = &bytes[i..];
+            tail.starts_with(b"AKIA") || tail.starts_with(b"ASIA") || tail.starts_with(b"AIza")
+        }
+        b'e' => bytes[i..].starts_with(b"eyJ"),
+        b'b' | b'B' => bytes[i..]
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"bearer")),
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+#[path = "privacy_fast_path_tests.rs"]
+mod fast_path_tests;
 
 #[cfg(test)]
 mod tests {

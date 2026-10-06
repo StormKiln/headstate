@@ -27,6 +27,7 @@ fn dead() -> Liveness {
 
 fn unknown() -> Liveness {
     Liveness::Unknown {
+        possible_processes: None,
         why: "the live session registry could not be read".into(),
     }
 }

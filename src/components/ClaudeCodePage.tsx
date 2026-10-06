@@ -1,3 +1,5 @@
+import { PossibleProcessEvidence } from "./PossibleProcessEvidence";
+import { possibleProcessLabel } from "@/lib/possibleProcesses";
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Bot, Circle, FolderOpen, GitBranch, RefreshCw, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
@@ -1421,7 +1423,7 @@ function Banners({
 ///
 /// Grey for `unknown`, following `NotMeasured`: amber would tell the
 /// user to act on something the app did not manage to look at.
-function LivenessBadge({ liveness }: { liveness: Liveness }) {
+function LivenessBadge({ liveness, compact = false }: { liveness: Liveness; compact?: boolean }) {
   if (liveness.state === "running") {
     return (
       <span className="flex items-center gap-1 text-[#3fb950]" title={`pid ${liveness.pid}`}>
@@ -1444,14 +1446,14 @@ function LivenessBadge({ liveness }: { liveness: Liveness }) {
     );
   }
   return (
-    <span className="flex items-center gap-1 text-[#8b949e]" title={liveness.why}>
+    <span className="flex min-w-0 items-center gap-1 text-[#8b949e]" title={liveness.why}>
       {/* A DASHED ring, so "could not tell" is not merely a paler
           "not running". The two enable different actions. */}
       <span
         className="h-2.5 w-2.5 rounded-full border border-dashed border-[#8b949e]"
         aria-hidden="true"
       />
-      Could not tell
+      <span className={compact ? "truncate" : undefined}>{possibleProcessLabel(liveness) ?? "Could not tell"}{compact ? null : <PossibleProcessEvidence liveness={liveness} />}</span>
     </span>
   );
 }
@@ -1749,7 +1751,7 @@ function SessionEntry({
           active ? "text-white" : "text-[#8b949e]"
         }`}
       >
-        <LivenessBadge liveness={s.liveness} />
+        <LivenessBadge liveness={s.liveness} compact />
         {activeNow && s.liveness.state === "running" ? <ActiveNow muted={active} /> : null}
         {/* A DATE on every row, not only in the detail. 147 sessions in
             the largest directory share a title with a sibling (mostly

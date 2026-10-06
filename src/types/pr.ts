@@ -1372,6 +1372,16 @@ export interface ClaudeMdScan {
 /// fact alive starts a SECOND copy of it. `SystemHealthPage`'s
 /// `HealthConditions` is the house pattern for keeping the three
 /// distinct on screen.
+/** Display evidence only. A possible PID does not identify this session. */
+export interface PossibleProcess {
+  pid: number;
+  cwd: string | null;
+  cwd_truncated: boolean;
+}
+export interface PossibleProcesses {
+  candidates: PossibleProcess[];
+  total: number;
+}
 export type Liveness =
   /// Alive, and its start time matches what was recorded -- so it is the
   /// same process and not a reused pid.
@@ -1389,7 +1399,7 @@ export type Liveness =
   /// because one of them -- an orphaned registry entry -- is a crash.
   | { state: "dead"; why: string }
   /// The check could not be completed. NOT a shade of `dead`.
-  | { state: "unknown"; why: string };
+  | { state: "unknown"; why: string; possible_processes?: PossibleProcesses };
 
 /// Whether a path a session recorded still exists (#918, #919).
 ///
@@ -1603,7 +1613,7 @@ export interface ClaudeSearchAnswer {
 type WireLiveness =
   | { state: "running"; pid: number; status: string | null }
   | { state: "dead"; why: number }
-  | { state: "unknown"; why: number };
+  | { state: "unknown"; why: number; possible_processes?: { group: number | null; total: number } };
 
 /// Whether a session is waiting on the user, and how sure we are (#1067).
 ///
@@ -2600,6 +2610,7 @@ export interface ClaudeSessionList {
 /// `hydrateClaudeSessions` turns this into `ClaudeSessionList` at the
 /// hook boundary, which is the only place either shape is known.
 export interface WireClaudeSessionList {
+  possible_process_groups?: PossibleProcess[][];
   sessions: WireClaudeSession[];
   /// Every distinct liveness reason, once. A `WireLiveness`'s `why` is
   /// an index into this. ONE entry on the measured corpus of 1,474.
@@ -2930,12 +2941,13 @@ export interface StatsObservation extends StatsWindow {
 }
 /// A local read reports measurements, never a demand registration.
 export interface StatsBoardReadback {
+  measurementScope?: import("./measurement").MeasurementReference;
   owner: StatsOwner;
   viewer: string;
   scopeKey: string;
   window: StatsWindow;
   stream: string;
-  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill">;
+  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill" | "measurementScope">;
 }
 
 /// One frame of PR Stats backfill progress (#1093). Mirrors
@@ -3721,6 +3733,7 @@ export interface ShortSlice {
 /// Rust `Subject::cache_key` doc records as a real case -- would put the
 /// viewer's own work under "Others" and show "no activity" for Mine.
 export interface StatsBoard {
+  measurementScope?: import("./measurement").MeasurementReference;
   window?: StatsWindow;
   stream?: string;
   totalVerified?: boolean;

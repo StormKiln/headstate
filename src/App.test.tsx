@@ -1,5 +1,6 @@
+import { preserveMeasurement } from "../scripts/measurement-evidence.mjs";
 import { GitLabViewerProvider } from "./api/authAvailability";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest, StatsTree } from "./types/pr";
@@ -11,6 +12,10 @@ import { AuthGate } from "./components/AuthGate";
 
 // The shell talks to Tauri on mount. Stub the command surface so these tests
 // exercise the wiring, not the backend.
+const measurements = vi.hoisted(() => vi.fn<(_batch: readonly unknown[]) => Promise<void>>(() => Promise.resolve()));
+vi.mock("./api/tauri", async importOriginal => ({
+  ...await importOriginal<typeof import("./api/tauri")>(), recordClientMeasurements: measurements,
+}));
 const mockStatsTree = vi.fn<() => StatsTree | undefined>(() => undefined);
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
@@ -903,9 +908,75 @@ describe("active inventory footer wiring", () => {
     useFilters.setState({ view: "to-review", selectedPr: null });
   });
   afterEach(() => {
+    uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
+    measurements.mockClear();
     mockReviewPhase.mockReturnValue(undefined); mockReviewReceivedAt.mockReturnValue(undefined);
     mockReviewError.mockReturnValue(null); mockReviewCoverage.mockReturnValue("complete");
     useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  });
+  it("records actual scoped Ready counts together with the displayed freshness branch", async () => {
+    uiPrefs.value = { hidden_views: [], diagnostic_logging: true };
+    measurements.mockClear();
+    const observed = { state: "observed" as const, last_observed_at: null, retained_fields: [], unknown_fields: [] };
+    const base = { ...PR_FIXTURES[0], is_draft: false, ci: "success" as const, merge: "mergeable" as const,
+      review: "none" as const, in_merge_queue: false, observation: observed };
+    mockReviewing.mockReturnValue([
+      { ...base, number: 1, repo: "PRIVATE/selected", observation: { ...observed, state: "retained" } },
+      { ...base, number: 2, repo: "PRIVATE/selected", observation: { ...observed, retained_fields: ["review"] } },
+      { ...base, number: 3, repo: "PRIVATE/selected", observation: { ...observed, unknown_fields: ["ci"] } },
+      { ...base, number: 4, repo: "PRIVATE/other" },
+    ]);
+    useFilters.getState().setFilter("repo", "PRIVATE/selected");
+    useFilters.getState().setFilter("readyMyPushes", "show");
+    renderApp();
+    expect(screen.getByText("Ready for review (2)")).toBeTruthy();
+    expect(screen.getByText("Review requests need checking")).toBeTruthy();
+    await waitFor(() => expect(measurements).toHaveBeenCalledWith([expect.objectContaining({
+      kind: "mounted_review", surface: "ready_panel", selection: "selected_scope",
+      inventory_count: 3, eligible_count: 2, visible_count: 2, visible_retained_count: 1,
+      visible_retained_readiness_count: 1, visible_readiness_unknown_count: 0, visible_last_known_count: 1,
+      footer_location: "desktop_footer", footer: "needs_checking",
+    })]));
+    expect(JSON.stringify(measurements.mock.calls)).not.toContain("PRIVATE");
+    preserveMeasurement("mounted-ready", measurements.mock.calls.flatMap(call=>call[0]));
+    act(() => useFilters.getState().setFilter("repo", undefined));
+    await waitFor(() => expect(measurements).toHaveBeenCalledWith([expect.objectContaining({
+      inventory_count: 4, eligible_count: 3, visible_count: 3, selection: "all_repositories",
+    })]));
+    uiPrefs.value = { hidden_views: [] };
+  });
+  it.each(["cold", "empty", "legacy"] as const)("qualifies %s Ready observations without inventing zero or legacy freshness", async kind => {
+    uiPrefs.value = { hidden_views: [], diagnostic_logging: true };
+    const legacy = { ...PR_FIXTURES[0], is_draft: false, ci: "success" as const, merge: "mergeable" as const,
+      review: "none" as const, in_merge_queue: false, observation: undefined };
+    mockReviewing.mockReturnValue(kind === "cold" ? undefined : kind === "empty" ? [] : [legacy]);
+    useFilters.getState().setFilter("readyMyPushes", "show");
+    renderApp();
+    await waitFor(() => expect(measurements).toHaveBeenCalled());
+    const observed = measurements.mock.calls.flatMap(call => call[0] as unknown[]).at(-1) as Record<string, unknown>;
+    expect(observed.inventory_count).toBe(kind === "cold" ? undefined : kind === "empty" ? 0 : 1);
+    expect(observed.visible_readiness_unknown_count).toBe(kind === "cold" ? undefined : kind === "empty" ? 0 : 1);
+    expect(observed.footer).toBe(kind === "cold" ? "not_checked" : kind === "empty" ? "checked" : "needs_checking");
+    expect(observed.receipt).toBeUndefined();
+  });
+  it("keeps retained Ready rows measurable during fetching/failure and emits nothing while opted out or GitLab-only", async () => {
+    measurements.mockClear();
+    const mounted = renderApp();
+    expect(measurements).not.toHaveBeenCalled();
+    uiPrefs.value = { hidden_views: [], diagnostic_logging: true };
+    mockReviewing.mockReturnValue([{ ...PR_FIXTURES[0], is_draft: false, ci: "success", merge: "mergeable",
+      review: "none", in_merge_queue: false }]);
+    mockReviewPhase.mockReturnValue("fetching");
+    act(() => useFilters.getState().setFilter("readyMyPushes", "show"));
+    await waitFor(() => expect(measurements).toHaveBeenCalledWith([expect.objectContaining({ visible_count: 1, footer: "checking" })]));
+    mockReviewError.mockReturnValue(new Error("PRIVATE_FAILURE"));
+    act(() => useFilters.getState().setFilter("query", "changed"));
+    await waitFor(() => expect(measurements).toHaveBeenCalledWith([expect.objectContaining({ visible_count: 1, footer: "refresh_failed" })]));
+    expect(JSON.stringify(measurements.mock.calls)).not.toContain("PRIVATE_FAILURE");
+    measurements.mockClear();
+    await act(() => useSourceSelection.setState({ selection: "gitlab" }));
+    expect(measurements).not.toHaveBeenCalled();
+    await mounted.unmount();
   });
   it("switches from reviewing failure to the independently accepted authored receipt", () => {
     mockReviewError.mockReturnValue(new Error("Review queue unavailable"));

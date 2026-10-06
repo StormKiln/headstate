@@ -60,16 +60,19 @@ it("a late disk receipt never replaces an accepted live receipt", async () => {
 });
 it("a verified account change retires both lists and old detail authority", async () => {
   const qc = new QueryClient();
+  qc.setQueryData(["measurement-capture"], {epoch:"a".repeat(32),capture:1});
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
   const hook = renderHook(() => ({ authored: hooks.useSourceRefresh("authored"), reviewing: hooks.useSourceRefresh("reviewing") }), { wrapper });
   await act(async () => {});
   const callbacks = vi.mocked(listen).mock.calls.filter(c => c[0] === "source-poll-status").map(c => c[1]);
-  const frame = (list: string, owner: string, revision: number, prs = PR_FIXTURES) => ({ source: { provider: "github", host: "github.com" }, list, owner, session: "desktop", revision, receipt_revision: revision, prs, phase: "ready", error: null, coverage: "complete" });
+  const frame = (list: string, owner: string, revision: number, prs = PR_FIXTURES) => ({ source: { provider: "github", host: "github.com" }, list, owner, session: "desktop", revision, receipt_revision: revision, measurement_receipt: { epoch: "a".repeat(32), capture: 1, id: revision }, prs, phase: "ready", error: null, coverage: "complete" });
   act(() => { for (const fn of callbacks) { fn({ payload: frame("authored", "alice", 1) } as never); fn({ payload: frame("reviewing", "alice", 1) } as never); } });
   expect(hook.result.current.reviewing.prs).toEqual(PR_FIXTURES);
+  expect(hook.result.current.reviewing.measurementReceipt?.id).toBe(1);
   act(() => { for (const fn of callbacks) fn({ payload: frame("authored", "bob", 2, []) } as never); });
   expect(hook.result.current.authored.prs).toEqual([]);
   expect(hook.result.current.reviewing.prs).toBeUndefined();
+  expect(hook.result.current.reviewing.measurementReceipt).toBeUndefined();
   expect(qc.getQueryData(["reviewing"])).toBeUndefined();
 });
 it("delayed provider identity reopens the retained cache without another live refresh", async () => {

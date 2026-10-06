@@ -13,7 +13,7 @@ vi.mock("@/lib/useIsMobile", () => ({
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
-vi.mock("../api/tauri", () => ({ revealLog: vi.fn() }));
+vi.mock("../api/tauri", () => ({ measurementStatus: () => new Promise(() => {}), exportMeasurements: vi.fn(), revealLog: vi.fn() }));
 // The same shape SettingsDialog.test.tsx mocks: the dialog reads half a
 // dozen preference hooks, none of which this file is about.
 vi.mock("../api/hooks", () => ({

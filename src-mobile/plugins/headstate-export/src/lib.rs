@@ -17,9 +17,22 @@ struct Native<R: Runtime>(tauri::plugin::PluginHandle<R>);
 struct Reply {
     outcome: String,
 }
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportKind {
+    TranscriptMarkdown,
+    MeasurementJsonl,
+}
 pub async fn share<R: Runtime>(app: AppHandle<R>, markdown: String) -> Result<String, String> {
+    share_kind(app, markdown, ExportKind::TranscriptMarkdown).await
+}
+pub async fn share_kind<R: Runtime>(
+    app: AppHandle<R>,
+    markdown: String,
+    kind: ExportKind,
+) -> Result<String, String> {
     if markdown.len() > 8 * 1024 * 1024 {
-        return Err("The export exceeds 8 MiB. Select fewer turns and try again.".into());
+        return Err("The export exceeds 8 MiB. Select a smaller report and try again.".into());
     }
     #[cfg(mobile)]
     {
@@ -27,18 +40,18 @@ pub async fn share<R: Runtime>(app: AppHandle<R>, markdown: String) -> Result<St
         // Tauri's native callback sends to its oneshot with unwrap. Keep that
         // receiver owned until native completion, even if the command is dropped.
         tauri::async_runtime::spawn(async move {
-            let reply: Reply = handle.run_mobile_plugin_async(cmd::SHARE, serde_json::json!({"markdown":markdown})).await.map_err(|_| "Could not open the share sheet. Try again, or copy the masked transcript.".to_string())?;
+            let reply: Reply = handle.run_mobile_plugin_async(cmd::SHARE, serde_json::json!({"markdown":markdown,"kind":kind})).await.map_err(|_| "Could not open the share sheet. Try again.".to_string())?;
             match reply.outcome.as_str() {
                 "cancelled" | "shared" | "presented" => Ok(reply.outcome),
-                "capacity" => Err("Export storage is full for 24 hours. Reuse an unchanged export or copy the masked transcript.".into()),
+                "capacity" => Err("Export storage is full for 24 hours. Reuse an unchanged export or try again later.".into()),
                 "busy" => Err("A share sheet is already open. Finish it before exporting again.".into()),
-                _ => Err("Could not share the markdown. Try again, or copy the masked transcript.".into()),
+                _ => Err("Could not share the report. Try again.".into()),
             }
         }).await.map_err(|_| "Could not finish sharing. Try again.".to_string())?
     }
     #[cfg(not(mobile))]
     {
-        let _ = (app, markdown);
+        let _ = (app, markdown, kind);
         Err("Native sharing is unavailable on this platform.".into())
     }
 }

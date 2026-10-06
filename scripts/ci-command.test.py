@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise real exits and cancellation, not a mocked subprocess lifecycle."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -96,6 +97,101 @@ class CommandEvidence(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
+
+
+class RustProgressEvidence(unittest.TestCase):
+    def test_real_split_ansi_output_distinguishes_slow_and_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code = "import os,time;os.write(1,b'\\x1b[32mtest suite::slow has been running for over 60 seconds\\x1b[0m\\n');time.sleep(.1);os.write(1,b'test suite::');time.sleep(.1);os.write(1,b'done ... ok\\n')"
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', 'probe', '--rust', '--', sys.executable, '-c', code],
+                env={**os.environ, 'RUNNER_TEMP': tmp}, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads((Path(tmp) / 'ci-diagnostics/probe.json').read_text())
+            progress = data['rustProgress']
+            self.assertEqual(progress['lastCompletedTest']['name'], 'suite::done')
+            self.assertEqual([x['name'] for x in progress['reportedSlowTests']], ['suite::slow'])
+            self.assertFalse(progress['activeTestVisibilityComplete'])
+            self.assertGreaterEqual(progress['lastCompletedTest']['elapsedSeconds'], .1)
+            self.assertIn(b'\x1b[32m', (Path(tmp) / 'ci-diagnostics/probe.log').read_bytes())
+
+    def test_parser_bounds_lines_and_slow_population_and_clears_completed(self):
+        spec = importlib.util.spec_from_file_location('ci_command', SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(hasattr(module, 'RustProgress'), 'opt-in bounded Rust parser missing')
+        parser = module.RustProgress()
+        parser.feed(b'x' * 100000, 1)
+        parser.feed(b'\ntest good::one has been running for over 60 seconds\n', 2)
+        parser.feed(b'test good::one ... ok\n', 3)
+        for i in range(100):
+            parser.feed(f'test slow::{i} has been running for over 60 seconds\n'.encode(), 4)
+        result = parser.snapshot()
+        self.assertEqual(result['lastCompletedTest']['name'], 'good::one')
+        self.assertLessEqual(len(result['reportedSlowTests']), 32)
+        self.assertTrue(result['truncated'])
+        self.assertFalse(any(x['name'] == 'good::one' for x in result['reportedSlowTests']))
+        self.assertLessEqual(len(parser.pending), 8192)
+
+    def test_capture_failure_is_nonzero_and_missing_executable_is_127(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / 'ci-diagnostics'
+            folder.mkdir()
+            (folder / 'probe.log').mkdir()
+            result = CommandEvidence().run_command('import time;time.sleep(30)', tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(json.loads((folder / 'probe.json').read_text())['captureIncomplete'])
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', 'missing', '--', 'headstate-nonexistent-test-executable'],
+                env={**os.environ, 'RUNNER_TEMP': tmp}, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 127)
+            self.assertEqual(json.loads((folder / 'missing.json').read_text())['state'], 'spawn-failed')
+
+
+class DiagnosticLifecycle(unittest.TestCase):
+    def test_quiet_work_keeps_running_checkpoint_and_finishes_without_inactivity_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            driver = ("import importlib.util,sys;from pathlib import Path;"
+                      f"s=importlib.util.spec_from_file_location('c',{str(SCRIPT)!r});"
+                      "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+                      f"sys.exit(m.run(Path({tmp!r}),'quiet',[sys.executable,'-c','import time;time.sleep(1.6)'],rust=True,heartbeat_seconds=.1))")
+            proc = subprocess.Popen([sys.executable, '-c', driver], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    path = folder / 'quiet.json'
+                    data = json.loads(path.read_text()) if path.exists() else {}
+                    if data.get('elapsedSeconds', 0) >= .2: break
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                self.assertEqual(data['state'], 'running')
+                self.assertNotIn('exitCode', data)
+                self.assertNotIn('finishedAt', data)
+                self.assertIsNone(data['rustProgress']['lastCompletedTest'])
+                self.assertEqual(data['rustProgress']['reportedSlowTests'], [])
+                output, errors = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 0, errors)
+                self.assertIn(b'since output', output)
+                final = json.loads(path.read_text())
+                self.assertEqual(final['state'], 'completed')
+                self.assertEqual(final['exitCode'], 0)
+            finally:
+                if proc.poll() is None: proc.kill()
+                proc.communicate()
+
+    def test_persistence_failure_after_spawn_stops_owned_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ci-diagnostics/probe.tmp'
+            code = f'import os,time;from pathlib import Path;time.sleep(.2);Path({str(path)!r}).mkdir();print("running",flush=True);time.sleep(30)'
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', 'probe', '--rust', '--', sys.executable, '-c', code],
+                env={**os.environ, 'RUNNER_TEMP': tmp}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertLess(time.monotonic() - started, 7)
+            data = json.loads((Path(tmp) / 'ci-diagnostics/probe.json').read_text())
+            self.assertEqual(data['state'], 'running')
+            self.assertNotIn('exitCode', data)
+            with self.assertRaises(ProcessLookupError): os.kill(data['pid'], 0)
+            self.assertIn('CI evidence unavailable', result.stderr)
 
 
 if __name__ == '__main__':

@@ -43,6 +43,11 @@ import { assertRemoteReply, isRemoteEvent, remoteEventError } from "./wireContra
 /// the app suspends, and re-subscribing is how the phone catches up.
 const CLIENT_COMMANDS = new Set([
   "save_markdown",
+  "get_phone_measurement_prefs",
+  "set_phone_measurement_prefs",
+  "phone_measurement_status",
+  "record_phone_measurements",
+  "export_phone_measurements",
   "pair_from_qr",
   "unpair",
   "connection_state",

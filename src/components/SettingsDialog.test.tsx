@@ -37,7 +37,7 @@ const cleanupPrefs = vi.hoisted(() => ({
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
-vi.mock("../api/tauri", () => ({ revealLog: revealFn }));
+vi.mock("../api/tauri", () => ({ measurementStatus: () => new Promise(() => {}), exportMeasurements: vi.fn(), revealLog: revealFn }));
 vi.mock("./GitLabHostPanel", () => ({ GitLabHostPanel: () => <button>Save GitLab host</button> }));
 vi.mock("../api/hooks", () => ({
   // #1154. Undefined renders nothing, which is what these tests assume:
@@ -121,7 +121,7 @@ describe("SettingsDialog", () => {
     fireEvent.change(screen.getByLabelText(/directories to scan/i), {
       target: { value: "  /a  \n\n /b \n   " },
     });
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() => expect(setDirs).toHaveBeenCalledWith(["/a", "/b"]));
   });
 
@@ -130,7 +130,7 @@ describe("SettingsDialog", () => {
   it("shows the backend's error instead of closing", async () => {
     setDirs.mockImplementationOnce(() => Promise.reject("not a directory: /nope"));
     open();
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     expect(await screen.findByRole("alert")).toHaveProperty(
       "textContent",
       "not a directory: /nope",

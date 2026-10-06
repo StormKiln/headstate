@@ -184,7 +184,46 @@ pub fn read(conn: &Connection, now: DateTime<Utc>) -> Result<SessionDigest, rusq
     let registry = super::sessions::live_registry();
     let list = super::sessions::list_with(conn, &registry)?;
     let failures = newest_failures(conn)?;
-    Ok(assemble(&list, &registry, &failures, now))
+    Ok(assemble_measured(
+        &list,
+        &registry,
+        &failures,
+        now,
+        crate::measurement_desktop::recorder(),
+    ))
+}
+
+/// Observe the gathered sources before any display cap or classifier filter.
+pub(super) fn assemble_measured(
+    list: &SessionList,
+    registry: &Registry,
+    failures: &HashMap<String, Failure>,
+    now: DateTime<Utc>,
+    recorder: Option<&crate::measurement::Recorder>,
+) -> SessionDigest {
+    if let Some(r) = recorder.filter(|r| r.enabled()) {
+        for row in &list.sessions {
+            let entry = registry.entries.get(&row.session_id);
+            let running = matches!(row.liveness, ListLiveness::Running { .. });
+            let idle =
+                matches!(&row.liveness,ListLiveness::Running{status:Some(s),..} if s=="idle");
+            let busy =
+                matches!(&row.liveness,ListLiveness::Running{status:Some(s),..} if s=="busy");
+            r.failure_sample(
+                &row.session_id,
+                entry
+                    .filter(|_| running)
+                    .map(|e| (e.pid, e.proc_start.clone().unwrap_or_default())),
+                busy,
+                entry.filter(|_| idle).and_then(|e| e.status_since_ms()),
+                failures
+                    .get(&row.session_id)
+                    .and_then(|f| DateTime::parse_from_rfc3339(&f.at).ok())
+                    .map(|t| t.timestamp_millis()),
+            );
+        }
+    }
+    assemble(list, registry, failures, now)
 }
 
 /// The newest `StopFailure` per session. One query; `ORDER BY at` so the
@@ -487,7 +526,10 @@ mod tests {
             running("busy"),
             running("shell"),
             ListLiveness::Dead { why: 0 },
-            ListLiveness::Unknown { why: 0 },
+            ListLiveness::Unknown {
+                why: 0,
+                possible_processes: None,
+            },
         ] {
             let d = assemble(
                 &list(vec![list_row(
@@ -692,5 +734,160 @@ mod tests {
         assert_eq!(f["s1"].at, "2026-09-26T11:00:00Z");
         assert_eq!(f["s1"].error_type.as_deref(), Some("overloaded"));
         assert_eq!(f["s2"].error_type.as_deref(), Some("authentication_failed"));
+    }
+    #[tokio::test]
+    async fn pre_classifier_measurement_observes_both_arrival_orders_and_old_hook_without_changing_outcome(
+    ) {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        for hook_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let r = Recorder::new(Config {
+                directory: root.join("journal"),
+                epoch: [53; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap();
+            r.set_enabled(true);
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::migrate(&conn).unwrap();
+            let registry = registry("synthetic-session", IDLE_MS);
+            let busy = list(vec![list_row(
+                "synthetic-session",
+                running("busy"),
+                "2026-09-26T11:58:00Z",
+            )]);
+            let idle = list(vec![list_row(
+                "synthetic-session",
+                running("idle"),
+                "2026-09-26T11:58:00Z",
+            )]);
+            assemble_measured(&busy, &registry, &HashMap::new(), now(), Some(&r));
+            if !hook_first {
+                assemble_measured(&idle, &registry, &HashMap::new(), now(), Some(&r));
+            }
+            let hook_at = DateTime::from_timestamp_millis(IDLE_MS - 30_000)
+                .unwrap()
+                .to_rfc3339();
+            let path = root.join("handoff");
+            std::fs::write(&path,format!("{{\"v\":1,\"event\":\"StopFailure\",\"session_id\":\"synthetic-session\",\"ppid\":4242,\"ts\":\"{hook_at}\"}}\n")).unwrap();
+            super::super::handoff::consume_measured(
+                &mut conn,
+                &path,
+                super::super::handoff::Offset(0),
+                &HashMap::new(),
+                Some(&r),
+            )
+            .unwrap();
+            let failures = newest_failures(&conn).unwrap();
+            let expected = assemble(&idle, &registry, &failures, now());
+            let actual = assemble_measured(&idle, &registry, &failures, now(), Some(&r));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assemble_measured(&idle, &registry, &failures, now(), Some(&r));
+            let path = root.join("report");
+            r.export_to(path.clone()).await.unwrap();
+            crate::tests::preserve_test_export(
+                if hook_first {
+                    "hook-valid-first"
+                } else {
+                    "sample-valid-first"
+                },
+                &path,
+            );
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("\"delta_ms\":-30000"));
+            assert!(text.contains("out_of_window"));
+            assert_eq!(text.matches("\"observation\":\"sampled_idle\"").count(), 1);
+            assert!(!text.contains("synthetic-session"));
+        }
+    }
+    #[tokio::test]
+    async fn missing_hook_time_stays_unknown_after_store_fallback_and_digest_in_both_orders() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        for hook_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let r = Recorder::new(Config {
+                directory: root.join("journal"),
+                epoch: [53; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap();
+            r.set_enabled(true);
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::migrate(&conn).unwrap();
+            let registry = registry("synthetic-session", IDLE_MS);
+            let busy = list(vec![list_row(
+                "synthetic-session",
+                running("busy"),
+                "2026-09-26T11:58:00Z",
+            )]);
+            let idle = list(vec![list_row(
+                "synthetic-session",
+                running("idle"),
+                "2026-09-26T11:58:00Z",
+            )]);
+            assemble_measured(&busy, &registry, &HashMap::new(), now(), Some(&r));
+            if !hook_first {
+                assemble_measured(&idle, &registry, &HashMap::new(), now(), Some(&r));
+            }
+            let path = root.join("handoff");
+            std::fs::write(&path, "{\"v\":1,\"event\":\"StopFailure\",\"session_id\":\"synthetic-session\",\"ppid\":4242}\n").unwrap();
+            super::super::handoff::consume_measured(
+                &mut conn,
+                &path,
+                super::super::handoff::Offset(0),
+                &HashMap::new(),
+                Some(&r),
+            )
+            .unwrap();
+            let failures = newest_failures(&conn).unwrap();
+            let expected = assemble(&idle, &registry, &failures, now());
+            let actual = assemble_measured(&idle, &registry, &failures, now(), Some(&r));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assemble_measured(&idle, &registry, &failures, now(), Some(&r));
+            let path = root.join("report");
+            r.export_to(path.clone()).await.unwrap();
+            crate::tests::preserve_test_export(
+                if hook_first {
+                    "hook-missing-first"
+                } else {
+                    "sample-missing-first"
+                },
+                &path,
+            );
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(DateTime::parse_from_rfc3339(&failures["synthetic-session"].at).is_ok());
+            let comparisons: Vec<serde_json::Value> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .map(|v: serde_json::Value| v["event"].clone())
+                .filter(|v: &serde_json::Value| {
+                    matches!(
+                        v["observation"].as_str(),
+                        Some("candidate_pair" | "retrospective_pair")
+                    )
+                })
+                .collect();
+            assert!(!comparisons.is_empty());
+            assert!(
+                comparisons
+                    .iter()
+                    .all(|v| v.get("delta_ms").is_none_or(serde_json::Value::is_null)),
+                "stored fallback is not a source hook time: {comparisons:?}"
+            );
+            assert_eq!(text.matches("\"observation\":\"sampled_idle\"").count(), 1);
+            assert!(!text.contains("synthetic-session"));
+        }
     }
 }

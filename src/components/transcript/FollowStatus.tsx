@@ -15,6 +15,7 @@
 import type { TranscriptLive } from "@/api/hooks";
 import { commandError } from "@/lib/errorKind";
 import { positionLabel } from "@/lib/transcriptPages";
+import { PositionScrubber } from "./PositionScrubber";
 import { palette } from "./palette";
 
 /// "14:03:07" from epoch ms; the instant comes from the follow.
@@ -55,7 +56,7 @@ function followAnnouncement(
   }
 }
 
-export function FollowStatus({ live }: { live: TranscriptLive }) {
+export function FollowStatus({ live, seekPosition }: { live: TranscriptLive; seekPosition: (percent: number) => void }) {
   const at = live.lastReadAt === null ? null : clock(live.lastReadAt);
   let line: string | null;
   switch (live.status) {
@@ -86,6 +87,7 @@ export function FollowStatus({ live }: { live: TranscriptLive }) {
   const older = live.older;
   return (
     <>
+      <PositionScrubber seek={seekPosition} />
       <span role="status" className="sr-only" data-testid="transcript-follow-announce">
         {followAnnouncement(live)}
       </span>

@@ -1,3 +1,4 @@
+import { PossibleProcessEvidence } from "@/components/PossibleProcessEvidence";
 /// The transcript's session header (#1485): what the session is doing
 /// now, what it has cost so far, where it ran, and what can be done
 /// about it. One component for both hosts; the layout (`variant`) and
@@ -104,6 +105,7 @@ export function TranscriptHeader({
       <span role="status" className="sr-only">
         {waiting.tone === "now" ? <MaskedText text={waiting.label} /> : ""}
       </span>
+      <PossibleProcessEvidence liveness={d.liveness} />
       {live.detail ? (
         <p className="text-[11px] text-[#8b949e]" data-testid="transcript-header-liveness-why">
           {live.detail}

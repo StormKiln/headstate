@@ -130,3 +130,34 @@ it("accepts legacy absent detail qualification and validates positive detail gro
   expect(() => assertRemoteReply("get_reviewing", [qualified])).not.toThrow();
   expect(remoteEventError("reviewing-updated", [{ ...qualified, observation: { ...qualified.observation, detail_fields: ["invented"] } }])).not.toBeNull();
 });
+
+it("accepts additive possible-process detail and compact groups with old-host omissions", () => {
+  const liveness = { state: "unknown", why: 0 };
+  const row = { session_id: "s", name: null, opening_prompt: null, cwd: null, git_branch: null,
+    last_activity_at: null, liveness, cwd_state: { state: "not-recorded" }, kind: { kind: "own" },
+    subagents: 0, waiting: { state: "no", reason: "never-observed" }, context_pressure: null };
+  const base = { sessions: [row], reasons: ["uncertain"], registry_failure: null, registry_unreadable: [], registry_unnamed: [] };
+  expect(() => assertRemoteReply("claude_sessions", base)).not.toThrow();
+  const candidate = { pid: 42, cwd: null, cwd_truncated: false };
+  const modern = { ...base, possible_process_groups: [[candidate]], sessions: [{ ...row,
+    liveness: { ...liveness, possible_processes: { group: 0, total: 1 } } }] };
+  expect(() => assertRemoteReply("claude_sessions", modern)).not.toThrow();
+  const detail = { session_id: "s", claude_version: null, transcript_path: null, first_seen_at: "fixture-time",
+    liveness: { state: "unknown", why: "uncertain", possible_processes: { candidates: [candidate], total: 1 } },
+    transcript_state: { state: "not-recorded" }, resume: { command: "fixture", caveat: null, anchored: false }, runs: 0,
+    registry_failure: null, kind: { kind: "own" }, subagents: [], parent: null, unattributed: null,
+    compactions: null, agent_types: null, waiting: { state: "no", reason: "never-observed" } };
+  expect(() => assertRemoteReply("claude_session_detail", detail)).not.toThrow();
+  expect(() => assertRemoteReply("claude_sessions", { ...modern, possible_process_groups: [[{ ...candidate, pid: "private-sentinel" }]] })).toThrow();
+});
+
+it("accepts legacy Stats readbacks and validates optional native scope metadata",()=>{
+ const old={owner:{viewer:"synthetic",generation:1},viewer:"synthetic",scopeKey:"merged|*|all",window:{from:"2026-10-01",to:"2026-10-05"},stream:"sample",
+ measurement:{rows:[],repoCounts:[],total:null,retrieved:0,complete:false,truncatedSlices:[],refusedFields:0,slices:0,rounds:0,spend:{points:0,requests:0,unmetered:0,remaining:null,resetAt:null},slowest:[],largest:[],accumulated:0,accumulating:true,daysCovered:0,daysTotal:5}};
+ expect(()=>assertRemoteReply("stats_board_cached",old)).not.toThrow();
+ expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:1,id:2}})).not.toThrow();
+ expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:"invalid",id:2}})).toThrow(/measurementScope/);
+});
+it("keeps the remote preference acknowledgment legacy-null",()=>{
+ expect(()=>assertRemoteReply("set_ui_prefs",null)).not.toThrow();
+});

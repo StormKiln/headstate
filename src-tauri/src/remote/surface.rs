@@ -875,6 +875,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the phone because the poll its banner reports runs on the desktop,
     // and every part is already a Read on its own (`build_target`,
     // `tool_versions`, `read_log_tail`, `get_poll_interval`).
+    ("measurement_status", Class::Local),
+    ("measurement_export", Class::Local),
+    ("measurement_client_events", Class::Local),
     ("diagnostic_bundle", Class::Read),
     ("reveal_log", Class::Local),
     // Reveals a session's directory or transcript in the file manager
@@ -1534,7 +1537,9 @@ async fn call(
             a.get("worktreePath")?,
         )),
         "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?)),
-        "set_ui_prefs" => res(commands::set_ui_prefs(app.clone(), a.get("prefs")?)),
+        "set_ui_prefs" => {
+            res(commands::set_ui_prefs(app.clone(), a.get("prefs")?, None).map(|_| ()))
+        }
         "apply_updates_in_background" => res(commands::apply_updates_in_background(
             app.clone(),
             app.state(),
@@ -1870,6 +1875,20 @@ mod tests {
             RemoteError::Command(CommandError::classify("m")).http_status(),
             500
         );
+    }
+
+    #[test]
+    fn companion_measurement_commands_are_unknown_to_desktop_forwarding() {
+        for name in [
+            "get_phone_measurement_prefs",
+            "set_phone_measurement_prefs",
+            "phone_measurement_status",
+            "record_phone_measurements",
+            "export_phone_measurements",
+        ] {
+            assert_eq!(class_of(name), None);
+            assert_eq!(admit(name), Err(RemoteError::Unknown(name.to_string())));
+        }
     }
 
     #[test]

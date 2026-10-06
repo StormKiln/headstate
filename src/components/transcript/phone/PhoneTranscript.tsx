@@ -356,7 +356,7 @@ export function PhoneTranscript({
           className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
           style={{ color: palette.muted, ...scaleStyle(scale) }}
         >
-          <FollowStatus live={active} />
+          <FollowStatus live={active} seekPosition={jumps.seekPosition} />
           {note ? <span>{note}</span> : null}
           {canReveal ? (
             <button

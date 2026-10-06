@@ -301,6 +301,7 @@ export interface TranscriptBlockText {
 export type TranscriptPageAnchor =
   | { kind: "start" }
   | { kind: "end" }
+  | { kind: "position"; percent: number }
   | { kind: "cursor"; offset: number; behind_digest: string };
 
 /// Which way from the anchor: `before` is older messages.

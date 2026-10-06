@@ -186,6 +186,7 @@ export interface FollowSnapshot {
 }
 
 export interface FollowConfig {
+  observe?: (value: {phase: "follow" | "idle" | "hidden" | "evict"; rows?: number; resident_rows?: number}) => void;
   /// Most messages held; `MAX_RESIDENT` by default.
   maxResident?: number;
   /// What `relievePressure` keeps.
@@ -230,6 +231,7 @@ function pageOf(pages: readonly RemoteTranscriptWindow[], id: string): number {
 export class TranscriptFollower {
   private pages: RemoteTranscriptWindow[] = [];
   private attached = true;
+  private manualHold = false;
   private lastGrowthAt: number | null = null;
   private idleDelay = IDLE_MIN_MS;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -263,6 +265,7 @@ export class TranscriptFollower {
   /// at" would stop advancing while the poll kept going (#1525).
   private delivered: FollowSnapshot = this.snap;
   private readonly listeners = new Set<() => void>();
+  private readonly observe: NonNullable<FollowConfig["observe"]>;
   private readonly max: number;
   private readonly pressure: number;
   private readonly now: () => number;
@@ -275,6 +278,7 @@ export class TranscriptFollower {
     private readonly fetchPage: FetchPage,
     config: FollowConfig = {},
   ) {
+    this.observe = value => { try { config.observe?.(value); } catch { /* Observations cannot change reader behavior. */ } };
     this.max = config.maxResident ?? MAX_RESIDENT;
     this.pressure = config.pressureResident ?? PRESSURE_RESIDENT;
     this.now = config.now ?? Date.now;
@@ -322,6 +326,7 @@ export class TranscriptFollower {
   setVisible(visible: boolean): void {
     if (visible === this.visible) return;
     this.visible = visible;
+    if (!visible) this.observe({phase:"hidden",resident_rows:this.snap.messages?.length});
     if (!visible) this.cancelNavigation();
     this.kick();
   }
@@ -367,17 +372,49 @@ export class TranscriptFollower {
   /// "Jump to latest" from a run that no longer reaches the live edge:
   /// open on the newest page again.
   jumpToLatest(): Promise<void> {
-    this.cancelNavigation();
+    const generation = this.cancelNavigation();
     if (this.attached) return Promise.resolve();
     return this.enqueue(async () => {
-      const w = await this.read({ kind: "end" }, "before");
+      const w = await this.read({ kind: "end" }, "before", generation);
       if (w === null) return;
       this.pages = [w];
       this.attached = true;
+      this.manualHold = false;
       this.viewport = null;
       this.bump();
       this.publish();
     });
+  }
+
+  /// A percentage is resolved by the host; only its actual page can replace
+  /// the reader's content. Failure rejects; cancellation returns null. Both
+  /// preserve content and follow intent. An empty successful page has id:null.
+  seekPosition(percent: number): Promise<{ id: string | null } | null> {
+    const generation = this.cancelNavigation();
+    let result: { id: string | null } | null = null;
+    return this.enqueue(async () => {
+      if (!this.navigationCurrent(generation)) return;
+      if (!Number.isInteger(percent) || percent < 0 || percent > 100) {
+        const error = new Error("Choose a position between 0 and 100 percent.");
+        this.snap = { ...this.snap, error };
+        this.publish();
+        throw error;
+      }
+      const w = await this.read({ kind: "position", percent }, "after", generation);
+      if (!this.navigationCurrent(generation)) return;
+      if (w === null) {
+        this.publish();
+        throw this.snap.error;
+      }
+      this.pages = [w];
+      this.manualHold = true;
+      this.attached = false;
+      this.viewport = null;
+      this.snap = { ...this.snap, navigationNotice: null };
+      this.bump();
+      result = { id: w.page.messages[0]?.id ?? null };
+      this.publish();
+    }).then(() => this.navigationCurrent(generation) ? result : null);
   }
 
   /// A copy of the real page boundary; unavailable after its page is evicted.
@@ -433,7 +470,7 @@ export class TranscriptFollower {
       if (w !== null) {
         stale = w.rewritten;
         this.pages = [w];
-        this.attached = w.at_end;
+        this.attached = w.at_end && !this.manualHold;
         this.viewport = null;
         this.bump();
         if (stale) await this.reachBack(id, generation, budget);
@@ -684,6 +721,10 @@ export class TranscriptFollower {
   /// reader on the message they were looking at if it can be reached.
   private async replace(w: RemoteTranscriptWindow): Promise<void> {
     const target = this.viewport?.first ?? null;
+    if (this.manualHold) {
+      this.snap = { ...this.snap, error: new Error("The transcript changed. Choose a position again or jump to the latest.") };
+      return;
+    }
     this.pages = [w];
     this.attached = true;
     if (target !== null) await this.reachBack(target);
@@ -746,7 +787,7 @@ export class TranscriptFollower {
       await this.replace(w);
     } else {
       this.append(w);
-      if (w.at_end) this.attached = true;
+      if (w.at_end && !this.manualHold) this.attached = true;
       this.evict(this.max, "tail");
     }
     this.publish();
@@ -784,12 +825,14 @@ export class TranscriptFollower {
       // paging and memory pressure still drop the farther end.
       const dropTail =
         canHead && canTail ? !liveGrowth && shown !== null && n - 1 - shown.hi > shown.lo : canTail;
+      const dropped = this.pages[dropTail ? n - 1 : 0].page.messages.length;
       if (dropTail) {
         this.pages = this.pages.slice(0, -1);
         this.attached = false;
       } else {
         this.pages = this.pages.slice(1);
       }
+      this.observe({phase:"evict",rows:dropped,resident_rows:count(this.pages)});
     }
   }
 
@@ -877,6 +920,7 @@ export class TranscriptFollower {
     // no row re-renders.
     if (shallowEqual(next, this.delivered)) return;
     this.delivered = next;
+    this.observe({phase:!this.visible?"hidden":next.status === "idle"?"idle":"follow",resident_rows:messages?.length});
     for (const l of this.listeners) l();
   }
 }

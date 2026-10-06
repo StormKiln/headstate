@@ -12,9 +12,27 @@ use tokio::time::Instant;
 
 pub(super) const READ_BUDGET: Duration = Duration::from_secs(30);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub(super) struct ReadTransport {
+    pub(super) measurement: Option<std::sync::Arc<crate::measurement::Recorder>>,
     pub(super) admission: Admission,
+    pub(super) stats_measurement: crate::stats_measurement::Tracker,
+}
+
+impl std::fmt::Debug for ReadTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadTransport")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
+fn work(class: super::admission::ReadClass) -> crate::measurement::WorkClass {
+    match class {
+        super::admission::ReadClass::Foreground => crate::measurement::WorkClass::Foreground,
+        super::admission::ReadClass::Background => crate::measurement::WorkClass::Background,
+        super::admission::ReadClass::Advisory => crate::measurement::WorkClass::Unknown,
+    }
 }
 
 fn operation(body: &Value) -> &'static str {
@@ -51,14 +69,28 @@ fn map_error(error: octocrab::Error) -> ClientError {
 
 // The guard reports cancellation as well as completion: an outer operation
 // deadline dropping this future must not look like an unexplained missing end.
-struct RequestLog {
+struct RequestLog<'a> {
+    recorder: Option<&'a crate::measurement::Recorder>,
+    work: crate::measurement::WorkClass,
     id: u64,
     operation: &'static str,
     started: Instant,
     outcome: &'static str,
 }
-impl Drop for RequestLog {
+impl Drop for RequestLog<'_> {
     fn drop(&mut self) {
+        if let Some(recorder) = self.recorder {
+            recorder.aggregate(crate::measurement::AggregateDelta {
+                domain: crate::measurement::Domain::ReadTransport,
+                metric: if self.outcome == "cancelled" {
+                    crate::measurement::AggregateKind::Canceled
+                } else {
+                    crate::measurement::AggregateKind::Completed
+                },
+                work: self.work,
+                count: 1,
+            });
+        }
         crate::diag!(
             "[diag] provider read id={} operation={} outcome={} elapsed_ms={} budget_ms={}",
             self.id,
@@ -88,6 +120,26 @@ impl Read<'_> {
     }
 }
 impl ReadTransport {
+    pub(super) fn recorder(&self) -> Option<&crate::measurement::Recorder> {
+        match self.measurement.as_deref() {
+            Some(r) => Some(r),
+            None => crate::measurement_desktop::recorder(),
+        }
+    }
+    fn observe(&self, context: &ReadContext, metric: crate::measurement::AggregateKind) {
+        if let Some(recorder) = self.recorder() {
+            recorder.aggregate(crate::measurement::AggregateDelta {
+                domain: crate::measurement::Domain::ReadTransport,
+                metric,
+                work: if context.live.is_some() {
+                    crate::measurement::WorkClass::Unknown
+                } else {
+                    work(context.class)
+                },
+                count: 1,
+            });
+        }
+    }
     #[cfg(test)]
     pub(super) async fn post(&self, client: &Octocrab, body: &Value) -> Result<Value, ClientError> {
         self.post_with(
@@ -202,6 +254,12 @@ impl ReadTransport {
         #[cfg(feature = "enterprise-harness")]
         let mut logical = crate::enterprise_harness::metrics::Scope::new("logical-read", id);
         let mut log = RequestLog {
+            recorder: self.recorder(),
+            work: if context.live.is_some() {
+                crate::measurement::WorkClass::Unknown
+            } else {
+                work(context.class)
+            },
             id,
             operation,
             started: Instant::now(),
@@ -254,6 +312,14 @@ impl ReadTransport {
                     _ => "refused",
                 });
             }
+            self.observe(
+                &context,
+                if admitted.is_ok() {
+                    crate::measurement::AggregateKind::Admitted
+                } else {
+                    crate::measurement::AggregateKind::Refused
+                },
+            );
             let mut permit = admitted?;
             #[cfg(feature = "enterprise-harness")]
             queue.finish("admitted");
@@ -495,6 +561,104 @@ mod admission_tests {
             .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn measurement_counts_real_read_admission_completion_without_extra_http() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::new(Config {
+                directory: dir.path().canonicalize().unwrap().join("journal"),
+                epoch: [43; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let transport = ReadTransport {
+            measurement: Some(recorder.clone()),
+            ..Default::default()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"ok":true}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        transport
+            .post(
+                &client(&server).await,
+                &serde_json::json!({"query":"PRIVATE_QUERY"}),
+            )
+            .await
+            .unwrap();
+        let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+        recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("PRIVATE_QUERY"));
+        assert!(text.contains("\"metric\":\"admitted\""));
+        assert!(text.contains("\"metric\":\"completed\""));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn measurement_refusal_and_cancellation_preserve_one_issued_http_and_disabled_silence() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::new(Config {
+                directory: dir.path().canonicalize().unwrap().join("journal"),
+                epoch: [50; 16],
+                role: Role::Desktop,
+                platform: Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let transport = ReadTransport {
+            measurement: Some(recorder.clone()),
+            ..Default::default()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({"data":{}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+        let body = serde_json::json!({"query":"query Synthetic { viewer { login } }"});
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), transport.post(&client, &body))
+                .await
+                .is_err()
+        );
+        transport.admission.limit(Bucket::Graphql, 60, false);
+        assert!(transport.post(&client, &body).await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+        let first = recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("\"domain\":\"read_transport\""));
+        assert!(text.contains("\"metric\":\"canceled\""));
+        assert!(text.contains("\"metric\":\"refused\""));
+        recorder.set_enabled(false);
+        assert!(transport.post(&client, &body).await.is_err());
+        let second = recorder
+            .export_to(dir.path().canonicalize().unwrap().join("disabled.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(first.records, second.records);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[cfg(feature = "enterprise-harness")]

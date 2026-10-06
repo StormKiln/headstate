@@ -664,3 +664,97 @@ fn human(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
+
+/// Reuses preserved synthetic input, never rewrites it. No-index is a cold
+/// INDEX, not a cold filesystem cache. Native acquisition and JSON serialization
+/// are measured here; browser delivery/paint and physical phone costs are not.
+#[test]
+#[ignore]
+fn transcript_position_timings() {
+    use std::io::Write;
+    use std::time::Instant;
+    let input = std::path::PathBuf::from(
+        std::env::var_os("HEADSTATE_POSITION_INPUT").expect("preserved fixture input directory"),
+    );
+    let output = std::path::PathBuf::from(
+        std::env::var_os("HEADSTATE_POSITION_OUTPUT").expect("new output directory"),
+    );
+    std::fs::create_dir_all(&output).unwrap();
+    let mut measurements = Vec::new();
+    for name in [
+        "messages-1k",
+        "messages-10k",
+        "tool-heavy-70mb",
+        "huge-result-5mb",
+    ] {
+        let path = input.join(format!("{name}.jsonl"));
+        let began = Instant::now();
+        let ix =
+            transcript_page::build_index(&path, None, Instant::now() + Duration::from_secs(10))
+                .unwrap();
+        println!(
+            "position index {name}: {:.3} ms",
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+        for indexed in [false, true] {
+            for percent in [0, 50, 100] {
+                let mut times = Vec::new();
+                let mut answer = None;
+                for _ in 0..7 {
+                    let start = Instant::now();
+                    let result = transcript_page::read_page(
+                        &path,
+                        &PageAnchor::Position { percent },
+                        PageDirection::After,
+                        None,
+                        if indexed {
+                            IndexUse::Given(&ix)
+                        } else {
+                            IndexUse::None
+                        },
+                    );
+                    times.push(start.elapsed().as_secs_f64() * 1000.0);
+                    answer = Some(result);
+                }
+                times.sort_by(f64::total_cmp);
+                let mut row = serde_json::json!({"fixture":name,"indexed":indexed,"percent":percent,"medianMs":times[3]});
+                match answer.unwrap() {
+                    Ok(w) => {
+                        assert!(w.page.bytes_read <= transcript_page::POSITION_READ_BOUND);
+                        row["bytesRead"] = w.page.bytes_read.into();
+                        row["bytesScanned"] = w.bytes_scanned.into();
+                        row["messages"] = w.page.messages.len().into();
+                        row["basis"] = serde_json::to_value(w.position.basis).unwrap();
+                        let start = Instant::now();
+                        let payload = serde_json::to_vec(&w).unwrap();
+                        row["serializationMs"] = (start.elapsed().as_secs_f64() * 1000.0).into();
+                        row["payloadBytes"] = payload.len().into();
+                        if indexed {
+                            let dest = output.join(format!("{name}.position-{percent}.json"));
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(dest)
+                                .unwrap()
+                                .write_all(&payload)
+                                .unwrap();
+                        }
+                    }
+                    Err(error) => {
+                        row["error"] = error.into();
+                    }
+                }
+                println!("{row}");
+                measurements.push(row);
+            }
+        }
+    }
+    let dest = output.join("position-measurements.json");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .unwrap()
+        .write_all(&serde_json::to_vec_pretty(&measurements).unwrap())
+        .unwrap();
+}

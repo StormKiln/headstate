@@ -1,3 +1,6 @@
+import { observeTranscript } from "./transcriptMeasurement";
+import { beginCaptureWrite, acceptCaptureWrite } from "./measurementCapture";
+import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
 import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
 import { useStatsDemand } from "./useStatsDemand";
 import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
@@ -5,15 +8,15 @@ import { useDetailSourceGeneration, detailSourceGeneration, beginDetailRead, det
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
-import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, QueryClientContext, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
-import { clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
+import { invalidateSourceMeasurements, clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
-import { useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useContext, useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   AlertReport,
   ClaudeMdAdviceMode,
@@ -1523,6 +1526,10 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
                 why: `the reason for this session's state did not arrive (index ${s.liveness.why} of ${wire.reasons.length})`,
               }
             : { state: s.liveness.state, why: reason };
+        if (s.liveness.state === "unknown" && liveness.state === "unknown") {
+          const evidence = hydratePossibleProcesses(s.liveness.possible_processes, wire.possible_process_groups);
+          if (evidence) liveness.possible_processes = evidence;
+        }
       }
       return {
         session_id: s.session_id,
@@ -1650,12 +1657,18 @@ export function useClaudeTranscriptLive(
   },
 ) {
   const { liveness, enabled = true, reveal = false, openAt = null, openAtCursor = null, sessionId = null, watchActivity = false } = options;
+  const measurementClient = useContext(QueryClientContext);
   const on = enabled && path !== null && path !== "";
   const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
   const make = () =>
     new TranscriptFollower(
-      (anchor, direction) => claudeTranscriptPage(path as string, anchor, direction, null, reveal),
-      { openAt, openAtCursor },
+      async (anchor, direction) => {
+        const started = performance.now();
+        const page = await claudeTranscriptPage(path as string, anchor, direction, null, reveal);
+        observeTranscript(measurementClient,{phase:"page",rows:page.page.messages.length,elapsed_ms:Math.max(0,Math.round(performance.now()-started))});
+        return page;
+      },
+      { openAt, openAtCursor, observe:value=>observeTranscript(measurementClient,value) },
     );
   // A follower belongs to ONE file: a cursor is an offset into it. A new
   // path is a new follower, swapped during render so the pane never
@@ -1712,6 +1725,7 @@ export function useClaudeTranscriptLive(
       refresh: () => follower.refresh(),
       setViewport: (first: string, last: string) => follower.setViewport(first, last),
       seek: (id: string, at: PageCursor | null) => follower.seek(id, at),
+      seekPosition: (percent: number) => follower.seekPosition(percent),
       cursorFor: (id: string) => follower.cursorFor(id),
       loadOlderUntil: (wanted: (m: TranscriptMessage) => boolean) =>
         follower.loadOlderUntil(wanted),
@@ -4495,6 +4509,9 @@ export function useBackgroundPanicked(): boolean {
   return query.data === true;
 }
 
+// Product publication follows successful writes, not merely requested writes.
+// One high-water mark per client: failures require no retained request history.
+const uiPrefsSuccessfulWrites = new WeakMap<QueryClient, number>();
 export function useUiPrefs() {
   const qc = useQueryClient();
   const query = useQuery({
@@ -4502,10 +4519,17 @@ export function useUiPrefs() {
     queryFn: getUiPrefs,
     staleTime: Infinity,
   });
-  const set = (prefs: UiPrefs) =>
-    setUiPrefs(prefs).then(() => {
-      qc.setQueryData(["ui-prefs"], prefs);
+  const set = (prefs: UiPrefs) => {
+    const serial = beginCaptureWrite(qc);
+    return setUiPrefs(prefs, true).then(capture => {
+      acceptCaptureWrite(qc, serial, IS_MOBILE_BUILD ? null : capture);
+      invalidateSourceMeasurements(qc);
+      if (serial > (uiPrefsSuccessfulWrites.get(qc) ?? 0)) {
+        uiPrefsSuccessfulWrites.set(qc, serial);
+        qc.setQueryData(["ui-prefs"], prefs);
+      }
     });
+  };
   return { prefs: query.data, set };
 }
 

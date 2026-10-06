@@ -6,20 +6,47 @@ virtualization choice in the viewer-shell issue (#1479) and the memory window
 in the live-follow issue (#1476). Neither choice should be made without these
 numbers.
 
-**Status.** The fixtures, the Rust read bench, the receive-side parse bench
-and the browser harness are in place. The 8.2 run below measures twelve
-production windows, plus follow/growth in Chromium, and estimates B5 from
-historical real-text compression ratios. A bounded own-PID WKWebView runner
-is available but its locked/occluded execution produced no timing samples. Nothing is
-yet confirmed in WKWebView, and every phone figure is still **not
-measured**, not "passing". The 8.1 corrections and retest below cover exact
-paint timing, grown-file reads, idle controls, large-page mounting, and
-retention during eviction. The dated 2026-09-27 tables are historical.
+**Status (9.2).** The original locked/occluded native run was unavailable,
+but it is no longer the latest native evidence: twelve later visible owned-process
+WKWebView runs produced qualified open/append proxies. They do not certify native
+budgets or physical-phone performance. The 9.2 additions measure indexed position
+reads and mounted Chromium control proxies; the field journal records native
+read/client/RAF layers without claiming physical paint. Follow the
+[9.2 owner field guide](release-9.2-field-testing.md). #1487 remains open.
 
-## Current 8.2 results — 2026-10-01
+## Later visible native evidence and 9.2 position measurements
+
+The preserved 8.2 `native-unlocked-results.md` records three fresh owned-process
+runs for each of four synthetic fixtures on Apple M2 Max/macOS26.6.2 at1280×800.
+All retained visible-window and stable host/WebContent PID qualification. Open
+DOM-ready/double-rAF medians were **160,156,145,70ms** (1k,10k,70MiB,huge-result);
+one opening reached **306ms**. Append medians were **96,97,92,47ms**. OS caches
+were not cleared; the harness was already running. These are paint-opportunity
+proxies, not compositor presentation or an application-startup measurement.
+WebContent RSS baseline/open/idle ranges were separately attributed; whole-process
+RSS/footprint is not JS heap or transcript allocations. The earlier zero-sample
+run below remains historical evidence, not a statement that no native samples exist.
+
+For9.2, release-profile position reads measured24 synthetic cases (four preserved
+files ×start/middle/end ×no-index/ready-index), seven warm acquisitions each.
+Ready-index12/12 succeeded, medians **0.828–21.671ms**; no-index11/12 succeeded,
+medians **0.822–21.860ms**. Huge-result middle correctly refused bounded alignment
+in **0.039ms**. Maximum held reads were466945 bytes; oversized-record streaming
+still reached21185083 bytes. No-index means no position index, not cold OS storage.
+The24 mounted Chromium desktop/phone-layout control cases made exactlyone position
+request each; control-to-two-frame proxy was **30.0–124.8ms**, one sample/case,
+using preloaded real native indexed payloads. This excludes native/network/decode
+delivery, is not Element Timing, and is not WKWebView or a physical iPhone.
+Raw evidence is retained in the release workspace's
+`artifacts/release-9.2-build/scrubber-position-measurements-final/` and associated
+`scrubber-*-final.log` files. No new physical-device measurements are claimed here.
+Exact native CPU/heap/presentation, older navigation/eviction and physical-phone/LAN
+budgets remain unmeasured. The historical tables below retain their original scope.
+
+## Historical 8.2 results — 2026-10-01
 
 The [full measured tables and method](transcript-performance-8.2-results.md)
-are the current production-window baseline. One opening sample per window,
+are the historical 8.2 production-window baseline. One opening sample per window,
 Apple M2 Max/macOS 26.6.2, Chromium headless shell 153; timings exclude app
 startup/native transport and use mock IPC with actual production payloads.
 No competing build ran during measurement. These results retain the bounded
@@ -33,7 +60,7 @@ viewer/eviction design; they do not establish WKWebView or phone acceptance.
 | B4 idle/visibility/nudge | 656–685B/read; 1.45–2.54ms script/read in measured read phases; zero idle row mutations/long tasks; zero hidden/same-size-nudge reads; new-byte nudge 3.4ms | mock IPC serialization included; status work is nonzero; hidden state simulated for the production hook |
 | B4 growth/retention | live readers appended 3,240/3,245 messages, retained 25/40 and 34/55 growth pages; parked readers detached at page 21/31 and rejoined | all four page-granular residency checks pass; at most 300 DOM rows mounted; subsequent growth spans explicitly synthetic |
 | B5 <150KB compressed | 2.7–57.2KB at historical worst ratio; 5.7–120.7KB uncompressed JSON | estimate across twelve windows, not measured LAN bytes; over-budget estimates now fail the driver |
-| Native desktop / physical phone | unavailable / unmeasured | owned native window hidden/occluded; no valid native timing samples, no device acceptance |
+| Original native run / physical phone | unavailable / unmeasured | original owned window hidden/occluded; later visible proxies are summarized above; no device acceptance |
 
 The unchanged Rust reader was separately measured in release mode: newest
 page medians **1.08, 1.07, 0.94, 20.82ms** for 1k, 10k, 70MiB and 5MiB-result
@@ -48,10 +75,10 @@ or native receive latency.
 `make bench-transcript-native` now provides a [bounded own-PID WKWebView
 probe](../scripts/transcript-native/README.md), with separate host/WebContent
 RSS and physical-footprint samples and open/append/idle paint-opportunity
-proxies. Actual compiled execution returned **exit 3, unavailable**, because
+proxies. The original compiled execution returned **exit 3, unavailable**, because
 the window was hidden/occluded/inactive; zero samples were accepted. It never
 substitutes host RSS for renderer memory or compositor timing for double-rAF.
-A successful future proxy run still does not certify native budgets. Exact
+The later successful visible proxy runs above still do not certify native budgets. Exact
 heap/CPU/presentation, native older navigation/eviction and all physical-phone
 measurements remain outstanding under the checklists below. #1487's device
 acceptance is therefore not declared complete.
@@ -842,3 +869,61 @@ The Task 7 migration itself recorded no replacement timings. Task 10
 measurements below use the final export/accessibility renderer. Historical
 400-message stress results, B5 compression estimates, and actual-device
 limitations remain qualified as originally measured.
+
+## 9.2 conservative masking pre-check — 2026-10-06 (#1531)
+
+A byte-only necessary-condition check now skips the existing sixteen regexes
+for text that cannot contain any of their shapes. The original ordered regex,
+keep predicates, overlap merging, markers and counts are unchanged. Punctuation
+(`-`, `_`, `:`, `=`), AWS/Google/JWT prefixes and case-insensitive ASCII `Bearer`
+still enter the original engine. This deliberately accepts false positives;
+it does not add secret policy or require long GitHub tokens (`ghp_a` still masks).
+
+Fresh release-profile measurements on Apple M2 Max/macOS 26.6.2, without a
+concurrent build/benchmark: eleven interleaved original/candidate pairs per
+corpus, reversing order each pair. Regexes and input were warm; OS caches were
+not cleared. Inputs are synthetic, with SHA-256 input/output and mask counts
+checked equal. These are masking microbenchmarks, not app/phone paint timings.
+
+| Corpus | Bytes / masked spans | Original min / median / max ms | Fast-path min / median / max ms |
+|---|---:|---:|---:|
+| Safe prose with Unicode/CRLF | 1,556,480 / 0 | 63.340 / 63.837 / 64.750 | 1.355 / 1.368 / 1.383 |
+| Punctuation/code/URL prose | 2,097,152 / 0 | 11.213 / 11.304 / 11.355 | 11.207 / 11.313 / 11.407 |
+| Dense synthetic secrets | 821,248 / 28,673 | 12.605 / 12.831 / 13.227 | 12.722 / 12.920 / 13.048 |
+
+Before applying the optimization, the original-vs-wrapper baseline median
+ratios differed by less than 1%. The predeclared retention criterion was an
+improvement for safe prose and no more than 5% median overhead for punctuation
+or dense secrets against the same-binary reference. Actual fallback changes
+were +0.08% and +0.70%. The ~46.7× safe-prose microbenchmark improvement is
+specific to this corpus; punctuation-heavy text generally takes the fallback.
+
+Separate before/after generated 10k-message and 70MiB transcript runs rebuilt
+indexes from `None` three times (warm filesystem, not cold storage) and ran
+five samples of each masked/unmasked find for `widget`, `zzzabsentzzz`, and
+`hidden`. All hit counts/completeness/limit outcomes agreed. For example,
+70MiB absent masked find medians were 373.970→360.987ms and `hidden` masked
+520.014→513.338ms; hit-limited `widget` masked was 23.110→24.238ms. Index
+medians were 122.402→119.370ms (10k) and 251.449→269.588ms (70MiB). Index
+construction does not call this masker; those separate-run changes are not
+attributed improvements/regressions of masking. There is no demonstrated
+universal find/index speedup or device-budget certification.
+
+Reproduce deliberately with a fresh retained output directory and the same
+release toolchain/profile (never alongside another benchmark):
+
+```sh
+HEADSTATE_MASK_BENCH_OUT=/absolute/fresh-mask-run \
+  cargo test --release --manifest-path src-tauri/Cargo.toml --lib \
+  remote::privacy::fast_path_tests::masking_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test-only reference calls the original engine, not a copied algorithm.
+Tests pin the ordered policy fingerprint and one witness per shape, plus
+4,096 generated mixed Unicode/CRLF/overlap/placeholder cases. All retained
+raw logs, baseline source/hash provenance, generated fixtures and analysis
+are under `artifacts/release-9.2-build/masking-*` in the release workspace.
+The corpus is synthetic and must not be replaced with private transcripts in
+published benchmark evidence. Historical native/phone acceptance qualifications
+above remain unchanged.

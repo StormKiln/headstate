@@ -361,7 +361,7 @@ fn not_running<P: ProcessProbe>(
     let own = runs.get(session_id).map(Vec::as_slice).unwrap_or(&[]);
     match derive_at(probe, registry, &unnamed, session_id, None, own) {
         Liveness::Running { pid, .. } => Refusal::RunningUnconfirmable { pid },
-        Liveness::Unknown { why } => Refusal::Unconfirmable {
+        Liveness::Unknown { why, .. } => Refusal::Unconfirmable {
             why: format!("Headstate could not determine whether this session is running: {why}"),
         },
         Liveness::Dead { .. } => Refusal::NotRunning { why },

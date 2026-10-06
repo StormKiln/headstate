@@ -2,6 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>UTExportedTypeDeclarations</key>
+  <array><dict>
+    <key>UTTypeIdentifier</key><string>com.pktstorm.headstate.measurements-jsonl</string>
+    <key>UTTypeDescription</key><string>Headstate measurement report</string>
+    <key>UTTypeConformsTo</key><array><string>public.text</string></array>
+    <key>UTTypeTagSpecification</key><dict>
+      <key>public.filename-extension</key><array><string>jsonl</string></array>
+      <key>public.mime-type</key><string>application/x-ndjson</string>
+    </dict>
+  </dict></array>
   <!-- Merged into the generated Xcode project's Info.plist by the Tauri
        CLI. LAN discovery of the paired desktop (#511): without this key
        iOS silently drops every multicast and every connection to a

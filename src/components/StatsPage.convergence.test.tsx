@@ -1,5 +1,6 @@
+import { preserveMeasurement } from "../../scripts/measurement-evidence.mjs";
 import { StrictMode } from "react";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 const seam = vi.hoisted(() => ({ call: vi.fn(), callbacks: new Map<string, Set<(event: {payload: unknown}) => void>>() }));
@@ -10,6 +11,7 @@ vi.mock("../api/transport", async original => ({ ...await original<Record<string
   }),
 }));
 vi.mock("../store/filters", () => ({ useActiveFilters: () => ({statsScopeKind:"org",statsScopeValue:"synthetic-lab"}), useFilters: () => ({setFilter:vi.fn(),setPanel:vi.fn()}) }));
+import { useUiPrefs } from "../api/hooks";
 import { StatsPage } from "./StatsPage";
 const owner={viewer:"synthetic-viewer",generation:1};
 const scopeKey="merged|*|org:synthetic-lab";
@@ -18,7 +20,9 @@ const spend={points:0,requests:0,unmetered:0,remaining:null,resetAt:null};
 function measurement(count=50,complete=false,total:number|null=250) { return {rows:[{login:owner.viewer,prs:count,additions:count,deletions:0,changedFiles:count,reviewsReceived:0,cycleTimeHours:[]}],total,retrieved:50,complete,truncatedSlices:[],refusedFields:0,slices:1,rounds:1,spend,slowest:[],largest:[],repoCounts:[{repo:`synthetic-lab/${complete?'finished':'initial'}`,merged:count}],accumulated:count,accumulating:true,daysCovered:complete?30:0,daysTotal:30}; }
 function mount(initial=measurement(), strict=false, pending?:Promise<unknown>) {
  const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
+ qc.setQueryData(["ui-prefs"], {diagnostic_logging:true});
  seam.call.mockImplementation((name:string)=>{
+  if(name==='measurement_client_events')return Promise.resolve();
   if(name==='stats_board')return pending??Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',...initial,backfill:{state:'registered',owner,lastFrame:null}});
   if(name==='stats_board_cached')return Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',measurement:measurement(250,true)});
   if(name==='stats_tree')return Promise.resolve({viewer:owner.viewer,orgs:[],repos:[]});
@@ -85,4 +89,53 @@ it("reconciles final progress received before the initial normal board settles e
  await act(async()=>{for(const callback of seam.callbacks.get('stats-backfill-progress')??[])callback({payload});});
  expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board')).toHaveLength(1);
  expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(1);qc.clear();
+});
+
+it("observes the actual mounted Stats publication without adding a provider request",async()=>{
+ const scope={epoch:'synthetic-epoch',capture:1,id:2};
+ const initial={...measurement(),measurementScope:scope};
+ const qc=mount(initial);await screen.findByText('synthetic-lab/initial');
+ await waitFor(()=>expect(seam.call.mock.calls.some(c=>c[0]==='measurement_client_events'&&JSON.stringify(c[1]).includes('stats_view'))).toBe(true));
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board')).toHaveLength(1);
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(0);
+ const batches=seam.call.mock.calls.filter(c=>c[0]==='measurement_client_events');
+ expect(batches.flatMap(c=>c[1].batch)).toContainEqual(expect.objectContaining({observation:'mounted',rows:1,outcome:'accepted'}));
+ expect(JSON.stringify(batches)).not.toContain('synthetic-viewer');
+ expect(JSON.stringify(batches)).not.toContain('synthetic-lab');
+ preserveMeasurement("mounted-stats", batches.flatMap(c=>c[1].batch));
+ qc.clear();
+});
+
+it("keeps cached mounted Stats unlinked across capture toggles and remount until a fresh accepted scope",async()=>{
+ const old={epoch:"synthetic",capture:1,id:1};
+ const initial={...measurement(),measurementScope:old};
+ const qc=mount(initial);
+ await screen.findByText("synthetic-lab/initial");
+ const wrapper=({children}:{children:React.ReactNode})=><QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+ const prefs=renderHook(()=>useUiPrefs(),{wrapper});
+ const original=seam.call.getMockImplementation()!;
+ let current={epoch:"synthetic",capture:1};
+ seam.call.mockImplementation((name,...args)=>name==="set_ui_prefs"?Promise.resolve(current):original(name,...args));
+ await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:false});});
+ const previous=seam.call.mock.calls.filter(c=>c[0]==="measurement_client_events").length;
+ current={...current,capture:2};
+ await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true});});
+ await waitFor(()=>expect(seam.call.mock.calls.filter(c=>c[0]==="measurement_client_events").length).toBeGreaterThan(previous));
+ const events=()=>seam.call.mock.calls.filter(c=>c[0]==="measurement_client_events").flatMap(c=>c[1].batch).filter(e=>e.kind==="stats_view");
+ expect(events().at(-1)?.scope).toBeUndefined();
+ expect(seam.call.mock.calls.filter(c=>c[0]==="stats_board")).toHaveLength(1);
+ expect(seam.call.mock.calls.filter(c=>c[0]==="stats_board_cached")).toHaveLength(0);
+ cleanup(); render(<StatsPage/>,{wrapper});
+ await screen.findByText("synthetic-lab/initial");
+ expect(events().at(-1)?.scope).toBeUndefined();
+ await act(async()=>{});
+ const cacheReads=seam.call.mock.calls.filter(c=>c[0]==="stats_board_cached").length;
+ const fresh={...current,id:4};
+ seam.call.mockImplementation((name,...args)=>name==="stats_board_cached"?Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:"synthetic-stream",measurementScope:fresh,measurement:measurement(250,true)}):original(name,...args));
+ await act(async()=>{for(const callback of seam.callbacks.get('stats-backfill-progress')??[])callback({payload:{owner,scopeKey,daysCovered:30,daysTotal:30,collected:250,total:250,phase:{kind:'converged'},nextTickAtMs:null,observation:{...window,stream:'synthetic-stream',sequence:1,cacheChange:1}}});});
+ await screen.findByText("synthetic-lab/finished");
+ await waitFor(()=>expect(events().at(-1)?.scope).toEqual(fresh));
+ expect(seam.call.mock.calls.filter(c=>c[0]==="stats_board")).toHaveLength(1);
+ expect(seam.call.mock.calls.filter(c=>c[0]==="stats_board_cached")).toHaveLength(cacheReads+1);
+ qc.clear();
 });

@@ -301,6 +301,9 @@ const ROWS: Row[] = [
   row(api.toolVersions, [], "tool_versions"),
   row(api.readLogTail, [4096], "read_log_tail", { maxBytes: 4096 }),
   row(api.revealLog, [], "reveal_log"),
+  row(api.measurementStatus, [], "measurement_status"),
+  row(api.exportMeasurements, [], "measurement_export"),
+  row(api.recordClientMeasurements, [[]], "measurement_client_events", { batch: [] }),
   row(api.diagnosticBundle, [], "diagnostic_bundle"),
   row(api.claudeMdEffective, [repoPath], "claude_md_effective", { repoPath }),
   // `mode` is omitted by the caller and sent as explicit `null` (#1293):
@@ -539,6 +542,11 @@ describe("tauri.ts wrappers through the transport", () => {
   /// dropped on the way out, that row would still pass and Refresh
   /// (#1293) would silently be a cached read -- a no-op exactly when a
   /// user presses it.
+  it("negotiates capture metadata only with the local same-version preference setter", async () => {
+    await api.setUiPrefs(uiPrefs, true);
+    expect(local.call).toHaveBeenCalledWith("set_ui_prefs", {prefs:uiPrefs,measurementCapture:true});
+  });
+
   it("sends the advice mode the caller chose", async () => {
     await api.claudeMdAdvice("/repos/hello-world", "fresh");
     expect(local.call).toHaveBeenCalledWith("claude_md_advice", {
@@ -579,6 +587,18 @@ describe("tauri.ts wrappers through the transport", () => {
   /// than omitting the keys -- the same shape `respondToPairing` uses
   /// for its optional argument, so the wire is not two shapes depending
   /// on what the caller passed.
+  it("sends the typed percentage anchor once and preserves old-host rejection without a latest fallback", async () => {
+    await api.claudeTranscriptPage("/p.jsonl", { kind: "position", percent: 50 }, "after", null);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_page", {
+      path: "/p.jsonl", anchor: { kind: "position", percent: 50 }, direction: "after", limit: null,
+    });
+    local.call.mockRejectedValueOnce(new Error("unknown variant position"));
+    await expect(api.claudeTranscriptPage("/p.jsonl", { kind: "position", percent: 20 }, "after", null))
+      .rejects.toThrow("unknown variant position");
+    expect(local.call).toHaveBeenCalledTimes(2);
+    expect(local.call.mock.calls.every(([, args]) => (args?.anchor as { kind: string }).kind === "position")).toBe(true);
+  });
+
   it("sends null terms when the caller chooses none", async () => {
     await api.claudeLaunchSession("sess-1", "/tmp/x");
     expect(local.call).toHaveBeenCalledWith("claude_launch_session", {
@@ -736,6 +756,14 @@ describe("transport selection", () => {
     const cb = () => {};
     await mod.listen("prs-updated", cb);
     expect(remote.listen).toHaveBeenCalledWith("prs-updated", cb);
+  });
+
+  it("keeps preference writes legacy-compatible on older remote hosts without retry", async () => {
+    vi.stubEnv("VITE_TARGET", "mobile"); vi.resetModules();
+    const mod = await import("./tauri");
+    await mod.setUiPrefs(uiPrefs, true);
+    expect(remote.call).toHaveBeenCalledExactlyOnceWith("set_ui_prefs", {prefs:uiPrefs});
+    expect(local.call).not.toHaveBeenCalled();
   });
 
   it("refuses a target it does not know", async () => {

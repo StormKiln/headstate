@@ -36,6 +36,7 @@
 //! of connection state is also emitted as the `connection-state` event
 //! with the same object `connection_state` returns.
 
+// Platform-neutral core only; phone preference/share adapters land separately.
 pub mod background;
 mod client;
 mod companion;
@@ -43,12 +44,15 @@ mod connection;
 pub mod discovery;
 mod events;
 mod keys;
+#[path = "../../src-tauri/src/measurement/mod.rs"]
+pub mod measurement;
 /// The constants this crate shares with the desktop, asserted against the
 /// desktop's own source (#854). Test-only.
 #[cfg(test)]
 mod mirrored;
 pub mod notify;
 mod pairing;
+mod phone_measurement;
 mod stepup;
 mod store;
 mod surface;
@@ -166,6 +170,7 @@ fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         keys::HardwareKeys::new(app.handle().clone()),
         keys::SoftwareKeys::new(store.clone()),
     ));
+    phone_measurement::initialize(app, store.clone(), dir.clone());
     let companion = Companion::new(
         store,
         keys,
@@ -233,6 +238,11 @@ pub fn run() {
         .plugin(tauri_plugin_headstate_export::init())
         .invoke_handler(tauri::generate_handler![
             save_markdown,
+            phone_measurement::get_phone_measurement_prefs,
+            phone_measurement::set_phone_measurement_prefs,
+            phone_measurement::phone_measurement_status,
+            phone_measurement::record_phone_measurements,
+            phone_measurement::export_phone_measurements,
             pair_from_qr,
             unpair,
             connection_state,

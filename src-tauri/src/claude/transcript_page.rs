@@ -138,6 +138,9 @@ pub const PAGE_READ_BOUND: u64 = PAGE_BYTES
     + SEED_LOOKBACK_BYTES
     + 3 * (CURSOR_FINGERPRINT_BYTES + 1);
 
+/// Percentage alignment and complete-tail validation each read at most 64 KiB.
+pub const POSITION_READ_BOUND: u64 = PAGE_READ_BOUND + 2 * SEED_LOOKBACK_BYTES;
+
 /// Where a page is read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -147,6 +150,8 @@ pub enum PageAnchor {
     /// The end of the last complete record. A record still being written
     /// is not read, `preview::follow`'s case 3.
     End,
+    /// An estimated percentage resolved against this read’s current index.
+    Position { percent: u8 },
     /// A cursor a previous page returned, handed back unread.
     Cursor { offset: u64, behind_digest: String },
 }
@@ -274,7 +279,55 @@ pub fn page(
     direction: PageDirection,
     limit: Option<usize>,
 ) -> Result<TranscriptWindow, String> {
-    read_page(path, anchor, direction, limit, IndexUse::Cached)
+    page_observed(
+        path,
+        anchor,
+        direction,
+        limit,
+        crate::measurement_desktop::recorder(),
+    )
+}
+pub(crate) fn page_observed(
+    path: &Path,
+    anchor: &PageAnchor,
+    direction: PageDirection,
+    limit: Option<usize>,
+    recorder: Option<&crate::measurement::Recorder>,
+) -> Result<TranscriptWindow, String> {
+    use crate::measurement::{
+        AggregateDelta, AggregateKind, Capability, Domain, Event, TranscriptPhase, WorkClass,
+    };
+    let Some(recorder) = recorder.filter(|r| r.enabled()) else {
+        return read_page(path, anchor, direction, limit, IndexUse::Cached);
+    };
+    let recorder = Some(recorder);
+    let operation = recorder.and_then(|r| r.next_operation(None));
+    let started = std::time::Instant::now();
+    let result = read_page(path, anchor, direction, limit, IndexUse::Cached);
+    if let (Some(r), Some(operation)) = (recorder, operation) {
+        let window = result.as_ref().ok();
+        r.record(Event::Transcript {
+            operation: operation.clone(),
+            phase: TranscriptPhase::Read,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).ok(),
+            bytes: window.and_then(|w| r.measured_count(w.page.bytes_read)),
+            rows: window.and_then(|w| r.measured_count(w.page.messages.len() as u64)),
+            resident_rows: None,
+            capability: if window.is_some() {
+                Capability::Measured
+            } else {
+                Capability::Unmeasured
+            },
+        });
+        r.aggregate(AggregateDelta {
+            domain: Domain::Transcript,
+            metric: AggregateKind::Completed,
+            work: WorkClass::Foreground,
+            count: 1,
+        });
+        r.retire(&operation);
+    }
+    result
 }
 
 /// Which position index a read consults. `None` and `Given` are the
@@ -296,13 +349,40 @@ pub(crate) fn read_page(
     limit: Option<usize>,
     index: IndexUse,
 ) -> Result<TranscriptWindow, String> {
+    if matches!(anchor, PageAnchor::Position { percent } if *percent > 100) {
+        return Err("Transcript position must be between 0 and 100 percent".into());
+    }
     let limit = limit.unwrap_or(PAGE_MESSAGES).clamp(1, PAGE_MESSAGES);
     let mut r = Reader::open(path)?;
-    let boundary = r.boundary_end()?;
+    let boundary = if matches!(anchor, PageAnchor::Position { .. }) {
+        r.position_boundary_end()?
+    } else {
+        r.boundary_end()?
+    };
+    let cached: Option<Arc<PositionIndex>>;
+    let ix: Option<&PositionIndex> = match index {
+        IndexUse::None => None,
+        IndexUse::Given(i) => Some(i),
+        IndexUse::Cached => {
+            cached = index_for(path, &mut r, boundary);
+            cached.as_deref()
+        }
+    };
 
     let (at, direction, rewritten) = match anchor {
         PageAnchor::Start => (0, direction, false),
         PageAnchor::End => (boundary, direction, false),
+        PageAnchor::Position { percent } => {
+            if *percent == 100 {
+                (boundary, PageDirection::Before, false)
+            } else {
+                (
+                    r.position_offset(*percent, boundary, ix)?,
+                    PageDirection::After,
+                    false,
+                )
+            }
+        }
         PageAnchor::Cursor {
             offset,
             behind_digest,
@@ -397,15 +477,6 @@ pub(crate) fn read_page(
 
     let at_start = start == 0;
     let at_end = end >= boundary;
-    let cached: Option<Arc<PositionIndex>>;
-    let ix: Option<&PositionIndex> = match index {
-        IndexUse::None => None,
-        IndexUse::Given(i) => Some(i),
-        IndexUse::Cached => {
-            cached = index_for(path, &mut r, boundary);
-            cached.as_deref()
-        }
-    };
     let position = position(
         page.messages.len() as u64,
         records as u64,
@@ -592,6 +663,67 @@ impl Reader {
 
     /// The end of the last complete record: one past the last newline, or
     /// 0. A trailing record still being written is not a record yet.
+    /// Position fallback never searches arbitrarily far through an unfinished or huge record.
+    fn position_boundary_end(&mut self) -> Result<u64, String> {
+        let start = self.size.saturating_sub(SEED_LOOKBACK_BYTES);
+        let bytes = self.read_held(start, self.size - start)?;
+        match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(i) => Ok(start + i as u64 + 1),
+            None if start == 0 => Ok(0),
+            None => Err(
+                "Could not locate a complete record near this position. Try a nearby percentage."
+                    .into(),
+            ),
+        }
+    }
+
+    fn position_offset(
+        &mut self,
+        percent: u8,
+        boundary: u64,
+        ix: Option<&PositionIndex>,
+    ) -> Result<u64, String> {
+        if percent == 0 || boundary == 0 {
+            return Ok(0);
+        }
+        let estimate = if let Some(ix) = ix.filter(|ix| ix.covered > 0 && ix.count > 0) {
+            let total = ix.count as u128
+                + boundary.saturating_sub(ix.covered) as u128 * ix.count as u128
+                    / ix.covered as u128;
+            let target = total * percent as u128 / 100;
+            if target < ix.count as u128 {
+                let i = ix
+                    .records
+                    .partition_point(|(_, before)| (*before as u128) < target);
+                if let Some((offset, _)) = ix.records.get(i) {
+                    return Ok(*offset);
+                }
+                ix.covered
+            } else {
+                (ix.covered as u128
+                    + (target - ix.count as u128) * ix.covered as u128 / ix.count as u128)
+                    .min(boundary as u128) as u64
+            }
+        } else {
+            (boundary as u128 * percent as u128 / 100) as u64
+        };
+        let estimate = estimate.min(boundary);
+        if self.is_boundary(estimate)? {
+            return Ok(estimate);
+        }
+        // Align to the containing record, not the next one: the latter
+        // would make a one-record transcript's middle falsely look empty.
+        let start = estimate.saturating_sub(SEED_LOOKBACK_BYTES);
+        let bytes = self.read_held(start, estimate - start)?;
+        match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(i) => Ok(start + i as u64 + 1),
+            None if start == 0 => Ok(0),
+            None => {
+                Err("Could not locate a record near this position. Try a nearby percentage.".into())
+            }
+        }
+    }
+
     fn boundary_end(&mut self) -> Result<u64, String> {
         let mut to = self.size;
         while to > 0 {
@@ -1520,6 +1652,247 @@ fn clip_chars(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::claude::transcript_model::{self, IdSource, TranscriptBlock};
+
+    #[tokio::test]
+    async fn measured_page_observes_actual_bounded_read_without_private_content() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = write(
+            &root,
+            "synthetic-private-transcript.jsonl",
+            &conversation(3),
+        );
+        let recorder = Recorder::new(Config {
+            directory: root.join("journal"),
+            epoch: [8; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "test".into(),
+        })
+        .unwrap();
+        let off = page_observed(
+            &path,
+            &PageAnchor::End,
+            PageDirection::Before,
+            Some(2),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert_eq!(recorder.status().durable_records, 0);
+        recorder.set_enabled(true);
+        let actual = page_observed(
+            &path,
+            &PageAnchor::End,
+            PageDirection::Before,
+            Some(2),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert_eq!(actual.page.messages, off.page.messages);
+        let output = root.join("report.jsonl");
+        recorder.export_to(output.clone()).await.unwrap();
+        crate::tests::preserve_test_export("transcript-native", &output);
+        let text = std::fs::read_to_string(output).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let observed = records
+            .iter()
+            .find(|v| v["event"]["kind"] == "transcript")
+            .unwrap();
+        assert_eq!(observed["event"]["bytes"], actual.page.bytes_read);
+        assert_eq!(observed["event"]["rows"], actual.page.messages.len());
+        assert!(observed["event"]["elapsed_ms"].is_u64());
+        assert!(!text.contains("synthetic-private-transcript"));
+        assert!(text.lines().all(|line| line.len() <= 1024));
+    }
+
+    #[test]
+    fn percentage_position_resolves_current_index_and_bounded_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..100)
+            .map(|i| user(&format!("p{i}"), "synthetic"))
+            .collect();
+        let p = write(dir.path(), "position.jsonl", &records);
+        let ix = build_index(&p, None, Instant::now() + Duration::from_secs(5)).unwrap();
+        for indexed in [false, true] {
+            for (percent, expected) in [(0, "p0"), (50, "p50"), (100, "p97")] {
+                let anchor: PageAnchor = serde_json::from_value(
+                    serde_json::json!({"kind":"position", "percent":percent}),
+                )
+                .expect("percentage is a supported page anchor");
+                let w = read_page(
+                    &p,
+                    &anchor,
+                    PageDirection::After,
+                    Some(3),
+                    if indexed {
+                        IndexUse::Given(&ix)
+                    } else {
+                        IndexUse::None
+                    },
+                )
+                .unwrap();
+                if indexed || percent != 50 {
+                    assert_eq!(w.page.messages[0].id, expected);
+                }
+                assert!(w.page.messages.len() <= 3);
+                assert!(w.page.bytes_read <= POSITION_READ_BOUND);
+                assert!(!w.rewritten);
+                assert!(
+                    w.start.offset == 0
+                        || std::fs::read(&p).unwrap()[w.start.offset as usize - 1] == b'\n'
+                );
+            }
+        }
+    }
+
+    fn at_percent(p: &Path, percent: u8, index: IndexUse) -> Result<TranscriptWindow, String> {
+        read_page(
+            p,
+            &PageAnchor::Position { percent },
+            PageDirection::After,
+            Some(3),
+            index,
+        )
+    }
+
+    #[test]
+    fn percentage_position_empty_single_invalid_and_oversized_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = write(dir.path(), "empty.jsonl", &[]);
+        for percent in [0, 50, 100] {
+            let w = at_percent(&empty, percent, IndexUse::None).unwrap();
+            assert!(w.page.messages.is_empty());
+            assert!(w.at_start && w.at_end);
+        }
+        let single = write(dir.path(), "single.jsonl", &[user("only", "small")]);
+        let ix = build_index(&single, None, Instant::now() + Duration::from_secs(2)).unwrap();
+        for percent in [0, 50, 100] {
+            assert_eq!(
+                at_percent(&single, percent, IndexUse::Given(&ix))
+                    .unwrap()
+                    .page
+                    .messages[0]
+                    .id,
+                "only"
+            );
+        }
+        assert_eq!(
+            at_percent(&single, 50, IndexUse::None)
+                .unwrap()
+                .page
+                .messages[0]
+                .id,
+            "only"
+        );
+        assert!(at_percent(&single, 101, IndexUse::None)
+            .unwrap_err()
+            .contains("between"));
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(256),
+            serde_json::json!("50"),
+        ] {
+            assert!(serde_json::from_value::<PageAnchor>(
+                serde_json::json!({"kind":"position", "percent":invalid})
+            )
+            .is_err());
+        }
+        let huge = write(
+            dir.path(),
+            "huge.jsonl",
+            &[user("huge", &"x".repeat(2 * 1024 * 1024))],
+        );
+        assert!(at_percent(&huge, 50, IndexUse::None)
+            .unwrap_err()
+            .contains("near this position"));
+        let ix = build_index(&huge, None, Instant::now() + Duration::from_secs(2)).unwrap();
+        let w = at_percent(&huge, 50, IndexUse::Given(&ix)).unwrap();
+        assert_eq!(w.page.messages[0].id, "huge");
+        assert!(w.page.bytes_read <= POSITION_READ_BOUND);
+        assert!(w.bytes_scanned > 1024 * 1024);
+        std::fs::write(&huge, "x".repeat(2 * 1024 * 1024)).unwrap();
+        assert!(at_percent(&huge, 100, IndexUse::None)
+            .unwrap_err()
+            .contains("complete record"));
+    }
+
+    #[test]
+    fn percentage_position_partial_index_append_and_version_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first: Vec<_> = (0..50)
+            .map(|i| user(&format!("p{i:03}"), "synthetic"))
+            .collect();
+        let p = write(dir.path(), "append.jsonl", &first);
+        let ix = build_index(&p, None, Instant::now() + Duration::from_secs(2)).unwrap();
+        let all: Vec<_> = (0..100)
+            .map(|i| user(&format!("p{i:03}"), "synthetic"))
+            .collect();
+        write(dir.path(), "append.jsonl", &all);
+        let mut r = Reader::open(&p).unwrap();
+        assert!(still_describes(&ix, &mut r));
+        for (percent, id) in [(25, "p025"), (75, "p075")] {
+            let w = at_percent(&p, percent, IndexUse::Given(&ix)).unwrap();
+            assert_eq!(w.page.messages[0].id, id);
+            assert_eq!(w.position.basis, PositionBasis::PartialIndex);
+            assert!(!w.position.exact);
+            assert!(w.page.bytes_read <= POSITION_READ_BOUND);
+        }
+        write(
+            dir.path(),
+            "append.jsonl",
+            &[user("replacement", "changed")],
+        );
+        assert!(!still_describes(&ix, &mut Reader::open(&p).unwrap()));
+        let current = build_index(&p, None, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            at_percent(&p, 50, IndexUse::Given(&current))
+                .unwrap()
+                .page
+                .messages[0]
+                .id,
+            "replacement"
+        );
+        std::fs::write(&p, "").unwrap();
+        assert!(!still_describes(&current, &mut Reader::open(&p).unwrap()));
+    }
+
+    #[test]
+    fn percentage_position_cached_read_rejects_rewritten_and_truncated_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..100)
+            .map(|i| user(&format!("old{i}"), "synthetic"))
+            .collect();
+        let p = write(dir.path(), "cached-position.jsonl", &records);
+        let ix = build_index(&p, None, Instant::now() + Duration::from_secs(2)).unwrap();
+        // A held worker's previous index exercises the production selection
+        // without starting a background build that could race the assertion.
+        INDEXES
+            .lock()
+            .unwrap()
+            .insert(p.clone(), Slot::Building(Some(Arc::new(ix))));
+        let middle = at_percent(&p, 50, IndexUse::Cached).unwrap();
+        assert_eq!(middle.page.messages[0].id, "old50");
+        write(
+            dir.path(),
+            "cached-position.jsonl",
+            &[user("new", "replacement")],
+        );
+        let current = at_percent(&p, 50, IndexUse::Cached).unwrap();
+        assert_eq!(current.page.messages[0].id, "new");
+        assert!(current.at_start && current.at_end);
+        std::fs::write(&p, "").unwrap();
+        assert!(at_percent(&p, 50, IndexUse::Cached)
+            .unwrap()
+            .page
+            .messages
+            .is_empty());
+        INDEXES.lock().unwrap().remove(&p);
+    }
 
     fn user(uuid: &str, text: &str) -> serde_json::Value {
         serde_json::json!({"type": "user", "uuid": uuid, "timestamp": "2026-01-01T00:00:00Z",

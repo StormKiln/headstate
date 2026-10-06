@@ -179,6 +179,17 @@ impl GitHubClient {
                         slot.metric.id(),
                     );
                 }
+                if state.receipt.is_some() || state.task.is_some() {
+                    crate::queue_measurement::aggregate(
+                        self.measurement_recorder(),
+                        if state.receipt.is_some() {
+                            crate::measurement::AggregateKind::CacheReuse
+                        } else {
+                            crate::measurement::AggregateKind::Coalesced
+                        },
+                        crate::measurement::WorkClass::Unknown,
+                    );
+                }
                 state.callers.insert(id, (context.clone(), mode));
                 slot.publish_demand(&state);
                 if state.task.is_none() && state.receipt.is_none() {

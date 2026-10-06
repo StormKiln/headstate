@@ -1138,18 +1138,47 @@ pub(crate) async fn run_queue_continuations<F, Fut>(
     focused: Arc<AtomicBool>,
     view_needs_github: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
+    dispatch: F,
+) where
+    F: FnMut(CachedList) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    run_queue_continuations_observed(
+        focused,
+        view_needs_github,
+        enabled,
+        dispatch,
+        crate::measurement_desktop::recorder(),
+    )
+    .await;
+}
+async fn run_queue_continuations_observed<F, Fut>(
+    focused: Arc<AtomicBool>,
+    view_needs_github: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
     mut dispatch: F,
+    recorder: Option<&crate::measurement::Recorder>,
 ) where
     F: FnMut(CachedList) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
+        crate::queue_measurement::aggregate(
+            recorder,
+            crate::measurement::AggregateKind::Tick,
+            crate::measurement::WorkClass::Background,
+        );
         for list in [CachedList::Authored, CachedList::Reviewing] {
             if !focused.load(Ordering::Relaxed)
                 || !view_needs_github.load(Ordering::Relaxed)
                 || !enabled.load(Ordering::Relaxed)
             {
+                crate::queue_measurement::aggregate(
+                    recorder,
+                    crate::measurement::AggregateKind::Hidden,
+                    crate::measurement::WorkClass::Background,
+                );
                 break;
             }
             dispatch(list).await;
@@ -1193,6 +1222,15 @@ async fn continue_queues(
             .ok()
             .flatten()
             .unwrap_or(false);
+            crate::queue_measurement::aggregate(
+                crate::measurement_desktop::recorder(),
+                if due {
+                    crate::measurement::AggregateKind::Continuation
+                } else {
+                    crate::measurement::AggregateKind::NoWork
+                },
+                crate::measurement::WorkClass::Background,
+            );
             if !due {
                 return;
             }
@@ -1692,6 +1730,7 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
                     + chrono::Duration::from_std(crate::github::stats::backfill::BACKFILL_INTERVAL)
                         .unwrap_or_else(|_| chrono::Duration::seconds(60));
                 emit_backfill(
+                    &client,
                     &app,
                     &crate::commands::db_path(&app),
                     &scope.owner,
@@ -1764,6 +1803,36 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
 async fn backfill_tick(
+    db: std::path::PathBuf,
+    client: &Arc<GitHubClient>,
+    demand: Arc<crate::stats_demand::Registry>,
+) -> Tick {
+    let tick = backfill_tick_inner(db, client, demand).await;
+    use crate::github::stats::backfill::TickOutcome as T;
+    use crate::measurement::{AggregateKind as A, WorkClass};
+    crate::stats_measurement::aggregate(
+        client.measurement_recorder(),
+        A::Tick,
+        WorkClass::Background,
+        1,
+    );
+    let metric = match &tick.outcome {
+        T::NoScope => A::NoWork,
+        T::ForegroundBusy | T::Skipped { .. } => A::Declined,
+        T::Complete => A::Completed,
+        T::Advanced { .. } => A::Continuation,
+        T::Failed(_) => A::Refused,
+    };
+    crate::stats_measurement::aggregate(
+        client.measurement_recorder(),
+        metric,
+        WorkClass::Background,
+        1,
+    );
+    tick
+}
+
+async fn backfill_tick_inner(
     db: std::path::PathBuf,
     client: &Arc<GitHubClient>,
     demand: Arc<crate::stats_demand::Registry>,
@@ -1914,6 +1983,7 @@ async fn backfill_tick(
             ));
         }
     };
+    let observation = client.stats_observation(&owner, &scope.scope_key, &from, &to);
     let written = {
         let db = db.clone();
         let key = scope.scope_key.clone();
@@ -1948,6 +2018,17 @@ async fn backfill_tick(
     // Useful row upserts include same-count corrections and partial failures.
     // Empty-day/coverage/count changes are compared in the emitted frame;
     // continuation bookkeeping alone is not a board invalidation.
+    if let Some(o) = &observation {
+        match &written {
+            Ok(Ok((rows, _, coverage, _))) => o.commit(
+                *rows,
+                Some(coverage.days_covered()),
+                crate::github::stats::backfill::days_between(&from, &to),
+                crate::measurement::WorkClass::Background,
+            ),
+            _ => o.emit(crate::measurement::StatsOutcome::CommitFailed, None, None),
+        }
+    }
     let committed = matches!(&written, Ok(Ok((rows, _, _, _))) if *rows > 0);
     let mut tick = match written {
         Ok(Ok((_, true, coverage, true))) if !coverage.partial => here(TickOutcome::Complete),
@@ -2001,6 +2082,7 @@ async fn mark_worked(
 /// invisible.
 #[allow(clippy::too_many_arguments)]
 async fn emit_backfill(
+    client: &GitHubClient,
     app: &AppHandle,
     db: &std::path::Path,
     owner: &crate::store::stats_owner::StatsOwner,
@@ -2055,6 +2137,11 @@ async fn emit_backfill(
                 report.total,
                 report.phase
             );
+            if let Some(o) =
+                client.stats_observation(&report.owner, &report.scope_key, &report.from, &report.to)
+            {
+                o.progress(&report);
+            }
             crate::commands::emit_stats_backfill(app, &report);
         }
         Ok(None) => log::warn!("stats backfill could not read coverage back to report progress"),
@@ -2082,6 +2169,43 @@ mod tests {
         assert!(same_active_client(Some(&same), &captured));
         assert!(!same_active_client(Some(&derived), &captured));
         assert!(!same_active_client(None, &captured));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measurement_continuation_clock_observes_hidden_ticks_without_new_dispatch() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(Config {
+            directory: dir.path().canonicalize().unwrap().join("journal"),
+            epoch: [49; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap();
+        recorder.set_enabled(true);
+        let focused = Arc::new(AtomicBool::new(false));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let run = run_queue_continuations_observed(
+            focused,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async {}
+            },
+            Some(&recorder),
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(31), run)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        tokio::time::resume();
+        let path = dir.path().canonicalize().unwrap().join("report.jsonl");
+        recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("\"metric\":\"tick\""));
+        assert!(text.contains("\"metric\":\"hidden\""));
     }
 
     #[test]

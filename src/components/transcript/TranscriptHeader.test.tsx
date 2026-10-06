@@ -393,3 +393,25 @@ it("makes the full masked Asked prompt visible without a secret title, including
   view.rerender(headerElement({}, { opening_prompt: "STALE_SECRET_SENTINEL" }, { withheld: true }));
   expect(screen.queryByText(/STALE_SECRET_SENTINEL/)).toBeNull();
 });
+
+it("renders structured possible process evidence in the mounted phone header", () => {
+  state.mobile = true;
+  const liveness = { state: "unknown" as const, why: "Identity is uncertain", possible_processes: {
+    candidates: [{ pid: 4242, cwd: null, cwd_truncated: false }], total: 2,
+  } };
+  renderHeader({ liveness }, {}, { variant: "phone" });
+  expect(screen.getByText("May be running · 2 possible processes")).toBeTruthy();
+  expect(screen.getByText(/pid 4242 · folder unknown/)).toBeTruthy();
+  expect(screen.getByText("Showing 1 of 2 possible processes")).toBeTruthy();
+});
+
+it("keeps the existing uncertain-resume confirmation with a possible PID", () => {
+  state.terminal = "iterm";
+  renderHeader({ liveness: { state: "unknown", why: "uncertain", possible_processes: {
+    candidates: [{ pid: 42, cwd: null, cwd_truncated: false }], total: 1,
+  } } });
+  expect(launchSession).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Resume in terminal" }));
+  expect(screen.getByText(/may already be open somewhere/)).toBeTruthy();
+  expect(launchSession).not.toHaveBeenCalled();
+});

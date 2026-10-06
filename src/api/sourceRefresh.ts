@@ -1,3 +1,4 @@
+import type { MeasurementReference } from "../types/measurement";
 import type { SourceSnapshot } from "./tauri";
 import type { PullRequest } from "../types/pr";
 
@@ -14,6 +15,7 @@ export type SourceStatus = {
   session?: string;
   revision?: number;
   receipt_revision?: number | null;
+  measurement_receipt?: MeasurementReference | null;
   completed_request?: string | null;
   prs?: PullRequest[] | null;
   coverage?: SourceCoverage | null;
@@ -21,7 +23,7 @@ export type SourceStatus = {
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
 export type ProviderReceipt = { rows: PullRequest[]; session?: string; coverage?: SourceCoverage | null };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-export type SourceRefreshSnapshot = { lastReceivedAt?: string; phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
+export type SourceRefreshSnapshot = { measurementReceipt?: MeasurementReference; lastReceivedAt?: string; phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
@@ -43,6 +45,7 @@ export class SourceRefreshState {
   private retained: { staleSecs: number | null; fetchedAt: string; savedOwner?: string } | undefined;
   private providerReceipt = false;
   private providerAt: string | undefined;
+  private measurementReceipt: MeasurementReference | undefined;
   private retired = false;
   private value: SourceRefreshSnapshot = { prs: undefined, error: null, modern: false };
   private phase: string | undefined;
@@ -61,10 +64,14 @@ export class SourceRefreshState {
   private listeners = new Set<() => void>();
   private onProviderRows?: (receipt: ProviderReceipt) => void;
 
-  constructor(onProviderRows?: (receipt: ProviderReceipt) => void) {
+  constructor(onProviderRows?: (receipt: ProviderReceipt) => void, private readonly qualifyMeasurement = (value: MeasurementReference | undefined) => value) {
     this.onProviderRows = onProviderRows;
   }
 
+  invalidateMeasurement() {
+    this.measurementReceipt = this.qualifyMeasurement(this.measurementReceipt);
+    this.publish();
+  }
   readonly snapshot = () => this.value;
   readonly subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -72,7 +79,7 @@ export class SourceRefreshState {
   };
   private publish(prs = this.value.prs, fromProvider = false) {
     const providerAge = this.providerAt ? Math.max(0, Math.floor((Date.now() - Date.parse(this.providerAt)) / 1000)) : 0;
-    this.value = { lastReceivedAt: this.providerAt, phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
+    this.value = { measurementReceipt: this.measurementReceipt, lastReceivedAt: this.providerAt, phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
     for (const listener of this.listeners) listener();
     // Display patches and status-only publications are not provider evidence.
     // Deliver the accepted rows themselves, never a later patched snapshot.
@@ -105,6 +112,7 @@ export class SourceRefreshState {
       this.session = update.session;
       this.revision = -1;
       this.receiptRevision = -1;
+      this.measurementReceipt = undefined;
     }
     if (update.completed_request) {
       const request = this.requests.get(update.completed_request);
@@ -124,6 +132,7 @@ export class SourceRefreshState {
       this.providerReceipt = true;
       this.providerAt = update.last_received_at ?? undefined;
       this.receiptRevision = update.receipt_revision;
+      this.measurementReceipt = this.qualifyMeasurement(update.measurement_receipt ?? undefined);
       this.coverage = update.coverage ?? null;
       this.rowEpoch++;
       rows = update.prs;
@@ -137,6 +146,7 @@ export class SourceRefreshState {
     this.retained = undefined;
     this.providerReceipt = true;
     this.providerAt = undefined;
+    this.measurementReceipt = undefined;
     this.phase = "ready";
     this.rowEpoch++;
     if (!this.legacyStatusError) this.backendError = null;
@@ -171,6 +181,7 @@ export class SourceRefreshState {
     const rows = patch(this.value.prs);
     if (rows === this.value.prs) return;
     this.rowEpoch++;
+    this.measurementReceipt = undefined;
     this.publish(rows);
   }
   reject(request: Request, error: unknown) {
@@ -203,7 +214,9 @@ export class SourceRefreshState {
       this.session = receipt.session;
       this.revision = -1;
       this.receiptRevision = -1;
+      this.measurementReceipt = undefined;
     }
+    this.measurementReceipt = undefined;
     this.coverage = receipt.data.coverage;
     this.retained = { staleSecs: receipt.data.stale_secs, fetchedAt: receipt.data.fetched_at,
       savedOwner: ownership.state === "saved_desktop" ? ownership.owner : undefined };
@@ -216,6 +229,7 @@ export class SourceRefreshState {
   }
   retire() {
     this.retired = true;
+    this.measurementReceipt = undefined;
     this.requests.clear();
     this.coverage = undefined;
     this.transportError = null;

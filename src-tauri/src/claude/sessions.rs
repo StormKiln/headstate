@@ -323,9 +323,25 @@ pub(crate) fn shell_quote(path: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum ListLiveness {
-    Running { pid: u32, status: Option<String> },
-    Dead { why: usize },
-    Unknown { why: usize },
+    Running {
+        pid: u32,
+        status: Option<String>,
+    },
+    Dead {
+        why: usize,
+    },
+    Unknown {
+        why: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        possible_processes: Option<PossibleProcessGroup>,
+    },
+}
+
+/// A bounded group reference. None means details exceeded the response budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PossibleProcessGroup {
+    pub group: Option<usize>,
+    pub total: usize,
 }
 
 /// Interns liveness reasons while a list is assembled.
@@ -338,6 +354,7 @@ pub enum ListLiveness {
 struct Reasons {
     seen: std::collections::HashMap<String, usize>,
     list: Vec<String>,
+    groups: Vec<Vec<super::liveness::PossibleProcess>>,
 }
 
 impl Reasons {
@@ -358,7 +375,27 @@ impl Reasons {
             Liveness::Dead { why } => ListLiveness::Dead {
                 why: self.intern(why),
             },
-            Liveness::Unknown { why } => ListLiveness::Unknown {
+            Liveness::Unknown {
+                why,
+                possible_processes,
+            } => ListLiveness::Unknown {
+                possible_processes: possible_processes.map(|evidence| {
+                    let group = self
+                        .groups
+                        .iter()
+                        .position(|g| g == &evidence.candidates)
+                        .or_else(|| {
+                            if self.groups.len() >= 32 {
+                                return None;
+                            }
+                            self.groups.push(evidence.candidates);
+                            Some(self.groups.len() - 1)
+                        });
+                    PossibleProcessGroup {
+                        group,
+                        total: evidence.total,
+                    }
+                }),
                 why: self.intern(why),
             },
         }
@@ -525,6 +562,8 @@ pub struct SessionList {
     /// Every distinct liveness reason, once. `ListLiveness`'s `why` is an
     /// index into this. One entry on the measured corpus.
     pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_process_groups: Vec<Vec<super::liveness::PossibleProcess>>,
     /// Why the live registry could not be listed. `None` with running
     /// sessions absent means "read it, nothing is running"; `Some` means
     /// "we do not know what is running".
@@ -1380,6 +1419,7 @@ fn assemble<P: ProcessProbe>(
     SessionList {
         sessions,
         reasons: reasons.list,
+        possible_process_groups: reasons.groups,
         registry_failure: registry.failure.clone(),
         registry_unreadable: registry.unreadable.clone(),
         // Stated once for the list, beside the rows it hedged: a session
@@ -1444,8 +1484,93 @@ mod tests {
                 status: status.clone(),
             },
             ListLiveness::Dead { why: ix } => Liveness::Dead { why: why(*ix) },
-            ListLiveness::Unknown { why: ix } => Liveness::Unknown { why: why(*ix) },
+            ListLiveness::Unknown {
+                why: ix,
+                possible_processes,
+            } => Liveness::Unknown {
+                why: why(*ix),
+                possible_processes: possible_processes.as_ref().map(|e| {
+                    super::super::liveness::PossibleProcesses {
+                        total: e.total,
+                        candidates: e
+                            .group
+                            .and_then(|i| list.possible_process_groups.get(i))
+                            .cloned()
+                            .unwrap_or_default(),
+                    }
+                }),
+            },
         }
+    }
+
+    #[test]
+    fn possible_process_groups_share_bytes_and_qualify_budget_omissions() {
+        use crate::claude::liveness::{PossibleProcess, PossibleProcesses};
+        let mut reasons = Reasons::default();
+        let candidate = |pid| PossibleProcess {
+            pid,
+            cwd: Some("/synthetic/".repeat(80)),
+            cwd_truncated: false,
+        };
+        let evidence = |pid| Liveness::Unknown {
+            why: "same uncertain reason".into(),
+            possible_processes: Some(PossibleProcesses {
+                candidates: vec![candidate(pid)],
+                total: 1,
+            }),
+        };
+        let rows: Vec<_> = (0..1474)
+            .map(|_| reasons.intern_liveness(evidence(1)))
+            .collect();
+        assert_eq!(reasons.list.len(), 1);
+        assert_eq!(reasons.groups.len(), 1);
+        let bytes = serde_json::to_vec(&(&rows, &reasons.groups)).unwrap().len();
+        let baseline: Vec<_> = (0..1474)
+            .map(|_| ListLiveness::Unknown {
+                why: 0,
+                possible_processes: None,
+            })
+            .collect();
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+        let inline_bytes = serde_json::to_vec(&(0..1474).map(|_| evidence(1)).collect::<Vec<_>>())
+            .unwrap()
+            .len();
+        eprintln!("synthetic1474 baseline={baseline_bytes} compact={bytes} added={} inline={inline_bytes}", bytes - baseline_bytes);
+        assert!(bytes < baseline_bytes + 80_000);
+        assert!(inline_bytes > bytes * 5);
+        for pid in 2..=32 {
+            reasons.intern_liveness(evidence(pid));
+        }
+        let omitted = reasons.intern_liveness(evidence(33));
+        assert!(matches!(
+            omitted,
+            ListLiveness::Unknown {
+                possible_processes: Some(PossibleProcessGroup {
+                    group: None,
+                    total: 1
+                }),
+                ..
+            }
+        ));
+        assert_eq!(reasons.groups.len(), 32);
+        assert!(matches!(
+            reasons.intern_liveness(evidence(1)),
+            ListLiveness::Unknown {
+                possible_processes: Some(PossibleProcessGroup {
+                    group: Some(0),
+                    total: 1
+                }),
+                ..
+            }
+        ));
+        let old: ListLiveness = serde_json::from_str(r#"{"state":"unknown","why":0}"#).unwrap();
+        assert!(matches!(
+            old,
+            ListLiveness::Unknown {
+                possible_processes: None,
+                ..
+            }
+        ));
     }
 
     /// A directory that really exists, on every platform.
@@ -2444,7 +2569,8 @@ mod tests {
         let unknown = resolved(&got, "unknown");
         assert!(matches!(dead, Liveness::Dead { .. }), "{dead:?}");
         assert!(matches!(unknown, Liveness::Unknown { .. }), "{unknown:?}");
-        let (Liveness::Dead { why: a }, Liveness::Unknown { why: b }) = (&dead, &unknown) else {
+        let (Liveness::Dead { why: a }, Liveness::Unknown { why: b, .. }) = (&dead, &unknown)
+        else {
             unreachable!()
         };
         assert_ne!(a, b, "each verdict keeps its own grounds");
@@ -2625,7 +2751,7 @@ mod tests {
                     dead += 1;
                     assert!(!why.is_empty(), "{}: Dead with no reason", s.session_id);
                 }
-                Liveness::Unknown { why } => {
+                Liveness::Unknown { why, .. } => {
                     unknown += 1;
                     assert!(!why.is_empty(), "{}: Unknown with no reason", s.session_id);
                 }
@@ -2895,8 +3021,32 @@ mod tests {
             ["pid 4242, running in /Users/acme/code/widget"],
             "the list must not read as complete while a session runs on no row"
         );
+        let wire = serde_json::to_value(&got).unwrap();
+        let here = wire["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "here")
+            .unwrap();
+        assert_eq!(
+            here["liveness"]["possible_processes"],
+            serde_json::json!({"group": 0, "total": 1})
+        );
+        assert_eq!(
+            wire["possible_process_groups"][0][0],
+            serde_json::json!({
+                "pid": 4242, "cwd": "/Users/acme/code/widget", "cwd_truncated": false
+            })
+        );
         match resolved(&got, "here") {
-            Liveness::Unknown { why } => assert!(why.contains("pid 4242"), "{why}"),
+            Liveness::Unknown {
+                why,
+                possible_processes: Some(evidence),
+            } => {
+                assert!(why.contains("pid 4242"), "{why}");
+                assert_eq!(evidence.total, 1);
+                assert_eq!(evidence.candidates[0].pid, 4242);
+            }
             other => panic!("the row in the live session's folder read as {other:?}"),
         }
         assert!(

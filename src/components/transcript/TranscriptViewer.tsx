@@ -1,3 +1,4 @@
+import { useTranscriptWindowMeasurement } from "../../api/transcriptMeasurement";
 /// The transcript viewer's shell (#1479, epic #1473).
 ///
 /// Scrolling, following and windowing only. What a message LOOKS like is
@@ -204,6 +205,7 @@ function ViewerBody({
   // following, the scroller publishes `end: false` even mid-catch-up.
   const following = pins.end.at === "tail" && !scrollable.end;
   const win = resolveWindow(messages, pins, following, pins === OPEN_PINS);
+  useTranscriptWindowMeasurement(win.to-win.from,messages.length,messages);
   if (win.pins !== pins) setPins(win.pins);
 
   // The arrival bookkeeping, folded in during render ("adjusting state

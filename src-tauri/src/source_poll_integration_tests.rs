@@ -3070,7 +3070,19 @@ async fn detail_fact_publication_is_durable_without_a_local_review() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("detail-facts.db");
     let conn = crate::store::open_db(&path).unwrap();
-    let polls = SourcePolls::default();
+    let recorder = Arc::new(
+        crate::measurement::Recorder::new(crate::measurement::Config {
+            directory: dir.path().canonicalize().unwrap().join("measurement"),
+            epoch: [45; 16],
+            role: crate::measurement::Role::Desktop,
+            platform: crate::measurement::Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap(),
+    );
+    recorder.set_enabled(true);
+    let mut polls = SourcePolls::default();
+    polls.7.recorder = Some(recorder.clone());
     let mut raw = node(1, false);
     raw["isInMergeQueue"] = json!(false);
     raw["updatedAt"] = json!("2026-10-01T10:00:00Z");
@@ -3097,20 +3109,73 @@ async fn detail_fact_publication_is_durable_without_a_local_review() {
         "octocat/repo-1",
     );
     let mut publications = Vec::new();
-    record_github_effect_at(
-        path.clone(),
-        &polls,
-        "octocat/repo-1",
-        1,
-        "synthetic-viewer",
-        GithubEffect::ReviewReadback(Box::new(detail), [0, 0]),
-        |event| publications.push(event.unwrap()),
+    crate::queue_measurement::run(
+        Some(&recorder),
+        crate::measurement::OperationClass::Detail,
+        async {
+            record_github_effect_at(
+                path.clone(),
+                &polls,
+                "octocat/repo-1",
+                1,
+                "synthetic-viewer",
+                GithubEffect::ReviewReadback(Box::new(detail), [0, 0]),
+                |event| publications.push(event.unwrap()),
+            )
+            .await;
+            Ok::<_, ()>(())
+        },
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(
         publications.len(),
         2,
         "detail knowledge must publish to both lists"
+    );
+    let receipt_ids: Vec<_> = publications
+        .iter()
+        .map(|update| {
+            update
+                .measurement_receipt
+                .clone()
+                .expect("actual accepted row token")
+        })
+        .collect();
+    assert!(receipt_ids.iter().all(|id| recorder.is_live_receipt(id)));
+    let export = dir.path().canonicalize().unwrap().join("report.jsonl");
+    recorder.export_to(export.clone()).await.unwrap();
+    crate::tests::preserve_test_export("queue-detail-fact", &export);
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(export)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter_map(|row| row.get("event").cloned())
+        .collect();
+    let started = events
+        .iter()
+        .find(|event| event["stage"] == "started")
+        .unwrap();
+    let accepted: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "queue_receipt")
+        .collect();
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted
+        .iter()
+        .all(|event| event["operation"] == started["operation"]));
+    assert!(events
+        .iter()
+        .any(|event| event["stage"] == "published" && event["operation"] == started["operation"]));
+    assert!(events
+        .iter()
+        .any(|event| event["stage"] == "completed" && event["outcome"] == "success"));
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "operation")
+            .all(|event| event.get("affected_fields").is_none()),
+        "unmeasured field count must be absent, not fabricated zero"
     );
     for update in publications {
         assert!(update.prs.unwrap()[0].in_merge_queue);

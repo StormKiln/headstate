@@ -1,3 +1,4 @@
+import { captureReference } from "./measurementCapture";
 import { retireStatsOwnership } from "./statsBoardRefresh";
 import { retireReviewOwnership } from "./reviewOperations";
 import { acceptDetailFacts, retireDetailOwnership } from "./detailRevalidation";
@@ -37,6 +38,10 @@ export function retireSourceOwnership(qc: QueryClient, preserveSession = false) 
     value.state.retire();
   }
 }
+/** Diagnostic metadata only; retain row, revision, error and disclosure state. */
+export function invalidateSourceMeasurements(qc: QueryClient) {
+  for (const value of Object.values(entries.get(qc) ?? {})) value.state.invalidateMeasurement();
+}
 function retireCurrentQueue(qc: QueryClient) {
   retireSourceOwnership(qc, true);
   void qc.cancelQueries();
@@ -62,7 +67,7 @@ function adoptOwner(qc: QueryClient, owner: string | undefined) {
 function entry(qc: QueryClient, list: List): Entry {
   let lists = entries.get(qc);
   if (!lists) { lists = {}; entries.set(qc, lists); }
-  return lists[list] ??= { state: new SourceRefreshState(receipt => acceptDetailFacts(qc, { ...receipt, list })), users: 0 };
+  return lists[list] ??= { state: new SourceRefreshState(receipt => acceptDetailFacts(qc, { ...receipt, list }), ref => captureReference(qc, ref)), users: 0 };
 }
 function observe(qc: QueryClient, list: List, value: Entry) {
   if (value.users++ > 0) return;

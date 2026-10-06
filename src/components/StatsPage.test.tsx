@@ -1,4 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement } from "react";
+import { fireEvent, render as renderView, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthorRow, StatsBoard, StatsOutcome, StatsSeries } from "@/types/pr";
 
@@ -1315,3 +1317,8 @@ it.each([undefined,{viewer:"octocat",generation:2}])("renders older boards but s
  expect(screen.queryByText(/450 of 500 pull requests collected/)).toBeNull();
  expect(screen.getByText(/remaining days are queued for collection/)).toBeTruthy();
 });
+
+function render(view:ReactElement) {
+  const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+  return renderView(<QueryClientProvider client={client}>{view}</QueryClientProvider>);
+}

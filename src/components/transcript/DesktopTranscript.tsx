@@ -340,7 +340,7 @@ function Loaded({
       data-testid="desktop-transcript"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" style={{ color: palette.muted }}>
-        <FollowStatus live={live} />
+        <FollowStatus live={live} seekPosition={jumps.seekPosition} />
         {/* A jump's note, said from a region mounted with the host: one
             that arrives with its text already in it -- or is hidden until
             it has some -- is often not read (#1489). */}

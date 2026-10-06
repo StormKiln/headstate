@@ -698,28 +698,37 @@ pub async fn act_on_pr(
     action: String,
     inventory_managed: Option<bool>,
 ) -> Result<Option<PrActionOutcome>, String> {
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let act = parse_action(&action)?;
+    crate::queue_measurement::run(
+        crate::measurement_desktop::recorder(),
+        crate::measurement::OperationClass::Action,
+        async {
+            let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+            let act = parse_action(&action)?;
 
-    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
-    match client.mutate_pr(&id, act).await {
-        Ok(effect) => {
-            if let Some(effect) = effect {
-                crate::source_poll::record_confirmed_action(&app, &repo, number, effect, operation)
-                    .await;
+            let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
+            match client.mutate_pr(&id, act).await {
+                Ok(effect) => {
+                    if let Some(effect) = effect {
+                        crate::source_poll::record_confirmed_action(
+                            &app, &repo, number, effect, operation,
+                        )
+                        .await;
+                    }
+                    log::info!("{repo}#{number} {}", act.describe());
+                    // Refresh promptly rather than waiting out the poll interval:
+                    // the list would otherwise keep showing a PR as open for up
+                    // to two minutes after merging it.
+                    waker.0.notify_one();
+                    Ok(PrActionOutcome::for_request(inventory_managed))
+                }
+                Err(e) => {
+                    log::warn!("{repo}#{number} could not be {}: {e}", act.describe());
+                    Err(e.to_string())
+                }
             }
-            log::info!("{repo}#{number} {}", act.describe());
-            // Refresh promptly rather than waiting out the poll interval:
-            // the list would otherwise keep showing a PR as open for up
-            // to two minutes after merging it.
-            waker.0.notify_one();
-            Ok(PrActionOutcome::for_request(inventory_managed))
-        }
-        Err(e) => {
-            log::warn!("{repo}#{number} could not be {}: {e}", act.describe());
-            Err(e.to_string())
-        }
-    }
+        },
+    )
+    .await
 }
 
 /// Merge, or add to the merge queue, a native GitHub stack up to and
@@ -1284,49 +1293,57 @@ pub async fn get_pr_detail(
     repo: String,
     number: u64,
 ) -> Result<PrDetail, String> {
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
-    // command for the reason `get_reviewing` gives: without it the log
-    // holds the individual POSTs and no total, so a 30-second click
-    // could not be attributed to the command at all -- and the gap
-    // between the summed POSTs and this elapsed time is exactly where
-    // octocrab's rate-limit wait hides, which nothing else records.
-    // The repository and number are NOT logged: the diagnostic log is
-    // something a user pastes into an issue, and a private repository's
-    // name is not ours to put in it.
-    crate::diag!("[diag] cmd get_pr_detail start");
-    let started = std::time::Instant::now();
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    // The scoped client owns one deadline and can return completed check pages
-    // when a continuation expires; an outer timeout would discard that progress.
-    let client = client.with_read_context(crate::github::admission::ReadContext::new(
-        crate::github::admission::ReadClass::Foreground,
-        crate::poll::FETCH_TIMEOUT,
-    ));
-    let review_generation = crate::source_poll::review_read_generation(&app);
-    let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
-    let mut out = client
-        .fetch_pr_detail(&repo, number)
-        .await
-        .map_err(|e| e.to_string());
-    if let Ok(detail) = &mut out {
-        if let Some(observation) = &mut detail.inventory_facts {
-            for fact in &mut observation.facts {
-                fact.operation = Some(operation.clone());
+    crate::queue_measurement::run(
+        crate::measurement_desktop::recorder(),
+        crate::measurement::OperationClass::Detail,
+        async {
+            // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
+            // command for the reason `get_reviewing` gives: without it the log
+            // holds the individual POSTs and no total, so a 30-second click
+            // could not be attributed to the command at all -- and the gap
+            // between the summed POSTs and this elapsed time is exactly where
+            // octocrab's rate-limit wait hides, which nothing else records.
+            // The repository and number are NOT logged: the diagnostic log is
+            // something a user pastes into an issue, and a private repository's
+            // name is not ours to put in it.
+            crate::diag!("[diag] cmd get_pr_detail start");
+            let started = std::time::Instant::now();
+            let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+            // The scoped client owns one deadline and can return completed check pages
+            // when a continuation expires; an outer timeout would discard that progress.
+            let client = client.with_read_context(crate::github::admission::ReadContext::new(
+                crate::github::admission::ReadClass::Foreground,
+                crate::poll::FETCH_TIMEOUT,
+            ));
+            let review_generation = crate::source_poll::review_read_generation(&app);
+            let operation = crate::source_poll::fact_operation(&app, &repo, number).await;
+            let mut out = client
+                .fetch_pr_detail(&repo, number)
+                .await
+                .map_err(|e| e.to_string());
+            if let Ok(detail) = &mut out {
+                if let Some(observation) = &mut detail.inventory_facts {
+                    for fact in &mut observation.facts {
+                        fact.operation = Some(operation.clone());
+                    }
+                }
             }
-        }
-    }
-    if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
-        crate::source_poll::record_review_readback(&app, detail, viewer, review_generation).await;
-    }
-    crate::diag!(
-        "[diag] cmd get_pr_detail end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(d) => format!("ok checks={}/{}", d.checks.len(), d.checks_total),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+            if let (Ok(detail), Some(viewer)) = (&out, client.known_viewer()) {
+                crate::source_poll::record_review_readback(&app, detail, viewer, review_generation)
+                    .await;
+            }
+            crate::diag!(
+                "[diag] cmd get_pr_detail end {}ms {}",
+                started.elapsed().as_millis(),
+                match &out {
+                    Ok(d) => format!("ok checks={}/{}", d.checks.len(), d.checks_total),
+                    Err(e) => format!("err: {e}"),
+                }
+            );
+            out
+        },
+    )
+    .await
 }
 
 /// Whether the viewer's approval can count, and whether conversations must
@@ -4711,7 +4728,11 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 /// Change interface preferences.
 #[tauri::command]
-pub fn set_ui_prefs(app: AppHandle, prefs: crate::poll::UiPrefs) -> Result<(), String> {
+pub fn set_ui_prefs(
+    app: AppHandle,
+    prefs: crate::poll::UiPrefs,
+    measurement_capture: Option<bool>,
+) -> Result<Option<crate::measurement::CaptureIdentity>, String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     crate::store::settings::set(&conn, settings::keys::UI_PREFS, &prefs)
         .map_err(|e| e.to_string())?;
@@ -4719,13 +4740,15 @@ pub fn set_ui_prefs(app: AppHandle, prefs: crate::poll::UiPrefs) -> Result<(), S
     // just ticked the box to capture a problem should get the log for
     // the problem they are currently reproducing, not the next one.
     crate::diag::set_enabled(prefs.diagnostic_logging);
+    crate::measurement_desktop::set_enabled(prefs.diagnostic_logging);
     log::info!(
         "ui: {} view(s) hidden, close_hides_to_tray={}, diagnostics={}",
         prefs.hidden_views.len(),
         prefs.close_hides_to_tray,
         prefs.diagnostic_logging
     );
-    Ok(())
+    Ok(crate::measurement_desktop::recorder()
+        .and_then(|r| r.preference_capture(measurement_capture == Some(true))))
 }
 
 /// Change which desktop notifications are sent.
@@ -5798,6 +5821,15 @@ async fn stats_board_with_demand(
         horizon_days: clamp_days(days) as u32,
     };
     let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
+    let observed_start = std::time::Instant::now();
+    let observation = client.stats_observation(
+        &owner,
+        &q.cache_key(&viewer),
+        &req.window.from,
+        &req.window.to,
+    );
+    let mut observed_answer =
+        crate::stats_measurement::AnswerGuard::new(observation.clone(), observed_start);
     let hit = stats_cache_read(
         db.clone(),
         owner.clone(),
@@ -5823,6 +5855,17 @@ async fn stats_board_with_demand(
         &owner,
         &q.cache_key(&viewer),
     );
+    if let Some(o) = &observation {
+        o.emit(
+            if matches!(backfill, BackfillRegistration::Registered(_)) {
+                crate::measurement::StatsOutcome::Registered
+            } else {
+                crate::measurement::StatsOutcome::RegistrationFailed
+            },
+            None,
+            crate::stats_measurement::elapsed(observed_start),
+        );
+    }
     if matches!(backfill, BackfillRegistration::Registered(_)) {
         waker.notify_one();
     }
@@ -5835,7 +5878,9 @@ async fn stats_board_with_demand(
     )
     .await?
     {
+        observed_answer.finish(crate::measurement::StatsOutcome::CacheReuse, Some(&board));
         return Ok(StatsBoard {
+            measurement_scope: observation.as_ref().map(|o| o.id.clone()),
             window: Some(StatsWindow {
                 from: req.window.from.clone(),
                 to: req.window.to.clone(),
@@ -5869,6 +5914,11 @@ async fn stats_board_with_demand(
             cached.stream = Some(stats_progress_stream().into());
             cached.backfill = backfill;
             cached.owner = Some(owner.clone());
+            cached.measurement_scope = observation.as_ref().map(|o| o.id.clone());
+            observed_answer.finish(
+                crate::measurement::StatsOutcome::CacheReuse,
+                Some(&cached.board),
+            );
             return Ok(cached);
         }
         // Same handling as `stats_count`'s: a payload that will not parse
@@ -5947,7 +5997,8 @@ async fn stats_board_with_demand(
     let mut out = match out {
         Ok(loaded) => {
             pure_board = Some(loaded.board.clone());
-            let board = accumulate_board(
+            let board = accumulate_board_measured(
+                observation.clone(),
                 db.clone(),
                 owner.clone(),
                 scope_key.clone(),
@@ -5959,6 +6010,7 @@ async fn stats_board_with_demand(
             )
             .await;
             Ok(StatsBoard {
+                measurement_scope: observation.as_ref().map(|o| o.id.clone()),
                 window: Some(StatsWindow {
                     from: req.window.from.clone(),
                     to: req.window.to.clone(),
@@ -6044,6 +6096,14 @@ async fn stats_board_with_demand(
             }
         }
     }
+    observed_answer.finish(
+        if out.is_ok() {
+            crate::measurement::StatsOutcome::Accepted
+        } else {
+            crate::measurement::StatsOutcome::Rejected
+        },
+        out.as_ref().ok().map(|b| &b.board),
+    );
     out
 }
 
@@ -6163,6 +6223,8 @@ pub struct StatsWindow {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoardReadback {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_scope: Option<crate::measurement::OpaqueId>,
     pub owner: StatsOwner,
     pub viewer: String,
     pub scope_key: String,
@@ -6202,6 +6264,36 @@ async fn stats_board_cached_for_client(
     measure: String,
     days: i64,
 ) -> Result<StatsBoardReadback, String> {
+    let result = stats_board_cached_measured(
+        client,
+        db,
+        expected_owner,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await;
+    if result.is_err() {
+        crate::stats_measurement::aggregate(
+            client.measurement_recorder(),
+            crate::measurement::AggregateKind::Declined,
+            crate::measurement::WorkClass::Foreground,
+            1,
+        );
+    }
+    result
+}
+
+async fn stats_board_cached_measured(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    expected_owner: StatsOwner,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoardReadback, String> {
     let viewer = client
         .known_viewer()
         .ok_or("Stats cache identity is not verified")?
@@ -6222,7 +6314,8 @@ async fn stats_board_cached_for_client(
         from: req.window.from,
         to: req.window.to,
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let started = std::time::Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let measurement = stored_board_snapshot(
@@ -6233,7 +6326,8 @@ async fn stats_board_cached_for_client(
             &window.to,
             now,
         )?;
-        Ok(StatsBoardReadback {
+        Ok::<_, String>(StatsBoardReadback {
+            measurement_scope: None,
             owner: expected_owner,
             viewer,
             scope_key,
@@ -6243,7 +6337,26 @@ async fn stats_board_cached_for_client(
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    match result {
+        Ok(mut answer) => {
+            if let Some(o) = client.stats_observation(
+                &answer.owner,
+                &answer.scope_key,
+                &answer.window.from,
+                &answer.window.to,
+            ) {
+                o.emit(
+                    crate::measurement::StatsOutcome::CacheReuse,
+                    Some(&answer.measurement),
+                    crate::stats_measurement::elapsed(started),
+                );
+                answer.measurement_scope = Some(o.id);
+            }
+            Ok(answer)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn stats_progress_stream() -> &'static str {
@@ -6285,7 +6398,8 @@ fn stats_progress_stream() -> &'static str {
 /// is created and dropped inside the closure.
 // Captured owner, evidence, and caller authority stay explicit across awaits.
 #[allow(clippy::too_many_arguments)]
-async fn accumulate_board(
+async fn accumulate_board_measured(
+    observation: Option<crate::stats_measurement::Observation>,
     db: std::path::PathBuf,
     owner: StatsOwner,
     scope_key: String,
@@ -6297,7 +6411,8 @@ async fn accumulate_board(
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(
+        accumulate_board_blocking_measured(
+            observation.as_ref(),
             &db,
             &owner,
             &scope_key,
@@ -6316,10 +6431,11 @@ async fn accumulate_board(
     .unwrap_or(fallback)
 }
 
-/// The blocking half of [`accumulate_board`].
+/// The blocking half of [`accumulate_board_measured`].
 // Captured owner, evidence, and caller authority stay explicit across awaits.
 #[allow(clippy::too_many_arguments)]
-fn accumulate_board_blocking(
+fn accumulate_board_blocking_measured(
+    observation: Option<&crate::stats_measurement::Observation>,
     db: &std::path::Path,
     owner: &StatsOwner,
     scope_key: &str,
@@ -6330,6 +6446,7 @@ fn accumulate_board_blocking(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
+    let mut commit = crate::stats_measurement::CommitGuard::new(observation);
 
     let crate::github::stats::board::LoadedBoard { board, prs, slices } = loaded;
     let Ok(mut conn) = open_db(db) else {
@@ -6357,7 +6474,7 @@ fn accumulate_board_blocking(
     // One transaction over both, for the reason `record_all_with_rows`
     // gives: a ledger row without its evidence is a claim nothing
     // revisits.
-    if let Err(e) = crate::store::pr_slice::record_all_with_rows_in(
+    let written = match crate::store::pr_slice::record_all_with_rows_in(
         &tx,
         scope_key,
         window_start,
@@ -6366,9 +6483,12 @@ fn accumulate_board_blocking(
         &prs,
         now,
     ) {
-        log::warn!("could not accumulate pull requests for PR stats: {e}");
-        return board;
-    }
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("could not accumulate pull requests for PR stats: {e}");
+            return board;
+        }
+    };
     // Bounded here rather than on a schedule: this is the only site that
     // grows the table, so it is the only one that needs to bound it.
     match pr_history::prune_in(&tx) {
@@ -6394,8 +6514,10 @@ fn accumulate_board_blocking(
     // the rest". A window with no ledger rows reports `None` for its
     // total, and the board carries that through as a `None` rather than
     // defaulting it -- see `Board::from_stored`.
-    let coverage = crate::store::pr_slice::coverage(&tx, scope_key, window_start, window_end)
-        .unwrap_or_default();
+    let coverage_result =
+        crate::store::pr_slice::coverage(&tx, scope_key, window_start, window_end);
+    let covered = coverage_result.as_ref().ok().map(|c| c.days_covered());
+    let coverage = coverage_result.unwrap_or_default();
     crate::diag!(
         "[diag] stats accumulate fetched={} stored={} claimed={} days={}/{} ledger_total={:?}",
         board.retrieved,
@@ -6407,6 +6529,15 @@ fn accumulate_board_blocking(
     );
     if tx.commit().is_err() {
         return board;
+    }
+    commit.committed = true;
+    if let Some(o) = observation {
+        o.commit(
+            written,
+            covered,
+            crate::github::stats::backfill::days_between(window_start, window_end),
+            crate::measurement::WorkClass::Foreground,
+        );
     }
     crate::github::stats::Board::from_stored(
         &stored,
@@ -6428,6 +6559,8 @@ fn accumulate_board_blocking(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoard {
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub measurement_scope: Option<crate::measurement::OpaqueId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<StatsWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8277,7 +8410,8 @@ pub async fn claude_transcript_watch(
 /// reach the machine. One `.jsonl` under `~/.claude/projects` through
 /// the `claude_transcript_path` guard, nothing written. Bounded INSIDE the command whatever the
 /// caller asks: at most `PAGE_MESSAGES` messages and
-/// `transcript_page::PAGE_READ_BOUND` bytes read into memory, and a
+/// `transcript_page::PAGE_READ_BOUND` bytes read into memory (percentage
+/// anchors additionally allow two bounded 64 KiB alignment reads), and a
 /// record over `RECORD_HOLD_BYTES` streamed and clipped rather than
 /// held -- so a paired phone paging through a 70 MB transcript is handed
 /// one bounded page per call, never the file.
@@ -12379,4 +12513,25 @@ pub(crate) async fn stats_demand_with_context(
     .map_err(|e| e.to_string())??;
     app.state::<crate::poll::BackfillWaker>().0.notify_one();
     Ok(receipt)
+}
+
+/// Desktop-local typed measurement status. No journal contents or private path.
+#[tauri::command]
+pub fn measurement_status() -> crate::measurement::JournalStatus {
+    crate::measurement_desktop::status()
+}
+#[tauri::command]
+pub async fn measurement_export(
+    window: tauri::WebviewWindow,
+) -> Result<crate::measurement::ExportReceipt, String> {
+    crate::measurement_desktop::export(window).await
+}
+#[tauri::command]
+pub fn measurement_client_events(
+    batch: Vec<crate::measurement::ClientMeasurement>,
+) -> Result<(), String> {
+    if let Some(recorder) = crate::measurement_desktop::recorder() {
+        recorder.client_events(batch).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

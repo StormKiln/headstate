@@ -1,8 +1,10 @@
+import { captureReference } from "./measurementCapture";
 import { useEffect, useSyncExternalStore } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import type { StatsBackfillFrame, StatsBoard, StatsOwner, StatsWindow } from "@/types/pr";
 import { statsBoardCached } from "./tauri";
 import { listen, type UnlistenFn } from "./transport";
+import { observeStats } from "./statsMeasurement";
 import { safeUnlisten } from "./unlisten";
 import { commandError } from "@/lib/errorKind";
 
@@ -50,7 +52,7 @@ export async function readStatsBoard(qc: QueryClient, key: readonly unknown[], w
   // Ordinary observer cleanup (including StrictMode replay) does not retire
   // TanStack's normal request. Ownership retirement does.
   if (value.retired || version !== value.normalVersion) throw new DOMException("Stats owner retired", "AbortError");
-  return result;
+  return {...result, measurementScope:captureReference(qc, result.measurementScope)};
 }
 class Controller {
   epoch = 0; normalVersion = 0; retired = false;
@@ -133,13 +135,15 @@ class Controller {
     const epoch = this.epoch, normalVersion = this.normalVersion, dirty = this.dirty;
     this.inFlight = true; this.publish({...this.status,refreshing:true});
     let succeeded = false;
+    const measurementStarted = performance.now();
+    const rejected = () => observeStats(this.qc, "readback", "rejected", undefined, performance.now()-measurementStarted);
     try {
       const answer = await statsBoardCached(question.scopeKind, question.scopeValue, question.measure, question.days, board.owner);
-      if (this.retired || epoch !== this.epoch || this.query() !== query || normalVersion !== this.normalVersion || query.state.fetchStatus !== "idle") return;
+      if (this.retired || epoch !== this.epoch || this.query() !== query || normalVersion !== this.normalVersion || query.state.fetchStatus !== "idle") { rejected(); return; }
       const current = this.board();
-      if (!current || !sameOwner(current.owner, answer.owner) || answer.scopeKey !== current.scopeKey) return;
-      if (current.window && (answer.window.to < current.window.to || (answer.window.to === current.window.to && answer.window.from < current.window.from))) return;
-      const measured = {...current,...answer.measurement,owner:answer.owner,viewer:answer.viewer,scopeKey:answer.scopeKey,window:answer.window,stream:answer.stream};
+      if (!current || !sameOwner(current.owner, answer.owner) || answer.scopeKey !== current.scopeKey) { rejected(); return; }
+      if (current.window && (answer.window.to < current.window.to || (answer.window.to === current.window.to && answer.window.from < current.window.from))) { rejected(); return; }
+      const measured = {...current,...answer.measurement,measurementScope:captureReference(this.qc, answer.measurementScope),owner:answer.owner,viewer:answer.viewer,scopeKey:answer.scopeKey,window:answer.window,stream:answer.stream};
       // Backfill registration belongs to the normal load, not this readback.
       // Weaker same-window evidence cannot erase useful foreground-only rows.
       const retain = sameWindow(current.window, answer.window) && population(current) > 0
@@ -147,15 +151,17 @@ class Controller {
           || (!measured.complete && population(measured) < population(current)));
       const next = retain ? {...current,stream:answer.stream,window:answer.window} : measured;
       this.qc.setQueryData(this.key, next);
+      observeStats(this.qc, "readback", retain ? "retained" : "accepted", next, performance.now()-measurementStarted);
       this.adopt(next); this.applied = dirty; this.attempts = 0; succeeded = true;
       this.publish({refreshing:true,retained:retain});
     } catch (error) {
-      if (this.retired || epoch !== this.epoch) return;
+      if (this.retired || epoch !== this.epoch) { rejected(); return; }
       const unsupported = /not a Headstate command|unknown command|command.*not found/i.test(commandError(error).message);
       if (unsupported) {
         const state = registry(this.qc); state.unsupported = true;
         for (const listener of state.listeners) listener();
       }
+      observeStats(this.qc,"readback",unsupported?"unsupported":"rejected",undefined,performance.now()-measurementStarted);
       this.publish({refreshing:true,error:unsupported?"This desktop does not support local Stats refresh.":"Stored Stats refresh failed; previous measurements are retained.",unsupported});
       if (!unsupported && this.dirty === dirty && this.attempts < 2) {
         const delay = [5_000,30_000][this.attempts++];

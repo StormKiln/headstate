@@ -1,3 +1,4 @@
+import { useReadyMeasurement, readyMeasurementLastKnown } from "../api/reviewMeasurement";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { observationStatus } from "@/lib/rowObservation";
 import { prKey } from "@/lib/prIdentity";
@@ -383,6 +384,12 @@ export function ReadyStrip({
   const part = partitionReady(all, pushers.of, mode);
   const ready = part.shown;
   const stacks = useReadyStacks(ready, priority);
+  useReadyMeasurement(prs, all, ready, availability.status === "available", pr => {
+    const stack = stacks.displayOf(pr);
+    const pusher = pushers.displayOf(pr);
+    return readyMeasurementLastKnown(pr, stack, pusher, now);
+  });
+
   const rowIdentity = JSON.stringify(ready.map(prKey).sort());
   useEffect(() => {
     if (typeof IntersectionObserver === "undefined" || !region.current) return;
