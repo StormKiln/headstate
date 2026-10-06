@@ -2,7 +2,7 @@
 
 This guide collects evidence from the enterprise laptop and **iPhone 17 Pro** after release. A successful export or synthetic test does not establish field reliability or device performance. Keep #1100, #1487, #1542 and #1737 open until their evidence criteria are met. The notification classifier remains **15 seconds**.
 
-Record the installed versions before starting: desktop release **[verified release version/build to be filled at release]**, companion TestFlight **[verified version/build to be filled at release]**, macOS/iOS version and phone model. Use the matching newly released companion; an older bundled frontend cannot exercise the new controls. Do not include account/repository names, addresses, pairing secrets or private transcript text in the written report.
+Record the installed versions before starting: desktop version and companion TestFlight version/build. The intended matching release is **9.2.0**; use the verified delivery details linked from [release epic #1736](https://github.com/StormKiln/headstate/issues/1736). Also record, macOS/iOS version and phone model. Use the matching newly released companion; an older bundled frontend cannot exercise the new controls. Do not include account/repository names, addresses, pairing secrets or private transcript text in the written report.
 
 ## Enterprise laptop: capture one ordinary session
 
