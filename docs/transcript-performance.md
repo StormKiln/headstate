@@ -842,3 +842,61 @@ The Task 7 migration itself recorded no replacement timings. Task 10
 measurements below use the final export/accessibility renderer. Historical
 400-message stress results, B5 compression estimates, and actual-device
 limitations remain qualified as originally measured.
+
+## 9.2 conservative masking pre-check — 2026-10-06 (#1531)
+
+A byte-only necessary-condition check now skips the existing sixteen regexes
+for text that cannot contain any of their shapes. The original ordered regex,
+keep predicates, overlap merging, markers and counts are unchanged. Punctuation
+(`-`, `_`, `:`, `=`), AWS/Google/JWT prefixes and case-insensitive ASCII `Bearer`
+still enter the original engine. This deliberately accepts false positives;
+it does not add secret policy or require long GitHub tokens (`ghp_a` still masks).
+
+Fresh release-profile measurements on Apple M2 Max/macOS 26.6.2, without a
+concurrent build/benchmark: eleven interleaved original/candidate pairs per
+corpus, reversing order each pair. Regexes and input were warm; OS caches were
+not cleared. Inputs are synthetic, with SHA-256 input/output and mask counts
+checked equal. These are masking microbenchmarks, not app/phone paint timings.
+
+| Corpus | Bytes / masked spans | Original min / median / max ms | Fast-path min / median / max ms |
+|---|---:|---:|---:|
+| Safe prose with Unicode/CRLF | 1,556,480 / 0 | 63.340 / 63.837 / 64.750 | 1.355 / 1.368 / 1.383 |
+| Punctuation/code/URL prose | 2,097,152 / 0 | 11.213 / 11.304 / 11.355 | 11.207 / 11.313 / 11.407 |
+| Dense synthetic secrets | 821,248 / 28,673 | 12.605 / 12.831 / 13.227 | 12.722 / 12.920 / 13.048 |
+
+Before applying the optimization, the original-vs-wrapper baseline median
+ratios differed by less than 1%. The predeclared retention criterion was an
+improvement for safe prose and no more than 5% median overhead for punctuation
+or dense secrets against the same-binary reference. Actual fallback changes
+were +0.08% and +0.70%. The ~46.7× safe-prose microbenchmark improvement is
+specific to this corpus; punctuation-heavy text generally takes the fallback.
+
+Separate before/after generated 10k-message and 70MiB transcript runs rebuilt
+indexes from `None` three times (warm filesystem, not cold storage) and ran
+five samples of each masked/unmasked find for `widget`, `zzzabsentzzz`, and
+`hidden`. All hit counts/completeness/limit outcomes agreed. For example,
+70MiB absent masked find medians were 373.970→360.987ms and `hidden` masked
+520.014→513.338ms; hit-limited `widget` masked was 23.110→24.238ms. Index
+medians were 122.402→119.370ms (10k) and 251.449→269.588ms (70MiB). Index
+construction does not call this masker; those separate-run changes are not
+attributed improvements/regressions of masking. There is no demonstrated
+universal find/index speedup or device-budget certification.
+
+Reproduce deliberately with a fresh retained output directory and the same
+release toolchain/profile (never alongside another benchmark):
+
+```sh
+HEADSTATE_MASK_BENCH_OUT=/absolute/fresh-mask-run \
+  cargo test --release --manifest-path src-tauri/Cargo.toml --lib \
+  remote::privacy::fast_path_tests::masking_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test-only reference calls the original engine, not a copied algorithm.
+Tests pin the ordered policy fingerprint and one witness per shape, plus
+4,096 generated mixed Unicode/CRLF/overlap/placeholder cases. All retained
+raw logs, baseline source/hash provenance, generated fixtures and analysis
+are under `artifacts/release-9.2-build/masking-*` in the release workspace.
+The corpus is synthetic and must not be replaced with private transcripts in
+published benchmark evidence. Historical native/phone acceptance qualifications
+above remain unchanged.
