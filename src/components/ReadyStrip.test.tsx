@@ -1,3 +1,4 @@
+import { acceptCaptureWrite, beginCaptureWrite } from "../api/measurementCapture";
 import {
   act,
   cleanup,
@@ -86,7 +87,7 @@ const ready: PullRequest = {
 };
 
 describe("ReadyStrip", () => {
-  it("keeps receipt metadata with source rows despite an independently shared query array", async () => {
+  it.each([false,true])("keeps source row ownership and qualifies receipt metadata with acknowledged capture=%s", async acknowledged => {
     let observed: ReturnType<typeof useSourceRefresh> | undefined;
     let cache: QueryClient | undefined;
     function FromSource() {
@@ -97,6 +98,7 @@ describe("ReadyStrip", () => {
     render(<FromSource />);
     await waitFor(() => expect(eventHandlers.has("source-poll-status")).toBe(true));
     const token = { epoch: "a".repeat(32), capture: 1, id: 2 };
+    if(acknowledged)await act(async()=>{acceptCaptureWrite(cache!,beginCaptureWrite(cache!),{epoch:token.epoch,capture:token.capture});});
     const payload = { source: { provider: "github", host: "github.com" }, list: "reviewing", owner: "synthetic",
       session: "measurement-session", revision: 1, receipt_revision: 1, phase: "ready", error: null,
       prs: [{ ...ready }], coverage: "complete", measurement_receipt: token };
@@ -107,9 +109,9 @@ describe("ReadyStrip", () => {
     } }));
     expect(cache!.getQueryData(["reviewing"])).toBe(first);
     expect(observed!.prs).not.toBe(first);
-    expect(observed!.measurementReceipt?.id).toBe(3);
+    expect(observed!.measurementReceipt?.id).toBe(acknowledged ? 3 : undefined);
     await act(async () => eventHandlers.get("source-poll-status")?.({ payload: { ...payload, revision: 3, receipt_revision: 2, phase: "fetching", prs: null } }));
-    expect(observed!.measurementReceipt?.id).toBe(3);
+    expect(observed!.measurementReceipt?.id).toBe(acknowledged ? 3 : undefined);
   });
   it("keeps unread-head transport receipts out of Ready until a positively changed head", async () => {
     function FromSource() {

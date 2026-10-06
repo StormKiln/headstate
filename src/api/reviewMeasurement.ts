@@ -2,7 +2,7 @@ import { createContext, createElement, useCallback, useContext, useEffect, useMe
 import type { SourceRefreshSnapshot } from "./sourceRefresh";
 import type { PullRequest } from "../types/pr";
 import type { ClientMeasurement, MeasurementReference } from "../types/measurement";
-import { recordClientMeasurements } from "./tauri";
+import { publishClientMeasurements } from "./clientMeasurements";
 
 type Review = Extract<ClientMeasurement, { kind: "mounted_review" }>;
 type Presentation = Pick<Review, "footer" | "footer_location">;
@@ -63,6 +63,6 @@ export function useReadyMeasurement(inventory: PullRequest[], eligible: PullRequ
     if (encoded === last.current) return;
     last.current = encoded;
     // Failure is diagnostic loss, never a UI error or a retry/refresh request.
-    void recordClientMeasurements([JSON.parse(encoded) as Review]).catch(() => {});
+    void publishClientMeasurements([JSON.parse(encoded) as Review]).catch(() => {});
   }, [encoded]);
 }

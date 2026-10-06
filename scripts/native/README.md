@@ -36,9 +36,11 @@ staging location and is useful for inspection and isolated fault injection.
 
 These gates do not prove native presentation, URI permissions, final Rust bridge
 registration, signing or physical-device behavior. Runtime evidence remains
-separate. Plugin exports use only a neutral `transcript.md`, bounded 8 MiB UTF-8
-input, and private immutable files. Byte-identical exports reuse one file and
-renew its 24-hour lease; cache capacity is eight files / 32 MiB. New distinct
+separate. Plugin exports use closed kinds with neutral `transcript.md` or
+`headstate-measurements.jsonl` filenames, bounded 8 MiB UTF-8 input, and private immutable
+files. JSONL uses `application/x-ndjson` on Android and an exported text-conforming
+UTI on iOS. Kind-qualified byte-identical exports reuse one file and renew its
+24-hour lease; both kinds share eight files / 32 MiB of cache capacity. New distinct
 exports are refused at capacity rather than deleting a URI a recipient might
 still be reading. Cleanup touches only expired app-owned hash directories on a
 later export. Chooser completion does not claim that any destination saved data.

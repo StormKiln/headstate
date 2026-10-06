@@ -22,6 +22,7 @@ pub(super) enum Control {
         cutoff: u64,
     },
     Export {
+        max_bytes: Option<u64>,
         cutoff: u64,
         loss: Box<Loss>,
         deferred: Vec<DeferredAggregate>,
@@ -409,6 +410,7 @@ impl Writer {
                     }
                 }
                 Ok(Control::Export {
+                    max_bytes,
                     cutoff,
                     mut loss,
                     deferred,
@@ -437,6 +439,7 @@ impl Writer {
                             deferred,
                             lifecycle,
                             &cancel,
+                            max_bytes,
                         )
                     };
                     // Completion must release admission before waking the caller.

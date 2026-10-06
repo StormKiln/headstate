@@ -1,20 +1,20 @@
 import { captureReference } from "./measurementCapture";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { IS_MOBILE_BUILD } from "../lib/target";
-import { recordClientMeasurements } from "./tauri";
+import { measurementsEnabled, publishClientMeasurements } from "./clientMeasurements";
+
 import type { StatsBoard } from "../types/pr";
 import type { ClientMeasurement, MeasurementOutcome } from "../types/measurement";
 type Observation = Extract<ClientMeasurement, {kind:"stats_view"}>;
 function enabled(qc: QueryClient) {
-  return !IS_MOBILE_BUILD && qc.getQueryData<{diagnostic_logging?:boolean}>(["ui-prefs"])?.diagnostic_logging === true;
+  return measurementsEnabled(qc);
 }
 function value(qc: QueryClient, observation: "readback"|"mounted", outcome:MeasurementOutcome, board?:StatsBoard, elapsed?:number):Observation {
   return {kind:"stats_view",observation,outcome,scope:captureReference(qc, board?.measurementScope),
     rows:outcome === "rejected" ? undefined : board?.rows.length, elapsed_ms:elapsed===undefined?undefined:Math.max(0,Math.round(elapsed))};
 }
 export function observeStats(qc:QueryClient, observation:"readback"|"mounted",outcome:MeasurementOutcome,board?:StatsBoard,elapsed?:number) {
-  if(enabled(qc))void recordClientMeasurements([value(qc,observation,outcome,board,elapsed)]).catch(()=>{});
+  if(enabled(qc))void publishClientMeasurements([value(qc,observation,outcome,board,elapsed)]).catch(()=>{});
 }
 /** Subscribe only to preferences already owned by the app; no preference query. */
 export function useStatsMeasurement(board:StatsBoard|undefined,outcome:MeasurementOutcome) {
@@ -27,6 +27,6 @@ export function useStatsMeasurement(board:StatsBoard|undefined,outcome:Measureme
   useEffect(()=>{
     if(!encoded){last.current=undefined;return;}
     if(last.current===encoded)return;last.current=encoded;
-    void recordClientMeasurements([JSON.parse(encoded) as Observation]).catch(()=>{});
+    void publishClientMeasurements([JSON.parse(encoded) as Observation]).catch(()=>{});
   },[encoded]);
 }

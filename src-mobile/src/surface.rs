@@ -30,6 +30,11 @@ pub enum Class {
 /// Command name to class, in the desktop's order.
 pub const SURFACE: &[(&str, Class)] = &[
     ("save_markdown", Class::Local),
+    ("get_phone_measurement_prefs", Class::Local),
+    ("set_phone_measurement_prefs", Class::Local),
+    ("phone_measurement_status", Class::Local),
+    ("record_phone_measurements", Class::Local),
+    ("export_phone_measurements", Class::Local),
     // read: no side effects on GitHub or disk.
     // Whether the DESKTOP's background work has died (#1144). Read: a
     // question about state, not an action on that machine. The remedy it

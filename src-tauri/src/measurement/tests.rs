@@ -1030,3 +1030,73 @@ async fn preference_capture_negotiation_keeps_old_links_strict_and_new_unlinked_
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|v| v["capture"] == second.capture));
 }
+
+#[tokio::test]
+async fn recent_phone_export_selects_whole_record_suffix_with_explicit_omission() {
+    let (dir, r, _) = fixture(Caps {
+        data: 512,
+        transitions_per_minute: 512,
+        ..Caps::default()
+    });
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("synthetic-recent-private")).unwrap();
+    for revision in 0..200 {
+        assert!(Recorder::record(&r, event(&owner, revision)));
+    }
+    let path = dir.path().canonicalize().unwrap().join("recent.jsonl");
+    let receipt = r
+        .export_with_limit(path.clone(), Some(66 * 1024))
+        .await
+        .unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    assert!(
+        bytes.len() <= 66 * 1024,
+        "recent output must include metadata within cap"
+    );
+    let lines: Vec<serde_json::Value> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert!(lines[0]["omitted_prefix"]["records"].as_u64().unwrap() > 0);
+    assert_eq!(lines.len() as u64, receipt.records + 2);
+    assert_eq!(receipt.bytes, bytes.len() as u64);
+    assert_eq!(
+        lines[0]["omitted_prefix"]["records"].as_u64().unwrap() + receipt.records,
+        200
+    );
+    assert_eq!(lines[0]["omitted_prefix"]["oldest_wall_ms"], 1000);
+    assert_eq!(lines[0]["omitted_prefix"]["newest_wall_ms"], 1000);
+    assert_eq!(lines[0]["cutoff_seq"], 200);
+    assert_eq!(lines.last().unwrap()["records"], receipt.records);
+    assert_eq!(lines.last().unwrap()["cutoff_seq"], 200);
+    assert_eq!(
+        lines[1]["event"]["revision"],
+        lines[0]["omitted_prefix"]["records"]
+    );
+    assert_eq!(lines[lines.len() - 2]["event"]["revision"], 199);
+    assert!(receipt.incomplete);
+    assert!(!String::from_utf8(bytes)
+        .unwrap()
+        .contains("synthetic-recent-private"));
+}
+
+#[tokio::test]
+async fn recent_phone_export_empty_history_is_a_valid_bounded_frame() {
+    let (dir, r, _) = fixture(Caps::default());
+    let path = dir.path().canonicalize().unwrap().join("empty.jsonl");
+    let receipt = r.export_recent_to(path.clone()).await.unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let lines: Vec<serde_json::Value> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(receipt.records, 0);
+    assert_eq!(receipt.bytes, bytes.len() as u64);
+    assert!(receipt.bytes <= 8 * 1024 * 1024);
+    assert_eq!(lines[0]["omitted_prefix"]["records"], 0);
+    assert!(lines[0]["omitted_prefix"]["oldest_wall_ms"].is_null());
+    assert!(!receipt.incomplete);
+}

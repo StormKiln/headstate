@@ -719,6 +719,21 @@ impl Recorder {
         out
     }
     pub async fn export_to(&self, destination: PathBuf) -> Result<ExportReceipt, ExportError> {
+        self.export_with_limit(destination, None).await
+    }
+    /// Trusted phone adapter only: whole-record recent suffix, including metadata.
+    pub async fn export_recent_to(
+        &self,
+        destination: PathBuf,
+    ) -> Result<ExportReceipt, ExportError> {
+        self.export_with_limit(destination, Some(8 * 1024 * 1024))
+            .await
+    }
+    async fn export_with_limit(
+        &self,
+        destination: PathBuf,
+        max_bytes: Option<u64>,
+    ) -> Result<ExportReceipt, ExportError> {
         if self.shared.unavailable.load(Ordering::Acquire) {
             return Err(ExportError::Unavailable);
         }
@@ -749,6 +764,7 @@ impl Recorder {
                 .collect();
             let lifecycle = self.shared.lifecycle.lock().unwrap().clone();
             let command = writer::Control::Export {
+                max_bytes,
                 cutoff,
                 loss: Box::new(loss),
                 deferred,

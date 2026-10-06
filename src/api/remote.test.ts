@@ -31,6 +31,11 @@ afterEach(() => {
 });
 
 describe("remote transport: commands", () => {
+  it.each(["get_phone_measurement_prefs","set_phone_measurement_prefs","phone_measurement_status","record_phone_measurements","export_phone_measurements"])("keeps %s local even without a pairing", async command=>{
+    tauri.invoke.mockImplementation((name)=>name==="remote_call"?Promise.reject(new Error("unpaired")):Promise.resolve(null));
+    await expect(remote.call(command,{batch:[]})).resolves.toBeNull();
+    expect(tauri.invoke).toHaveBeenCalledExactlyOnceWith(command,{batch:[]});
+  });
   it("keeps native markdown export on the phone, never remote_call", async () => {
     tauri.invoke.mockResolvedValueOnce("presented");
     await expect(remote.call("save_markdown", {markdown: "# masked"})).resolves.toBe("presented");

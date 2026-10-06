@@ -52,6 +52,7 @@ pub mod measurement;
 mod mirrored;
 pub mod notify;
 mod pairing;
+mod phone_measurement;
 mod stepup;
 mod store;
 mod surface;
@@ -169,6 +170,7 @@ fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         keys::HardwareKeys::new(app.handle().clone()),
         keys::SoftwareKeys::new(store.clone()),
     ));
+    phone_measurement::initialize(app, store.clone(), dir.clone());
     let companion = Companion::new(
         store,
         keys,
@@ -236,6 +238,11 @@ pub fn run() {
         .plugin(tauri_plugin_headstate_export::init())
         .invoke_handler(tauri::generate_handler![
             save_markdown,
+            phone_measurement::get_phone_measurement_prefs,
+            phone_measurement::set_phone_measurement_prefs,
+            phone_measurement::phone_measurement_status,
+            phone_measurement::record_phone_measurements,
+            phone_measurement::export_phone_measurements,
             pair_from_qr,
             unpair,
             connection_state,

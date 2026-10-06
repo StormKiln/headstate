@@ -1111,3 +1111,25 @@ it("a new percentage supersedes an outstanding Latest without a transient tail j
   releasePosition(await file.page({ kind: "position", percent: 10 }, "after"));
   expect(await position).toEqual({ id: "r10" }); f.stop();
 });
+
+
+describe("actual follower observations",()=>{
+  it("observes idle/hidden and actual eviction without extra reads or changing manual hold",async()=>{
+    const file=new FakeFile(12,3);const observed:unknown[]=[];
+    const f=follower(file,{maxResident:5,pressureResident:3,observe:value=>observed.push(value)});
+    f.setLive("unknown");f.start();await settle();
+    expect(file.calls).toHaveLength(1);
+    expect(observed).toContainEqual(expect.objectContaining({phase:"idle",resident_rows:3}));
+    await f.loadOlder();await settle();
+    expect(observed).toContainEqual(expect.objectContaining({phase:"evict",rows:3}));
+    f.setVisible(false);const calls=file.calls.length;
+    await vi.advanceTimersByTimeAsync(IDLE_MAX_MS*2);
+    expect(file.calls).toHaveLength(calls);
+    expect(observed).toContainEqual(expect.objectContaining({phase:"hidden"}));
+    f.stop();
+  });
+  it("a broken observation sink cannot fail a successful page",async()=>{
+    const file=new FakeFile(3);const f=follower(file,{observe:()=>{throw new Error("synthetic observer");}});
+    f.start();await settle();expect(f.getSnapshot().messages).toHaveLength(3);expect(file.calls).toHaveLength(1);f.stop();
+  });
+});

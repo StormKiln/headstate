@@ -279,7 +279,55 @@ pub fn page(
     direction: PageDirection,
     limit: Option<usize>,
 ) -> Result<TranscriptWindow, String> {
-    read_page(path, anchor, direction, limit, IndexUse::Cached)
+    page_observed(
+        path,
+        anchor,
+        direction,
+        limit,
+        crate::measurement_desktop::recorder(),
+    )
+}
+pub(crate) fn page_observed(
+    path: &Path,
+    anchor: &PageAnchor,
+    direction: PageDirection,
+    limit: Option<usize>,
+    recorder: Option<&crate::measurement::Recorder>,
+) -> Result<TranscriptWindow, String> {
+    use crate::measurement::{
+        AggregateDelta, AggregateKind, Capability, Domain, Event, TranscriptPhase, WorkClass,
+    };
+    let Some(recorder) = recorder.filter(|r| r.enabled()) else {
+        return read_page(path, anchor, direction, limit, IndexUse::Cached);
+    };
+    let recorder = Some(recorder);
+    let operation = recorder.and_then(|r| r.next_operation(None));
+    let started = std::time::Instant::now();
+    let result = read_page(path, anchor, direction, limit, IndexUse::Cached);
+    if let (Some(r), Some(operation)) = (recorder, operation) {
+        let window = result.as_ref().ok();
+        r.record(Event::Transcript {
+            operation: operation.clone(),
+            phase: TranscriptPhase::Read,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).ok(),
+            bytes: window.and_then(|w| r.measured_count(w.page.bytes_read)),
+            rows: window.and_then(|w| r.measured_count(w.page.messages.len() as u64)),
+            resident_rows: None,
+            capability: if window.is_some() {
+                Capability::Measured
+            } else {
+                Capability::Unmeasured
+            },
+        });
+        r.aggregate(AggregateDelta {
+            domain: Domain::Transcript,
+            metric: AggregateKind::Completed,
+            work: WorkClass::Foreground,
+            count: 1,
+        });
+        r.retire(&operation);
+    }
+    result
 }
 
 /// Which position index a read consults. `None` and `Given` are the
@@ -1604,6 +1652,61 @@ fn clip_chars(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::claude::transcript_model::{self, IdSource, TranscriptBlock};
+
+    #[tokio::test]
+    async fn measured_page_observes_actual_bounded_read_without_private_content() {
+        use crate::measurement::{Config, Platform, Recorder, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = write(
+            &root,
+            "synthetic-private-transcript.jsonl",
+            &conversation(3),
+        );
+        let recorder = Recorder::new(Config {
+            directory: root.join("journal"),
+            epoch: [8; 16],
+            role: Role::Desktop,
+            platform: Platform::Macos,
+            build: "test".into(),
+        })
+        .unwrap();
+        let off = page_observed(
+            &path,
+            &PageAnchor::End,
+            PageDirection::Before,
+            Some(2),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert_eq!(recorder.status().durable_records, 0);
+        recorder.set_enabled(true);
+        let actual = page_observed(
+            &path,
+            &PageAnchor::End,
+            PageDirection::Before,
+            Some(2),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert_eq!(actual.page.messages, off.page.messages);
+        let output = root.join("report.jsonl");
+        recorder.export_to(output.clone()).await.unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let observed = records
+            .iter()
+            .find(|v| v["event"]["kind"] == "transcript")
+            .unwrap();
+        assert_eq!(observed["event"]["bytes"], actual.page.bytes_read);
+        assert_eq!(observed["event"]["rows"], actual.page.messages.len());
+        assert!(observed["event"]["elapsed_ms"].is_u64());
+        assert!(!text.contains("synthetic-private-transcript"));
+        assert!(text.lines().all(|line| line.len() <= 1024));
+    }
 
     #[test]
     fn percentage_position_resolves_current_index_and_bounded_fallback() {

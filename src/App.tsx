@@ -1,3 +1,4 @@
+import { useMeasurementsEnabled } from "./api/clientMeasurements";
 import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
 import { listen } from "./api/transport";
@@ -384,6 +385,7 @@ export default function App() {
   // already does with the same value, so the two agree in the uncertain
   // case as well as the settled ones.
   const { prefs } = useUiPrefs();
+  const measurementEnabled = useMeasurementsEnabled();
   const claudeCodeOff = !prefs?.claude_integrations_enabled;
   const view =
     (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView)) ||
@@ -883,7 +885,7 @@ export default function App() {
     // nothing above it can push the status bar past the window's edge.
     // `index.css` sizes `html`, `body` and `#root` to the viewport and
     // stops the document itself from scrolling.
-    <ReviewMeasurementProvider enabled={!IS_MOBILE_BUILD && prefs?.diagnostic_logging === true}
+    <ReviewMeasurementProvider enabled={IS_MOBILE_BUILD ? measurementEnabled : prefs?.diagnostic_logging === true}
       snapshot={githubReceipt} selected={!!filters.repo || !!sourceRepoKey}
       receipt={reviewingQuery.data === reviewingReceipt.prs ? reviewingReceipt.measurementReceipt : undefined}>
     <div className="flex h-full flex-col bg-[#0d1117] text-[#e6edf3] px-safe">

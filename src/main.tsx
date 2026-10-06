@@ -8,6 +8,8 @@ import { PairingGate } from "./components/PairingGate";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PairingRequestModal } from "./components/PairingRequestModal";
 import { PERSIST_KEY } from "./store/filters";
+import { PhoneMeasurementStartup } from "./api/phoneMeasurements";
+import { IS_MOBILE_BUILD } from "./lib/target";
 import { IS_DESKTOP_BUILD } from "./lib/target";
 import { initSplash } from "./splash";
 import "./index.css";
@@ -62,6 +64,7 @@ createRoot(document.getElementById("root") as HTMLElement).render(
         the only thing left to render it. */}
     <ErrorBoundary onReset={() => localStorage.removeItem(PERSIST_KEY)}>
       <QueryClientProvider client={queryClient}>
+        {IS_MOBILE_BUILD ? <PhoneMeasurementStartup /> : null}
         {/* Pairing is the OUTER gate, and only on the phone. The
             companion forwards every desktop command over `remote_call`,
             which rejects while unpaired -- so `AuthGate`'s check failed

@@ -1,3 +1,4 @@
+import { PhoneMeasurementPanel } from "./PhoneMeasurementPanel";
 import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
@@ -389,6 +390,7 @@ export function SettingsDialog({
               </button>
             </>
           ) : null}
+          {IS_MOBILE_BUILD && section === "general" ? <PhoneMeasurementPanel /> : null}
           {!IS_MOBILE_BUILD && section === "general" ? <MeasurementExport diagnosticLogging={ui?.diagnostic_logging ?? false} /> : null}
           {autostartError ? (
             <p role="alert" className="text-xs text-[#f85149]">

@@ -85,6 +85,14 @@ struct Header<'a> {
     incomplete: bool,
     deferred: &'a [DeferredAggregate],
     lifecycle: &'a Lifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_prefix: Option<&'a OmittedPrefix>,
+}
+#[derive(Default, serde::Serialize)]
+struct OmittedPrefix {
+    records: u64,
+    oldest_wall_ms: Option<u64>,
+    newest_wall_ms: Option<u64>,
 }
 #[derive(serde::Serialize)]
 struct Trailer {
@@ -95,6 +103,7 @@ struct Trailer {
     complete: bool,
     incomplete: bool,
 }
+#[allow(clippy::too_many_arguments)] // One writer-owned immutable export snapshot.
 pub(super) fn write_report(
     writer: &writer::Writer,
     destination: &Path,
@@ -103,6 +112,7 @@ pub(super) fn write_report(
     deferred: Vec<DeferredAggregate>,
     lifecycle: Lifecycle,
     cancel: &AtomicBool,
+    max_bytes: Option<u64>,
 ) -> Result<ExportReceipt, ExportError> {
     let mut perform = || -> Result<ExportReceipt, ExportError> {
         writer::safe_path(destination).map_err(|_| ExportError::Destination)?;
@@ -124,21 +134,58 @@ pub(super) fn write_report(
             }
         }
         let _cleanup = Cleanup(staging.clone());
+        // Reserve a fixed bounded metadata allowance, never materialize history.
+        // Selection is a suffix of validated whole records in writer order.
+        const METADATA_BYTES: u64 = 64 * 1024;
+        let mut remaining_bytes = 0u64;
+        if max_bytes.is_some() {
+            for segment in &writer.segments {
+                read_records(
+                    &writer::segment_path(&writer.config.directory, segment.number),
+                    |line, _| {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(io::Error::other("canceled"));
+                        }
+                        remaining_bytes = remaining_bytes.saturating_add(line.len() as u64);
+                        Ok(())
+                    },
+                    &mut Loss::default(),
+                )
+                .map_err(|_| ExportError::Unavailable)?;
+            }
+        }
+        let payload_bound = max_bytes.map(|limit| limit.saturating_sub(METADATA_BYTES));
+        let mut omitted = OmittedPrefix::default();
         let mut count = 0u64;
         let mut oldest = None::<u64>;
         let mut newest = None::<u64>;
         let mut epochs = 0u32;
         let mut captures = 0u32;
         let mut previous = None::<(String, u64)>;
-        // Frozen writer-owned files: first pass validates/counts with bounded
-        // memory, second streams precisely those records. Rotation cannot run.
+        // Frozen writer-owned files: validate/count, then stream selected records.
+        // Recent export adds the byte-count pass above. Rotation cannot run.
         let mut detected = Loss::default();
         for segment in &writer.segments {
             read_records(
                 &writer::segment_path(&writer.config.directory, segment.number),
-                |_, record| {
+                |line, record| {
                     if cancel.load(Ordering::Acquire) {
                         return Err(io::Error::other("canceled"));
+                    }
+                    if payload_bound.is_some_and(|bound| remaining_bytes > bound) {
+                        remaining_bytes = remaining_bytes.saturating_sub(line.len() as u64);
+                        omitted.records += 1;
+                        omitted.oldest_wall_ms = Some(
+                            omitted
+                                .oldest_wall_ms
+                                .map_or(record.wall_time_ms, |x| x.min(record.wall_time_ms)),
+                        );
+                        omitted.newest_wall_ms = Some(
+                            omitted
+                                .newest_wall_ms
+                                .map_or(record.wall_time_ms, |x| x.max(record.wall_time_ms)),
+                        );
+                        return Ok(());
                     }
                     count += 1;
                     oldest =
@@ -162,7 +209,7 @@ pub(super) fn write_report(
         loss.malformed = loss
             .malformed
             .saturating_add(detected.malformed.saturating_sub(known));
-        let incomplete = loss.incomplete();
+        let incomplete = loss.incomplete() || omitted.records > 0;
         let header = Header {
             kind: "header",
             schema: 1,
@@ -186,17 +233,29 @@ pub(super) fn write_report(
             incomplete,
             deferred: &deferred,
             lifecycle: &lifecycle,
+            omitted_prefix: max_bytes.map(|_| &omitted),
         };
-        serde_json::to_writer(&mut output, &header).map_err(|_| ExportError::Destination)?;
+        let header_bytes = serde_json::to_vec(&header).map_err(|_| ExportError::Destination)?;
+        if header_bytes.len() as u64 + 1024 > METADATA_BYTES {
+            return Err(ExportError::Destination);
+        }
+        output
+            .write_all(&header_bytes)
+            .map_err(|_| ExportError::Destination)?;
         output
             .write_all(b"\n")
             .map_err(|_| ExportError::Destination)?;
+        let mut skip = omitted.records;
         for segment in &writer.segments {
             read_records(
                 &writer::segment_path(&writer.config.directory, segment.number),
                 |line, _| {
                     if cancel.load(Ordering::Acquire) {
                         return Err(io::Error::other("canceled"));
+                    }
+                    if skip > 0 {
+                        skip -= 1;
+                        return Ok(());
                     }
                     output.write_all(line)
                 },
@@ -227,7 +286,7 @@ pub(super) fn write_report(
             .metadata()
             .map_err(|_| ExportError::Destination)?
             .len();
-        if bytes > 129 * 1024 * 1024 {
+        if bytes > max_bytes.unwrap_or(129 * 1024 * 1024) {
             return Err(ExportError::Destination);
         }
         if cancel.load(Ordering::Acquire) {

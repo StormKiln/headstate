@@ -3,6 +3,10 @@ import CryptoKit
 import UIKit
 import Tauri
 
+public enum ExportKind: String, Decodable, CaseIterable {
+  case transcriptMarkdown = "transcript_markdown", measurementJsonl = "measurement_jsonl"
+  var filename: String { self == .transcriptMarkdown ? "transcript.md" : "headstate-measurements.jsonl" }
+}
 public enum ExportFailure: Error, Equatable { case capacity, unavailable, tooLarge }
 
 /// Immutable app-owned files: reuse identical bytes; retain for 24 hours so
@@ -10,7 +14,7 @@ public enum ExportFailure: Error, Equatable { case capacity, unavailable, tooLar
 public final class MarkdownExportStore {
   public let root: URL
   public init(root: URL) { self.root = root }
-  public func prepare(_ markdown: String, now: Date = Date()) throws -> URL {
+  public func prepare(_ markdown: String, now: Date = Date(), kind: ExportKind = .transcriptMarkdown) throws -> URL {
     let data = Data(markdown.utf8)
     guard data.count <= 8 * 1024 * 1024 else { throw ExportFailure.tooLarge }
     let fm = FileManager.default
@@ -21,9 +25,9 @@ public final class MarkdownExportStore {
       let date = try entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? now
       if now.timeIntervalSince(date) > 24 * 60 * 60 { try fm.removeItem(at: entry) }
     }
-    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let hash = SHA256.hash(data: Data((kind.rawValue + "\0").utf8) + data).map { String(format: "%02x", $0) }.joined()
     let directory = root.appendingPathComponent(hash, isDirectory: true)
-    let file = directory.appendingPathComponent("transcript.md")
+    let file = directory.appendingPathComponent(kind.filename)
     if fm.fileExists(atPath: file.path) {
       try fm.setAttributes([.modificationDate: now], ofItemAtPath: directory.path)
       return file
@@ -31,7 +35,9 @@ public final class MarkdownExportStore {
     let live = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
       .filter { $0.lastPathComponent.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil }
     let bytes = live.reduce(0) { total, entry in
-      total + ((try? entry.appendingPathComponent("transcript.md").resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+      total + ExportKind.allCases.reduce(0) { size, kind in
+        size + ((try? entry.appendingPathComponent(kind.filename).resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+      }
     }
     guard live.count < 8 && bytes + data.count <= 32 * 1024 * 1024 else { throw ExportFailure.capacity }
     try fm.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -43,6 +49,14 @@ public final class MarkdownExportStore {
   }
 }
 
+private final class MeasurementShareItem: NSObject, UIActivityItemSource {
+  let file: URL
+  init(_ file: URL) { self.file = file }
+  func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any { file }
+  func activityViewController(_ activityViewController: UIActivityViewController, itemForActivityType activityType: UIActivity.ActivityType?) -> Any? { file }
+  func activityViewController(_ activityViewController: UIActivityViewController, dataTypeIdentifierForActivityType activityType: UIActivity.ActivityType?) -> String { "com.pktstorm.headstate.measurements-jsonl" }
+}
+
 /// UIKit is entered only on main. One owner resolves presentation, activity
 /// completion and interactive dismissal through the same once-only terminal.
 public final class MarkdownSharePresenter: NSObject, UIAdaptivePresentationControllerDelegate {
@@ -50,7 +64,7 @@ public final class MarkdownSharePresenter: NSObject, UIAdaptivePresentationContr
   private var completion: ((String) -> Void)?
   private var controller: UIActivityViewController?
   public init(store: MarkdownExportStore) { self.store = store }
-  public func present(_ markdown: String, from host: UIViewController?, completion: @escaping (String) -> Void) {
+  public func present(_ markdown: String, kind: ExportKind = .transcriptMarkdown, from host: UIViewController?, completion: @escaping (String) -> Void) {
     dispatchPrecondition(condition: .onQueue(.main))
     guard self.completion == nil else { completion("busy"); return }
     guard var host = host, host.viewIfLoaded?.window != nil else { completion("failed"); return }
@@ -58,14 +72,15 @@ public final class MarkdownSharePresenter: NSObject, UIAdaptivePresentationContr
     guard !host.isBeingDismissed && !host.isBeingPresented else { completion("failed"); return }
     self.completion = completion
     DispatchQueue.global(qos: .userInitiated).async {
-      let result = Result { try self.store.prepare(markdown) }
+      let result = Result { try self.store.prepare(markdown, kind: kind) }
       DispatchQueue.main.async {
         guard self.completion != nil else { return }
         switch result {
         case .failure(let error): self.finish(error as? ExportFailure == .capacity ? "capacity" : "failed")
         case .success(let file):
           guard host.viewIfLoaded?.window != nil, !host.isBeingDismissed, host.presentedViewController == nil else { self.finish("failed"); return }
-          let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+          let item: Any = kind == .measurementJsonl ? MeasurementShareItem(file) : file
+          let sheet = UIActivityViewController(activityItems: [item], applicationActivities: nil)
           self.controller = sheet
           sheet.completionWithItemsHandler = { [weak self] _, completed, _, error in
             self?.finish(error != nil ? "failed" : completed ? "shared" : "cancelled")
@@ -91,7 +106,7 @@ public final class MarkdownSharePresenter: NSObject, UIAdaptivePresentationContr
   }
 }
 
-private struct ShareArgs: Decodable { let markdown: String }
+private struct ShareArgs: Decodable { let markdown: String; let kind: ExportKind? }
 private struct ShareReply: Encodable { let outcome: String }
 class HeadstateExportPlugin: Plugin {
   private lazy var presenter = MarkdownSharePresenter(store: MarkdownExportStore(root:
@@ -99,7 +114,7 @@ class HeadstateExportPlugin: Plugin {
   @objc public func share(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(ShareArgs.self)
     DispatchQueue.main.async {
-      self.presenter.present(args.markdown, from: self.manager.viewController) { outcome in
+      self.presenter.present(args.markdown, kind: args.kind ?? .transcriptMarkdown, from: self.manager.viewController) { outcome in
         invoke.resolve(ShareReply(outcome: outcome))
       }
     }

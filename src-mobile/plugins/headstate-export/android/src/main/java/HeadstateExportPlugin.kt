@@ -20,9 +20,13 @@ import java.util.concurrent.Executors
 // A distinct manifest component preserves Tauri's own FileProvider.
 class MarkdownExportProvider : FileProvider()
 
+enum class ExportKind(val wire: String, val filename: String, val mime: String) {
+    TRANSCRIPT("transcript_markdown", "transcript.md", "text/markdown"),
+    MEASUREMENT("measurement_jsonl", "headstate-measurements.jsonl", "application/x-ndjson")
+}
 class ExportCapacityException : Exception()
 class MarkdownExportStore(private val root: File) {
-    fun prepare(markdown: String, now: Long = System.currentTimeMillis()): File {
+    fun prepare(markdown: String, now: Long = System.currentTimeMillis(), kind: ExportKind = ExportKind.TRANSCRIPT): File {
         val bytes = markdown.toByteArray(Charsets.UTF_8)
         require(bytes.size <= 8 * 1024 * 1024) { "Export exceeds 8 MiB" }
         check(root.isDirectory || root.mkdirs()) { "Export storage unavailable" }
@@ -31,9 +35,9 @@ class MarkdownExportStore(private val root: File) {
         entries().filter { now - it.lastModified() > 24 * 60 * 60 * 1000L }.forEach {
             check(it.deleteRecursively()) { "Export cleanup unavailable" }
         }
-        val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val hash = MessageDigest.getInstance("SHA-256").digest(kind.wire.toByteArray(Charsets.UTF_8) + byteArrayOf(0) + bytes).joinToString("") { "%02x".format(it) }
         val folder = File(root, hash)
-        val file = File(folder, "transcript.md")
+        val file = File(folder, kind.filename)
         val staged = File(folder, ".transcript.pending")
         // Validate older cache entries too: a previous process may have died
         // while writing the final filename before atomic publication existed.
@@ -43,7 +47,7 @@ class MarkdownExportStore(private val root: File) {
             return file
         }
         val live = entries().filter { it != folder }
-        if (live.size >= 8 || live.sumOf { File(it, "transcript.md").length() } + bytes.size > 32 * 1024 * 1024) throw ExportCapacityException()
+        if (live.size >= 8 || live.sumOf { folder -> ExportKind.values().sumOf { File(folder, it.filename).length() } } + bytes.size > 32 * 1024 * 1024) throw ExportCapacityException()
         check(folder.isDirectory || folder.mkdir())
         try {
             // A retry truncates an abandoned stage. Android's same-directory
@@ -58,7 +62,7 @@ class MarkdownExportStore(private val root: File) {
 }
 
 @InvokeArg
-class ShareArgs { lateinit var markdown: String }
+class ShareArgs { lateinit var markdown: String; var kind: String = "transcript_markdown" }
 @TauriPlugin
 class HeadstateExportPlugin(private val activity: Activity) : Plugin(activity) {
     private val worker = Executors.newSingleThreadExecutor()
@@ -66,24 +70,26 @@ class HeadstateExportPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun share(invoke: Invoke) {
         val args = invoke.parseArgs(ShareArgs::class.java)
+        val kind = ExportKind.values().firstOrNull { it.wire == args.kind }
+        if (kind == null) { reply(invoke, "failed"); return }
         activity.runOnUiThread {
             if (pending != null) { reply(invoke, "busy"); return@runOnUiThread }
             if (activity.isFinishing || activity.isDestroyed) { reply(invoke, "failed"); return@runOnUiThread }
             pending = invoke
             worker.execute {
                 try {
-                    val file = MarkdownExportStore(File(activity.cacheDir, "headstate-export")).prepare(args.markdown)
+                    val file = MarkdownExportStore(File(activity.cacheDir, "headstate-export")).prepare(args.markdown, kind = kind)
                     activity.runOnUiThread {
                         if (pending !== invoke) return@runOnUiThread
                         try {
                             val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.headstate.export", file)
                             val send = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/markdown"
+                                type = kind.mime
                                 putExtra(Intent.EXTRA_STREAM, uri)
-                                clipData = ClipData.newUri(activity.contentResolver, "transcript.md", uri)
+                                clipData = ClipData.newUri(activity.contentResolver, kind.filename, uri)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
-                            startActivityForResult(invoke, Intent.createChooser(send, "Share markdown").apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }, "shared")
+                            startActivityForResult(invoke, Intent.createChooser(send, "Share report").apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }, "shared")
                         } catch (_: Exception) { finish(invoke, "failed") }
                     }
                 } catch (error: Exception) {

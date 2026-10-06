@@ -1,8 +1,8 @@
 # Measurement foundation API (schema 1)
 
 The foundation includes Task 6A desktop To Review and Task 6B Stats/StopFailure
-producers described below. Transcript, the analyzer and independent phone-local
-adapters remain separate subsequent slices.
+producers described below, plus Task 6C transcript and independent phone-local capture.
+The analyzer and field runbook remain the subsequent 6D slice.
 A successful export is not a performance or convergence pass.
 
 ## Construction and ownership
@@ -13,8 +13,8 @@ writer. The shell supplies a secure random process epoch and an app-owned direct
 Initialization/entropy failure leaves diagnostics unavailable without failing startup.
 Desktop `measurement_desktop` owns a `OnceLock<Recorder>` and binds the persisted
 `ui.diagnostic_logging` preference at startup and after successful preference saves.
-The companion compiles the same core; it has **no capture preference, adapter or
-measurement UI yet**. Desktop commands are `Local` in both surface tables.
+The companion compiles the same core with its independent local preference, adapter
+and measurement UI described under Task 6C. Desktop commands are `Local` in both surface tables.
 
 `enabled()` is an atomic fast path. `set_enabled(false)` immediately closes admission,
 clears private keys/live handles, and requests a best-effort flush without waiting for
@@ -170,7 +170,7 @@ row qualifiers are absent. Optional advisory count remains absent. The displayed
 footer branch is bound to the same source frame before an observation is sent. This is a
 React commit observation, not a paint or user-perceived latency measurement. GitLab-only,
 main-list rows and the phone ConnectionBanner are not measured by this slice; a hidden
-desktop footer is explicitly hidden. Phone capture remains off/unimplemented until 6C.
+desktop footer is explicitly hidden. Phone capture is independently default-off; Task 6C adds its local wiring.
 Recording failure, stale references and budget loss cannot change product success.
 
 ## Task 6B Stats and sampled StopFailure observations
@@ -206,8 +206,8 @@ actual accepted board at React effect/commit, with its author-row count (not PR 
 viewport rows or paint timing). Retained data keeps its own scope reference, and older
 responses without metadata remain unlinked. Mounted elapsed time is absent. It subscribes
 to the app's existing preference cache without fetching preferences, Stats or progress.
-This slice is desktop-only; 6C must enable phone-local preference/recording and omit foreign
-host scope references, never interpret them as phone-local authority.
+Task 6C also enables phone-local preference/recording and omits foreign host scope
+references; they are never interpreted as phone-local authority.
 
 StopFailure ingestion is observed only after the real consume transaction commits, using
 the existing INSERT OR IGNORE row count for duplicate replay. The bounded staging list
@@ -260,7 +260,7 @@ answers cannot restore a retired link. Useful counts continue without a referenc
 Only an accepted reference matching the acknowledged local capture restores linkage;
 core handle-kind/owner/liveness validation remains strict. Failed saves publish no
 context. A late success cannot establish native completion order and clears linkage
-conservatively without replacing the latest requested preferences.
+conservatively without overriding a later successful preference write.
 
 Startup without a proven local acknowledgment remains unlinked. This bridge observes
 this application's successful preference calls; it does not claim to observe capture
@@ -275,3 +275,71 @@ hook observation confirms that exact source timestamp. This deliberately sacrifi
 unprovable historical timing (also after bounded correlation expiry) instead of treating
 storage fallback as source time. Existing storage and the15-second classifier are
 unchanged; no schema migration or additional query is introduced.
+
+## Task 6C transcript and phone integration
+
+`transcript_page::page` observes its actual bounded native read using the desktop
+recorder, without changing reader/index policy. Native Transcript Read bytes are the
+returned `page.bytes_read` (bytes held/read by that page path, including its cursor
+work), not serialized/compressed wire size; streamed `bytes_scanned` is not silently
+added. Rows are returned page messages; elapsed is that synchronous read section.
+Failure leaves byte/row readings absent. Disabled capture takes the original read
+path directly. The completed operation is retired and is not attached to the reply.
+
+The real frontend page hook measures the existing awaited call (including transport
+and decoding to the extent they happen inside that promise), not server-only time.
+Follower state publications observe current residency and idle/follow states; explicit
+hide transitions and actual dropped-page rows are observed without starting reads.
+Evicted rows describe dropped page entries, not unique lifetime messages. The mounted
+viewer observes its bounded window and input-array residency at React effect/commit.
+`raf_proxy` is elapsed time to two browser animation callbacks after that commit;
+it is neither compositor paint nor CPU/heap. Hidden/unmounted/changed windows cancel
+pending callbacks. Client observations are unlinked: no request ID, session path,
+message ID, or retired host operation is fabricated. Exact duplicate suppression and
+shared event quotas coalesce/refuse repeats with the foundation's loss accounting.
+
+The companion owns a separate default-off `phone-measurement-prefs` key in its local
+store and its own secure random epoch/phone-role recorder. Startup reads only that
+local preference. Successful local persistence precedes enable/disable and returns
+its own optional capture identity. Failed writes do not publish capture or preference
+state. Phone Ready/Stats/transcript events use only local opt-in and local command
+routing; any foreign receipt/scope/operation is omitted before submission. Ready
+counts are observed, but the actual phone ConnectionBanner remains unmeasured, not
+misreported as a displayed desktop footer. External preference origins retain the
+previously documented lifecycle boundary.
+
+Five specifically named companion commands (`get_phone_measurement_prefs`,
+`set_phone_measurement_prefs`, `phone_measurement_status`, `record_phone_measurements`,
+`export_phone_measurements`) use CLIENT_COMMANDS and work without pairing. The actual
+“This phone” panel is mounted in General settings and on the unpaired screen. It
+loads local status on mount/control/export, not a polling timer. Status/control
+failure remains unavailable; disabled capture can still share retained history.
+Phone report bytes and paths never cross JavaScript.
+
+`export_recent_to` reuses the same writer, admission owner, five-second pre-streaming
+barrier and immutable cutoff as full export. With rotation serialized, it makes one
+bounded validation pass for payload bytes, one for suffix counts/ranges, and one to
+stream selected whole records. It reserves 64 KiB for bounded header/trailer metadata,
+rejects metadata exceeding that reservation, and checks the exact final file bytes
+against 8 MiB. This may leave unused space; it never creates a full-history temporary
+or materializes 128 MiB. Public full desktop export retains its prior cap. The phone
+adapter reads only that bounded native file (8 MiB + one-byte overflow probe) for
+native sharing and removes its private temporary after presentation completes.
+
+Recent header adds `omitted_prefix: {records, oldest_wall_ms, newest_wall_ms}`. Counts
+cover validated omitted records in writer order; malformed data stays in loss rather
+than pretending to be counted. Wall ranges are minima/maxima, not cross-epoch clock
+ordering. Header oldest/newest/records describe the selected suffix, and header/trailer
+retain the actual barrier cutoff even when prefix records are omitted. Any omission
+sets incomplete. Header build/platform/role describe the current exporter; retained
+envelopes keep their own epoch/capture/role, and old epochs are not relabeled as current.
+
+The native-only share bridge accepts closed TranscriptMarkdown/MeasurementJsonl kinds
+with fixed `transcript.md` / `headstate-measurements.jsonl` names. Measurement MIME is
+application/x-ndjson (iOS app UTI declaration and typed share item; Android intent).
+Kind participates in the private cache hash. Both kinds share the existing 8-file,
+32-MiB, 24-hour retention and 8-MiB per-file limits. Busy/cancel/presented outcomes keep
+their original meaning; Android presented does not mean a destination saved the file.
+A companion build is required; an older installed app honestly lacks these local
+commands. No physical iPhone paint, sharing latency, background execution, memory,
+or enterprise performance acceptance follows from the synthetic tests.

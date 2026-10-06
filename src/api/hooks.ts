@@ -1,3 +1,4 @@
+import { observeTranscript } from "./transcriptMeasurement";
 import { beginCaptureWrite, acceptCaptureWrite } from "./measurementCapture";
 import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
 import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
@@ -7,7 +8,7 @@ import { useDetailSourceGeneration, detailSourceGeneration, beginDetailRead, det
 import { reconcileReviewDetail, submitBoundReview, reviewReadGeneration, reviewAccountGeneration } from "./reviewOperations";
 import { useTranscriptWatch } from "./useTranscriptWatch";
 import { DetailPollBackoff } from "./detailPolling";
-import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, QueryClientContext, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
@@ -15,7 +16,7 @@ import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
 import { invalidateSourceMeasurements, clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
-import { useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useContext, useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   AlertReport,
   ClaudeMdAdviceMode,
@@ -1656,12 +1657,18 @@ export function useClaudeTranscriptLive(
   },
 ) {
   const { liveness, enabled = true, reveal = false, openAt = null, openAtCursor = null, sessionId = null, watchActivity = false } = options;
+  const measurementClient = useContext(QueryClientContext);
   const on = enabled && path !== null && path !== "";
   const key = `${reveal ? "reveal" : "masked"}:${path ?? ""}`;
   const make = () =>
     new TranscriptFollower(
-      (anchor, direction) => claudeTranscriptPage(path as string, anchor, direction, null, reveal),
-      { openAt, openAtCursor },
+      async (anchor, direction) => {
+        const started = performance.now();
+        const page = await claudeTranscriptPage(path as string, anchor, direction, null, reveal);
+        observeTranscript(measurementClient,{phase:"page",rows:page.page.messages.length,elapsed_ms:Math.max(0,Math.round(performance.now()-started))});
+        return page;
+      },
+      { openAt, openAtCursor, observe:value=>observeTranscript(measurementClient,value) },
     );
   // A follower belongs to ONE file: a cursor is an offset into it. A new
   // path is a new follower, swapped during render so the pane never

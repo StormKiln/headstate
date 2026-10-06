@@ -186,6 +186,7 @@ export interface FollowSnapshot {
 }
 
 export interface FollowConfig {
+  observe?: (value: {phase: "follow" | "idle" | "hidden" | "evict"; rows?: number; resident_rows?: number}) => void;
   /// Most messages held; `MAX_RESIDENT` by default.
   maxResident?: number;
   /// What `relievePressure` keeps.
@@ -264,6 +265,7 @@ export class TranscriptFollower {
   /// at" would stop advancing while the poll kept going (#1525).
   private delivered: FollowSnapshot = this.snap;
   private readonly listeners = new Set<() => void>();
+  private readonly observe: NonNullable<FollowConfig["observe"]>;
   private readonly max: number;
   private readonly pressure: number;
   private readonly now: () => number;
@@ -276,6 +278,7 @@ export class TranscriptFollower {
     private readonly fetchPage: FetchPage,
     config: FollowConfig = {},
   ) {
+    this.observe = value => { try { config.observe?.(value); } catch { /* Observations cannot change reader behavior. */ } };
     this.max = config.maxResident ?? MAX_RESIDENT;
     this.pressure = config.pressureResident ?? PRESSURE_RESIDENT;
     this.now = config.now ?? Date.now;
@@ -323,6 +326,7 @@ export class TranscriptFollower {
   setVisible(visible: boolean): void {
     if (visible === this.visible) return;
     this.visible = visible;
+    if (!visible) this.observe({phase:"hidden",resident_rows:this.snap.messages?.length});
     if (!visible) this.cancelNavigation();
     this.kick();
   }
@@ -821,12 +825,14 @@ export class TranscriptFollower {
       // paging and memory pressure still drop the farther end.
       const dropTail =
         canHead && canTail ? !liveGrowth && shown !== null && n - 1 - shown.hi > shown.lo : canTail;
+      const dropped = this.pages[dropTail ? n - 1 : 0].page.messages.length;
       if (dropTail) {
         this.pages = this.pages.slice(0, -1);
         this.attached = false;
       } else {
         this.pages = this.pages.slice(1);
       }
+      this.observe({phase:"evict",rows:dropped,resident_rows:count(this.pages)});
     }
   }
 
@@ -914,6 +920,7 @@ export class TranscriptFollower {
     // no row re-renders.
     if (shallowEqual(next, this.delivered)) return;
     this.delivered = next;
+    this.observe({phase:!this.visible?"hidden":next.status === "idle"?"idle":"follow",resident_rows:messages?.length});
     for (const l of this.listeners) l();
   }
 }

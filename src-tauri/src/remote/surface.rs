@@ -63,6 +63,11 @@ pub enum Class {
 /// diff against the design document is a line-by-line comparison.
 pub const SURFACE: &[(&str, Class)] = &[
     ("save_markdown", Class::Local),
+    ("get_phone_measurement_prefs", Class::Local),
+    ("set_phone_measurement_prefs", Class::Local),
+    ("phone_measurement_status", Class::Local),
+    ("record_phone_measurements", Class::Local),
+    ("export_phone_measurements", Class::Local),
     // read: no side effects on GitHub or disk.
     // Read: the phone asking whether the DESKTOP's background work died
     // is a question about state, not an action on the machine. The

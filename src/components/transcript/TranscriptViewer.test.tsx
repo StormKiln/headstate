@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -5,6 +6,8 @@ import { useSyncExternalStore } from "react";
 import { TranscriptFollower } from "../../lib/transcriptFollow";
 import type { RemoteTranscriptWindow, TranscriptMessage } from "../../types/transcript";
 import { installScrollShim, type ScrollShim } from "./scrollShim";
+const measurementRecords=vi.hoisted(()=>vi.fn(()=>Promise.resolve()));
+vi.mock("../../api/tauri",async importOriginal=>({...await importOriginal<object>(),recordClientMeasurements:measurementRecords}));
 import { TranscriptViewer } from "./TranscriptViewer";
 import { WINDOW_SIZE, WINDOW_SLACK, WINDOW_STEP } from "./transcriptWindow";
 
@@ -437,4 +440,17 @@ describe("TranscriptViewer: an idle read (#1525)", () => {
     expect(mutations).toEqual([]);
     follower.stop();
   });
+});
+
+it("observes the actual bounded mounted window and two-frame proxy without calling it paint",async()=>{
+ const qc=new QueryClient();qc.setQueryData(["ui-prefs"],{diagnostic_logging:true});measurementRecords.mockClear();
+ const messages=conversation(150);
+ const view=render(<QueryClientProvider client={qc}><TranscriptViewer messages={messages} renderMessage={renderOne}/></QueryClientProvider>);
+ await shim.flush();
+ const events=measurementRecords.mock.calls.flatMap(call=>(call as unknown as [unknown[]])[0]);
+ expect(events).toContainEqual(expect.objectContaining({phase:"render",resident_rows:messages.length}));
+ expect(events).toContainEqual(expect.objectContaining({phase:"raf_proxy",elapsed_ms:expect.any(Number)}));
+ const renderEvent=events.find(value=>(value as {phase:string}).phase==="render") as {rows:number};
+ expect(renderEvent.rows).toBeLessThanOrEqual(WINDOW_SIZE+WINDOW_SLACK);
+ expect(JSON.stringify(events)).not.toContain("t149");view.unmount();
 });
