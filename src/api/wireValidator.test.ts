@@ -158,3 +158,6 @@ it("accepts legacy Stats readbacks and validates optional native scope metadata"
  expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:1,id:2}})).not.toThrow();
  expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:"invalid",id:2}})).toThrow(/measurementScope/);
 });
+it("keeps the remote preference acknowledgment legacy-null",()=>{
+ expect(()=>assertRemoteReply("set_ui_prefs",null)).not.toThrow();
+});

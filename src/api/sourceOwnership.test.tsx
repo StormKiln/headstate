@@ -60,6 +60,7 @@ it("a late disk receipt never replaces an accepted live receipt", async () => {
 });
 it("a verified account change retires both lists and old detail authority", async () => {
   const qc = new QueryClient();
+  qc.setQueryData(["measurement-capture"], {epoch:"a".repeat(32),capture:1});
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
   const hook = renderHook(() => ({ authored: hooks.useSourceRefresh("authored"), reviewing: hooks.useSourceRefresh("reviewing") }), { wrapper });
   await act(async () => {});

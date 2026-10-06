@@ -1,5 +1,6 @@
 /** Closed diagnostic input. References are native-issued capture-qualified handles. */
-export interface MeasurementReference { epoch: string; capture: number; id: number }
+export interface MeasurementCapture { epoch: string; capture: number }
+export interface MeasurementReference extends MeasurementCapture { id: number }
 export type MeasurementOutcome = "registered" | "registration_failed" | "committed" | "commit_failed" | "accepted" | "retained" | "rejected" | "cache_reuse" | "no_work" | "unknown" | "unsupported";
 export type MeasurementTranscriptPhase = "read" | "follow" | "page" | "render" | "raf_proxy" | "evict" | "hidden" | "idle";
 export type ClientMeasurement = {

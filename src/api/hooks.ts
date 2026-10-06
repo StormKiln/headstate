@@ -1,3 +1,4 @@
+import { beginCaptureWrite, acceptCaptureWrite } from "./measurementCapture";
 import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
 import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
 import { useStatsDemand } from "./useStatsDemand";
@@ -12,7 +13,7 @@ import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
-import { clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
+import { invalidateSourceMeasurements, clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
 import { timeCall, timed } from "./diag";
 import { useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
@@ -4508,10 +4509,14 @@ export function useUiPrefs() {
     queryFn: getUiPrefs,
     staleTime: Infinity,
   });
-  const set = (prefs: UiPrefs) =>
-    setUiPrefs(prefs).then(() => {
-      qc.setQueryData(["ui-prefs"], prefs);
+  const set = (prefs: UiPrefs) => {
+    const serial = beginCaptureWrite(qc);
+    return setUiPrefs(prefs, true).then(capture => {
+      const latest = acceptCaptureWrite(qc, serial, IS_MOBILE_BUILD ? null : capture);
+      invalidateSourceMeasurements(qc);
+      if (latest) qc.setQueryData(["ui-prefs"], prefs);
     });
+  };
   return { prefs: query.data, set };
 }
 

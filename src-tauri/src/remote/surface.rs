@@ -1537,7 +1537,9 @@ async fn call(
             a.get("worktreePath")?,
         )),
         "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?)),
-        "set_ui_prefs" => res(commands::set_ui_prefs(app.clone(), a.get("prefs")?)),
+        "set_ui_prefs" => {
+            res(commands::set_ui_prefs(app.clone(), a.get("prefs")?, None).map(|_| ()))
+        }
         "apply_updates_in_background" => res(commands::apply_updates_in_background(
             app.clone(),
             app.state(),

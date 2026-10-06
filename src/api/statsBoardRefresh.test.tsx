@@ -118,3 +118,23 @@ it('qualifies accepted, retained and owner-fenced readbacks without logging reje
  expect(JSON.stringify(seam.record.mock.calls)).not.toContain('other-synthetic');
  expect(qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(8);
 });
+it('accepts held old Stats data without resurrecting its retired capture link',async()=>{
+ const {beginCaptureWrite,acceptCaptureWrite}=await import('./measurementCapture');
+ const old={epoch:'synthetic',capture:1,id:1};
+ const a=setup(board(8,{measurementScope:old,complete:true}));
+ acceptCaptureWrite(a.qc,beginCaptureWrite(a.qc),{epoch:'synthetic',capture:1});
+ a.qc.setQueryData(['ui-prefs'],{diagnostic_logging:true});
+ const held=deferred<StatsBoardReadback>();seam.cached.mockReturnValueOnce(held.promise);
+ await flush();
+ acceptCaptureWrite(a.qc,beginCaptureWrite(a.qc),{epoch:'synthetic',capture:2});
+ await act(async()=>held.resolve({...reply(2),measurementScope:old}));
+ await flush();
+ expect(a.qc.getQueryData<StatsBoard>(key)?.retrieved).toBe(8);
+ expect(a.qc.getQueryData<StatsBoard>(key)?.measurementScope).toBeUndefined();
+ expect(seam.record.mock.calls.flatMap(c=>c[0]).at(-1)).toMatchObject({outcome:'retained'});
+ expect(seam.record.mock.calls.flatMap(c=>c[0]).at(-1)?.scope).toBeUndefined();
+ const normal=deferred<StatsBoard>(); const reading=readStatsBoard(a.qc,key,()=>normal.promise);
+ normal.resolve(board(9,{measurementScope:old}));
+ expect((await reading).measurementScope).toBeUndefined();
+ expect(seam.cached).toHaveBeenCalledTimes(1);
+});

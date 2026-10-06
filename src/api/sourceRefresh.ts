@@ -64,10 +64,14 @@ export class SourceRefreshState {
   private listeners = new Set<() => void>();
   private onProviderRows?: (receipt: ProviderReceipt) => void;
 
-  constructor(onProviderRows?: (receipt: ProviderReceipt) => void) {
+  constructor(onProviderRows?: (receipt: ProviderReceipt) => void, private readonly qualifyMeasurement = (value: MeasurementReference | undefined) => value) {
     this.onProviderRows = onProviderRows;
   }
 
+  invalidateMeasurement() {
+    this.measurementReceipt = this.qualifyMeasurement(this.measurementReceipt);
+    this.publish();
+  }
   readonly snapshot = () => this.value;
   readonly subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -128,7 +132,7 @@ export class SourceRefreshState {
       this.providerReceipt = true;
       this.providerAt = update.last_received_at ?? undefined;
       this.receiptRevision = update.receipt_revision;
-      this.measurementReceipt = update.measurement_receipt ?? undefined;
+      this.measurementReceipt = this.qualifyMeasurement(update.measurement_receipt ?? undefined);
       this.coverage = update.coverage ?? null;
       this.rowEpoch++;
       rows = update.prs;

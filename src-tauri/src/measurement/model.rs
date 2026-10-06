@@ -1,4 +1,11 @@
 use serde::{Deserialize, Serialize};
+/// Capture lifetime metadata, not a handle or authorization token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureIdentity {
+    pub epoch: String,
+    pub capture: u64,
+}
 macro_rules! closed { ($name:ident { $($value:ident),+ $(,)? }) => {
     #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
     #[serde(rename_all = "snake_case")]

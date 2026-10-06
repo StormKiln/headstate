@@ -4728,7 +4728,11 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 /// Change interface preferences.
 #[tauri::command]
-pub fn set_ui_prefs(app: AppHandle, prefs: crate::poll::UiPrefs) -> Result<(), String> {
+pub fn set_ui_prefs(
+    app: AppHandle,
+    prefs: crate::poll::UiPrefs,
+    measurement_capture: Option<bool>,
+) -> Result<Option<crate::measurement::CaptureIdentity>, String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     crate::store::settings::set(&conn, settings::keys::UI_PREFS, &prefs)
         .map_err(|e| e.to_string())?;
@@ -4743,7 +4747,8 @@ pub fn set_ui_prefs(app: AppHandle, prefs: crate::poll::UiPrefs) -> Result<(), S
         prefs.close_hides_to_tray,
         prefs.diagnostic_logging
     );
-    Ok(())
+    Ok(crate::measurement_desktop::recorder()
+        .and_then(|r| r.preference_capture(measurement_capture == Some(true))))
 }
 
 /// Change which desktop notifications are sent.

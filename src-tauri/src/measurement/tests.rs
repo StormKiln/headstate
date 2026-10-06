@@ -979,3 +979,54 @@ fn operation_affected_fields_preserves_numeric_counts_and_omits_unknown() {
     wire["affected_fields"] = serde_json::json!(65536);
     assert!(serde_json::from_value::<Event>(wire).is_err());
 }
+
+#[tokio::test]
+async fn preference_capture_negotiation_keeps_old_links_strict_and_new_unlinked_counts_exportable()
+{
+    let (dir, r, _) = fixture(Caps::default());
+    assert!(r.preference_capture(true).is_none());
+    r.set_enabled(true);
+    assert_eq!(
+        serde_json::to_value(r.preference_capture(false)).unwrap(),
+        serde_json::Value::Null
+    );
+    let first = r.preference_capture(true).unwrap();
+    let owner = r.intern(Key::Owner("synthetic")).unwrap();
+    let receipt = r.receipt_reference(&owner).unwrap();
+    let scope = r
+        .intern(Key::StatsScope {
+            owner: "synthetic",
+            scope: "synthetic",
+            from_day: 1,
+            to_day: 7,
+        })
+        .unwrap();
+    r.set_enabled(false);
+    assert!(r.preference_capture(true).is_none());
+    r.set_enabled(true);
+    let second = r.preference_capture(true).unwrap();
+    assert_eq!(first.epoch, second.epoch);
+    assert!(second.capture > first.capture);
+    for mut value in [
+        serde_json::json!({"kind":"mounted_review","source":"github","list":"reviewing","surface":"ready_panel","selection":"all_repositories","receipt":receipt,"inventory_count":130,"footer_location":"desktop_footer","footer":"checked"}),
+        serde_json::json!({"kind":"stats_view","observation":"mounted","scope":scope,"outcome":"accepted","rows":12}),
+    ] {
+        let observation = serde_json::from_value(value.clone()).unwrap();
+        assert!(!Recorder::record(&r, Event::Client { observation }));
+        value.as_object_mut().unwrap().remove("receipt");
+        value.as_object_mut().unwrap().remove("scope");
+        let observation = serde_json::from_value(value).unwrap();
+        assert!(Recorder::record(&r, Event::Client { observation }));
+    }
+    assert_eq!(r.status().loss.stale_handle, 2);
+    let path = dir.path().canonicalize().unwrap().join("capture-export");
+    r.export_to(path.clone()).await.unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|v: &serde_json::Value| v["event"]["kind"] == "client")
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|v| v["capture"] == second.capture));
+}

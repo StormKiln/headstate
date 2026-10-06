@@ -688,6 +688,17 @@ impl Recorder {
         }
         Ok(())
     }
+    /// Only negotiated local callers receive identity; legacy replies stay null.
+    pub fn preference_capture(&self, negotiated: bool) -> Option<CaptureIdentity> {
+        if !negotiated || !self.enabled() {
+            return None;
+        }
+        let s = self.state.lock().unwrap();
+        s.active.then(|| CaptureIdentity {
+            epoch: self.epoch.clone(),
+            capture: s.capture,
+        })
+    }
     pub fn status(&self) -> JournalStatus {
         let mut out = self.shared.status.lock().unwrap().clone();
         let live = self.shared.loss.lock().unwrap().clone();

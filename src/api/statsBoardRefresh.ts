@@ -1,3 +1,4 @@
+import { captureReference } from "./measurementCapture";
 import { useEffect, useSyncExternalStore } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import type { StatsBackfillFrame, StatsBoard, StatsOwner, StatsWindow } from "@/types/pr";
@@ -51,7 +52,7 @@ export async function readStatsBoard(qc: QueryClient, key: readonly unknown[], w
   // Ordinary observer cleanup (including StrictMode replay) does not retire
   // TanStack's normal request. Ownership retirement does.
   if (value.retired || version !== value.normalVersion) throw new DOMException("Stats owner retired", "AbortError");
-  return result;
+  return {...result, measurementScope:captureReference(qc, result.measurementScope)};
 }
 class Controller {
   epoch = 0; normalVersion = 0; retired = false;
@@ -142,7 +143,7 @@ class Controller {
       const current = this.board();
       if (!current || !sameOwner(current.owner, answer.owner) || answer.scopeKey !== current.scopeKey) { rejected(); return; }
       if (current.window && (answer.window.to < current.window.to || (answer.window.to === current.window.to && answer.window.from < current.window.from))) { rejected(); return; }
-      const measured = {...current,...answer.measurement,measurementScope:answer.measurementScope,owner:answer.owner,viewer:answer.viewer,scopeKey:answer.scopeKey,window:answer.window,stream:answer.stream};
+      const measured = {...current,...answer.measurement,measurementScope:captureReference(this.qc, answer.measurementScope),owner:answer.owner,viewer:answer.viewer,scopeKey:answer.scopeKey,window:answer.window,stream:answer.stream};
       // Backfill registration belongs to the normal load, not this readback.
       // Weaker same-window evidence cannot erase useful foreground-only rows.
       const retain = sameWindow(current.window, answer.window) && population(current) > 0

@@ -1,4 +1,4 @@
-import type { MeasurementStatus, MeasurementExportReceipt, ClientMeasurement } from "../types/measurement";
+import type { MeasurementStatus, MeasurementExportReceipt, ClientMeasurement, MeasurementCapture } from "../types/measurement";
 import type { TranscriptWatch } from "../types/transcript";
 /// Typed wrappers around the Tauri command surface in
 /// `src-tauri/src/commands.rs`. Every command returns `Result<T, String>` on
@@ -199,7 +199,10 @@ export interface UiPrefs {
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
-export const setUiPrefs = (prefs: UiPrefs) => call<void>("set_ui_prefs", { prefs });
+export const setUiPrefs = (prefs: UiPrefs, measurementCapture = false) =>
+  measurementCapture && import.meta.env.VITE_TARGET === "desktop"
+    ? call<MeasurementCapture | null>("set_ui_prefs", { prefs, measurementCapture: true })
+    : call<void>("set_ui_prefs", { prefs });
 
 /// Whether the app starts at login.
 ///

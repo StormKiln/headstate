@@ -242,3 +242,36 @@ capture aggregates using the foundation's counted policy; it cannot join old han
 These records describe sampled/censored observations, not an unbiased latency population.
 The independent60/minute StopFailure quota and all existing classifier/action authority
 remain unchanged. Shutdown/crash tails retain the foundation's unclean-capture limits.
+
+### Capture lifetime after preference changes (#1740)
+
+The desktop's existing `set_ui_prefs` call can negotiate `measurementCapture: true`.
+After a successful saved preference change it returns only `{epoch, capture}` for an
+active local capture, otherwise null. Calls without negotiation still return null;
+the remote dispatcher always retains the legacy null response and never transfers
+capture ownership to the phone. The mobile wrapper never sends the new parameter,
+and its hook ignores any foreign reply metadata. There is no new RPC or provider work.
+
+The QueryClient retains acknowledged local lifetime across component remounts. A
+successful transition clears only incompatible diagnostic references from both source
+states and cached Stats boards, preserving row identity, revisions, freshness, errors,
+query data timestamps and UI selection. Future old/status-only frames and held Stats
+answers cannot restore a retired link. Useful counts continue without a reference.
+Only an accepted reference matching the acknowledged local capture restores linkage;
+core handle-kind/owner/liveness validation remains strict. Failed saves publish no
+context. A late success cannot establish native completion order and clears linkage
+conservatively without replacing the latest requested preferences.
+
+Startup without a proven local acknowledgment remains unlinked. This bridge observes
+this application's successful preference calls; it does not claim to observe capture
+changes initiated by another native/remote caller. Such changes are still rejected by
+strict core validation if a previously acknowledged context has become stale. No token
+ordering, synthetic handle, retry or diagnostic lookup is used to recover correlation.
+Task6C must establish its own local phone lifetime rather than use desktop metadata.
+
+Stored StopFailure history may contain legacy ingestion-time fallback timestamps. A
+candidate or retrospective diagnostic delta is now absent unless a retained independent
+hook observation confirms that exact source timestamp. This deliberately sacrifices
+unprovable historical timing (also after bounded correlation expiry) instead of treating
+storage fallback as source time. Existing storage and the15-second classifier are
+unchanged; no schema migration or additional query is introduced.

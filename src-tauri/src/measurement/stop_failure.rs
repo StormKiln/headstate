@@ -252,7 +252,11 @@ impl Recorder {
                             &s.id,
                             FailureObservation::RetrospectivePair,
                             None,
-                            hook.checked_sub(at),
+                            s.hooks
+                                .iter()
+                                .any(|h| h.at == Some(hook))
+                                .then(|| hook.checked_sub(at))
+                                .flatten(),
                             lag,
                             None,
                             outcome,
@@ -321,9 +325,11 @@ impl Recorder {
         }
         s.last_pair = Some(pair);
         let observed = s.hooks.iter().any(|h| h.at == Some(hook));
-        let delta = hook.checked_sub(b.at);
+        // History may contain the legacy ingestion-time fallback. Only an
+        // independently retained source timestamp establishes a hook-time delta.
+        let delta = observed.then(|| hook.checked_sub(b.at)).flatten();
         let lag = u64::try_from(b.at).ok().and_then(|t| wall.checked_sub(t));
-        let outcome = if delta.is_none()
+        let outcome = if (observed && delta.is_none())
             || lag.is_none()
             || u64::try_from(hook).ok().is_none_or(|t| t > wall)
         {

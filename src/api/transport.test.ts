@@ -542,6 +542,11 @@ describe("tauri.ts wrappers through the transport", () => {
   /// dropped on the way out, that row would still pass and Refresh
   /// (#1293) would silently be a cached read -- a no-op exactly when a
   /// user presses it.
+  it("negotiates capture metadata only with the local same-version preference setter", async () => {
+    await api.setUiPrefs(uiPrefs, true);
+    expect(local.call).toHaveBeenCalledWith("set_ui_prefs", {prefs:uiPrefs,measurementCapture:true});
+  });
+
   it("sends the advice mode the caller chose", async () => {
     await api.claudeMdAdvice("/repos/hello-world", "fresh");
     expect(local.call).toHaveBeenCalledWith("claude_md_advice", {
@@ -751,6 +756,14 @@ describe("transport selection", () => {
     const cb = () => {};
     await mod.listen("prs-updated", cb);
     expect(remote.listen).toHaveBeenCalledWith("prs-updated", cb);
+  });
+
+  it("keeps preference writes legacy-compatible on older remote hosts without retry", async () => {
+    vi.stubEnv("VITE_TARGET", "mobile"); vi.resetModules();
+    const mod = await import("./tauri");
+    await mod.setUiPrefs(uiPrefs, true);
+    expect(remote.call).toHaveBeenCalledExactlyOnceWith("set_ui_prefs", {prefs:uiPrefs});
+    expect(local.call).not.toHaveBeenCalled();
   });
 
   it("refuses a target it does not know", async () => {
