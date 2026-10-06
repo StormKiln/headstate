@@ -2941,12 +2941,13 @@ export interface StatsObservation extends StatsWindow {
 }
 /// A local read reports measurements, never a demand registration.
 export interface StatsBoardReadback {
+  measurementScope?: import("./measurement").MeasurementReference;
   owner: StatsOwner;
   viewer: string;
   scopeKey: string;
   window: StatsWindow;
   stream: string;
-  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill">;
+  measurement: Omit<StatsBoard, "owner" | "viewer" | "scopeKey" | "window" | "stream" | "backfill" | "measurementScope">;
 }
 
 /// One frame of PR Stats backfill progress (#1093). Mirrors
@@ -3732,6 +3733,7 @@ export interface ShortSlice {
 /// Rust `Subject::cache_key` doc records as a real case -- would put the
 /// viewer's own work under "Others" and show "no activity" for Mine.
 export interface StatsBoard {
+  measurementScope?: import("./measurement").MeasurementReference;
   window?: StatsWindow;
   stream?: string;
   totalVerified?: boolean;

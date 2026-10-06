@@ -16,6 +16,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub(super) struct ReadTransport {
     pub(super) measurement: Option<std::sync::Arc<crate::measurement::Recorder>>,
     pub(super) admission: Admission,
+    pub(super) stats_measurement: crate::stats_measurement::Tracker,
 }
 
 impl std::fmt::Debug for ReadTransport {

@@ -204,10 +204,26 @@ async fn rotation_restart_and_malformed_tail_are_qualified_without_copying_priva
 fn malformed_unknown_fields_and_old_optional_client_counts_remain_distinct() {
     let old =
         r#"{"kind":"stats_view","scope":null,"outcome":"unknown","elapsed_ms":null,"rows":null}"#;
+    for provenance in ["readback", "mounted"] {
+        let input = old.replace(
+            "\"rows\":null",
+            &format!("\"rows\":null,\"observation\":\"{provenance}\""),
+        );
+        assert!(serde_json::from_str::<ClientMeasurement>(&input).is_ok());
+    }
+    assert!(serde_json::from_str::<ClientMeasurement>(&old.replace(
+        "\"rows\":null",
+        "\"rows\":null,\"observation\":\"invented\""
+    ))
+    .is_err());
     let parsed: ClientMeasurement = serde_json::from_str(old).unwrap();
     assert!(matches!(
         parsed,
-        ClientMeasurement::StatsView { rows: None, .. }
+        ClientMeasurement::StatsView {
+            rows: None,
+            observation: None,
+            ..
+        }
     ));
     assert!(serde_json::from_str::<ClientMeasurement>(
         &old.replace("\"rows\":null", "\"rows\":null,\"private\":\"SECRET\"")
@@ -353,6 +369,7 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
         &r,
         Event::Client {
             observation: ClientMeasurement::StatsView {
+                observation: None,
                 scope: Some(owner.clone()),
                 outcome: StatsOutcome::Accepted,
                 elapsed_ms: None,
@@ -364,6 +381,7 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
         &r,
         Event::Client {
             observation: ClientMeasurement::StatsView {
+                observation: None,
                 scope: Some(scope.clone()),
                 outcome: StatsOutcome::Accepted,
                 elapsed_ms: None,
@@ -390,6 +408,7 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
         &r,
         Event::Client {
             observation: ClientMeasurement::StatsView {
+                observation: None,
                 scope: Some(scope),
                 outcome: StatsOutcome::Accepted,
                 elapsed_ms: None,
@@ -445,6 +464,7 @@ async fn routine_budget_retains_deferred_totals_and_separate_failure_budget() {
 fn client_batch_cap_counts_refusal_but_opt_out_retains_nothing() {
     let (_dir, r, _) = fixture(Caps::default());
     let event = ClientMeasurement::StatsView {
+        observation: None,
         scope: None,
         outcome: StatsOutcome::Unknown,
         elapsed_ms: None,
@@ -838,7 +858,7 @@ fn queue_receipt_reference_must_belong_to_its_live_owner_and_old_records_remain_
     if let Event::QueueReceipt { receipt: value, .. } = &mut observation {
         *value = Some(receipt.clone());
     }
-    assert!(!r.record(observation));
+    assert!(!Recorder::record(&r, observation));
     let legacy = serde_json::to_value(event(&owner, 1)).unwrap();
     assert!(legacy.get("receipt").is_none());
     assert!(serde_json::from_value::<Event>(legacy).is_ok());

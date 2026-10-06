@@ -2,6 +2,7 @@
 //! database dependency. Admission never performs IO or waits for the writer.
 mod export;
 pub mod model;
+mod stop_failure;
 mod writer;
 pub use model::*;
 use std::{
@@ -156,6 +157,7 @@ struct Shared {
     deferred_pending: AtomicBool,
 }
 pub struct Recorder {
+    failure_observer: Mutex<stop_failure::Observer>,
     config: Config,
     epoch: String,
     caps: Caps,
@@ -204,6 +206,7 @@ impl Recorder {
             .spawn(move || writer.run(receiver, controls))
             .map_err(|_| ExportError::Unavailable)?;
         Ok(Self {
+            failure_observer: Mutex::new(stop_failure::Observer::default()),
             config,
             epoch,
             caps,
@@ -220,9 +223,12 @@ impl Recorder {
             && !self.shared.unavailable.load(Ordering::Acquire)
     }
     pub fn set_enabled(&self, on: bool) {
-        if !on {
-            self.shared.enabled.store(false, Ordering::Release)
-        }
+        let censored = if !on {
+            self.shared.enabled.store(false, Ordering::Release);
+            self.failure_observer.lock().unwrap().clear()
+        } else {
+            0
+        };
         let mut s = self.state.lock().unwrap();
         if on && !s.active {
             s.capture = s.capture.saturating_add(1);
@@ -249,6 +255,20 @@ impl Recorder {
             } else {
                 lifecycle.captures_closed = lifecycle.captures_closed.saturating_add(1);
                 lifecycle.active_capture = None;
+            }
+        }
+        if censored > 0 {
+            let key = (
+                Domain::StopFailure,
+                AggregateKind::Eviction,
+                WorkClass::Unknown,
+            );
+            if s.aggregates.contains_key(&key) || s.aggregates.len() < self.caps.aggregates {
+                let value = s.aggregates.entry(key).or_insert((0, self.clock.now().0));
+                value.0 = value.0.saturating_add(censored);
+                self.shared.deferred_pending.store(true, Ordering::Release);
+            } else {
+                self.shared.loss.lock().unwrap().cardinality += 1;
             }
         }
         s.active = on;
@@ -633,6 +653,17 @@ impl Recorder {
     }
     /// Checked narrowing for measured populations. Overflow is unavailable,
     /// never a wrapped or saturated reading claiming an exact population.
+    pub fn measured_days(&self, value: usize) -> Option<u16> {
+        match u16::try_from(value) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                if self.enabled() {
+                    self.shared.loss.lock().unwrap().overflow += 1;
+                }
+                None
+            }
+        }
+    }
     pub fn measured_count(&self, value: u64) -> Option<u32> {
         match u32::try_from(value) {
             Ok(value) => Some(value),

@@ -5816,6 +5816,15 @@ async fn stats_board_with_demand(
         horizon_days: clamp_days(days) as u32,
     };
     let owner = capture_stats_owner(db.clone(), viewer.clone()).await?;
+    let observed_start = std::time::Instant::now();
+    let observation = client.stats_observation(
+        &owner,
+        &q.cache_key(&viewer),
+        &req.window.from,
+        &req.window.to,
+    );
+    let mut observed_answer =
+        crate::stats_measurement::AnswerGuard::new(observation.clone(), observed_start);
     let hit = stats_cache_read(
         db.clone(),
         owner.clone(),
@@ -5841,6 +5850,17 @@ async fn stats_board_with_demand(
         &owner,
         &q.cache_key(&viewer),
     );
+    if let Some(o) = &observation {
+        o.emit(
+            if matches!(backfill, BackfillRegistration::Registered(_)) {
+                crate::measurement::StatsOutcome::Registered
+            } else {
+                crate::measurement::StatsOutcome::RegistrationFailed
+            },
+            None,
+            crate::stats_measurement::elapsed(observed_start),
+        );
+    }
     if matches!(backfill, BackfillRegistration::Registered(_)) {
         waker.notify_one();
     }
@@ -5853,7 +5873,9 @@ async fn stats_board_with_demand(
     )
     .await?
     {
+        observed_answer.finish(crate::measurement::StatsOutcome::CacheReuse, Some(&board));
         return Ok(StatsBoard {
+            measurement_scope: observation.as_ref().map(|o| o.id.clone()),
             window: Some(StatsWindow {
                 from: req.window.from.clone(),
                 to: req.window.to.clone(),
@@ -5887,6 +5909,11 @@ async fn stats_board_with_demand(
             cached.stream = Some(stats_progress_stream().into());
             cached.backfill = backfill;
             cached.owner = Some(owner.clone());
+            cached.measurement_scope = observation.as_ref().map(|o| o.id.clone());
+            observed_answer.finish(
+                crate::measurement::StatsOutcome::CacheReuse,
+                Some(&cached.board),
+            );
             return Ok(cached);
         }
         // Same handling as `stats_count`'s: a payload that will not parse
@@ -5965,7 +5992,8 @@ async fn stats_board_with_demand(
     let mut out = match out {
         Ok(loaded) => {
             pure_board = Some(loaded.board.clone());
-            let board = accumulate_board(
+            let board = accumulate_board_measured(
+                observation.clone(),
                 db.clone(),
                 owner.clone(),
                 scope_key.clone(),
@@ -5977,6 +6005,7 @@ async fn stats_board_with_demand(
             )
             .await;
             Ok(StatsBoard {
+                measurement_scope: observation.as_ref().map(|o| o.id.clone()),
                 window: Some(StatsWindow {
                     from: req.window.from.clone(),
                     to: req.window.to.clone(),
@@ -6062,6 +6091,14 @@ async fn stats_board_with_demand(
             }
         }
     }
+    observed_answer.finish(
+        if out.is_ok() {
+            crate::measurement::StatsOutcome::Accepted
+        } else {
+            crate::measurement::StatsOutcome::Rejected
+        },
+        out.as_ref().ok().map(|b| &b.board),
+    );
     out
 }
 
@@ -6181,6 +6218,8 @@ pub struct StatsWindow {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoardReadback {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_scope: Option<crate::measurement::OpaqueId>,
     pub owner: StatsOwner,
     pub viewer: String,
     pub scope_key: String,
@@ -6220,6 +6259,36 @@ async fn stats_board_cached_for_client(
     measure: String,
     days: i64,
 ) -> Result<StatsBoardReadback, String> {
+    let result = stats_board_cached_measured(
+        client,
+        db,
+        expected_owner,
+        scope_kind,
+        scope_value,
+        measure,
+        days,
+    )
+    .await;
+    if result.is_err() {
+        crate::stats_measurement::aggregate(
+            client.measurement_recorder(),
+            crate::measurement::AggregateKind::Declined,
+            crate::measurement::WorkClass::Foreground,
+            1,
+        );
+    }
+    result
+}
+
+async fn stats_board_cached_measured(
+    client: &crate::github::client::GitHubClient,
+    db: std::path::PathBuf,
+    expected_owner: StatsOwner,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoardReadback, String> {
     let viewer = client
         .known_viewer()
         .ok_or("Stats cache identity is not verified")?
@@ -6240,7 +6309,8 @@ async fn stats_board_cached_for_client(
         from: req.window.from,
         to: req.window.to,
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let started = std::time::Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let measurement = stored_board_snapshot(
@@ -6251,7 +6321,8 @@ async fn stats_board_cached_for_client(
             &window.to,
             now,
         )?;
-        Ok(StatsBoardReadback {
+        Ok::<_, String>(StatsBoardReadback {
+            measurement_scope: None,
             owner: expected_owner,
             viewer,
             scope_key,
@@ -6261,7 +6332,26 @@ async fn stats_board_cached_for_client(
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    match result {
+        Ok(mut answer) => {
+            if let Some(o) = client.stats_observation(
+                &answer.owner,
+                &answer.scope_key,
+                &answer.window.from,
+                &answer.window.to,
+            ) {
+                o.emit(
+                    crate::measurement::StatsOutcome::CacheReuse,
+                    Some(&answer.measurement),
+                    crate::stats_measurement::elapsed(started),
+                );
+                answer.measurement_scope = Some(o.id);
+            }
+            Ok(answer)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn stats_progress_stream() -> &'static str {
@@ -6303,7 +6393,8 @@ fn stats_progress_stream() -> &'static str {
 /// is created and dropped inside the closure.
 // Captured owner, evidence, and caller authority stay explicit across awaits.
 #[allow(clippy::too_many_arguments)]
-async fn accumulate_board(
+async fn accumulate_board_measured(
+    observation: Option<crate::stats_measurement::Observation>,
     db: std::path::PathBuf,
     owner: StatsOwner,
     scope_key: String,
@@ -6315,7 +6406,8 @@ async fn accumulate_board(
 ) -> crate::github::stats::Board {
     let fallback = loaded.board.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        accumulate_board_blocking(
+        accumulate_board_blocking_measured(
+            observation.as_ref(),
             &db,
             &owner,
             &scope_key,
@@ -6334,10 +6426,11 @@ async fn accumulate_board(
     .unwrap_or(fallback)
 }
 
-/// The blocking half of [`accumulate_board`].
+/// The blocking half of [`accumulate_board_measured`].
 // Captured owner, evidence, and caller authority stay explicit across awaits.
 #[allow(clippy::too_many_arguments)]
-fn accumulate_board_blocking(
+fn accumulate_board_blocking_measured(
+    observation: Option<&crate::stats_measurement::Observation>,
     db: &std::path::Path,
     owner: &StatsOwner,
     scope_key: &str,
@@ -6348,6 +6441,7 @@ fn accumulate_board_blocking(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::github::stats::Board {
     use crate::store::pr_history;
+    let mut commit = crate::stats_measurement::CommitGuard::new(observation);
 
     let crate::github::stats::board::LoadedBoard { board, prs, slices } = loaded;
     let Ok(mut conn) = open_db(db) else {
@@ -6375,7 +6469,7 @@ fn accumulate_board_blocking(
     // One transaction over both, for the reason `record_all_with_rows`
     // gives: a ledger row without its evidence is a claim nothing
     // revisits.
-    if let Err(e) = crate::store::pr_slice::record_all_with_rows_in(
+    let written = match crate::store::pr_slice::record_all_with_rows_in(
         &tx,
         scope_key,
         window_start,
@@ -6384,9 +6478,12 @@ fn accumulate_board_blocking(
         &prs,
         now,
     ) {
-        log::warn!("could not accumulate pull requests for PR stats: {e}");
-        return board;
-    }
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("could not accumulate pull requests for PR stats: {e}");
+            return board;
+        }
+    };
     // Bounded here rather than on a schedule: this is the only site that
     // grows the table, so it is the only one that needs to bound it.
     match pr_history::prune_in(&tx) {
@@ -6412,8 +6509,10 @@ fn accumulate_board_blocking(
     // the rest". A window with no ledger rows reports `None` for its
     // total, and the board carries that through as a `None` rather than
     // defaulting it -- see `Board::from_stored`.
-    let coverage = crate::store::pr_slice::coverage(&tx, scope_key, window_start, window_end)
-        .unwrap_or_default();
+    let coverage_result =
+        crate::store::pr_slice::coverage(&tx, scope_key, window_start, window_end);
+    let covered = coverage_result.as_ref().ok().map(|c| c.days_covered());
+    let coverage = coverage_result.unwrap_or_default();
     crate::diag!(
         "[diag] stats accumulate fetched={} stored={} claimed={} days={}/{} ledger_total={:?}",
         board.retrieved,
@@ -6425,6 +6524,15 @@ fn accumulate_board_blocking(
     );
     if tx.commit().is_err() {
         return board;
+    }
+    commit.committed = true;
+    if let Some(o) = observation {
+        o.commit(
+            written,
+            covered,
+            crate::github::stats::backfill::days_between(window_start, window_end),
+            crate::measurement::WorkClass::Foreground,
+        );
     }
     crate::github::stats::Board::from_stored(
         &stored,
@@ -6446,6 +6554,8 @@ fn accumulate_board_blocking(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsBoard {
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub measurement_scope: Option<crate::measurement::OpaqueId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<StatsWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

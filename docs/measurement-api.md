@@ -1,8 +1,8 @@
 # Measurement foundation API (schema 1)
 
-The foundation now includes Task 6A desktop To Review producers described below.
-Stats, StopFailure, transcript, the analyzer and independent phone-local adapters remain
-separate subsequent slices.
+The foundation includes Task 6A desktop To Review and Task 6B Stats/StopFailure
+producers described below. Transcript, the analyzer and independent phone-local
+adapters remain separate subsequent slices.
 A successful export is not a performance or convergence pass.
 
 ## Construction and ownership
@@ -172,3 +172,73 @@ React commit observation, not a paint or user-perceived latency measurement. Git
 main-list rows and the phone ConnectionBanner are not measured by this slice; a hidden
 desktop footer is explicitly hidden. Phone capture remains off/unimplemented until 6C.
 Recording failure, stale references and budget loss cannot change product success.
+
+## Task 6B Stats and sampled StopFailure observations
+
+Stats observations reuse the immutable client's recorder and existing owner, query and
+window. Registration is recorded after its existing transaction returns; `registered`
+and `registration_failed` are separate from returned-board success. Foreground and
+background `committed` observations follow successful history/coverage transaction
+commit; `upsert` totals count actual returned written rows, including repeated corrections,
+not unique insertions. A useful partial transaction can be committed while the tick fails.
+`commit_failed` never claims written rows. Existing tick outcomes use bounded Stats
+aggregates; existing progress reports supply counts without another database read.
+Covered days are a union, not a partition. Partial/unknown-day counts remain absent;
+checked u32/u16 narrowing counts overflow. Durations cover the observed request section
+(after foreground owner capture, or the actual cache-only read), not provider latency.
+
+`measurementScope` is optional metadata on existing StatsBoard/StatsBoardReadback replies.
+It is never recovered from serialized board caches and never requires another RPC.
+The native client tracker holds at most 32 question slots; changing a question's exact
+window retires its old scope. A changed captured owner generation retires that client's
+old owner and descendants; dropping the client also retires them. Older in-flight owner
+generations cannot restore the tracker's owner. Concurrent different windows for the same
+question can retire an earlier window's diagnostic reference: the earlier answer remains
+usable but correlation becomes unavailable/counts stale, never a reason to refetch.
+Core capture/handle limits still apply and refusal leaves the optional reference absent.
+No diagnostic code queries current ownership or acquires demand. Cache-only reads remain
+zeroHTTP/zero-registration/zero-demand, including while capture is disabled.
+
+StatsView adds optional closed `observation: readback | mounted`; legacy omission means
+unspecified. Readback events occur after the existing controller acceptance/retention
+fences; rejected numbers and references are absent. The mounted StatsPage observes the
+actual accepted board at React effect/commit, with its author-row count (not PR population,
+viewport rows or paint timing). Retained data keeps its own scope reference, and older
+responses without metadata remain unlinked. Mounted elapsed time is absent. It subscribes
+to the app's existing preference cache without fetching preferences, Stats or progress.
+This slice is desktop-only; 6C must enable phone-local preference/recording and omit foreign
+host scope references, never interpret them as phone-local authority.
+
+StopFailure ingestion is observed only after the real consume transaction commits, using
+the existing INSERT OR IGNORE row count for duplicate replay. The bounded staging list
+holds at most512 descriptors referencing already parsed records. Missing/invalid source
+timestamps stay absent/clock-anomalous even though legacy storage supplies a timestamp.
+Failed commits/exclusions contribute `StopFailure/Declined`, not committed hook events.
+The real digest observes its already gathered list/registry/newest-failure map before the
+unchanged 15-second classifier and before display filtering. No extra registry/DB read,
+provider call, notification, or timer is introduced.
+
+The instance-owned join retains at most128 sessions, four hook observations and four idle
+boundaries per session for ten monotonic minutes. Native-only session/process strings are
+capped at1024 bytes each; they are never event labels. An observed boundary ordinal is
+capture-local, not an upstream turn ID. First idle, registry gaps and process changes are
+censored. Repeated unchanged samples are coalesced; they do not create a new boundary when
+the join buffer expires. A current registry/newest-history comparison after expiry remains
+retrospective/censored with no invented ordinal. Candidate `matched` means one retained
+candidate after a sampled busy→idle observation, not proven turn membership. Multiple
+retained candidates are ambiguous; old hooks remain visible through signed delta and
+out_of_window/censored provenance. Hook age and idle observation lag are separate from
+the signed hook-time minus idle-time delta. Future/invalid source times never wrap or
+become a measured unsigned age. Both ingestion-first and sample-first orders are observed.
+
+StopFailure `eviction` aggregates count retained hook/boundary entries removed from
+correlation memory by expiry, per-session capacity, process change or reset. They are not
+lost journal events, numbers of true turns, or counts of sessions. Reasons share this
+closed category; it cannot distinguish those causes after export. `declined` counts input
+observations excluded before retention/commit (including capacity refusals), not provider
+failures. Disable closes admission first, clears private join state, and retains the reset
+count in the existing bounded deferred metadata of that capture. Re-enable discards old
+capture aggregates using the foundation's counted policy; it cannot join old handles.
+These records describe sampled/censored observations, not an unbiased latency population.
+The independent60/minute StopFailure quota and all existing classifier/action authority
+remain unchanged. Shutdown/crash tails retain the foundation's unclean-capture limits.

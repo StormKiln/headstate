@@ -631,6 +631,26 @@ impl GitHubClient {
             .map_or(usize::MAX, |a| a.remaining())
     }
 
+    pub(crate) fn stats_observation(
+        &self,
+        owner: &crate::store::stats_owner::StatsOwner,
+        key: &str,
+        from: &str,
+        to: &str,
+    ) -> Option<crate::stats_measurement::Observation> {
+        let source = self
+            .read_transport
+            .measurement
+            .clone()
+            .map(crate::stats_measurement::Source::Shared)
+            .or_else(|| {
+                crate::measurement_desktop::recorder()
+                    .map(crate::stats_measurement::Source::Desktop)
+            });
+        self.read_transport
+            .stats_measurement
+            .scope(source, owner, key, from, to)
+    }
     pub(crate) fn measurement_recorder(&self) -> Option<&crate::measurement::Recorder> {
         self.read_transport.recorder()
     }

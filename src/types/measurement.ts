@@ -1,6 +1,6 @@
 /** Closed diagnostic input. References are native-issued capture-qualified handles. */
 export interface MeasurementReference { epoch: string; capture: number; id: number }
-export type MeasurementOutcome = "accepted" | "retained" | "rejected" | "cache_reuse" | "no_work" | "unknown" | "unsupported";
+export type MeasurementOutcome = "registered" | "registration_failed" | "committed" | "commit_failed" | "accepted" | "retained" | "rejected" | "cache_reuse" | "no_work" | "unknown" | "unsupported";
 export type MeasurementTranscriptPhase = "read" | "follow" | "page" | "render" | "raf_proxy" | "evict" | "hidden" | "idle";
 export type ClientMeasurement = {
   kind: "mounted_review"; source: "github" | "gitlab" | "unknown"; list: "authored" | "reviewing" | "unknown";
@@ -13,7 +13,7 @@ export type ClientMeasurement = {
   footer_location: "desktop_footer" | "phone_banner" | "hidden" | "unmeasured";
   footer: "checked" | "needs_checking" | "partly_checked" | "coverage_unknown" | "not_checked" | "checking" | "retrying" | "load_failed" | "refresh_failed" | "background_stopped" | "auth_unavailable" | "auth_unknown" | "legacy_up_to_date" | "hidden" | "unavailable";
 } | {
-  kind: "stats_view"; scope?: MeasurementReference | null; outcome: MeasurementOutcome; elapsed_ms?: number | null; rows?: number | null;
+  kind: "stats_view"; observation?: "readback" | "mounted"; scope?: MeasurementReference | null; outcome: MeasurementOutcome; elapsed_ms?: number | null; rows?: number | null;
 } | {
   kind: "transcript_view"; operation?: MeasurementReference | null; phase: MeasurementTranscriptPhase;
   elapsed_ms?: number | null; rows?: number | null; resident_rows?: number | null; capability: "measured" | "unsupported" | "unmeasured";

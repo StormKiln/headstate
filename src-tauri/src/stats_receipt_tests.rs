@@ -26,6 +26,13 @@ impl Drop for Provider {
     }
 }
 async fn provider(viewer: &str, value: u64) -> Provider {
+    provider_measured(viewer, value, None).await
+}
+async fn provider_measured(
+    viewer: &str,
+    value: u64,
+    recorder: Option<Arc<crate::measurement::Recorder>>,
+) -> Provider {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -84,6 +91,10 @@ async fn provider(viewer: &str, value: u64) -> Provider {
             .build()
             .unwrap(),
     );
+    let client = match recorder {
+        Some(r) => client.with_measurement(r),
+        None => client,
+    };
     Provider {
         client,
         calls,
@@ -1922,7 +1933,19 @@ fn latest_attempt_metadata_does_not_downgrade_complete_measurements_or_replay_sp
 #[tokio::test]
 async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_owner() {
     use crate::store::{pr_history, pr_slice};
-    let p = provider("synthetic-cache-viewer", 1).await;
+    let journal = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(
+        crate::measurement::Recorder::new(crate::measurement::Config {
+            directory: journal.path().canonicalize().unwrap().join("journal"),
+            epoch: [51; 16],
+            role: crate::measurement::Role::Desktop,
+            platform: crate::measurement::Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap(),
+    );
+    recorder.set_enabled(true);
+    let p = provider_measured("synthetic-cache-viewer", 1, Some(recorder.clone())).await;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("stats.db");
     let mut conn = open_db(&db).unwrap();
@@ -2012,6 +2035,39 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
         calls,
         "readback must not query even the viewer"
     );
+    let exported = journal.path().canonicalize().unwrap().join("report.jsonl");
+    recorder.export_to(exported.clone()).await.unwrap();
+    let events = std::fs::read_to_string(exported).unwrap();
+    assert!(
+        events.contains("\"kind\":\"stats_progress\""),
+        "cache-only producer missing: {events}"
+    );
+    assert!(events.contains("\"outcome\":\"cache_reuse\""));
+    assert!(!events.contains("synthetic-cache-viewer"));
+
+    let old_scope = staged
+        .measurement_scope
+        .clone()
+        .expect("accepted exact scope");
+    let record_scope = |id| {
+        crate::measurement::Recorder::record(
+            &recorder,
+            crate::measurement::Event::Client {
+                observation: crate::measurement::ClientMeasurement::StatsView {
+                    observation: Some(crate::measurement::StatsObservation::Mounted),
+                    scope: Some(id),
+                    outcome: crate::measurement::StatsOutcome::Accepted,
+                    elapsed_ms: None,
+                    rows: Some(1),
+                },
+            },
+        )
+    };
+    assert!(
+        !record_scope(old_scope),
+        "wider window retired the older scope"
+    );
+    assert!(record_scope(wider.measurement_scope.clone().unwrap()));
     let mut pure = staged.measurement.clone();
     pure.accumulating = false;
     pure.accumulated = 0;
@@ -2020,6 +2076,7 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
     pure.repo_counts[0].merged = 5;
     pure.refused_fields = 1;
     let materialized = StatsBoard {
+        measurement_scope: None,
         owner: Some(owner.clone()),
         viewer: owner.viewer().into(),
         scope_key: empty.scope_key.clone(),
@@ -2217,4 +2274,161 @@ async fn cached_board_retains_foreground_after_concurrent_empty_commit_supersede
         read.measurement.rows, measured.board.rows,
         "older complete-empty evidence cannot erase useful unsaved foreground rows"
     );
+}
+
+#[tokio::test]
+async fn measurement_normal_stats_registration_commit_cache_reuse_and_owner_retirement_are_observed(
+) {
+    let journal = tempfile::tempdir().unwrap();
+    let root = journal.path().canonicalize().unwrap();
+    let recorder = Arc::new(
+        crate::measurement::Recorder::new(crate::measurement::Config {
+            directory: root.join("journal"),
+            epoch: [58; 16],
+            role: crate::measurement::Role::Desktop,
+            platform: crate::measurement::Platform::Macos,
+            build: "synthetic".into(),
+        })
+        .unwrap(),
+    );
+    recorder.set_enabled(true);
+    let p = provider_measured("synthetic-measured", 1, Some(recorder.clone())).await;
+    let db = root.join("stats.db");
+    let wake = tokio::sync::Notify::new();
+    let first = stats_board_for_client(
+        &p.client,
+        db.clone(),
+        &wake,
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    let calls = p.calls.load(Ordering::SeqCst);
+    let second = stats_board_for_client(
+        &p.client,
+        db.clone(),
+        &wake,
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        calls,
+        "instrumented covered click still zero HTTP"
+    );
+    assert_eq!(first.measurement_scope, second.measurement_scope);
+    let conn = open_db(&db).unwrap();
+    stats_owner::capture_verified(&conn, "other-synthetic").unwrap();
+    let fresh_owner = stats_owner::capture_verified(&conn, "synthetic-measured").unwrap();
+    let fresh = stats_board_cached_for_client(
+        &p.client,
+        db.clone(),
+        fresh_owner,
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_ne!(first.measurement_scope, fresh.measurement_scope);
+    assert!(!crate::measurement::Recorder::record(
+        &recorder,
+        crate::measurement::Event::Client {
+            observation: crate::measurement::ClientMeasurement::StatsView {
+                observation: Some(crate::measurement::StatsObservation::Readback),
+                scope: first.measurement_scope,
+                outcome: crate::measurement::StatsOutcome::Accepted,
+                elapsed_ms: None,
+                rows: None
+            }
+        }
+    ));
+    let path = root.join("report");
+    recorder.export_to(path.clone()).await.unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    for outcome in ["registered", "committed", "accepted", "cache_reuse"] {
+        assert!(
+            text.contains(&format!("\"outcome\":\"{outcome}\"")),
+            "{outcome} absent"
+        );
+    }
+    assert!(!text.contains("synthetic-measured"));
+    recorder.set_enabled(false);
+    let before = p.calls.load(Ordering::SeqCst);
+    let disabled = stats_board_cached_for_client(
+        &p.client,
+        db,
+        fresh.owner,
+        "org".into(),
+        Some("fixture-org".into()),
+        "merged".into(),
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(disabled.measurement_scope.is_none());
+    assert_eq!(p.calls.load(Ordering::SeqCst), before);
+}
+
+#[tokio::test]
+async fn measurement_registration_and_commit_failures_do_not_change_useful_stats_answers() {
+    for registration_failure in [true, false] {
+        let journal = tempfile::tempdir().unwrap();
+        let root = journal.path().canonicalize().unwrap();
+        let recorder = Arc::new(
+            crate::measurement::Recorder::new(crate::measurement::Config {
+                directory: root.join("journal"),
+                epoch: [59; 16],
+                role: crate::measurement::Role::Desktop,
+                platform: crate::measurement::Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let p = provider_measured("synthetic-failure", 1, Some(recorder.clone())).await;
+        let db = root.join("stats.db");
+        prepare_stats_barrier(&p, &db).await;
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(if registration_failure {
+            "CREATE TRIGGER synthetic_deny BEFORE INSERT ON pr_backfill_scope BEGIN SELECT RAISE(ABORT,'synthetic refusal'); END;"
+        } else {
+            "CREATE TRIGGER synthetic_deny BEFORE INSERT ON pr_history BEGIN SELECT RAISE(ABORT,'synthetic refusal'); END;"
+        }).unwrap();
+        let board = stats_board_for_client(
+            &p.client,
+            db,
+            &tokio::sync::Notify::new(),
+            "org".into(),
+            Some("fixture-org".into()),
+            "merged".into(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(board.board.retrieved, 1);
+        assert_eq!(
+            matches!(board.backfill, BackfillRegistration::Failed(_)),
+            registration_failure
+        );
+        assert_eq!(board.board.accumulating, registration_failure);
+        let path = root.join("report");
+        recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(if registration_failure {
+            "registration_failed"
+        } else {
+            "commit_failed"
+        }));
+        assert!(text.contains("\"outcome\":\"accepted\""));
+        assert!(!text.contains("synthetic refusal"));
+    }
 }

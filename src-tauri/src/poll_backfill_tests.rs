@@ -26,6 +26,13 @@ struct Rig {
 }
 impl Rig {
     async fn new(total: usize, days: u32) -> Self {
+        Self::measured(total, days, None).await
+    }
+    async fn measured(
+        total: usize,
+        days: u32,
+        recorder: Option<Arc<crate::measurement::Recorder>>,
+    ) -> Self {
         let server = wiremock::MockServer::start().await;
         let fault = Arc::new(Mutex::new(String::new()));
         let response_fault = fault.clone();
@@ -76,14 +83,18 @@ impl Rig {
                 .set_body_json(response);
             if fault == "delay" {reply.set_delay(std::time::Duration::from_millis(200))} else {reply}
         }).mount(&server).await;
-        let client = Arc::new(GitHubClient::new(
+        let client = GitHubClient::new(
             octocrab::Octocrab::builder()
                 .base_uri(server.uri())
                 .unwrap()
                 .personal_token("fixture-token".to_string())
                 .build()
                 .unwrap(),
-        ));
+        );
+        let client = Arc::new(match recorder {
+            Some(r) => client.with_measurement(r),
+            None => client,
+        });
         client.fetch_viewer().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("worker.db");
@@ -572,7 +583,20 @@ fn committed_partial_tick_invalidates_stored_measurements_but_refused_admission_
     let _observed = budget::observed_test_lock();
     let _restore = budget::RestoreObserved::capture();
     run(|| async {
-        let r = Rig::new(120, 1).await;
+        let journal = tempfile::tempdir().unwrap();
+        let root = journal.path().canonicalize().unwrap();
+        let recorder = Arc::new(
+            crate::measurement::Recorder::new(crate::measurement::Config {
+                directory: root.join("journal"),
+                epoch: [55; 16],
+                role: crate::measurement::Role::Desktop,
+                platform: crate::measurement::Platform::Macos,
+                build: "synthetic".into(),
+            })
+            .unwrap(),
+        );
+        recorder.set_enabled(true);
+        let r = Rig::measured(120, 1, Some(recorder.clone())).await;
         r.fault("bad-node");
         let partial = backfill_tick(r.db.clone(), &r.client, r.demand.clone()).await;
         assert!(matches!(partial.outcome, bf::TickOutcome::Failed(_)));
@@ -584,6 +608,7 @@ fn committed_partial_tick_invalidates_stored_measurements_but_refused_admission_
             partial.cache_changed,
             "failed outcome must not hide committed usable rows"
         );
+        let requests = r.server.received_requests().await.unwrap().len();
         let idle = backfill_tick(
             r.db.clone(),
             &r.client,
@@ -594,6 +619,14 @@ fn committed_partial_tick_invalidates_stored_measurements_but_refused_admission_
             !idle.cache_changed,
             "no-demand admission cannot claim durable progress"
         );
+        assert_eq!(r.server.received_requests().await.unwrap().len(), requests);
+        let path = root.join("report");
+        recorder.export_to(path.clone()).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("\"outcome\":\"committed\""));
+        assert!(text.contains("\"metric\":\"upsert\""));
+        assert!(text.contains("no_work"));
+        assert!(!text.contains("fixture-viewer"));
     });
 }
 

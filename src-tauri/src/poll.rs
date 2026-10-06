@@ -1730,6 +1730,7 @@ pub fn spawn_backfill(app: AppHandle, client: Arc<GitHubClient>, waker: Arc<Noti
                     + chrono::Duration::from_std(crate::github::stats::backfill::BACKFILL_INTERVAL)
                         .unwrap_or_else(|_| chrono::Duration::seconds(60));
                 emit_backfill(
+                    &client,
                     &app,
                     &crate::commands::db_path(&app),
                     &scope.owner,
@@ -1802,6 +1803,36 @@ impl From<crate::github::stats::backfill::TickOutcome> for Tick {
 /// Separated from the loop so the sequencing is readable and so the loop
 /// itself holds no state that a failure could corrupt.
 async fn backfill_tick(
+    db: std::path::PathBuf,
+    client: &Arc<GitHubClient>,
+    demand: Arc<crate::stats_demand::Registry>,
+) -> Tick {
+    let tick = backfill_tick_inner(db, client, demand).await;
+    use crate::github::stats::backfill::TickOutcome as T;
+    use crate::measurement::{AggregateKind as A, WorkClass};
+    crate::stats_measurement::aggregate(
+        client.measurement_recorder(),
+        A::Tick,
+        WorkClass::Background,
+        1,
+    );
+    let metric = match &tick.outcome {
+        T::NoScope => A::NoWork,
+        T::ForegroundBusy | T::Skipped { .. } => A::Declined,
+        T::Complete => A::Completed,
+        T::Advanced { .. } => A::Continuation,
+        T::Failed(_) => A::Refused,
+    };
+    crate::stats_measurement::aggregate(
+        client.measurement_recorder(),
+        metric,
+        WorkClass::Background,
+        1,
+    );
+    tick
+}
+
+async fn backfill_tick_inner(
     db: std::path::PathBuf,
     client: &Arc<GitHubClient>,
     demand: Arc<crate::stats_demand::Registry>,
@@ -1952,6 +1983,7 @@ async fn backfill_tick(
             ));
         }
     };
+    let observation = client.stats_observation(&owner, &scope.scope_key, &from, &to);
     let written = {
         let db = db.clone();
         let key = scope.scope_key.clone();
@@ -1986,6 +2018,17 @@ async fn backfill_tick(
     // Useful row upserts include same-count corrections and partial failures.
     // Empty-day/coverage/count changes are compared in the emitted frame;
     // continuation bookkeeping alone is not a board invalidation.
+    if let Some(o) = &observation {
+        match &written {
+            Ok(Ok((rows, _, coverage, _))) => o.commit(
+                *rows,
+                Some(coverage.days_covered()),
+                crate::github::stats::backfill::days_between(&from, &to),
+                crate::measurement::WorkClass::Background,
+            ),
+            _ => o.emit(crate::measurement::StatsOutcome::CommitFailed, None, None),
+        }
+    }
     let committed = matches!(&written, Ok(Ok((rows, _, _, _))) if *rows > 0);
     let mut tick = match written {
         Ok(Ok((_, true, coverage, true))) if !coverage.partial => here(TickOutcome::Complete),
@@ -2039,6 +2082,7 @@ async fn mark_worked(
 /// invisible.
 #[allow(clippy::too_many_arguments)]
 async fn emit_backfill(
+    client: &GitHubClient,
     app: &AppHandle,
     db: &std::path::Path,
     owner: &crate::store::stats_owner::StatsOwner,
@@ -2093,6 +2137,11 @@ async fn emit_backfill(
                 report.total,
                 report.phase
             );
+            if let Some(o) =
+                client.stats_observation(&report.owner, &report.scope_key, &report.from, &report.to)
+            {
+                o.progress(&report);
+            }
             crate::commands::emit_stats_backfill(app, &report);
         }
         Ok(None) => log::warn!("stats backfill could not read coverage back to report progress"),

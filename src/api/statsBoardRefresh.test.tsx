@@ -2,8 +2,8 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { QueryClient } from '@tanstack/react-query';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { StatsBackfillFrame, StatsBoard, StatsBoardReadback } from '@/types/pr';
-const seam=vi.hoisted(()=>({cached:vi.fn(),callbacks:new Map<string,Set<(e:{payload:unknown})=>void>>() }));
-vi.mock('./tauri',()=>({statsBoardCached:seam.cached}));
+const seam=vi.hoisted(()=>({cached:vi.fn(),record:vi.fn().mockResolvedValue(undefined),callbacks:new Map<string,Set<(e:{payload:unknown})=>void>>() }));
+vi.mock('./tauri',()=>({statsBoardCached:seam.cached,recordClientMeasurements:seam.record}));
 vi.mock('./transport',()=>({listen:vi.fn(async(name:string,fn:(e:{payload:unknown})=>void)=>{const set=seam.callbacks.get(name)??new Set();set.add(fn);seam.callbacks.set(name,set);return()=>set.delete(fn);})}));
 import { readStatsBoard, retireStatsOwnership, useStatsBoardRefresh } from './statsBoardRefresh';
 const key=['stats-board','org:synthetic','merged',7];
@@ -18,7 +18,7 @@ async function flush(){await act(async()=>{await Promise.resolve();await Promise
 async function emit(sequence:number,cacheChange=sequence,extra:Partial<StatsBackfillFrame>={}){await act(async()=>{for(const fn of seam.callbacks.get('stats-backfill-progress')??[])fn({payload:{owner,scopeKey:board().scopeKey,daysCovered:0,daysTotal:7,collected:2,total:10,phase:{kind:'working'},nextTickAtMs:null,observation:{...window,stream:'stream-a',sequence,cacheChange},...extra}});});}
 function deferred<T>(){let resolve!:(v:T)=>void;let reject!:(e:unknown)=>void;const promise=new Promise<T>((a,b)=>{resolve=a;reject=b;});return{promise,resolve,reject};}
 beforeEach(()=>{seam.cached.mockResolvedValue(reply());});
-afterEach(()=>{cleanup();for(const qc of clients)qc.clear();clients.length=0;seam.cached.mockReset();seam.callbacks.clear();vi.useRealTimers();});
+afterEach(()=>{cleanup();for(const qc of clients)qc.clear();clients.length=0;seam.cached.mockReset();seam.record.mockClear();seam.callbacks.clear();vi.useRealTimers();});
 it('coalesces observers and event bursts, ignores duplicates, countdowns, other owners and scopes',async()=>{
  const pending=deferred<StatsBoardReadback>();seam.cached.mockReturnValueOnce(pending.promise);
  const a=setup();const b=renderHook(()=>useStatsBoardRefresh(a.qc,key,question,true));await flush();expect(seam.cached).toHaveBeenCalledTimes(1);
@@ -104,4 +104,17 @@ it('accepts a smaller new-window measurement at the ordinary UTC rollover',async
  expect(a.qc.getQueryData<StatsBoard>(key)?.window?.to).toBe('2026-09-08');
  expect(a.qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(0);
  expect(a.result.current.retained).toBe(false);
+});
+
+it('qualifies accepted, retained and owner-fenced readbacks without logging rejected numbers',async()=>{
+ const pending=deferred<StatsBoardReadback>();seam.cached.mockReturnValueOnce(pending.promise);
+ const {qc}=setup(board(8));qc.setQueryData(['ui-prefs'],{diagnostic_logging:true});await flush();
+ await act(async()=>pending.resolve(reply(2)));
+ await waitFor(()=>expect(seam.record).toHaveBeenCalled());
+ expect(seam.record.mock.calls.flatMap(c=>c[0])).toContainEqual(expect.objectContaining({kind:'stats_view',observation:'readback',outcome:'retained'}));
+ seam.record.mockClear();seam.cached.mockResolvedValueOnce({...reply(999),owner:{viewer:'other-synthetic',generation:9}});
+ await emit(1);await flush();
+ const rejected=seam.record.mock.calls.flatMap(c=>c[0]).find(v=>v.outcome==='rejected');expect(rejected).toBeTruthy();expect(rejected.rows).toBeUndefined();expect(rejected.scope).toBeUndefined();
+ expect(JSON.stringify(seam.record.mock.calls)).not.toContain('other-synthetic');
+ expect(qc.getQueryData<StatsBoard>(key)?.accumulated).toBe(8);
 });

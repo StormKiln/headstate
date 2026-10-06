@@ -18,7 +18,9 @@ const spend={points:0,requests:0,unmetered:0,remaining:null,resetAt:null};
 function measurement(count=50,complete=false,total:number|null=250) { return {rows:[{login:owner.viewer,prs:count,additions:count,deletions:0,changedFiles:count,reviewsReceived:0,cycleTimeHours:[]}],total,retrieved:50,complete,truncatedSlices:[],refusedFields:0,slices:1,rounds:1,spend,slowest:[],largest:[],repoCounts:[{repo:`synthetic-lab/${complete?'finished':'initial'}`,merged:count}],accumulated:count,accumulating:true,daysCovered:complete?30:0,daysTotal:30}; }
 function mount(initial=measurement(), strict=false, pending?:Promise<unknown>) {
  const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
+ qc.setQueryData(["ui-prefs"], {diagnostic_logging:true});
  seam.call.mockImplementation((name:string)=>{
+  if(name==='measurement_client_events')return Promise.resolve();
   if(name==='stats_board')return pending??Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',...initial,backfill:{state:'registered',owner,lastFrame:null}});
   if(name==='stats_board_cached')return Promise.resolve({owner,viewer:owner.viewer,scopeKey,window,stream:'synthetic-stream',measurement:measurement(250,true)});
   if(name==='stats_tree')return Promise.resolve({viewer:owner.viewer,orgs:[],repos:[]});
@@ -85,4 +87,18 @@ it("reconciles final progress received before the initial normal board settles e
  await act(async()=>{for(const callback of seam.callbacks.get('stats-backfill-progress')??[])callback({payload});});
  expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board')).toHaveLength(1);
  expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(1);qc.clear();
+});
+
+it("observes the actual mounted Stats publication without adding a provider request",async()=>{
+ const scope={epoch:'synthetic-epoch',capture:1,id:2};
+ const initial={...measurement(),measurementScope:scope};
+ const qc=mount(initial);await screen.findByText('synthetic-lab/initial');
+ await waitFor(()=>expect(seam.call.mock.calls.some(c=>c[0]==='measurement_client_events'&&JSON.stringify(c[1]).includes('stats_view'))).toBe(true));
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board')).toHaveLength(1);
+ expect(seam.call.mock.calls.filter(c=>c[0]==='stats_board_cached')).toHaveLength(0);
+ const batches=seam.call.mock.calls.filter(c=>c[0]==='measurement_client_events');
+ expect(batches.flatMap(c=>c[1].batch)).toContainEqual(expect.objectContaining({observation:'mounted',scope,rows:1,outcome:'accepted'}));
+ expect(JSON.stringify(batches)).not.toContain('synthetic-viewer');
+ expect(JSON.stringify(batches)).not.toContain('synthetic-lab');
+ qc.clear();
 });

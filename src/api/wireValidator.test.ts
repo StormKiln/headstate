@@ -150,3 +150,11 @@ it("accepts additive possible-process detail and compact groups with old-host om
   expect(() => assertRemoteReply("claude_session_detail", detail)).not.toThrow();
   expect(() => assertRemoteReply("claude_sessions", { ...modern, possible_process_groups: [[{ ...candidate, pid: "private-sentinel" }]] })).toThrow();
 });
+
+it("accepts legacy Stats readbacks and validates optional native scope metadata",()=>{
+ const old={owner:{viewer:"synthetic",generation:1},viewer:"synthetic",scopeKey:"merged|*|all",window:{from:"2026-10-01",to:"2026-10-05"},stream:"sample",
+ measurement:{rows:[],repoCounts:[],total:null,retrieved:0,complete:false,truncatedSlices:[],refusedFields:0,slices:0,rounds:0,spend:{points:0,requests:0,unmetered:0,remaining:null,resetAt:null},slowest:[],largest:[],accumulated:0,accumulating:true,daysCovered:0,daysTotal:5}};
+ expect(()=>assertRemoteReply("stats_board_cached",old)).not.toThrow();
+ expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:1,id:2}})).not.toThrow();
+ expect(()=>assertRemoteReply("stats_board_cached",{...old,measurementScope:{epoch:"synthetic",capture:"invalid",id:2}})).toThrow(/measurementScope/);
+});

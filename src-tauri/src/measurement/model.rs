@@ -69,7 +69,12 @@ closed!(Outcome {
     Unsupported,
     Unmeasured
 });
+closed!(StatsObservation { Readback, Mounted });
 closed!(StatsOutcome {
+    Registered,
+    RegistrationFailed,
+    Committed,
+    CommitFailed,
     Accepted,
     Retained,
     Rejected,
@@ -207,6 +212,8 @@ pub enum ClientMeasurement {
         footer: Footer,
     },
     StatsView {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observation: Option<StatsObservation>,
         scope: Option<OpaqueId>,
         outcome: StatsOutcome,
         elapsed_ms: Option<u64>,

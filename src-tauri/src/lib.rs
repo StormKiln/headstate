@@ -39,6 +39,7 @@ pub mod report;
 pub mod repos;
 pub mod source_poll;
 pub mod stats_demand;
+mod stats_measurement;
 pub mod store;
 pub mod tools;
 pub mod tray;
