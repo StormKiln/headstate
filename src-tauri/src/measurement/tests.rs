@@ -382,7 +382,7 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
             stage: Stage::Completed,
             outcome: Outcome::Success,
             elapsed_ms: None,
-            affected_fields: 0
+            affected_fields: None
         }
     ));
     assert!(r.next_operation(Some(&receipt)).is_none());
@@ -919,4 +919,43 @@ async fn ci_stalled_fixture_flush_is_bounded_and_does_not_claim_readiness() {
     release.send(()).unwrap();
     assert!(!flushed);
     assert!(flush_fixture(&r, std::time::Duration::from_secs(2)).await);
+}
+
+#[test]
+fn operation_affected_fields_preserves_numeric_counts_and_omits_unknown() {
+    let (_dir, recorder, _) = fixture(Caps::default());
+    recorder.set_enabled(true);
+    let operation = recorder.next_operation(None).unwrap();
+    let event = Event::Operation {
+        operation_class: Some(OperationClass::Detail),
+        operation,
+        parent: None,
+        domain: Domain::Queue,
+        stage: Stage::Published,
+        outcome: Outcome::Success,
+        elapsed_ms: None,
+        affected_fields: None,
+    };
+    let mut wire = serde_json::to_value(&event).unwrap();
+    assert!(wire.get("affected_fields").is_none());
+    assert!(matches!(
+        serde_json::from_value::<Event>(wire.clone()).unwrap(),
+        Event::Operation {
+            affected_fields: None,
+            ..
+        }
+    ));
+    for count in [0, 3, u16::MAX] {
+        wire["affected_fields"] = serde_json::json!(count);
+        let legacy = serde_json::from_value::<Event>(wire.clone()).unwrap();
+        assert!(
+            matches!(&legacy, Event::Operation { affected_fields: Some(value), .. } if *value == count)
+        );
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap()["affected_fields"],
+            count
+        );
+    }
+    wire["affected_fields"] = serde_json::json!(65536);
+    assert!(serde_json::from_value::<Event>(wire).is_err());
 }

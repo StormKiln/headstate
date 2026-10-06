@@ -144,7 +144,9 @@ updates, and retires it when rows or ownership change. The optional wire field i
 remain unlinked. The frontend carries the reference with the accepted source rows, never
 with an independently cached row array solely because its status revision advanced.
 
-`Operation.operation_class` is optional `detail` or `action`. Actual awaited command
+`Operation.operation_class` is optional `detail` or `action`.
+`Operation.affected_fields` is optional: unmeasured counts are omitted, while existing
+numeric values (including a genuinely measured zero) remain readable and unchanged. Actual awaited command
 scopes emit start/completion and retire their handle, including cancellation and early
 errors. Completed success means the command returned successfully. Action acknowledgment
 is success only for an actual confirmed effect; successful but unconfirmed outcomes are

@@ -3169,6 +3169,13 @@ async fn detail_fact_publication_is_durable_without_a_local_review() {
     assert!(events
         .iter()
         .any(|event| event["stage"] == "completed" && event["outcome"] == "success"));
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "operation")
+            .all(|event| event.get("affected_fields").is_none()),
+        "unmeasured field count must be absent, not fabricated zero"
+    );
     for update in publications {
         assert!(update.prs.unwrap()[0].in_merge_queue);
     }

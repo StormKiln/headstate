@@ -61,7 +61,8 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   selection?: SourceSelection; gitlab?: GitLabQueueSnapshot; github?: GitHubQueueStatus;
 }) {
   const gitlabSummary = gitlabQueueSummary(gitlab);
-  const receivedAt = github ? githubQueueSummary(github).updatedAt : updatedAt;
+  const githubSummary = github ? githubQueueSummary(github) : undefined;
+  const receivedAt = githubSummary ? githubSummary.updatedAt : updatedAt;
   const legacyState = usePollState();
   const state = github ? github.receipt.phase : legacyState;
   const legacyError = usePollError();
@@ -157,8 +158,8 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   // go: with it, "Up to date" and the timestamp each broke onto two
   // lines.
   const isMobile = useIsMobile();
-  useReviewPresentation(isMobile || selection === "gitlab" ? "hidden" : showReceipt && github
-    ? githubQueueSummary(github).measurement
+  useReviewPresentation(isMobile || selection === "gitlab" ? "hidden" : showReceipt && githubSummary
+    ? githubSummary.measurement
     : ({ panicked: "background_stopped", authUnavailable: "auth_unavailable", authUnknown: "auth_unknown",
       fetching: "checking", retrying: "retrying", failed: "load_failed", stale: "refresh_failed", ok: "legacy_up_to_date" } as const)[status],
     isMobile || selection === "gitlab" ? "hidden" : "desktop_footer");

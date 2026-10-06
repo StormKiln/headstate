@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
+  renders: 0,
   current: "idle" as "idle" | "fetching" | "retrying",
   error: null as string | null,
   removal: null as { done: number; total: number } | null,
@@ -38,7 +39,7 @@ vi.mock("../api/hooks", () => ({
   useCleanupPrefs: () => ({ prefs: undefined, set: () => Promise.resolve() }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
   useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
-  usePollState: () => state.current,
+  usePollState: () => { state.renders++; return state.current; },
   useRemovalProgress: () => state.removal,
   useUpdateProgress: () => state.updating,
   useCancelUpdateRun: () => () => Promise.resolve(),
@@ -52,6 +53,14 @@ vi.mock("../api/hooks", () => ({
   }),
 }));
 
+vi.mock("../lib/githubQueueSummary", async importOriginal => {
+  const actual = await importOriginal<typeof import("../lib/githubQueueSummary")>();
+  return { ...actual, githubQueueSummary: vi.fn(actual.githubQueueSummary) };
+});
+import { githubQueueSummary } from "../lib/githubQueueSummary";
+import { ReviewMeasurementProvider } from "../api/reviewMeasurement";
+import type { SourceRefreshSnapshot } from "../api/sourceRefresh";
+import type { PullRequest } from "../types/pr";
 import { StatusBar } from "./StatusBar";
 
 describe("StatusBar on a phone", () => {
@@ -523,5 +532,26 @@ describe("active GitHub inventory receipt", () => {
   it("does not fabricate a provider timestamp from the query cache", () => {
     render(<StatusBar updatedAt={Date.now()} github={{ list: "authored", receipt: { ...receipt, lastReceivedAt: undefined } }} />);
     expect(screen.queryByText(/^Updated /)).toBeNull();
+  });
+});
+
+
+describe("footer measurement summary reuse", () => {
+  afterEach(() => stubViewport(null));
+  it.each([false, true])("adds no summary traversal with capture=%s above the row cap", async enabled => {
+    stubViewport(1400);
+    const snapshot: SourceRefreshSnapshot = { modern: true, phase: "ready", error: null, coverage: "complete",
+      prs: Array.from({ length: 4097 }, () => ({ observation: undefined }) as PullRequest) };
+    const github = { list: "reviewing" as const, receipt: snapshot };
+    state.renders = 0;
+    vi.mocked(githubQueueSummary).mockClear();
+    await act(async () => { render(<ReviewMeasurementProvider enabled={enabled} selected={false} snapshot={snapshot}>
+      <StatusBar updatedAt={0} github={github} />
+    </ReviewMeasurementProvider>); });
+    expect(state.renders).toBeGreaterThan(0);
+    // Existing timestamp summary + the separately mounted production footer.
+    // Diagnostics must reuse the former, including when its count pass is capped/off.
+    expect(githubQueueSummary).toHaveBeenCalledTimes(state.renders * 2);
+    expect(screen.getByText("Review requests need checking")).toBeTruthy();
   });
 });

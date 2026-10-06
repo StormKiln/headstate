@@ -16,7 +16,7 @@ pub fn mark(recorder: Option<&Recorder>, stage: Stage, outcome: Outcome) {
                 stage,
                 outcome,
                 elapsed_ms: None,
-                affected_fields: 0,
+                affected_fields: None,
             })
         });
     }
@@ -38,7 +38,7 @@ impl Drop for Scope<'_> {
             stage: Stage::Completed,
             outcome: self.outcome,
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).ok(),
-            affected_fields: 0,
+            affected_fields: None,
         });
         self.recorder.retire(&self.id);
     }

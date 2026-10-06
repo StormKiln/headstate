@@ -247,7 +247,8 @@ pub enum Event {
         stage: Stage,
         outcome: Outcome,
         elapsed_ms: Option<u64>,
-        affected_fields: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_fields: Option<u16>,
     },
     StatsProgress {
         scope: OpaqueId,
