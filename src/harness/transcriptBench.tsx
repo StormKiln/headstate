@@ -31,6 +31,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { SESSION_ACTIVITY_EVENT } from "../api/hooks";
+import { PhoneTranscript } from "../components/transcript/phone/PhoneTranscript";
 import { DesktopTranscript } from "../components/transcript/DesktopTranscript";
 import "../index.css";
 import type { Liveness } from "../types/pr";
@@ -90,6 +91,15 @@ async function main() {
   const fixture = params.get("fixture");
   if (!fixture) throw new Error("harness: ?fixture=<name> is required");
   const follow = params.get("mode") === "follow";
+  const positions = params.get("mode") === "position";
+  const positionPages = new Map<number, TranscriptWindow>();
+  if (positions) {
+    for (const percent of [0, 50, 100]) {
+      const response = await fetch(`/fixtures/${fixture.replace(/\.position-100$/, "")}.position-${percent}.json`);
+      if (!response.ok) throw new Error("harness: missing native percentage payload");
+      positionPages.set(percent, await response.json() as TranscriptWindow);
+    }
+  }
   const raw = await (await fetch(`/fixtures/${fixture}.json`)).text();
   const base = JSON.parse(raw) as TranscriptWindow;
 
@@ -146,7 +156,13 @@ async function main() {
         probe.refused.push(cmd);
         throw new Error(`harness: no answer for ${cmd}`);
       }
-      const a = args as { anchor: { kind: string; offset?: number; behind_digest?: string }; direction: string };
+      const a = args as { anchor: { kind: string; percent?: number; offset?: number; behind_digest?: string }; direction: string };
+      if (positions && a.anchor.kind === "position") {
+        const w = positionPages.get(a.anchor.percent ?? -1);
+        if (!w) throw new Error("harness: percentage was not measured natively");
+        probe.reads.push({ at: performance.now(), direction: a.direction, anchor: "position", bytes: JSON.stringify(w).length, messages: w.page.messages.length });
+        return w;
+      }
       if (!file) {
         if (a.anchor.kind === "end") return JSON.parse(raw) as TranscriptWindow;
         throw new Error("harness: static position fixture has no adjacent pages");
@@ -184,7 +200,7 @@ async function main() {
     },
     { shouldMockEvents: follow },
   );
-  if (follow) window.__harness = probe;
+  if (follow || positions) window.__harness = probe;
   const liveness: Liveness = follow
     ? { state: "running", pid: 1, status: "busy" }
     : { state: "dead", why: "harness" };
@@ -197,14 +213,15 @@ async function main() {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <QueryClientProvider client={new QueryClient()}>
-        <Harness liveness={liveness} sessionId={follow ? SESSION : null} />
+        <Harness liveness={liveness} sessionId={follow ? SESSION : null} phone={params.get("host") === "phone"} />
       </QueryClientProvider>
     </StrictMode>,
   );
   document.body.dataset.harness = "ready";
 }
 
-function Harness({ liveness, sessionId }: { liveness: Liveness; sessionId: string | null }) {
+function Harness({ liveness, sessionId, phone }: { liveness: Liveness; sessionId: string | null; phone: boolean }) {
+  const Host = phone ? PhoneTranscript : DesktopTranscript;
   const [open, setOpen] = useState(false);
   return (
     <div className="flex h-screen flex-col bg-[#0d1117] p-3">
@@ -213,7 +230,7 @@ function Harness({ liveness, sessionId }: { liveness: Liveness; sessionId: strin
           Open
         </button>
       ) : (
-        <DesktopTranscript path={PATH} liveness={liveness} sessionId={sessionId} />
+        <Host path={PATH} liveness={liveness} sessionId={sessionId} />
       )}
     </div>
   );

@@ -7,7 +7,7 @@ import type {
   TranscriptMessage,
 } from "../../../types/transcript";
 import { readMarker } from "../sinceYouLeft";
-import { DEAD, output } from "../fixtures";
+import { DEAD, LIVE, output } from "../fixtures";
 import { installScrollShim, type ScrollShim } from "../scrollShim";
 
 /// The phone build: the pull gesture and the touch shield are
@@ -99,6 +99,7 @@ function windowOf(p: RemoteTranscriptPage): RemoteTranscriptWindow {
 
 const saveExport = vi.hoisted(() => vi.fn().mockResolvedValue("presented"));
 const { PhoneTranscript } = await import("./PhoneTranscript");
+const { DesktopTranscript } = await import("../DesktopTranscript");
 
 function msg(id: string, over: Partial<TranscriptMessage> = {}): TranscriptMessage {
   return {
@@ -488,4 +489,73 @@ describe("touch (#1481)", () => {
     expect(root.className).toContain("[&_[data-slot=message-scroller-button]]:right-4");
     expect(root.className).toContain("[&_[data-slot=message-scroller-button]]:min-h-11");
   });
+});
+
+describe("committed percentage navigation", () => {
+  it.each([["phone", PhoneTranscript], ["desktop", DesktopTranscript]] as const)("lands the %s viewport on the returned ID, holds at EOF and preserves it on an old host error", async (_name, Host) => {
+    state.masked = { data: page(Array.from({ length: 60 }, (_, i) => msg(`position-${i}`))) };
+    render(<Host path="/p.jsonl" liveness={LIVE} />);
+    await shim.flush();
+    const scroll = vi.spyOn(Element.prototype, "scrollTo");
+    const target = windowOf(page(Array.from({ length: 30 }, (_, i) => msg(`position-${i + 10}`))));
+    pageRead.mockResolvedValueOnce(target);
+    const slider = screen.getByRole("slider", { name: "Transcript position" });
+    fireEvent.pointerDown(slider);
+    fireEvent.change(slider, { target: { value: "50" } });
+    expect(pageRead.mock.calls.filter(c => c[1].kind === "position")).toHaveLength(0);
+    fireEvent.pointerUp(slider);
+    await shim.flush();
+    expect(pageRead.mock.calls.filter(c => c[1].kind === "position")).toHaveLength(1);
+    expect(shim.rowTop("position-10")).toBe(0);
+    expect(scroll).toHaveBeenCalled();
+    const readsAtHold = pageRead.mock.calls.length;
+    state.masked = { data: page([msg("appended-tail")]) };
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    await shim.flush();
+    expect(pageRead.mock.calls).toHaveLength(readsAtHold);
+    expect(shim.rowTop("position-10")).toBe(0);
+    expect(screen.getByRole("button", { name: "Jump to the latest" })).toBeTruthy();
+    const before = shim.viewport().scrollTop;
+    pageRead.mockRejectedValueOnce(new Error("unknown variant position"));
+    fireEvent.change(slider, { target: { value: "20" } });
+    await shim.flush();
+    expect(shim.rowTop("position-10")).toBe(0);
+    expect(shim.viewport().scrollTop).toBe(before);
+    expect(screen.getByTestId("jump-note-announce").textContent).toContain("previous view is preserved");
+    expect(pageRead.mock.calls.filter(c => c[1].kind === "end")).toHaveLength(1);
+  });
+});
+
+it.each([["phone", PhoneTranscript], ["desktop", DesktopTranscript]] as const)("discards a held %s position result after a session change", async (_name, Host) => {
+  state.masked = { data: page([msg("initial-session")]) };
+  const view = render(<Host path="/old.jsonl" liveness={DEAD} />);
+  await shim.flush();
+  let release!: (w: RemoteTranscriptWindow) => void;
+  pageRead.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  fireEvent.change(screen.getByRole("slider"), { target: { value: "20" } });
+  await shim.flush();
+  state.masked = { data: page([msg("new-session")]) };
+  view.rerender(<Host path="/new.jsonl" liveness={DEAD} />);
+  await shim.flush();
+  await act(async () => release(windowOf(page([msg("stale-position")]))));
+  await shim.flush();
+  expect(shim.rows().map(row => row.dataset.messageId)).toContain("new-session");
+  expect(shim.rows().map(row => row.dataset.messageId)).not.toContain("stale-position");
+  expect(screen.getByTestId("jump-note-announce").textContent).toBe("");
+});
+
+it("an explicit Latest supersedes a phone position request without reporting a failure", async () => {
+  await show({ data: page([msg("initial")]) });
+  pageRead.mockResolvedValueOnce(windowOf(page([msg("held")])));
+  fireEvent.change(screen.getByRole("slider"), { target: { value: "50" } });
+  await shim.flush();
+  let release!: (w: RemoteTranscriptWindow) => void;
+  pageRead.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  fireEvent.change(screen.getByRole("slider"), { target: { value: "20" } });
+  await shim.flush();
+  fireEvent.click(screen.getByRole("button", { name: "Jump to the latest" }));
+  await act(async () => release(windowOf(page([msg("cancelled")]))));
+  await shim.flush();
+  expect(screen.getByTestId("jump-note-announce").textContent).not.toContain("could not be loaded");
+  expect(shim.rows().map(row => row.dataset.messageId)).toContain("initial");
 });

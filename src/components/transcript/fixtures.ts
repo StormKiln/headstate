@@ -124,6 +124,7 @@ export function liveOf(
     refresh: () => Promise.resolve(),
     setViewport: () => undefined,
     seek: () => Promise.resolve(true),
+    seekPosition: () => Promise.resolve(null),
     loadOlderUntil: () => Promise.resolve(false),
     ...over,
   };

@@ -8277,7 +8277,8 @@ pub async fn claude_transcript_watch(
 /// reach the machine. One `.jsonl` under `~/.claude/projects` through
 /// the `claude_transcript_path` guard, nothing written. Bounded INSIDE the command whatever the
 /// caller asks: at most `PAGE_MESSAGES` messages and
-/// `transcript_page::PAGE_READ_BOUND` bytes read into memory, and a
+/// `transcript_page::PAGE_READ_BOUND` bytes read into memory (percentage
+/// anchors additionally allow two bounded 64 KiB alignment reads), and a
 /// record over `RECORD_HOLD_BYTES` streamed and clipped rather than
 /// held -- so a paired phone paging through a 70 MB transcript is handed
 /// one bounded page per call, never the file.

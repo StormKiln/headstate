@@ -1717,6 +1717,7 @@ export function useClaudeTranscriptLive(
       refresh: () => follower.refresh(),
       setViewport: (first: string, last: string) => follower.setViewport(first, last),
       seek: (id: string, at: PageCursor | null) => follower.seek(id, at),
+      seekPosition: (percent: number) => follower.seekPosition(percent),
       cursorFor: (id: string) => follower.cursorFor(id),
       loadOlderUntil: (wanted: (m: TranscriptMessage) => boolean) =>
         follower.loadOlderUntil(wanted),

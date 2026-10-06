@@ -579,6 +579,18 @@ describe("tauri.ts wrappers through the transport", () => {
   /// than omitting the keys -- the same shape `respondToPairing` uses
   /// for its optional argument, so the wire is not two shapes depending
   /// on what the caller passed.
+  it("sends the typed percentage anchor once and preserves old-host rejection without a latest fallback", async () => {
+    await api.claudeTranscriptPage("/p.jsonl", { kind: "position", percent: 50 }, "after", null);
+    expect(local.call).toHaveBeenLastCalledWith("claude_transcript_page", {
+      path: "/p.jsonl", anchor: { kind: "position", percent: 50 }, direction: "after", limit: null,
+    });
+    local.call.mockRejectedValueOnce(new Error("unknown variant position"));
+    await expect(api.claudeTranscriptPage("/p.jsonl", { kind: "position", percent: 20 }, "after", null))
+      .rejects.toThrow("unknown variant position");
+    expect(local.call).toHaveBeenCalledTimes(2);
+    expect(local.call.mock.calls.every(([, args]) => (args?.anchor as { kind: string }).kind === "position")).toBe(true);
+  });
+
   it("sends null terms when the caller chooses none", async () => {
     await api.claudeLaunchSession("sess-1", "/tmp/x");
     expect(local.call).toHaveBeenCalledWith("claude_launch_session", {

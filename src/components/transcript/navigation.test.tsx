@@ -57,7 +57,7 @@ const pageRead = vi.hoisted(() =>
       const n = file.n;
       const rewritten = anchor.kind === "cursor" && anchor.behind_digest !== `d${anchor.offset}`;
       const at = rewritten ? n :
-        anchor.kind === "start" ? 0 : anchor.kind === "end" ? n : anchor.offset / 100;
+        anchor.kind === "start" ? 0 : anchor.kind === "end" ? n : anchor.kind === "position" ? Math.floor(n * anchor.percent / 100) : anchor.offset / 100;
       const [from, to] =
         (rewritten || direction === "before") ? [Math.max(0, at - 5), at] : [at, Math.min(n, at + 5)];
       const messages = [];

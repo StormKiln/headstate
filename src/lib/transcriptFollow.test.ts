@@ -125,6 +125,10 @@ class FakeFile {
     let rewritten = false;
     if (anchor.kind === "start") at = 0;
     else if (anchor.kind === "end") at = n;
+    else if (anchor.kind === "position") {
+      at = Math.floor(n * anchor.percent / 100);
+      dir = anchor.percent === 100 ? "before" : "after";
+    }
     else if (
       anchor.offset % REC === 0 &&
       anchor.offset / REC <= n &&
@@ -1025,4 +1029,85 @@ describe("TranscriptFollower: masking (#1488)", () => {
       withheld: false,
     });
   });
+});
+
+
+describe("percentage navigation (#1528)", () => {
+  it("holds even EOF through append, paging, rewrite and refresh until explicit Latest", async () => {
+    const file = new FakeFile(30);
+    const f = follower(file);
+    f.setLive("running"); f.start(); await settle();
+    expect(await f.seekPosition(100)).toEqual({ id: "r27" });
+    expect(f.getSnapshot().atLiveEdge).toBe(false);
+    file.add(3); f.nudge(); await settle(); await f.refresh();
+    expect(ids(f.getSnapshot())).toEqual(["r27", "r28", "r29"]);
+    await f.loadNewer();
+    expect(f.getSnapshot().atLiveEdge).toBe(false);
+    file.rewrite(); file.add(3);
+    const held = ids(f.getSnapshot());
+    await f.loadNewer();
+    expect(ids(f.getSnapshot())).toEqual(held);
+    expect(f.getSnapshot().atLiveEdge).toBe(false);
+    await f.jumpToLatest();
+    expect(ids(f.getSnapshot())).toEqual(["r33", "r34", "r35"]);
+    expect(f.getSnapshot().atLiveEdge).toBe(true);
+    f.stop();
+  });
+  it("failed position keeps content and original follow intent", async () => {
+    const file = new FakeFile(30); const f = follower(file);
+    f.start(); await settle(); const held = ids(f.getSnapshot());
+    file.failNext = 1;
+    await expect(f.seekPosition(20)).rejects.toThrow("could not read it");
+    expect(ids(f.getSnapshot())).toEqual(held);
+    expect(f.getSnapshot().atLiveEdge).toBe(true);
+    expect(f.getSnapshot().error).toBeTruthy();
+    f.stop();
+  });
+});
+
+describe("percentage navigation ownership", () => {
+  it("opposing commits discard the outstanding page and issue only the newest queued seek", async () => {
+    const file = new FakeFile(100);
+    let release!: (w: RemoteTranscriptWindow) => void;
+    const read = vi.fn(file.page);
+    const f = new TranscriptFollower(read); f.start(); await settle();
+    read.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const old = f.seekPosition(10); await settle();
+    const abandoned = f.seekPosition(30);
+    const newest = f.seekPosition(70);
+    release(await file.page({ kind: "position", percent: 10 }, "after"));
+    expect(await old).toBeNull(); expect(await abandoned).toBeNull();
+    expect(await newest).toEqual({ id: "r70" });
+    expect(ids(f.getSnapshot())).toEqual(["r70", "r71", "r72"]);
+    expect(read.mock.calls.filter(([a]) => a.kind === "position").map(([a]) => a)).toEqual([
+      { kind: "position", percent: 10 }, { kind: "position", percent: 70 },
+    ]);
+    f.stop();
+  });
+  it("a stopped session discards an outstanding response without blanking the reader", async () => {
+    const file = new FakeFile(100); let release!: (w: RemoteTranscriptWindow) => void;
+    const read = vi.fn(file.page); const f = new TranscriptFollower(read);
+    f.start(); await settle(); const held = ids(f.getSnapshot());
+    read.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const seek = f.seekPosition(10); await settle(); f.stop();
+    release(await file.page({ kind: "position", percent: 10 }, "after"));
+    expect(await seek).toBeNull(); expect(ids(f.getSnapshot())).toEqual(held);
+    expect(f.getSnapshot().atLiveEdge).toBe(true);
+  });
+});
+
+it("a new percentage supersedes an outstanding Latest without a transient tail jump", async () => {
+  const file = new FakeFile(100); const read = vi.fn(file.page);
+  const f = new TranscriptFollower(read); f.start(); await settle();
+  await f.seekPosition(50);
+  let releaseLatest!: (w: RemoteTranscriptWindow) => void;
+  let releasePosition!: (w: RemoteTranscriptWindow) => void;
+  read.mockImplementationOnce(() => new Promise(resolve => { releaseLatest = resolve; }))
+    .mockImplementationOnce(() => new Promise(resolve => { releasePosition = resolve; }));
+  const latest = f.jumpToLatest(); await settle(); const position = f.seekPosition(10);
+  releaseLatest(await file.page({ kind: "end" }, "before")); await latest; await settle();
+  expect(ids(f.getSnapshot())).toEqual(["r50", "r51", "r52"]);
+  expect(f.getSnapshot().atLiveEdge).toBe(false);
+  releasePosition(await file.page({ kind: "position", percent: 10 }, "after"));
+  expect(await position).toEqual({ id: "r10" }); f.stop();
 });

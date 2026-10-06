@@ -150,6 +150,7 @@ const HIDDEN_ALL = "That message is hidden by the Show settings, and nothing nea
 export interface Jumps {
   /// Scroll to message `id`, loading its page first when it is not held.
   jumpTo: (id: string, at: PageCursor | null) => void;
+  seekPosition: (percent: number) => void;
   /// The previous (`-1`) or next (`1`) prompt from the top of the view.
   step: (dir: -1 | 1) => void;
   /// What the last jump could not do, in words; `null` when it did it.
@@ -162,7 +163,7 @@ export function useJumps({
   shown,
   handle,
 }: {
-  live: Pick<TranscriptLive, "seek" | "loadOlderUntil" | "loadNewer" | "hasOlder" | "atLiveEdge" | "navigationNotice">;
+  live: Pick<TranscriptLive, "seek" | "seekPosition" | "loadOlderUntil" | "loadNewer" | "hasOlder" | "atLiveEdge" | "navigationNotice">;
   messages: readonly TranscriptMessage[];
   shown: readonly TranscriptMessage[];
   handle: RefObject<TranscriptViewerHandle | null>;
@@ -174,6 +175,8 @@ export function useJumps({
   // after the render that decided it. `seq` makes a second jump to the
   // same row a new request.
   const [landing, setLanding] = useState<{ anchor: string; seq: number } | null>(null);
+  useEffect(() => () => { jumpRequest.current++; }, [live.seekPosition]);
+  const [positionNote, setPositionNote] = useState<{ owner: typeof live.seekPosition; text: string } | null>(null);
   useEffect(() => {
     if (landing !== null) handle.current?.scrollTo(landing.anchor);
   }, [landing, handle]);
@@ -221,6 +224,7 @@ export function useJumps({
   const jumpTo = useCallback(
     (id: string, at: PageCursor | null) => {
       const request = ++jumpRequest.current;
+      setPositionNote(null);
       const l = resolveId(id);
       if (l !== null) {
         setPending(null);
@@ -244,9 +248,29 @@ export function useJumps({
     [resolveId, land, live],
   );
 
+  const seekPosition = useCallback((percent: number) => {
+    const request = ++jumpRequest.current;
+    setPending(null);
+    setNote(null);
+    setPositionNote({ owner: live.seekPosition, text: `Loading about ${percent}% through transcript…` });
+    void live.seekPosition(percent).then((result) => {
+      if (request !== jumpRequest.current) return;
+      if (result === null) {
+        setPositionNote(null); // superseded or stopped, not a read failure
+        return;
+      }
+      setPositionNote(result.id === null ? { owner: live.seekPosition, text: "This transcript has no messages." } : null);
+      if (result.id !== null) setPending({ kind: "id", id: result.id });
+    }, () => {
+      if (request !== jumpRequest.current) return;
+      setPositionNote({ owner: live.seekPosition, text: "Position could not be loaded. Your previous view is preserved. If this host does not support position navigation, update Headstate on the desktop." });
+    });
+  }, [live]);
+
   const step = useCallback(
     (dir: -1 | 1) => {
       jumpRequest.current++;
+      setPositionNote(null);
       setPending(null);
       const from = handle.current?.firstVisible() ?? null;
       const target = adjacentOpener(shown, from, dir);
@@ -276,7 +300,7 @@ export function useJumps({
 
   // Landing clears the jump/filter note, but must retain a stale saved
   // position's explanation even when the fallback found the message.
-  return { jumpTo, step, note: [live.navigationNotice, note].filter(Boolean).join(" ") || null };
+  return { jumpTo, seekPosition, step, note: [live.navigationNotice, note, positionNote?.owner === live.seekPosition ? positionNote.text : null].filter(Boolean).join(" ") || null };
 }
 
 /// `j`/`k` on the desktop: the next and previous prompt, from anywhere
