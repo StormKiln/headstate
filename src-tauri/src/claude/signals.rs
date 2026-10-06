@@ -496,7 +496,7 @@ impl Events {
                 tool: tool.clone(),
                 summary: summary.clone(),
             },
-            Liveness::Dead { why } | Liveness::Unknown { why } => Waiting::LastSeen {
+            Liveness::Dead { why } | Liveness::Unknown { why, .. } => Waiting::LastSeen {
                 kind: kind.clone(),
                 at: at.clone(),
                 tool: tool.clone(),

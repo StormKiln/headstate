@@ -206,7 +206,7 @@ pub fn restart_list(list: &super::sessions::SessionList) -> RestartList {
             super::sessions::ListLiveness::Running { .. } => {
                 out.running.push(entry(row));
             }
-            super::sessions::ListLiveness::Unknown { why } => {
+            super::sessions::ListLiveness::Unknown { why, .. } => {
                 out.uncertain.push(UncertainEntry {
                     entry: entry(row),
                     // The reason is INTERNED in the list, so an index out
@@ -282,6 +282,7 @@ mod tests {
         SessionList {
             sessions,
             reasons,
+            possible_process_groups: Vec::new(),
             registry_failure: None,
             registry_unreadable: Vec::new(),
             registry_unnamed: Vec::new(),
@@ -457,7 +458,14 @@ mod tests {
                         status: None,
                     },
                 ),
-                row("sess-unknown", Some(&dir), ListLiveness::Unknown { why: 0 }),
+                row(
+                    "sess-unknown",
+                    Some(&dir),
+                    ListLiveness::Unknown {
+                        why: 0,
+                        possible_processes: None,
+                    },
+                ),
                 row("sess-dead", Some(&dir), ListLiveness::Dead { why: 1 }),
             ],
             vec![
@@ -505,7 +513,10 @@ mod tests {
             vec![row(
                 "sess-unknown",
                 Some(&dir),
-                ListLiveness::Unknown { why: 7 },
+                ListLiveness::Unknown {
+                    why: 7,
+                    possible_processes: None,
+                },
             )],
             Vec::new(),
         ));

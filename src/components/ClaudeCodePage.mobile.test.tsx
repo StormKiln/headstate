@@ -675,3 +675,15 @@ describe("the transcript viewer on the phone", () => {
     expect(useFilters.getState().claudeSelected).toBeUndefined();
   });
 });
+
+it("shows possible processes on the phone list without hover or process authority", () => {
+  state.list = listOf([session({ name: "Structured uncertain", liveness: { state: "unknown", why: "uncertain", possible_processes: {
+    candidates: [{ pid: 4242, cwd: null, cwd_truncated: false }, { pid: 4243, cwd: "/synthetic", cwd_truncated: true }], total: 3,
+  } } })]);
+  render(<ClaudeCodePage />);
+  expect(screen.getAllByText("May be running · 3 possible processes").length).toBeGreaterThan(0);
+  open("Structured uncertain");
+  expect(screen.getAllByText(/pid 4242 · folder unknown/).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/folder truncated/).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("button", { name: /^Stop/ })).toBeNull();
+});

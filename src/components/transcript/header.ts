@@ -1,3 +1,4 @@
+import { possibleProcessLabel } from "@/lib/possibleProcesses";
 /// What the transcript's session header says, as data (#1485).
 ///
 /// Pure, so each state can be tested apart from the layout, and so the
@@ -55,7 +56,7 @@ export function livenessView(liveness: Liveness, noTranscript: boolean): Livenes
     case "unknown":
       return {
         tone: "unknown",
-        label: "Could not tell whether it is running",
+        label: possibleProcessLabel(liveness) ?? "Could not tell whether it is running",
         detail: liveness.why,
       };
   }

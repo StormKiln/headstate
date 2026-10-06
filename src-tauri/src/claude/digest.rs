@@ -487,7 +487,10 @@ mod tests {
             running("busy"),
             running("shell"),
             ListLiveness::Dead { why: 0 },
-            ListLiveness::Unknown { why: 0 },
+            ListLiveness::Unknown {
+                why: 0,
+                possible_processes: None,
+            },
         ] {
             let d = assemble(
                 &list(vec![list_row(

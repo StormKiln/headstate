@@ -1,3 +1,4 @@
+import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
 import { readStatsBoard, useStatsBoardRefresh, statsOwnership } from "./statsBoardRefresh";
 import { useStatsDemand } from "./useStatsDemand";
 import { assertCurrent, display, receipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
@@ -1523,6 +1524,10 @@ export function hydrateClaudeSessions(wire: WireClaudeSessionList): ClaudeSessio
                 why: `the reason for this session's state did not arrive (index ${s.liveness.why} of ${wire.reasons.length})`,
               }
             : { state: s.liveness.state, why: reason };
+        if (s.liveness.state === "unknown" && liveness.state === "unknown") {
+          const evidence = hydratePossibleProcesses(s.liveness.possible_processes, wire.possible_process_groups);
+          if (evidence) liveness.possible_processes = evidence;
+        }
       }
       return {
         session_id: s.session_id,

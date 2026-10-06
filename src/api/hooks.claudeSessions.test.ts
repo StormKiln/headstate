@@ -325,3 +325,62 @@ describe("hydrateClaudeSessions carries the opening prompt and the masking", () 
     expect("masking" in hydrateClaudeSessions(wire())).toBe(false);
   });
 });
+
+it("hydrates bounded possible process groups without inventing certainty", () => {
+  const input = wire();
+  const candidates = [{ pid: 4242, cwd: null, cwd_truncated: false }];
+  Object.assign(input, { possible_process_groups: [candidates] });
+  Object.assign(input.sessions[0], { liveness: { state: "unknown", why: 0, possible_processes: { group: 0, total: 2 } } });
+  expect(hydrateClaudeSessions(input).sessions[0].liveness).toEqual({ state: "unknown", why: DEAD,
+    possible_processes: { candidates, total: 2 } });
+});
+
+it("qualifies omitted or malformed process groups without changing Unknown or its reason", () => {
+  for (const group of [null, -1, 0, 32, 0.5, "0"]) {
+    const input = wire();
+    Object.assign(input.sessions[0], { liveness: { state: "unknown", why: 0, possible_processes: { group, total: 3 } } });
+    expect(hydrateClaudeSessions(input).sessions[0].liveness).toEqual({ state: "unknown", why: DEAD,
+      possible_processes: { candidates: [], total: 3 } });
+  }
+  for (const total of [null, -1, 0, 0.5, "1", Number.MAX_SAFE_INTEGER + 1]) {
+    const input = wire();
+    Object.assign(input.sessions[0], { liveness: { state: "unknown", why: 0, possible_processes: { group: 0, total } } });
+    expect(hydrateClaudeSessions(input).sessions[0].liveness).toEqual({ state: "unknown", why: DEAD });
+  }
+});
+
+it("rejects malformed candidates, retains old payloads and never attaches candidates to Running", () => {
+  const valid = { pid: 42, cwd: "/synthetic", cwd_truncated: false };
+  for (const candidates of [[{ ...valid, pid: -1 }], [{ ...valid, cwd: 3 }], [{ ...valid, cwd: "界".repeat(400) }],
+    [{ ...valid, cwd: null, cwd_truncated: true }], Array.from({ length: 9 }, () => valid)]) {
+    const input = wire();
+    Object.assign(input, { possible_process_groups: [candidates] });
+    Object.assign(input.sessions[0], { liveness: { state: "unknown", why: 0, possible_processes: { group: 0, total: 9 } } });
+    expect(hydrateClaudeSessions(input).sessions[0].liveness).toEqual({ state: "unknown", why: DEAD,
+      possible_processes: { candidates: [], total: 9 } });
+  }
+  const input = wire();
+  Object.assign(input.sessions[0], { liveness: { state: "running", pid: 7, status: null, possible_processes: { group: 0, total: 1 } } });
+  expect(hydrateClaudeSessions(input).sessions[0].liveness).toEqual({ state: "running", pid: 7, status: null });
+});
+
+
+it("shares candidate arrays across hydrated rows and keeps a broken reason Unknown", () => {
+  const input = wire();
+  const candidates = [{ pid: 42, cwd: null, cwd_truncated: false }];
+  Object.assign(input, { possible_process_groups: [candidates] });
+  const row = { ...input.sessions[0], liveness: { state: "unknown" as const, why: 0, possible_processes: { group: 0, total: 1 } } };
+  input.sessions = [row, { ...row, session_id: "s2" }];
+  const got = hydrateClaudeSessions(input).sessions;
+  for (const s of got) {
+    expect(s.liveness.state).toBe("unknown");
+    if (s.liveness.state === "unknown") expect(s.liveness.possible_processes?.candidates).toBe(candidates);
+  }
+  row.liveness.why = 99;
+  const broken = hydrateClaudeSessions(input).sessions[0].liveness;
+  expect(broken.state).toBe("unknown");
+  if (broken.state === "unknown") {
+    expect(broken.why).toContain("did not arrive");
+    expect(broken.possible_processes?.total).toBe(1);
+  }
+});
