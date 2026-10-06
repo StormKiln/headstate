@@ -19,3 +19,74 @@ test('synthetic advisory ledger attributes actual production-shaped downward/upw
   {stage:'pusher-activity',subjects:[{repo:'synthetic-lab/repo-1',number:51}]},
  ]);
 }));
+
+test('opt-in convergence fixture declares independent 236 reviewing and 130 Ready identities',()=>{
+ const data=fixture({convergence:true});
+ const reviewing=searchRows(data.rows,'is:pr is:open review-requested:@me');
+ assert.deepEqual(reviewing.map(row=>row.number),Array.from({length:236},(_,i)=>51+i));
+ assert.deepEqual(reviewing.filter(row=>!row.isDraft).map(row=>row.number),Array.from({length:130},(_,i)=>51+i));
+ assert.equal(searchRows(data.rows,'is:pr is:open author:@me').length,50);
+ assert.ok(new Set(reviewing.map(row=>row.repository.nameWithOwner)).size>=50);
+ assert.ok(data.members.length>=50);
+ assert.equal(fixture().rows.filter(row=>row.state==='OPEN').length,200,'ordinary fixture remains unchanged');
+});
+
+test('targeted held search materializes stale values while detail and mutations continue',async()=>{
+ const p=await startProvider({convergence:true});
+ const query=async q=>(await (await fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})})).json()).data;
+ try{
+  p.fault.holdSearch={list:'reviewing',after:null,remaining:1};
+  const held=query('{search(query:"is:pr is:open review-requested:@me",first:25){nodes{id isDraft}}}');
+  for(let i=0;i<100&&!p.heldCount;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(p.heldCount,1);
+  const mutation=await query('mutation {convertPullRequestToDraft(input:{pullRequestId:"PR_51"}){pullRequest{id isDraft updatedAt}}}');
+  assert.equal(mutation.convertPullRequestToDraft.pullRequest.isDraft,true);
+  const fresh=await query('{node(id:"PR_51"){id isDraft}}');assert.equal(fresh.node.isDraft,true);
+  p.release();
+  assert.equal((await held).search.nodes.find(row=>row.id==='PR_51').isDraft,false,'held reply must preserve pre-mutation provider facts');
+ }finally{p.release();await p.close();}
+});
+
+test('one-shot failed continuation leaves head and detail queries available',async()=>{
+ const p=await startProvider({convergence:true});
+ const query=q=>fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})});
+ try{
+  p.fault.failSearch={list:'reviewing',after:'cursor-50',remaining:1};
+  const q='{search(query:"is:pr is:open review-requested:@me",first:25,after:"cursor-50"){nodes{id}}}';
+  assert.equal((await query('{node(id:"PR_51"){id}}')).status,200);
+  assert.equal((await query(q)).status,503);
+  assert.equal((await query(q)).status,200);
+  assert.equal(p.ledger.filter(e=>e.targetedFailure).length,1);
+ }finally{p.release();await p.close();}
+});
+
+test('dequeue consumes schema id and rejects enqueue-style pullRequestId',async()=>{
+ const p=await startProvider({convergence:true});const query=q=>fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q})});
+ try{
+  const invalid=await query('mutation {dequeuePullRequest(input:{pullRequestId:"PR_51"}){mergeQueueEntry{state}}}');assert.equal(invalid.status,500);
+  const response=await query('mutation {dequeuePullRequest(input:{id:"PR_51"}){mergeQueueEntry{state pullRequest{id isInMergeQueue mergeQueueEntry{state} updatedAt}}}}');assert.equal(response.status,200);
+  const receipt=(await response.json()).data.dequeuePullRequest;assert.equal(receipt.mergeQueueEntry.pullRequest.id,'PR_51');assert.equal(receipt.mergeQueueEntry.pullRequest.isInMergeQueue,false);assert.equal(receipt.mergeQueueEntry.pullRequest.mergeQueueEntry,null);
+ }finally{await p.close();}
+});
+
+test('ledger distinguishes primary detail identity from check continuations and stack reads',()=>usingProvider(async(p,query)=>{
+ await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id body latestReviews(first:1){nodes{id}} reviewThreads(first:1){nodes{id}}}}}');
+ await query('{repository(owner:"synthetic-lab",name:"repo-1"){pullRequest(number:51){id reviews(first:1){nodes{id}}}}}');
+ assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);assert.deepEqual(p.ledger[1].primaryDetails,[]);
+}));
+
+test('actual native PR_DETAIL_QUERY is one primary acquisition with exact identity',()=>usingProvider(async(p)=>{
+ const {readFile}=await import('node:fs/promises');
+ const source=await readFile(new URL('../../src-tauri/src/github/query.rs',import.meta.url),'utf8');
+ const query=source.split('pub const PR_DETAIL_QUERY: &str = r#"')[1].split('"#;')[0];
+ const response=await fetch(p.url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query,variables:{owner:'synthetic-lab',repo:'repo-1',number:51}})});
+ assert.equal(response.status,200);const body=await response.json();assert.equal(body.data.repository.pullRequest.number,51);
+ assert.deepEqual(p.ledger[0].primaryDetails,[{repo:'synthetic-lab/repo-1',number:51}]);
+}));
+test('conditional hold skips ineligible natural candidate without spending armed hold',()=>usingProvider(async(p,query)=>{
+ const observations=[{eligible:false,reason:'expired'},{eligible:true,observation:{enabled:true}}];
+ p.fault.holdSearch={list:'reviewing',after:null,remaining:1,observeReady:async()=>observations.shift()};
+ const document='{search(query:"is:pr is:open review-requested:@me",first:25){nodes{id}}}';
+ await query(document);assert.equal(p.heldCount,0);assert.equal(p.fault.holdSearch.remaining,1);assert.equal(p.ledger[0].holdEligibility.eligible,false);
+ const pending=query(document);for(let i=0;i<100&&!p.heldCount;i++)await new Promise(r=>setTimeout(r,1));assert.equal(p.heldCount,1);assert.equal(p.fault.holdSearch.remaining,0);assert.equal(p.ledger[1].holdEligibility.eligible,true);p.release();await pending;
+}));

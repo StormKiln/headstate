@@ -150,7 +150,7 @@ const ROWS: Row[] = [
   // the row above and a deliberately different command: this classifies
   // the MAIN CHECKOUT only, where that one classifies every worktree.
   row(api.classifyRepoUpstream, [repoPath], "classify_repo_upstream", { repoPath }),
-  row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
+  row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action, inventoryManaged: true }),
   row(api.removeWorktrees, [repoPath, worktreePaths, 7], "remove_worktrees", {
     repoPath,
     worktreePaths,

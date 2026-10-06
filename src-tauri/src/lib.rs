@@ -9,6 +9,7 @@ pub mod claudemd;
 pub mod cleanup;
 pub mod commands;
 pub mod diag;
+pub mod disk_inventory;
 pub mod docker;
 #[cfg(feature = "enterprise-harness")]
 pub mod enterprise_harness;
@@ -344,6 +345,12 @@ pub fn run() {
             commands::review_pr_at_head,
             commands::comment_on_pr,
             commands::scan_artifacts,
+            disk_inventory::commands::disk_inventory_status,
+            disk_inventory::commands::disk_inventory_history,
+            disk_inventory::commands::disk_inventory_settings,
+            disk_inventory::commands::set_disk_inventory_settings,
+            disk_inventory::commands::start_disk_inventory,
+            disk_inventory::commands::cancel_disk_inventory,
             commands::read_cached_scan,
             commands::remove_artifacts,
             commands::size_artifacts,

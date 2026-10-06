@@ -240,14 +240,14 @@ describe("background reviewing publications", () => {
     expect(String(result.current.error)).toContain("desktop unreachable");
   });
 
-  it.each(["enqueue", "draft", "ready", "approve"] as const)("shows confirmed %s in authoritative rows while readback is pending and after it fails", async (action) => {
+  it.each(["enqueue", "draft", "ready", "approve"] as const)("keeps legacy confirmed %s in authoritative rows while readback is pending and after it fails", async (action) => {
     const row = { ...PR_FIXTURES[0], repo: "o/r", number: 1, is_draft: action === "ready", in_merge_queue: false, review: "review_required" as const };
     let reject!: (error: Error) => void;
     const pending = new Promise<PullRequest[]>((_, no) => { reject = no; });
     ipc.call.mockImplementation((command: string) => {
       if (command === "get_source_snapshot") return Promise.resolve({ source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs: [row], fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } });
       if (command === "refresh_now") return pending;
-      if (command === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "fixture", commit_oid: row.head_oid, submitted_at: null, pr_id: "id", repo: "o/r", number: 1 } });
+      if (command === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "review", state: "APPROVED", actor: "fixture", commit_oid: row.head_oid, submitted_at: null, pr_id: row.id, repo: "o/r", number: 1 } });
       return Promise.resolve(undefined);
     });
     const { result } = renderHook(() => ({
@@ -256,22 +256,57 @@ describe("background reviewing publications", () => {
     await waitFor(() => expect(result.current.authored.data?.[0].number).toBe(1));
     act(() => {
       for (const list of ["authored", "reviewing"]) emit("source-poll-status", {
-        source: { provider: "github", host: "github.com" }, list, session: "desktop", revision: 2,
+        source: { provider: "github", host: "github.com" }, list, owner: "fixture", session: "desktop", revision: 2,
         receipt_revision: 2, prs: [row], phase: "ready", error: null,
       });
     });
     let mutation!: Promise<unknown>;
     act(() => {
       mutation = action === "approve"
-        ? result.current.review("id", "o/r", 1, "approve", "", row.head_oid)
-        : result.current.action("id", "o/r", 1, action);
+        ? result.current.review(row.id, "o/r", 1, "approve", "", row.head_oid)
+        : result.current.action(row.id, "o/r", 1, action);
     });
     const patch = action === "approve" ? { review: "review_required", observation: { confirmed_review: { review: "approved" } } }
       : action === "enqueue" ? { in_merge_queue: true } : { is_draft: action === "draft" };
-    await waitFor(() => expect(result.current.authored.data?.[0]).toMatchObject(patch));
+    try {
+      await waitFor(() => expect(result.current.authored.data?.[0]).toMatchObject(patch));
+      expect(result.current.reviewing.data?.[0]).toMatchObject(patch);
+      await waitFor(() => expect(ipc.call).toHaveBeenCalledWith("refresh_now", { requestId: expect.any(String) }));
+    } finally {
+      // Even a failing assertion must settle the shared legacy refresh, rather
+      // than leaving the next case attached to this case's unresolved request.
+      await act(async () => { reject(new Error("readback unavailable")); await mutation; });
+    }
+    expect(result.current.authored.data?.[0]).toMatchObject(patch);
     expect(result.current.reviewing.data?.[0]).toMatchObject(patch);
-    await waitFor(() => expect(ipc.call).toHaveBeenCalledWith("refresh_now", { requestId: expect.any(String) }));
-    await act(async () => { reject(new Error("readback unavailable")); await mutation; });
+  });
+
+  it.each(["enqueue", "draft", "ready"] as const)("adopts managed %s from native publications and retains it through background readback failure", async action => {
+    const row = { ...pr(1), is_draft: action === "ready", in_merge_queue: false };
+    let acknowledge!: (value: { inventory_managed: boolean }) => void;
+    ipc.call.mockImplementation((command: string) => {
+      if (command === "get_source_snapshot") return Promise.resolve({ source: { provider: "github", host: "github.com" }, list: "authored", ownership: { state: "live_verified", owner: "fixture" }, data: { state: "available", prs: [row], fetched_at: "2026-01-01T00:00:00Z", stale_secs: null, coverage: "complete" } });
+      if (command === "act_on_pr") return new Promise(resolve => { acknowledge = resolve; });
+      return Promise.resolve(undefined);
+    });
+    const { result } = renderHook(() => ({ authored: usePullRequests(), reviewing: useReviewing(false), action: useActOnPr(), error: usePollError() }), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.authored.data?.[0].id).toBe(row.id));
+    const frame = { source: { provider: "github", host: "github.com" }, owner: "fixture", session: "desktop", revision: 2, receipt_revision: 2, coverage: "complete", prs: [row], phase: "ready", error: null };
+    act(() => { for (const list of ["authored", "reviewing"]) emit("source-poll-status", { ...frame, list }); });
+    let mutation!: Promise<unknown>;
+    act(() => { mutation = result.current.action(row.id, row.repo, row.number, action); });
+    expect(result.current.authored.data?.[0]).toEqual(row);
+    const patch = action === "enqueue" ? { in_merge_queue: true } : { is_draft: action === "draft" };
+    const accepted = { ...frame, revision: 3, receipt_revision: 3, prs: [{ ...row, ...patch }] };
+    await act(async () => {
+      for (const list of ["authored", "reviewing"]) emit("source-poll-status", { ...accepted, list });
+      acknowledge({ inventory_managed: true }); await mutation;
+    });
+    expect(result.current.authored.data?.[0]).toMatchObject(patch);
+    expect(result.current.reviewing.data?.[0]).toMatchObject(patch);
+    expect(ipc.call.mock.calls.filter(([name]) => ["refresh_now", "get_reviewing"].includes(name))).toEqual([]);
+    act(() => { for (const list of ["authored", "reviewing"]) emit("source-poll-status", { ...accepted, list, revision: 4, phase: "failed", error: "background readback unavailable" }); });
+    await waitFor(() => expect(result.current.error).toBe("background readback unavailable"));
     expect(result.current.authored.data?.[0]).toMatchObject(patch);
     expect(result.current.reviewing.data?.[0]).toMatchObject(patch);
   });

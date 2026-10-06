@@ -205,3 +205,78 @@ mod tests {
         );
     }
 }
+
+// Opaque observer IDs only; this module is absent from ordinary builds.
+tokio::task_local! {
+    pub static COMMAND: u64;
+    pub static SCAN_SLOT: u64;
+}
+
+static SCAN_RECEIPTS: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
+pub fn scan_receipt(receipt: &str, slot: u64) {
+    let mut receipts = SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !insert_scan_receipt(&mut receipts, receipt, slot) {
+        LOST.store(true, Ordering::SeqCst);
+    }
+}
+fn insert_scan_receipt(
+    receipts: &mut std::collections::HashMap<String, u64>,
+    receipt: &str,
+    slot: u64,
+) -> bool {
+    if let Some(existing) = receipts.get(receipt) {
+        return *existing == slot;
+    }
+    if receipts.len() >= 100000 {
+        return false;
+    }
+    receipts.insert(receipt.to_owned(), slot);
+    true
+}
+
+pub fn accepted_scan(receipt: &str, revision: u64) {
+    let receipts = SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = receipts.get(receipt) {
+        record(*slot, "accepted-reviewing", "scan-slot", revision);
+        #[cfg(test)]
+        ACCEPTED_SCANS.lock().unwrap().push((*slot, revision));
+    }
+}
+
+#[cfg(test)]
+pub fn receipt_slot(receipt: &str) -> Option<u64> {
+    SCAN_RECEIPTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(receipt)
+        .copied()
+}
+
+#[cfg(test)]
+#[test]
+fn conflicting_scan_producer_is_rejected_without_overwriting_provenance() {
+    let mut receipts = std::collections::HashMap::new();
+    assert!(insert_scan_receipt(&mut receipts, "synthetic-receipt", 1));
+    assert!(insert_scan_receipt(&mut receipts, "synthetic-receipt", 1));
+    assert!(!insert_scan_receipt(&mut receipts, "synthetic-receipt", 2));
+    assert_eq!(receipts.get("synthetic-receipt"), Some(&1));
+}
+
+#[cfg(test)]
+static ACCEPTED_SCANS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub fn accepted_revisions(slot: u64) -> Vec<u64> {
+    ACCEPTED_SCANS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, revision)| (*id == slot).then_some(*revision))
+        .collect()
+}

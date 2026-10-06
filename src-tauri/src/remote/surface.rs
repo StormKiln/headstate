@@ -218,6 +218,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    ("disk_inventory_status", Class::Read),
+    ("disk_inventory_history", Class::Read),
+    ("disk_inventory_settings", Class::Read),
+    ("set_disk_inventory_settings", Class::Local),
+    ("start_disk_inventory", Class::Local),
+    ("cancel_disk_inventory", Class::Local),
     // Read: what a previous scan already found, so a cold start paints
     // rows instead of a blank page (#1152). Same class as the scan
     // above -- it returns the same information, just earlier -- and it
@@ -1267,6 +1273,13 @@ async fn call(
         "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
+        "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
+        "disk_inventory_history" => {
+            res(crate::disk_inventory::commands::disk_inventory_history(app.clone()).await)
+        }
+        "disk_inventory_settings" => {
+            res(crate::disk_inventory::commands::disk_inventory_settings(app.clone()).await)
+        }
         "read_cached_scan" => res(commands::read_cached_scan(app.clone(), a.get("kind")?).await),
         "size_artifacts" => res(commands::size_artifacts(a.get("paths")?).await),
         "scan_venvs" => res(commands::scan_venvs(app.clone()).await),
@@ -1418,6 +1431,7 @@ async fn call(
             a.get("repo")?,
             a.get("number")?,
             a.get("action")?,
+            a.get("inventoryManaged")?,
         )
         .await),
         "act_on_prs" => res(commands::act_on_prs(
@@ -1946,6 +1960,35 @@ mod tests {
         assert_eq!(a.get::<String>("repo"), Ok("octocat/hello-world".into()));
         assert_eq!(a.get::<u64>("number"), Ok(7));
         assert_eq!(a.get::<String>("action"), Ok("merge".into()));
+    }
+
+    #[test]
+    fn action_capability_preserves_old_and_new_phone_host_combinations() {
+        for modern_phone in [false, true] {
+            let mut body =
+                json!({"id":"PR_1","repo":"synthetic/repo","number":1,"action":"enqueue"});
+            if modern_phone {
+                body["inventoryManaged"] = json!(true);
+            }
+            let args = Args::new("act_on_pr", body).unwrap();
+            // The old host reads only its existing keys; additions are ignored.
+            assert_eq!(args.get::<String>("id").unwrap(), "PR_1");
+            assert_eq!(args.get::<String>("action").unwrap(), "enqueue");
+            let legacy_reply = serde_json::to_value(()).unwrap();
+            assert!(legacy_reply.is_null());
+            let modern_reply = serde_json::to_value(commands::PrActionOutcome::for_request(
+                args.get("inventoryManaged").unwrap(),
+            ))
+            .unwrap();
+            if modern_phone {
+                assert_eq!(modern_reply, json!({"inventory_managed":true}));
+            } else {
+                assert!(
+                    modern_reply.is_null(),
+                    "old phone's void schema must keep accepting the reply"
+                );
+            }
+        }
     }
 
     #[test]

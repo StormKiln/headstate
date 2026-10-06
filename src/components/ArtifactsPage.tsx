@@ -1,3 +1,4 @@
+import { DiskUsagePanel } from "./DiskUsagePanel";
 import { isCancelled } from "@/lib/cancelled";
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useMemo, useState } from "react";
@@ -177,6 +178,10 @@ function describeAge(secs: number): string {
 }
 
 export function ArtifactsPage() {
+  return <><DiskUsagePanel /><ArtifactInventory /></>;
+}
+
+function ArtifactInventory() {
   const filters = useActiveFilters();
   const isMobile = useIsMobile();
   // `repo` is the sidebar's selection key across every view; here it

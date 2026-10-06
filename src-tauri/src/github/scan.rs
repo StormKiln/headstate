@@ -169,6 +169,16 @@ impl GitHubClient {
                     "scan-slot",
                     state.callers.len() as u64,
                 );
+                #[cfg(feature = "enterprise-harness")]
+                if let Ok(command) = crate::enterprise_harness::metrics::COMMAND.try_with(|id| *id)
+                {
+                    crate::enterprise_harness::metrics::record(
+                        command,
+                        "slot",
+                        "command-scan",
+                        slot.metric.id(),
+                    );
+                }
                 state.callers.insert(id, (context.clone(), mode));
                 slot.publish_demand(&state);
                 if state.task.is_none() && state.receipt.is_none() {
@@ -236,6 +246,9 @@ impl GitHubClient {
                                     now,
                                     mode,
                                 );
+                                #[cfg(feature = "enterprise-harness")]
+                                let step = crate::enterprise_harness::metrics::SCAN_SLOT
+                                    .scope(shared.metric.id(), step);
                                 tokio::pin!(step);
                                 loop {
                                     if dispatched.load(std::sync::atomic::Ordering::Acquire) {
@@ -260,6 +273,19 @@ impl GitHubClient {
                             }
                         };
                         let result = run.await.map_err(Arc::new);
+                        #[cfg(feature = "enterprise-harness")]
+                        if let Some(receipt) = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|r| r.scan.as_ref())
+                            .filter(|scan| !scan.state.no_work)
+                            .and_then(|scan| scan.state.receipt_id.as_deref())
+                        {
+                            crate::enterprise_harness::metrics::scan_receipt(
+                                receipt,
+                                shared.metric.id(),
+                            );
+                        }
                         #[cfg(feature = "enterprise-harness")]
                         metric.finish(if result.is_ok() { "receipt" } else { "failed" });
                         shared
@@ -326,10 +352,13 @@ impl GitHubClient {
         let attempts_before = client.attempts_remaining();
         if state.done {
             if let Some(finished_at) = state.finished_at {
-                state.eligible_at = finished_at + state.pass_delay.max(queue_scan::CONFIRM_DELAY);
+                state.eligible_at = finished_at + state.completed_pass_delay();
             }
         }
-        if mode == ScanMode::Refresh && state.done && now >= state.eligible_at {
+        if state.done
+            && now >= state.eligible_at
+            && (mode == ScanMode::Refresh || state.repair_due(now))
+        {
             state.fresh_pass();
         }
         let began_at_head = state.after.is_none();
@@ -380,7 +409,11 @@ impl GitHubClient {
                             if after.is_some() && explicit_invalid_cursor(&error) {
                                 partition::reset_leaf(&mut state);
                             }
-                            state.failure(now);
+                            if provider_repair_error(&error) {
+                                state.provider_failure(now);
+                            } else {
+                                state.failure(now);
+                            }
                             state.step_failure = Some(scan_failure(&error));
                             break;
                         }
@@ -395,7 +428,11 @@ impl GitHubClient {
                             state.fresh_pass();
                             state.receipt_id = receipt_id;
                         }
-                        state.failure(now);
+                        if provider_repair_error(&error) {
+                            state.provider_failure(now);
+                        } else {
+                            state.failure(now);
+                        }
                         state.step_failure = Some(scan_failure(&error));
                         break;
                     }
@@ -546,7 +583,11 @@ impl GitHubClient {
                     }
                 }
                 Err(error) => {
-                    state.failure(now);
+                    if provider_repair_error(&error) {
+                        state.provider_failure(now);
+                    } else {
+                        state.failure(now);
+                    }
                     state.step_failure = Some(scan_failure(&error));
                 }
             }
@@ -561,6 +602,15 @@ impl GitHubClient {
 
         if !state.no_work && !state.done && state.failures == 0 {
             state.eligible_at = now + 15;
+        }
+        // Local effects and recovered provider failures invalidate this pass's
+        // proof but not its useful rows.
+        // After terminal discovery, repair once on the normal visible clock.
+        // Partition metadata has been restored before evaluating its bounds.
+        if !state.no_work && state.repair_ready() {
+            if let Some(finished) = state.finished_at {
+                state.eligible_at = finished + state.completed_pass_delay();
+            }
         }
         // A positive measurement in this step always beats a tentative negative.
         removals.retain(|id| !prs.iter().any(|r| &r.identity() == id));
@@ -706,6 +756,16 @@ fn scan_failure(error: &ClientError) -> queue_scan::ScanFailure {
         message: error.to_string(),
         transient: error.is_transient(),
         not_asked: matches!(error, ClientError::NotDispatched(_)),
+    }
+}
+
+// Refused admission and structural cursor errors do not earn a provider
+// recovery pass, including when an acquisition shares its error with callers.
+fn provider_repair_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Shared(inner) => provider_repair_error(inner),
+        ClientError::NotDispatched(_) => false,
+        _ => !explicit_invalid_cursor(error),
     }
 }
 
@@ -1902,6 +1962,277 @@ mod tests {
         assert_eq!(result.state.after.as_deref(), Some("cursor-25"));
         assert!(result.state.eligible_at > 3000);
     }
+    #[test]
+    fn provider_repair_excludes_refused_and_invalid_cursor_errors() {
+        for error in [
+            ClientError::NotDispatched("synthetic admission".into()),
+            ClientError::Graphql("The cursor is invalid".into()),
+        ] {
+            assert!(!provider_repair_error(&error));
+            assert!(!provider_repair_error(&ClientError::Shared(
+                std::sync::Arc::new(error)
+            )));
+        }
+        assert!(provider_repair_error(&ClientError::Graphql(
+            "Synthetic provider failure".into()
+        )));
+        assert!(provider_repair_error(&ClientError::Timeout(30)));
+    }
+
+    #[tokio::test]
+    async fn local_taint_terminal_pass_repairs_on_visible_continuation_after_restart() {
+        let server = MockServer::start().await;
+        let client = client(&server);
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":1,"nodes":[node(1)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}))).mount(&server).await;
+        client.fetch_viewer().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-repair.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let initial = State {
+            started_at: Some(990),
+            after: Some("prior-page".into()),
+            pass_delay: 300,
+            ..State::default()
+        };
+        assert!(queue_scan::commit(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "fixture",
+            &queue_scan::Commit {
+                expected_revision: 0,
+                state: initial,
+                removals: vec![]
+            },
+            |_| Ok(())
+        )
+        .unwrap());
+        for _ in 0..3 {
+            queue_scan::taint(&conn, &Source::default(), CachedList::Reviewing, "fixture").unwrap();
+        }
+        let loaded =
+            queue_scan::load(&conn, &Source::default(), CachedList::Reviewing, "fixture").unwrap();
+        let terminal = client
+            .advance_scan_mode(CachedList::Reviewing, loaded, &[], 1000, ScanMode::Continue)
+            .await
+            .unwrap();
+        let commit = terminal.scan.as_ref().unwrap();
+        assert!(commit.state.done && commit.state.tainted && !commit.state.coverage_valid);
+        assert_eq!(commit.state.eligible_at, 1015, "local invalidation needs the normal continuation opportunity, not completed-pass cadence");
+        assert!(queue_scan::commit(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "fixture",
+            commit,
+            |_| Ok(())
+        )
+        .unwrap());
+        drop(conn);
+        let conn = crate::store::open_db(&path).unwrap();
+        let loaded =
+            queue_scan::load(&conn, &Source::default(), CachedList::Reviewing, "fixture").unwrap();
+        assert!(!crate::poll::queue_continuation_due(
+            &loaded.state,
+            1014,
+            true,
+            true,
+            true
+        ));
+        for flags in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!crate::poll::queue_continuation_due(
+                &loaded.state,
+                1015,
+                flags.0,
+                flags.1,
+                flags.2
+            ));
+        }
+        assert!(crate::poll::queue_continuation_due(
+            &loaded.state,
+            1015,
+            true,
+            true,
+            true
+        ));
+        assert!(loaded.state.local_repair_pending);
+        let before = server.received_requests().await.unwrap().len();
+        let declined = client
+            .with_attempt_limit(0)
+            .advance_scan_mode(
+                CachedList::Reviewing,
+                Loaded {
+                    revision: loaded.revision,
+                    state: loaded.state.clone(),
+                },
+                &terminal.prs,
+                1015,
+                ScanMode::Continue,
+            )
+            .await
+            .unwrap();
+        assert!(
+            declined.scan.unwrap().state.local_repair_pending,
+            "no admitted work cannot spend the repair opportunity"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+        let repaired = client
+            .advance_scan_mode(
+                CachedList::Reviewing,
+                loaded,
+                &terminal.prs,
+                1015,
+                ScanMode::Continue,
+            )
+            .await
+            .unwrap();
+        assert!(server.received_requests().await.unwrap().len() - before <= 3);
+        let commit = repaired.scan.unwrap();
+        assert!(commit.state.done && !commit.state.tainted && commit.state.coverage_valid);
+        assert!(!commit.state.local_repair_pending);
+        assert_eq!(commit.state.eligible_at, 1315);
+        assert!(commit.removals.is_empty());
+        assert!(
+            !crate::poll::queue_continuation_due(&commit.state, 2000, true, true, true),
+            "one repair cannot become perpetual completed-pass polling"
+        );
+        assert!(queue_scan::commit(
+            &conn,
+            &Source::default(),
+            CachedList::Reviewing,
+            "fixture",
+            &commit,
+            |_| Ok(())
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_repair_does_not_expedite_ordinary_failed_or_bounded_passes() {
+        let server = MockServer::start().await;
+        let client = client(&server);
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .mount(&server)
+            .await;
+        client.fetch_viewer().await.unwrap();
+        server.reset().await;
+        for kind in ["ordinary", "failure", "ceiling", "partition"] {
+            let mut state = State {
+                done: true,
+                started_at: Some(990),
+                finished_at: Some(1000),
+                eligible_at: 1300,
+                pass_delay: 300,
+                ..State::default()
+            };
+            if kind != "ordinary" {
+                state.taint_effect();
+            }
+            match kind {
+                "failure" => {
+                    state.failure(1000);
+                    state.step_failure = Some(queue_scan::ScanFailure {
+                        message: "synthetic refused page".into(),
+                        transient: true,
+                        not_asked: false,
+                    });
+                }
+                "ceiling" => state.ceiling = true,
+                "partition" => {
+                    state.github_partition = Some(queue_scan::GithubPartition {
+                        blocked: vec![(
+                            queue_scan::Window { lo: 1, hi: 1 },
+                            queue_scan::BlockReason::TimestampResolution,
+                        )],
+                        ..Default::default()
+                    })
+                }
+                _ => {}
+            }
+            assert!(
+                !crate::poll::queue_continuation_due(&state, 1015, true, true, true),
+                "{kind}"
+            );
+            let old = state.clone();
+            let result = client
+                .advance_scan_mode(
+                    CachedList::Reviewing,
+                    Loaded {
+                        revision: 20,
+                        state,
+                    },
+                    &[],
+                    1015,
+                    ScanMode::Continue,
+                )
+                .await
+                .unwrap();
+            let result = result.scan.unwrap().state;
+            assert!(result.no_work && result.done, "{kind}");
+            assert_eq!(
+                result.eligible_at, old.eligible_at,
+                "no admission cannot alter {kind} retry time"
+            );
+            assert_eq!(result.local_repair_pending, old.local_repair_pending);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[cfg(feature = "enterprise-harness")]
+    #[tokio::test]
+    async fn no_work_scan_keeps_original_observer_receipt_producer() {
+        let server = MockServer::start().await;
+        let client = client(&server);
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}))).mount(&server).await;
+        client.fetch_viewer().await.unwrap();
+        let produced = client
+            .advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 111,
+                    state: State::default(),
+                },
+                &[],
+                1000,
+            )
+            .await
+            .unwrap();
+        let state = produced.scan.unwrap().state;
+        assert!(!state.no_work);
+        let receipt = state.receipt_id.clone().unwrap();
+        let original = crate::enterprise_harness::metrics::receipt_slot(&receipt).unwrap();
+        server.reset().await;
+        let refused = client
+            .with_attempt_limit(0)
+            .advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 112,
+                    state,
+                },
+                &[],
+                1100,
+            )
+            .await
+            .unwrap();
+        let state = refused.scan.unwrap().state;
+        assert!(state.no_work);
+        assert_eq!(state.receipt_id.as_deref(), Some(receipt.as_str()));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            crate::enterprise_harness::metrics::receipt_slot(&receipt),
+            Some(original)
+        );
+        assert!(!crate::enterprise_harness::metrics::lost());
+    }
     #[tokio::test]
     async fn explicit_expired_cursor_restarts_only_traversal_and_keeps_inventory_qualified() {
         let server = MockServer::start().await;
@@ -1997,6 +2328,10 @@ mod tests {
             assert!(state.receipt_id.is_some());
             assert!(state.eligible_at > 1000);
             if reset {
+                assert!(
+                    !state.provider_failure_pending,
+                    "invalid cursor is structural, not provider recovery"
+                );
                 server.reset().await;
                 Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":1,"nodes":[node(8)],"pageInfo":{"hasNextPage":false,"endCursor":"new"}}}}))).mount(&server).await;
                 let recovered = client

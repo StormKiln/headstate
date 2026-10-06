@@ -24,6 +24,8 @@ import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
 import type { SourceSelection } from "../store/sourceSelection";
 import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
+import { githubQueueSummary, type GitHubQueueStatus } from "../lib/githubQueueSummary";
+import { GitHubQueueFreshness } from "./GitHubQueueFreshness";
 import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
 
 const CHOICES = [60, 120, 300, 900];
@@ -53,13 +55,16 @@ function label(secs: number): string {
 /// still being fast enough that nobody sits three versions behind.
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
-export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "github", gitlab }: {
+export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "github", gitlab, github }: {
   updatedAt: number; githubAuthAvailable?: GitHubAuthAvailability;
-  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot;
+  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot; github?: GitHubQueueStatus;
 }) {
   const gitlabSummary = gitlabQueueSummary(gitlab);
-  const state = usePollState();
-  const pollError = usePollError();
+  const receivedAt = github ? githubQueueSummary(github).updatedAt : updatedAt;
+  const legacyState = usePollState();
+  const state = github ? github.receipt.phase : legacyState;
+  const legacyError = usePollError();
+  const pollError = github ? github.receipt.error : legacyError;
 
   // "Never succeeded" and "stale after a failure" are different. A green
   // dot beside "Updated 3 hours ago" is defensible; a green dot with no
@@ -74,9 +79,8 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   // task that would have emitted it is the one that died.
   const panicked = useBackgroundPanicked();
 
-  // A cache read can set `updatedAt` to now even when startup had no gh
-  // client and Rust did not start a poll. Auth availability outranks the
-  // idle state; the timestamp is withheld below for the same reason.
+  // Authentication and worker health outrank accepted list evidence.
+  // The legacy fallback supports isolated callers without a source receipt.
   const status = panicked
     ? ("panicked" as const)
     : githubAuthAvailable === false
@@ -144,6 +148,7 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
     stale: "Could not refresh PRs",
     failed: "Could not load PRs",
   } as const;
+  const showReceipt = !["panicked", "authUnavailable", "authUnknown"].includes(status);
   const { seconds, set } = usePollInterval();
   const [settingsOpen, setSettingsOpen] = useState(false);
   // The poll cadence is the desktop's setting, and Settings > General
@@ -262,7 +267,7 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
           Only this pair moves. The progress counter, its cancel button,
           the version and the settings entry point below have no second
           home and stay on both. */}
-      {isMobile || selection === "gitlab" ? null : (
+      {isMobile || selection === "gitlab" ? null : showReceipt && github ? <GitHubQueueFreshness github={github} selection={selection} /> : (
         <>
           <span className="flex items-center gap-1.5">
             <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
@@ -271,10 +276,9 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
             </span>
           </span>
 
-          {/* `dataUpdatedAt`, not `isFetching`: the tray path advances the
-              former on both routes but never flips the latter. */}
-          {githubAuthAvailable === true && updatedAt > 0 ? (
-            <span>{selection === "both" ? "GitHub updated" : "Updated"} {relativeTime(new Date(updatedAt).toISOString())}</span>
+          {/* Receipt acquisition time survives local cache/fact publications. */}
+          {githubAuthAvailable === true && receivedAt !== undefined && receivedAt > 0 ? (
+            <span>{selection === "both" ? "GitHub updated" : "Updated"} {relativeTime(new Date(receivedAt).toISOString())}</span>
           ) : null}
         </>
       )}

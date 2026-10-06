@@ -5,12 +5,15 @@ import type { ProviderReceipt } from "./sourceRefresh";
 import { reviewAccountGeneration } from "./reviewOperations";
 
 type Facts = Record<string, string>;
-interface Target { revision: number; facts: Facts; probe?: boolean }
+interface Target { revision: number; facts: Facts; probe?: boolean; scalarReadback?: { id: string; head: string } }
 interface State { facts: Facts; observed: Facts; initial: boolean; revision: number; required?: Target; reading?: number; account: number; session: number }
-type Member = Pick<PullRequest, "repo" | "number">;
+type Member = Pick<PullRequest, "repo" | "number" | "id" | "head_oid">;
 interface Source { listeners: Set<() => void>; session?: string; generation: number; retired: Set<string>; account: number; membership: Partial<Record<"authored" | "reviewing", Map<string, Member>>> }
 const memberKey = (row: Member) => JSON.stringify([row.repo.toLowerCase(), row.number]);
 const states = new WeakMap<Query, State>();
+// A successful terminal read can arrive before its native removal event.
+// Positive membership received later retires this witness, even if unchanged.
+const terminalReads = new WeakMap<Query, { id: string; head: string; account: number; session: number }>();
 const sources = new WeakMap<QueryClient, Source>();
 export const reviewReconciliations = new WeakMap<QueryClient, Map<string, symbol>>();
 export const reviewKey = (repo: string, number: number) => JSON.stringify([repo, number]);
@@ -57,9 +60,13 @@ function source(qc: QueryClient): Source {
   qc.getQueryCache().subscribe(event => {
     if (event.type !== "updated" || event.action.type !== "success" || event.action.manual) return;
     const query = event.query;
+    if (query.queryKey[0] !== "pr-detail" || query.queryKey.length !== 3) return;
+    const data = query.state.data as PrDetail | undefined;
+    if (data?.state === "closed" || data?.state === "merged") {
+      terminalReads.set(query, { id: data.id, head: data.head_oid, account: reviewAccountGeneration(qc), session: value.generation });
+    } else terminalReads.delete(query);
     const state = current(qc, query);
     if (!state) return;
-    const data = query.state.data as PrDetail | undefined;
     // Only scalars with identical source/detail semantics can prove readback.
     // Counts, capped lists and CI aggregates are source-to-source signals; a
     // full post-target read acknowledges them without comparing unlike data.
@@ -76,7 +83,11 @@ function source(qc: QueryClient): Source {
     const target = state.required;
     if (!target) return;
     const overtaken = target.revision > (state.reading ?? -1);
-    if (!overtaken && data && matches(target.facts)) {
+    // Native detail reconciliation may remove the row before this same command
+    // returns. Its positive terminal response already answers the absence probe.
+    const terminalReadback = target.probe && (data?.state === "closed" || data?.state === "merged");
+    const ownScalarReadback = target.scalarReadback && data?.id === target.scalarReadback.id && data.head_oid === target.scalarReadback.head && matches(target.facts);
+    if (terminalReadback || ownScalarReadback || (!overtaken && data && matches(target.facts))) {
       state.required = undefined;
     } else if (overtaken) {
       // Let TanStack finish the current retryer before asking for the single
@@ -107,31 +118,41 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
   const account = reviewAccountGeneration(qc);
   if (src.account !== account) { src.membership = {}; src.account = account; }
   const previous = src.membership[list] ?? new Map<string, Member>();
-  const observed = new Map(rows.filter(row => row.observation?.state !== "retained").map(row => [memberKey(row), { repo: row.repo, number: row.number }]));
+  const observed = new Map(rows.filter(row => row.observation?.state !== "retained").map(row => [memberKey(row), { repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid }]));
   const present = new Set(rows.map(memberKey));
   const missing = coverage === "complete" ? [...previous].filter(([id]) => !present.has(id)).map(([, row]) => row) : [];
   src.membership[list] = coverage === "complete" ? new Map([...previous].filter(([id]) => present.has(id)).concat([...observed])) : new Map([...previous, ...observed]);
   for (const row of rows) for (const query of detailAliases(qc, row.repo, row.number)) {
+    if (row.observation?.state !== "retained") terminalReads.delete(query);
     let state = current(qc, query);
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: query.state.data === undefined, revision: 0, account: reviewAccountGeneration(qc), session: src.generation };
       states.set(query, state);
     }
     const next = facts(row);
-    const changed = Object.entries(next).some(([key, value]) => state.facts[key] !== undefined && state.facts[key] !== value);
+    const changedFields = Object.entries(next).filter(([key, value]) => state.facts[key] !== undefined && state.facts[key] !== value).map(([key]) => key);
+    const changed = changedFields.length > 0;
     // Do not transplant head-dependent requirements across a positively new
     // head when that receipt could not observe the new head's scalar values.
     if (next.head && next.head !== state.facts.head) state.observed = {};
     state.observed = { ...state.observed, ...next };
     state.facts = { ...state.facts, ...next };
     if (!changed) continue;
-    state.required = { revision: ++state.revision, facts: { ...state.observed } };
+    // These three normalized scalar fields can acknowledge their own native
+    // pre-return publication. Head/check/count/thread changes still require a
+    // post-target read; never let a scalar receipt consume such an older target.
+    const scalarReadback = changedFields.every(field => ["draft", "review", "queue"].includes(field)) && (!state.required || state.required.scalarReadback)
+      ? { id: row.id, head: row.head_oid } : undefined;
+    state.required = { revision: ++state.revision, facts: { ...state.observed }, scalarReadback };
     // Inactive details need a stale marker, but no provider command.
     void qc.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
     request(qc, query);
   }
   for (const row of missing) for (const query of detailAliases(qc, row.repo, row.number)) {
     let state = current(qc, query);
+    const terminal = terminalReads.get(query);
+    if (!state?.required && terminal?.account === account && terminal.session === src.generation
+      && terminal.id === row.id && terminal.head === row.head_oid) continue;
     if (!state) {
       state = { facts: baseline(query.state.data as PrDetail | undefined), observed: {}, initial: false, revision: 0, account, session: src.generation };
       states.set(query, state);
@@ -150,6 +171,7 @@ export function beginDetailRead(qc: QueryClient, repo: string, number: number) {
   if (state) state.reading = state.revision;
   return source(qc).generation;
 }
+export function detailSourceGeneration(qc: QueryClient) { return source(qc).generation; }
 export function detailReadIsCurrent(qc: QueryClient, generation: number) { return source(qc).generation === generation; }
 export function detailNeedsRevalidation(qc: QueryClient, repo: string, number: number) {
   const query = detailQuery(qc, repo, number);

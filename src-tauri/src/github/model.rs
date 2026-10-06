@@ -488,6 +488,9 @@ pub struct ChecksCoverage {
 /// would make every poll carry data almost none of the rows need.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrDetail {
+    /// Native acquisition evidence, not frontend action authority.
+    #[serde(skip)]
+    pub inventory_facts: Option<crate::store::github_facts::Observation>,
     /// GraphQL node ID. Every mutation takes this rather than a number,
     /// so the detail view is what makes a PR actionable.
     pub id: String,

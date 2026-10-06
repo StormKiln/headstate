@@ -7,6 +7,8 @@ import { useReadyStacks } from '../api/useReadyStacks';
 import { prKey } from '../lib/prIdentity';
 import { readyForReview } from '../lib/derive';
 import { useSourceRefresh, refreshWithState } from '../api/sourceRefreshHooks';
+import { GitHubQueueFreshness } from '../components/GitHubQueueFreshness';
+import type { SourceRefreshSnapshot } from '../api/sourceRefresh';
 import { PrList } from '../components/PrList';
 import { ReadyStrip } from '../components/ReadyStrip';
 import { PrDetailView } from '../components/PrDetailView';
@@ -20,8 +22,10 @@ const longTasks:{at:number;duration:number}[]|null=PerformanceObserver.supported
 if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())boundedPush(longTasks,{at:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});
 let renderedInventory:{authored:string[];reviewing:string[]}={authored:[],reviewing:[]};
 let renderedReadyEligibility:string[]=[];
+let renderedSource:SourceRefreshSnapshot|undefined;
+const convergenceScenario=new URL(location.href).searchParams.get("scenario")==="convergence";
 const advisoryPublications:{at:number;wallTime:number;kind:string;identity:unknown;number:number;owner:unknown;generation:unknown;freshPusher:boolean;freshRules:boolean;freshStack:boolean}[]=[];
-const probe={advisoryPublications,readyEligibility:()=>renderedReadyEligibility,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
+const probe={sourceEvidence:()=>renderedSource,advisoryPublications,readyEligibility:()=>renderedReadyEligibility,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
  const schedule=query.meta?.advisorySchedule as {claims?:Map<string,boolean>;lastAdmittedAt?:number;hasContinuation?:boolean;resumeBoostSpent?:boolean}|undefined;
  const freshness=(field:string,usable:boolean)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:usable&&evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
@@ -30,7 +34,7 @@ const probe={advisoryPublications,readyEligibility:()=>renderedReadyEligibility,
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
   ...(query.queryKey[0]==='stats-board'?{owner:value?.owner,viewer:value?.viewer,scopeKey:value?.scopeKey,days:query.queryKey[3],daysCovered:value?.daysCovered,daysTotal:value?.daysTotal,total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
-}),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
+}),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshReviewing:()=>refreshWithState(client,'reviewing'),refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
 declare global {interface Window {__enterprise:typeof probe}}
 window.__enterprise=probe;
 const client=new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false}}});
@@ -52,11 +56,12 @@ export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
   // Observe exactly what the production hooks render, including retained startup data.
+  if(convergenceScenario)renderedSource=source;
   renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
   renderedReadyEligibility=(reviewing.data??[]).filter(readyForReview).map(row=>`${row.repo}/${row.number}`).sort();
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;
-  if(authored.data?.length===50&&reviewing.data?.length===150&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
- },[authored.data,reviewing.data]);
+  if(authored.data?.length===50&&reviewing.data?.length===(convergenceScenario?236:150)&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
+ },[authored.data,reviewing.data,source]);
  const completionProbe=new URL(location.href).searchParams.get('scenario')==='ready-completion';
  const first=new URL(location.href).searchParams.get('role')==='paired'?76:51;
  const readyRows=completionProbe?(reviewing.data??[]).filter(row=>row.number>=first&&row.number<first+16):(reviewing.data??[]);
@@ -65,6 +70,8 @@ export function Workload(){
   <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button><button onClick={()=>setView('stats')}>Statistics</button></nav>
   <output data-testid="counts">Authored {authored.data?.length??'unknown'} / Reviewing {reviewing.data?.length??'unknown'}</output>
   {view==='idle'?null:view==='stats'?<StatsPage/>:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
+  {convergenceScenario&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
+  {convergenceScenario?<footer data-testid="inventory-footer" className="flex gap-3 text-xs"><GitHubQueueFreshness github={{list:"reviewing",receipt:source}}/></footer>:null}
  </main>;
 }
 function ReadyProgressRows({rows}:{rows:PullRequest[]}) {

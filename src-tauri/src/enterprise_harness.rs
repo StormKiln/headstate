@@ -84,6 +84,7 @@ fn supported(command: &str) -> bool {
     matches!(
         command,
         "get_auth_state"
+            | "act_on_pr"
             | "diag_log"
             | "get_reviewing"
             | "get_viewer"
@@ -133,7 +134,12 @@ async fn call(
         );
     }
     let mut scope = metrics::Scope::new("command", u64::from(route.0 == "paired"));
-    let (status, Json(mut value)) = call_inner(State(d), Path(route), headers, Json(args)).await;
+    let (status, Json(mut value)) = metrics::COMMAND
+        .scope(
+            scope.id(),
+            call_inner(State(d), Path(route), headers, Json(args)),
+        )
+        .await;
     scope.finish(if status.is_success() {
         "complete"
     } else {

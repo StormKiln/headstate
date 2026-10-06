@@ -10,6 +10,7 @@ import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
 import type { SourceSelection } from "../store/sourceSelection";
 import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
+import { githubQueueSummary, type GitHubQueueStatus } from "../lib/githubQueueSummary";
 import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
 
 /// Where "update Headstate on your desktop" sends the user: the desktop
@@ -77,9 +78,9 @@ function describeState(state: Exclude<ConnectionState, { kind: "local" }>, githu
 /// Renders nothing on the desktop, where the app IS the desktop and
 /// there is no connection to describe. Tapping opens Settings on the
 /// Phone topic, which is where pairing lives.
-export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, selection = "github", gitlab }: {
+export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, selection = "github", gitlab, github }: {
   updatedAt?: number; githubAuthAvailable?: GitHubAuthAvailability;
-  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot;
+  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot; github?: GitHubQueueStatus;
 } = {}) {
   const isMobile = useIsMobile();
   const state = useConnectionState();
@@ -112,10 +113,13 @@ export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, se
   const described = describeState(state, githubEnabled ? githubAuthAvailable : true);
   const gitlabSummary = gitlabQueueSummary(gitlab);
   const connected = state.kind === "connected";
-  const githubFreshness = connected && githubEnabled && githubAuthAvailable === true && updatedAt > 0
-    ? ` · ${selection === "both" ? "GitHub updated" : "PRs updated"} ${relativeTime(new Date(updatedAt).toISOString())}` : "";
-  const line = `${described.text}${githubFreshness}${connected && selection !== "github" ? ` · ${gitlabSummary.text}` : ""}`;
-  const dot = connected && selection !== "github" && gitlabSummary.warning ? "bg-[#d29922]" : described.dot;
+  const githubSummary = github ? githubQueueSummary(github) : undefined;
+  const receivedAt = githubSummary ? githubSummary.updatedAt : updatedAt;
+  const githubStatus = connected && githubEnabled && githubAuthAvailable === true && githubSummary ? ` · ${githubSummary.text}` : "";
+  const githubFreshness = connected && githubEnabled && githubAuthAvailable === true && receivedAt !== undefined && receivedAt > 0
+    ? ` · ${selection === "both" ? "GitHub updated" : "PRs updated"} ${relativeTime(new Date(receivedAt).toISOString())}` : "";
+  const line = `${described.text}${githubStatus}${githubFreshness}${connected && selection !== "github" ? ` · ${gitlabSummary.text}` : ""}`;
+  const dot = connected && ((selection !== "github" && gitlabSummary.warning) || (githubEnabled && githubSummary?.warning)) ? "bg-[#d29922]" : described.dot;
   return (
     <>
       <button
@@ -125,7 +129,7 @@ export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, se
         className={BANNER_CLASS}
       >
         <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate">{line}</span>
+        <span title={connected && githubEnabled && githubAuthAvailable === true ? githubSummary?.explanation : undefined} className="min-w-0 flex-1 truncate">{line}</span>
         <span className="shrink-0 text-[#8b949e]">Pairing</span>
       </button>
       {/* Mounted only while open: Settings reads half a dozen

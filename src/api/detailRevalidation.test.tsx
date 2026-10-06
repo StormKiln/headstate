@@ -3,11 +3,13 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 import { PR_FIXTURES } from "../fixtures/prs";
+import targetedPublications from "../../src-tauri/tests/fixtures/targeted-fact-publications.json";
+import { assertRemoteReply } from "./wireContract";
 import type { PrDetail, PullRequest } from "../types/pr";
 const boundary = vi.hoisted(() => ({ invoke: vi.fn(), detail: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: boundary.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, cb: (event: { payload: unknown }) => void) => { boundary.listeners.set(name, cb); return () => boundary.listeners.delete(name); } }));
-import { detailNeedsRevalidation } from "./detailRevalidation";
+import { acceptDetailFacts, detailNeedsRevalidation } from "./detailRevalidation";
 import { usePrDetail, useReviewPr, useActOnPr } from "./hooks";
 import { useSourceRefresh, refreshWithState, readRetained, retireSourceOwnership } from "./sourceRefreshHooks";
 const row: PullRequest = { ...PR_FIXTURES[0], repo: "synthetic/project", number: 1, head_oid: "h1", base_ref: "main", merge_status: "clean", review: "none", ci: "success", latest_reviews: [], comment_count: 0, unresolved_threads: 0,
@@ -487,4 +489,118 @@ it("marks all inactive aliases stale without transport and consumes only the rev
   await waitFor(() => expect(detailNeedsRevalidation(qc, upperRepo, 1)).toBe(false));
   expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(true);
   expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
+});
+
+it.each(targetedPublications.terminal_details.map(detail => [detail.state, detail] as const))("consumes native removal emitted before the %s detail command returns without another read", async (_state, nativeDetail) => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  await inventory([]);
+  assertRemoteReply("get_pr_detail", nativeDetail);
+  await act(async () => finish(nativeDetail as PrDetail));
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(targetedPublications.terminal_details.map(detail => [detail.state, detail] as const))("consumes native removal delivered after the %s detail reply without another read", async (_state, nativeDetail) => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...nativeDetail, repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid } as PrDetail;
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(qc.getQueryData<PrDetail>(key)?.state).toBe(actual.state);
+  await inventory([]);
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(["positive-membership", "different-node", "different-head", "manual-cache", "new-session"])("does not suppress absence read after %s", async mode => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...targetedPublications.terminal_details[0], repo: row.repo, number: row.number, id: mode === "different-node" ? "OTHER_NODE" : row.id, head_oid: mode === "different-head" ? "other-head" : row.head_oid } as PrDetail;
+  await inventory([row]);
+  qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  if (mode === "manual-cache") qc.setQueryData(key, actual);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  if (mode === "positive-membership") await inventory([row]);
+  const source = mode === "new-session" ? { session: "new-session" } : {};
+  if (mode === "new-session") await inventory([row], "complete", source);
+  const before = boundary.detail.mock.calls.length;
+  await inventory([], "complete", source);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(boundary.detail).toHaveBeenCalledTimes(before + 1);
+});
+
+it("retires the successful terminal witness with its old account query", async () => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const actual = { ...targetedPublications.terminal_details[0], repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid } as PrDetail;
+  await inventory([row]); qc.removeQueries({ queryKey: key, exact: true });
+  boundary.detail.mockResolvedValue(actual);
+  const mounted = renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  await inventory([row], "complete", { owner: "other-viewer" });
+  expect(qc.getQueryData(key)).toBeUndefined();
+  mounted.unmount();
+  qc.setQueryData(["viewer"], "other-viewer");
+  qc.setQueryData(key, actual); // Display-only cache is not a successful read witness.
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  await act(async () => acceptDetailFacts(qc, { rows: [row], coverage: "complete", list: "reviewing", session: "new-owner-session" }));
+  const before = boundary.detail.mock.calls.length;
+  await act(async () => acceptDetailFacts(qc, { rows: [], coverage: "complete", list: "reviewing", session: "new-owner-session" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(boundary.detail).toHaveBeenCalledTimes(before + 1);
+});
+
+it.each([{ in_merge_queue: true }, { is_draft: true }, { review: "approved" as const }])("consumes its own fresh scalar publication before detail returns: %j", async patch => {
+  vi.useFakeTimers(); const { qc, wrapper } = setup();
+  await inventory([row]);
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  void qc.invalidateQueries({ queryKey: key, exact: true });
+  await act(async () => {});
+  await inventory([{ ...row, ...patch }]);
+  await act(async () => finish({ ...detail, ...patch }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it.each(["identity", "checks", "comments"])("does not let a matching scalar readback consume an overtaken %s target", async reason => {
+  const { qc, wrapper } = setup(); await inventory([{ ...row, observation: { ...row.observation!, detail_fields: ["comments"] } }]);
+  let finish!: (value: PrDetail) => void;
+  const next = { ...detail, in_merge_queue: true, ...(reason === "identity" ? { id: "replacement-node" } : {}) };
+  boundary.detail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue(next);
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  void qc.invalidateQueries({ queryKey: key, exact: true }); await act(async () => {});
+  const patch = reason === "identity" ? { id: "replacement-node" } : reason === "checks" ? { ci: "failure" as const } : { comment_count: 2, observation: { ...row.observation!, detail_fields: ["comments" as const] } };
+  await inventory([{ ...row, ...patch, in_merge_queue: true }]);
+  await act(async () => finish({ ...detail, in_merge_queue: true }));
+  await waitFor(() => expect(boundary.detail).toHaveBeenCalledTimes(2));
+  expect(qc.getQueryData<PrDetail>(key)?.id).toBe(next.id);
+});
+
+it("still revalidates a terminal detail when a positive source observes a reopened new head", async () => {
+  const { qc, wrapper } = setup();
+  const terminal = targetedPublications.terminal_details[0] as PrDetail;
+  qc.setQueryData(key, terminal);
+  boundary.detail.mockResolvedValue({ ...detail, state: "open", head_oid: "reopened-head" });
+  renderHook(() => usePrDetail(row.repo, 1), { wrapper });
+  expect(boundary.detail).not.toHaveBeenCalled();
+  await inventory([{ ...row, head_oid: "reopened-head" }]);
+  await waitFor(() => expect(qc.getQueryData<PrDetail>(key)?.state).toBe("open"));
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
 });

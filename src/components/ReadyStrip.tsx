@@ -193,7 +193,8 @@ export function ReadyObservationStatus({ pr, focusable }: { pr: PullRequest; foc
     const below = triggerRect.top - tooltipRect.height - 4 < 8;
     setPosition(current => ({ ...current, top: below ? triggerRect.bottom + 4 : triggerRect.top - 4, below }));
   }, [open, status?.explanation]);
-  if (!status) return null;
+  // The age chip already qualifies a retained ready-since date.
+  if (!status || status.label === "Ready date last known") return null;
   const descriptionId = observationDescriptionId(pr);
   const disclosureId = `${descriptionId}-disclosure`;
   const openDisclosure = () => {

@@ -21,12 +21,12 @@ export type SourceStatus = {
 export type RefreshReply = PullRequest[] | { request_id: string; update: SourceStatus };
 export type ProviderReceipt = { rows: PullRequest[]; session?: string; coverage?: SourceCoverage | null };
 type Request = { id: string; order: number; rows: number; status: number; completed: boolean; session: string | undefined };
-type Snapshot = { phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
+export type SourceRefreshSnapshot = { lastReceivedAt?: string; phase?: string; prs: PullRequest[] | undefined; error: string | null; modern: boolean; session?: string; coverage?: SourceCoverage | null; staleSecs?: number | null; fetchedAt?: string; savedOwner?: string };
 
 /// A qualifier for the accepted receipt, never for the most recent attempt.
 /// Missing counts and partial coverage without a positive measured gap use the
 /// generic warning; only a complete receipt can clear it with zero.
-export function receiptAdvisory(snapshot: Snapshot, kind: "total" | "missing"): number | null | undefined {
+export function receiptAdvisory(snapshot: SourceRefreshSnapshot, kind: "total" | "missing"): number | null | undefined {
   const { coverage, prs } = snapshot;
   if (coverage === undefined || prs === undefined) return undefined;
   if (coverage === "complete") return 0;
@@ -44,7 +44,7 @@ export class SourceRefreshState {
   private providerReceipt = false;
   private providerAt: string | undefined;
   private retired = false;
-  private value: Snapshot = { prs: undefined, error: null, modern: false };
+  private value: SourceRefreshSnapshot = { prs: undefined, error: null, modern: false };
   private phase: string | undefined;
   private backendError: string | null = null;
   private legacyStatusError = false;
@@ -72,7 +72,7 @@ export class SourceRefreshState {
   };
   private publish(prs = this.value.prs, fromProvider = false) {
     const providerAge = this.providerAt ? Math.max(0, Math.floor((Date.now() - Date.parse(this.providerAt)) / 1000)) : 0;
-    this.value = { phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
+    this.value = { lastReceivedAt: this.providerAt, phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
     for (const listener of this.listeners) listener();
     // Display patches and status-only publications are not provider evidence.
     // Deliver the accepted rows themselves, never a later patched snapshot.

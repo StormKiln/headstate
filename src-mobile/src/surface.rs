@@ -124,6 +124,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    ("disk_inventory_status", Class::Read),
+    ("disk_inventory_history", Class::Read),
+    ("disk_inventory_settings", Class::Read),
+    ("set_disk_inventory_settings", Class::Local),
+    ("start_disk_inventory", Class::Local),
+    ("cancel_disk_inventory", Class::Local),
     // Read: what a previous scan already found, so a cold start paints
     // rows instead of a blank page (#1152). Same class as the scan
     // above -- it returns the same information, just earlier -- and it

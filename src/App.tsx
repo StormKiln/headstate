@@ -886,7 +886,7 @@ export default function App() {
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
-      <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
+      <ConnectionBanner github={{ list: view === "to-review" ? "reviewing" : "authored", receipt: githubReceipt }} updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
       {sourceSelectionError ? <p role="alert" className="border-b border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">The source choice could not be saved: {sourceSelectionError}</p> : null}
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
@@ -1285,7 +1285,7 @@ export default function App() {
       </div>
       {/* Pinned below both the sidebar and the list, so it reads as the
           window's status rather than the list's. */}
-      <StatusBar updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
+      <StatusBar github={{ list: view === "to-review" ? "reviewing" : "authored", receipt: githubReceipt }} updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
     </div>
   );
 }

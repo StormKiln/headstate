@@ -22,6 +22,7 @@ import { useActOnPr, useActOnPrs, useReviewPr } from "./hooks";
 function readyRow(overrides: Partial<PullRequest> = {}): PullRequest {
   return {
     ...PR_FIXTURES[0],
+    id: "id",
     repo: "octocat/hello-world",
     number: 7,
     is_draft: false,
@@ -217,8 +218,8 @@ describe("a pull request whose enqueue GitHub refused stays in the list", () => 
   });
 
   it("does not drop the batch rows GitHub refused, only the ones it accepted", async () => {
-    const ok = readyRow({ number: 7 });
-    const refused = readyRow({ number: 8 });
+    const ok = readyRow({ id: "id7", number: 7 });
+    const refused = readyRow({ id: "id8", number: 8 });
     invoke.mockImplementation((cmd: string) => {
       if (cmd === "act_on_prs") {
         return Promise.resolve([
@@ -283,4 +284,38 @@ describe("merge and close still wait for GitHub", () => {
     await done;
     expect(reviewingRows(qc)).toEqual([before]);
   });
+});
+
+
+it("does not patch replacement ownership when an old action completes", async () => {
+  let acknowledge!: () => void;
+  invoke.mockImplementation(cmd => cmd === "act_on_pr" ? new Promise<void>(resolve => { acknowledge = resolve; }) : Promise.resolve([]));
+  const qc = seeded(readyRow({ id: "id" }));
+  const { result } = renderHook(() => useActOnPr(), { wrapper: wrap(qc) });
+  const done = result.current("id", "octocat/hello-world", 7, "enqueue");
+  qc.setQueryData(["viewer"], "replacement-owner");
+  qc.setQueryData(["reviewing"], [readyRow({ id: "id" })]);
+  acknowledge();
+  await done;
+  expect(reviewingRows(qc)[0].in_merge_queue).toBe(false);
+});
+
+it("waits for native inventory receipts instead of inventing a modern action patch", async () => {
+  invoke.mockImplementation(cmd => cmd === "act_on_pr" ? Promise.resolve({ inventory_managed: true }) : Promise.resolve([]));
+  const qc = seeded(readyRow({ id: "id" }));
+  const { result } = renderHook(() => useActOnPr(), { wrapper: wrap(qc) });
+  await result.current("id", "octocat/hello-world", 7, "enqueue");
+  expect(reviewingRows(qc)[0].in_merge_queue).toBe(false);
+});
+
+it("does not transplant a legacy action patch to a replacement head", async () => {
+  let acknowledge!: () => void;
+  invoke.mockImplementation(cmd => cmd === "act_on_pr" ? new Promise<void>(resolve => { acknowledge = resolve; }) : Promise.resolve([]));
+  const qc = seeded(readyRow({ id: "id", head_oid: "old-head" }));
+  const { result } = renderHook(() => useActOnPr(), { wrapper: wrap(qc) });
+  const done = result.current("id", "octocat/hello-world", 7, "enqueue");
+  qc.setQueryData(["reviewing"], [readyRow({ id: "id", head_oid: "new-head" })]);
+  acknowledge();
+  await done;
+  expect(reviewingRows(qc)[0]).toMatchObject({ head_oid: "new-head", in_merge_queue: false });
 });

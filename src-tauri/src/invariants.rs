@@ -5491,12 +5491,17 @@ let f = std::env::temp_dir;
     fn worktree_git_spawns_suppress_windows_consoles() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/worktrees");
         let mut checked = 0;
-        for file in rust_files(&root) {
+        for file in rust_files(&root)
+            .into_iter()
+            .chain([root.parent().unwrap().join("disk_inventory/process.rs")])
+        {
             let source = std::fs::read_to_string(&file).unwrap();
             // These functions contain statement-level cfg(test) overrides;
             // production() masks whole items and would cut off their bodies.
             for (name, body) in fn_bodies(&source) {
-                if !["git_output_with", "git_piped"].contains(&name.as_str()) {
+                if !["git_output_with", "git_piped"].contains(&name.as_str())
+                    && !(file.ends_with("disk_inventory/process.rs") && name == "read")
+                {
                     continue;
                 }
                 let code: String = body
@@ -5513,8 +5518,8 @@ let f = std::env::temp_dir;
             }
         }
         assert_eq!(
-            checked, 2,
-            "both worktree git spawn boundaries must be checked"
+            checked, 3,
+            "worktree and disk metadata spawn boundaries must be checked"
         );
     }
 }
