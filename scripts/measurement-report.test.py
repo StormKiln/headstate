@@ -133,6 +133,48 @@ class Contracts(unittest.TestCase):
     def test_unencodable_known_metadata_is_invalid_without_an_exception(self):
         h=header();h['build']='\ud800'
         self.assertEqual(self.run_report(report(h=h))['integrity'],'invalid')
+    def test_client_stats_populations_preserve_scope_and_unlinked_identity(self):
+        records=[]
+        for i,scope in enumerate([1,2,None]):
+            ev={'kind':'client','observation':{'kind':'stats_view','observation':'mounted','scope':dict(epoch=EPOCH,capture=1,id=scope) if scope else None,'outcome':'accepted','rows':[2,200,300][i]}}
+            r=envelope(ev);r['seq']=i+1;records.append(r)
+        out=self.run_report(report(records));g=out['captures'][0]
+        self.assertEqual(sorted(v['median'] for k,v in g['series'].items() if k.endswith(':rows')),[2,200,300])
+        self.assertEqual(len(g['client_populations']),3)
+        self.assertEqual([p['identity'] for p in g['client_populations']],['linked_scope','linked_scope','unlinked_mixed'])
+        self.assertNotEqual(g['client_populations'][0]['scope_ordinal'],g['client_populations'][1]['scope_ordinal'])
+        self.assertIn('client_identity_unavailable',out['issues']);self.assertNotIn(EPOCH,json.dumps(out))
+    def test_ready_closed_dimensions_never_silently_merge(self):
+        base={'kind':'mounted_review','source':'github','list':'reviewing','surface':'ready_panel','selection':'all_repositories','footer_location':'desktop_footer','footer':'checked','visible_count':130}
+        variants=[base,dict(base,selection='selected_scope'),dict(base,footer_location='phone_banner'),dict(base,source='gitlab'),dict(base,list='authored'),dict(base,surface='review_list')]
+        records=[]
+        for i,ev in enumerate(variants):
+            r=envelope({'kind':'client','observation':ev});r['seq']=i+1;records.append(r)
+        g=self.run_report(report(records))['captures'][0]
+        self.assertEqual(len(g['client_populations']),6)
+        self.assertTrue(all(p['identity']=='unlinked_mixed' for p in g['client_populations']))
+        self.assertEqual(len([k for k in g['series'] if k.endswith(':visible_count')]),6)
+    def test_client_scope_ordinals_are_capture_qualified_and_receipts_do_not_invent_scope(self):
+        records=[]
+        for i,(capture,provenance) in enumerate([(1,'readback'),(1,'mounted'),(2,'mounted')]):
+            r=envelope({'kind':'client','observation':{'kind':'stats_view','observation':provenance,'scope':dict(epoch=EPOCH,capture=capture,id=77),'outcome':'accepted','rows':2}});r.update(seq=i+1,capture=capture);records.append(r)
+        h=header(3);h['captures']=2
+        out=self.run_report(report(records,h));a,b=out['captures'];self.assertEqual(a['client_populations'][0]['scope_ordinal'],a['client_populations'][1]['scope_ordinal']);self.assertNotEqual(a['client_populations'][0]['scope_ordinal'],b['client_populations'][0]['scope_ordinal'])
+        records=[]
+        for i in range(2):
+            ev={'kind':'mounted_review','source':'github','list':'reviewing','surface':'ready_panel','selection':'selected_scope','footer_location':'desktop_footer','footer':'checked','receipt':dict(epoch=EPOCH,capture=1,id=i+1),'visible_count':i+1}
+            r=envelope({'kind':'client','observation':ev});r['seq']=i+1;records.append(r)
+        out=self.run_report(report(records));p=out['captures'][0]['client_populations'][0]
+        self.assertEqual(p['identity'],'unlinked_mixed');self.assertIsNone(p['scope_ordinal']);self.assertIn('client_identity_unavailable',out['issues'])
+    def test_client_population_and_scope_caps_qualify_omissions(self):
+        from unittest.mock import patch
+        records=[]
+        for i in range(2):
+            r=envelope({'kind':'client','observation':{'kind':'stats_view','scope':dict(epoch=EPOCH,capture=1,id=i+1),'outcome':'accepted','rows':i+1}});r['seq']=i+1;records.append(r)
+        for limit,issue in [('MAX_CLIENT_POPULATIONS','client_population_capacity'),('MAX_SCOPES','client_scope_capacity')]:
+            with patch.object(mod,limit,1):
+                out=self.run_report(report(records));self.assertIn(issue,out['issues']);self.assertEqual(out['records_omitted_by_analysis_capacity'],1)
+                self.assertEqual(len(out['captures'][0]['client_populations']),1)
     def test_large_file_and_record_budget_cannot_look_clean(self):
         from unittest.mock import patch
         with patch.object(mod,'MAX_FILE',1):self.assertEqual(self.run_report(report())['integrity'],'invalid')

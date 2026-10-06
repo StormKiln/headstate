@@ -18,6 +18,7 @@ MAX_RECORD = 1024
 MAX_RECORDS = 500000
 MAX_CAPTURES = 64
 MAX_SCOPES = 256
+MAX_CLIENT_POPULATIONS = 256
 MAX_SERIES = 256
 MAX_SAMPLES = 256
 DOMAINS = ['queue', 'stats', 'stop_failure', 'transcript', 'client', 'read_transport']
@@ -130,9 +131,41 @@ def distribution(values, missing, seen):
 
 class Analysis:
     def __init__(self):
-        self.issues=set();self.invalid=False;self.groups={};self.series_count=0;self.scope_count=0;self.domains=set();self.validated=0;self.body=0;self.skipped=0
+        self.issues=set();self.invalid=False;self.groups={};self.series_count=0;self.scope_count=0;self.client_population_count=0;self.domains=set();self.validated=0;self.body=0;self.skipped=0
     def issue(self, code, invalid=False):
         self.issues.add(code);self.invalid |= invalid
+    def client_population(self, group, event):
+        kind = event['kind']
+        dimensions = ('observation', 'outcome') if kind == 'stats_view' else (
+            'source', 'list', 'surface', 'selection', 'footer_location', 'footer')
+        scope = event.get('scope')
+        # Equality is used only within this already validated role/epoch/capture.
+        # Receipt identity is not a substitute for unavailable selected-scope identity.
+        scope_key = (kind, scope['id']) if scope else None
+        key = (kind, scope_key, tuple(event.get(field) for field in dimensions))
+        populations = group['client_populations']
+        if key in populations:
+            return populations[key]['ordinal']
+        if self.client_population_count >= MAX_CLIENT_POPULATIONS:
+            self.issue('client_population_capacity'); self.skipped += 1
+            return None
+        scope_ordinal = None
+        if scope_key is not None:
+            if scope_key not in group['client_scope_ordinals']:
+                if self.scope_count >= MAX_SCOPES:
+                    self.issue('client_scope_capacity'); self.skipped += 1
+                    return None
+                self.scope_count += 1
+                group['client_scope_ordinals'][scope_key] = self.scope_count
+            scope_ordinal = group['client_scope_ordinals'][scope_key]
+        else:
+            self.issue('client_identity_unavailable')
+        self.client_population_count += 1
+        populations[key] = dict(kind=kind, ordinal=self.client_population_count,
+            scope_ordinal=scope_ordinal, identity='linked_scope' if scope else 'unlinked_mixed',
+            dimensions={field:event.get(field) for field in dimensions})
+        return self.client_population_count
+
     def observe(self, r):
         self.validated+=1
         if any(t['epoch']!=r['epoch'] or t['capture']!=r['capture'] for t in tokens(r['event'])):
@@ -140,7 +173,7 @@ class Analysis:
         key=(r['role'],r['epoch'],r['capture'])
         if key not in self.groups:
             if len(self.groups)>=MAX_CAPTURES: self.skipped+=1;self.issue('capture_capacity');return
-            self.groups[key]={'role':r['role'],'capture_ordinal':len(self.groups)+1,'events':{},'series':{},'scopes':{},'aggregates':{},'last_seq':0,'last_mono':None,'records':0}
+            self.groups[key]={'role':r['role'],'capture_ordinal':len(self.groups)+1,'events':{},'series':{},'scopes':{},'client_populations':{},'client_scope_ordinals':{},'aggregates':{},'last_seq':0,'last_mono':None,'records':0}
         g=self.groups[key]
         if r['seq']<=g['last_seq']: self.issue('duplicate_or_out_of_order');return
         if g['last_seq'] and r['seq']>g['last_seq']+1:self.issue('sequence_gap')
@@ -153,6 +186,10 @@ class Analysis:
         label=kind+':'+str(e.get('observation') or e.get('operation_class') or e.get('phase') or e.get('metric') or 'unspecified')+':'+str(e.get('outcome') or e.get('footer') or e.get('capability') or 'observed')
         if kind=='operation':label += ':'+e['domain']+':'+e['stage']
         if kind=='queue_receipt':label += ':'+e['list']
+        if kind in ('stats_view','mounted_review'):
+            population = self.client_population(g, e)
+            if population is None:return
+            label += ':population_'+str(population)
         g['events'][label]=g['events'].get(label,0)+1
         for field in ('elapsed_ms','delta_ms','observed_lag_ms','hook_age_ms','rows','bytes','resident_rows','inventory_count','eligible_count','visible_count','visible_retained_count','visible_retained_readiness_count','visible_readiness_unknown_count','visible_last_known_count','visible_advisory_unavailable_count','affected_fields'):
             spec=CLIENTS.get(kind,EVENTS.get(kind,{}))
@@ -190,10 +227,10 @@ class Analysis:
     def output(self,h=None):
         captures=[]
         for (_,epoch,_),g in self.groups.items():
-            captures.append({k:v for k,v in g.items() if k not in ('series','scopes','last_seq','last_mono')})
-            captures[-1].update(series={k:distribution(*v) for k,v in g['series'].items()},scopes=list(g['scopes'].values()),build_attribution='exporter_header_only' if h and epoch==h['cutoff_epoch'] else 'unknown')
+            captures.append({k:v for k,v in g.items() if k not in ('series','scopes','client_populations','client_scope_ordinals','last_seq','last_mono')})
+            captures[-1].update(series={k:distribution(*v) for k,v in g['series'].items()},scopes=list(g['scopes'].values()),client_populations=list(g['client_populations'].values()),build_attribution='exporter_header_only' if h and epoch==h['cutoff_epoch'] else 'unknown')
             for a in captures[-1]['aggregates'].values():a.pop('last_end',None)
-        return {'integrity':'invalid' if self.invalid else 'valid','quality':'qualified' if self.issues else 'unqualified','field_acceptance':False,'issues':sorted(self.issues),'records_validated':self.validated,'records_omitted_by_analysis_capacity':self.skipped,'captures':captures,'unmeasured_domains':[d for d in DOMAINS if d not in self.domains], 'metadata_loss':h.get('loss') if h else None,'metadata_lifecycle':h.get('lifecycle') if h else None,'deferred_untimed_summaries':h.get('deferred',[]) if h else [],'omitted_prefix':h.get('omitted_prefix') if h else None,'export_range':{k:h[k] for k in ('oldest_wall_ms','newest_wall_ms','records')} if h else None,'method':'median is midpoint of central values; p95/p99 nearest-rank only at n>=20/100; bounded first256 samples per series; no cross-clock subtraction or inferred lineage','limits':{'file_bytes':MAX_FILE,'records':MAX_RECORDS,'captures':MAX_CAPTURES,'series':MAX_SERIES,'scopes':MAX_SCOPES,'samples_per_series':MAX_SAMPLES},'cautions':['Missing domains are unmeasured, not healthy.','Counters in export metadata are one cumulative snapshot, not per-capture loss.','Overlapping Ready qualifiers are not a partition.','StopFailure is sampled/censored; eviction units are retained hook/boundary entries, not lost records.','RAF is a scheduling proxy; native read and client await are separate populations.','No exact lineage or physical field acceptance is inferred.']}
+        return {'integrity':'invalid' if self.invalid else 'valid','quality':'qualified' if self.issues else 'unqualified','field_acceptance':False,'issues':sorted(self.issues),'records_validated':self.validated,'records_omitted_by_analysis_capacity':self.skipped,'captures':captures,'unmeasured_domains':[d for d in DOMAINS if d not in self.domains], 'metadata_loss':h.get('loss') if h else None,'metadata_lifecycle':h.get('lifecycle') if h else None,'deferred_untimed_summaries':h.get('deferred',[]) if h else [],'omitted_prefix':h.get('omitted_prefix') if h else None,'export_range':{k:h[k] for k in ('oldest_wall_ms','newest_wall_ms','records')} if h else None,'method':'median is midpoint of central values; p95/p99 nearest-rank only at n>=20/100; bounded first256 samples per series; no cross-clock subtraction or inferred lineage','limits':{'file_bytes':MAX_FILE,'records':MAX_RECORDS,'captures':MAX_CAPTURES,'series':MAX_SERIES,'scopes':MAX_SCOPES,'client_populations':MAX_CLIENT_POPULATIONS,'samples_per_series':MAX_SAMPLES},'cautions':['Missing domains are unmeasured, not healthy.','Counters in export metadata are one cumulative snapshot, not per-capture loss.','Overlapping Ready qualifiers are not a partition.','StopFailure is sampled/censored; eviction units are retained hook/boundary entries, not lost records.','RAF is a scheduling proxy; native read and client await are separate populations.','No exact lineage or physical field acceptance is inferred.']}
 
 def analyze(path):
     a=Analysis();h=None;trailer=None;total=0;oldest=None;newest=None;previous=None;epochs=0;captures=0
@@ -249,6 +286,7 @@ def main(argv):
         print('Qualifications:',', '.join(result['issues']) or 'none detected in exported structure')
         for group in result['captures']:
             print('\nCapture',group['capture_ordinal'],group['role'],'records',group['records'],'build',group['build_attribution'])
+            for population in group['client_populations']:print(' Client population',json.dumps(population,sort_keys=True))
             for category,n in sorted(group['events'].items()):print(' ',category,n)
             for name,v in sorted(group['series'].items()):print(' ',name,json.dumps(v,sort_keys=True))
             for scope in group['scopes']:print(' ',scope['kind'],'scope',scope['ordinal'],json.dumps(scope,sort_keys=True))

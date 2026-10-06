@@ -807,6 +807,32 @@ pub(crate) fn preserve_test_export(name: &str, path: &std::path::Path) {
     if let Ok(root) = std::env::var("HEADSTATE_MEASUREMENT_SMOKE") {
         let root = std::path::PathBuf::from(root);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::copy(path, root.join(format!("{name}.jsonl"))).unwrap();
+        preserve_test_export_to(&root, name, path).unwrap();
+    }
+}
+
+#[cfg(test)]
+fn preserve_test_export_to(
+    root: &std::path::Path,
+    name: &str,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let destination = root.join(format!("{name}.jsonl"));
+    let bytes = std::fs::read(path)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file.write_all(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(destination)? == bytes {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
     }
 }

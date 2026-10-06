@@ -1143,3 +1143,23 @@ async fn task6d_mounted_producers_export_smoke() {
     }
     assert!(r.status().durable_records > 0);
 }
+
+#[test]
+fn smoke_export_preserves_original_when_repeated_input_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::write(&source, b"original").unwrap();
+    preserve_test_export_to(dir.path(), "retained", &source).unwrap();
+    preserve_test_export_to(dir.path(), "retained", &source).unwrap();
+    std::fs::write(&source, b"different").unwrap();
+    assert_eq!(
+        preserve_test_export_to(dir.path(), "retained", &source)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("retained.jsonl")).unwrap(),
+        b"original"
+    );
+}
