@@ -71,3 +71,23 @@ it("publishes no capture on a failed save and fences late successful acknowledgm
  expect(qc.getQueryData(["ui-prefs"])).toEqual(initial);
  expect(seam.call.mock.calls).toHaveLength(4);qc.clear();
 });
+it.each(["success-first", "failure-first"] as const)("publishes the earlier successful preference save when the newer request fails (%s)",async order=>{
+ const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
+ const initial={hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true};
+ const saved={...initial,close_hides_to_tray:false};
+ qc.setQueryData(["ui-prefs"],initial);
+ const pending:Array<{resolve:(v:unknown)=>void,reject:(e:Error)=>void}>=[];
+ seam.call.mockImplementation((name)=>name==="set_ui_prefs"?new Promise((resolve,reject)=>pending.push({resolve,reject})):Promise.resolve(undefined));
+ const wrapper=({children}:{children:ReactNode})=><QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+ const prefs=renderHook(()=>useUiPrefs(),{wrapper});
+ let earlier!:Promise<void>,later!:Promise<void>;
+ act(()=>{earlier=prefs.result.current.set(saved);later=prefs.result.current.set({...saved,announce_updates:true});});
+ const succeed=async()=>act(async()=>{pending[0].resolve(capture);await earlier;});
+ const fail=async()=>act(async()=>{pending[1].reject(new Error("synthetic save refusal"));await expect(later).rejects.toThrow("synthetic save refusal");});
+ if(order==="success-first"){await succeed();await fail();}else{await fail();await succeed();}
+ expect(qc.getQueryData(["ui-prefs"])).toEqual(saved);
+ await waitFor(()=>expect(prefs.result.current.prefs).toEqual(saved));
+ // Product success is publishable even though native capture order remains unproven.
+ expect(qc.getQueryData(["measurement-capture"])).toBeNull();
+ expect(seam.call.mock.calls).toHaveLength(2);qc.clear();
+});

@@ -4502,6 +4502,9 @@ export function useBackgroundPanicked(): boolean {
   return query.data === true;
 }
 
+// Product publication follows successful writes, not merely requested writes.
+// One high-water mark per client: failures require no retained request history.
+const uiPrefsSuccessfulWrites = new WeakMap<QueryClient, number>();
 export function useUiPrefs() {
   const qc = useQueryClient();
   const query = useQuery({
@@ -4512,9 +4515,12 @@ export function useUiPrefs() {
   const set = (prefs: UiPrefs) => {
     const serial = beginCaptureWrite(qc);
     return setUiPrefs(prefs, true).then(capture => {
-      const latest = acceptCaptureWrite(qc, serial, IS_MOBILE_BUILD ? null : capture);
+      acceptCaptureWrite(qc, serial, IS_MOBILE_BUILD ? null : capture);
       invalidateSourceMeasurements(qc);
-      if (latest) qc.setQueryData(["ui-prefs"], prefs);
+      if (serial > (uiPrefsSuccessfulWrites.get(qc) ?? 0)) {
+        uiPrefsSuccessfulWrites.set(qc, serial);
+        qc.setQueryData(["ui-prefs"], prefs);
+      }
     });
   };
   return { prefs: query.data, set };
