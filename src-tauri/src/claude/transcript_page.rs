@@ -1692,7 +1692,7 @@ mod tests {
         assert_eq!(actual.page.messages, off.page.messages);
         let output = root.join("report.jsonl");
         recorder.export_to(output.clone()).await.unwrap();
-        crate::measurement::preserve_test_export("transcript-native", &output);
+        crate::tests::preserve_test_export("transcript-native", &output);
         let text = std::fs::read_to_string(output).unwrap();
         let records: Vec<serde_json::Value> = text
             .lines()

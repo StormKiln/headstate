@@ -1209,6 +1209,15 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// Desktop producer-test artifacts only; the companion shares the core, not these producers.
+    pub(crate) fn preserve_test_export(name: &str, path: &std::path::Path) {
+        if let Ok(root) = std::env::var("HEADSTATE_MEASUREMENT_SMOKE") {
+            let root = std::path::PathBuf::from(root);
+            std::fs::create_dir_all(&root).unwrap();
+            measurement::preserve_test_export_to(&root, name, path).unwrap();
+        }
+    }
+
     /// This is the bug Task 10 left behind: the `Arc<AtomicBool>` given to
     /// `poll::spawn` was never retained anywhere else, so nothing could
     /// ever flip it and the background 300s cadence was unreachable at

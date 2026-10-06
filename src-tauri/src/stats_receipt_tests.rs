@@ -2037,7 +2037,7 @@ async fn cached_board_reads_staged_rows_without_http_or_registration_and_fences_
     );
     let exported = journal.path().canonicalize().unwrap().join("report.jsonl");
     recorder.export_to(exported.clone()).await.unwrap();
-    crate::measurement::preserve_test_export("stats-cache-only", &exported);
+    crate::tests::preserve_test_export("stats-cache-only", &exported);
     let events = std::fs::read_to_string(exported).unwrap();
     assert!(
         events.contains("\"kind\":\"stats_progress\""),

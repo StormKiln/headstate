@@ -791,7 +791,7 @@ mod tests {
             assemble_measured(&idle, &registry, &failures, now(), Some(&r));
             let path = root.join("report");
             r.export_to(path.clone()).await.unwrap();
-            crate::measurement::preserve_test_export(
+            crate::tests::preserve_test_export(
                 if hook_first {
                     "hook-valid-first"
                 } else {
@@ -858,7 +858,7 @@ mod tests {
             assemble_measured(&idle, &registry, &failures, now(), Some(&r));
             let path = root.join("report");
             r.export_to(path.clone()).await.unwrap();
-            crate::measurement::preserve_test_export(
+            crate::tests::preserve_test_export(
                 if hook_first {
                     "hook-missing-first"
                 } else {
