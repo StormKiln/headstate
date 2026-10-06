@@ -58,7 +58,9 @@ async fn private_keys_never_leave_memory_and_disabled_retained_export_is_complet
     let (dir, r, _) = fixture(Caps::default());
     r.set_enabled(true);
     let id = r
-        .intern(Key::Owner("PRIVATE_OWNER/repo#12345 secret"))
+        .intern(Key::Owner(
+            "octocat/hello-world#12345 SYNTHETIC_KEY_SENTINEL",
+        ))
         .unwrap();
     assert!(Recorder::record(&r, event(&id, 1)));
     assert!(!Recorder::record(&r, event(&id, 1)));
@@ -68,8 +70,8 @@ async fn private_keys_never_leave_memory_and_disabled_retained_export_is_complet
     assert_eq!(receipt.records, 1);
     assert!(!receipt.incomplete);
     let text = std::fs::read_to_string(path).unwrap();
-    assert!(!text.contains("PRIVATE_OWNER"));
-    assert!(!text.contains("repo#12345"));
+    assert!(!text.contains("SYNTHETIC_KEY_SENTINEL"));
+    assert!(!text.contains("octocat/hello-world#12345"));
     let records: Vec<serde_json::Value> = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -163,6 +165,12 @@ async fn rotation_restart_and_malformed_tail_are_qualified_without_copying_priva
     for n in 0..8 {
         assert!(Recorder::record(&r, event(&owner, n)));
     }
+    // This fixture checks rotation contents, not storage throughput under the
+    // production export deadline. Deadline/cancellation have separate controls.
+    assert!(
+        flush_fixture(&r, std::time::Duration::from_secs(30)).await,
+        "rotation fixture writer did not flush its accepted cutoff within 30s"
+    );
     let path = dir.path().canonicalize().unwrap().join("report.jsonl");
     let result = r.export_to(path.clone()).await.unwrap();
     assert!(result.records < 8);
@@ -846,4 +854,69 @@ fn legacy_five_domain_loss_remains_readable_after_shared_transport_classificatio
     assert!(
         serde_json::from_value::<Loss>(serde_json::json!({"by_domain":[0,0,0,0,0,0,0]})).is_err()
     );
+}
+
+async fn completion_allows_immediate_export(destination_refused: bool) {
+    let (dir, r, _) = fixture(Caps::default());
+    r.set_enabled(true);
+    let owner = r.intern(Key::Owner("a")).unwrap();
+    assert!(Recorder::record(&r, event(&owner, 1)));
+    let root = dir.path().canonicalize().unwrap();
+    let destination = root.join("first");
+    if destination_refused {
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("keep"), "keep").unwrap();
+    }
+    let (release, gate) = std::sync::mpsc::channel();
+    *r.shared.export_reply_gate.lock().unwrap() = Some(gate);
+    let first = r.export_to(destination.clone()).await;
+    let second = r.export_to(root.join("second"));
+    tokio::pin!(second);
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx))).await;
+    // Always release before assertions/drop, including the intentional RED path.
+    let released = release.send(());
+    assert!(
+        matches!(polled, std::task::Poll::Pending),
+        "completed export retained admission: {polled:?}"
+    );
+    released.unwrap();
+    if destination_refused {
+        assert_eq!(first.unwrap_err(), ExportError::Destination);
+        assert_eq!(
+            std::fs::read_to_string(destination.join("keep")).unwrap(),
+            "keep"
+        );
+    } else {
+        assert_eq!(first.unwrap().records, 1);
+    }
+    assert_eq!(second.await.unwrap().records, 1);
+}
+#[tokio::test]
+async fn ci_export_success_releases_admission_before_reply() {
+    completion_allows_immediate_export(false).await;
+}
+#[tokio::test]
+async fn ci_export_refusal_releases_admission_before_reply() {
+    completion_allows_immediate_export(true).await;
+}
+
+async fn flush_fixture(r: &Recorder, bound: std::time::Duration) -> bool {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let cutoff = r.state.lock().unwrap().seq;
+    if r.control
+        .try_send(writer::Control::FlushAcknowledged { cutoff, reply })
+        .is_err()
+    {
+        return false;
+    }
+    matches!(tokio::time::timeout(bound, receive).await, Ok(Ok(true)))
+}
+#[tokio::test]
+async fn ci_stalled_fixture_flush_is_bounded_and_does_not_claim_readiness() {
+    let (_dir, r, _) = fixture(Caps::default());
+    let release = pause(&r);
+    let flushed = flush_fixture(&r, std::time::Duration::from_millis(20)).await;
+    release.send(()).unwrap();
+    assert!(!flushed);
+    assert!(flush_fixture(&r, std::time::Duration::from_secs(2)).await);
 }

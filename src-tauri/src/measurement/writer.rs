@@ -13,6 +13,11 @@ pub(super) enum Control {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     },
+    #[cfg(test)]
+    FlushAcknowledged {
+        cutoff: u64,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     Flush {
         cutoff: u64,
     },
@@ -390,6 +395,14 @@ impl Writer {
                     let _ = entered.send(());
                     let _ = release.recv();
                 }
+                #[cfg(test)]
+                Ok(Control::FlushAcknowledged { cutoff, reply }) => {
+                    let success = self.through(cutoff, &data, &mut pending).is_ok();
+                    if !success {
+                        self.fail();
+                    }
+                    let _ = reply.send(success);
+                }
                 Ok(Control::Flush { cutoff }) => {
                     if self.through(cutoff, &data, &mut pending).is_err() {
                         self.fail();
@@ -426,8 +439,13 @@ impl Writer {
                             &cancel,
                         )
                     };
-                    let _ = reply.send(result);
+                    // Completion must release admission before waking the caller.
                     self.shared.exporting.store(false, Ordering::Release);
+                    let _ = reply.send(result);
+                    #[cfg(test)]
+                    if let Some(gate) = self.shared.export_reply_gate.lock().unwrap().take() {
+                        let _ = gate.recv_timeout(Duration::from_secs(2));
+                    }
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => break,

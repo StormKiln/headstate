@@ -148,6 +148,8 @@ struct Shared {
     unavailable: AtomicBool,
     stopping: AtomicBool,
     exporting: AtomicBool,
+    #[cfg(test)]
+    export_reply_gate: Mutex<Option<mpsc::Receiver<()>>>,
     status: Mutex<JournalStatus>,
     loss: Mutex<Loss>,
     lifecycle: Mutex<Lifecycle>,
@@ -187,6 +189,8 @@ impl Recorder {
             unavailable: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             exporting: AtomicBool::new(false),
+            #[cfg(test)]
+            export_reply_gate: Mutex::new(None),
             status: Mutex::new(JournalStatus::default()),
             loss: Mutex::new(Loss::default()),
             lifecycle: Mutex::new(Lifecycle::default()),
