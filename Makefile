@@ -233,9 +233,7 @@ deny:
 # the point, since a local run that differed would not reproduce what CI
 # saw.
 test-race:
-	cd src-tauri && for i in 1 2 3; do \
-		cargo test --lib -- --test-threads=8 || { echo "FAILED ON ITERATION $$i"; exit 1; }; \
-	done
+	python3 scripts/test-rust-ci.py race
 
 # Mutation testing, ONE MODULE AT A TIME and never in CI (#893).
 #
@@ -394,6 +392,7 @@ lint-deps:
 	# worse than the bug.
 	python3 scripts/install-dependencies.test.py
 	python3 scripts/ci-command.test.py
+	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
