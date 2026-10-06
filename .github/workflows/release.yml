@@ -144,10 +144,13 @@ jobs:
 
   build:
     needs: gate
-    # Up to ~20m measured for a signed, notarized macOS bundle; 60 leaves
-    # room for a slow notarization queue without ever sitting for six
-    # hours (#885).
-    timeout-minutes: 60
+    # Windows and Linux retain their 60m ceiling. macOS gets 90m because
+    # packaging performs two sequential Apple waits: v9.2.0 reached the DMG
+    # wait at roughly 54m after the app notarization was accepted. The
+    # existing 30m DMG wait plus verification/upload margin therefore fits
+    # 90m, while 60m canceled it after about 7m (#1742). This remains finite;
+    # unusually long Apple processing can still time out without a retry.
+    timeout-minutes: ${{ matrix.timeout-minutes }}
     # Builds and uploads artifacts for `publish` to collect. It creates
     # nothing in the repository, so it does not need write (#886).
     permissions:
@@ -162,12 +165,15 @@ jobs:
           - os: macos-latest
             target: universal-apple-darwin
             bundles: app,dmg
+            timeout-minutes: 90
           - os: windows-latest
             target: ""
             bundles: nsis
+            timeout-minutes: 60
           - os: ubuntu-latest
             target: ""
             bundles: deb,appimage
+            timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     # Hoisted to job level so the signing step's `if:` can test a plain env
     # var. A step-level `if: secrets.X != ''` is not reliably evaluatable --
