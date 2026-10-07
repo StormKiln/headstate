@@ -15,6 +15,7 @@ vi.mock("../api/hooks", async original => ({ ...await original<object>(),
 }));
 import { useSourceRefresh } from "@/api/sourceRefreshHooks";
 import { PrDetailView } from "./PrDetailView";
+import { useReadyStacks } from "@/api/useReadyStacks";
 function Selected() { useSourceRefresh("reviewing"); return <PrDetailView repo="octocat/repo-1" number={1} onBack={() => {}} />; }
 const clients: QueryClient[] = [];
 afterEach(() => { cleanup(); clients.splice(0).forEach(qc => qc.clear()); vi.clearAllMocks(); boundary.listener = undefined; stubViewport(null); });
@@ -111,4 +112,43 @@ it.each([false, true])("Refresh recovers stack evidence without a background tic
   expect(lines.some(line => line.startsWith("detail actions ") && line.includes("merge=clean stack=none") && line.includes(`approved=${approve}`))).toBe(true);
   expect(lines.filter(line => line.startsWith("detail actions ")).join("\n")).not.toMatch(/octocat|synthetic|head-1|PR_1/);
   expect(boundary.invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(readsBeforeRefresh + 1);
+});
+
+
+it.each([false, true])("recovers selected approval and the actual action beside 150 budget-refused strip rows (queue: %s)", async queued => {
+  stubViewport(1200);
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }); clients.push(qc);
+  qc.setQueryData(["viewer"], "synthetic-viewer");
+  const subject = { ...detail(), merge_queue_enabled: queued };
+  qc.setQueryData(["pr-detail", subject.repo, 1], subject);
+  const rows = Array.from({ length: 150 }, (_, i) => ({ ...subject, repo: `octocat/repo-${i + 1}`, number: i + 1, head_oid: `head-${i + 1}` }));
+  function Strip() { useReadyStacks(rows); return null; }
+  let writes = 0;
+  let selected = 0;
+  let strips = 0;
+  boundary.invoke.mockImplementation(async (name: string, args: Record<string, unknown>) => {
+    if (name === "get_ready_stacks") {
+      if (args.selected === true) selected++; else strips++;
+      return (args.rows as object[]).map(row => ({ ...row, stack: { kind: args.selected ? "none" : "unknown" }, valid_for_ms: args.selected ? 60_000 : 5_000 }));
+    }
+    if (name === "get_review_gates") return { rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false }, last_pusher: { state: "not_needed" }, rules_valid_for_ms: 600000 };
+    if (name === "get_pr_detail") return { ...subject, body: "Accepted full readback" };
+    if (name === "review_pr_at_head") {
+      writes++;
+      return { outcome: "acknowledged", receipt: { review_id: "review-1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "head-1", submitted_at: new Date().toISOString(), pr_id: "PR_1", repo: subject.repo, number: 1 } };
+    }
+    return undefined;
+  });
+  const view = render(<QueryClientProvider client={qc}><Strip /></QueryClientProvider>);
+  await waitFor(() => expect(strips).toBeGreaterThan(0));
+  view.rerender(<QueryClientProvider client={qc}><Strip /><Selected /></QueryClientProvider>);
+  await waitFor(() => expect(selected).toBe(1));
+  fireEvent.click(screen.getAllByRole("button", { name: "Approve" })[0]);
+  await screen.findByText("Accepted full readback");
+  await screen.findAllByRole("button", { name: "Approved" });
+  const label = queued ? "Add to merge queue" : "Merge";
+  await waitFor(() => expect(screen.getAllByRole("button", { name: label }).every(button => !button.matches(":disabled"))).toBe(true));
+  expect(writes).toBe(1); expect(selected).toBe(1);
+  expect(boundary.invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(1);
+  expect(strips).toBeLessThanOrEqual(16);
 });

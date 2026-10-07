@@ -565,3 +565,81 @@ it("preserves a thread draft across a new head but isolates a known account chan
   fireEvent.click(screen.getByRole("button", { name: /synthetic.ts/ }));
   expect((screen.getByRole("textbox", { name: /Reply to the conversation/ }) as HTMLTextAreaElement).value).toBe("");
 });
+
+it.each(["manual", "automatic"])("distinguishes acknowledged approval recovery from provider computation and recovers by %s refresh", async recovery => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const base = invoke.getMockImplementation()!;
+  let rejectRead!: (error: Error) => void;
+  let postReview = false;
+  let response: "pending" | "unknown" | "clean" = "pending";
+  let detailReads = 0;
+  invoke.mockImplementation((name, args) => {
+    if (name === "review_pr_at_head") {
+      postReview = true;
+      return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "R-ack", state: "APPROVED", actor: "reviewer", commit_oid: "head-7", submitted_at: new Date().toISOString(), pr_id: "PR_7", repo: "octocat/hello-world", number: 7 } });
+    }
+    if (name === "get_pr_detail") {
+      detailReads++;
+      if (postReview && response === "pending") return new Promise((_yes, no) => { rejectRead = no; });
+      return Promise.resolve({ ...detail(7, postReview ? response as "unknown" | "clean" : "blocked"), body: disclosureBody });
+    }
+    return base(name, args);
+  });
+  const view = mount(); await screen.findByText("Synthetic check 7");
+  const disclosure = view.container.querySelector("details")!; disclosure.open = true;
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "Keep this draft" } });
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(rejectRead).toBeDefined());
+  expect(await screen.findByText(/Refreshing merge readiness…/)).toBeTruthy();
+  expect(screen.queryByText(/GitHub is still checking/)).toBeNull();
+  expect(screen.getAllByRole("button", { name: "Merge" }).every(button => button.matches(":disabled"))).toBe(true);
+  await act(async () => rejectRead(new Error("Synthetic provider cooldown is active")));
+  await screen.findByRole("alert");
+  expect(screen.getByText("Approval saved. Merge readiness could not be refreshed.")).toBeTruthy();
+  expect(screen.queryByText(/GitHub is still checking/)).toBeNull();
+  expect(qc.getQueryData<PrDetail>(key)?.latest_reviews).toContainEqual(expect.objectContaining({ id: "R-ack" }));
+  expect(view.container.querySelector("details")).toBe(disclosure); expect(disclosure.open).toBe(true);
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("Keep this draft");
+  expect(screen.getByRole("link", { name: /^github$/i })).toBeTruthy();
+  response = "unknown";
+  if (recovery === "manual") fireEvent.click(screen.getByRole("button", { name: /retry refresh/i }));
+  else await act(async () => { await vi.advanceTimersByTimeAsync(3_100); });
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(await screen.findByText(/GitHub is still checking mergeability\./)).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: "Merge" }).every(button => button.matches(":disabled"))).toBe(true);
+  response = "clean";
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "Merge" }).every(button => !button.matches(":disabled"))).toBe(true));
+  expect(detailReads).toBe(4);
+  expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
+});
+
+it.each(["head", "base"] as const)("never enables Merge from a clean approval read overtaken by a newer source %s", async field => {
+  const { acceptDetailFacts } = await import("@/api/detailRevalidation");
+  const base = invoke.getMockImplementation()!;
+  const initial = detail(7, "blocked");
+  const newer = { ...detail(), ...(field === "head" ? { head_oid: "head-new" } : { base_ref: "release" }) };
+  let afterApproval = false;
+  const pending: ((pr: PrDetail) => void)[] = [];
+  invoke.mockImplementation((name, args) => {
+    if (name === "review_pr_at_head") {
+      afterApproval = true;
+      return Promise.resolve({ outcome: "acknowledged", receipt: { review_id: "R-ack", state: "APPROVED", actor: "reviewer", commit_oid: "head-7", submitted_at: new Date().toISOString(), pr_id: "PR_7", repo: "octocat/hello-world", number: 7 } });
+    }
+    if (name === "get_pr_detail") return afterApproval ? new Promise(resolve => pending.push(resolve)) : Promise.resolve(initial);
+    return base(name, args);
+  });
+  mount(); await loaded();
+  const publish = (pr: PrDetail) => acceptDetailFacts(qc, { list: "reviewing", rows: [{ ...pr, observation: { state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [], detail_fields: ["base"] } } as unknown as PullRequest], coverage: "complete" });
+  act(() => publish(initial));
+  fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
+  await waitFor(() => expect(pending).toHaveLength(1));
+  act(() => publish(newer));
+  await act(async () => pending[0](detail()));
+  await waitFor(() => expect(pending).toHaveLength(2));
+  expect(qc.getQueryData<PrDetail>(key)?.merge_status).toBe("clean");
+  expect(screen.getAllByRole("button", { name: "Merge" }).every(button => button.matches(":disabled"))).toBe(true);
+  await act(async () => pending[1](newer));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "Merge" }).every(button => !button.matches(":disabled"))).toBe(true));
+  expect(pending).toHaveLength(2);
+});

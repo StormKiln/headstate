@@ -121,5 +121,5 @@ it("does not queue a standalone PR while mergeability is being checked", () => {
   render(<PrActions pr={pr({ stack: { kind: "none" }, merge_status: "unknown" })} />);
   const button = screen.getByRole("button", { name: "Add to merge queue" }) as HTMLButtonElement;
   expect(button.disabled).toBe(true);
-  expect(button.title).toMatch(/checking/i);
+  expect(button.title).toMatch(/readiness is unavailable/i);
 });

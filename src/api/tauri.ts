@@ -2295,8 +2295,8 @@ export const gitLabAction = (request: import("../types/gitlabActions").GitLabAct
 
 /// Bounded metadata-only stack lookups for Ready rows (#1602).
 export type StackAsk = PrIdentity & { head_oid?: string; base_ref?: string };
-export const getReadyStacks = (rows: StackAsk[]) =>
-  call<(PrIdentity & { advisory_progress?: import("../types/pr").AdvisoryProgress; stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number; last_known_stack?: { value: PrStack; age_ms: number } })[]>("get_ready_stacks", { rows });
+export const getReadyStacks = (rows: StackAsk[], selected = false) =>
+  call<(PrIdentity & { advisory_progress?: import("../types/pr").AdvisoryProgress; stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number; last_known_stack?: { value: PrStack; age_ms: number } })[]>("get_ready_stacks", { rows, ...(selected ? { selected: true } : {}) });
 
 /** Desktop notification clicks wait here until the app shell mounts. */
 export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");

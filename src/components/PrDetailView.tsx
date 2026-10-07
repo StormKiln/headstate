@@ -239,6 +239,7 @@ export function PrDetailView({
     isLoading,
     isPlaceholderData,
     isFetching,
+    mergeEvidence,
     isError,
     error,
     refetch,
@@ -301,7 +302,7 @@ export function PrDetailView({
     pr?.latest_reviews?.some((r) => r.author === viewer && r.state === "APPROVED") === true;
 
   useDetailActionsDiag({
-    merge: pr?.merge_status, stack: pr?.stack?.kind, operation: operation?.state,
+    merge: pr?.merge_status, mergeEvidence, stack: pr?.stack?.kind, operation: operation?.state,
     approved: approvedByViewer, reviewBlocked, detailError: isError,
     detailFetching: isFetching, gatesFetching: gateQuery.isFetching, stackFetching: ancestry.isFetching,
   });
@@ -464,7 +465,7 @@ export function PrDetailView({
           Won't count toward merging
         </span>
       ) : null}
-      {!isError && <PrActions pr={pr} requireStackEvidence compact conversations={gate.mergeBlocked} />}
+      {!isError && <PrActions pr={pr} mergeEvidence={mergeEvidence} requireStackEvidence compact conversations={gate.mergeBlocked} />}
       {/* Claudify (#1455), which replaced "Copy for agent", pinned here
           since #1580: it sat at the very bottom, below every comment,
           so reaching it on a long pull request meant scrolling the whole
@@ -487,7 +488,7 @@ export function PrDetailView({
     // it still spans the panel.
     <div key={readingIdentity} className="mx-auto flex max-w-4xl flex-col gap-3">
       {isError ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
-        <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
+        <p className="font-medium">{approvedByViewer && operation?.state === "acknowledged" ? "Approval saved. Merge readiness could not be refreshed." : "Could not refresh this pull request. Showing previously loaded details."}</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
         <p>Reviews use the loaded commit shown here. Refresh before merging or other actions, or open GitHub for the current state.</p>
         <button type="button" disabled={isFetching || gateQuery.isFetching || ancestry.isFetching} onClick={() => void refreshDetail()}
@@ -639,7 +640,7 @@ export function PrDetailView({
         </p>
       </div>
 
-      {!isError && <PrActions pr={pr} requireStackEvidence conversations={gate.mergeBlocked} />}
+      {!isError && <PrActions pr={pr} mergeEvidence={mergeEvidence} requireStackEvidence conversations={gate.mergeBlocked} />}
 
       {operation?.state === "unresolved" ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
         <p>{operation.message}</p>

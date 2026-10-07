@@ -9227,10 +9227,50 @@ prunable gitdir file points to non-existent location
         fn a_git_call_past_its_budget_is_killed_with_what_it_started() {
             let tmp = tempfile::TempDir::new().unwrap();
             let (script, pids) = hanging_git(tmp.path());
+            // Reproduce startup slower than the tested 300ms budget (#1748).
+            // Readiness, not scheduler speed, decides when that budget starts.
+            let delayed = std::fs::read_to_string(&script).unwrap().replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nsleep 1\n",
+                1,
+            );
+            std::fs::write(&script, delayed).unwrap();
+            let mut cmd = Command::new(&script);
+            cmd.arg("-C")
+                .arg(tmp.path())
+                .arg("status")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            let mut child = cmd.spawn().unwrap();
+            let setup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let seen = loop {
+                let seen = recorded(&pids);
+                if seen.len() == 2 && seen.iter().all(|pid| alive(*pid)) {
+                    break seen;
+                }
+                if std::time::Instant::now() >= setup_deadline {
+                    // A failed fixture must also leave no processes behind.
+                    super::super::kill_group(&mut child);
+                    panic!("git and its child did not become ready: {seen:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert_eq!(seen[0], child.id() as i32, "the recorded parent is our git");
+            assert_ne!(seen[0], seen[1], "the child is a separate process");
+
             let started = std::time::Instant::now();
             let deadline = started + std::time::Duration::from_millis(300);
             let (out, report) = super::super::budget::with(deadline, 100, || {
-                super::super::git_output_with(&script, tmp.path(), &["status"])
+                let limit = match super::super::budget::admit() {
+                    Ok(limit) => limit,
+                    Err(err) => {
+                        super::super::kill_group(&mut child);
+                        panic!("the ready fixture must enter the production wait: {err}");
+                    }
+                };
+                // Exercise the production timeout and group cleanup after setup.
+                super::super::wait_bounded(child, limit)
             });
             let took = started.elapsed();
 
@@ -9241,12 +9281,47 @@ prunable gitdir file points to non-existent location
                 took < std::time::Duration::from_secs(5),
                 "the call must end at its deadline, not at GIT_TIMEOUT: {took:?}"
             );
-            let seen = recorded(&pids);
             assert_eq!(seen.len(), 2, "git and the child it started: {seen:?}");
             let live = all_gone_within(&seen, std::time::Duration::from_secs(3));
             assert!(
                 live.is_empty(),
                 "no git may outlive its budget, nor anything it started: {live:?} still running"
+            );
+        }
+
+        /// Keep coverage of the launcher's wiring: the ready-process test
+        /// above calls `wait_bounded` directly so startup cannot spend its budget.
+        #[cfg(unix)]
+        #[test]
+        fn git_output_with_wires_the_process_group_and_budget_into_its_wait() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (script, _) = hanging_git(tmp.path());
+            std::fs::write(&script, "#!/bin/sh\nkill -0 -$$\n").unwrap();
+            let output = super::super::git_output_with(&script, tmp.path(), &["status"])
+                .expect("the group probe must finish");
+            assert!(
+                output.status.success(),
+                "git must lead an isolated group (kill -0 only probes existence): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_millis(300);
+            let (out, report) = super::super::budget::with(deadline, 100, || {
+                super::super::git_output_with(&script, tmp.path(), &["status"])
+            });
+            let took = started.elapsed();
+            let err = out.expect_err("the public path must time out its hanging call");
+            assert!(err.contains("time budget"), "{err}");
+            assert_eq!(
+                report.calls, 1,
+                "the call was admitted, not refused before spawn"
+            );
+            assert_eq!(report.spent, Some(super::super::budget::Spent::Time));
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "the launcher must pass the budget to its wait: {took:?}"
             );
         }
 

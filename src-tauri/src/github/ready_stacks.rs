@@ -50,13 +50,43 @@ pub async fn ready_stacks(
     client: &GitHubClient,
     rows: Vec<StackAsk>,
 ) -> Result<Vec<RowStack>, String> {
+    ready_stacks_with_demand(client, rows, false).await
+}
+
+/// Only the selected action prerequisite may use foreground admission. Keep
+/// one exact subject and eight actual attempts (including retries), with the
+/// same ten-second deadline, cache slots, continuations and account semaphore.
+pub async fn ready_stacks_with_demand(
+    client: &GitHubClient,
+    rows: Vec<StackAsk>,
+    selected: bool,
+) -> Result<Vec<RowStack>, String> {
+    if selected
+        && (rows.len() != 1
+            || rows.iter().any(|row| {
+                row.head_oid.as_ref().is_none_or(|head| head.is_empty())
+                    || row.base_ref.as_ref().is_none_or(|base| base.is_empty())
+            }))
+    {
+        return Err("Selected stack metadata requires one exact head and base".into());
+    }
     if rows.len() > 8 {
         return Err("Stack metadata accepts at most 8 pull requests per batch".into());
     }
     let client = client.with_read_context(super::admission::ReadContext::new(
-        super::admission::ReadClass::Advisory,
+        if selected {
+            super::admission::ReadClass::Foreground
+        } else {
+            super::admission::ReadClass::Advisory
+        },
         Duration::from_secs(10),
     ));
+    let client = if selected {
+        client.with_attempt_limit(8)
+    } else {
+        client
+    };
+    check_principal(&client)?;
     let mut seen = HashSet::new();
     let rows: Vec<_> = rows
         .into_iter()
@@ -181,7 +211,15 @@ pub async fn ready_stacks(
             },
         });
     }
+    check_principal(&client)?;
     Ok(out)
+}
+
+fn check_principal(client: &GitHubClient) -> Result<(), String> {
+    if let Some(caller) = client.read_context().advisory_context.as_ref() {
+        drop(caller.guard()?);
+    }
+    Ok(())
 }
 
 async fn lookup(client: &GitHubClient, ask: &StackAsk) -> (PrStack, Option<u64>) {
@@ -214,13 +252,17 @@ async fn lookup(client: &GitHubClient, ask: &StackAsk) -> (PrStack, Option<u64>)
             .load_measurement(
                 (row.repo.clone(), row.number, head.into(), base.into()),
                 client.read_context().deadline,
-                |_| {
-                    !client.advisory.stack_continuations.pending(&(
-                        row.repo.clone(),
-                        row.number,
-                        head.into(),
-                        base.into(),
-                    ))
+                |value| {
+                    // A locally deferred strip receipt must not suppress the
+                    // selected opportunity. Known evidence still singleflights.
+                    (client.read_context().class != super::admission::ReadClass::Foreground
+                        || *value != PrStack::Unknown)
+                        && !client.advisory.stack_continuations.pending(&(
+                            row.repo.clone(),
+                            row.number,
+                            head.into(),
+                            base.into(),
+                        ))
                 },
                 work,
             )
@@ -259,6 +301,7 @@ mod tests {
                 .base_uri(server.uri())
                 .unwrap()
                 .personal_token("test-token")
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
                 .build()
                 .unwrap(),
         )
@@ -266,17 +309,27 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_stack_resumes_verified_downward_work_after_shared_allowance_refusal() {
-        assert_stack_resume(31, 1, 9, 27_000, 29_000).await;
+        assert_stack_resume(31, 1, 9, 27_000, 29_000, false).await;
     }
 
     #[tokio::test]
     async fn resumed_stack_with_less_than_failure_ttl_retains_success_and_original_age() {
-        assert_stack_resume(57, 1, 9, 1_000, 3_000).await;
+        assert_stack_resume(57, 1, 9, 1_000, 3_000, false).await;
     }
 
     #[tokio::test]
     async fn expired_stack_prerequisite_is_retrieved_again_before_authority_returns() {
-        assert_stack_resume(61, 2, 10, 58_000, 60_000).await;
+        assert_stack_resume(61, 2, 10, 58_000, 60_000, false).await;
+    }
+
+    #[tokio::test]
+    async fn selected_continuation_recovers_in_the_exhausted_advisory_cycle() {
+        assert_stack_resume(0, 1, 9, 59_000, 60_000, true).await;
+    }
+
+    #[tokio::test]
+    async fn selected_expired_continuation_reacquires_before_authority_returns() {
+        assert_stack_resume(61, 2, 10, 58_000, 60_000, true).await;
     }
 
     async fn assert_stack_resume(
@@ -285,6 +338,7 @@ mod tests {
         total_count: usize,
         min_ttl: u64,
         max_ttl: u64,
+        selected: bool,
     ) {
         let server = MockServer::start().await;
         Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
@@ -328,7 +382,9 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(advance_secs)).await;
         tokio::time::resume();
-        let completed = ready_stacks(&client, vec![ask.clone()]).await.unwrap();
+        let completed = ready_stacks_with_demand(&client, vec![ask.clone()], selected)
+            .await
+            .unwrap();
         assert_eq!(completed[0].stack, PrStack::None);
         assert_eq!(
             serde_json::to_value(&completed[0]).unwrap()["advisory_progress"],
@@ -517,6 +573,15 @@ mod tests {
 
     #[tokio::test]
     async fn canceled_stack_loader_retains_only_completed_identity_checked_stage() {
+        assert_canceled_stack_loader(false).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_selected_loader_retains_only_completed_identity_checked_stage() {
+        assert_canceled_stack_loader(true).await;
+    }
+
+    async fn assert_canceled_stack_loader(selected: bool) {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -541,8 +606,9 @@ mod tests {
         ask.base_ref = Some("main".into());
         let worker_client = client.clone();
         let worker_ask = ask.clone();
-        let worker =
-            tokio::spawn(async move { ready_stacks(&worker_client, vec![worker_ask]).await });
+        let worker = tokio::spawn(async move {
+            ready_stacks_with_demand(&worker_client, vec![worker_ask], selected).await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while upward.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -561,7 +627,9 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(31)).await;
         tokio::time::resume();
-        let completed = ready_stacks(&client, vec![ask]).await.unwrap();
+        let completed = ready_stacks_with_demand(&client, vec![ask], selected)
+            .await
+            .unwrap();
         assert_eq!(completed[0].stack, PrStack::None);
         assert!(completed[0]
             .valid_for_ms
@@ -571,6 +639,177 @@ mod tests {
             3,
             "one downward, canceled upward, resumed upward"
         );
+    }
+
+    #[tokio::test]
+    async fn selected_recovers_exact_evidence_after_150_rows_exhaust_advisory() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let number = body["variables"]["number"].as_u64().unwrap_or(5);
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{
+                "defaultBranchRef":{"name":"main"},"pullRequest":{"number":number,
+                "headRefOid":"selected-head","headRefName":"feature","baseRefName":"main",
+                "stackEntry":{"position":1,"stack":{"number":9,"size":1}}}}}}))
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+        for number in 1..=150 {
+            ready_stacks(&client, vec![row(number)]).await.unwrap();
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 8);
+        let mut ask = row(151);
+        ask.head_oid = Some("selected-head".into());
+        ask.base_ref = Some("main".into());
+        assert_eq!(
+            ready_stacks(&client, vec![ask.clone()]).await.unwrap()[0].stack,
+            PrStack::Unknown
+        );
+        let recovered = ready_stacks_with_demand(&client, vec![ask.clone()], true)
+            .await
+            .unwrap();
+        assert_ne!(
+            recovered[0].stack,
+            PrStack::Unknown,
+            "selected action prerequisite recovers in the same exhausted cycle"
+        );
+        assert_eq!(recovered[0].head_oid, ask.head_oid);
+        assert_eq!(recovered[0].base_ref, ask.base_ref);
+        assert!(recovered[0].valid_for_ms.is_some_and(|ms| ms > 59_000));
+        assert_eq!(server.received_requests().await.unwrap().len(), 9);
+        ready_stacks_with_demand(&client, vec![ask.clone()], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            9,
+            "fresh selected evidence reuses the shared slot"
+        );
+        let other = self::client(&server).await;
+        ready_stacks_with_demand(&other, vec![ask.clone()], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            10,
+            "another account cannot reuse this evidence"
+        );
+        for changed in [
+            StackAsk {
+                head_oid: Some("changed".into()),
+                ..ask.clone()
+            },
+            StackAsk {
+                base_ref: Some("changed".into()),
+                ..ask.clone()
+            },
+        ] {
+            let answer = ready_stacks_with_demand(&client, vec![changed], true)
+                .await
+                .unwrap();
+            assert_eq!(answer[0].stack, PrStack::Unknown);
+            assert_eq!(answer[0].valid_for_ms, None);
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        assert!(ready_stacks_with_demand(&client, vec![ask], true)
+            .await
+            .unwrap()[0]
+            .valid_for_ms
+            .is_some());
+        assert_eq!(server.received_requests().await.unwrap().len(), 13);
+    }
+
+    #[tokio::test]
+    async fn selected_requires_one_exact_subject_and_retired_principal_cannot_read_cache() {
+        let server = MockServer::start().await;
+        let client = client(&server).await;
+        for asks in [vec![], vec![row(1)], vec![row(1), row(2)]] {
+            assert!(ready_stacks_with_demand(&client, asks, true).await.is_err());
+        }
+        let caller = crate::remote::context::DispatchContext::paired_for_test();
+        caller.retire_for_test();
+        let client = client.with_advisory_context(caller);
+        let ask = StackAsk {
+            head_oid: Some("head".into()),
+            base_ref: Some("main".into()),
+            ..row(1)
+        };
+        assert!(ready_stacks_with_demand(&client, vec![ask], true)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_and_strip_share_one_exact_receipt_without_extending_its_lifetime() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(10))
+            .set_body_json(json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequest":{
+                "number":5,"headRefOid":"head-5","headRefName":"feature","baseRefName":"main",
+                "stackEntry":{"position":1,"stack":{"number":9,"size":1}}
+            }}}}))).expect(1).mount(&server).await;
+        let client = client(&server).await;
+        let ask = StackAsk {
+            head_oid: Some("head-5".into()),
+            base_ref: Some("main".into()),
+            ..row(5)
+        };
+        let (strip, selected) = tokio::join!(
+            ready_stacks(&client, vec![ask.clone()]),
+            ready_stacks_with_demand(&client, vec![ask.clone()], true)
+        );
+        let strip = strip.unwrap();
+        let selected = selected.unwrap();
+        assert_eq!(strip[0].stack, selected[0].stack);
+        assert_ne!(selected[0].stack, PrStack::Unknown);
+        assert!(selected[0].valid_for_ms <= strip[0].valid_for_ms);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_respects_primary_and_secondary_provider_cooldowns() {
+        for secondary in [false, true] {
+            let server = MockServer::start().await;
+            let response = if secondary {
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(json!({"message":"secondary rate limit"}))
+            } else {
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({"message":"primary quota"}))
+            };
+            Mock::given(method("POST"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client(&server).await;
+            let ask = StackAsk {
+                head_oid: Some("head".into()),
+                base_ref: Some("main".into()),
+                ..row(1)
+            };
+            for _ in 0..2 {
+                let answer = ready_stacks_with_demand(&client, vec![ask.clone()], true)
+                    .await
+                    .unwrap();
+                assert_eq!(answer[0].stack, PrStack::Unknown);
+                assert_eq!(answer[0].valid_for_ms, None);
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let snapshot = client.admission_snapshot();
+            assert!(if secondary {
+                snapshot.secondary_cooldown_ms > 119_000
+            } else {
+                snapshot.graphql.primary_cooldown_ms > 59_000
+            });
+        }
     }
 
     #[tokio::test]

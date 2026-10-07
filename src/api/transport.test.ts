@@ -520,6 +520,12 @@ describe("tauri.ts wrappers through the transport", () => {
     expect(local.call).toHaveBeenCalledWith(r.command, r.expected);
   });
 
+  it("forwards selected exact-head ancestry demand to desktop and remote transport", async () => {
+    const rows = [{ repo, number, head_oid: "head", base_ref: "main" }];
+    await api.getReadyStacks(rows, true);
+    expect(local.call).toHaveBeenCalledWith("get_ready_stacks", { rows, selected: true });
+  });
+
   it("routes correlated reviewing refreshes through get_reviewing", async () => {
     await api.refreshSource("reviewing", "request-2");
     expect(local.call).toHaveBeenCalledWith("get_reviewing", { requestId: "request-2" });

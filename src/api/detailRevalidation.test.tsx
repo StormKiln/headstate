@@ -9,7 +9,7 @@ import type { PrDetail, PullRequest } from "../types/pr";
 const boundary = vi.hoisted(() => ({ invoke: vi.fn(), detail: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: boundary.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, cb: (event: { payload: unknown }) => void) => { boundary.listeners.set(name, cb); return () => boundary.listeners.delete(name); } }));
-import { acceptDetailFacts, detailNeedsRevalidation } from "./detailRevalidation";
+import { acceptDetailFacts, detailNeedsRevalidation, retireDetailOwnership } from "./detailRevalidation";
 import { usePrDetail, useReviewPr, useActOnPr } from "./hooks";
 import { useSourceRefresh, refreshWithState, readRetained, retireSourceOwnership } from "./sourceRefreshHooks";
 const row: PullRequest = { ...PR_FIXTURES[0], repo: "synthetic/project", number: 1, head_oid: "h1", base_ref: "main", merge_status: "clean", review: "none", ci: "success", latest_reviews: [], comment_count: 0, unresolved_threads: 0,
@@ -502,7 +502,7 @@ it.each(targetedPublications.terminal_details.map(detail => [detail.state, detai
   expect(boundary.detail).toHaveBeenCalledTimes(1);
   await inventory([]);
   assertRemoteReply("get_pr_detail", nativeDetail);
-  await act(async () => finish(nativeDetail as PrDetail));
+  await act(async () => finish({ ...nativeDetail, repo: row.repo, number: row.number, id: row.id, head_oid: row.head_oid } as PrDetail));
   await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
   expect(boundary.detail).toHaveBeenCalledTimes(1);
   expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
@@ -564,7 +564,7 @@ it("retires the successful terminal witness with its old account query", async (
   expect(boundary.detail).toHaveBeenCalledTimes(before + 1);
 });
 
-it.each([{ in_merge_queue: true }, { is_draft: true }, { review: "approved" as const }])("consumes its own fresh scalar publication before detail returns: %j", async patch => {
+it.each([{ in_merge_queue: true }, { is_draft: true }, { review: "approved" as const }, { merge_status: "behind" as const }])("consumes its own fresh scalar publication before detail returns: %j", async patch => {
   vi.useFakeTimers(); const { qc, wrapper } = setup();
   await inventory([row]);
   let finish!: (value: PrDetail) => void;
@@ -603,4 +603,71 @@ it("still revalidates a terminal detail when a positive source observes a reopen
   await inventory([{ ...row, head_oid: "reopened-head" }]);
   await waitFor(() => expect(qc.getQueryData<PrDetail>(key)?.state).toBe("open"));
   expect(boundary.detail).toHaveBeenCalledTimes(1);
+});
+
+it("accepts the complete post-approval read and its own scalar publication without a second request", async () => {
+  vi.useFakeTimers();
+  const { qc, wrapper } = setup();
+  const receipt = { review_id: "review-1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "h1", submitted_at: "2026-10-07T00:00:00Z", pr_id: detail.id, repo: row.repo, number: 1 };
+  const fresh: PrDetail = { ...detail, body: "Newly retrieved full content", review: "approved", latest_reviews: [{ id: "review-1", state: "APPROVED", author: "synthetic-viewer", commit_oid: "h1", submitted_at: receipt.submitted_at }] };
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue(fresh);
+  boundary.invoke.mockImplementation((name: string) => {
+    if (name === "get_pr_detail") return boundary.detail();
+    if (name === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt });
+    return Promise.resolve();
+  });
+  const view = renderHook(() => ({ detail: usePrDetail(row.repo, 1), review: useReviewPr() }), { wrapper });
+  await publish();
+  await act(async () => { await view.result.current.review(row.id, row.repo, 1, "approve", "", "h1", "synthetic-viewer"); });
+  await publish({ review: "approved" });
+  await act(async () => finish(fresh));
+  await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(qc.getQueryData<PrDetail>(key)?.body).toBe("Newly retrieved full content");
+  expect(detailNeedsRevalidation(qc, row.repo, 1)).toBe(false);
+});
+
+it("coalesces manual detail refresh with a pending acknowledged review readback", async () => {
+  const { qc, wrapper } = setup();
+  const receipt = { review_id: "review-1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "h1", submitted_at: "2026-10-07T00:00:00Z", pr_id: detail.id, repo: row.repo, number: 1 };
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  boundary.invoke.mockImplementation((name: string) => {
+    if (name === "get_pr_detail") return boundary.detail();
+    if (name === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt });
+    return Promise.resolve();
+  });
+  const view = renderHook(() => ({ detail: usePrDetail(row.repo, 1), review: useReviewPr() }), { wrapper });
+  await act(async () => { await view.result.current.review(row.id, row.repo, 1, "approve", "", "h1", "synthetic-viewer"); });
+  const refresh = view.result.current.detail.refetch({ cancelRefetch: false });
+  await act(async () => finish(detail));
+  await refresh;
+  expect(boundary.detail).toHaveBeenCalledTimes(1);
+  expect(qc.getQueryData<PrDetail>(key)?.latest_reviews).toContainEqual(expect.objectContaining({ id: "review-1", state: "APPROVED" }));
+});
+
+it.each(["cancelled", "account", "source", "head", "identity"] as const)("discards %s post-approval readback without replacing newer cached content", async cause => {
+  const { qc, wrapper } = setup();
+  const receipt = { review_id: "review-1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "h1", submitted_at: "2026-10-07T00:00:00Z", pr_id: detail.id, repo: row.repo, number: 1 };
+  let finish!: (value: PrDetail) => void;
+  boundary.detail.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  boundary.invoke.mockImplementation((name: string) => {
+    if (name === "get_pr_detail") return boundary.detail();
+    if (name === "review_pr_at_head") return Promise.resolve({ outcome: "acknowledged", receipt });
+    return Promise.resolve();
+  });
+  const view = renderHook(() => ({ detail: usePrDetail(row.repo, 1), review: useReviewPr() }), { wrapper });
+  await act(async () => { await view.result.current.review(row.id, row.repo, 1, "approve", "", "h1", "synthetic-viewer"); });
+  await act(async () => {
+    if (cause === "cancelled") await qc.cancelQueries({ queryKey: key, exact: true });
+    if (cause === "account") qc.setQueryData(["viewer"], "new-viewer");
+    if (cause === "source") retireDetailOwnership(qc);
+    qc.setQueryData(key, { ...detail, body: "Newer cached content", ...(cause === "head" ? { head_oid: "h2" } : {}) });
+  });
+  await act(async () => finish({ ...detail, body: "Stale readback", ...(cause === "identity" ? { number: 999 } : {}) }));
+  expect(qc.getQueryData<PrDetail>(key)?.body).toBe("Newer cached content");
+  const lines = boundary.invoke.mock.calls.filter(([name]) => name === "diag_log").map(([, args]) => args.line as string);
+  expect(lines.some(line => line.includes(`outcome=discarded cause=${cause}`))).toBe(true);
+  expect(lines.join("\n")).not.toMatch(/synthetic|Newer cached|Stale readback|h1|h2|new-viewer/);
 });

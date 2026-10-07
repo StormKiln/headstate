@@ -76,3 +76,16 @@ describe("what the log is allowed to contain", () => {
     expect(joined).toContain("#7");
   });
 });
+
+it("allowlists detail action evidence and logs only transitions", async () => {
+  const { useDetailActionsDiag } = await import("./diag");
+  const props = { merge: "private/project", stack: "/Users/private", operation: "secret-token", mergeEvidence: "private-body", approved: true, reviewBlocked: true, detailError: false, detailFetching: true, gatesFetching: false, stackFetching: false };
+  const view = renderHook(p => useDetailActionsDiag(p), { initialProps: props });
+  view.rerender({ ...props });
+  expect(lines()).toHaveLength(1);
+  expect(lines()[0]).toContain("evidence=unavailable merge=unknown stack=unknown review=none");
+  view.rerender({ ...props, mergeEvidence: "provider-pending" });
+  expect(lines()).toHaveLength(2);
+  expect(lines()[1]).toContain("evidence=provider-pending");
+  expect(lines().join("\n")).not.toMatch(/private|secret|Users/);
+});

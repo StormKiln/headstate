@@ -104,9 +104,9 @@ describe("PrActions", () => {
   /// `unknown` is what GitHub reports WHILE it recomputes mergeability,
   /// and an approval is exactly what triggers that. The old wording
   /// reported a transient state in the words of a settled refusal.
-  it("says the unknown merge state is transient, not a refusal", () => {
+  it("does not attribute unread merge readiness to GitHub computation", () => {
     render(<PrActions pr={pr({ merge_status: "unknown" })} />);
-    expect(screen.getByText(/still checking/i)).toBeTruthy();
+    expect(screen.getByText(/Merge readiness is unavailable/i)).toBeTruthy();
     expect(screen.queryByText(/has not confirmed/i)).toBeNull();
   });
 
@@ -206,7 +206,7 @@ describe("PrActions", () => {
       ["behind", /behind its base/i],
       // Transient, so it gets its own wording -- see #349. Still
       // disabled, which is what this test is really pinning.
-      ["unknown", /still checking/i],
+      ["unknown", /Merge readiness is unavailable/i],
     ] as const) {
       const { unmount } = render(<PrActions pr={pr({ merge_status: status })} />);
       expect(screen.getByRole("button", { name: "Merge" })).toHaveProperty("disabled", true);
