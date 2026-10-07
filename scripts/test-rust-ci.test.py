@@ -111,6 +111,10 @@ sys.exit(7 if len(a)=={fail} else 0)
         self.assertIn('timeout-minutes: 30', rust)
         for stage in ['stepup', 'desktop', 'enterprise-contracts', 'race']:
             self.assertIn(f'python3 scripts/test-rust-ci.py {stage}', rust)
+        self.assertLess(rust.index('python3 scripts/test-rust-ci.py desktop'),
+                        rust.index('python3 scripts/test-rust-ci.py race'))
+        self.assertLess(rust.index('python3 scripts/test-rust-ci.py race'),
+                        rust.index('python3 scripts/test-rust-ci.py enterprise-contracts'))
         self.assertIn('if: always()', rust)
         self.assertIn('${{ runner.temp }}/ci-diagnostics/', rust)
         self.assertNotIn('continue-on-error', rust)
