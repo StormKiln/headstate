@@ -29,7 +29,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   const keys = selected.map(pr => ["ready-stack", owner, session.generation, keyOf(pr)]);
   const metas = keys.map(key => scheduleMeta(qc, key));
   useScheduleClaims(selected.map((pr, i) => ({ meta: metas[i], preferred: window.preferred.has(keyOf(pr)) })));
-  useQueries({ queries: selected.map((pr, i) => ({
+  const queries = useQueries({ queries: selected.map((pr, i) => ({
     queryKey: keys[i], meta: metas[i],
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
       let answer: Receipt;
@@ -74,7 +74,11 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
     const value = qc.getQueryData<Receipt>(["ready-stack", owner, session.generation, keyOf(pr)]);
     return value ? [value.expiresAt] : [];
   }), window.visible && enabled);
-  return { of: (pr: StackSubject): PrStack | undefined => {
+  return {
+    isFetching: queries.some(query => query.isFetching),
+    // Only the observed window; never invalidate the whole account's stacks.
+    refetch: () => Promise.all(queries.map(query => query.refetch({ cancelRefetch: false }))),
+    of: (pr: StackSubject): PrStack | undefined => {
     const receipt = qc.getQueryData<Receipt>(["ready-stack", owner, session.generation, keyOf(pr)]);
     return receipt && receipt.expiresAt > performance.now() ? receipt.stack : undefined;
   }, displayOf: (pr: StackSubject) => {

@@ -5,11 +5,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Semaphore, SemaphorePermit},
+    sync::{Notify, Semaphore, SemaphorePermit},
     time::Instant,
 };
 
 pub const READ_LIMIT: usize = 4;
+const RECOVERY_PENDING: &str = "provider recovery probe is in progress";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadClass {
     Foreground,
@@ -258,6 +259,7 @@ struct State {
 pub(super) struct Admission {
     total: Semaphore,
     background: Semaphore,
+    recovery_changed: Notify,
     state: Mutex<State>,
 }
 impl Default for Admission {
@@ -265,6 +267,7 @@ impl Default for Admission {
         Self {
             total: Semaphore::new(READ_LIMIT),
             background: Semaphore::new(2),
+            recovery_changed: Notify::new(),
             state: Mutex::new(State {
                 quotas: Default::default(),
                 secondary: None,
@@ -326,6 +329,8 @@ impl Drop for Attempt<'_> {
                     state.secondary = Some(state.secondary.map_or(retry, |old| old.max(retry)));
                 }
             }
+            drop(state);
+            self.admission.recovery_changed.notify_waiters();
         }
     }
 }
@@ -372,11 +377,11 @@ impl Admission {
             return Err(refused("provider quota retry deadline is active"));
         }
         if quota.probing {
-            return Err(refused("provider recovery probe is in progress"));
+            return Err(refused(RECOVERY_PENDING));
         }
         // A secondary recovery is serialized across BOTH buckets.
         if secondary_recovery && state.quotas.iter().any(|q| q.probing) {
-            return Err(refused("provider recovery probe is in progress"));
+            return Err(refused(RECOVERY_PENDING));
         }
         if class == Some(ReadClass::Advisory) {
             let new_cycle = now.duration_since(state.cycle) >= Duration::from_secs(30);
@@ -448,44 +453,64 @@ impl Admission {
             };
             let deadline = demand.deadline;
             let acquire = async {
-                let background = if demand.class != ReadClass::Foreground {
-                    Some(
-                        self.background
-                            .acquire()
-                            .await
-                            .map_err(|_| refused("read admission closed"))?,
-                    )
-                } else {
-                    None
-                };
-                let total = self
-                    .total
-                    .acquire()
-                    .await
-                    .map_err(|_| refused("read admission closed"))?;
-                if Instant::now() >= deadline {
-                    return Err(refused("read deadline elapsed before dispatch"));
-                }
-                let mut attempt = self
-                    .enter(
+                loop {
+                    // Register before inspecting admission so a finishing probe
+                    // cannot be missed between refusal and awaiting notification.
+                    let changed = self.recovery_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    let background = if demand.class != ReadClass::Foreground {
+                        Some(
+                            self.background
+                                .acquire()
+                                .await
+                                .map_err(|_| refused("read admission closed"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    let total = self
+                        .total
+                        .acquire()
+                        .await
+                        .map_err(|_| refused("read admission closed"))?;
+                    if Instant::now() >= deadline {
+                        return Err(refused("read deadline elapsed before dispatch"));
+                    }
+                    let entered = self.enter(
                         bucket,
                         Some(demand.class),
                         context.attempts.as_ref(),
                         context.advisory_context.as_ref(),
-                    )
+                    );
+                    let mut attempt = match entered {
+                        Err(ClientError::NotDispatched(ref message))
+                            if demand.class == ReadClass::Foreground
+                                && message == RECOVERY_PENDING =>
+                        {
+                            // Keep only demand, not scarce read capacity. The outer
+                            // deadline/live-demand select still bounds this wait.
+                            drop(total);
+                            drop(background);
+                            changed.await;
+                            continue;
+                        }
+                        result => result,
+                    }
                     .map_err(|error| match error {
                         ClientError::NotDispatched(message) if message.starts_with("provider") => {
                             ClientError::RateLimited(message)
                         }
                         other => other,
                     })?;
-                attempt._background = background;
-                attempt._total = Some(total);
-                attempt.deadline = Some(deadline);
-                if let Some(observer) = &context.first_attempt {
-                    observer.observe();
+                    attempt._background = background;
+                    attempt._total = Some(total);
+                    attempt.deadline = Some(deadline);
+                    if let Some(observer) = &context.first_attempt {
+                        observer.observe();
+                    }
+                    return Ok(attempt);
                 }
-                Ok(attempt)
             };
             let wait = tokio::time::timeout_at(deadline, acquire);
             if let Some(receiver) = &mut live {
@@ -1100,6 +1125,105 @@ mod tests {
             .await
             .unwrap();
     }
+    #[tokio::test(start_paused = true)]
+    async fn foreground_waits_for_recovery_without_holding_capacity() {
+        let admission = Admission::default();
+        admission.limit(Bucket::Graphql, 5, true);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut probe = admission
+            .read(Bucket::Graphql, context(ReadClass::Background))
+            .await
+            .unwrap();
+        let waiting = admission.read(Bucket::Rest, context(ReadClass::Foreground));
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("foreground must wait for the existing recovery probe"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert_eq!(admission.total.available_permits(), READ_LIMIT - 1);
+        assert_eq!(admission.background.available_permits(), 1);
+        assert!(admission
+            .read(Bucket::Rest, context(ReadClass::Advisory))
+            .await
+            .is_err());
+        probe.complete();
+        drop(probe);
+        let resumed = waiting
+            .await
+            .expect("successful probe resumes foreground without a UI retry");
+        drop(resumed);
+        assert_eq!(admission.total.available_permits(), READ_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_probe_wait_keeps_newer_cooldowns_and_failure_backoff() {
+        for newer_limit in [false, true] {
+            let admission = Admission::default();
+            admission.limit(Bucket::Graphql, 1, true);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let mut probe = admission
+                .read(Bucket::Graphql, context(ReadClass::Background))
+                .await
+                .unwrap();
+            let waiting = admission.read(Bucket::Rest, context(ReadClass::Foreground));
+            tokio::pin!(waiting);
+            tokio::select! {
+                biased;
+                _ = &mut waiting => panic!("must remain queued during recovery"),
+                _ = tokio::task::yield_now() => {},
+            }
+            if newer_limit {
+                admission.limit(Bucket::Rest, 30, true);
+                probe.complete();
+            }
+            drop(probe);
+            assert!(matches!(waiting.await, Err(ClientError::RateLimited(_))));
+            assert_eq!(admission.total.available_permits(), READ_LIMIT);
+            assert_eq!(
+                admission.retry_wait(Bucket::Rest),
+                if newer_limit { 30 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_probe_wait_deadline_and_cancellation_release_all_capacity() {
+        let admission = Admission::default();
+        admission.limit(Bucket::Graphql, 1, true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut probe = admission
+            .read(Bucket::Graphql, context(ReadClass::Background))
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(admission.read(
+            Bucket::Rest,
+            ReadContext::new(ReadClass::Foreground, Duration::from_secs(2)),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("must remain queued during recovery"),
+            _ = tokio::task::yield_now() => {},
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(waiting.await, Err(ClientError::NotDispatched(_))));
+        let mut cancelled = Box::pin(admission.read(Bucket::Rest, context(ReadClass::Foreground)));
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => panic!("must remain queued during recovery"),
+            _ = tokio::task::yield_now() => {},
+        }
+        drop(cancelled);
+        assert_eq!(admission.total.available_permits(), READ_LIMIT - 1);
+        probe.complete();
+        drop(probe);
+        assert!(admission
+            .read(Bucket::Rest, context(ReadClass::Foreground))
+            .await
+            .is_ok());
+        assert_eq!(admission.total.available_permits(), READ_LIMIT);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cooldown_recovery_has_one_probe_and_failed_probe_backs_off() {
         let admission = Admission::default();

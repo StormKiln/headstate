@@ -66,3 +66,49 @@ it("refreshes failed same-head gates with the primary detail, coalesces clicks a
   expect(document.activeElement).toBe(draft);
   expect(boundary.invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(1);
 });
+
+it.each([false, true])("Refresh recovers stack evidence without a background tick (after approval: %s)", async approve => {
+  stubViewport(1200);
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }); clients.push(qc);
+  qc.setQueryData(["pr-detail", "octocat/repo-1", 1], detail());
+  qc.setQueryData(["viewer"], "synthetic-viewer");
+  let stacks = 0;
+  let approved = false;
+  let finishStack!: (value: unknown) => void;
+  boundary.invoke.mockImplementation(async (name: string) => {
+    if (name === "review_pr_at_head") {
+      approved = true;
+      return { outcome: "acknowledged", receipt: { review_id: "review-1", state: "APPROVED", actor: "synthetic-viewer", commit_oid: "head-1", submitted_at: "2026-10-07T12:00:00Z", pr_id: "PR_1", repo: "octocat/repo-1", number: 1 } };
+    }
+    if (name === "get_pr_detail") return { ...detail(), latest_reviews: approved ? [{ id: "review-1", author: "synthetic-viewer", state: "APPROVED", commit_oid: "head-1", submitted_at: "2026-10-07T12:00:00Z" }] : [] };
+    if (name === "get_review_gates") return { rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false }, last_pusher: { state: "not_needed" }, rules_valid_for_ms: 600000 };
+    if (name === "get_ready_stacks") {
+      stacks++;
+      if (stacks === 1) return [{ repo: "octocat/repo-1", number: 1, head_oid: "head-1", base_ref: "main", stack: { kind: "unknown" }, valid_for_ms: 5000 }];
+      return new Promise(resolve => { finishStack = resolve; });
+    }
+    return undefined;
+  });
+  render(<QueryClientProvider client={qc}><Selected /></QueryClientProvider>);
+  await waitFor(() => expect(stacks).toBe(1));
+  const refresh = screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement;
+  await waitFor(() => expect(refresh.disabled).toBe(false));
+  expect(screen.getAllByRole("button", { name: "Merge" }).every(button => (button as HTMLButtonElement).disabled)).toBe(true);
+  if (approve) {
+    fireEvent.click(screen.getAllByRole("button", { name: "Approve" })[0]);
+    await screen.findAllByRole("button", { name: "Approved" });
+    await waitFor(() => expect(qc.getQueryData<PrDetail>(["pr-detail", "octocat/repo-1", 1])?.merge_status).toBe("clean"));
+  }
+  const readsBeforeRefresh = boundary.invoke.mock.calls.filter(([name]) => name === "get_pr_detail").length;
+  fireEvent.click(refresh); fireEvent.click(refresh);
+  await waitFor(() => expect(stacks).toBe(2));
+  await waitFor(() => expect(refresh.disabled).toBe(true));
+  expect(screen.getByText(/Cannot merge: Stack membership/)).toBeTruthy();
+  await act(async () => finishStack([{ repo: "octocat/repo-1", number: 1, head_oid: "head-1", base_ref: "main", stack: { kind: "none" }, valid_for_ms: 60000 }]));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "Merge" }).every(button => !(button as HTMLButtonElement).disabled)).toBe(true));
+  expect(stacks).toBe(2);
+  const lines = boundary.invoke.mock.calls.filter(([name]) => name === "diag_log").map(([, args]) => args.line as string);
+  expect(lines.some(line => line.startsWith("detail actions ") && line.includes("merge=clean stack=none") && line.includes(`approved=${approve}`))).toBe(true);
+  expect(lines.filter(line => line.startsWith("detail actions ")).join("\n")).not.toMatch(/octocat|synthetic|head-1|PR_1/);
+  expect(boundary.invoke.mock.calls.filter(([name]) => name === "get_pr_detail")).toHaveLength(readsBeforeRefresh + 1);
+});

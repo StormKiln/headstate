@@ -206,12 +206,17 @@ export function PrActions({
       ? ["ready", "close"]
       : [primaryMerge, "draft", "close"];
 
+  const actionReason = (action: PrActionName): string | null =>
+    unavailable(pr, action, conversations) ?? (
+      requireStackEvidence && (!pr.stack || pr.stack.kind === "unknown") && (action === "merge" || action === "enqueue")
+        ? "Stack membership could not be confirmed. Refresh or check GitHub."
+        : null
+    );
+
   return (
     <div className="flex flex-wrap items-center gap-2">
       {offered.map((action) => {
-        const why = requireStackEvidence && (!pr.stack || pr.stack.kind === "unknown") && (action === "merge" || action === "enqueue")
-          ? "Stack membership could not be confirmed. Check this pull request on GitHub."
-          : unavailable(pr, action, conversations);
+        const why = actionReason(action);
         const primary = action === primaryMerge && action !== "dequeue";
         // Closing a pull request is destructive and irreversible from
         // here (`inverseOf` deliberately gives close no undo), so it is
@@ -260,19 +265,19 @@ export function PrActions({
       {/* Suppressed in the header, where there is no room for a
           sentence -- the disabled button keeps its `title`, and the full
           explanation is still in the open in the body below. */}
-      {!compact && unavailable(pr, "merge", conversations) && !pr.is_draft ? (
+      {!compact && actionReason("merge") && !pr.is_draft ? (
         <span className="text-xs text-[#8b949e]">
-          Cannot merge: {unavailable(pr, "merge", conversations)}
+          Cannot merge: {actionReason("merge")}
         </span>
       ) : null}
       {/* The reason a disabled "Add to merge queue" is disabled (#1452),
           unless the line above already said the same thing. */}
       {!compact &&
       primaryMerge === "enqueue" &&
-      unavailable(pr, "enqueue", conversations) &&
-      unavailable(pr, "enqueue", conversations) !== unavailable(pr, "merge", conversations) ? (
+      actionReason("enqueue") &&
+      actionReason("enqueue") !== actionReason("merge") ? (
         <span className="text-xs text-[#8b949e]">
-          Cannot queue: {unavailable(pr, "enqueue", conversations)}
+          Cannot queue: {actionReason("enqueue")}
         </span>
       ) : null}
 
