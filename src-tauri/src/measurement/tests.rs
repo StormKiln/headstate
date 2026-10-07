@@ -1043,6 +1043,14 @@ async fn recent_phone_export_selects_whole_record_suffix_with_explicit_omission(
     for revision in 0..200 {
         assert!(Recorder::record(&r, event(&owner, revision)));
     }
+    // Suffix selection needs a durable fixture, not a race between 200 queued
+    // writes and the production cutoff deadline. Timeout/cancellation are
+    // exercised separately with a deliberately stalled writer.
+    assert!(
+        flush_fixture(&r, std::time::Duration::from_secs(30)).await,
+        "recent-export fixture did not reach its durable cutoff within 30s"
+    );
+    assert_eq!(r.status().durable_records, 200);
     let path = dir.path().canonicalize().unwrap().join("recent.jsonl");
     let receipt = r
         .export_with_limit(path.clone(), Some(66 * 1024))
