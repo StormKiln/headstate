@@ -26,6 +26,7 @@ function unavailable(
   pr: PrDetail,
   action: PrActionName,
   conversations: string | null = null,
+  unknownReason = "Merge readiness is unavailable. Refresh or check GitHub.",
 ): string | null {
   const byConversations =
     conversations !== null && pr.merge_status !== "clean" ? conversations : null;
@@ -41,18 +42,9 @@ function unavailable(
       if (pr.merge_status === "blocked") return "a required review or check is missing";
       if (pr.merge_status === "unstable") return "checks are failing";
       if (pr.merge_status === "behind") return "the branch is behind its base";
-      // `unknown` is TRANSIENT, not a verdict. GitHub sets it while it
-      // recomputes mergeability -- which an approval is precisely what
-      // triggers -- so the old wording reported "GitHub has not
-      // confirmed this can merge" about a pull request that was about
-      // to become mergeable, and stayed that way until something else
-      // refetched. Reported as merge failing on a PR that had in fact
-      // merged.
-      //
-      // Still disabled: enabling merge on a state we cannot read would
-      // ask GitHub to reject it. The defect was the wording and the
-      // absence of a refresh, not the gate.
-      if (pr.merge_status === "unknown") return "GitHub is still checking — this usually clears in a moment";
+      // Unknown may be local invalidation or an unavailable read. Only the
+      // detail query can say whether a provider actually reported computation.
+      if (pr.merge_status === "unknown") return unknownReason;
       // Anything else unrecognised is NOT mergeable, for the same
       // reason: acting on a state we cannot read is the one wrong
       // answer that costs something.
@@ -66,7 +58,7 @@ function unavailable(
     // next blocker once the stack is out of the way.
     case "enqueue":
       return stackBlocksQueue(stackGate(pr.stack, pr.number)) ?? byConversations ??
-        (pr.merge_status === "unknown" ? "GitHub is still checking — this usually clears in a moment" : null);
+        (pr.merge_status === "unknown" ? unknownReason : null);
     case "ready":
       return pr.is_draft ? null : "already ready for review";
     case "draft":
@@ -108,9 +100,11 @@ export function PrActions({
   compact = false,
   requireStackEvidence = false,
   conversations = null,
+  mergeEvidence,
 }: {
   pr: PrDetail;
   requireStackEvidence?: boolean;
+  mergeEvidence?: "refreshing" | "unavailable" | "provider-pending" | "settled";
   /// Why merge and enqueue must wait on conversations, from the base
   /// branch's rules (#1454), or null when nothing is known to require it.
   conversations?: string | null;
@@ -207,7 +201,11 @@ export function PrActions({
       : [primaryMerge, "draft", "close"];
 
   const actionReason = (action: PrActionName): string | null =>
-    unavailable(pr, action, conversations) ?? (
+    ((action === "merge" || action === "enqueue") && (mergeEvidence === "refreshing" || mergeEvidence === "unavailable")
+      ? mergeEvidence === "refreshing" ? "Refreshing merge readiness…" : "Merge readiness is unavailable. Refresh or check GitHub."
+      : null) ?? unavailable(pr, action, conversations,
+      mergeEvidence === "refreshing" ? "Refreshing merge readiness…"
+        : mergeEvidence === "provider-pending" ? "GitHub is still checking mergeability." : undefined) ?? (
       requireStackEvidence && (!pr.stack || pr.stack.kind === "unknown") && (action === "merge" || action === "enqueue")
         ? "Stack membership could not be confirmed. Refresh or check GitHub."
         : null

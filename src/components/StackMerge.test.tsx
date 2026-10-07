@@ -201,7 +201,7 @@ it("keeps native enqueue disabled while selected mergeability is being refreshed
   render(<PrActions pr={pr({ merge_status: "unknown" })} />);
   const action = screen.getByRole("button", { name: "Queue 2 pull requests…" }) as HTMLButtonElement;
   expect(action.disabled).toBe(true);
-  expect(action.title).toMatch(/checking/i);
+  expect(action.title).toMatch(/readiness is unavailable/i);
 });
 
 it("requires a fresh confirmation when the viewed head changes", () => {

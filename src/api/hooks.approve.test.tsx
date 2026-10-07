@@ -144,10 +144,7 @@ describe("useReviewPr and the merge buttons", () => {
     const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
     await result.current("id", "o/r", 7, "approve", "");
 
-    const after = qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7]);
-    expect(after?.in_merge_queue, "the queue button would offer an action GitHub refuses").toBe(
-      true,
-    );
+    await waitFor(() => expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.in_merge_queue).toBe(true));
   });
 
   /// The other reported symptom, on a repository with no merge queue:
@@ -161,14 +158,14 @@ describe("useReviewPr and the merge buttons", () => {
     const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
     await result.current("id", "o/r", 7, "approve", "");
 
-    expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.merge_status).toBe("clean");
+    await waitFor(() => expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.merge_status).toBe("clean"));
   });
 
   /// The trap this fix had to avoid: the merge fields and the review
   /// verdict lag in OPPOSITE directions. `latestReviews` lags behind
   /// the approval, so re-reading it reverts the button; mergeability
   /// lags ahead of the cache, so NOT re-reading it strands the button.
-  /// Copying only the merge fields is what serves both.
+  /// Reconciliation must preserve the verified receipt in the full response.
   it("does not let the re-read undo the seeded verdict", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     qc.setQueryData(["viewer"], "me");

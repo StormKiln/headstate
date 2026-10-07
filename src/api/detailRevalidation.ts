@@ -138,10 +138,10 @@ export function acceptDetailFacts(qc: QueryClient, { rows, session, coverage, li
     state.observed = { ...state.observed, ...next };
     state.facts = { ...state.facts, ...next };
     if (!changed) continue;
-    // These three normalized scalar fields can acknowledge their own native
+    // These normalized scalar fields can acknowledge their own native
     // pre-return publication. Head/check/count/thread changes still require a
     // post-target read; never let a scalar receipt consume such an older target.
-    const scalarReadback = changedFields.every(field => ["draft", "review", "queue"].includes(field)) && (!state.required || state.required.scalarReadback)
+    const scalarReadback = changedFields.every(field => ["draft", "review", "queue", "mergeStatus"].includes(field)) && (!state.required || state.required.scalarReadback)
       ? { id: row.id, head: row.head_oid } : undefined;
     state.required = { revision: ++state.revision, facts: { ...state.observed }, scalarReadback };
     // Inactive details need a stale marker, but no provider command.

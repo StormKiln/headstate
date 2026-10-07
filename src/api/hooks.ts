@@ -15,7 +15,7 @@ import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { receiptAdvisory } from "./sourceRefresh";
 import { invalidateSourceMeasurements, clearAuthoredError, patchSourceRows, readAuthored, readRetained, refreshWithState, useSourceRefresh } from "./sourceRefreshHooks";
-import { timeCall, timed } from "./diag";
+import { diagMark, timeCall, timed } from "./diag";
 import { useContext, useRef, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   AlertReport,
@@ -677,21 +677,10 @@ export function withOwnReview(detail: PrDetail, viewer: string, state: string): 
   return { ...detail, latest_reviews: [...others, { author: viewer, state }] };
 }
 
-/// Re-read one pull request's mergeability after a review, without
-/// disturbing the verdict this app just seeded.
-///
-/// A whole-object refetch is what we cannot do here: it would overwrite
-/// `latest_reviews` with GitHub's pre-approval set, which lags
-/// `addPullRequestReview` by a second or two, and the button would
-/// revert to "Approve" for an approval that succeeded. That is the very
-/// failure the seeding exists to prevent, so this copies the three
-/// merge-related fields across and leaves everything else alone.
-///
-/// Failure is swallowed on purpose. The review itself already
-/// succeeded; a failed follow-up read must not report it as failed. The
-/// poll loop and `usePrDetail`'s own refetching still catch up.
-// A verified write completes independently of its read-back. Track the latest
-// reconciliation per cache/key so a late response cannot undo a newer review.
+// A verified write completes independently of its full readback. Query-owned
+// review receipts preserve the acknowledgement through provider read lag, while
+// the ordinary query lifecycle coalesces reads and publishes all accepted fields.
+const mergeReadbacks = new WeakMap<object, { head: string; account: number }>();
 
 async function mergeFieldsAfterReview(
   qc: QueryClient,
@@ -706,27 +695,21 @@ async function mergeFieldsAfterReview(
   }
   const generation = Symbol();
   pending.set(key, generation);
-  const before = qc.getQueryData<PrDetail>(["pr-detail", repo, number]);
+  const query = qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+  const detail = query?.state.data as PrDetail | undefined;
+  if (query && detail) mergeReadbacks.set(query, { head: detail.head_oid, account: reviewAccountGeneration(qc) });
   qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
     prev ? { ...prev, merge_status: "unknown" } : prev,
   );
   try {
-    const accountGeneration = reviewAccountGeneration(qc);
-    const readGeneration = reviewReadGeneration(qc);
-    const fresh = reconcileReviewDetail(qc, await getPrDetail(repo, number), readGeneration);
-    if (pending.get(key) !== generation || reviewAccountGeneration(qc) !== accountGeneration) return;
-    qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
-      prev === undefined || prev.latest_reviews !== before?.latest_reviews
-        || prev.head_oid !== before?.head_oid || fresh.head_oid !== before?.head_oid
-        ? prev
-        : {
-            ...prev,
-            latest_reviews: fresh.latest_reviews,
-            merge_status: fresh.merge_status,
-            merge_queue_enabled: fresh.merge_queue_enabled,
-            in_merge_queue: fresh.in_merge_queue,
-          },
-    );
+    // Use the real query lifecycle: publish every retrieved field, coalesce
+    // manual/source reads, and let successful readback acknowledge its facts.
+    await qc.fetchQuery({
+      queryKey: ["pr-detail", repo, number],
+      queryFn: ({ signal }) => readPrDetail(qc, repo, number, signal, "after-review"),
+      staleTime: 0, retry: false,
+      meta: qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true })?.meta ?? {},
+    });
   } catch {
     // The verified review succeeded. Keep mergeability unknown and let the
     // bounded detail poll recover, without reporting the write as failed.
@@ -736,7 +719,7 @@ async function mergeFieldsAfterReview(
       resumeDetailRevalidation(qc, repo, number);
       // Re-evaluate the detail poll even if the read failed: no new response
       // would otherwise notify its observer that reconciliation ended.
-      qc.setQueryData<PrDetail>(["pr-detail", repo, number], prev => prev ? { ...prev } : prev);
+      qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true })?.setState({});
     }
   }
 }
@@ -2557,6 +2540,39 @@ function seedFromRow(row: PullRequest): PrDetail {
   };
 }
 
+async function readPrDetail(qc: QueryClient, repo: string, number: number, signal: AbortSignal,
+  reason: "after-review" | "source" | "query",
+): Promise<PrDetail> {
+  return timeCall("pr-detail", async () => {
+    const sourceGeneration = beginDetailRead(qc, repo, number);
+    const generation = reviewReadGeneration(qc);
+    const accountGeneration = reviewAccountGeneration(qc);
+    const before = qc.getQueryData<PrDetail>(["pr-detail", repo, number]);
+    diagMark(`detail read reason=${reason} outcome=start`);
+    let fresh: PrDetail;
+    try { fresh = await getPrDetail(repo, number); }
+    catch (error) {
+      diagMark(`detail read reason=${reason} outcome=failed`);
+      throw error;
+    }
+    const discard = (cause: "cancelled" | "account" | "source" | "identity" | "head") => {
+      diagMark(`detail read reason=${reason} outcome=discarded cause=${cause}`);
+      throw new Error("The pull request changed while refreshing. Refresh to load its current state.");
+    };
+    if (signal.aborted) return discard("cancelled");
+    if (reviewAccountGeneration(qc) !== accountGeneration) return discard("account");
+    if (!detailReadIsCurrent(qc, sourceGeneration)) return discard("source");
+    if (fresh.repo.toLowerCase() !== repo.toLowerCase() || fresh.number !== number) return discard("identity");
+    const current = qc.getQueryData<PrDetail>(["pr-detail", repo, number]);
+    if (current?.head_oid !== before?.head_oid && current?.head_oid !== fresh.head_oid) return discard("head");
+    const accepted = reconcileReviewDetail(qc, fresh, generation);
+    const query = qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+    if (query) mergeReadbacks.delete(query);
+    diagMark(`detail read reason=${reason} outcome=accepted`);
+    return accepted;
+  });
+}
+
 /// One pull request's detail, fetched when the view opens.
 ///
 /// Not part of the poll loop: it is per-PR and only wanted while on
@@ -2585,7 +2601,7 @@ function seedFromRow(row: PullRequest): PrDetail {
 export function usePrDetail(repo: string | undefined, number: number | undefined) {
   const qc = useQueryClient();
   const polling = useMemo(() => new DetailPollBackoff(), [repo, number]);
-  return useQuery({
+  const result = useQuery({
     queryKey: ["pr-detail", repo, number],
     // Observer option updates must preserve the query-owned confirmed review fact.
     meta: qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true })?.meta ?? {},
@@ -2595,16 +2611,8 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
     // `diag.ts`. This is the line that tells a slow COMMAND from a slow
     // RENDER: the Rust side's `[diag] cmd get_pr_detail` pair brackets
     // the fetch, and the gap between the two is React's (#790).
-    queryFn: () =>
-      timeCall(`pr-detail`, async () => {
-        const sourceGeneration = beginDetailRead(qc, repo as string, number as number);
-        const generation = reviewReadGeneration(qc);
-        const accountGeneration = reviewAccountGeneration(qc);
-        const fresh = await getPrDetail(repo as string, number as number);
-        if (reviewAccountGeneration(qc) !== accountGeneration) throw new Error("The GitHub account changed; reload this pull request.");
-        if (!detailReadIsCurrent(qc, sourceGeneration)) throw new Error("The GitHub connection changed; reload this pull request.");
-        return reconcileReviewDetail(qc, fresh, generation);
-      }),
+    queryFn: ({ signal }) => readPrDetail(qc, repo as string, number as number, signal,
+      detailNeedsRevalidation(qc, repo as string, number as number) ? "source" : "query"),
     enabled: Boolean(repo && number),
     staleTime: 30_000,
     // Evaluated on every render, which is what makes it work: the row
@@ -2646,6 +2654,15 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
             Math.max(query.state.dataUpdatedAt, query.state.errorUpdatedAt),
           ),
   });
+  const query = qc.getQueryCache().find({ queryKey: ["pr-detail", repo, number], exact: true });
+  const readback = query && mergeReadbacks.get(query);
+  const awaitingReadback = (!!readback && readback.head === result.data?.head_oid && readback.account === reviewAccountGeneration(qc))
+    || detailNeedsRevalidation(qc, repo as string, number as number);
+  const mergeEvidence = result.isError ? "unavailable" as const
+    : awaitingReadback ? (result.isFetching ? "refreshing" as const : "unavailable" as const)
+    : result.isPlaceholderData ? "unavailable" as const
+    : result.data?.merge_status === "unknown" ? "provider-pending" as const : "settled" as const;
+  return { ...result, mergeEvidence };
 }
 
 /// The base branch's review rules and the head's last pusher, for the
