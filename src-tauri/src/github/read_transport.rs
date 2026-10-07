@@ -2,6 +2,7 @@
 //! Diagnostics contain operation classes and numeric IDs, never query inputs.
 use super::admission::{retry_seconds, Admission, Bucket, ReadContext};
 use super::client::ClientError;
+use super::read_diagnostics::{Diagnostics, Event, Reason, Stage};
 use octocrab::{FromResponse, Octocrab};
 use serde_json::Value;
 use std::{
@@ -14,6 +15,7 @@ pub(super) const READ_BUDGET: Duration = Duration::from_secs(30);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 pub(super) struct ReadTransport {
+    diagnostics: Diagnostics,
     pub(super) measurement: Option<std::sync::Arc<crate::measurement::Recorder>>,
     pub(super) admission: Admission,
     pub(super) stats_measurement: crate::stats_measurement::Tracker,
@@ -168,6 +170,18 @@ impl ReadTransport {
         self.read(client, Read::Rest { path, budget }, "rest-read", context)
             .await
     }
+    fn evidence(&self, bucket: Bucket, reason: Reason) {
+        if crate::diag::enabled() {
+            self.diagnostics.emit(Event::new(
+                0,
+                None,
+                bucket,
+                Stage::ProviderEvidence,
+                reason,
+                self.admission.snapshot(),
+            ));
+        }
+    }
     pub(super) fn observe_headers(&self, bucket: Bucket, status: u16, headers: &hyper::HeaderMap) {
         let number = |key| {
             headers
@@ -187,9 +201,11 @@ impl ReadTransport {
         if exhausted && current_window {
             self.admission
                 .limit(bucket, reset.map(seconds_until).unwrap_or(60), false);
+            self.evidence(bucket, Reason::PrimaryHeader);
         }
         if (refused && !exhausted) || (refused && retry.is_some()) {
             self.admission.limit(bucket, retry.unwrap_or(60), true);
+            self.evidence(bucket, Reason::SecondaryHeader);
         }
     }
 
@@ -207,6 +223,7 @@ impl ReadTransport {
                 reset.map(seconds_until).unwrap_or(60),
                 false,
             );
+            self.evidence(Bucket::Graphql, Reason::PrimaryGraphql);
         }
         let secondary = value
             .get("errors")
@@ -219,6 +236,7 @@ impl ReadTransport {
         if secondary || (graphql_exhausted(value) && (remaining != Some(0) || retry.is_some())) {
             self.admission
                 .limit(Bucket::Graphql, retry.unwrap_or(60), true);
+            self.evidence(Bucket::Graphql, Reason::SecondaryGraphql);
         }
     }
 
@@ -226,6 +244,7 @@ impl ReadTransport {
         if secondary_message(value["message"].as_str().unwrap_or_default()) {
             self.admission
                 .limit(Bucket::Rest, retry.unwrap_or(60), true);
+            self.evidence(Bucket::Rest, Reason::SecondaryBody);
         }
     }
     pub(super) fn observe_error(
@@ -237,6 +256,7 @@ impl ReadTransport {
         if matches!(error, octocrab::Error::GitHub { source, .. } if secondary_message(&source.message))
         {
             self.admission.limit(bucket, retry.unwrap_or(60), true);
+            self.evidence(bucket, Reason::SecondaryBody);
             true
         } else {
             false
@@ -320,6 +340,25 @@ impl ReadTransport {
                     crate::measurement::AggregateKind::Refused
                 },
             );
+            if let Some(error) = admitted.as_ref().err().filter(|_| crate::diag::enabled()) {
+                let class = context
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.borrow().map(|d| d.class))
+                    .unwrap_or(context.class);
+                self.diagnostics.emit(
+                    Event::new(
+                        id,
+                        Some(class),
+                        read.bucket(),
+                        Stage::LocalRefusal,
+                        Reason::LocalOther,
+                        self.admission.snapshot(),
+                    )
+                    .attempt(attempt as u8)
+                    .refused(error),
+                );
+            }
             let mut permit = admitted?;
             #[cfg(feature = "enterprise-harness")]
             queue.finish("admitted");
@@ -355,6 +394,23 @@ impl ReadTransport {
                 #[cfg(feature = "enterprise-harness")]
                 if let Ok(slot) = crate::enterprise_harness::metrics::SCAN_SLOT.try_with(|id| *id) {
                     metric.mark("scan-slot", slot);
+                }
+                if crate::diag::enabled() {
+                    self.diagnostics.emit(
+                        Event::new(
+                            id,
+                            permit.class,
+                            read.bucket(),
+                            Stage::Dispatch,
+                            if permit.is_probe() {
+                                Reason::RecoveryProbe
+                            } else {
+                                Reason::Admitted
+                            },
+                            self.admission.snapshot(),
+                        )
+                        .attempt(attempt as u8),
+                    );
                 }
                 let response = match read {
                     Read::Graphql(body) => client._post("/graphql", Some(body)).await,
@@ -561,6 +617,50 @@ mod admission_tests {
             .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn admission_diagnostics_distinguish_dispatch_refusal_and_provider_evidence_privately() {
+        let _switch = crate::diag::capture::switch_lock();
+        let logger = crate::diag::capture::logger();
+        let mark = logger.mark();
+        crate::diag::set_enabled(true);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120")
+                    .set_body_json(serde_json::json!({"message":"secondary rate limit PRIVATE_BODY"})))
+                .expect(1).mount(&server).await;
+            let transport = ReadTransport::default();
+            let client = client(&server).await;
+            for _ in 0..2 {
+                assert!(transport.post(&client, &serde_json::json!({"query":"PRIVATE_QUERY", "variables":{"repo":"PRIVATE_REPO"}})).await.is_err());
+            }
+            server.verify().await;
+        });
+        crate::diag::set_enabled(false);
+        let lines = logger.since(mark);
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("[diag] provider admission ")
+                    .map(|body| serde_json::from_str(body).unwrap())
+            })
+            .collect();
+        assert!(events.iter().any(|e| e["stage"] == "dispatch"
+            && e["class"] == "foreground"
+            && e["protocol"] == "graphql"));
+        assert!(events.iter().any(|e| e["stage"] == "local_refusal"
+            && e["reason"] == "secondary_cooldown"
+            && e["secondary_cooldown_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms > 119_000)));
+        assert!(events
+            .iter()
+            .any(|e| e["stage"] == "provider_evidence" && e["reason"] == "secondary_header"));
+        for line in lines {
+            assert!(!line.contains("PRIVATE_"));
+        }
     }
 
     #[tokio::test]

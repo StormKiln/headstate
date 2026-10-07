@@ -283,6 +283,7 @@ fn refused(message: &str) -> ClientError {
     ClientError::NotDispatched(message.into())
 }
 pub(super) struct Attempt<'a> {
+    pub(super) class: Option<ReadClass>,
     admission: &'a Admission,
     bucket: Bucket,
     probe: Option<(u64, Option<u64>, bool)>,
@@ -294,6 +295,9 @@ pub(super) struct Attempt<'a> {
     metric: crate::enterprise_harness::metrics::Scope,
 }
 impl Attempt<'_> {
+    pub(super) fn is_probe(&self) -> bool {
+        self.probe.is_some()
+    }
     pub fn complete(&mut self) {
         self.done = true;
     }
@@ -348,7 +352,7 @@ impl Admission {
         let caller = caller.unwrap_or(&desktop);
         // Registry-before-capability lock order, held only through accounting.
         // A revoked paired incarnation cannot renew demand or admit an attempt.
-        let _capability = if class == Some(ReadClass::Advisory) {
+        let _capability = if class.is_some() {
             // Drop each liveness snapshot before acquiring the next guard.
             // Different immutable account instances may share capabilities;
             // holding two reader guards could deadlock behind queued revokers.
@@ -417,6 +421,7 @@ impl Admission {
             state.shares.debit(caller.principal());
         }
         Ok(Attempt {
+            class,
             admission: self,
             bucket,
             probe,
@@ -978,6 +983,16 @@ mod tests {
             .read(Bucket::Graphql, read(&paired))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_foreground_cannot_dispatch_for_a_retired_pairing() {
+        let admission = Admission::default();
+        let caller = crate::remote::context::DispatchContext::paired_for_test();
+        let mut selected = context(ReadClass::Foreground);
+        selected.advisory_context = Some(caller.clone());
+        caller.retire_for_test();
+        assert!(admission.read(Bucket::Graphql, selected).await.is_err());
     }
 
     #[tokio::test(start_paused = true)]

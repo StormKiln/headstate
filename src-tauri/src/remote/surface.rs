@@ -1241,6 +1241,7 @@ async fn call(
         "get_ready_stacks" => res(commands::get_ready_stacks_with_context(
             app.state(),
             a.get("rows")?,
+            a.get("selected")?,
             context.clone(),
         )
         .await),

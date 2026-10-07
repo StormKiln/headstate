@@ -14,6 +14,7 @@ pub mod stack_merge;
 pub mod stats;
 
 pub mod admission;
+mod read_diagnostics;
 mod read_transport;
 
 pub(crate) mod scan;

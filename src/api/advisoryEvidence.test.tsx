@@ -314,3 +314,92 @@ it("reads selected advisory expiry without hashing every unrelated cached query"
   expect(invoke.mock.calls.length).toBe(16);
   expect(unrelatedProbes).toBe(0);
 });
+
+
+it("selected ancestry forwards bounded native demand while 150+ strip rows stay advisory", async () => {
+  failure = true;
+  const strip = renderHook(() => useReadyStacks(rows), { wrapper });
+  await advance(5);
+  expect(invoke.mock.calls.filter(call => call[0] === "get_ready_stacks").every(call => !call[1]?.selected)).toBe(true);
+  const target = rows[0];
+  invoke.mockImplementation(async (cmd, args) => {
+    if (cmd === "get_viewer") return "octocat";
+    return (args?.rows as PullRequest[]).map(pr => ({ ...pr,
+      stack: args?.selected ? { kind: "none" } : { kind: "unknown" },
+      valid_for_ms: args?.selected ? 60_000 : undefined,
+    }));
+  });
+  const detail = renderHook(() => useReadyStacks([target], new Set(), true, "detail"), { wrapper });
+  await advance(5);
+  expect(detail.result.current.of(target)).toEqual({ kind: "none" });
+  const selected = invoke.mock.calls.filter(call => call[1]?.selected);
+  expect(selected).toHaveLength(1);
+  expect(selected[0][1]?.rows).toHaveLength(1);
+  expect(strip.result.current.of(target)).toEqual({ kind: "none" });
+});
+
+it.each([false, true])("selection joining dispatched strip work follows up once unless unmounted=%s", async (unmount) => {
+  let release!: (value: unknown) => void;
+  const target = rows[0];
+  invoke.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  renderHook(() => useReadyStacks([target]), { wrapper });
+  await advance(5);
+  const detail = renderHook(() => useReadyStacks([target], new Set(), true, "detail"), { wrapper });
+  await advance(5);
+  if (unmount) detail.unmount();
+  await act(async () => release([{ ...target, stack: { kind: "unknown" } }]));
+  await advance(5);
+  const selected = invoke.mock.calls.filter(call => call[1]?.selected);
+  expect(selected).toHaveLength(unmount ? 0 : 1);
+  if (!unmount) expect(detail.result.current.of(target)).toEqual(stacked);
+});
+
+it("selected same-head expiry removes authority and explicit refresh restores it", async () => {
+  lifetime = 5;
+  const target = rows[0];
+  const detail = renderHook(() => useReadyStacks([target], new Set(), true, "detail"), { wrapper });
+  await advance(2);
+  expect(detail.result.current.of(target)).toEqual(stacked);
+  await advance(10);
+  expect(detail.result.current.of(target)).toBeUndefined();
+  lifetime = 60_000;
+  await act(async () => { await detail.result.current.refetch(); });
+  expect(detail.result.current.of(target)).toEqual(stacked);
+  expect(invoke.mock.calls.filter(call => call[1]?.selected)).toHaveLength(2);
+});
+
+
+it.each(["head", "base", "account"])("selected receipt never crosses a %s replacement", async (change) => {
+  const initial = rows[0];
+  const detail = renderHook(({ target }) => useReadyStacks([target], new Set(), true, "detail"), { wrapper, initialProps: { target: initial } });
+  await advance(5);
+  expect(detail.result.current.of(initial)).toEqual(stacked);
+  failure = true;
+  const next = { ...initial, ...(change === "head" ? { head_oid: "replacement-head" } : change === "base" ? { base_ref: "replacement-base" } : {}) };
+  if (change === "account") await act(async () => { qc.setQueryData(["viewer"], "replacement-account"); });
+  detail.rerender({ target: next });
+  await advance(5);
+  expect(detail.result.current.of(next)?.kind).not.toBe("stacked");
+});
+
+it.each([false, true])("queued strip work checks live selected demand at dispatch, unmounted=%s", async (unmount) => {
+  let release!: (value: unknown) => void;
+  invoke.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  renderHook(() => useReadyStacks(rows.slice(0, 2)), { wrapper });
+  await advance(5);
+  const detail = renderHook(() => useReadyStacks([rows[1]], new Set(), true, "detail"), { wrapper });
+  await advance(5);
+  if (unmount) detail.unmount();
+  await act(async () => release([{ ...rows[0], stack: stacked, valid_for_ms: 60_000 }]));
+  await advance(5);
+  const targetCalls = invoke.mock.calls.filter(call => (call[1]?.rows as PullRequest[] | undefined)?.[0]?.number === rows[1].number);
+  expect(targetCalls).toHaveLength(1);
+  expect(targetCalls[0][1]?.selected).toBe(unmount ? undefined : true);
+});
+
+it("a failed selected request does not schedule another automatic selected attempt", async () => {
+  invoke.mockRejectedValue(new Error("synthetic transport failure"));
+  renderHook(() => useReadyStacks([rows[0]], new Set(), true, "detail"), { wrapper });
+  await advance(5);
+  expect(invoke.mock.calls.filter(call => call[1]?.selected)).toHaveLength(1);
+});

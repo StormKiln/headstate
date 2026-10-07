@@ -9008,10 +9008,12 @@ pub async fn claude_permission_ownership(
 pub async fn get_ready_stacks(
     client: State<'_, GhClient>,
     rows: Vec<crate::github::ready_stacks::StackAsk>,
+    selected: Option<bool>,
 ) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
     get_ready_stacks_with_context(
         client,
         rows,
+        selected,
         crate::remote::context::DispatchContext::desktop(),
     )
     .await
@@ -9019,6 +9021,7 @@ pub async fn get_ready_stacks(
 pub(crate) async fn get_ready_stacks_with_context(
     client: State<'_, GhClient>,
     rows: Vec<crate::github::ready_stacks::StackAsk>,
+    selected: Option<bool>,
     context: crate::remote::context::DispatchContext,
 ) -> Result<Vec<crate::github::ready_stacks::RowStack>, String> {
     let client = client
@@ -9026,7 +9029,8 @@ pub(crate) async fn get_ready_stacks_with_context(
         .clone()
         .ok_or_else(|| AUTH_ERR.to_string())?
         .with_advisory_context(context);
-    crate::github::ready_stacks::ready_stacks(&client, rows).await
+    crate::github::ready_stacks::ready_stacks_with_demand(&client, rows, selected.unwrap_or(false))
+        .await
 }
 
 #[cfg(test)]
