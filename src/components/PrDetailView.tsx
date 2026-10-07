@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { commentKeys } from "../lib/commentIdentity";
 import { reviewAccountGeneration, useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
+import { useDetailActionsDiag } from "@/api/diag";
 import { useReadyStacks } from "@/api/useReadyStacks";
 import { commandError } from "@/lib/errorKind";
 import { ExternalLink } from "./ExternalLink";
@@ -263,6 +264,7 @@ export function PrDetailView({
   const refreshDetail = () => Promise.all([
     refetch({ cancelRefetch: false }),
     ...(matchingFull ? [gateQuery.refetch({ cancelRefetch: false })] : []),
+    ancestry.refetch(),
   ]);
   const gate = pr
     ? gateVerdict(gates, pr, viewer, isPlaceholderData)
@@ -297,6 +299,12 @@ export function PrDetailView({
   const approvedByViewer =
     viewer !== undefined &&
     pr?.latest_reviews?.some((r) => r.author === viewer && r.state === "APPROVED") === true;
+
+  useDetailActionsDiag({
+    merge: pr?.merge_status, stack: pr?.stack?.kind, operation: operation?.state,
+    approved: approvedByViewer, reviewBlocked, detailError: isError,
+    detailFetching: isFetching, gatesFetching: gateQuery.isFetching, stackFetching: ancestry.isFetching,
+  });
 
   /// Lifted out of the ReviewBox JSX so the sticky header can submit
   /// the same way. Two call sites for one mutation, and a second inline
@@ -405,7 +413,7 @@ export function PrDetailView({
   /// place the same elements rather than two copies that drift.
   const pinnedActions = (
     <>
-      <button type="button" onClick={() => void refreshDetail()} disabled={isFetching || gateQuery.isFetching}
+      <button type="button" onClick={() => void refreshDetail()} disabled={isFetching || gateQuery.isFetching || ancestry.isFetching}
         className="rounded border border-[#30363d] px-2.5 py-1 text-sm disabled:opacity-50">Refresh</button>
       {/* The two the user actually reaches for, in the order they
           reach for them. Approve is absent: it needs the comment box
@@ -482,9 +490,9 @@ export function PrDetailView({
         <p className="font-medium">Could not refresh this pull request. Showing previously loaded details.</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
         <p>Reviews use the loaded commit shown here. Refresh before merging or other actions, or open GitHub for the current state.</p>
-        <button type="button" disabled={isFetching} onClick={() => void refreshDetail()}
+        <button type="button" disabled={isFetching || gateQuery.isFetching || ancestry.isFetching} onClick={() => void refreshDetail()}
           className="tap-target mt-2 rounded border border-[#30363d] px-3 py-1.5 disabled:opacity-50">
-          {isFetching ? "Refreshing…" : "Retry refresh"}
+          {isFetching || gateQuery.isFetching || ancestry.isFetching ? "Refreshing…" : "Retry refresh"}
         </button>
       </div> : null}
       {/* NOTE: the body's own `back` button is deliberately not rendered

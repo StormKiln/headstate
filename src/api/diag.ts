@@ -100,3 +100,17 @@ export function useReviewingDiag(q: {
     // to show.
   }, [line]);
 }
+
+/** Selected-detail transitions only. Never accepts identity or free-form reasons. */
+export function useDetailActionsDiag(q: {
+  merge: string | undefined; stack: string | undefined; operation: string | undefined;
+  approved: boolean; reviewBlocked: boolean; detailError: boolean;
+  detailFetching: boolean; gatesFetching: boolean; stackFetching: boolean;
+}): void {
+  // Return constants from the allowlist, even if a malformed response reaches UI.
+  const merge = ["clean", "blocked", "behind", "dirty", "unstable", "unknown", "draft"].find(value => value === q.merge) ?? "unknown";
+  const stack = ["none", "stacked", "unknown"].find(value => value === q.stack) ?? "unknown";
+  const operation = ["pending", "acknowledged", "unresolved"].find(value => value === q.operation) ?? "none";
+  const line = `detail actions merge=${merge} stack=${stack} review=${operation} approved=${!!q.approved} review_blocked=${!!q.reviewBlocked} detail_error=${!!q.detailError} detail_fetching=${!!q.detailFetching} gates_fetching=${!!q.gatesFetching} stack_fetching=${!!q.stackFetching}`;
+  useEffect(() => { diag(line); }, [line]);
+}
