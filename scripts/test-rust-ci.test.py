@@ -108,7 +108,7 @@ sys.exit(7 if len(a)=={fail} else 0)
     def test_workflow_and_make_keep_required_gate(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         rust = text.split('  test-rust:\n', 1)[1].split('\n  test-frontend:', 1)[0]
-        self.assertIn('timeout-minutes: 30', rust)
+        self.assertIn('timeout-minutes: 45', rust)
         for stage in ['stepup', 'desktop', 'enterprise-contracts', 'race']:
             self.assertIn(f'python3 scripts/test-rust-ci.py {stage}', rust)
         self.assertIn('if: always()', rust)

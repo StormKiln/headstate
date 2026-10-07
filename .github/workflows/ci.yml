@@ -256,9 +256,12 @@ jobs:
           retention-days: 7
 
   test-rust:
-    # Whole-job bound, including builds and three race runs (#885).
+    # Whole-job bound, including compilation, enterprise contracts and three
+    # full race runs (#885, #1758). A healthy run exhausted 30 minutes after
+    # two successful race iterations while the third was still progressing.
+    # Allow runner/build variance without reducing tests or changing app deadlines.
     # Retain phase evidence: a timeout is not proof of a test deadlock (#1735).
-    timeout-minutes: 30
+    timeout-minutes: 45
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
