@@ -1,6 +1,45 @@
 use super::*;
 use std::future::Future;
 use std::sync::atomic::AtomicU64;
+// These tests exercise real filesystem results, not the writer's five-second
+// admission deadline. Keep Tokio time fixed while its independent std thread
+// writes; awaiting on an idle paused runtime would auto-advance that deadline.
+// The wall-clock guard bounds pending polls without changing production time;
+// it does not interrupt synchronous filesystem work or the writer's drop join.
+fn await_writer<T>(future: impl Future<Output = T>) -> T {
+    struct ResumeClock;
+    impl Drop for ResumeClock {
+        fn drop(&mut self) {
+            tokio::time::resume();
+        }
+    }
+    struct WakeThread(std::thread::Thread);
+    impl std::task::Wake for WakeThread {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    tokio::time::pause();
+    let _resume = ResumeClock;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let waker = std::task::Waker::from(Arc::new(WakeThread(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "measurement writer fixture did not finish"
+        );
+        std::thread::park_timeout(remaining);
+    }
+}
 struct TestClock(AtomicU64, AtomicU64);
 impl Clock for TestClock {
     fn now(&self) -> (u64, u64) {
@@ -66,7 +105,7 @@ async fn private_keys_never_leave_memory_and_disabled_retained_export_is_complet
     assert!(!Recorder::record(&r, event(&id, 1)));
     r.set_enabled(false);
     let path = dir.path().canonicalize().unwrap().join("report.jsonl");
-    let receipt = r.export_to(path.clone()).await.unwrap();
+    let receipt = await_writer(r.export_to(path.clone())).unwrap();
     assert_eq!(receipt.records, 1);
     assert!(!receipt.incomplete);
     let text = std::fs::read_to_string(path).unwrap();
@@ -172,7 +211,7 @@ async fn rotation_restart_and_malformed_tail_are_qualified_without_copying_priva
         "rotation fixture writer did not flush its accepted cutoff within 30s"
     );
     let path = dir.path().canonicalize().unwrap().join("report.jsonl");
-    let result = r.export_to(path.clone()).await.unwrap();
+    let result = await_writer(r.export_to(path.clone())).unwrap();
     assert!(result.records < 8);
     assert!(result.incomplete);
     assert!(r.status().rotated_out > 0);
@@ -194,7 +233,7 @@ async fn rotation_restart_and_malformed_tail_are_qualified_without_copying_priva
         .write_all(b"PRIVATE_BROKEN_TAIL")
         .unwrap();
     let r = Recorder::new(config).unwrap();
-    let result = r.export_to(path.clone()).await.unwrap();
+    let result = await_writer(r.export_to(path.clone())).unwrap();
     assert!(result.incomplete);
     assert!(!std::fs::read_to_string(path)
         .unwrap()
@@ -244,7 +283,7 @@ async fn destination_refusal_preserves_original_and_writer_remains_usable() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("keep"), "keep").unwrap();
     assert_eq!(
-        r.export_to(destination.clone()).await.unwrap_err(),
+        await_writer(r.export_to(destination.clone())).unwrap_err(),
         ExportError::Destination
     );
     assert_eq!(
@@ -252,8 +291,7 @@ async fn destination_refusal_preserves_original_and_writer_remains_usable() {
         "keep"
     );
     assert_eq!(
-        r.export_to(dir.path().canonicalize().unwrap().join("okay"))
-            .await
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("okay")))
             .unwrap()
             .records,
         1
@@ -292,13 +330,13 @@ async fn saturated_writer_counts_loss_disable_is_immediate_and_refused_sequence_
     assert!(!Recorder::record(&r, event(&owner, 4)));
     release.send(()).unwrap();
     let path = dir.path().canonicalize().unwrap().join("report");
-    let mut result = r.export_to(path.clone()).await;
+    let mut result = await_writer(r.export_to(path.clone()));
     for _ in 0..5 {
         if !matches!(result, Err(ExportError::Busy)) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        result = r.export_to(path.clone()).await;
+        result = await_writer(r.export_to(path.clone()));
     }
     let result = result.unwrap();
     assert_eq!(result.records, 1);
@@ -307,30 +345,32 @@ async fn saturated_writer_counts_loss_disable_is_immediate_and_refused_sequence_
 }
 #[tokio::test]
 async fn export_freezes_cutoff_and_loss_even_when_later_producers_overflow() {
-    let (dir, r, _) = fixture(Caps {
-        data: 1,
-        ..Caps::default()
+    await_writer(async {
+        let (dir, r, _) = fixture(Caps {
+            data: 1,
+            ..Caps::default()
+        });
+        r.set_enabled(true);
+        let owner = r.intern(Key::Owner("a")).unwrap();
+        let release = pause(&r);
+        assert!(Recorder::record(&r, event(&owner, 1)));
+        let path = dir.path().canonicalize().unwrap().join("report");
+        let export = r.export_to(path.clone());
+        tokio::pin!(export);
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        assert!(!Recorder::record(&r, event(&owner, 2)));
+        release.send(()).unwrap();
+        let result = export.await.unwrap();
+        assert_eq!(result.records, 1);
+        assert!(
+            !result.incomplete,
+            "post-cutoff loss belongs to a later report"
+        );
+        assert_eq!(r.status().loss.dropped, 1);
     });
-    r.set_enabled(true);
-    let owner = r.intern(Key::Owner("a")).unwrap();
-    let release = pause(&r);
-    assert!(Recorder::record(&r, event(&owner, 1)));
-    let path = dir.path().canonicalize().unwrap().join("report");
-    let export = r.export_to(path.clone());
-    tokio::pin!(export);
-    assert!(matches!(
-        std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
-        std::task::Poll::Pending
-    ));
-    assert!(!Recorder::record(&r, event(&owner, 2)));
-    release.send(()).unwrap();
-    let result = export.await.unwrap();
-    assert_eq!(result.records, 1);
-    assert!(
-        !result.incomplete,
-        "post-cutoff loss belongs to a later report"
-    );
-    assert_eq!(r.status().loss.dropped, 1);
 }
 #[tokio::test]
 async fn writer_failure_is_latched_without_affecting_producer_caller() {
@@ -342,9 +382,7 @@ async fn writer_failure_is_latched_without_affecting_producer_caller() {
     assert!(Recorder::record(&r, event(&owner, 1)));
     release.send(()).unwrap();
     assert_eq!(
-        r.export_to(dir.path().canonicalize().unwrap().join("report"))
-            .await
-            .unwrap_err(),
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("report"))).unwrap_err(),
         ExportError::Unavailable
     );
     assert_eq!(r.status().writer_state, WriterState::Unavailable);
@@ -416,10 +454,8 @@ async fn stale_parent_and_wrong_kind_client_reference_are_rejected() {
             }
         }
     ));
-    let saved = r
-        .export_to(dir.path().canonicalize().unwrap().join("report"))
-        .await
-        .unwrap();
+    let saved =
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("report"))).unwrap();
     assert_eq!(saved.records, 1);
     assert!(saved.incomplete);
 }
@@ -456,7 +492,7 @@ async fn routine_budget_retains_deferred_totals_and_separate_failure_budget() {
         count: 4,
     });
     let path = dir.path().canonicalize().unwrap().join("report");
-    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 2);
+    assert_eq!(await_writer(r.export_to(path.clone())).unwrap().records, 2);
     let text = std::fs::read_to_string(path).unwrap();
     assert!(text.contains("\"count\":9"));
 }
@@ -491,7 +527,7 @@ fn journal_and_export_symlinks_are_refused() {
     })
     .is_err());
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bounded_barrier_timeout_and_busy_never_publish_a_canceled_destination() {
     let (dir, r, _) = fixture(Caps::default());
     r.set_enabled(true);
@@ -512,7 +548,25 @@ async fn bounded_barrier_timeout_and_busy_never_publish_a_canceled_destination()
                 .unwrap_err(),
             ExportError::Busy
         );
-        assert_eq!(first.await.unwrap_err(), ExportError::Timeout);
+        tokio::time::advance(std::time::Duration::from_millis(4999)).await;
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        let completed =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await;
+        assert!(matches!(
+            completed,
+            std::task::Poll::Ready(Err(ExportError::Timeout))
+        ));
+        assert_eq!(
+            r.export_to(dir.path().canonicalize().unwrap().join("after-timeout"))
+                .await
+                .unwrap_err(),
+            ExportError::Busy,
+            "timeout must retain admission until the writer acknowledges cancellation"
+        );
     }
     assert!(!path.exists());
     release.send(()).unwrap();
@@ -534,7 +588,7 @@ async fn lifecycle_and_deferred_counts_survive_disabled_export_without_claiming_
     assert_eq!(r.state.lock().unwrap().aggregates.len(), 1);
     r.set_enabled(false);
     let path = dir.path().canonicalize().unwrap().join("report");
-    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 0);
+    assert_eq!(await_writer(r.export_to(path.clone())).unwrap().records, 0);
     let text = std::fs::read_to_string(path).unwrap();
     let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(header["deferred"][0]["count"], 2000);
@@ -547,36 +601,38 @@ async fn lifecycle_and_deferred_counts_survive_disabled_export_without_claiming_
 }
 #[tokio::test]
 async fn queued_flush_controls_cannot_write_post_export_cutoff_records_into_snapshot() {
-    let (dir, r, _) = fixture(Caps {
-        data: 2,
-        ..Caps::default()
+    await_writer(async {
+        let (dir, r, _) = fixture(Caps {
+            data: 2,
+            ..Caps::default()
+        });
+        r.set_enabled(true);
+        let owner = r.intern(Key::Owner("a")).unwrap();
+        let release = pause(&r);
+        r.control
+            .send(writer::Control::Flush { cutoff: 0 })
+            .unwrap();
+        r.control
+            .send(writer::Control::Flush { cutoff: 0 })
+            .unwrap();
+        assert!(Recorder::record(&r, event(&owner, 1)));
+        let path = dir.path().canonicalize().unwrap().join("report");
+        let export = r.export_to(path.clone());
+        tokio::pin!(export);
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        assert!(Recorder::record(&r, event(&owner, 2)));
+        release.send(()).unwrap();
+        assert_eq!(
+            export.await.unwrap().records,
+            1,
+            "later accepted record must remain outside the frozen export"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("\"revision\":2"));
     });
-    r.set_enabled(true);
-    let owner = r.intern(Key::Owner("a")).unwrap();
-    let release = pause(&r);
-    r.control
-        .send(writer::Control::Flush { cutoff: 0 })
-        .unwrap();
-    r.control
-        .send(writer::Control::Flush { cutoff: 0 })
-        .unwrap();
-    assert!(Recorder::record(&r, event(&owner, 1)));
-    let path = dir.path().canonicalize().unwrap().join("report");
-    let export = r.export_to(path.clone());
-    tokio::pin!(export);
-    assert!(matches!(
-        std::future::poll_fn(|cx| std::task::Poll::Ready(export.as_mut().poll(cx))).await,
-        std::task::Poll::Pending
-    ));
-    assert!(Recorder::record(&r, event(&owner, 2)));
-    release.send(()).unwrap();
-    assert_eq!(
-        export.await.unwrap().records,
-        1,
-        "later accepted record must remain outside the frozen export"
-    );
-    let text = std::fs::read_to_string(path).unwrap();
-    assert!(!text.contains("\"revision\":2"));
 }
 #[tokio::test]
 async fn restart_of_unclosed_capture_marks_unknown_tail_instead_of_inventing_zero_loss() {
@@ -585,14 +641,14 @@ async fn restart_of_unclosed_capture_marks_unknown_tail_instead_of_inventing_zer
     let owner = r.intern(Key::Owner("a")).unwrap();
     assert!(Recorder::record(&r, event(&owner, 1)));
     let path = dir.path().canonicalize().unwrap().join("report");
-    assert!(!r.export_to(path.clone()).await.unwrap().incomplete);
+    assert!(!await_writer(r.export_to(path.clone())).unwrap().incomplete);
     let config = r.config.clone();
     drop(r);
     // An active capture in the durable manifest provides no proof that all
     // admitted records reached disk before process termination.
     let restarted = Recorder::new(config).unwrap();
     assert_eq!(restarted.status().loss.unclean_capture, 1);
-    assert!(restarted.export_to(path).await.unwrap().incomplete);
+    assert!(await_writer(restarted.export_to(path)).unwrap().incomplete);
 }
 
 async fn closed_two_records() -> (tempfile::TempDir, Config, PathBuf) {
@@ -603,7 +659,7 @@ async fn closed_two_records() -> (tempfile::TempDir, Config, PathBuf) {
     assert!(Recorder::record(&r, event(&owner, 2)));
     r.set_enabled(false);
     let report = dir.path().canonicalize().unwrap().join("report");
-    assert_eq!(r.export_to(report).await.unwrap().records, 2);
+    assert_eq!(await_writer(r.export_to(report)).unwrap().records, 2);
     let config = r.config.clone();
     drop(r);
     let segment = writer::segment_path(&config.directory, 0);
@@ -616,10 +672,8 @@ async fn fix1_closed_valid_line_truncation_is_an_explicit_durable_gap() {
     let first = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
     std::fs::write(segment, &bytes[..first]).unwrap();
     let r = Recorder::new(config).unwrap();
-    let result = r
-        .export_to(dir.path().canonicalize().unwrap().join("after"))
-        .await
-        .unwrap();
+    let result =
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("after"))).unwrap();
     assert_eq!(result.records, 1);
     assert_eq!(r.status().loss.durable_gap_records, 1);
     assert_eq!(
@@ -637,10 +691,8 @@ async fn fix1_missing_closed_segment_is_an_explicit_durable_gap() {
     let (dir, config, segment) = closed_two_records().await;
     std::fs::remove_file(segment).unwrap();
     let r = Recorder::new(config).unwrap();
-    let result = r
-        .export_to(dir.path().canonicalize().unwrap().join("after"))
-        .await
-        .unwrap();
+    let result =
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("after"))).unwrap();
     assert_eq!(result.records, 0);
     assert_eq!(r.status().loss.durable_gap_records, 2);
     assert_eq!(r.status().loss.durable_gap_segments, 1);
@@ -664,14 +716,14 @@ async fn fix1_clean_disabled_restart_preserves_deferred_totals_or_durable_omissi
     }
     r.set_enabled(false);
     let path = dir.path().canonicalize().unwrap().join("before");
-    r.export_to(path.clone()).await.unwrap();
+    await_writer(r.export_to(path.clone())).unwrap();
     let before = std::fs::read_to_string(path).unwrap();
     assert!(before.contains("\"count\":2000"));
     let config = r.config.clone();
     drop(r);
     let r = Recorder::new(config.clone()).unwrap();
     let path = dir.path().canonicalize().unwrap().join("after");
-    let result = r.export_to(path.clone()).await.unwrap();
+    let result = await_writer(r.export_to(path.clone())).unwrap();
     let after = std::fs::read_to_string(path).unwrap();
     assert!(
         after.contains("\"count\":2000") || result.incomplete,
@@ -687,9 +739,7 @@ async fn fix1_clean_disabled_restart_preserves_deferred_totals_or_durable_omissi
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_DEFERRED_OWNER"));
     }
     let r = Recorder::new(config).unwrap();
-    r.export_to(dir.path().canonicalize().unwrap().join("again"))
-        .await
-        .unwrap();
+    await_writer(r.export_to(dir.path().canonicalize().unwrap().join("again"))).unwrap();
     assert_eq!(r.status().loss.deferred_aggregate_gaps, 1);
 }
 #[test]
@@ -761,10 +811,8 @@ async fn fix1_extra_flushed_records_beyond_manifest_are_retained_without_false_g
     file.sync_all().unwrap();
     drop(file);
     let r = Recorder::new(config).unwrap();
-    let result = r
-        .export_to(dir.path().canonicalize().unwrap().join("after"))
-        .await
-        .unwrap();
+    let result =
+        await_writer(r.export_to(dir.path().canonicalize().unwrap().join("after"))).unwrap();
     assert_eq!(result.records, 3);
     assert!(!result.incomplete);
     assert_eq!(r.status().loss.durable_gap_records, 0);
@@ -783,17 +831,17 @@ async fn fix1_recorded_rotation_and_repeated_restart_do_not_double_count_gaps() 
     }
     r.set_enabled(false);
     let path = dir.path().canonicalize().unwrap().join("report");
-    r.export_to(path.clone()).await.unwrap();
+    await_writer(r.export_to(path.clone())).unwrap();
     let loss = r.status().loss;
     let config = r.config.clone();
     drop(r);
     let r = Recorder::new(config.clone()).unwrap();
-    r.export_to(path.clone()).await.unwrap();
+    await_writer(r.export_to(path.clone())).unwrap();
     assert_eq!(r.status().loss.durable_gap_segments, 0);
     assert_eq!(r.status().loss.rotated_out, loss.rotated_out);
     drop(r);
     let r = Recorder::new(config).unwrap();
-    r.export_to(path).await.unwrap();
+    await_writer(r.export_to(path)).unwrap();
     assert_eq!(r.status().loss.durable_gap_segments, 0);
     assert_eq!(r.status().loss.rotated_out, loss.rotated_out);
 }
@@ -828,7 +876,7 @@ async fn fix1_concurrent_success_keeps_only_new_delta_deferred_and_reuses_comple
         release.send(()).unwrap();
     });
     let path = dir.path().canonicalize().unwrap().join("report");
-    assert_eq!(r.export_to(path.clone()).await.unwrap().records, 1);
+    assert_eq!(await_writer(r.export_to(path.clone())).unwrap().records, 1);
     let text = std::fs::read_to_string(path).unwrap();
     let lines: Vec<serde_json::Value> = text
         .lines()
@@ -877,39 +925,49 @@ fn legacy_five_domain_loss_remains_readable_after_shared_transport_classificatio
 }
 
 async fn completion_allows_immediate_export(destination_refused: bool) {
-    let (dir, r, _) = fixture(Caps::default());
-    r.set_enabled(true);
-    let owner = r.intern(Key::Owner("a")).unwrap();
-    assert!(Recorder::record(&r, event(&owner, 1)));
-    let root = dir.path().canonicalize().unwrap();
-    let destination = root.join("first");
-    if destination_refused {
-        std::fs::create_dir(&destination).unwrap();
-        std::fs::write(destination.join("keep"), "keep").unwrap();
-    }
-    let (release, gate) = std::sync::mpsc::channel();
-    *r.shared.export_reply_gate.lock().unwrap() = Some(gate);
-    let first = r.export_to(destination.clone()).await;
-    let second = r.export_to(root.join("second"));
-    tokio::pin!(second);
-    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx))).await;
-    // Always release before assertions/drop, including the intentional RED path.
-    let released = release.send(());
-    assert!(
-        matches!(polled, std::task::Poll::Pending),
-        "completed export retained admission: {polled:?}"
-    );
-    released.unwrap();
-    if destination_refused {
-        assert_eq!(first.unwrap_err(), ExportError::Destination);
-        assert_eq!(
-            std::fs::read_to_string(destination.join("keep")).unwrap(),
-            "keep"
+    await_writer(async {
+        let (dir, r, _) = fixture(Caps::default());
+        r.set_enabled(true);
+        let owner = r.intern(Key::Owner("a")).unwrap();
+        assert!(Recorder::record(&r, event(&owner, 1)));
+        let root = dir.path().canonicalize().unwrap();
+        let destination = root.join("first");
+        if destination_refused {
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("keep"), "keep").unwrap();
+        }
+        let (release, gate) = std::sync::mpsc::channel();
+        *r.shared.export_reply_gate.lock().unwrap() = Some(gate);
+        let first = r.export_to(destination.clone()).await;
+        assert!(
+            matches!(
+                (&first, destination_refused),
+                (Ok(_), false) | (Err(ExportError::Destination), true)
+            ),
+            "first export must complete before testing released admission: {first:?}"
         );
-    } else {
-        assert_eq!(first.unwrap().records, 1);
-    }
-    assert_eq!(second.await.unwrap().records, 1);
+        let second = r.export_to(root.join("second"));
+        tokio::pin!(second);
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx))).await;
+        // Always release before assertions/drop, including the intentional RED path.
+        let released = release.send(());
+        assert!(
+            matches!(polled, std::task::Poll::Pending),
+            "completed export retained admission: {polled:?}"
+        );
+        released.unwrap();
+        if destination_refused {
+            assert_eq!(first.unwrap_err(), ExportError::Destination);
+            assert_eq!(
+                std::fs::read_to_string(destination.join("keep")).unwrap(),
+                "keep"
+            );
+        } else {
+            assert_eq!(first.unwrap().records, 1);
+        }
+        assert_eq!(second.await.unwrap().records, 1);
+    });
 }
 #[tokio::test]
 async fn ci_export_success_releases_admission_before_reply() {
@@ -1020,7 +1078,7 @@ async fn preference_capture_negotiation_keeps_old_links_strict_and_new_unlinked_
     }
     assert_eq!(r.status().loss.stale_handle, 2);
     let path = dir.path().canonicalize().unwrap().join("capture-export");
-    r.export_to(path.clone()).await.unwrap();
+    await_writer(r.export_to(path.clone())).unwrap();
     let text = std::fs::read_to_string(path).unwrap();
     let records: Vec<serde_json::Value> = text
         .lines()
@@ -1052,10 +1110,7 @@ async fn recent_phone_export_selects_whole_record_suffix_with_explicit_omission(
     );
     assert_eq!(r.status().durable_records, 200);
     let path = dir.path().canonicalize().unwrap().join("recent.jsonl");
-    let receipt = r
-        .export_with_limit(path.clone(), Some(66 * 1024))
-        .await
-        .unwrap();
+    let receipt = await_writer(r.export_with_limit(path.clone(), Some(66 * 1024))).unwrap();
     let bytes = std::fs::read(path).unwrap();
     assert!(
         bytes.len() <= 66 * 1024,
@@ -1093,7 +1148,7 @@ async fn recent_phone_export_selects_whole_record_suffix_with_explicit_omission(
 async fn recent_phone_export_empty_history_is_a_valid_bounded_frame() {
     let (dir, r, _) = fixture(Caps::default());
     let path = dir.path().canonicalize().unwrap().join("empty.jsonl");
-    let receipt = r.export_recent_to(path.clone()).await.unwrap();
+    let receipt = await_writer(r.export_recent_to(path.clone())).unwrap();
     let bytes = std::fs::read(path).unwrap();
     let lines: Vec<serde_json::Value> = bytes
         .split(|b| *b == b'\n')
@@ -1136,12 +1191,12 @@ async fn task6d_mounted_producers_export_smoke() {
     assert!(batch.len() <= 32);
     r.client_events(batch.clone()).unwrap();
     let disabled = root.join("client-disabled.jsonl");
-    r.export_to(disabled.clone()).await.unwrap();
+    await_writer(r.export_to(disabled.clone())).unwrap();
     assert_eq!(r.status().durable_records, 0);
     r.set_enabled(true);
     r.client_events(batch).unwrap();
     let path = root.join("mounted-client.jsonl");
-    r.export_to(path.clone()).await.unwrap();
+    await_writer(r.export_to(path.clone())).unwrap();
     let text = std::fs::read_to_string(path).unwrap();
     for kind in ["mounted_review", "stats_view", "transcript_view"] {
         assert!(text.contains(kind));

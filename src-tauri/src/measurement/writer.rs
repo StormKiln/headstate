@@ -447,7 +447,8 @@ impl Writer {
                     let _ = reply.send(result);
                     #[cfg(test)]
                     if let Some(gate) = self.shared.export_reply_gate.lock().unwrap().take() {
-                        let _ = gate.recv_timeout(Duration::from_secs(2));
+                        // The test owns the sender; dropping it also releases us on panic.
+                        let _ = gate.recv();
                     }
                 }
                 Err(TryRecvError::Empty) => {}
