@@ -920,10 +920,18 @@ mod tests {
     /// Exit 0 at once, the way a launcher that has handed off does.
     const HANDS_OFF: &str = "exit 0";
 
-    /// Stay running, the way a terminal the user keeps open does. 60s
-    /// stands in for "as long as the user keeps it open": long enough
-    /// that waiting on it is unmistakable in the timing.
-    const STAYS_OPEN: &str = "sleep 60";
+    /// Own the synthetic terminal until the assertion finishes, including
+    /// unwinding. A dropped Child does not stop its process: the old sleep
+    /// fixture inherited CI stdout and kept that pipe open after a fast suite
+    /// finished (#1773). Only this test-owned shell is killed and reaped.
+    struct FixtureChild(std::process::Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     #[test]
     fn a_program_that_exits_non_zero_at_once_is_reported_not_called_success() {
@@ -978,22 +986,33 @@ mod tests {
     /// The property the module header calls load-bearing: a real
     /// terminal, which stays open for hours, must not be waited on.
     ///
-    /// Asserted on the CLOCK rather than on the code, because "it
-    /// returns" is not the claim -- the claim is that it returns
-    /// PROMPTLY while the child is still running. A `wait()` that
-    /// slipped back in would hang here for 60 seconds and fail on the
-    /// elapsed-time assertion, which is the regression that matters.
+    /// Asserted on the clock AND the child's live state: returning after the
+    /// child has exited would not prove the nonblocking success path. Keep
+    /// ownership here while exercising the production watcher; the tests above
+    /// exercise launch's parsing, spawning, and exit reporting end to end.
     #[test]
     fn a_terminal_that_stays_open_is_not_waited_on() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let dir = temp.path();
+        // A shell builtin blocked on our open stdin has no child processes of
+        // its own. Killing this fixture therefore closes every inherited CI
+        // output handle on Windows as well as Unix, without PID-file races.
+        let mut child = FixtureChild(
+            Command::new("sh")
+                .args(["-c", "read -r fixture"])
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the test-owned terminal"),
+        );
         let start = std::time::Instant::now();
-        launch(SHELL, STAYS_OPEN, Some(&dir.to_string_lossy()))
-            .expect("a still-running terminal is a successful launch");
+        watch_briefly(&mut child.0).expect("a still-running terminal is a successful launch");
         let elapsed = start.elapsed();
         assert!(
             elapsed < SETTLE * 4,
             "launch waited {elapsed:?} on a child that stays open -- it must return after ~{SETTLE:?}"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the fixture must still be running"
         );
     }
 
