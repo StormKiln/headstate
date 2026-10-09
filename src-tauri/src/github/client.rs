@@ -2940,105 +2940,156 @@ mod tests {
     #[tokio::test]
     async fn credential_binding_persistence_respects_viewer_deadline() {
         use std::time::{Duration, Instant};
-        let artifact =
-            std::env::var_os("HEADSTATE_CREDENTIAL_PROBE_DIR").map(std::path::PathBuf::from);
-        let temporary = tempfile::tempdir().unwrap();
-        let root = artifact.as_deref().unwrap_or_else(|| temporary.path());
-        std::fs::create_dir_all(root).unwrap();
-        let mut observations = Vec::new();
-        for metered in [false, true] {
-            for existing in [false, true] {
-                let server = MockServer::start().await;
-                Mock::given(method("POST"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"}}})),
-                    )
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                let path = root.join(format!("binding-{metered}-{existing}.db"));
-                let conn = crate::store::open_db(&path).unwrap();
-                let client = client_for(&server)
-                    .await
-                    .with_credential("synthetic-binding-probe", path.clone());
-                if existing {
-                    crate::store::source_cache::save_verified_binding(
-                        &conn,
-                        client.credential_binding().unwrap(),
-                        "synthetic-viewer",
-                    )
-                    .unwrap();
+
+        struct HeldWriter {
+            release: Option<std::sync::mpsc::Sender<()>>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl HeldWriter {
+            fn finish(mut self) {
+                drop(self.release.take());
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+        impl Drop for HeldWriter {
+            fn drop(&mut self) {
+                // Channel closure releases the transaction even on assertion panic.
+                drop(self.release.take());
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
                 }
-                drop(conn);
-                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                let writer_path = path.clone();
-                let writer = std::thread::spawn(move || {
-                    let conn = crate::store::open_db(&writer_path).unwrap();
-                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-                    ready_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(700));
-                    conn.execute_batch("ROLLBACK").unwrap();
-                });
-                ready_rx.recv().unwrap();
-                let started = Instant::now();
-                let timer = tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    started.elapsed().as_millis()
-                });
-                let managed_client = client.clone();
-                let client = client.with_read_context(super::super::admission::ReadContext::new(
-                    super::super::admission::ReadClass::Foreground,
-                    Duration::from_millis(50),
-                ));
-                let result = if metered {
-                    client
-                        .fetch_viewer_metered(&crate::github::stats::Budget::new())
+            }
+        }
+
+        let scenario = async {
+            let artifact =
+                std::env::var_os("HEADSTATE_CREDENTIAL_PROBE_DIR").map(std::path::PathBuf::from);
+            let temporary = tempfile::tempdir().unwrap();
+            let root = artifact.as_deref().unwrap_or_else(|| temporary.path());
+            std::fs::create_dir_all(root).unwrap();
+            let mut observations = Vec::new();
+            for metered in [false, true] {
+                for existing in [false, true] {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                // Deliberately longer than the isolated persistence
+                                // budget: network readiness is not a 50ms promise (#1778).
+                                .set_delay(Duration::from_millis(100))
+                                .set_body_json(
+                                    json!({"data":{"viewer":{"login":"synthetic-viewer"}}}),
+                                ),
+                        )
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let path = root.join(format!("binding-{metered}-{existing}.db"));
+                    let conn = crate::store::open_db(&path).unwrap();
+                    let client = client_for(&server)
                         .await
-                } else {
-                    client.fetch_viewer().await
-                };
-                let elapsed = started.elapsed().as_millis();
-                let timer_elapsed = timer.await.unwrap();
-                writer.join().unwrap();
-                // A contended best-effort save must not become a late queued write.
-                let conn = crate::store::open_db(&path).unwrap();
-                let saved: i64 = conn
-                    .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
-                        r.get(0)
-                    })
-                    .unwrap();
-                if !metered {
-                    assert_eq!(
-                        managed_client.fetch_viewer().await.unwrap(),
-                        "synthetic-viewer"
-                    );
-                    let recovered: i64 = conn
+                        .with_credential("synthetic-binding-probe", path.clone());
+                    if existing {
+                        crate::store::source_cache::save_verified_binding(
+                            &conn,
+                            client.credential_binding().unwrap(),
+                            "synthetic-viewer",
+                        )
+                        .unwrap();
+                    }
+                    drop(conn);
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let writer_path = path.clone();
+                    let writer = HeldWriter {
+                        release: Some(release_tx),
+                        thread: Some(std::thread::spawn(move || {
+                            let conn = crate::store::open_db(&writer_path).unwrap();
+                            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                            let _ = ready_tx.send(());
+                            assert_ne!(
+                                release_rx.recv_timeout(Duration::from_secs(30)),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                                "fixture writer was never released"
+                            );
+                            conn.execute_batch("ROLLBACK").unwrap();
+                        })),
+                    };
+                    ready_rx.await.unwrap();
+
+                    // Both public paths must return verified HTTP data while a
+                    // writer remains held. Use their normal transport budget.
+                    let network_started = Instant::now();
+                    let result = if metered {
+                        client
+                            .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                            .await
+                    } else {
+                        client.fetch_viewer().await
+                    };
+                    let network_elapsed = network_started.elapsed().as_millis();
+                    assert_eq!(result.as_ref().unwrap(), "synthetic-viewer");
+
+                    // Now measure only persistence under the short deadline,
+                    // with no HTTP or writer-release race inside that budget.
+                    let started = Instant::now();
+                    let timer = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        started.elapsed().as_millis()
+                    });
+                    let short =
+                        client.with_read_context(super::super::admission::ReadContext::new(
+                            super::super::admission::ReadClass::Foreground,
+                            Duration::from_millis(50),
+                        ));
+                    short.persist_verified_viewer("synthetic-viewer").await;
+                    let elapsed = started.elapsed().as_millis();
+                    let timer_elapsed = timer.await.unwrap();
+                    writer.finish();
+                    let persistence = client.credential.as_ref().unwrap().persistence.clone();
+                    // A running or cancelled blocking job must retire before
+                    // checking for a late write, not after the assertion.
+                    drop(persistence.acquire().await.unwrap());
+                    let conn = crate::store::open_db(&path).unwrap();
+                    let saved: i64 = conn
                         .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
                             r.get(0)
                         })
                         .unwrap();
-                    assert_eq!(recovered, 1, "normal cached viewer call retries a transiently refused save without new HTTP");
+                    assert_eq!(
+                        saved,
+                        i64::from(existing),
+                        "a contended save must not publish after its caller retires"
+                    );
+
+                    if !metered {
+                        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+                        let recovered: i64 = conn
+                            .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                                r.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            recovered, 1,
+                            "normal cached viewer call retries a refused save without new HTTP"
+                        );
+                    }
+                    let receipts = server.received_requests().await.unwrap().len();
+                    assert_eq!(receipts, 1);
+                    observations.push(json!({"metered":metered,"alreadyBound":existing,
+                            "networkElapsedMs":network_elapsed,"elapsedMs":elapsed,"timerMs":timer_elapsed,
+                            "success":true,"providerReceipts":receipts,"bindingSaved":saved==1}));
                 }
-                observations.push(json!({"metered":metered,"alreadyBound":existing,
-                    "elapsedMs":elapsed,"timerMs":timer_elapsed,"success":result.is_ok(),
-                    "providerReceipts":server.received_requests().await.unwrap().len(),"bindingSaved":saved==1}));
             }
-        }
-        let evidence = serde_json::to_string_pretty(&observations).unwrap();
-        println!("credential binding probe: {evidence}");
-        if artifact.is_some() {
-            std::fs::write(root.join("result.json"), &evidence).unwrap();
-        }
-        assert!(
-            observations
-                .iter()
-                .all(|row| row["elapsedMs"].as_u64().unwrap() < 250
-                    && row["timerMs"].as_u64().unwrap() < 250
-                    && row["bindingSaved"] == row["alreadyBound"]
-                    && row["success"] == true),
-            "50ms viewer budget and concurrent runtime timer must not wait for the held writer"
-        );
+            let evidence = serde_json::to_string_pretty(&observations).unwrap();
+            println!("credential binding probe: {evidence}");
+            if artifact.is_some() {
+                std::fs::write(root.join("result.json"), &evidence).unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), scenario)
+            .await
+            .expect("the synchronized persistence probe must finish within its fixture budget");
     }
 
     #[tokio::test]
@@ -3147,114 +3198,154 @@ mod tests {
 
     #[test]
     fn credential_binding_queued_job_is_bounded_cancelled_and_never_publishes_late() {
+        use futures_util::FutureExt;
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
             .build()
             .unwrap();
         runtime.block_on(async {
-            let server = MockServer::start().await;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("binding.db");
-            let conn = crate::store::open_db(&path).unwrap();
-            let client = client_for(&server)
-                .await
-                .with_credential("synthetic-old", path.clone());
-            let gate = client.credential.as_ref().unwrap().persistence.clone();
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
-            started_rx.recv().unwrap();
-            let pending_client = client.clone();
-            let pending = tokio::spawn(async move {
-                pending_client
-                    .persist_verified_viewer("synthetic-old-viewer")
+            let scenario = async {
+                let server = MockServer::start().await;
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("binding.db");
+                let conn = crate::store::open_db(&path).unwrap();
+                let client = client_for(&server)
+                    .await
+                    .with_credential("synthetic-old", path.clone());
+                let gate = client.credential.as_ref().unwrap().persistence.clone();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    // Sender drop releases this worker on assertion panic; the real
+                    // bound also prevents a paused-clock fixture from waiting forever.
+                    assert_ne!(
+                        release_rx.recv_timeout(std::time::Duration::from_secs(30)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                        "fixture worker was never released"
+                    );
+                });
+                started_rx.await.unwrap();
+                let pending_client = client.clone();
+                let pending = tokio::spawn(async move {
+                    pending_client
+                        .persist_verified_viewer("synthetic-old-viewer")
+                        .await;
+                });
+                while gate.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+                // All overlapping callers skip rather than enqueue another blocking job.
+                for _ in 0..100 {
+                    client.persist_verified_viewer("synthetic-old-viewer").await;
+                    assert_eq!(gate.available_permits(), 0);
+                }
+                pending.abort();
+                let _ = pending.await;
+                release_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                drop(gate.acquire().await.unwrap());
+                let count: i64 = conn
+                    .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "aborted queued job cannot publish after its caller retires"
+                );
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    // Sender drop releases this worker on assertion panic; the real
+                    // bound also prevents a paused-clock fixture from waiting forever.
+                    assert_ne!(
+                        release_rx.recv_timeout(std::time::Duration::from_secs(30)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                        "fixture worker was never released"
+                    );
+                });
+                started_rx.await.unwrap();
+                // HTTP and worker readiness are outside the virtual deadline.
+                // This fresh binding is unconfirmed, so persistence must really queue.
+                tokio::time::pause();
+                let clock_start = tokio::time::Instant::now();
+                let timer = tokio::time::sleep(std::time::Duration::from_millis(20));
+                tokio::pin!(timer);
+                let short = client.with_read_context(super::super::admission::ReadContext::new(
+                    super::super::admission::ReadClass::Foreground,
+                    std::time::Duration::from_millis(50),
+                ));
+                let pending = short.persist_verified_viewer("synthetic-old-viewer");
+                tokio::pin!(pending);
+                assert!(
+                    pending.as_mut().now_or_never().is_none(),
+                    "persistence must await its occupied worker"
+                );
+                assert_eq!(
+                    gate.available_permits(),
+                    0,
+                    "the persistence job really queued"
+                );
+                // Poll borrowed pinned futures: no await can silently advance
+                // virtual time beyond the deadline being tested (#1778).
+                tokio::time::advance(std::time::Duration::from_millis(25)).await;
+                assert!(
+                    timer.as_mut().now_or_never().is_some(),
+                    "the runtime timer must progress while persistence waits"
+                );
+                assert!(
+                    pending.as_mut().now_or_never().is_none(),
+                    "persistence must not return before its deadline"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(35)).await;
+                assert!(
+                    pending.as_mut().now_or_never().is_some(),
+                    "persistence must return once its 50ms deadline passes"
+                );
+                assert!(clock_start.elapsed() <= std::time::Duration::from_millis(60));
+                tokio::time::resume();
+                // The caller finished at its deadline with the worker still held.
+                release_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                drop(gate.acquire().await.unwrap());
+                let count: i64 = conn
+                    .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "deadline also retires queued persistence without a late write"
+                );
+                let replacement = client_for(&server)
+                    .await
+                    .with_credential("synthetic-new", path);
+                replacement
+                    .persist_verified_viewer("synthetic-new-viewer")
                     .await;
-            });
-            while gate.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-            // All overlapping callers skip rather than enqueue another blocking job.
-            for _ in 0..100 {
-                client.persist_verified_viewer("synthetic-old-viewer").await;
-                assert_eq!(gate.available_permits(), 0);
-            }
-            pending.abort();
-            let _ = pending.await;
-            release_tx.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while gate.available_permits() != 1 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            let count: i64 = conn
-                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            assert_eq!(
-                count, 0,
-                "aborted queued job cannot publish after its caller retires"
-            );
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
-            started_rx.recv().unwrap();
-            let short = client.with_read_context(super::super::admission::ReadContext::new(
-                super::super::admission::ReadClass::Foreground,
-                std::time::Duration::from_millis(30),
-            ));
-            let started = std::time::Instant::now();
-            short.persist_verified_viewer("synthetic-old-viewer").await;
-            assert!(started.elapsed() < std::time::Duration::from_millis(250));
-            release_tx.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while gate.available_permits() != 1 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            let count: i64 = conn
-                .query_row("SELECT count(*) FROM snapshot_credentials", [], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            assert_eq!(
-                count, 0,
-                "deadline also retires queued persistence without a late write"
-            );
-            let replacement = client_for(&server)
+                let rows: Vec<(String, String)> = conn
+                    .prepare("SELECT binding,owner FROM snapshot_credentials")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![(
+                        replacement.credential_binding().unwrap().into(),
+                        "synthetic-new-viewer".into()
+                    )]
+                );
+                assert!(server.received_requests().await.unwrap().is_empty());
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), scenario)
                 .await
-                .with_credential("synthetic-new", path);
-            replacement
-                .persist_verified_viewer("synthetic-new-viewer")
-                .await;
-            let rows: Vec<(String, String)> = conn
-                .prepare("SELECT binding,owner FROM snapshot_credentials")
-                .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            assert_eq!(
-                rows,
-                vec![(
-                    replacement.credential_binding().unwrap().into(),
-                    "synthetic-new-viewer".into()
-                )]
-            );
-            assert!(server.received_requests().await.unwrap().is_empty());
+                .expect("the synchronized queued-persistence probe must finish");
         });
     }
 
