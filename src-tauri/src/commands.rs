@@ -9217,56 +9217,96 @@ mod claudify_tests {
 mod tests {
     #[tokio::test]
     async fn delayed_bulk_board_cannot_publish_after_stats_owner_changes() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        async fn fixture(
-            viewer: &str,
-        ) -> (
-            MockServer,
-            crate::github::client::GitHubClient,
-            serde_json::Value,
-        ) {
-            let server = MockServer::start().await;
-            let mut data = serde_json::json!({"viewer":{"login":viewer}});
-            for i in 0..20 {
-                data[format!("s{i}")] = serde_json::json!({"issueCount":0,"nodes":[]});
+        // Bound the whole fixture lifecycle, not the time a busy runner takes
+        // to migrate a database before its first HTTP request can arrive.
+        let scenario = async {
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            };
+            struct ResponseGate {
+                armed: AtomicBool,
+                arrived: tokio::sync::Notify,
+                release: tokio::sync::Semaphore,
             }
-            let response = serde_json::json!({"data":data});
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
-                .mount(&server)
-                .await;
-            let client = crate::github::client::GitHubClient::new(
-                octocrab::Octocrab::builder()
-                    .base_uri(server.uri())
-                    .unwrap()
-                    .personal_token("synthetic")
-                    .build()
-                    .unwrap(),
-            );
-            client
-                .stats_viewer_metered(&client.request_budget())
+            async fn fixture(
+                viewer: &str,
+                servers: &mut tokio::task::JoinSet<()>,
+            ) -> (crate::github::client::GitHubClient, Arc<ResponseGate>) {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let gate = Arc::new(ResponseGate {
+                    armed: AtomicBool::new(false),
+                    arrived: tokio::sync::Notify::new(),
+                    release: tokio::sync::Semaphore::new(0),
+                });
+                let mut data = serde_json::json!({"viewer":{"login":viewer}});
+                for i in 0..20 {
+                    data[format!("s{i}")] = serde_json::json!({"issueCount":0,"nodes":[]});
+                }
+                let response = serde_json::json!({"data":data});
+                let handler_gate = gate.clone();
+                let router = axum::Router::new().route(
+                    "/graphql",
+                    axum::routing::post(
+                        move |axum::Json(_request): axum::Json<serde_json::Value>| {
+                            let gate = handler_gate.clone();
+                            let response = response.clone();
+                            async move {
+                                if gate.armed.load(Ordering::SeqCst) {
+                                    // Signal only after the real request body arrived.
+                                    // A semaphore permit survives release-before-wait.
+                                    gate.arrived.notify_one();
+                                    gate.release.acquire().await.unwrap().forget();
+                                }
+                                axum::Json(response)
+                            }
+                        },
+                    ),
+                );
+                // JoinSet aborts the fixture server if an assertion unwinds.
+                servers.spawn(async move { axum::serve(listener, router).await.unwrap() });
+                let client = crate::github::client::GitHubClient::new(
+                    octocrab::Octocrab::builder()
+                        .base_uri(format!("http://{address}"))
+                        .unwrap()
+                        .personal_token("synthetic")
+                        .build()
+                        .unwrap(),
+                );
+                client
+                    .stats_viewer_metered(&client.request_budget())
+                    .await
+                    .unwrap();
+                (client, gate)
+            }
+            let mut servers = tokio::task::JoinSet::new();
+            let (old_client, old_gate) = fixture("old-viewer", &mut servers).await;
+            let (new_client, _new_gate) = fixture("new-viewer", &mut servers).await;
+            old_gate.armed.store(true, Ordering::SeqCst);
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("stats.db");
+            let load_db = db.clone();
+            let mut old = tokio::spawn(async move {
+                super::stats_board_for_client(
+                    &old_client,
+                    load_db,
+                    &tokio::sync::Notify::new(),
+                    "org".into(),
+                    Some("fixture-org".into()),
+                    "merged".into(),
+                    7,
+                )
                 .await
-                .unwrap();
-            (server, client, response)
-        }
-        let (old_server, old_client, response) = fixture("old-viewer").await;
-        let (_new_server, new_client, _) = fixture("new-viewer").await;
-        old_server.reset().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_millis(500))
-                    .set_body_json(response),
-            )
-            .mount(&old_server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("stats.db");
-        let load_db = db.clone();
-        let old = tokio::spawn(async move {
-            super::stats_board_for_client(
-                &old_client,
-                load_db,
+            });
+            tokio::select! {
+                _ = old_gate.arrived.notified() => {},
+                result = &mut old => panic!("old board ended before its HTTP request arrived: {result:?}"),
+            }
+            // Only the explicit release below can complete old HTTP (#1774).
+            let fresh = super::stats_board_for_client(
+                &new_client,
+                db.clone(),
                 &tokio::sync::Notify::new(),
                 "org".into(),
                 Some("fixture-org".into()),
@@ -9274,55 +9314,43 @@ mod tests {
                 7,
             )
             .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while old_server.received_requests().await.unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let fresh = super::stats_board_for_client(
-            &new_client,
-            db.clone(),
-            &tokio::sync::Notify::new(),
-            "org".into(),
-            Some("fixture-org".into()),
-            "merged".into(),
-            7,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fresh.viewer, "new-viewer");
-        assert!(
-            !old.is_finished(),
-            "new client must establish ownership before old HTTP completes"
-        );
-        let old_result = old.await.unwrap().unwrap();
-        assert_eq!(old_result.viewer, "old-viewer");
-        assert!(old_result.board.complete);
-        let conn = super::open_db(&db).unwrap();
-        let owner = crate::store::settings::get::<String>(
-            &conn,
-            crate::store::settings::keys::STATS_VIEWER,
-        )
-        .unwrap();
-        assert_eq!(owner.as_deref(), Some("new-viewer"));
-        let again = super::stats_board_for_client(
-            &new_client,
-            db.clone(),
-            &tokio::sync::Notify::new(),
-            "org".into(),
-            Some("fixture-org".into()),
-            "merged".into(),
-            7,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            again.viewer, "new-viewer",
-            "late old-client payload must not be served by the current client's cache"
-        );
+            .unwrap();
+            assert_eq!(fresh.viewer, "new-viewer");
+            assert!(
+                !old.is_finished(),
+                "new client must establish ownership before old HTTP completes"
+            );
+            old_gate.armed.store(false, Ordering::SeqCst);
+            old_gate.release.add_permits(1);
+            let old_result = old.await.unwrap().unwrap();
+            assert_eq!(old_result.viewer, "old-viewer");
+            assert!(old_result.board.complete);
+            let conn = super::open_db(&db).unwrap();
+            let owner = crate::store::settings::get::<String>(
+                &conn,
+                crate::store::settings::keys::STATS_VIEWER,
+            )
+            .unwrap();
+            assert_eq!(owner.as_deref(), Some("new-viewer"));
+            let again = super::stats_board_for_client(
+                &new_client,
+                db.clone(),
+                &tokio::sync::Notify::new(),
+                "org".into(),
+                Some("fixture-org".into()),
+                "merged".into(),
+                7,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                again.viewer, "new-viewer",
+                "late old-client payload must not be served by the current client's cache"
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), scenario)
+            .await
+            .expect("the synchronized ownership scenario must finish within its fixture budget");
     }
 
     /// Serialises the tests that CLEAR the remembered frames against the
