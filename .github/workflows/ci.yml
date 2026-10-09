@@ -823,25 +823,14 @@ jobs:
           #                     (#695). A change there changes what a
           #                     signature made on the phone has to satisfy.
           #
-          #   src-tauri/src/remote/events.rs
-          #   src-tauri/src/remote/surface.rs
-          #                     The non-obvious ones, and the reason this
-          #                     filter cannot just be "src-mobile plus
-          #                     crates". src-mobile's tests `include_str!`
-          #                     these two DESKTOP files at compile time --
-          #                     `events.rs:496` and `surface.rs:205` -- to
-          #                     compare the event allowlist and the surface
-          #                     table against the desktop's as they are
-          #                     checked in. `make test-mobile` is the only
-          #                     thing that runs those comparisons. Leave
-          #                     these out and a change to the desktop's
-          #                     `EVENT_NAMES` skips the very job that
-          #                     exists to catch it drifting -- which is a
-          #                     page on the phone that never fills in, with
-          #                     no error anywhere. (The third copy of the
-          #                     allowlist, `src/api/transport.test.ts`, is
-          #                     covered by `src/` below and by
-          #                     `test-frontend`, which is unconditional.)
+          #   src-tauri/src/measurement/, src-tauri/src/remote/
+          #                     Mobile imports the desktop measurement module
+          #                     with #[path], including its tests and fixtures.
+          #                     Mobile tests also include desktop remote sources
+          #                     to check the shared pairing and wire contract.
+          #                     Cover both subtrees so changes cannot skip their
+          #                     mobile consumers. check-mobile-gate.py checks this
+          #                     filter against literal shared-source references.
           #
           #   src/, index.html, public/, tsconfig*, vite.config.ts
           #                     The frontend is SHARED. `mobile-ios` ends
@@ -878,7 +867,7 @@ jobs:
           #                     the jobs themselves and the setup action
           #                     they share. A change to this file must
           #                     always test itself.
-          if echo "$CHANGED" | grep -qE '^(src-mobile/|crates/|src/|scripts/|public/|\.github/actions/|src-tauri/src/remote/(events|surface)\.rs$|index\.html$|package\.json$|yarn\.lock$|tsconfig[^/]*\.json$|vite\.config\.ts$|Makefile$|\.github/workflows/ci\.yml$)'; then
+          if echo "$CHANGED" | grep -qE '^(src-mobile/|crates/|src/|scripts/|public/|\.github/actions/|src-tauri/src/(measurement|remote)/|index\.html$|package\.json$|yarn\.lock$|tsconfig[^/]*\.json$|vite\.config\.ts$|Makefile$|\.github/workflows/ci\.yml$)'; then
             echo "Mobile-relevant paths changed; running the mobile jobs in full."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else

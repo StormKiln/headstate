@@ -188,7 +188,8 @@ thiserror = "2"
 # HTTP/1.1 for the client to talk to. Already in the graph through
 # reqwest's hyper-rustls; default features off so TLS 1.2 stays out.
 tokio-rustls = { version = "0.26", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
+# Shared measurement tests exercise paused deadlines; production features stay above.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "test-util"] }
 # The stand-in desktop gzips a reply the way the real listener does
 # (#1478). Already in this graph via png and zip.
 flate2 = "1"
