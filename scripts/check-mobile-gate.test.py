@@ -31,6 +31,8 @@ Run: python3 scripts/check-mobile-gate.test.py
 
 import importlib.util
 import pathlib
+import re
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -201,12 +203,18 @@ def verdict(name: str, yaml: str, should_pass: bool) -> None:
 
 
 # Both known jobs present, gated, every step carrying the condition.
+FILTER = guard.path_filter(guard.WORKFLOW.read_text())
 GOOD = f"""
 jobs:
   {GATE}:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Changed paths
+        run: |
+          if echo "$CHANGED" | grep -qE '{FILTER}'; then
+            echo run=true
+          fi
   mobile-android:
     needs: {GATE}
     runs-on: ubuntu-latest
@@ -307,6 +315,69 @@ verdict(
 """,
     True,
 )
+
+
+# #1783: exercise the actual grep expression, not a second list of paths.
+
+workflow = guard.WORKFLOW.read_text()
+filters = re.findall(r"^\s*if echo \"\$CHANGED\" \| grep -qE '([^']+)'; then\s*$", workflow, re.M)
+if len(filters) != 1:
+    failures.append("the actual workflow must expose exactly one mobile path filter")
+else:
+    expected_shared = ["src-tauri/src/measurement/mod.rs",
+                       "src-tauri/src/measurement/tests.rs",
+                       "src-tauri/src/measurement/writer.rs"] + [
+        f"src-tauri/src/remote/{name}.rs"
+        for name in ["pairing", "discovery", "identity", "listener", "events", "surface"]]
+    for path in expected_shared:
+        result = subprocess.run(['grep', '-E', filters[0]], input=path+'\n', text=True,
+                                capture_output=True)
+        if result.returncode != 0:
+            failures.append(f"actual mobile workflow filter excludes shared dependency {path}")
+    for path in ['docs/mobile-release-process.md', 'README.md']:
+        result = subprocess.run(['grep', '-E', filters[0]], input=path+'\n', text=True,
+                                capture_output=True)
+        if result.returncode != 1:
+            failures.append(f"unrelated documentation lost its mobile fast path: {path}")
+
+
+# Every literal desktop dependency in the real mobile sources must be covered.
+# The discovery is deliberately independent of a hard-coded desktop-file list.
+missing_shared = guard.uncovered_dependencies(workflow)
+if missing_shared:
+    failures.append(f"discovered mobile dependencies are not covered: {missing_shared}")
+
+# A new shared dependency outside today's prefixes must fail the guard. A
+# mod.rs reference also covers sibling/nested sources and test fixtures.
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    mobile = root / 'src-mobile/src'
+    mobile.mkdir(parents=True)
+    desktop = root / 'src-tauri/src/new_shared'
+    (desktop / 'module/nested').mkdir(parents=True)
+    for name in ['module/mod.rs', 'module/tests.rs', 'module/nested/worker.rs',
+                 'fixture.json', 'bytes.bin', 'included.rs']:
+        (desktop / name).write_text('synthetic fixture')
+    (root / 'src-tauri' / 'policy.json').write_text('{}')
+    (mobile / 'lib.rs').write_text('''
+#[path = "../../src-tauri/src/new_shared/module/mod.rs"]
+mod shared;
+const TEXT: &str = include_str!("../../src-tauri/src/new_shared/fixture.json");
+const BYTES: &[u8] = include_bytes!(r#"../../src-tauri/src/new_shared/bytes.bin"#);
+include!("../../src-tauri/src/new_shared/included.rs");
+const POLICY: &str = include_str!("../../src-tauri/policy.json");
+''')
+    expected = {f'src-tauri/src/new_shared/{name}' for name in
+                ['module/mod.rs', 'module/tests.rs', 'module/nested/worker.rs',
+                 'fixture.json', 'bytes.bin', 'included.rs']}
+    expected.add('src-tauri/policy.json')
+    if guard.shared_desktop_dependencies(root) != expected:
+        failures.append('literal include/path discovery missed a shared module dependency')
+    if set(guard.uncovered_dependencies(workflow, root)) != expected:
+        failures.append('a new shared source outside the filter did not fail coverage')
+    wider = workflow.replace(FILTER, FILTER.replace('^(src-mobile/', '^(src-tauri/policy\\.json$|src-tauri/src/new_shared/|src-mobile/'))
+    if guard.uncovered_dependencies(wider, root):
+        failures.append('covering a new shared source prefix did not repair the coverage guard')
 
 
 if failures:

@@ -19,6 +19,9 @@ is merely wasteful (the job does work it was meant to skip) but it also
 means the job is no longer honestly described by this comment, so it is
 checked too.
 
+The workflow filter must also cover literal desktop dependencies imported by
+mobile Rust sources, including the entire subtree of shared mod.rs modules.
+
 Deliberately parses by indentation rather than importing PyYAML, the same
 tradeoff `check-workflow-shells.py` makes: the lint runner has no
 third-party Python packages, and a guard that needs its own install is a
@@ -40,10 +43,13 @@ an empty result would otherwise pass vacuously, which is the same
 (check-privacy.sh, 'Abort loudly instead').
 """
 
+import os
 import pathlib
 import re
+import subprocess
 import sys
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = pathlib.Path(".github/workflows/ci.yml")
 GATE_JOB = "mobile-changes"
 CONDITION = f"needs.{GATE_JOB}.outputs.run == 'true'"
@@ -119,6 +125,61 @@ def steps_of(lines: list[str]):
         yield current
 
 
+def path_filter(text: str) -> str:
+    """Read the actual grep -E expression from the mobile-changes job."""
+    body = "\n".join(jobs_of(text).get(GATE_JOB, []))
+    matches = re.findall(r"^\s*if echo \"\$CHANGED\" \| grep -qE '([^']+)'; then\s*$", body, re.M)
+    if len(matches) != 1:
+        raise ValueError("expected exactly one literal mobile path filter")
+    return matches[0]
+
+
+def shared_desktop_dependencies(root: pathlib.Path) -> set[str]:
+    """Conservative literal-source scan, not a Rust parser.
+
+    #[path] modules and include macros resolve beside the mobile source. A
+    shared mod.rs imports its whole directory, including tests and fixtures.
+    Ignore generated build/dependency trees; inspect mobile plugins too.
+    """
+    root = root.resolve()
+    references = re.compile(
+        r'(?:#\s*\[\s*path\s*=|include(?:_str|_bytes)?!\s*\()\s*'
+        r'(?:r#*)?"([^"\r\n]+)"'
+    )
+    dependencies: set[str] = set()
+    for folder, dirs, files in os.walk(root / "src-mobile"):
+        dirs[:] = [name for name in dirs if name not in {"target", "node_modules", ".git"}]
+        for name in files:
+            if not name.endswith(".rs"):
+                continue
+            source = pathlib.Path(folder) / name
+            text = "\n".join(line for line in source.read_text().splitlines()
+                             if not line.lstrip().startswith("//"))
+            for literal in references.findall(text):
+                dependency = (source.parent / literal).resolve()
+                if not dependency.is_relative_to(root / "src-tauri"):
+                    continue
+                dependencies.add(dependency.relative_to(root).as_posix())
+                if dependency.name == "mod.rs":
+                    dependencies.update(path.relative_to(root).as_posix()
+                                        for path in dependency.parent.rglob("*") if path.is_file())
+    return dependencies
+
+
+def uncovered_dependencies(text: str, root: pathlib.Path = ROOT) -> list[str]:
+    expression = path_filter(text)
+    dependencies = sorted(shared_desktop_dependencies(root))
+    if not dependencies:
+        raise ValueError("no shared desktop dependencies found in mobile Rust sources")
+    # Use grep itself: Python's regular-expression dialect is not grep -E.
+    result = subprocess.run(["grep", "-E", expression],
+                            input="\n".join(dependencies) + "\n", text=True,
+                            capture_output=True, check=False)
+    if result.returncode not in (0, 1):
+        raise ValueError("the mobile path filter is not a valid grep -E expression")
+    return sorted(set(dependencies) - set(result.stdout.splitlines()))
+
+
 def main() -> int:
     text = WORKFLOW.read_text()
     jobs = jobs_of(text)
@@ -129,6 +190,12 @@ def main() -> int:
         print("have nothing to read their condition from and would skip")
         print("every step while reporting success.")
         return 1
+
+    try:
+        problems.extend(f"shared mobile dependency `{path}` is excluded by the workflow path filter"
+                        for path in uncovered_dependencies(text))
+    except ValueError as error:
+        problems.append(str(error))
 
     checked = gated_jobs(jobs)
 
@@ -169,13 +236,14 @@ def main() -> int:
         for p in problems:
             print(f"  {p}")
         print()
+        print("The path filter must cover every discovered shared desktop dependency.")
         print("Every step of the mobile jobs must carry")
         print(f"  if: {CONDITION}")
         print(f"and each job must declare `needs: {GATE_JOB}`. See the")
         print(f"`{GATE_JOB}` job in {WORKFLOW} for why.")
         return 1
 
-    print(f"The mobile path gate is wired correctly on {', '.join(checked)}.")
+    print(f"The mobile path gate is wired correctly on {', '.join(checked)} and covers shared desktop sources.")
     return 0
 
 
