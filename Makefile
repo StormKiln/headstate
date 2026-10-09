@@ -399,6 +399,10 @@ lint-deps:
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
+	python3 scripts/wait-release-ci.test.py
+	python3 scripts/publish-release.test.py
+	python3 scripts/release_delivery.test.py
+	python3 scripts/reserve-mobile-release.test.py
 	python3 scripts/verify-linux-appimage.test.py
 	python3 scripts/check-native.test.py
 	python3 scripts/check-workflow-shells.test.py
@@ -423,7 +427,7 @@ lint-deps:
 	# installs it, so the gate is there; this is the local feedback loop.
 	# No GitHub Action and so no new pinned SHA -- it is one binary.
 	@if command -v actionlint >/dev/null 2>&1; then \
-		actionlint; \
+		python3 scripts/lint-workflows.test.py && python3 scripts/lint-workflows.py; \
 	else \
 		echo "actionlint not installed; skipping (brew install actionlint). CI runs it."; \
 	fi
