@@ -229,7 +229,7 @@ tower-service = "0.3"
 # zstd-sys, a C library, to both graphs for a smaller win on text this
 # compressible. Why only the call routes, and why the CRIME/BREACH shape
 # does not apply, is argued in `remote/listener.rs`.
-tower-http = { version = "0.6", default-features = false, features = ["compression-gzip"] }
+tower-http = { version = "0.7", default-features = false, features = ["compression-gzip"] }
 # The `/v1/events` stream (`remote/events.rs`): axum's `Sse` takes a
 # `Stream`, and `stream::unfold` is what turns a broadcast receiver plus
 # a revocation watch into one without a hand-written poll function.
