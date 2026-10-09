@@ -132,3 +132,10 @@ describe("PairingGate", () => {
     expect(screen.queryByText(/pair with your desktop/i)).toBeNull();
   });
 });
+
+it("offers remote setup before pairing with truthful relay privacy copy", async () => {
+  await renderGate("mobile");
+  await screen.findByText("Set up Tailscale");
+  expect(screen.getByText(/Your private network may relay encrypted traffic/)).toBeTruthy();
+  expect(screen.queryByText(/Nothing is sent to any server/)).toBeNull();
+});

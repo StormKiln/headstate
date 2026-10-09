@@ -77,9 +77,9 @@ const SERVER_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
 /// A LAN peer that is up answers a connect in single-digit
 /// milliseconds; an overlay hop (Tailscale, WireGuard) over cellular is
 /// the slow case, and still an order of magnitude inside this. What the
-/// old three seconds bought was a pathological WAN that this app does
-/// not have -- and it cost that on EVERY dead address, serially, before
-/// the phone could say the desktop was unreachable.
+/// previous three seconds also delayed every dead path. Keep the existing
+/// one-second limit until physical-device cold-VPN and relay measurements
+/// support a change; loopback tests cannot establish that budget.
 ///
 /// It is deliberately not tighter than a second. Below that a cold
 /// radio waking for the first packet starts to look like a dead
@@ -144,6 +144,21 @@ pub enum ClientError {
     /// The desktop answered something this client cannot use.
     #[error("bad reply from the desktop: {0}")]
     Protocol(String),
+}
+
+/// Bounded, privacy-safe diagnostics: never format a transport error or URL.
+pub(crate) fn failure_category(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::FingerprintMismatch => "identity",
+        ClientError::Handshake(_) => "tls",
+        ClientError::Unreachable(_) => "unreachable",
+        ClientError::TimedOut(_) => "timeout",
+        ClientError::Status {
+            status: 401 | 403, ..
+        } => "authorization",
+        ClientError::Status { .. } => "http",
+        ClientError::Protocol(_) => "protocol",
+    }
 }
 
 impl ClientError {
@@ -277,7 +292,10 @@ pub fn tls_config(identity: &SessionIdentity, server_fp: &str) -> Result<ClientC
 /// is for a busy network rather than for a desktop that is not there.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
+type HelloResult = (std::time::Instant, bool, Result<Hello, ClientError>);
+
 pub struct Client {
+    hello_check: tokio::sync::Mutex<Option<HelloResult>>,
     calls: reqwest::Client,
     stream: reqwest::Client,
     addrs: Vec<String>,
@@ -396,9 +414,13 @@ impl Client {
                 .map_err(|e| ClientError::Protocol(format!("HTTP client: {e}")))
         };
         Ok(Self {
+            hello_check: tokio::sync::Mutex::new(None),
             calls: build(base().timeout(call_timeout))?,
             stream: build(base().read_timeout(STREAM_READ_TIMEOUT))?,
-            addrs,
+            addrs: addrs
+                .into_iter()
+                .take(crate::pairing::MAX_QR_ADDRESSES)
+                .collect(),
             port,
             preferred: Mutex::new(None),
             server_fp: server_fp.to_string(),
@@ -463,7 +485,7 @@ impl Client {
         .flatten()?;
         let (ip, port) = found;
         let base = Self::base_url(&ip.to_string(), port);
-        log::info!("companion: found the desktop at {base} over mDNS");
+        log::info!("companion: discovered a desktop candidate over mDNS");
         Some(base)
     }
 
@@ -510,7 +532,7 @@ impl Client {
     /// rather than being raced out by it. `select!` on a set that drops
     /// the losers gives exactly that -- the first NON-`Unreachable`
     /// outcome returns and the rest are cancelled where they stand.
-    async fn try_each<T, F, Fut>(&self, f: F) -> Result<T, ClientError>
+    async fn try_each<T, F, Fut>(&self, discover: bool, f: F) -> Result<T, ClientError>
     where
         F: Fn(String) -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
@@ -523,6 +545,7 @@ impl Client {
         }
 
         let bases = self.bases();
+        let started = std::time::Instant::now();
         // EVERY attempt, not just the most recent. A phone that cannot
         // reach its desktop is the hardest failure to diagnose from the
         // outside -- the user sees one red box and has no way to learn
@@ -536,7 +559,7 @@ impl Client {
         let mut next = 0;
 
         loop {
-            if next < bases.len() {
+            if next < bases.len() && running.len() < crate::pairing::MAX_ADDRESSES {
                 running.push((bases[next].clone(), Box::pin(f(bases[next].clone()))));
                 next += 1;
             } else if running.is_empty() {
@@ -547,10 +570,25 @@ impl Client {
             // than the stagger while there is still an address to add.
             // `poll_settled` returns None on the stagger elapsing, which
             // is the signal to widen rather than to give up.
-            let more = next < bases.len();
+            let more = next < bases.len() && running.len() < crate::pairing::MAX_ADDRESSES;
             let Some((base, result)) = poll_settled(&mut running, more).await else {
                 continue;
             };
+            let ordinal = bases
+                .iter()
+                .position(|candidate| *candidate == base)
+                .map_or(0, |i| i + 1);
+            let address_class =
+                match Self::addr_of(&base).and_then(|host| host.parse::<std::net::IpAddr>().ok()) {
+                    Some(std::net::IpAddr::V4(_)) => "ipv4",
+                    Some(std::net::IpAddr::V6(_)) => "ipv6",
+                    None => "dns",
+                };
+            log::debug!(
+                "companion: candidate {ordinal} ({address_class}), {} ms, {}",
+                started.elapsed().as_millis().min(9999),
+                result.as_ref().err().map_or("ok", failure_category)
+            );
             match result {
                 Ok(v) => {
                     self.remember(&base);
@@ -582,7 +620,10 @@ impl Client {
                     | ClientError::Handshake(_)
                     | ClientError::FingerprintMismatch),
                 ) => {
-                    log::info!("companion: {base} did not answer: {e}");
+                    log::info!(
+                        "companion: connection candidate failed ({})",
+                        failure_category(&e)
+                    );
                     attempts.push(Attempt { base, err: e });
                 }
                 // The desktop's own answer -- a status or a malformed
@@ -601,7 +642,7 @@ impl Client {
         // rediscovering would spend `DISCOVERY_TIMEOUT` to be told the
         // same thing by the same machine.
         let answered = attempts.iter().any(|a| rank(&a.err) > 0);
-        if let Some(base) = if answered {
+        if let Some(base) = if answered || !discover {
             None
         } else {
             self.rediscover().await
@@ -617,7 +658,10 @@ impl Client {
                     | ClientError::Handshake(_)
                     | ClientError::FingerprintMismatch),
                 ) => {
-                    log::info!("companion: the address from mDNS did not answer: {e}");
+                    log::info!(
+                        "companion: discovered candidate failed ({})",
+                        failure_category(&e)
+                    );
                     attempts.push(Attempt {
                         base: format!("{base} (found by mDNS)"),
                         err: e,
@@ -706,18 +750,45 @@ impl Client {
         )
     }
 
-    /// `GET /v1/hello`.
+    /// `GET /v1/hello`, coalesced across simultaneous foreground,
+    /// background and subscriber callers. Completed checks are not a TTL
+    /// cache: a subsequent check must observe revocation or a changed path.
     pub async fn hello(&self) -> Result<Hello, ClientError> {
-        self.try_each(|base| async move {
-            let resp = self
-                .calls
-                .get(format!("{base}/v1/hello"))
-                .send()
-                .await
-                .map_err(classify)?;
-            json_body(resp).await
-        })
+        self.probe_hello(true).await
+    }
+
+    /// Probe stored candidates only, without discovery or provider reads.
+    pub async fn check_connection(&self) -> Result<Hello, ClientError> {
+        self.probe_hello(false).await
+    }
+
+    async fn probe_hello(&self, discover: bool) -> Result<Hello, ClientError> {
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut shared = tokio::time::timeout_at(deadline, self.hello_check.lock())
+            .await
+            .map_err(|_| ClientError::TimedOut("connection check deadline".into()))?;
+        if let Some((finished, prior_discover, result)) = shared.as_ref() {
+            if *finished >= started && (*prior_discover == discover || result.is_ok()) {
+                return result.clone();
+            }
+        }
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.try_each(discover, |base| async move {
+                let response = self
+                    .calls
+                    .get(format!("{base}/v1/hello"))
+                    .send()
+                    .await
+                    .map_err(classify)?;
+                json_body(response).await
+            }),
+        )
         .await
+        .unwrap_or_else(|_| Err(ClientError::TimedOut("connection check deadline".into())));
+        *shared = Some((std::time::Instant::now(), discover, result.clone()));
+        result
     }
 
     /// `POST /v1/pair`. `body` is the pair request; the reply is the
@@ -726,7 +797,7 @@ impl Client {
         &self,
         body: &Req,
     ) -> Result<Out, ClientError> {
-        self.try_each(|base| async move {
+        self.try_each(true, |base| async move {
             let resp = self
                 .calls
                 .post(format!("{base}/v1/pair"))
@@ -808,7 +879,30 @@ impl Client {
         if let Some(sig) = signature {
             req = req.header(stepup::HEADER, sig);
         }
-        let resp = req.send().await.map_err(classify)?;
+        let resp = match req.send().await.map_err(classify) {
+            Ok(response) => response,
+            Err(error) => {
+                if matches!(
+                    error,
+                    ClientError::Unreachable(_)
+                        | ClientError::Handshake(_)
+                        | ClientError::FingerprintMismatch
+                ) {
+                    // Only discard the failed path. Another in-flight probe may
+                    // already have found a different working address. Never replay.
+                    let mut discovered = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+                    if discovered.as_ref() == Some(&base) {
+                        *discovered = None;
+                    }
+                    let mut preferred = self.preferred.lock().unwrap_or_else(|e| e.into_inner());
+                    if preferred.is_some_and(|i| Self::base_url(&self.addrs[i], self.port) == base)
+                    {
+                        *preferred = None;
+                    }
+                }
+                return Err(error);
+            }
+        };
         json_body(resp).await
     }
 
@@ -840,7 +934,7 @@ impl Client {
     /// `GET /v1/events`: the response whose body is the event stream,
     /// returned once the headers are in. The caller reads chunks.
     pub async fn events(&self) -> Result<reqwest::Response, ClientError> {
-        self.try_each(|base| async move {
+        self.try_each(true, |base| async move {
             let resp = self
                 .stream
                 .get(format!("{base}/v1/events"))
@@ -1090,6 +1184,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_manual_check_shares_successful_inflight_subscriber_authentication() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        let (subscriber, manual) = tokio::join!(client.hello(), client.check_connection());
+        subscriber.unwrap();
+        manual.unwrap();
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_discards_reachability_without_replaying_the_command() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        client.hello().await.unwrap();
+        assert!(client.known_base().is_some());
+        server.go_away();
+        assert!(client
+            .call("act_on_pr", &serde_json::json!({}), Some("signed-once"))
+            .await
+            .is_err());
+        assert!(
+            client.known_base().is_none(),
+            "failed path must be revalidated before the next command"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_reads_share_one_hello_and_dispatch_once_each() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply(
+            "/v1/call/get_cached",
+            Reply::json(200, serde_json::json!([])),
+        );
+        let client =
+            Arc::new(Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(150));
+        let mut tasks = vec![];
+        for _ in 0..150 {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                client
+                    .call("get_cached", &serde_json::json!({}), None)
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        let requests = server.requests();
+        assert_eq!(requests.iter().filter(|r| r.path == "/v1/hello").count(), 1);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path == "/v1/call/get_cached")
+                .count(),
+            150
+        );
+    }
+
+    #[tokio::test]
     async fn a_paired_phone_gets_hello_and_the_key_exchange_is_post_quantum() {
         let id = identity();
         let server = TestServer::start().await;
@@ -1187,7 +1350,7 @@ mod tests {
         .unwrap();
         let seen = std::sync::Mutex::new(Vec::new());
         let got = client
-            .try_each(|base| {
+            .try_each(true, |base| {
                 seen.lock().unwrap().push(base.clone());
                 async move {
                     match base.as_str() {
@@ -1234,7 +1397,7 @@ mod tests {
         )
         .unwrap();
         let err = client
-            .try_each(|base| async move {
+            .try_each(true, |base| async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 Err::<(), _>(if base.contains("slow") {
                     ClientError::Unreachable("timed out".into())

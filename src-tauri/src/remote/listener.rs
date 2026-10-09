@@ -256,9 +256,10 @@ pub struct Peer {
 
 /// How `/v1/hello` learns the signed-in GitHub login. A closure rather
 /// than a client handle so the listener neither depends on octocrab nor
-/// needs a network in tests. `None` when not signed in or unreachable;
-/// the first `Some` is cached for the listener's lifetime, as the
-/// frontend already caches the same answer.
+/// needs a network in tests. Production reads only locally known identity:
+/// `None` when signed out or still unknown. None is retried on the next hello
+/// so normal provider work can populate it later; the first `Some` is cached
+/// for the listener's lifetime, as the frontend already caches the same answer.
 pub type ViewerLookup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 

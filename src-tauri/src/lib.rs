@@ -502,6 +502,7 @@ pub fn run() {
             commands::stats_reviewers,
             commands::get_auth_state,
             remote::pairing::issue_pairing_token,
+            remote::pairing::get_remote_connection_addresses,
             remote::pairing::respond_to_pairing,
             remote::pairing::list_paired_devices,
             remote::pairing::revoke_paired_device,

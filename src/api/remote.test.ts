@@ -31,6 +31,12 @@ afterEach(() => {
 });
 
 describe("remote transport: commands", () => {
+  it.each(["get_connection_addresses", "add_connection_address", "check_desktop_connection"])("keeps endpoint repair %s on the phone", async (command) => {
+    tauri.invoke.mockResolvedValueOnce(undefined);
+    await remote.call(command, command === "add_connection_address" ? { address: "100.90.80.70" } : undefined);
+    expect(tauri.invoke).toHaveBeenCalledTimes(1);
+    expect(tauri.invoke.mock.calls[0][0]).toBe(command);
+  });
   it.each(["get_phone_measurement_prefs","set_phone_measurement_prefs","phone_measurement_status","record_phone_measurements","export_phone_measurements"])("keeps %s local even without a pairing", async command=>{
     tauri.invoke.mockImplementation((name)=>name==="remote_call"?Promise.reject(new Error("unpaired")):Promise.resolve(null));
     await expect(remote.call(command,{batch:[]})).resolves.toBeNull();

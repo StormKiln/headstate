@@ -62,6 +62,11 @@ const box = () => screen.getByRole("checkbox", { name: /allow phone connections/
 /// The listener opens a port on every interface. It must be off until
 /// the user says otherwise, and the switch must say what it does.
 describe("phone connections setting", () => {
+  it("mounts the away-from-home guide with phone connections still off", () => {
+    show();
+    expect(screen.getByRole("region", { name: "Use away from home" })).toBeTruthy();
+    expect(setRemote).not.toHaveBeenCalled();
+  });
   it("offers the switch, off by default", () => {
     show();
     expect(box()).toHaveProperty("checked", false);
@@ -119,7 +124,7 @@ describe("phone connections setting", () => {
 
   it("names the port, so the user knows what was opened", () => {
     show();
-    expect(screen.getByText(/41919/)).toBeTruthy();
+    expect(screen.getByText(/Lets the Headstate companion app reach this desktop on port 41919/)).toBeTruthy();
   });
 
   // Same topic as the switch: pairing is the only reason to turn it on.

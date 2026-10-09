@@ -98,6 +98,24 @@ fn unpair(state: State<'_, Arc<Companion>>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_connection_addresses(state: State<'_, Arc<Companion>>) -> Vec<String> {
+    state.get_connection_addresses()
+}
+
+#[tauri::command]
+async fn add_connection_address(
+    state: State<'_, Arc<Companion>>,
+    address: String,
+) -> Result<(), String> {
+    state.add_connection_address(address).await
+}
+
+#[tauri::command]
+async fn check_desktop_connection(state: State<'_, Arc<Companion>>) -> Result<(), String> {
+    state.check_desktop_connection().await
+}
+
+#[tauri::command]
 fn connection_state(state: State<'_, Arc<Companion>>) -> connection::Report {
     state.connection_state()
 }
@@ -246,6 +264,9 @@ pub fn run() {
             pair_from_qr,
             unpair,
             connection_state,
+            get_connection_addresses,
+            add_connection_address,
+            check_desktop_connection,
             remote_call,
             subscribe_events,
             // The phone's own notification preferences (#789). NOT the
@@ -342,6 +363,9 @@ mod tests {
             "pair_from_qr",
             "unpair",
             "connection_state",
+            "get_connection_addresses",
+            "add_connection_address",
+            "check_desktop_connection",
             "remote_call",
             "subscribe_events",
         ] {

@@ -156,9 +156,45 @@ pub enum PairingError {
     Store(#[from] StoreError),
 }
 
+/// Bounded host-only candidates. A DNS address must be fully qualified;
+/// URL-parser IPv4 shorthands and scoped/bracketed IPv6 are not accepted.
+pub(crate) const MAX_ADDRESSES: usize = 8;
+// Older v2 desktops advertised all interfaces. Accept a bounded legacy list.
+pub(crate) const MAX_QR_ADDRESSES: usize = 64;
+pub(crate) fn validate_address(host: &str) -> Result<(), String> {
+    let invalid = || "Enter a bare IP address or full DNS name, without a port or URL.".to_string();
+    if host.is_empty() || host.len() > 253 || host.trim() != host {
+        return Err(invalid());
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let labels: Vec<_> = host.split('.').collect();
+    if labels.len() < 2
+        || !labels
+            .last()
+            .is_some_and(|label| label.bytes().any(|b| b.is_ascii_alphabetic()))
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Validate the QR payload. `now` is Unix seconds by the phone's clock.
 pub fn parse_qr(payload: &str, now: i64) -> Result<Parsed, PairingError> {
     let bad = |m: String| PairingError::BadQr(m);
+    if payload.len() > 8192 {
+        return Err(bad("pairing code is too large".into()));
+    }
     let qr: QrPayload = serde_json::from_str(payload.trim()).map_err(|e| bad(e.to_string()))?;
     if qr.v != QR_VERSION {
         return Err(bad(format!("version {} is not supported", qr.v)));
@@ -166,7 +202,10 @@ pub fn parse_qr(payload: &str, now: i64) -> Result<Parsed, PairingError> {
     if qr.name.trim().is_empty() {
         return Err(bad("desktop name is empty".into()));
     }
-    if qr.addrs.is_empty() || qr.addrs.iter().any(|a| a.trim().is_empty()) {
+    if qr.addrs.is_empty()
+        || qr.addrs.len() > MAX_QR_ADDRESSES
+        || qr.addrs.iter().any(|a| validate_address(a).is_err())
+    {
         return Err(bad("no addresses".into()));
     }
     if qr.port == 0 {
@@ -281,9 +320,15 @@ pub async fn pair(
             return Err(e);
         }
     };
+    let mut addrs = qr.addrs;
+    if let Some(best) = client.best_address() {
+        addrs.retain(|a| *a != best);
+        addrs.insert(0, best);
+    }
+    addrs.truncate(MAX_ADDRESSES);
     let desktop = Desktop {
         name: qr.name,
-        addrs: qr.addrs,
+        addrs,
         port: qr.port,
         fp: qr.fp,
         paired_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -369,6 +414,50 @@ mod tests {
     use serde_json::Value;
 
     /// One integer on the wire, two constants in the code.
+    #[tokio::test]
+    async fn legacy_qr_with_many_interfaces_keeps_the_working_path_in_bounded_storage() {
+        let store = MemoryStore::default();
+        let keys = SoftwareKeys::new(Arc::new(MemoryStore::default()));
+        let server = TestServer::start().await;
+        server.open_window(true);
+        let token = BASE64URL.encode([0u8; 32]);
+        let now = chrono::Utc::now();
+        let mut qr: serde_json::Value =
+            serde_json::from_str(&server.qr(&token, now.timestamp() + 120)).unwrap();
+        let mut addrs: Vec<String> = (2..=9).map(|n| format!("127.0.0.{n}")).collect();
+        addrs.push(server.addr());
+        qr["addrs"] = serde_json::json!(addrs);
+        let (desktop, _) = pair(&store, &keys, &qr.to_string(), "phone", now)
+            .await
+            .unwrap();
+        assert_eq!(desktop.addrs.len(), 8);
+        assert_eq!(desktop.addrs[0], server.addr());
+        assert_eq!(load_desktops(&store).unwrap()[0].addrs, desktop.addrs);
+    }
+
+    #[test]
+    fn hostile_connection_hosts_in_pairing_are_rejected() {
+        for host in [
+            "https://desktop.example",
+            "user@127.0.0.1",
+            "desktop.example:41919",
+            "desktop.example/path",
+            "desktop..example",
+            "999.1.2.3",
+            "127.1",
+            "0x7f000001",
+            "-desktop.example",
+            "desktop",
+            "[::1]",
+        ] {
+            let payload = serde_json::json!({"v":2,"name":"Desktop","addrs":[host],"port":41919,"fp":format!("sha256:{}", "a".repeat(64)),"token":BASE64URL.encode([0u8;32]),"exp":200});
+            assert!(
+                parse_qr(&payload.to_string(), 100).is_err(),
+                "accepted {host}"
+            );
+        }
+    }
+
     #[test]
     fn the_qr_version_is_the_protocol_version() {
         assert_eq!(u32::from(QR_VERSION), crate::client::PROTOCOL_VERSION);

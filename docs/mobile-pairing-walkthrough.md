@@ -1,5 +1,8 @@
 # Mobile companion: pairing walkthrough
 
+For remote access over cellular or another network, follow [the Tailscale setup guide](tailscale-remote-access.md). Keep the same pairing when adding a remote address; do not unpair to repair network reachability.
+
+
 The manual test that gates every mobile release. It exercises the parts of
 the companion that no automated test can reach: a real phone, its secure
 hardware, its biometric prompt, the platform's local-network permission,

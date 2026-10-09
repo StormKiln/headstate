@@ -51,7 +51,14 @@ struct Live {
 /// `headstate:cancelled`: their own decision reported back as an error.
 pub const CANCELLED: &str = "headstate:cancelled";
 
+struct ConnectionCheck {
+    client: Arc<Client>,
+    finished: std::time::Instant,
+    result: Result<(), String>,
+}
+
 pub struct Companion {
+    check: tokio::sync::Mutex<Option<ConnectionCheck>>,
     pairing_epoch: std::sync::atomic::AtomicU64,
     store: Arc<dyn Store>,
     keys: Arc<dyn DeviceKeys>,
@@ -79,6 +86,33 @@ fn last_poll_from_cache(store: &dyn Store, desktop: &str) -> Option<DateTime<Utc
     }
 }
 
+fn connection_check_error(error: ClientError) -> String {
+    log::info!(
+        "companion: connection check failed ({})",
+        crate::client::failure_category(&error)
+    );
+    match error {
+        ClientError::FingerprintMismatch => {
+            "The endpoint did not match your paired desktop's identity."
+        }
+        ClientError::Handshake(_) => {
+            "The secure connection failed. Check that this phone is still paired."
+        }
+        ClientError::Status {
+            status: 401 | 403, ..
+        } => "The desktop did not authorize this phone.",
+        ClientError::TimedOut(_) => {
+            "The connection check timed out. Check your private network and try again."
+        }
+        ClientError::Protocol(_) => "The desktop returned an incompatible connection response.",
+        ClientError::Status { .. } => "The desktop could not complete the connection check.",
+        ClientError::Unreachable(_) => {
+            "Desktop unreachable. Check that the desktop and private network are connected."
+        }
+    }
+    .into()
+}
+
 impl Companion {
     pub fn new(
         store: Arc<dyn Store>,
@@ -87,6 +121,7 @@ impl Companion {
         spawn: Spawner,
     ) -> Self {
         Self {
+            check: tokio::sync::Mutex::new(None),
             pairing_epoch: std::sync::atomic::AtomicU64::new(0),
             conn: Arc::new(Connection::new(sink.clone())),
             store,
@@ -217,7 +252,7 @@ impl Companion {
     /// Best effort throughout: a failure here costs one slow start, and
     /// is not worth failing the user's command over.
     fn remember_address(&self, client: &Client) {
-        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if !live
             .as_ref()
             .is_some_and(|l| std::ptr::eq(l.client.as_ref(), client))
@@ -238,6 +273,9 @@ impl Companion {
             return;
         };
         if d.addrs.first().is_some_and(|a| *a == best) {
+            if let Some(current) = live.as_mut() {
+                current.desktop.addrs = d.addrs.clone();
+            }
             return;
         }
         // Moved to the front rather than made the only one: the others
@@ -245,9 +283,142 @@ impl Companion {
         // and the QR is not shown again.
         d.addrs.retain(|a| *a != best);
         d.addrs.insert(0, best);
+        d.addrs.truncate(pairing::MAX_ADDRESSES);
+        let addresses = d.addrs.clone();
         if let Err(e) = pairing::save_desktops(self.store.as_ref(), &list) {
             log::warn!("companion: could not save the desktop's address order: {e}");
+        } else if let Some(current) = live.as_mut() {
+            current.desktop.addrs = addresses;
         }
+    }
+
+    pub fn get_connection_addresses(&self) -> Vec<String> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|live| live.desktop.addrs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Verify only the entered endpoint, using the existing pin and phone keys.
+    /// A failure never changes the existing pairing, cache or subscriber.
+    pub async fn add_connection_address(&self, address: String) -> Result<(), String> {
+        pairing::validate_address(&address)?;
+        let (old, mut desktop, epoch) = {
+            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            let current = live.as_ref().ok_or("not paired with a desktop")?;
+            (
+                current.client.clone(),
+                current.desktop.clone(),
+                self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
+        let identity = self
+            .keys
+            .session_identity()
+            .map_err(|_| "The phone keys are unavailable. Try again after unlocking.")?;
+        let candidate = Client::new(&identity, &desktop.fp, vec![address.clone()], desktop.port)
+            .map_err(|_| "Could not prepare the secure connection.".to_string())?;
+        let hello = candidate
+            .check_connection()
+            .await
+            .map_err(connection_check_error)?;
+        if hello.protocol_version != crate::client::PROTOCOL_VERSION {
+            return Err(
+                "The desktop uses an incompatible Headstate protocol. Update both apps.".into(),
+            );
+        }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let current = live
+            .as_mut()
+            .ok_or("The paired desktop changed during this check.")?;
+        if !Arc::ptr_eq(&current.client, &old)
+            || epoch != self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("The paired desktop changed during this check.".into());
+        }
+        // A command can learn a new LAN path while verification is in flight.
+        // Merge into the current owned record, never the pre-await snapshot.
+        desktop = current.desktop.clone();
+        desktop.addrs.retain(|a| *a != address);
+        desktop.addrs.insert(0, address);
+        desktop.addrs.truncate(pairing::MAX_ADDRESSES);
+        desktop.hello = Some(hello);
+        let client = Arc::new(
+            Client::new(&identity, &desktop.fp, desktop.addrs.clone(), desktop.port)
+                .map_err(|_| "Could not prepare the secure connection.".to_string())?,
+        );
+        let mut saved = pairing::load_desktops(self.store.as_ref())
+            .map_err(|_| "Could not read the saved pairing.")?;
+        let record = saved
+            .first_mut()
+            .filter(|d| d.fp == desktop.fp)
+            .ok_or("The saved pairing changed during this check.")?;
+        *record = desktop.clone();
+        pairing::save_desktops(self.store.as_ref(), &saved)
+            .map_err(|_| "Could not save the verified address.")?;
+        // stop() fences publications before the new subscriber can publish.
+        // Keep the pairing epoch: this is the same desktop and cache owner.
+        current.events.stop();
+        *current = Live {
+            desktop,
+            client,
+            events: events::Handle::new(),
+        };
+        self.start_events(current);
+        Ok(())
+    }
+
+    pub async fn check_desktop_connection(&self) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let (client, _, epoch) = self.snapshot_desktop()?;
+        let mut shared = self.check.lock().await;
+        if let Some(previous) = shared.as_ref() {
+            if Arc::ptr_eq(&previous.client, &client) && previous.finished >= started {
+                let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+                if !live
+                    .as_ref()
+                    .is_some_and(|l| Arc::ptr_eq(&l.client, &client))
+                    || epoch != self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err("The paired desktop changed during this check.".into());
+                }
+                return previous.result.clone();
+            }
+        }
+        let response = client.check_connection().await;
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let current = live
+            .as_ref()
+            .filter(|l| Arc::ptr_eq(&l.client, &client))
+            .filter(|_| epoch == self.pairing_epoch.load(std::sync::atomic::Ordering::SeqCst))
+            .ok_or("The paired desktop changed during this check.")?;
+        let result = match response {
+            Ok(hello) if hello.protocol_version == crate::client::PROTOCOL_VERSION => {
+                // A hello proves authentication, not event-stream health or data
+                // freshness. Let the one subscriber establish those normally.
+                if self.conn.state() == State::Unreachable {
+                    current.events.resume();
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                Err("The desktop uses an incompatible Headstate protocol. Update both apps.".into())
+            }
+            Err(error) => Err(connection_check_error(error)),
+        };
+        log::info!(
+            "companion: connection check finished in {} ms ({})",
+            started.elapsed().as_millis().min(9999),
+            if result.is_ok() { "ok" } else { "failed" }
+        );
+        *shared = Some(ConnectionCheck {
+            client,
+            finished: std::time::Instant::now(),
+            result: result.clone(),
+        });
+        result
     }
 
     /// `connection_state`.
@@ -399,7 +570,10 @@ impl Companion {
                 Ok(value)
             }
             Err(e) if e.is_handshake() => {
-                log::warn!("companion: the desktop refused this phone on {command}: {e}");
+                log::warn!(
+                    "companion: the desktop refused this phone ({})",
+                    crate::client::failure_category(&e)
+                );
                 events.stop();
                 let _ = events::forget_snapshot(self.store.as_ref());
                 self.conn.set_state(State::Revoked);
@@ -408,8 +582,10 @@ impl Companion {
                 ))
             }
             Err(ClientError::Unreachable(m)) => {
-                self.conn.set_state(State::Unreachable);
-                events.resume();
+                if self.conn.state() != State::Unreachable {
+                    self.conn.set_state(State::Unreachable);
+                    events.resume();
+                }
                 if command == "get_source_snapshot"
                     && args["source"]["provider"] == "github"
                     && args["source"]["host"] == "github.com"
@@ -435,8 +611,8 @@ impl Companion {
             // succeeding at this moment. The desktop may also still be
             // working on it, which is worth saying: a retry is a second
             // copy of the same work, not a reconnect.
-            Err(ClientError::TimedOut(m)) => {
-                log::info!("companion: {command} timed out: {m}");
+            Err(ClientError::TimedOut(_)) => {
+                log::info!("companion: command timed out; outcome unconfirmed");
                 Err(format!(
                     "{desktop_name} took too long to answer {command}; it may still be working on it"
                 ))
@@ -666,6 +842,204 @@ mod tests {
                 tokio::spawn(f);
             }),
         )
+    }
+
+    async fn address_fixture() -> (Companion, Arc<MemoryStore>, TestServer) {
+        let store = Arc::new(MemoryStore::default());
+        let keys = Arc::new(SoftwareKeys::new(store.clone()));
+        keys.generate().unwrap();
+        let server = TestServer::start().await;
+        server.pair(&keys.session_identity().unwrap().fingerprint());
+        let c = Companion::new(
+            store.clone(),
+            keys,
+            Arc::new(Recorder::default()),
+            Arc::new(|_| {}),
+        );
+        let desktop = Desktop {
+            name: "Desktop".into(),
+            fp: server.fp.clone(),
+            addrs: vec!["192.0.2.1".into()],
+            port: server.port(),
+            paired_at: "2026-10-09".into(),
+            hello: None,
+        };
+        pairing::save_desktops(store.as_ref(), &[desktop]).unwrap();
+        c.load().unwrap();
+        store.put(events::SNAPSHOT_KEY, b"preserved").unwrap();
+        (c, store, server)
+    }
+
+    #[tokio::test]
+    async fn a_path_remembered_during_verification_is_not_overwritten() {
+        let (c, store, server) = address_fixture().await;
+        let learned = Arc::new(
+            Client::new(
+                &c.keys.session_identity().unwrap(),
+                &server.fp,
+                vec![server.addr()],
+                server.port(),
+            )
+            .unwrap(),
+        );
+        learned.hello().await.unwrap();
+        c.live.lock().unwrap().as_mut().unwrap().client = learned.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        server.reply("/v1/hello", Reply::HeldJson { release: release.clone(), body: json!({"desktop_version":"10.0.0","protocol_version":crate::client::PROTOCOL_VERSION,"viewer_login":null}).to_string() });
+        let before = server.requests().len();
+        let (result, ()) =
+            tokio::join!(c.add_connection_address("::ffff:127.0.0.1".into()), async {
+                until(|| server.requests().len() > before).await;
+                c.remember_address(&learned);
+                release.notify_one();
+            });
+        result.unwrap();
+        assert_eq!(
+            pairing::load_desktops(store.as_ref()).unwrap()[0].addrs,
+            vec!["::ffff:127.0.0.1".into(), server.addr(), "192.0.2.1".into()]
+        );
+    }
+
+    #[tokio::test]
+    async fn remembered_new_lan_path_survives_remote_address_enrollment_and_restart() {
+        let (c, store, server) = address_fixture().await;
+        let learned = Arc::new(
+            Client::new(
+                &c.keys.session_identity().unwrap(),
+                &server.fp,
+                vec![server.addr()],
+                server.port(),
+            )
+            .unwrap(),
+        );
+        learned.hello().await.unwrap();
+        c.live.lock().unwrap().as_mut().unwrap().client = learned.clone();
+        c.remember_address(&learned);
+        assert_eq!(
+            c.get_connection_addresses(),
+            vec![server.addr(), "192.0.2.1".into()]
+        );
+        c.add_connection_address("::ffff:127.0.0.1".into())
+            .await
+            .unwrap();
+        let again = Companion::new(
+            store,
+            c.keys.clone(),
+            Arc::new(Recorder::default()),
+            Arc::new(|_| {}),
+        );
+        again.load().unwrap();
+        assert_eq!(
+            again.get_connection_addresses(),
+            vec!["::ffff:127.0.0.1".into(), server.addr(), "192.0.2.1".into()]
+        );
+    }
+
+    #[tokio::test]
+    async fn late_verified_address_cannot_restore_an_unpaired_desktop() {
+        let (c, store, server) = address_fixture().await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        server.reply("/v1/hello", Reply::HeldJson { release: release.clone(), body: json!({"desktop_version":"10.0.0","protocol_version":crate::client::PROTOCOL_VERSION,"viewer_login":null}).to_string() });
+        let (result, ()) = tokio::join!(c.add_connection_address(server.addr()), async {
+            until(|| !server.requests().is_empty()).await;
+            c.unpair().unwrap();
+            release.notify_one();
+        });
+        assert!(result.unwrap_err().contains("changed"));
+        assert!(pairing::load_desktops(store.as_ref()).unwrap().is_empty());
+        assert!(store.get(events::SNAPSHOT_KEY).unwrap().is_none());
+        assert_eq!(c.connection_state().state, State::Unpaired);
+        assert!(c.get_connection_addresses().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_address_book_retains_seven_prior_paths_and_rejects_http_denial() {
+        let (c, store, server) = address_fixture().await;
+        let old: Vec<_> = (1..=8).map(|n| format!("192.0.2.{n}")).collect();
+        c.live.lock().unwrap().as_mut().unwrap().desktop.addrs = old.clone();
+        server.reply(
+            "/v1/hello",
+            Reply::text(403, "private-address.example must not be displayed"),
+        );
+        let error = c.add_connection_address(server.addr()).await.unwrap_err();
+        assert!(!error.contains("private-address"));
+        assert_eq!(c.get_connection_addresses(), old);
+        server.reply("/v1/hello", Reply::json(200, json!({"desktop_version":"10.0.0","protocol_version":crate::client::PROTOCOL_VERSION,"viewer_login":null})));
+        c.add_connection_address(server.addr()).await.unwrap();
+        let saved = pairing::load_desktops(store.as_ref()).unwrap();
+        assert_eq!(saved[0].addrs.len(), 8);
+        assert_eq!(&saved[0].addrs[1..], &old[..7]);
+    }
+
+    #[tokio::test]
+    async fn address_enrollment_preserves_pairing_cache_and_old_addresses_after_restart() {
+        let (c, store, server) = address_fixture().await;
+        let epoch = c.snapshot_desktop().unwrap().2;
+        let keys = c.keys.session_identity().unwrap().fingerprint();
+        c.add_connection_address(server.addr()).await.unwrap();
+        assert_eq!(
+            c.get_connection_addresses(),
+            vec![server.addr(), "192.0.2.1".into()]
+        );
+        assert_eq!(c.snapshot_desktop().unwrap().2, epoch);
+        assert_eq!(c.keys.session_identity().unwrap().fingerprint(), keys);
+        assert_eq!(
+            store.get(events::SNAPSHOT_KEY).unwrap().as_deref(),
+            Some(b"preserved".as_slice())
+        );
+        let again = Companion::new(
+            store,
+            c.keys.clone(),
+            Arc::new(Recorder::default()),
+            Arc::new(|_| {}),
+        );
+        again.load().unwrap();
+        assert_eq!(
+            again.get_connection_addresses(),
+            vec![server.addr(), "192.0.2.1".into()]
+        );
+        assert!(server.requests().iter().all(|r| r.path == "/v1/hello"));
+    }
+
+    #[tokio::test]
+    async fn rejected_address_never_changes_pairing_or_cache() {
+        let (c, store, server) = address_fixture().await;
+        let original = pairing::load_desktops(store.as_ref()).unwrap();
+        let wrong = TestServer::start().await;
+        // Same endpoint, wrong expected certificate: never replace the pin.
+        c.live.lock().unwrap().as_mut().unwrap().desktop.fp = wrong.fp.clone();
+        assert!(c.add_connection_address(server.addr()).await.is_err());
+        assert_eq!(pairing::load_desktops(store.as_ref()).unwrap(), original);
+        assert_eq!(
+            store.get(events::SNAPSHOT_KEY).unwrap().as_deref(),
+            Some(b"preserved".as_slice())
+        );
+        assert!(server.requests().is_empty());
+        c.live.lock().unwrap().as_mut().unwrap().desktop.fp = server.fp.clone();
+        server.revoke(&c.keys.session_identity().unwrap().fingerprint());
+        assert!(c.add_connection_address(server.addr()).await.is_err());
+        assert_eq!(pairing::load_desktops(store.as_ref()).unwrap(), original);
+        assert_eq!(
+            store.get(events::SNAPSHOT_KEY).unwrap().as_deref(),
+            Some(b"preserved".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_only_probe_hello_once_without_replaying_commands() {
+        let (c, _, server) = address_fixture().await;
+        c.add_connection_address(server.addr()).await.unwrap();
+        let before = server.requests().len();
+        let results = tokio::join!(
+            c.check_desktop_connection(),
+            c.check_desktop_connection(),
+            c.check_desktop_connection()
+        );
+        results.0.unwrap();
+        results.1.unwrap();
+        results.2.unwrap();
+        assert_eq!(server.requests().len() - before, 1);
+        assert!(server.requests().iter().all(|r| r.path == "/v1/hello"));
     }
 
     /// The phone can say whether it holds a post-quantum key (#670).

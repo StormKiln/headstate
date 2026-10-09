@@ -824,6 +824,13 @@ fn local_addrs() -> Result<Vec<String>, String> {
 // Tauri commands
 // ---------------------------------------------------------------------
 
+/// Read interface addresses for remote setup without issuing a pairing token
+/// or enabling the listener. These are candidates, not proof of VPN reachability.
+#[tauri::command]
+pub fn get_remote_connection_addresses() -> Result<Vec<String>, String> {
+    local_addrs()
+}
+
 /// A paired device as the Settings screen sees it: no key material.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedDeviceSummary {

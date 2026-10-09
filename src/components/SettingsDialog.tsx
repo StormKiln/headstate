@@ -1,3 +1,4 @@
+import { RemoteConnectionPanel } from "./RemoteConnectionPanel";
 import { PhoneMeasurementPanel } from "./PhoneMeasurementPanel";
 import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
@@ -928,6 +929,7 @@ export function SettingsDialog({
           ) : null}
         </div>
         <GetCompanionPanel />
+        <RemoteConnectionPanel mode="desktop" />
         <PairPhonePanel />
         <PairedDevicesList />
         </>}
