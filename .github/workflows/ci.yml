@@ -22,7 +22,9 @@ on:
   merge_group:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ startsWith(github.ref, 'refs/tags/') && github.run_id || 'shared' }}
+  # Tag deliveries use independent run IDs: duplicate CI must run concurrently,
+  # not consume the release gate budget in a serialized queue (#1779).
   # Never cancel a tag run: `release.yml` waits on it, and a cancelled
   # check would either block the release forever or wave it through.
   #
@@ -57,9 +59,16 @@ jobs:
           rust-components: clippy, rustfmt
       - name: Privacy guard
         run: ./scripts/check-privacy.sh
+      - name: Install signature verifier for release contract tests
+        timeout-minutes: 5
+        run: brew install minisign
       - name: Release artifact selection
         run: |
           python3 scripts/check-release-artifacts.test.py
+          python3 scripts/wait-release-ci.test.py
+          python3 scripts/publish-release.test.py
+          python3 scripts/release_delivery.test.py
+          python3 scripts/reserve-mobile-release.test.py
           python3 scripts/verify-linux-appimage.test.py
       # The self-test first, as the symlink and mobile-gate guards do.
       # #892 recorded this script as already having one; it did not, and
@@ -102,7 +111,9 @@ jobs:
       - name: Install actionlint
         run: brew install actionlint
       - name: Workflow lint
-        run: actionlint
+        run: |
+          python3 scripts/lint-workflows.test.py
+          python3 scripts/lint-workflows.py
       # Asked BEFORE the heavy jobs, and asked at all because the ignore
       # rule alone cannot enforce this. A committed symlink whose target
       # is absolute or climbs out of the tree resolves only on the

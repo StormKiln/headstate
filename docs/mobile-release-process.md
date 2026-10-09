@@ -19,13 +19,13 @@ different pipeline with a different tag prefix. Nothing here touches it.
   (`scripts/stamp-mobile-version.py`); nothing is committed. The `0.1.0` in
   those files and in `gen/apple` is a placeholder that Tauri overwrites at
   build time.
-- The **build number** is the workflow run number, and it is the same on
-  both stores: `CFBundleVersion` on iOS, `versionCode` on Android. It is
-  what the pairing walkthrough's run record asks for and what the job
-  prints in its summary. Both stores require it to increase; a run number
-  only ever increases for a given workflow file, so do not rename the file.
-- Any tag on the same commit produces a new build number, so a re-tag after
-  a failed upload is fine.
+- The **build number** is reserved before a signed build starts and is shared
+  by both stores: `CFBundleVersion` on iOS and `versionCode` on Android.
+  It exceeds every recorded reservation and published build, plus the committed
+  high-water mark. The workflow run number is a minimum, not the allocation
+  order: queued runs can start out of order.
+- A new version tag reserves a new build. Do not move or reuse an existing tag
+  after a failed or uncertain upload; reconcile that delivery first.
 
 ## Cutting a release
 
@@ -39,11 +39,15 @@ different pipeline with a different tag prefix. Nothing here touches it.
    git push origin mobile-v0.2.0
    ```
 
-3. Wait for the **Mobile release** workflow. Both jobs run the mobile checks
-   first, then build, then upload. Failures stop before anything reaches a
-   store; the pre-release is created only after both uploads succeed.
-   The build number is in the job log ("Version 0.2.0, build 57") and in
-   the pre-release notes.
+3. Wait for the **Mobile release** workflow. Signed deliveries queue globally
+   without cancelling an earlier delivery; unsigned rehearsals use a separate
+   queue. The reservation job first records the tag, source commit, run and
+   attempt, and build number in a draft release. Enabled platform jobs then
+   run checks, build, and upload. Publication finalizes the draft only after
+   those uploads succeed. A failure can leave a store upload accepted without
+   a published release; follow the recovery rules below.
+   The build number appears in the job log and release notes. Android remains
+   skipped while `ANDROID_RELEASE_ENABLED` is unset.
 4. **Raise the build mark (one-line PR).** Set the last line of
    `.github/mobile-build-high-water-mark` to that build number and merge it.
    The run's summary prints this as a required follow-up with the exact
@@ -59,8 +63,33 @@ different pipeline with a different tag prefix. Nothing here touches it.
    only after a clean run against that exact build. Automation stops at the
    testing tracks on purpose.
 
-The GitHub pre-release holds the `.ipa`, the `.aab`, and a `SHA256SUMS`
-file for provenance. Users do not install from it.
+The GitHub pre-release holds the `.ipa`, an optional `.aab` when Android is
+configured, and a `SHA256SUMS` file for provenance. Users do not install from it.
+
+### Duplicate runs and uncertain uploads
+
+A completed duplicate verifies the source commit, provenance marker, complete
+asset set and downloaded checksums. Its required iOS and publication jobs finish
+successfully without building or uploading to a store again. Existing assets
+are never overwritten.
+
+An existing draft, partial asset upload, missing provenance, mismatched source,
+or ambiguous store response stops the new attempt. Even “Re-run failed jobs”
+cannot reuse a reservation from an earlier attempt. The write-capable reservation
+job emits its tag, commit, run, attempt and allocated build only after recording
+the draft. Read-only build jobs validate that receipt against their current
+identity; they do not need permission to read or modify private drafts. The
+publication job rechecks the durable draft using its own write-capable token. Inspect App Store Connect
+and, if enabled, Play Console using the recorded version and build number;
+retain the draft and run evidence. Reconcile what each store accepted before
+preparing a new version tag with a higher reserved build. Do not delete a draft
+to reclaim its number or rerun an upload merely because its response was lost.
+There is no automatic partial-delivery recovery command.
+
+Release notes include an HTML comment beginning `headstate-delivery-v1` that
+records immutable delivery provenance. Human-facing notes may be corrected, but
+preserve that entire comment and do not alter its fields. Removing or editing
+it prevents verified duplicate handling.
 
 ## The public beta (TestFlight external testing)
 
@@ -268,57 +297,32 @@ failure the gate exists to prevent.
 
 ## The build number never goes backwards
 
-`BUILD_NUMBER` is `github.run_number`, which becomes `CFBundleVersion` on
-iOS and `versionCode` on Android. Both stores refuse a build number they
-have already seen.
+`scripts/reserve-mobile-release.py` allocates `BUILD_NUMBER` while the signed
+workflow holds its global delivery queue. It takes the maximum of the current
+workflow run number and one above every observed reserved/published build and
+the committed `.github/mobile-build-high-water-mark`. The release listing and
+asset listing are paginated, and draft reservations count even when a run never
+reached a store. An unknown older draft blocks allocation until reconciled.
 
-`run_number` is counted per workflow **file**, so renaming
-`mobile-release.yml` restarts it at 1 and every upload after that is
-rejected as a duplicate — recoverable only by burning version numbers until
-the count climbs back past the highest already shipped.
+This makes reversed queue order and workflow-file renames safe without reusing
+a number. A recorded reservation consumes its number. Gaps are expected; they
+must not be filled by retrying an old upload.
 
-Preflight compares against `.github/mobile-build-high-water-mark` and fails
-in the first job with the cause named. **Raise that file whenever a build
-reaches TestFlight or Play.**
+Preflight still checks the allocated number against the committed mark.
+**Raise that file whenever a build reaches TestFlight or Play**, including a
+partially delivered release. The run summary names the value, and
+`scripts/check-mobile-build-mark.py` retains its published-asset comparison:
 
-You no longer have to remember to. The release run's summary names the
-value as a required follow-up (step 4 above), and
-`scripts/check-mobile-build-mark.py` compares the file with the `build<N>`
-of the newest published mobile asset in two places:
+- **Per commit** (`make lint` and CI): a mark below the latest published
+  `build<N>` asset produces a warning naming the required update.
+- **At a new mobile delivery** (`--require --release`): a lagging mark stops
+  the build. Raise it on `main`, then tag a commit that contains it.
 
-- **Per commit** (CI's `lint` job and `make lint`): a lagging mark is a
-  warning annotation naming the value to write. It does not fail.
-- **At the next mobile release** (Preflight, with `--release`): a lagging
-  mark fails the run before anything is built. Raise the mark on `main`,
-  then tag a commit that has it.
-
-That guard exists because the duplicate check could never catch this. It
-tests `BUILD_NUMBER > HIGH`, and `run_number` climbs every run, so a mark
-lagging by three still passes — run 29 cleared a mark of 25 as easily as 28.
-Staleness was invisible to the file's only reader, which is how it drifted
-before six consecutive releases without one of them failing (#787). The cost
-was never a blocked release; it was this file naming the wrong number to
-whoever is debugging a genuine duplicate rejection.
-
-Why it warns per commit instead of failing (#1418): it used to fail `lint`,
-and every open PR and the merge queue went red after each mobile release
-until the one-line mark PR merged, for a reason unrelated to any of them.
-The failure could not move to the `push` run on `main` or to a scheduled
-job either: the desktop release gate reads every check-run attempt on a
-commit, so one red attempt on `main` burns that commit for releases. A
-mobile release attaches to no `main` commit, so that is where it is
-enforced. A missing or unparseable mark file still fails everywhere.
-
-Numbers being non-contiguous per version (0.1.7 → 9, 0.1.12 → 14) is this
-system working, not drift: a rejected upload still consumes its number, and
-re-tagging the same version is routine. Only a decrease is a fault (#635).
-
-A mark *ahead* of the newest published asset is also fine, and the guard
-says so rather than failing: the file is written before the upload, so it
-records a number consumed by a run whose `publish` never finished. That is
-why the guard compares against the assets instead of being replaced by
-them — an asset exists only if `publish` succeeded, so assets can
-under-report what a store has seen, and this file cannot.
+A verified completed duplicate bypasses these new-build checks. A mark ahead
+of the latest published asset is valid: a store may have consumed a number
+before publication failed. Draft reservations additionally preserve that
+consumption automatically. Neither API unavailability nor malformed reservation
+metadata is treated as evidence that a number is free.
 
 ## Secrets
 
@@ -437,9 +441,10 @@ is not committed yet; write `keystore.properties`; `tauri android build
 `internal` track as a completed release through the Play Developer API
 (`scripts/play-upload.py`); delete the keystore and credentials.
 
-**Publish**: both artifacts and one `SHA256SUMS`, verified before upload,
-attached to a GitHub pre-release for the tag with notes generated against
-the previous `mobile-v*` tag.
+**Publish**: the enabled platforms’ artifacts and one `SHA256SUMS` are verified,
+attached to the owned reservation without overwriting assets, downloaded and
+verified again, then published with notes against the previous `mobile-v*` tag.
+A completed duplicate only verifies the existing delivery.
 
 ## Rotating material
 

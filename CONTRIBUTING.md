@@ -303,8 +303,20 @@ That fires `.github/workflows/release.yml`, which:
    Guarded on the Apple secrets (see below), which are present, so this runs
    on every release; a fork without them builds unsigned rather than
    failing.
-4. Creates the GitHub Release with the `.dmg` and a `.app.tar.gz`, and
-   generates release notes from the commits since the last tag.
+4. Creates a draft with the complete desktop package set and generated notes,
+   downloads it again, and verifies its hashes, updater URLs and signatures
+   before publishing. A completed release is immutable: duplicate runs verify
+   the existing delivery and do not overwrite its assets.
+
+Admission waits for every observed CI workflow attempt, including queued runs
+that have not registered check jobs yet, then applies the existing success-only
+check gate. Tag CI attempts run concurrently; release workflows queue without
+cancelling each other. Admission is checked again before publication.
+
+Release notes contain a hidden `headstate-delivery-v1` provenance marker with
+the source commit, owning run and artifact hashes. Preserve it when editing
+the human-readable notes. Missing or conflicting evidence and another run's
+unfinished draft stop publication; they do not authorize replacement uploads.
 
 The tag must be `vMAJOR.MINOR.PATCH`. Anything else (`v1.2`, `latest`,
 `vfoo`) fails the job early with a clear message rather than publishing a
@@ -318,10 +330,10 @@ workflow either way, and no stale instruction left behind for users to
 follow unnecessarily. Windows is still unsigned and its SmartScreen note is
 generated the same way.
 
-To undo a bad tag before anyone downloads it, delete it locally and
-remotely (`git tag -d v0.2.0 && git push origin :v0.2.0`) and delete the
-GitHub Release. Re-tagging the same version works, but only if the release
-and tag are both gone first.
+If a tag or release fails, retain it and its diagnostics. Fix the cause on a
+new commit, pass every required check, and cut the next patch version. Do not
+delete, move or rerun a failed tag to bypass the
+[release check-run policy](.claude/skills/release/SKILL.md).
 
 ## Code signing
 

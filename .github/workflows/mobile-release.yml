@@ -31,12 +31,20 @@ on:
 # Least privilege, per job rather than per workflow (#886).
 #
 # contents:write is for creating the pre-release and uploading its assets,
-# and `publish` is the only job that does either -- the store uploads use
+# and only `reserve`/`publish` have that permission -- the store uploads use
 # their own credentials. Granting it workflow-wide gave it to the two
 # build jobs as well, which run `yarn install` and `cargo build` over the
 # whole dependency tree and create nothing in this repository.
 permissions:
   contents: read
+
+# Queue signed deliveries across ALL tags: store build numbers must increase in
+# delivery order, and an in-flight upload must never be cancelled by a new tag.
+# Rehearsals cannot hold the signed-delivery queue.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && format('mobile-dry-{0}', github.ref) || 'mobile-signed-delivery' }}
+  cancel-in-progress: false
+  queue: max
 
 env:
   # Load-bearing on every `yarn tauri` call, and ABSOLUTE rather than the
@@ -48,15 +56,36 @@ env:
   TAURI_APP_PATH: ${{ github.workspace }}/src-mobile
   # `inputs` is empty on a tag push, so this is "false" there.
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-  # ONE build number for both stores, so the walkthrough's run record
-  # names a single number. It becomes CFBundleVersion on iOS and
-  # versionCode on Android; the version string from the tag becomes
-  # CFBundleShortVersionString and versionName. Both stores require it
-  # to increase, and run_number only ever increases for this workflow
-  # FILE -- renaming the file resets it to 1, so do not.
-  BUILD_NUMBER: ${{ github.run_number }}
 
 jobs:
+  reserve:
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    outputs:
+      delivery: ${{ steps.reservation.outputs.delivery }}
+      build_number: ${{ steps.reservation.outputs.build_number }}
+      reservation: ${{ steps.reservation.outputs.reservation }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reserve delivery or verify completed duplicate
+        id: reservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "delivery=dry-run" >> "$GITHUB_OUTPUT"
+            echo "build_number=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/reserve-mobile-release.py \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-number "$GITHUB_RUN_NUMBER"
+
   # --- First release gate ---------------------------------------------
   #
   # Build jobs are disabled until the repository variable
@@ -85,18 +114,37 @@ jobs:
     # 20m; 60 absorbs a slow App Store Connect without ever hanging for
     # six hours (#885).
     timeout-minutes: 60
+    needs: reserve
     permissions:
       contents: read
     if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
     runs-on: macos-latest
+    env:
+      BUILD_NUMBER: ${{ needs.reserve.outputs.build_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The write-capable reserve job emits this receipt after persisting its
+      # claim. Read-only builders need no access to private release drafts.
+      - name: Verify this attempt owns the store reservation
+        if: needs.reserve.outputs.delivery == 'new'
+        env:
+          MOBILE_RESERVATION: ${{ needs.reserve.outputs.reservation }}
+        run: |
+          python3 scripts/reserve-mobile-release.py --check-owner \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-number "$BUILD_NUMBER" --reservation-json "$MOBILE_RESERVATION"
+      - name: Completed delivery needs no store submission
+        if: needs.reserve.outputs.delivery == 'noop'
+        run: echo "Verified completed delivery; no build or store upload is necessary."
 
       # A signed release must come from a tag, and must have every secret
       # it will need BEFORE spending twenty minutes building. Checked
       # here in one place so a missing secret fails with its name rather
       # than as "failed to import keychain certificate" deep in the build.
       - name: Preflight
+        if: needs.reserve.outputs.delivery != 'noop'
         env:
           IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
           IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
@@ -140,22 +188,10 @@ jobs:
             exit 1
           fi
 
-      # The build number must never go backwards, and the way it silently
-      # can is a rename.
-      #
-      # `BUILD_NUMBER` is `github.run_number`, counted per workflow FILE.
-      # Renaming this file restarts it at 1, and every upload after that
-      # is refused by the store as a duplicate -- recoverable only by
-      # burning version numbers until the count climbs back past the
-      # high-water mark. Nothing in the run says why, because from the
-      # store's side the number is simply one it has already seen.
-      #
-      # Non-contiguous numbers per version (0.1.7 -> 9, 0.1.12 -> 14) are
-      # this system working, not drift: a rejected upload still consumes
-      # its number, and re-tagging a version is routine. Only a DECREASE
-      # is a fault. See #635.
+      # The reserved number exceeds both the committed floor and every visible
+      # published/reserved build. Check the committed floor again before signing.
       - name: The build number has not gone backwards
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         run: |
           set -euo pipefail
           MARK_FILE=.github/mobile-build-high-water-mark
@@ -174,10 +210,7 @@ jobs:
             echo "reached a store. Both stores refuse a build number they have seen," >&2
             echo "so this upload would be rejected." >&2
             echo >&2
-            echo "The usual cause is renaming this workflow file: BUILD_NUMBER is" >&2
-            echo "github.run_number, which counts per workflow FILE and restarts at 1" >&2
-            echo "when the file is renamed. If that is what happened, restore the" >&2
-            echo "previous filename rather than burning version numbers." >&2
+            echo "The reserved build must exceed the committed floor." >&2
             echo >&2
             echo "If $HIGH is simply stale, raise it in $MARK_FILE." >&2
             exit 1
@@ -204,7 +237,7 @@ jobs:
       # one. contents:read (this job's permission) covers listing and
       # viewing releases.
       - name: The build mark does not lag a shipped build
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -213,11 +246,13 @@ jobs:
           python3 scripts/check-mobile-build-mark.py --require --release
 
       - uses: ./.github/actions/setup
+        if: needs.reserve.outputs.delivery != 'noop'
         with:
           rust-components: clippy, rustfmt
           rust-workspaces: src-mobile
 
       - name: Rust target
+        if: needs.reserve.outputs.delivery != 'noop'
         run: rustup target add aarch64-apple-ios
 
       # The tag is the single source of truth for the version, exactly as
@@ -228,6 +263,7 @@ jobs:
       # not a third place to edit. A dry run from a branch builds
       # whatever version the tree declares.
       - name: Version from tag
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           case "$GITHUB_REF" in
@@ -251,10 +287,13 @@ jobs:
       # plus the host-side gates. A tag on a crate that does not pass them
       # fails here instead of shipping.
       - name: Rust formatting and Clippy
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make lint-mobile
       - name: Rust tests
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make test-mobile
       - name: Check the iOS target
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make check-mobile-ios
 
       # --- Signing material -------------------------------------------
@@ -278,7 +317,7 @@ jobs:
       # team and no profile. Setting those is the build step's job -- see
       # the `--` arguments there.
       - name: Import signing material
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         env:
           IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
           IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
@@ -440,6 +479,7 @@ jobs:
       # repository is public, so it stays a secret rather than being
       # written into the committed config.
       - name: Build the IPA
+        if: needs.reserve.outputs.delivery != 'noop'
         env:
           IOS_CERTIFICATE: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_P12_BASE64 || '' }}
           IOS_CERTIFICATE_PASSWORD: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_PASSWORD || '' }}
@@ -501,6 +541,7 @@ jobs:
           fi
 
       - name: Collect the IPA
+        if: needs.reserve.outputs.delivery != 'noop'
         env:
           # Read back out of the built app below, to prove the code that
           # was supplied is the one that shipped.
@@ -569,7 +610,7 @@ jobs:
       # upload, so the JSON result is inspected for product-errors
       # rather than trusting the exit code.
       - name: Upload to TestFlight
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         env:
           APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
@@ -605,7 +646,7 @@ jobs:
       # Here and not in `publish`: a publish that fails after this upload
       # still leaves the number consumed, so the follow-up still applies.
       - name: Required follow-up (raise the build mark)
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         run: |
           set -euo pipefail
           MARK_FILE=.github/mobile-build-high-water-mark
@@ -621,6 +662,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.reserve.outputs.delivery != 'noop'
         with:
           name: mobile-ios
           path: release-assets/*
@@ -629,7 +671,7 @@ jobs:
       # Runs whether the build passed or not, so a failed job never leaves
       # the distribution identity in a keychain (spec: "deletes it after").
       - name: Remove signing material
-        if: always() && env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (always() && env.DRY_RUN != 'true')
         run: |
           set -u
           if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
@@ -646,6 +688,7 @@ jobs:
     # Skips early today (#673's secrets are not configured), so this is a
     # ceiling for the day it does run (#885).
     timeout-minutes: 60
+    needs: reserve
     permissions:
       contents: read
     # Both gates: the mobile release gate AND Android's own. A dry run
@@ -655,6 +698,7 @@ jobs:
     if: vars.ANDROID_RELEASE_ENABLED == 'true' && (vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run))
     runs-on: ubuntu-latest
     env:
+      BUILD_NUMBER: ${{ needs.reserve.outputs.build_number }}
       # Pinned rather than `$ANDROID_NDK_HOME`, which is whatever the
       # runner image calls its default that month. `sdkmanager` below is
       # a no-op while the image ships this version and an install when
@@ -667,7 +711,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The write-capable reserve job emits this receipt after persisting its
+      # claim. Read-only builders need no access to private release drafts.
+      - name: Verify this attempt owns the store reservation
+        if: needs.reserve.outputs.delivery == 'new'
+        env:
+          MOBILE_RESERVATION: ${{ needs.reserve.outputs.reservation }}
+        run: |
+          python3 scripts/reserve-mobile-release.py --check-owner \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-number "$BUILD_NUMBER" --reservation-json "$MOBILE_RESERVATION"
+      - name: Completed delivery needs no store submission
+        if: needs.reserve.outputs.delivery == 'noop'
+        run: echo "Verified completed delivery; no build or store upload is necessary."
+
       - name: Preflight
+        if: needs.reserve.outputs.delivery != 'noop'
         env:
           ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -699,11 +759,12 @@ jobs:
       # Linux, which needs the WebKit and GTK headers. No appindicator:
       # phones have no tray and this crate does not enable it.
       - name: Linux system dependencies
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           bash scripts/install-linux-dependencies.sh libwebkit2gtk-4.1-dev libgtk-3-dev
 
       - name: Retain Linux dependency diagnostics
-        if: always()
+        if: needs.reserve.outputs.delivery != 'noop' && (always())
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: apt-diagnostics-${{ github.job }}-${{ runner.os }}
@@ -711,6 +772,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/setup
+        if: needs.reserve.outputs.delivery != 'noop'
         with:
           rust-components: clippy, rustfmt
           rust-workspaces: src-mobile
@@ -728,6 +790,7 @@ jobs:
       # "the Android toolchain" means the release cannot build with a
       # toolchain CI never checked.
       - name: Android NDK
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
@@ -750,9 +813,11 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
 
       - name: Rust target
+        if: needs.reserve.outputs.delivery != 'noop'
         run: rustup target add aarch64-linux-android
 
       - name: Version from tag
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           case "$GITHUB_REF" in
@@ -775,14 +840,19 @@ jobs:
       # The mobile checks, the same targets ci.yml's mobile-android job
       # runs.
       - name: Rust formatting and Clippy
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make lint-mobile
       - name: Rust tests
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make test-mobile
       - name: Check the Android target
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make check-mobile-android
       - name: Install cargo-deny
+        if: needs.reserve.outputs.delivery != 'noop'
         run: cargo install cargo-deny --locked --version 0.20.2
       - name: cargo-deny
+        if: needs.reserve.outputs.delivery != 'noop'
         run: make deny-mobile
 
       # `gen/android` is the Android Studio project, committed like
@@ -790,6 +860,7 @@ jobs:
       # lands this generates it, exactly as ci.yml's mobile-android job
       # does; after it, this reports "committed" and does nothing.
       - name: Android Studio project
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           if [ -d src-mobile/gen/android ]; then
@@ -804,6 +875,7 @@ jobs:
       # unsigned dry run still builds. Idempotent, so it is safe on a
       # committed gen/android that already carries it.
       - name: Release signing configuration
+        if: needs.reserve.outputs.delivery != 'noop'
         run: python3 scripts/android-release-signing.py
 
       # keystore.properties in the layout Tauri's guide reads (storeFile,
@@ -812,7 +884,7 @@ jobs:
       # and the root .gitignore both exclude, and removed by the last
       # step.
       - name: Write the upload keystore
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         env:
           ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -843,6 +915,7 @@ jobs:
       # app/tauri.properties for Gradle to read. Signing comes from the
       # keystore.properties above, not from flags.
       - name: Build the AAB
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           CONFIG=$(printf '{"bundle":{"android":{"versionCode":%s}}}' "$BUILD_NUMBER")
@@ -853,6 +926,7 @@ jobs:
           yarn tauri android build --ci --aab --target aarch64 --config "$CONFIG"
 
       - name: Collect the AAB
+        if: needs.reserve.outputs.delivery != 'noop'
         run: |
           set -euo pipefail
           AAB=$(find src-mobile/gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -1)
@@ -878,7 +952,7 @@ jobs:
       # internal-testing track; `completed` makes the build available to
       # its testers, which is what "upload to internal testing" means.
       - name: Upload to the Play internal track
-        if: env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (env.DRY_RUN != 'true')
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -893,13 +967,14 @@ jobs:
             --release-name "$VERSION ($BUILD_NUMBER)"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.reserve.outputs.delivery != 'noop'
         with:
           name: mobile-android
           path: release-assets/*
           if-no-files-found: error
 
       - name: Remove signing material
-        if: always() && env.DRY_RUN != 'true'
+        if: needs.reserve.outputs.delivery != 'noop' && (always() && env.DRY_RUN != 'true')
         run: |
           rm -f src-mobile/gen/android/keystore.properties \
             "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/play-service-account.json"
@@ -915,10 +990,10 @@ jobs:
     # Collects both platforms' artifacts and creates the pre-release
     # (#885).
     timeout-minutes: 30
-    # The only job that writes to this repository (#886).
+    # Publication writes assets; reservation has its own narrow write job.
     permissions:
       contents: write
-    needs: [ios-release, android-release]
+    needs: [reserve, ios-release, android-release]
     # `always()` so a SKIPPED android-release does not skip this too.
     # Without it, `needs` treats "skipped" like "did not succeed" and
     # takes publish with it -- which is exactly how a disabled Android
@@ -933,26 +1008,39 @@ jobs:
       always()
       && startsWith(github.ref, 'refs/tags/mobile-v')
       && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+      && needs.reserve.result == 'success'
       && needs.ios-release.result == 'success'
       && needs.android-release.result != 'failure'
       && needs.android-release.result != 'cancelled'
     runs-on: ubuntu-latest
+    env:
+      BUILD_NUMBER: ${{ needs.reserve.outputs.build_number }}
     steps:
-      # `gh release create` resolves the repository from the git remote,
-      # and --generate-notes needs the previous tag, which a depth-1
-      # clone does not have.
+      # The publisher verifies the tagged commit and artifact bytes before
+      # finalizing the owned draft; completed assets are never overwritten.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.reserve.outputs.delivery != 'noop'
         with:
           path: release-assets
           # The setup action also uploads diagnostics; publish only app bundles.
           pattern: mobile-*
           merge-multiple: true
 
+      - name: Verify completed delivery
+        if: needs.reserve.outputs.delivery == 'noop'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/publish-release.py --verify-only --kind mobile \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+
       - name: Publish pre-release
+        if: needs.reserve.outputs.delivery != 'noop'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -999,24 +1087,17 @@ jobs:
 
           $STORES Install from there, not from these assets: they are here for provenance. Run \`docs/mobile-pairing-walkthrough.md\` on a real device against build $BUILD_NUMBER before promoting $WHICH (\`docs/mobile-release-process.md\`)."
 
-          # Notes diff against the previous MOBILE tag. Without
-          # --notes-start-tag, --generate-notes picks the most recent tag
-          # of any kind, which is usually a desktop release, and the
-          # changelog would be the desktop's.
+          # Preserve the changelog boundary at the previous mobile tag.
           PREV=$(git tag --list 'mobile-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -1 || true)
           START=()
-          if [ -n "$PREV" ]; then START=(--notes-start-tag "$PREV"); fi
-
-          # Idempotent: a rerun after a partial failure uploads to the
-          # existing release rather than failing on "already exists".
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release exists; uploading assets to it."
-            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --prerelease \
-              --title "Headstate Companion $VERSION" \
-              --notes "$NOTES" \
-              --generate-notes "${START[@]}" \
-              "${ASSETS[@]}"
-          fi
+          if [ -n "$PREV" ]; then START=(-f "previous_tag_name=$PREV"); fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" --method POST \
+            -f "tag_name=$GITHUB_REF_NAME" -f "target_commitish=$GITHUB_SHA" \
+            "${START[@]}" --jq '.body' > "$RUNNER_TEMP/mobile-changelog.md"
+          printf '%s\n\n' "$NOTES" > "$RUNNER_TEMP/mobile-release-notes.md"
+          cat "$RUNNER_TEMP/mobile-changelog.md" >> "$RUNNER_TEMP/mobile-release-notes.md"
+          python3 scripts/publish-release.py --kind mobile --prerelease \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-number "$BUILD_NUMBER" --assets-dir release-assets \
+            --notes-file "$RUNNER_TEMP/mobile-release-notes.md"
