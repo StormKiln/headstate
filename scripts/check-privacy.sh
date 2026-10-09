@@ -60,7 +60,8 @@ set -euo pipefail
 # rather than a GitHub one and cannot change without a new App Store record.
 # Native compile gates name the public JDK, Swift bridge and Gradle license dependencies.
 # `synthetic-lab` is the isolated enterprise harness fixture, never a live account.
-ALLOWED='synthetic-lab|adoptium|Brendonovich|JetBrains|octocat|StormKiln|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
+# `tailscale` is the public VPN upstream linked by the remote-access guide.
+ALLOWED='tailscale|synthetic-lab|adoptium|Brendonovich|JetBrains|octocat|StormKiln|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatinem|typescript-eslint|org|owner|acme|anthropics'
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.

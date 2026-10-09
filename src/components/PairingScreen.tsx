@@ -1,3 +1,4 @@
+import { RemoteSetupGuide } from "./RemoteSetupGuide";
 import { PhoneMeasurementPanel } from "./PhoneMeasurementPanel";
 import { useEffect, useState } from "react";
 import { Camera, ClipboardPaste, Loader2, Settings, QrCode } from "lucide-react";
@@ -231,10 +232,7 @@ export function PairingScreen({ revokedBy }: { revokedBy?: string } = {}) {
         )}
 
         <details><summary>Phone measurements</summary><PhoneMeasurementPanel /></details>
-        <p className="mt-auto text-xs text-[#8b949e]">
-          Both devices need to be on the same network, or connected through the same
-          VPN. Nothing is sent to any server in between.
-        </p>
+        <RemoteSetupGuide />
       </div>
     </div>
   );

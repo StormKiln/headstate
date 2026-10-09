@@ -49,6 +49,10 @@ impl Request {
 /// What to answer a path with.
 #[derive(Debug, Clone)]
 pub(crate) enum Reply {
+    HeldJson {
+        release: Arc<Notify>,
+        body: String,
+    },
     Body {
         status: u16,
         content_type: &'static str,
@@ -67,7 +71,10 @@ pub(crate) enum Reply {
     /// A JSON body, gzipped when the request's `Accept-Encoding` names
     /// gzip and sent plain otherwise. That is what the real listener does
     /// on `/v1/call/*` (#1478).
-    GzipJson { status: u16, body: String },
+    GzipJson {
+        status: u16,
+        body: String,
+    },
 }
 
 impl Reply {
@@ -376,6 +383,10 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
                 .is_some_and(|v| v.split(',').any(|c| c.trim() == "gzip"));
             shared.requests.lock().unwrap().push(req);
             match reply {
+                Reply::HeldJson { release, body } => {
+                    release.notified().await;
+                    let _ = write_body(&mut tls, 200, "application/json", &body).await;
+                }
                 Reply::Body {
                     status,
                     content_type,

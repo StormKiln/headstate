@@ -539,8 +539,18 @@ pub struct Subscriber {
     pub desktop_fp: String,
 }
 
+fn retry_delay(delay: Duration, seed: u32) -> Duration {
+    delay.mul_f64(0.8 + f64::from(seed % 201) / 1000.0)
+}
+
 /// Sleep `d` or until woken. `false` when the handle was stopped.
 async fn wait(handle: &Handle, d: Duration) -> bool {
+    // Timing noise spreads retries; it carries no identity or security role.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let d = retry_delay(d, seed);
     tokio::select! {
         _ = tokio::time::sleep(d) => {}
         _ = handle.wake.notified() => {}
@@ -569,10 +579,20 @@ pub async fn run(sub: Subscriber, handle: Handle) {
         }
         handle.publish(|| sub.conn.set_state(State::Connecting));
 
-        let hello = match sub.client.hello().await {
+        let hello_result = tokio::select! {
+            result = sub.client.hello() => result,
+            _ = handle.wake.notified() => {
+                if handle.is_stopped() { return; }
+                continue;
+            }
+        };
+        let hello = match hello_result {
             Ok(h) => h,
             Err(e) if is_revocation(&e) => {
-                log::warn!("companion: the desktop refused this phone: {e}");
+                log::warn!(
+                    "companion: the desktop refused this phone ({})",
+                    crate::client::failure_category(&e)
+                );
                 handle.publish(|| {
                     let _ = forget_snapshot(sub.store.as_ref());
                     sub.conn.set_state(State::Revoked);
@@ -580,7 +600,10 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                 return;
             }
             Err(e) => {
-                log::info!("companion: desktop unreachable: {e}");
+                log::info!(
+                    "companion: desktop unreachable ({})",
+                    crate::client::failure_category(&e)
+                );
                 handle.publish(|| sub.conn.set_state(State::Unreachable));
                 if !wait(&handle, backoff).await {
                     return;
@@ -608,7 +631,14 @@ pub async fn run(sub: Subscriber, handle: Handle) {
             return;
         }
 
-        match sub.client.events().await {
+        let stream_result = tokio::select! {
+            result = sub.client.events() => result,
+            _ = handle.wake.notified() => {
+                if handle.is_stopped() { return; }
+                continue;
+            }
+        };
+        match stream_result {
             Ok(mut resp) => {
                 backoff = MIN_BACKOFF;
                 let mut parser = SseParser::default();
@@ -628,8 +658,8 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                                 log::info!("companion: the event stream ended; reconnecting");
                                 break;
                             }
-                            Err(e) => {
-                                log::info!("companion: the event stream failed: {e}");
+                            Err(_) => {
+                                log::info!("companion: the event stream failed");
                                 break;
                             }
                         },
@@ -668,7 +698,10 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                 }
             }
             Err(e) if is_revocation(&e) => {
-                log::warn!("companion: the desktop refused the event stream: {e}");
+                log::warn!(
+                    "companion: the desktop refused the event stream ({})",
+                    crate::client::failure_category(&e)
+                );
                 handle.publish(|| {
                     let _ = forget_snapshot(sub.store.as_ref());
                     sub.conn.set_state(State::Revoked);
@@ -676,7 +709,10 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                 return;
             }
             Err(e) => {
-                log::info!("companion: could not open the event stream: {e}");
+                log::info!(
+                    "companion: could not open the event stream ({})",
+                    crate::client::failure_category(&e)
+                );
                 handle.publish(|| sub.conn.set_state(State::Unreachable));
                 if !wait(&handle, backoff).await {
                     return;
@@ -970,6 +1006,17 @@ mod tests {
     }
 
     #[test]
+    fn retry_delays_are_jittered_without_exceeding_the_backoff_budget() {
+        for budget in [MIN_BACKOFF, MAX_BACKOFF] {
+            let early = retry_delay(budget, 0);
+            let late = retry_delay(budget, 200);
+            assert!(early < late, "different retry seeds must spread reconnects");
+            assert!(early >= budget.mul_f64(0.8));
+            assert!(late <= budget);
+        }
+    }
+
+    #[test]
     fn backoff_doubles_to_a_ceiling() {
         let mut d = MIN_BACKOFF;
         let mut seen = vec![];
@@ -1019,6 +1066,41 @@ mod tests {
             rec,
             conn,
             handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_a_subscriber_cancels_pending_hello_and_event_headers() {
+        for path in ["/v1/hello", "/v1/events"] {
+            let store = Arc::new(MemoryStore::default());
+            let keys = SoftwareKeys::new(store.clone());
+            keys.generate().unwrap();
+            let id = keys.session_identity().unwrap();
+            let server = TestServer::start().await;
+            server.pair(&id.fingerprint());
+            server.reply(path, Reply::Stall);
+            let client =
+                Arc::new(Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap());
+            let rec = Arc::new(Recorder::default());
+            let handle = Handle::new();
+            let task = tokio::spawn(run(
+                Subscriber {
+                    client,
+                    store,
+                    sink: rec.clone(),
+                    conn: Arc::new(Connection::new(rec)),
+                    desktop_fp: server.fp.clone(),
+                },
+                handle.clone(),
+            ));
+            until(|| server.requests().iter().any(|r| r.path == path)).await;
+            handle.stop();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), task)
+                    .await
+                    .is_ok(),
+                "stopped subscriber kept its {path} request alive"
+            );
         }
     }
 

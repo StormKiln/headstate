@@ -258,20 +258,20 @@ fn persist_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// `/v1/hello`'s login, through the GitHub client the app already
-/// holds. `None` when not signed in.
+/// `/v1/hello` reads only identity already learned by normal GitHub work.
+/// A cold or signed-out client returns `None`; a health probe must never
+/// trigger provider traffic just to fill in optional identity (#1769).
 fn viewer_lookup(app: &AppHandle) -> ViewerLookup {
     let client = app
         .try_state::<crate::commands::GhClient>()
         .and_then(|s| s.0.clone());
+    viewer_lookup_for(client)
+}
+
+fn viewer_lookup_for(client: Option<Arc<crate::github::client::GitHubClient>>) -> ViewerLookup {
     Arc::new(move || {
         let client = client.clone();
-        Box::pin(async move {
-            match client {
-                Some(c) => c.fetch_viewer().await.ok(),
-                None => None,
-            }
-        })
+        Box::pin(async move { client.and_then(|c| c.known_viewer().map(str::to_owned)) })
     })
 }
 
@@ -444,6 +444,51 @@ pub(crate) async fn start_synthetic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hello_viewer_lookup_never_fetches_and_observes_later_normal_fetch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        install_crypto_provider();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"viewer": {"login": "synthetic-viewer"}}
+            })))
+            .mount(&server)
+            .await;
+        let client = Arc::new(crate::github::client::GitHubClient::new(
+            octocrab::Octocrab::builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("synthetic-token")
+                .build()
+                .unwrap(),
+        ));
+        let lookup = viewer_lookup_for(Some(client.clone()));
+
+        // Repeated cold hellos remain provider-free; they must not initialize
+        // identity by spending even a successful provider request.
+        for _ in 0..2 {
+            assert_eq!(lookup().await, None);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(viewer_lookup_for(None)().await, None);
+
+        // The normal data path can still fetch identity. The same hello lookup
+        // must see its newly populated cache rather than retaining the cold None.
+        assert_eq!(client.fetch_viewer().await.unwrap(), "synthetic-viewer");
+        for _ in 0..2 {
+            assert_eq!(lookup().await.as_deref(), Some("synthetic-viewer"));
+        }
+        assert_eq!(
+            viewer_lookup_for(Some(client))().await.as_deref(),
+            Some("synthetic-viewer")
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     /// The pairing state IS the verifier's source: nothing paired and
     /// no window until a token is issued; the window closes when the

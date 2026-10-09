@@ -571,35 +571,14 @@ jobs:
       # libayatana-appindicator specifically -- without it the app compiles
       # and the tray silently never appears, which is the hardest kind of
       # failure to attribute later.
+      - name: Linux dependency installer self-tests
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/install-linux-dependencies.test.py
+
       - name: Linux system dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # Drop the third-party lists this project never installs
-          # from, then refresh.
-          #
-          # A bare `apt-get update` refreshes EVERY configured source,
-          # and the runner image ships a Google Chrome repository. When
-          # that mirror serves a corrupted index the command exits 100
-          # and the job dies on a fetch unrelated to the build:
-          #
-          #   E: Failed to fetch https://dl.google.com/linux/chrome-stable/...
-          #      Hash Sum mismatch
-          #
-          # Seen on two unrelated pull requests across three runs in one
-          # afternoon, blocking a release for an hour. See #713.
-          #
-          # Removing the Chrome list rather than disabling
-          # `sources.list.d` wholesale: the first attempt at this used
-          # `-o Dir::Etc::sourceparts=-`, which also disabled the
-          # UNIVERSE list that lives there -- and every package below is
-          # from universe, so the job then failed with "Unable to locate
-          # package libwebkit2gtk-4.1-dev". Narrower is correct here.
-          #
-          # `|| true` so a runner image that stops shipping Chrome does
-          # not fail on a missing file.
-          sudo rm -f /etc/apt/sources.list.d/*google-chrome* || true
-          sudo apt-get update
-          sudo apt-get install -y \
+          bash scripts/install-linux-dependencies.sh \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
@@ -609,6 +588,14 @@ jobs:
             gstreamer1.0-tools \
             squashfs-tools \
             xvfb
+
+      - name: Retain Linux dependency diagnostics
+        if: always() && (matrix.os == 'ubuntu-latest')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apt-diagnostics-${{ github.job }}-${{ runner.os }}
+          path: ${{ runner.temp }}/ci-diagnostics/apt-*
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/setup
 
@@ -936,32 +923,15 @@ jobs:
       - name: Linux system dependencies
         if: needs.mobile-changes.outputs.run == 'true'
         run: |
-          # Drop the third-party lists this project never installs
-          # from, then refresh.
-          #
-          # A bare `apt-get update` refreshes EVERY configured source,
-          # and the runner image ships a Google Chrome repository. When
-          # that mirror serves a corrupted index the command exits 100
-          # and the job dies on a fetch unrelated to the build:
-          #
-          #   E: Failed to fetch https://dl.google.com/linux/chrome-stable/...
-          #      Hash Sum mismatch
-          #
-          # Seen on two unrelated pull requests across three runs in one
-          # afternoon, blocking a release for an hour. See #713.
-          #
-          # Removing the Chrome list rather than disabling
-          # `sources.list.d` wholesale: the first attempt at this used
-          # `-o Dir::Etc::sourceparts=-`, which also disabled the
-          # UNIVERSE list that lives there -- and every package below is
-          # from universe, so the job then failed with "Unable to locate
-          # package libwebkit2gtk-4.1-dev". Narrower is correct here.
-          #
-          # `|| true` so a runner image that stops shipping Chrome does
-          # not fail on a missing file.
-          sudo rm -f /etc/apt/sources.list.d/*google-chrome* || true
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+          bash scripts/install-linux-dependencies.sh libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: Retain Linux dependency diagnostics
+        if: always() && (needs.mobile-changes.outputs.run == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apt-diagnostics-${{ github.job }}-${{ runner.os }}
+          path: ${{ runner.temp }}/ci-diagnostics/apt-*
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/setup
         if: needs.mobile-changes.outputs.run == 'true'

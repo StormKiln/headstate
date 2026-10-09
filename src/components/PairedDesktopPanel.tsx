@@ -1,3 +1,4 @@
+import { RemoteConnectionPanel } from "./RemoteConnectionPanel";
 import { useState } from "react";
 import { useUnpair } from "@/api/pairing";
 import { type ConnectionState, useConnectionState, usePhoneHasMldsa } from "@/api/connection";
@@ -90,6 +91,8 @@ export function PairedDesktopPanel() {
           )}
         </p>
       )}
+
+      <RemoteConnectionPanel mode="phone" />
 
       {confirming ? (
         <div className="mt-2 space-y-2 rounded border border-[#f85149]/30 bg-[#f85149]/10 p-3">

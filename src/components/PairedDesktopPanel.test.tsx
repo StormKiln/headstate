@@ -32,6 +32,13 @@ describe("PairedDesktopPanel", () => {
     mldsa.current = null;
   });
 
+  it("keeps remote repair available while the desktop is unreachable", () => {
+    state.current = { kind: "unreachable", desktop: "studio" };
+    render(<PairedDesktopPanel />);
+    expect(screen.getByRole("region", { name: "Remote connection" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Check connection" })).toBeTruthy();
+  });
+
   it("names the paired desktop", () => {
     render(<PairedDesktopPanel />);
     expect(screen.getByText("studio")).toBeTruthy();

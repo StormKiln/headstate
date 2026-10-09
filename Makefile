@@ -394,6 +394,7 @@ lint-deps:
 	python3 scripts/measurement-report.test.py
 	node --test scripts/measurement-evidence.test.mjs
 	python3 scripts/ci-command.test.py
+	python3 scripts/install-linux-dependencies.test.py
 	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/test-frontend-ci.test.py

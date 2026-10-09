@@ -896,6 +896,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // that could approve its own pairing request, revoke a rival, or
     // turn the listener off would defeat the point of each.
     ("issue_pairing_token", Class::Local),
+    ("get_remote_connection_addresses", Class::Local),
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
     ("revoke_paired_device", Class::Local),
@@ -1776,6 +1777,7 @@ mod tests {
             "set_autostart",
             "set_worktree_dirs",
             "issue_pairing_token",
+            "get_remote_connection_addresses",
             "respond_to_pairing",
             "list_paired_devices",
             "revoke_paired_device",
