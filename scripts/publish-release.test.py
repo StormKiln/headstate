@@ -8,7 +8,9 @@ from pathlib import Path
 import tempfile
 import shutil
 import unittest
-from release_delivery import DeliveryError, parse_marker, with_marker, verify_completed
+from unittest.mock import patch
+from types import SimpleNamespace
+from release_delivery import GitHub, DeliveryError, parse_marker, with_marker, verify_completed
 
 SPEC = importlib.util.spec_from_file_location('publisher', Path(__file__).with_name('publish-release.py'))
 publisher = importlib.util.module_from_spec(SPEC)
@@ -60,6 +62,56 @@ class PublicationTests(unittest.TestCase):
     def publish(self, run_id=10, **kwargs):
         return publisher.publish(self.api, 'mobile-v1.2.3', SHA, run_id, 1, 'mobile',
                                  self.directory, 'Release notes', True, 20, **kwargs)
+    def test_real_request_boundary_preserves_draft_identity_on_both_patches(self):
+        # Reproduce the observed #1785 boundary: an omitted draft tag becomes
+        # untagged. Exercise actual subprocess JSON serialization, not API.update.
+        api = self.api
+        requests = []
+        def process(args, **kwargs):
+            self.assertEqual(args[:2], ['gh', 'api'])
+            self.assertEqual(args[2], f'{api.base}/releases/1')
+            self.assertEqual(args[3:], ['--method', 'PATCH', '--input', '-'])
+            data = json.loads(kwargs['input'])
+            requests.append(data)
+            api.value.update(data)
+            api.value['tag_name'] = data.get('tag_name', 'untagged-observed')
+            return SimpleNamespace(returncode=0, stdout=json.dumps(api.value), stderr='')
+        api.request = lambda *args, **kwargs: GitHub.request(api, *args, **kwargs)
+        upload = api.upload
+        def upload_by_tag(tag, path):
+            self.assertEqual(tag, api.value['tag_name'], 'upload cannot resolve a renamed draft')
+            upload(tag, path)
+        api.upload = upload_by_tag
+        with patch('release_delivery.subprocess.run', side_effect=process):
+            self.assertEqual(self.publish(), 'published')
+        self.assertEqual(len(requests), 2)
+        for data in requests:
+            self.assertEqual(data['tag_name'], 'mobile-v1.2.3')
+            self.assertEqual(data['target_commitish'], SHA)
+
+    def test_changed_update_identity_stops_before_any_upload(self):
+        for field, value in [('tag_name', 'untagged-observed'), ('id', 999),
+                             ('target_commitish', 'b' * 40), ('draft', False)]:
+            with self.subTest(field=field):
+                api = API(); self.reserve(api); self.api = api
+                original = api.request
+                def change(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    result[field] = value
+                    return result
+                api.request = change
+                with self.assertRaises(DeliveryError): self.publish()
+                self.assertEqual(api.blobs, {})
+
+    def test_failed_upload_reports_safe_reason_and_owned_draft(self):
+        def fail(tag, path):
+            raise DeliveryError('release asset upload failed (release not found; exit 1)')
+        self.api.upload = fail
+        with patch.object(publisher.time, 'sleep'), self.assertRaises(DeliveryError) as caught:
+            self.publish()
+        self.assertIn('release not found', str(caught.exception))
+        self.assertIn('draft 1', str(caught.exception))
+
     def test_missing_mobile_reservation_never_creates_after_store_upload(self):
         self.api.value = None
         with self.assertRaises(DeliveryError): self.publish()

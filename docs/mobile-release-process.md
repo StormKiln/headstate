@@ -86,6 +86,15 @@ preparing a new version tag with a higher reserved build. Do not delete a draft
 to reclaim its number or rerun an upload merely because its response was lost.
 There is no automatic partial-delivery recovery command.
 
+A draft whose API tag changes (for example to `untagged-…`) still reserves the
+logical mobile tag and build recorded in its delivery marker. Reservation discovery
+reads that marker independently of the API tag. It refuses another submission of
+the original version, while a new version allocates above the preserved build.
+Conflicting or malformed provenance blocks reservation. After confirming what the
+store accepted, retain the original draft and upload evidence, record the consumed
+build, and release the corrected pipeline under a new version. Do not discard an
+orphan draft to make a retry appear new.
+
 Release notes include an HTML comment beginning `headstate-delivery-v1` that
 records immutable delivery provenance. Human-facing notes may be corrected, but
 preserve that entire comment and do not alter its fields. Removing or editing
