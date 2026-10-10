@@ -32,6 +32,16 @@ def check_partial(api, release, expected, only=None):
     return set(names)
 
 
+def check_response_identity(release, tag, sha, marker, release_id, *, draft):
+    # #1785: the observed draft lost its tag during the body update. Do not
+    # let a changed API identity send uploads to a different (or missing) tag.
+    if (not isinstance(release, dict) or type(release.get('id')) is not int
+            or release['id'] < 1 or (release_id is not None and release['id'] != release_id)
+            or release.get('tag_name') != tag or release.get('target_commitish') != sha
+            or release.get('draft') is not draft or parse_marker(release.get('body')) != marker):
+        raise DeliveryError('release response changed the owned delivery identity; reconcile the draft before retrying')
+
+
 def publish(api, tag, sha, run_id, run_attempt, kind, directory, notes,
             prerelease=False, build_number=None, updater_config=None, admit=lambda: None,
             generate_notes=False):
@@ -67,10 +77,14 @@ def publish(api, tag, sha, run_id, run_attempt, kind, directory, notes,
                                 data={'tag_name': tag, 'target_commitish': sha})
         notes = notes.rstrip() + '\n\n' + generated['body']
     body = with_marker(notes, marker)
+    release_id = release['id'] if release else None
     if release:
         # Verify existing bytes before making even a provenance update.
         existing = check_partial(api, release, hashes)
-        release = api.request(f'{api.base}/releases/{release["id"]}', method='PATCH', data={'body': body})
+        release = api.request(f'{api.base}/releases/{release["id"]}', method='PATCH', data={
+            'tag_name': tag, 'target_commitish': sha, 'body': body, 'draft': True,
+        })
+        check_response_identity(release, tag, sha, marker, release_id, draft=True)
     else:
         try:
             release = api.request(f'{api.base}/releases', method='POST', data={
@@ -89,19 +103,27 @@ def publish(api, tag, sha, run_id, run_attempt, kind, directory, notes,
             recovered = parse_marker(release.get('body'))
             if recovered != marker:
                 raise DeliveryError('another delivery owns the draft created concurrently')
+        check_response_identity(release, tag, sha, marker, release_id, draft=True)
         existing = check_partial(api, release, hashes)
+    release_id = release['id']
     for path in files:
         if path.name in existing: continue
+        failure = 'upload returned success but the asset is absent from the draft'
         for attempt in range(3):
             try:
                 api.upload(tag, path)
-            except (DeliveryError, subprocess.TimeoutExpired):
-                pass  # The response may have been lost after the upload committed.
+            except subprocess.TimeoutExpired:
+                failure = 'upload timed out; its response may have been lost'
+            except DeliveryError as error:
+                failure = str(error)  # Transport reports only sanitized status/category.
+            else:
+                failure = 'upload returned success but the asset is absent from the draft'
             existing = check_partial(api, release, hashes, only={path.name})
             if path.name in existing: break
             if attempt < 2: time.sleep(5 * (attempt + 1))
         else:
-            raise DeliveryError(f'could not verify upload after three attempts: {path.name}')
+            raise DeliveryError(f'could not verify upload after three attempts: {path.name}; '
+                                f'draft {release_id}: {failure}. Reconcile this draft before retrying.')
     if existing != set(hashes):
         raise DeliveryError('not every expected asset arrived')
     # Fresh downloaded bytes must satisfy the same signature/manifest contract.
@@ -117,10 +139,12 @@ def publish(api, tag, sha, run_id, run_attempt, kind, directory, notes,
     marker['state'] = 'complete'
     try:
         release = api.request(f'{api.base}/releases/{release["id"]}', method='PATCH',
-                              data={'body': with_marker(notes, marker), 'draft': False})
+                              data={'tag_name': tag, 'target_commitish': sha,
+                                    'body': with_marker(notes, marker), 'draft': False})
     except (DeliveryError, subprocess.TimeoutExpired):
         release = api.release(tag)
         if not release: raise DeliveryError('publication response was lost and completion cannot be verified')
+    check_response_identity(release, tag, sha, marker, release_id, draft=False)
     verify_completed(api, release, tag, sha, kind, updater_config)
     return 'published'
 

@@ -20,14 +20,42 @@ def marker_of(release):
     return parse_marker(release.get('body') or '')
 
 
-def reserve(*, releases, tag, sha, run_id, run_number, mark, verify, create, run_attempt=1):
-    existing = [item for item in releases if item.get('tag_name') == tag]
-    if len(existing) > 1:
-        raise ValueError('Multiple releases claim the requested mobile tag.')
-    if existing:
-        item = existing[0]
+def mobile_inventory(releases):
+    """Identify consumed builds by provenance, even if GitHub renamed a draft.
+
+    A body-only PATCH orphaned build46 after store acceptance (#1785). Its
+    logical tag still owns that submission; a new version may advance the floor,
+    but neither a renamed draft nor conflicting claims permit resubmission.
+    """
+    inventory = []
+    claimed = set()
+    for item in releases:
         marker = marker_of(item)
-        if (item.get('draft') or not marker or marker.get('state') != 'complete'
+        api_tag = str(item.get('tag_name', ''))
+        if marker and marker['kind'] == 'mobile':
+            logical_tag = marker['tag']
+            if (not re.fullmatch(r'mobile-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?', logical_tag)
+                    or (api_tag.startswith('mobile-v') and api_tag != logical_tag)):
+                raise ValueError('A mobile release has conflicting reservation tag identity.')
+        elif api_tag.startswith('mobile-v'):
+            if marker:
+                raise ValueError('A mobile release has invalid delivery provenance.')
+            logical_tag = api_tag
+        else:
+            continue
+        if logical_tag in claimed:
+            raise ValueError('Multiple releases claim the same mobile provenance tag.')
+        claimed.add(logical_tag)
+        inventory.append((item, marker, logical_tag))
+    return inventory
+
+
+def reserve(*, releases, tag, sha, run_id, run_number, mark, verify, create, run_attempt=1):
+    inventory = mobile_inventory(releases)
+    existing = [(item, marker) for item, marker, logical_tag in inventory if logical_tag == tag]
+    if existing:
+        item, marker = existing[0]
+        if (item.get('tag_name') != tag or item.get('draft') or not marker or marker.get('state') != 'complete'
                 or marker.get('kind') != 'mobile' or marker.get('tag') != tag
                 or marker.get('sha') != sha):
             raise ValueError('Prior mobile delivery is incomplete or ambiguous; reconcile it before another store submission.')
@@ -35,14 +63,10 @@ def reserve(*, releases, tag, sha, run_id, run_number, mark, verify, create, run
         return 'noop', marker['build_number']
 
     highest = mark
-    for item in releases:
-        if not str(item.get('tag_name', '')).startswith('mobile-v'):
-            continue
-        marker = marker_of(item)
+    for item, marker, _ in inventory:
         if marker:
             build = marker.get('build_number')
-            if (marker.get('kind') != 'mobile' or marker.get('tag') != item['tag_name']
-                    or type(build) is not int or build <= 0):
+            if type(build) is not int or build <= 0:
                 raise ValueError('A mobile release has an invalid build reservation.')
             highest = max(highest, build)
         elif item.get('draft'):
@@ -104,19 +128,24 @@ def main():
         raise ValueError('Invalid committed high-water mark or workflow run number.')
     releases = list(api.pages(f'repos/{args.repo}/releases'))
     # Explicit asset pagination avoids truncating the high-water observation.
-    for item in releases:
-        if str(item.get('tag_name', '')).startswith('mobile-v'):
-            item['assets'] = list(api.assets(item['id']))
+    for item, _, _ in mobile_inventory(releases):
+        item['assets'] = list(api.assets(item['id']))
     reserved_marker = None
     def create(marker):
         nonlocal reserved_marker
         notes = ('Mobile delivery reserved before store upload. An incomplete delivery '
                  'must be reconciled before retrying.\n')
-        api.request(f'repos/{args.repo}/releases', method='POST', data={
+        created = api.request(f'repos/{args.repo}/releases', method='POST', data={
             'tag_name': args.tag, 'target_commitish': args.sha, 'draft': True,
             'prerelease': True, 'name': f'Headstate Companion {args.tag.removeprefix("mobile-v")}',
             'body': with_marker(notes, marker),
         })
+        if (not isinstance(created, dict)
+                or type(created.get('id')) is not int or created['id'] <= 0
+                or created.get('tag_name') != args.tag
+                or created.get('target_commitish') != args.sha
+                or created.get('draft') is not True or marker_of(created) != marker):
+            raise ValueError('Created mobile reservation identity is uncertain; reconcile it before store submission.')
         reserved_marker = marker
     disposition, build = reserve(
         releases=releases, tag=args.tag, sha=args.sha, run_id=args.run_id,

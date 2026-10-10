@@ -30,6 +30,115 @@ class Reservations(unittest.TestCase):
         args.update(changes)
         return self.module.reserve(**args)
 
+    def orphan(self):
+        # Observed release408407263 after body-only PATCH lost its REST tag;
+        # Apple had already accepted build46, while GitHub had zero assets.
+        item = self.release(tag='mobile-v10.0.2',
+                            sha='89ad2f30b4bb8c62f84b34c0660567a53b80708c',
+                            build=46, state='uploading')
+        item.update(id=408407263, tag_name='untagged-82ea65cf29f7d316dbe2')
+        return item
+
+    def test_observed_orphan_cannot_resubmit_same_provenance_tag(self):
+        with self.assertRaises(ValueError):
+            self.reserve([self.orphan()], tag='mobile-v10.0.2', mark=45,
+                         sha='89ad2f30b4bb8c62f84b34c0660567a53b80708c')
+        self.assertEqual(self.created, [])
+        self.assertEqual(self.checked, [])
+
+    def test_observed_orphan_consumes_build_for_distinct_recovery_tag(self):
+        self.assertEqual(self.reserve([self.orphan()], tag='mobile-v10.0.3', mark=45),
+                         ('new', 47))
+        self.assertEqual(self.created[0]['build_number'], 47)
+
+    def test_orphan_cannot_hide_behind_complete_duplicate(self):
+        complete = self.release(tag='mobile-v10.0.2', draft=False, state='complete')
+        with self.assertRaises(ValueError):
+            self.reserve([complete, self.orphan()], tag='mobile-v10.0.2', sha='a'*40)
+        self.assertEqual(self.checked, [])
+        self.assertEqual(self.created, [])
+
+    def test_conflicting_mobile_identity_or_malformed_marker_fails_closed(self):
+        from release_delivery import DeliveryError
+        conflicting = self.orphan()
+        conflicting['tag_name'] = 'mobile-v10.0.1'
+        malformed = self.orphan()
+        malformed['body'] = '<!-- headstate-delivery-v1:broken -->'
+        for item in [conflicting, malformed]:
+            with self.subTest(item=item), self.assertRaises((ValueError, DeliveryError)):
+                self.reserve([item], tag='mobile-v10.0.3', mark=45)
+        self.assertEqual(self.created, [])
+
+    def test_renamed_complete_release_is_not_a_verified_noop(self):
+        item = self.release(tag='mobile-v10.0.2', draft=False, state='complete')
+        item['tag_name'] = 'untagged-renamed'
+        with self.assertRaises(ValueError):
+            self.reserve([item], tag='mobile-v10.0.2', sha='a'*40)
+        self.assertEqual(self.checked, [])
+        self.assertEqual(self.created, [])
+
+    def test_nonmobile_drafts_do_not_block_reservation(self):
+        unrelated = dict(tag_name='v10.0.2', draft=True, body='', assets=[])
+        self.assertEqual(self.reserve([unrelated], mark=45), ('new', 46))
+
+    def test_cli_paginates_orphan_assets_and_preserves_their_higher_floor(self):
+        from unittest.mock import patch
+        import contextlib
+        import io
+        import os
+        import tempfile
+        import release_delivery
+        with tempfile.TemporaryDirectory() as directory:
+            mark = Path(directory) / 'mark'
+            mark.write_text('45')
+            argv = [str(SCRIPT), '--repo', 'owner/repo', '--tag', 'mobile-v10.0.3',
+                    '--sha', 'b'*40, '--run-id', '102', '--run-attempt', '1',
+                    '--run-number', '20', '--mark-file', str(mark)]
+            with patch.object(sys, 'argv', argv), patch.object(release_delivery, 'GitHub') as api, \
+                    patch.dict(os.environ, {'GITHUB_OUTPUT': ''}), contextlib.redirect_stdout(io.StringIO()):
+                client = api.return_value
+                client.pages.return_value = [self.orphan()]
+                client.request.side_effect = lambda _path, **kw: dict(id=123, **kw['data'])
+                client.assets.return_value = [dict(name='Headstate-Companion-10.0.2-build61.ipa')]
+                self.module.main()
+                client.assets.assert_called_once_with(408407263)
+                client.request.assert_called_once()
+                request = client.request.call_args
+                self.assertEqual(request.kwargs['method'], 'POST')
+                marker = release_delivery.parse_marker(request.kwargs['data']['body'])
+                self.assertEqual(marker['build_number'], 62)
+
+    def test_creation_response_must_confirm_identity_before_upload_authority(self):
+        from unittest.mock import patch
+        import contextlib
+        import io
+        import os
+        import tempfile
+        import release_delivery
+        for field, value in [('id', None), ('id', True), ('id', 0),
+                             ('tag_name', 'untagged-renamed'), ('target_commitish', 'c'*40),
+                             ('draft', False), ('body', ''), ('body', self.release()['body'])]:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
+                mark = Path(directory) / 'mark'
+                mark.write_text('46')
+                output = Path(directory) / 'output'
+                argv = [str(SCRIPT), '--repo', 'owner/repo', '--tag', 'mobile-v10.0.3',
+                        '--sha', 'b'*40, '--run-id', '102', '--run-attempt', '1',
+                        '--run-number', '20', '--mark-file', str(mark)]
+                with patch.object(sys, 'argv', argv), patch.object(release_delivery, 'GitHub') as api, \
+                        patch.dict(os.environ, {'GITHUB_OUTPUT': str(output)}), contextlib.redirect_stdout(io.StringIO()):
+                    client = api.return_value
+                    client.pages.return_value = []
+                    def response(_path, **kw):
+                        result = dict(id=123, **kw['data'])
+                        result[field] = value
+                        return result
+                    client.request.side_effect = response
+                    with self.assertRaises(ValueError):
+                        self.module.main()
+                    client.request.assert_called_once()
+                    self.assertFalse(output.exists(), 'uncertain creation must emit no store authority')
+
     def test_reversed_queue_order_allocates_above_every_reserved_build(self):
         result = self.reserve([self.release(build=301)])
         self.assertEqual(result, ('new', 302))

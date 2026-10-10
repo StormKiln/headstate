@@ -1393,12 +1393,10 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
         std::fs::create_dir_all(dir).ok();
     }
     let conn = Connection::open(path)?;
-    // WAL lets a reader proceed while a writer holds the file, and
-    // busy_timeout replaces rusqlite's effectively-zero default with a
-    // real wait. Contention is near-impossible today -- one autocommit
-    // UPSERT of one row, from a loop whose only other writer is offset by
-    // construction -- so this is cheap hardening against a future second
-    // writer, not a fix for an observed failure.
+    // WAL lets a reader proceed while a writer holds the file. Keep an
+    // explicit five-second contention budget (also rusqlite's current default).
+    // Concurrent first opens can wait on the connection applying migrations;
+    // an opener returns DatabaseBusy if that writer outlasts the budget.
     //
     // Non-fatal: a read-only volume or an older SQLite should degrade to
     // the previous behaviour rather than refuse to open the cache.
@@ -1689,23 +1687,93 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_database_opens_all_succeed() {
+    fn first_database_open_reports_busy_until_the_migration_writer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held-first-open.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let opening_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(open_db(&opening_path).map(|_| ())).unwrap();
+        });
+        // Keep the competing migration writer held until open_db has returned;
+        // the outer deadline only prevents a broken bounded wait hanging CI.
+        let result = recv.recv_timeout(std::time::Duration::from_secs(30));
+        tx.rollback().unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            result.unwrap(),
+            Err(StoreError::Db(rusqlite::Error::SqliteFailure(error, _)))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        let version: i64 = writer
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 0, "the refused opener must not partially migrate");
+        assert!(schema_definition(&writer).unwrap().is_empty());
+        let opened = open_db(&path).unwrap();
+        let version: i64 = opened
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn concurrent_first_migrators_reread_version_after_the_winner_commits() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("first-open.db");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
-        let workers: Vec<_> = (0..6)
-            .map(|_| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let conn = open_db(&path)?;
-                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-                        .map_err(StoreError::from)
-                })
-            })
-            .collect();
-        for worker in workers {
+        let winner = Connection::open(&path).unwrap();
+        winner.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let (observed_send, observed_recv) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..6 {
+            let conn = Connection::open(&path).unwrap();
+            let observed_send = observed_send.clone();
+            let (release_send, release_recv) = std::sync::mpsc::channel();
+            releases.push(release_send);
+            workers.push(std::thread::spawn(move || {
+                conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                    if matches!(
+                        ctx.action,
+                        AuthAction::Transaction {
+                            operation: TransactionOperation::Begin
+                        }
+                    ) {
+                        // migrate has read version zero but has not yet acquired
+                        // its writer lock. Hold this exact stale-observation window.
+                        if observed_send.send(()).is_err() || release_recv.recv().is_err() {
+                            return Authorization::Deny;
+                        }
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+                migrate(&conn)?;
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .map_err(StoreError::from)
+            }));
+        }
+        drop(observed_send);
+        // Releasing through channel drop on panic also unblocks the workers.
+        for _ in 0..6 {
+            observed_recv
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        }
+        migrate(&winner).unwrap();
+        // #1787: the old six-open fixture raced the whole migration against a five-
+        // second production busy budget. A loaded Windows disk can exceed it.
+        // Every waiter here has already observed the old schema; releasing one
+        // at a time exercises the required reread without a disk-speed assertion.
+        for (release, worker) in releases.into_iter().zip(workers) {
+            release.send(()).unwrap();
             assert_eq!(worker.join().unwrap().unwrap(), MIGRATIONS.len() as i64);
         }
     }

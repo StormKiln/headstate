@@ -1,43 +1,19 @@
-# The highest mobile build number that has ever reached a store.
+# The highest mobile build number recorded as consumed by a store upload.
 #
-# BUILD_NUMBER is github.run_number, counted per workflow FILE. Renaming
-# mobile-release.yml restarts it at 1, and every upload after that is
-# refused as a duplicate -- recoverable only by burning version numbers
-# until the count climbs back past this line. Preflight compares against
-# this file so that failure happens in the first job with the cause
-# named, rather than at the store with a message that says only that the
-# number has been seen before.
+# The reservation job allocates above this committed floor and every recorded
+# reservation/published build. github.run_number is a minimum, not the final
+# allocation order: queued deliveries may start out of order.
 #
-# Why a committed file rather than the previous release's assets: this
-# file does not depend on any job downstream of the upload, so it records
-# what shipped even when a later job fails.
+# Raise this mark after an upload is accepted or its number is known to be
+# consumed, even if later publication fails. Do not lower it or reclaim a
+# reserved number after an uncertain upload. Non-contiguous values are valid.
+# The durable draft reservation protects the number before upload; this file
+# is the reviewed, committed record maintained afterward.
 #
-# The note here used to say `publish` had never run because
-# android-release fails Preflight without the #673 secrets. That is no
-# longer true: android-release is SKIPPED rather than failed, so publish
-# does run, and runs 26, 27 and 28 each completed it. The file is still
-# the right record -- it is written before the upload rather than derived
-# from it -- but not for the reason previously given.
-#
-# Raise it when a build reaches TestFlight or Play. Non-contiguous is
-# correct: a rejected upload still consumes its number.
-#
-# You no longer have to REMEMBER to raise it: the Mobile release run's
-# summary names the value as a required follow-up, and
-# scripts/check-mobile-build-mark.py compares this line with the `build<N>`
-# of the newest published mobile asset. Per commit (CI's lint job) a lag
-# is a warning naming the value to write; the next mobile release's
-# Preflight refuses to build until it is fixed (#1418). It is
-# a comparison against the assets, not a replacement for this file --
-# this file is written before the upload, so it still records a number
-# consumed by a run whose `publish` never finished, which no asset can.
-#
-# Why a guard was needed when Preflight already reads this file: Preflight
-# only catches a DECREASE. BUILD_NUMBER climbs every run, so a mark
-# lagging by three still passes `BUILD_NUMBER > HIGH` -- run 29 cleared
-# 25 as easily as 28. Staleness was invisible to the only reader, which
-# is how it survived six chore PRs (#714, #731, #740, #768, #786, #867)
-# without one release failing. The cost was never a blocked release; it
-# was this file naming the wrong number to whoever is debugging a
-# rejected upload. See #787.
-45
+# The Mobile release summary names the required follow-up value.
+# scripts/check-mobile-build-mark.py compares this mark with the newest
+# published mobile asset: lint warns if it lags, and the next mobile release
+# refuses to proceed until the record is updated. Keep this independent record
+# because a store may accept an upload whose later publication never finishes.
+# See docs/mobile-release-process.md for reservation and recovery details.
+46

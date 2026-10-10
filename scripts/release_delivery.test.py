@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from release_delivery import (ApiError, DeliveryError, GitHub, digest, parse_marker,
                               verify_payload, with_marker)
 
@@ -18,6 +20,20 @@ def marker():
                 run_attempt=1, state='complete', assets={})
 
 class ProvenanceTests(unittest.TestCase):
+    def test_upload_failure_diagnostics_keep_status_but_redact_process_output(self):
+        for stderr, expected in [
+            ('release not found\nsecret-token', 'release not found'),
+            ('HTTP 403 forbidden https://host/?token=secret-token', 'HTTP 403'),
+            ('private local path secret-token', 'exit 1'),
+        ]:
+            with self.subTest(stderr=stderr):
+                result = SimpleNamespace(returncode=1, stderr=stderr, stdout='secret-token')
+                with patch('release_delivery.subprocess.run', return_value=result), self.assertRaises(DeliveryError) as caught:
+                    GitHub('octocat/hello-world').upload('mobile-v1.2.3', Path('artifact.ipa'))
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn('secret-token', str(caught.exception))
+                self.assertNotIn('https://', str(caught.exception))
+
     def test_marker_update_preserves_human_notes(self):
         body = with_marker('Human release notes\n\nChangelog.', marker())
         changed = marker(); changed['run_id'] = 2

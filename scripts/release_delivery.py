@@ -152,7 +152,12 @@ class GitHub:
         result = subprocess.run(['gh', 'release', 'upload', tag, str(asset), '--repo', self.repo],
                                 capture_output=True, text=True, timeout=300)
         if result.returncode:
-            raise DeliveryError('release asset upload failed; checking whether its bytes arrived')
+            # Do not echo stderr: it can contain credentials, URLs or local paths.
+            status = re.search(r'\bHTTP ([1-5][0-9]{2})\b', result.stderr)
+            category = (f'HTTP {status[1]}' if status else
+                        'release not found' if 'release not found' in result.stderr.lower() else
+                        'upload command failed')
+            raise DeliveryError(f'release asset upload failed ({category}; exit {result.returncode})')
 
 
 def check_identity(marker, tag, sha, kind):
