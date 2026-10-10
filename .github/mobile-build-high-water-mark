@@ -16,4 +16,4 @@
 # refuses to proceed until the record is updated. Keep this independent record
 # because a store may accept an upload whose later publication never finishes.
 # See docs/mobile-release-process.md for reservation and recovery details.
-46
+47
