@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+from release_delivery import ApiError
 
 SPEC = importlib.util.spec_from_file_location('gate', Path(__file__).with_name('wait-release-ci.py'))
 gate = importlib.util.module_from_spec(SPEC)
@@ -25,6 +27,57 @@ def run(id=1, status='completed', conclusion='success', attempt=1, branch='v1.2.
                 head_branch=branch, head_sha='a'*40, event='push')
 
 class GateTests(unittest.TestCase):
+    def test_transient_error_resets_success_evidence_and_preserves_observed_runs(self):
+        observations = []
+        def poll(api, sha, tag, observed):
+            observations.append(observed)
+            observed[42] = run(42)
+            if len(observations) == 2:
+                raise ApiError('temporary', 502)
+            return True
+        with patch.object(gate, 'ready', side_effect=poll) as ready, patch.object(gate.time, 'sleep'):
+            gate.wait(API([]), 'a'*40, 'v1.2.3', 100)
+        self.assertEqual(ready.call_count, 4)
+        self.assertTrue(all(item is observations[0] for item in observations))
+        self.assertIn(42, observations[-1])
+
+    def test_transient_errors_have_bounded_backoff(self):
+        with patch.object(gate, 'ready', side_effect=ApiError('temporary', 503)) as ready, \
+                patch.object(gate.time, 'sleep') as sleep, self.assertRaises(ApiError):
+            gate.wait(API([]), 'a'*40, 'v1.2.3', 1000)
+        self.assertEqual(ready.call_count, 6)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30, 60, 60, 60])
+
+    def test_permanent_and_admission_errors_are_not_retried(self):
+        for error in [ApiError('unauthorized', 401), ApiError('forbidden', 403),
+                      ApiError('missing', 404), ApiError('unknown', None),
+                      gate.AdmissionError('failed CI')]:
+            with self.subTest(error=error), patch.object(gate, 'ready', side_effect=error) as ready, \
+                    patch.object(gate.time, 'sleep') as sleep, self.assertRaises(type(error)):
+                gate.wait(API([]), 'a'*40, 'v1.2.3', 100)
+            self.assertEqual(ready.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_transient_wait_respects_deadline(self):
+        with patch.object(gate, 'ready', side_effect=ApiError('temporary', 504)), \
+                patch.object(gate.time, 'monotonic', side_effect=[0, 0, 10]), \
+                patch.object(gate.time, 'sleep') as sleep, self.assertRaises(gate.AdmissionError):
+            gate.wait(API([]), 'a'*40, 'v1.2.3', 10)
+        sleep.assert_called_once_with(10)
+
+    def test_recovery_still_rejects_failed_ci(self):
+        with patch.object(gate, 'ready', side_effect=[ApiError('temporary', 502),
+                gate.AdmissionError('CI failed')]) as ready, patch.object(gate.time, 'sleep'), \
+                self.assertRaisesRegex(gate.AdmissionError, 'CI failed'):
+            gate.wait(API([]), 'a'*40, 'v1.2.3', 100)
+        self.assertEqual(ready.call_count, 2)
+
+    def test_success_after_deadline_does_not_admit_release(self):
+        with patch.object(gate, 'ready', return_value=True), \
+                patch.object(gate.time, 'monotonic', side_effect=[0, 0, 10]), \
+                patch.object(gate.time, 'sleep'), self.assertRaises(gate.AdmissionError):
+            gate.wait(API([]), 'a'*40, 'v1.2.3', 10)
+
     def test_observed_pending_run_cannot_disappear_from_later_list_snapshots(self):
         class EventuallyConsistent(API):
             def request(self, path, **kwargs):
