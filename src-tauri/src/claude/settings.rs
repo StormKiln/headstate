@@ -187,6 +187,19 @@ pub fn effective_in(home: &Path, repo: &Path) -> Effective {
         }
     }
 
+    resolve_scopes(parsed, out.unreadable)
+}
+
+/// Shared resolver for callers that obtain scopes through bounded reads.
+pub(super) fn resolve_scopes(
+    parsed: Vec<(Origin, Option<Value>)>,
+    unreadable: Vec<ScopeRefusal>,
+) -> Effective {
+    let mut out = Effective {
+        keys: Vec::new(),
+        unreadable,
+    };
+
     for key in KEYS {
         let mut contributions = Vec::new();
         for (origin, value) in &parsed {

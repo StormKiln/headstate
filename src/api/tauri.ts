@@ -1782,6 +1782,27 @@ export interface ClaudeEffectiveSettings {
 export const claudeEffectiveSettings = (repoPath: string) =>
   call<ClaudeEffectiveSettings>("claude_effective_settings", { repoPath });
 
+export interface ClaudeConfigCell {
+  state: "present" | "absent" | "unknown";
+  value: string | null;
+  detail: string | null;
+}
+export interface ClaudeConfigComparison {
+  leftLabel: string;
+  rightLabel: string;
+  limitations: string[];
+  rows: {
+    id: string;
+    category: "settings" | "hooks" | "definitions" | "claudeMd";
+    name: string;
+    status: "same" | "different" | "onlyLeft" | "onlyRight" | "cannotCompare";
+    left: ClaudeConfigCell;
+    right: ClaudeConfigCell;
+  }[];
+}
+export const claudeCompareConfig = (leftRepo: string, rightRepo: string | null) =>
+  call<ClaudeConfigComparison>("claude_compare_config", { leftRepo, rightRepo });
+
 /// A repository's configuration-health verdict (#1217).
 ///
 /// Three states, because two would lie. `unknown` is NOT a pass with a

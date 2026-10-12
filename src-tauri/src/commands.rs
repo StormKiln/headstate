@@ -12567,3 +12567,44 @@ pub fn measurement_client_events(
     }
     Ok(())
 }
+
+#[tauri::command]
+pub async fn claude_compare_config(
+    app: AppHandle,
+    left_repo: String,
+    right_repo: Option<String>,
+) -> Result<crate::claude::compare::Comparison, String> {
+    compare_config_for_caller(app, left_repo, right_repo, false).await
+}
+
+/// Remote callers get masked previews; the wire accepts no masking bypass.
+pub(crate) async fn claude_compare_config_remote(
+    app: AppHandle,
+    left_repo: String,
+    right_repo: Option<String>,
+) -> Result<crate::claude::compare::Comparison, String> {
+    compare_config_for_caller(app, left_repo, right_repo, true).await
+}
+
+async fn compare_config_for_caller(
+    app: AppHandle,
+    left_repo: String,
+    right_repo: Option<String>,
+    remote: bool,
+) -> Result<crate::claude::compare::Comparison, String> {
+    let left = scanned_repo_root(app.clone(), &left_repo).await?;
+    let right = match right_repo {
+        Some(repo) => Some(scanned_repo_root(app, &repo).await?),
+        None => None,
+    };
+    let home = crate::auth::home_dir().ok_or_else(|| "no home directory is set".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if remote {
+            crate::claude::compare::compare_remote(&home, &left, right.as_deref())
+        } else {
+            crate::claude::compare::compare(&home, &left, right.as_deref())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
