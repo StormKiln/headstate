@@ -67,6 +67,7 @@
 /// (#1477): session id, byte size, sequence number -- no path, no text.
 pub mod activity;
 pub mod cli;
+pub mod compare;
 /// Silently-broken agent configuration, swept across repositories (#1217).
 pub mod confighealth;
 /// What the app has READ, against what it HOLDS (#1212).

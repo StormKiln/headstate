@@ -58,6 +58,43 @@ class FrontendDiagnostics(unittest.TestCase):
                 self.assertIn("--report-exclude-network", options)
                 self.assertIn("--no-warnings", options)
 
+    def test_collector_failure_cannot_replace_native_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name, content in {
+                'node': '#!/bin/bash\nif [[ "$2" == "list" ]]; then exit 0; fi\nulimit -c 0\nkill -SEGV $$\n',
+                'python3': '#!/bin/bash\nexit 42\n',
+            }.items():
+                path = directory / name
+                path.write_text(content)
+                path.chmod(0o755)
+            result = subprocess.run(
+                ['bash', str(ROOT / 'scripts/test-frontend-ci.sh')],
+                env={**os.environ, 'PATH': f"{tmp}:{os.environ['PATH']}", 'RUNNER_TEMP': tmp},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 139, result.stderr)
+            self.assertIn('Native evidence collection failed', result.stdout)
+            self.assertEqual((directory / 'frontend-diagnostics/exit-code.txt').read_text(), '139\n')
+
+    def test_failed_log_capture_is_not_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name, content in {
+                'node': '#!/bin/bash\necho synthetic output\nexit 0\n',
+                'tee': '#!/bin/bash\ncat > "$1"\nexit 23\n',
+            }.items():
+                path = directory / name
+                path.write_text(content)
+                path.chmod(0o755)
+            result = subprocess.run(
+                ['bash', str(ROOT / 'scripts/test-frontend-ci.sh')],
+                env={**os.environ, 'PATH': f"{tmp}:{os.environ['PATH']}", 'RUNNER_TEMP': tmp},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual((directory / 'frontend-diagnostics/exit-code.txt').read_text(), '23\n')
+
     def test_zero_exit_without_a_report_is_not_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             node = Path(tmp) / "node"
@@ -79,7 +116,7 @@ class FrontendDiagnostics(unittest.TestCase):
             with self.subTest(signal=name), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 child = directory / "node"
-                child.write_text(f'#!/bin/bash\nif [[ "$2" == "list" ]]; then exit 0; fi\nulimit -c 0\nkill -{name} $$\n')
+                child.write_text(f'#!/bin/bash\nif [[ "$2" == "list" ]]; then exit 0; fi\nprintf "%s\\n" "$$" > "$RUNNER_TEMP/child-pid"\nulimit -c 0\nkill -{name} $$\n')
                 child.chmod(0o755)
                 yarn = directory / "yarn"
                 yarn.write_text(f"#!/bin/bash\nexit {137 if name == 'SIGKILL' else 1}\n")
@@ -93,6 +130,11 @@ class FrontendDiagnostics(unittest.TestCase):
                 expected = 128 + getattr(signal, name)
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual((directory / "frontend-diagnostics/exit-code.txt").read_text(), f"{expected}\n")
+                if name == "SIGSEGV":
+                    evidence = json.loads((directory / "frontend-diagnostics/native-vitest.json").read_text())
+                    self.assertEqual(evidence['status'], 'unavailable')
+                    self.assertEqual(evidence['pid'], int((directory / 'child-pid').read_text()))
+
 
 
 if __name__ == "__main__":

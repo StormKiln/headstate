@@ -397,6 +397,7 @@ lint-deps:
 	python3 scripts/install-linux-dependencies.test.py
 	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
+	python3 scripts/collect-frontend-crash.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
 	python3 scripts/wait-release-ci.test.py

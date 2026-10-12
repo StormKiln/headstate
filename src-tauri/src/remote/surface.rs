@@ -623,6 +623,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claude_hooks_inventory", Class::Read),
     // Read: three file reads, no side effects (#1130).
     ("claude_effective_settings", Class::Read),
+    ("claude_compare_config", Class::Read),
     // Read: the configuration-health sweep (#1217). Many file reads
     // across every scanned repository and no side effects -- it parses
     // settings and resolves CLAUDE.md imports, and writes nothing, offers
@@ -1412,6 +1413,12 @@ async fn call(
         )
         .await),
         "claude_hooks_inventory" => res(commands::claude_hooks_inventory()),
+        "claude_compare_config" => res(commands::claude_compare_config_remote(
+            app.clone(),
+            a.get("leftRepo")?,
+            a.get("rightRepo")?,
+        )
+        .await),
         "claude_effective_settings" => {
             res(commands::claude_effective_settings(a.get("repoPath")?).await)
         }

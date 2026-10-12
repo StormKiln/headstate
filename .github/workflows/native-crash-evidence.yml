@@ -1,0 +1,30 @@
+name: Native crash evidence acceptance
+
+# An explicit experiment, not a prerequisite for product tests. Run on a
+# diagnostic commit: a failed check attempt must not be hidden by a rerun.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-crash-evidence-acceptance:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify synthetic report selection and privacy bounds
+        run: python3 scripts/collect-frontend-crash.test.py
+      - name: Require a matching symbolized synthetic native stack
+        run: >-
+          python3 scripts/collect-frontend-crash.test.py --native-smoke
+          "${{ runner.temp }}/native-crash-acceptance/evidence.json"
+      - name: Retain only sanitized synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-crash-acceptance
+          path: ${{ runner.temp }}/native-crash-acceptance/evidence.json
+          if-no-files-found: warn
+          retention-days: 7
