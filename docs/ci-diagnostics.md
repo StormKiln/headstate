@@ -66,3 +66,59 @@ python3 scripts/test-rust-ci.test.py
 They exercise real subprocesses, exits, cancellation, retained pipes, capture and
 persistence failures, quiet work, parsing bounds, distinct race iterations and
 fail-fast behavior. They do not invoke Cargo or establish native test success.
+
+## Frontend native crash evidence (#1754)
+
+The hosted Node SIGSEGV in run `37621024762` exited 139 before the suite
+finished. Its four existing artifacts establish an incomplete run, not a
+specific Node/V8 defect, OOM, or test assertion failure. The cause remains open.
+
+The frontend wrapper still runs the same discovery and full-suite commands,
+then requires the existing complete JSON report. Its temporary FIFO lets bash
+retain the actual Node PID and wait for both Node and log capture. A native
+failure remains a failure even if evidence collection fails. No retry, pool,
+worker, timeout, heap, or assertion settings are changed.
+
+After a reportable native signal, `collect-frontend-crash.py` polls macOS's user
+and system `Library/Logs/DiagnosticReports` directories for at most ten seconds.
+Only a fresh `node*.ips` crash report with the exact launched child PID, process
+name `node`, and capture time within the command window qualifies. The current
+`vmThreads` workers share that process. Discovery and execution have separate
+`native-discovery.json` and `native-vitest.json` artifacts. Old evidence is
+removed before each run. An ordinary exit or SIGKILL does not imply that an
+Apple native crash report exists and does not start this collection.
+
+Collection reads at most 1,024 directory entries and 16 fresh candidates per
+poll, with a 2 MiB input-file ceiling and 128 retained frames from the faulting
+thread. Symlinks and non-regular files are rejected. Output contains only the
+PID, exception type/signal, faulting-thread index, numeric image/frame offsets,
+binary UUID/architecture and bounded native symbols. Paths, arbitrary image or
+thread names, registers, environment, command line, incident/device identifiers
+and raw report contents are never copied into these artifacts. Unsupported
+symbols are omitted; `symbolizedFrames` reports how many remain. Frame bounds and
+omissions are explicit through `truncated`. This supplements the existing
+Vitest/Node artifacts; it does not broaden their upload to any OS log directory.
+
+`status: unavailable` is an absence of evidence, not a clean native stack.
+Its reason distinguishes missing/unreadable reports, directory access, scan
+bounds and unsupported platforms. OS report generation or runner shutdown can
+prevent capture entirely. A captured unsymbolized image offset can still be
+useful but does not identify a cause by itself.
+
+Run synthetic fixtures with `python3 scripts/collect-frontend-crash.test.py`.
+The separate **Native crash evidence acceptance** manual workflow compiles a
+tiny synthetic program named `node`, disables core dumps, and causes a native
+fault with no user/application data. It requires a matching symbolized stack;
+unavailable evidence fails that acceptance run. Only sanitized JSON is uploaded.
+This optional experiment is deliberately outside the product CI prerequisites.
+Run it on a diagnostic branch/commit, observe every attempt, and do not treat a
+rerun as erasing a failed release check. The equivalent local macOS command is:
+
+```
+python3 scripts/collect-frontend-crash.test.py --native-smoke /tmp/native-evidence.json
+```
+
+The parser follows Apple's [IPS format documentation](https://developer.apple.com/documentation/xcode/interpreting-the-json-format-of-a-crash-report).
+Passing this synthetic test verifies the collection path, not a correction for
+the intermittent frontend crash. A future real crash must identify a failing
+native path before a runtime or pool change is justified.
