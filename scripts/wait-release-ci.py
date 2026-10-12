@@ -8,7 +8,7 @@ import argparse
 import sys
 import time
 from urllib.parse import quote
-from release_delivery import GitHub, DeliveryError
+from release_delivery import GitHub, DeliveryError, ApiError
 
 class AdmissionError(DeliveryError):
     pass
@@ -61,17 +61,33 @@ def wait(api, sha, tag, timeout, interval=15):
     # Two fresh successful polls avoid relying on a single eventually-consistent
     # snapshot. This cannot promise that no future event will ever be delivered.
     consecutive = 0
+    transient_failures = 0
     observed = {}
     while True:
-        consecutive = consecutive + 1 if ready(api, sha, tag, observed) else 0
-        if consecutive >= 2:
-            print('All observed CI runs and attempts succeeded, including tag CI.')
-            return
+        delay = interval
+        try:
+            consecutive = consecutive + 1 if ready(api, sha, tag, observed) else 0
+            transient_failures = 0
+        except ApiError as error:
+            # v10.1.0 was stranded by one GitHub 502 during read-only polling.
+            # Unavailable evidence is never success; retain observed runs but
+            # require two fresh successful polls again after recovery.
+            if error.status not in {500, 502, 503, 504}:
+                raise
+            consecutive = 0
+            transient_failures += 1
+            if transient_failures > 5:
+                raise
+            delay = min(interval * 2 ** (transient_failures - 1), 60)
+            print(f'Transient GitHub HTTP {error.status}; retry {transient_failures}/5.', flush=True)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AdmissionError('deadline exceeded waiting for all CI attempts')
+        if consecutive >= 2:
+            print('All observed CI runs and attempts succeeded, including tag CI.')
+            return
         print('Waiting for complete CI admission evidence...', flush=True)
-        time.sleep(min(interval, remaining))
+        time.sleep(min(delay, remaining))
 
 
 def main():
