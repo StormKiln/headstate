@@ -389,6 +389,14 @@ pub fn prompt_command(prompt: &str, cwd: &str) -> String {
 }
 
 pub fn launch(template: &str, command: &str, cwd: Option<&str>) -> Result<(), LaunchError> {
+    watch_briefly(&mut spawn_launcher(template, command, cwd)?)
+}
+
+fn spawn_launcher(
+    template: &str,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<std::process::Child, LaunchError> {
     if template.trim().is_empty() {
         return Err(LaunchError::NotConfigured);
     }
@@ -406,7 +414,7 @@ pub fn launch(template: &str, command: &str, cwd: Option<&str>) -> Result<(), La
     }
 
     let (program, args) = parsed.render(command);
-    let mut child = Command::new(&program)
+    Command::new(&program)
         .args(&args)
         // Captured so an instant failure has something to SAY. `open`'s
         // "The file … does not exist" goes here, and inheriting the
@@ -417,9 +425,7 @@ pub fn launch(template: &str, command: &str, cwd: Option<&str>) -> Result<(), La
         .spawn()
         .map_err(|e| LaunchError::Spawn {
             why: format!("{program}: {e}"),
-        })?;
-
-    watch_briefly(&mut child)
+        })
 }
 
 /// How long to give a launcher to fail before calling it launched.
@@ -933,11 +939,29 @@ mod tests {
         }
     }
 
+    // Spawning a shell is not a promise that the OS will schedule it within
+    // SETTLE. Synchronize the completed-status tests, then exercise the same
+    // watcher production uses. The separate live-child test keeps the bounded
+    // nonblocking contract covered without extending the user-facing delay.
+    fn completed_launcher(command: &str, dir: &Path) -> FixtureChild {
+        let mut child =
+            FixtureChild(spawn_launcher(SHELL, command, Some(&dir.to_string_lossy())).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if child.0.try_wait().unwrap().is_some() {
+                return child;
+            }
+            assert!(std::time::Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn a_program_that_exits_non_zero_at_once_is_reported_not_called_success() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path();
-        let e = launch(SHELL, FAILS_FAST, Some(&dir.to_string_lossy())).unwrap_err();
+        let mut child = completed_launcher(FAILS_FAST, dir);
+        let e = watch_briefly(&mut child.0).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { status, .. } => {
                 assert!(status.contains('1'), "expected exit 1, got {status:?}")
@@ -958,7 +982,8 @@ mod tests {
     fn the_stderr_of_an_instant_failure_reaches_the_message() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path();
-        let e = launch(SHELL, TALKS_THEN_FAILS, Some(&dir.to_string_lossy())).unwrap_err();
+        let mut child = completed_launcher(TALKS_THEN_FAILS, dir);
+        let e = watch_briefly(&mut child.0).unwrap_err();
         match &e {
             LaunchError::ExitedImmediately { stderr, status } => {
                 assert!(stderr.contains("headstate-1302-marker"), "{stderr:?}");
@@ -989,7 +1014,7 @@ mod tests {
     /// Asserted on the clock AND the child's live state: returning after the
     /// child has exited would not prove the nonblocking success path. Keep
     /// ownership here while exercising the production watcher; the tests above
-    /// exercise launch's parsing, spawning, and exit reporting end to end.
+    /// exercise the shared parsing/spawning path and completed exit reporting.
     #[test]
     fn a_terminal_that_stays_open_is_not_waited_on() {
         // A shell builtin blocked on our open stdin has no child processes of

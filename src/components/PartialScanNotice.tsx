@@ -1,3 +1,5 @@
+import { useId, useState } from "react";
+
 /// The banner for a worktree scan that could not read everything (#951).
 ///
 /// # The third answer
@@ -42,23 +44,27 @@ export function PartialScanNotice({
   /// least N orphans" are different claims and a shared phrasing would
   /// be vaguer than either.
   consequence,
-  /// What each entry IS (#1409). Paths by default -- every scan surface
-  /// sends `<path>: <why>`. The CLAUDE.md advice panel sends CHECKS
-  /// (`<check>: <why>`), and announcing those as "1 path could not be
-  /// read" named the wrong thing; `checks` carries the total so the lead
-  /// can say "N of M checks could not run" once, instead of the surface
-  /// restating it in its consequence.
+  /// Advice reports checks; scans can report both read errors and scope
+  /// limits, so their summary must not call every notice a read failure.
   checks,
 }: {
   unreadable: readonly string[];
   consequence: string;
   checks?: { total: number };
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const [page, setPage] = useState(0);
+  const detailsId = useId();
   if (unreadable.length === 0) return null;
   const n = unreadable.length;
   const lead = checks
     ? `${n} of ${checks.total} checks could not run`
-    : `${n} path${n === 1 ? "" : "s"} could not be read`;
+    : `Scan incomplete (${n} notice${n === 1 ? "" : "s"})`;
+  const large = n > 3;
+  const pageSize = 50;
+  const currentPage = Math.min(page, Math.ceil(n / pageSize) - 1);
+  const start = currentPage * pageSize;
+  const visible = unreadable.slice(start, start + pageSize);
   return (
     <div
       role="alert"
@@ -67,18 +73,58 @@ export function PartialScanNotice({
       <p>
         {lead}, so {consequence}
       </p>
-      {/* Every entry, not the first few. There are at most a handful in
-          practice -- one per unreadable directory under the scan roots --
-          and a truncated list would hide the one the user needs. `<ul>`
-          rather than a joined string so a screen reader announces a
-          count. */}
-      <ul className="mt-1 space-y-0.5">
-        {unreadable.map((u) => (
-          <li key={u} className="break-all font-mono text-[#8b949e]">
-            {u}
-          </li>
-        ))}
-      </ul>
+      {large && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={detailsId}
+          className="mt-1 underline"
+          onClick={() => {
+            setExpanded(!expanded);
+            setPage(0);
+          }}
+        >
+          {expanded ? "Hide details" : "Show details"}
+        </button>
+      )}
+      {/* Do not mount thousands of hidden paths. Paging keeps every reason
+          reachable without letting diagnostics displace repository navigation. */}
+      {(!large || expanded) && (
+        <div id={detailsId}>
+          <ul
+            tabIndex={0}
+            aria-label="Scan diagnostics"
+            className="mt-1 max-h-48 space-y-0.5 overflow-y-auto"
+          >
+            {visible.map((u, i) => (
+              <li key={start + i} className="break-all font-mono text-[#8b949e]">
+                {u}
+              </li>
+            ))}
+          </ul>
+          {n > pageSize && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <span aria-live="polite">{start + 1}–{Math.min(start + pageSize, n)} of {n}</span>
+              <button
+                type="button"
+                className="underline disabled:opacity-50"
+                disabled={currentPage === 0}
+                onClick={() => setPage(currentPage - 1)}
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                className="underline disabled:opacity-50"
+                disabled={start + pageSize >= n}
+                onClick={() => setPage(currentPage + 1)}
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

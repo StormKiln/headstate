@@ -208,7 +208,7 @@ describe("ClaudeMdPage", () => {
     state.unreadableFiles = ["/code/app/CLAUDE.md (Permission denied)"];
     render(<ClaudeMdPage />);
     expect(screen.queryByText(/No CLAUDE.md files in this repository/)).toBeNull();
-    expect(screen.getByText(/could not be read/)).toBeTruthy();
+    expect(screen.getByText(/Scan incomplete/)).toBeTruthy();
   });
 
   /// The path is NAMED. A count says something is wrong and nothing about
