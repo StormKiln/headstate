@@ -44,3 +44,11 @@ Linux CI exposed order-dependent bare-repository ownership when nested discovery
 Windows CI found Unix-only string separators and a test opening a directory as a File to change its timestamp. These are fixture portability errors. Assertions now compare Path components; the mutation fixture creates its new artifact and makes the saved timestamp deterministically stale, so resume still validates against live filesystem metadata. Full native tests (3,539) and lint pass locally.
 
 Windows lint subsequently identified a large platform-specific ReadDir variant inflating every pending measurement entry to at least 680 bytes. Box the iterator so ordinary pending paths remain compact; tracked under the existing checkpoint memory issue #1808.
+
+## Hosted CI interruption
+
+Run 38540137617 passed eight jobs, then GitHub Actions terminated the remaining
+native race-check and Windows jobs together with an internal-service-error
+annotation. The status API reported operational afterward. No tag was created;
+a fresh documentation commit records field acceptance and permits a clean CI
+attempt without reusing the cancelled release candidate.
