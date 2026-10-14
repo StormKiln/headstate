@@ -1207,7 +1207,7 @@ mod reliability_tests {
     fn changed_discovery_directory_restarts_instead_of_reusing_entry_offsets() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("a/b/c/d/e/f/g/h")).unwrap();
-        let first = scan(tmp.path());
+        let mut first = scan(tmp.path());
         assert!(first.remaining() > 0);
         std::fs::create_dir_all(tmp.path().join("new/.build")).unwrap();
         std::fs::write(
@@ -1215,10 +1215,13 @@ mod reliability_tests {
             "// swift-tools-version: 6.0",
         )
         .unwrap();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
-            .unwrap();
+        // Make the saved stamp deterministically stale without relying on
+        // filesystem timestamp resolution or opening a directory as a File
+        // (which Windows refuses). Resume still reads the real current stamp.
+        first.cursor.as_mut().unwrap().stamps.insert(
+            tmp.path().canonicalize().unwrap(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        );
         let restarted = resume(first, &Arc::new(AtomicBool::new(false)), Instant::now());
         assert!(restarted
             .locations
@@ -1351,13 +1354,11 @@ mod reliability_tests {
         )
         .unwrap();
         let found = scan(tmp.path());
-        assert!(found
-            .locations
-            .iter()
-            .any(|l| l.path.ends_with("owned/.build") && l.category == "Swift build output"));
-        assert!(!found
-            .locations
-            .iter()
-            .any(|l| l.path.ends_with("unowned/.build") && l.category == "Swift build output"));
+        assert!(found.locations.iter().any(|l| Path::new(&l.path)
+            .ends_with(Path::new("owned").join(".build"))
+            && l.category == "Swift build output"));
+        assert!(!found.locations.iter().any(|l| Path::new(&l.path)
+            .ends_with(Path::new("unowned").join(".build"))
+            && l.category == "Swift build output"));
     }
 }

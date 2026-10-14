@@ -38,3 +38,7 @@ Final local regression results: 3,539 native library tests passed (59 ignored); 
 ## Cross-platform CI follow-up (#1810)
 
 Linux CI exposed order-dependent bare-repository ownership when nested discovery enters a linked checkout first. The deterministic linked-only and reversed-root fixture failed locally before the fix. Discovery now reads the bare marker from Git porcelain, excludes the owner container from worktree rows, and deduplicates bare owners through the same common-directory set. All 176 scanner tests pass after the correction.
+
+## Windows fixture follow-up (#1811)
+
+Windows CI found Unix-only string separators and a test opening a directory as a File to change its timestamp. These are fixture portability errors. Assertions now compare Path components; the mutation fixture creates its new artifact and makes the saved timestamp deterministically stale, so resume still validates against live filesystem metadata. Full native tests (3,539) and lint pass locally.

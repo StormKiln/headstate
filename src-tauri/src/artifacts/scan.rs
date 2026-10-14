@@ -932,7 +932,7 @@ mod coverage_tests {
         assert!(
             failed
                 .iter()
-                .any(|f| f.root == project.to_string_lossy() && f.why.contains("depth limit")),
+                .any(|f| Path::new(&f.root) == project && f.why.contains("depth limit")),
             "{failed:?}"
         );
         let (found, failed) =
