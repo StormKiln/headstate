@@ -16,7 +16,8 @@ use std::{
 
 enum Pending {
     Path(PathBuf, String),
-    Directory(PathBuf, String, std::fs::ReadDir),
+    // ReadDir is much larger on Windows; do not inflate every pending path.
+    Directory(PathBuf, String, Box<std::fs::ReadDir>),
 }
 /// In-memory cursor: restarting the app starts a fresh observation. Completed
 /// batch observations remain durable even when the continuation is lost.
@@ -285,7 +286,8 @@ impl Scan {
                                 row.allocated = Some("0".into());
                             }
                         }
-                        self.stack.push(Pending::Directory(path, volume, entries));
+                        self.stack
+                            .push(Pending::Directory(path, volume, Box::new(entries)));
                     }
                     Err(e) => self.note(&path, e.to_string()),
                 }
