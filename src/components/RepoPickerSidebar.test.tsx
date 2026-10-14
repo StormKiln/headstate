@@ -230,7 +230,7 @@ describe("RepoPickerSidebar", () => {
     it("says nothing when the scan read everything", () => {
       repos.mockReturnValue([repo("alpha")]);
       render(<RepoPickerSidebar reviewingCount={0} />);
-      expect(screen.queryByText(/could not be read/i)).toBeNull();
+      expect(screen.queryByText(/Scan incomplete/i)).toBeNull();
     });
 
     /// Before the scan answers there is no shortfall to report either --
@@ -240,7 +240,7 @@ describe("RepoPickerSidebar", () => {
       scan.unreadable = [UNREADABLE];
       render(<RepoPickerSidebar reviewingCount={0} />);
       expect(screen.getByText(/looking for repositories/i)).toBeTruthy();
-      expect(screen.queryByText(/could not be read/i)).toBeNull();
+      expect(screen.queryByText(/Scan incomplete/i)).toBeNull();
     });
   });
 

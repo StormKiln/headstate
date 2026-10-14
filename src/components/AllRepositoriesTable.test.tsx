@@ -197,7 +197,7 @@ describe("AllRepositoriesTable", () => {
       scan({ unreadable: ["/code/locked: permission denied"] }),
     );
     render(<AllRepositoriesTable />);
-    expect(screen.getByText(/1 path could not be read/)).toBeTruthy();
+    expect(screen.getByText(/Scan incomplete \(1 notice\)/)).toBeTruthy();
     expect(screen.getByText("/code/locked: permission denied")).toBeTruthy();
   });
 
@@ -213,7 +213,7 @@ describe("AllRepositoriesTable", () => {
   it("renders no partial-scan notice when everything was read", () => {
     useWorktrees.mockReturnValue(scan());
     render(<AllRepositoriesTable />);
-    expect(screen.queryByText(/could not be read/)).toBeNull();
+    expect(screen.queryByText(/Scan incomplete/)).toBeNull();
   });
 
   /// #846: the error arm is reached BEFORE the empty arm. With `data`

@@ -3470,6 +3470,22 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
     );
 }
 
+// Installed bundle contents are not automatic repository discovery scope,
+// just like dependency/build directories. Explicit roots and Git checkouts
+// bypass this boundary; an extension alone is not evidence of a bundle.
+fn installed_discovery_bundle(dir: &Path) -> bool {
+    let info = match dir.extension().and_then(|extension| extension.to_str()) {
+        Some("app" | "bundle") => dir.join("Contents/Info.plist"),
+        Some("framework") => dir.join("Resources/Info.plist"),
+        _ => return false,
+    };
+    info.is_file()
+        && matches!(
+            std::fs::symlink_metadata(dir.join(".git")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
 fn collect_bounded(
     dir: &Path,
     depth: usize,
@@ -3478,6 +3494,9 @@ fn collect_bounded(
     common_dirs: &mut std::collections::HashSet<std::path::PathBuf>,
     remaining: &mut usize,
 ) {
+    if depth > 0 && installed_discovery_bundle(dir) {
+        return;
+    }
     if depth > 6 || *remaining == 0 {
         out.unreadable.push(format!(
             "{}: discovery {} limit reached; add this folder as a scan root",
@@ -12554,6 +12573,56 @@ mod nested_discovery_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn installed_bundles_are_boundaries_but_explicit_roots_and_real_repositories_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["Tool.app", "Plugin.bundle", "Library.framework"] {
+            let bundle = tmp.path().join(name);
+            let info = if name.ends_with(".framework") {
+                bundle.join("Resources/Info.plist")
+            } else {
+                bundle.join("Contents/Info.plist")
+            };
+            std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+            std::fs::write(info, "bundle").unwrap();
+            let nested = bundle.join("Contents/Resources/a/b/c/d/e/product");
+            std::fs::create_dir_all(&nested).unwrap();
+            run(&nested, &["init", "-q"]);
+            let broad = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+            assert!(broad.repos.is_empty(), "{broad:?}");
+            assert!(
+                !broad.is_partial(),
+                "bundle internals are outside discovery scope: {broad:?}"
+            );
+            let explicit = scan_dirs_fast_reporting(&[nested
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]);
+            assert_eq!(explicit.repos.len(), 1, "{explicit:?}");
+        }
+        let ordinary = tmp.path().join("source.app/product");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        run(&ordinary, &["init", "-q"]);
+        let checkout = tmp.path().join("checkout.app");
+        std::fs::create_dir_all(checkout.join("Contents")).unwrap();
+        std::fs::write(checkout.join("Contents/Info.plist"), "source").unwrap();
+        run(&checkout, &["init", "-q"]);
+        let scan = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+        assert_eq!(scan.repos.len(), 2, "{scan:?}");
+        assert!(!scan.is_partial(), "{scan:?}");
+        // An explicitly selected bundle remains a valid discovery root.
+        let direct = tmp.path().join("Tool.app/product");
+        std::fs::create_dir_all(&direct).unwrap();
+        run(&direct, &["init", "-q"]);
+        let explicit =
+            scan_dirs_fast_reporting(&[tmp.path().join("Tool.app").to_string_lossy().into_owned()]);
+        assert!(explicit
+            .repos
+            .iter()
+            .any(|repo| Path::new(&repo.path) == direct));
     }
 
     #[test]
