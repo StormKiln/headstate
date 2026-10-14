@@ -180,8 +180,9 @@ import {
   setCleanupPrefs,
   scanVenvs,
   sizeVenvs,
-  scanArtifacts,
+  scanArtifactsReport,
   sizeArtifacts,
+  sizeArtifactsReport,
   sizeWorktrees,
   repoTree,
   repoFile,
@@ -413,7 +414,7 @@ export function useViewCadence(view: string): void {
 /// Local-scan timings, for "slow on my machine" reports about the
 /// Artifacts, Virtualenvs and Docker views. Hoisted for the same reason
 /// as the GitHub ones above.
-const SCAN_ARTIFACTS_FN = timed("scan_artifacts", scanArtifacts);
+const SCAN_ARTIFACTS_FN = timed("scan_artifacts_report", scanArtifactsReport);
 const SCAN_VENVS_FN = timed("scan_venvs", scanVenvs);
 
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
@@ -902,7 +903,8 @@ export function useArtifactScanProgress(enabled: boolean) {
 /// progress is transient, and "we could not read /Volumes/code" is a
 /// fact about the result the user is now looking at.
 export function useArtifactScanFailures(enabled: boolean) {
-  return useLatestEvent<FailedRoot[]>("artifact-scan-failed-roots", enabled);
+  const query = useQuery({ queryKey: ["artifacts"], queryFn: SCAN_ARTIFACTS_FN, enabled: false });
+  return enabled ? query.data?.failed_roots : undefined;
 }
 
 /// How far the virtualenv directory walk has got (#1151).
@@ -949,10 +951,29 @@ export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   }
 }
 
+const diskRefreshes = new WeakMap<QueryClient, Map<string, Promise<unknown>>>();
+function refreshDiskMeasurements<T>(qc: QueryClient, discovery: string, measurement: string, refresh: () => Promise<T>): Promise<T> {
+  let running = diskRefreshes.get(qc);
+  if (!running) { running = new Map(); diskRefreshes.set(qc, running); }
+  const existing = running.get(discovery);
+  if (existing) return existing as Promise<T>;
+  const task: Promise<T> = Promise.resolve().then(async () => {
+    await Promise.all([qc.cancelQueries({ queryKey: [discovery] }), qc.cancelQueries({ queryKey: [measurement] })]);
+    await qc.invalidateQueries({ queryKey: [measurement], refetchType: "none" });
+    const result = await refresh();
+    if (running.get(discovery) === task) await qc.refetchQueries({ queryKey: [measurement], type: "active" }, { cancelRefetch: false });
+    return result;
+  });
+  running.set(discovery, task);
+  void task.finally(() => { if (running.get(discovery) === task) running.delete(discovery); }).catch(() => {});
+  return task;
+}
+
 export function useArtifacts(enabled: boolean) {
-  return useQuery({
+  const qc = useQueryClient();
+  const query = useQuery({
     queryKey: ["artifacts"],
-    queryFn: SCAN_ARTIFACTS_FN,
+    queryFn: async ({ signal }) => { const result = await SCAN_ARTIFACTS_FN(); signal.throwIfAborted(); return result; },
     enabled,
     // The set changes when someone builds or clones, not on a timer.
     staleTime: 60 * 1000,
@@ -981,6 +1002,7 @@ export function useArtifacts(enabled: boolean) {
     // broadly.
     gcTime: 60 * 60 * 1000,
   });
+  return { ...query, data: query.data?.artifacts, refetch: (...args: Parameters<typeof query.refetch>) => refreshDiskMeasurements(qc, "artifacts", "artifact-sizes", () => query.refetch(...args)) };
 }
 
 /// Sizes for artifact directories, measured in per-repository batches.
@@ -992,10 +1014,48 @@ export function useArtifacts(enabled: boolean) {
 ///
 /// `staleTime` is long for the same reason as the worktree equivalent: a
 /// directory's size does not change unless its contents do.
+type ArtifactMeasurement = [string, number | null, number | null, boolean?, number?];
+
+// Membership belongs in the key so an obsolete response cannot replace a new
+// scope. Reuse only fresh, non-invalidated measurements from sibling keys.
+function retainedMeasurements<T>(
+  qc: QueryClient,
+  prefix: string[],
+  entries: (data: T) => [string, unknown][],
+  allowStale = false,
+) {
+  const retained = new Map<string, unknown>();
+  const queries = qc
+    .getQueryCache()
+    .findAll({ queryKey: prefix })
+    .filter(
+      (q) =>
+        q.state.data !== undefined &&
+        (allowStale || (!q.state.isInvalidated && Date.now() - q.state.dataUpdatedAt < 5 * 60 * 1000)),
+    )
+    .sort((a, b) => a.state.dataUpdatedAt - b.state.dataUpdatedAt);
+  for (const query of queries) {
+    for (const [path, value] of entries(query.state.data as T))
+      retained.set(path, value);
+  }
+  return retained;
+}
+
+function artifactMeasurements(qc: QueryClient, repo: string, allowStale = false) {
+  const rows = new Map<string, ArtifactMeasurement>();
+  for (const query of qc.getQueryCache().findAll({ queryKey: ["artifact-sizes", repo] })) {
+    if (!allowStale && query.state.isInvalidated) continue;
+    for (const row of (query.state.data as ArtifactMeasurement[] | undefined) ?? []) {
+      const measuredAt = row[4] ?? query.state.dataUpdatedAt;
+      if (!allowStale && (row[1] === null || row[3] || Date.now() - measuredAt >= 5 * 60 * 1000)) continue;
+      if ((rows.get(row[0])?.[4] ?? -1) <= measuredAt) rows.set(row[0], [row[0], row[1], row[2], row[3], measuredAt]);
+    }
+  }
+  return rows;
+}
+
 export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
-  // Grouped OUTSIDE the query so the key set is stable across renders --
-  // a fresh grouping each render would remount every query and restart
-  // the measurement.
+  const qc = useQueryClient();
   const byRepo = new Map<string, string[]>();
   for (const a of artifacts) {
     const list = byRepo.get(a.repo_path) ?? [];
@@ -1003,39 +1063,55 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
     byRepo.set(a.repo_path, list);
   }
   const groups = [...byRepo.entries()].sort(([a], [b]) => a.localeCompare(b));
-
   const results = useQueries({
-    queries: groups.map(([repo, paths], i) => ({
-      // Keyed on the repo alone, NOT on `paths.length`.
-      //
-      // With the count in the key, removing one directory changed every
-      // surviving group's key too -- so the cache had nothing for the
-      // new keys and all of them refetched at once. That is the storm
-      // this is fixing; dropping removed entries from the cache
-      // achieves nothing if the key they were cached under no longer
-      // exists.
-      //
-      // The query function still closes over the current `paths`, so a
-      // group whose membership changed re-measures on its next natural
-      // fetch rather than never.
-      queryKey: ["artifact-sizes", repo],
-      queryFn: () =>
-        // The GROUP INDEX in the log label, never the path. This log is
-        // meant to be sent to someone, and a path carries a username and
-        // can name a private project. `src-tauri/src/redact.rs` strips
-        // paths that reach the log anyway; not writing one here means
-        // there is nothing to strip.
-        timeCall(`size_artifacts[#${i}] n=${paths.length}`, () => sizeArtifacts(paths)),
-      enabled,
-      staleTime: 5 * 60 * 1000,
-    })),
+    queries: groups.map(([repo, members], i) => {
+      const paths = [...new Set(members)].sort();
+      const key = ["artifact-sizes", repo, paths];
+      const retained = () => artifactMeasurements(qc, repo);
+      const warm = () => { const cached = retained(); return paths.flatMap((path) => cached.has(path) ? [cached.get(path)!] : []); };
+      return {
+        queryKey: key,
+        initialData: () => {
+          const rows = warm();
+          return rows.length === paths.length ? rows : undefined;
+        },
+        initialDataUpdatedAt: () => Math.min(...warm().map((row) => row[4] ?? Date.now())),
+        placeholderData: warm,
+        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+          const refresh = qc.getQueryState(key)?.isInvalidated;
+          const previous = artifactMeasurements(qc, repo, true);
+          const kept = refresh ? new Map<string, unknown>() : retained();
+          const missing = paths.filter((path) => !kept.has(path));
+          const measured = missing.length
+            ? await timeCall(`size_artifacts[#${i}] n=${missing.length}`, () =>
+                sizeArtifactsReport(missing),
+              )
+            : [];
+          signal.throwIfAborted();
+          for (const row of measured) {
+            const before = previous.get(row[0]) as ArtifactMeasurement | undefined;
+            kept.set(row[0], row[1] === null && before?.[1] != null ? [row[0], before[1], null, true, before[4]] : [row[0], row[1], row[2], false, Date.now()]);
+          }
+          return paths.flatMap((path) => {
+            const row = kept.get(path) as ArtifactMeasurement | undefined;
+            return row ? [row] : [];
+          });
+        },
+        enabled,
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+      };
+    }),
   });
 
   const sizes = new Map<string, number>();
   const ages = new Map<string, number>();
-  for (const r of results) {
-    for (const [path, bytes, age] of r.data ?? []) {
-      sizes.set(path, bytes);
+  for (const [index, result] of results.entries()) {
+    const [repo, paths] = groups[index];
+    const retained = artifactMeasurements(qc, repo, true);
+    const rows = result.data ?? paths.flatMap((path) => retained.has(path) ? [retained.get(path)!] : []);
+    for (const [path, bytes, age] of rows) {
+      if (bytes !== null) sizes.set(path, bytes);
       if (age !== null) ages.set(path, age);
     }
   }
@@ -1058,7 +1134,7 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
     /// `size_artifacts` genuinely rejects: it `map_err`s a semaphore
     /// acquire and then runs inside `spawn_blocking`, whose join can fail.
     /// With `retry: false` reasoning nearby, one rejection is final.
-    failed: results.filter((r) => r.isError).length,
+    failed: results.filter((r) => r.isError || r.data?.some(([, bytes, , incomplete]) => bytes === null || incomplete)).length,
   };
 }
 
@@ -1088,7 +1164,7 @@ export function useRemoveArtifacts() {
     // does exactly this.
     const gone = new Set(out.filter((o) => o.error === null).map((o) => o.path));
     if (gone.size > 0) {
-      qc.setQueriesData<[string, number, number | null][]>(
+      qc.setQueriesData<ArtifactMeasurement[]>(
         { queryKey: ["artifact-sizes"] },
         (old) => old?.filter(([path]) => !gone.has(path)),
       );
@@ -2763,14 +2839,16 @@ export { useReadyPushers } from "./useReadyPushers";
 /// distinguish those from an empty list and `WorktreeSidebar`'s comment
 /// says why.
 export function useWorktrees(enabled = true) {
+  const qc = useQueryClient();
   const q = useQuery({
     queryKey: ["worktrees"],
-    queryFn: listWorktrees,
+    queryFn: async ({ signal }) => { const result = await listWorktrees(); signal.throwIfAborted(); return result; },
     enabled,
     staleTime: 30_000,
   });
   return {
     ...q,
+    refetch: (...args: Parameters<typeof q.refetch>) => refreshDiskMeasurements(qc, "worktrees", "worktree-sizes", () => q.refetch(...args)),
     data: q.data?.repos,
     /// What the walk could not read. `[]` rather than `undefined` when
     /// there is nothing to report AND while the scan is still pending: a
@@ -3127,21 +3205,60 @@ function useRefetchFailedSizesOnReconnect(): void {
 ///
 /// Sizes change only when the tree does, so they are cached for longer
 /// than the rest.
-export function useWorktreeSizes(repoPath: string | undefined) {
+function worktreeSizeOptions(
+  qc: QueryClient,
+  repoPath: string | undefined,
+  members?: string[],
+) {
+  const paths = members ? [...new Set(members)].sort() : undefined;
+  const warm = () => {
+    if (!repoPath || !paths) return undefined;
+    const retained = retainedMeasurements<Map<string, number | null>>(
+      qc,
+      ["worktree-sizes", repoPath],
+      (data) => [...data],
+    );
+    const selected = new Map<string, number | null>();
+    for (const path of paths) {
+      if (retained.has(path))
+        selected.set(path, retained.get(path) as number | null);
+    }
+    return selected;
+  };
+  return {
+    queryKey: paths
+      ? ["worktree-sizes", repoPath, paths]
+      : ["worktree-sizes", repoPath],
+    initialData: () => {
+      const data = warm();
+      return data && data.size === paths?.length ? data : undefined;
+    },
+    initialDataUpdatedAt: () => {
+      const queries = qc.getQueryCache().findAll({ queryKey: ["worktree-sizes", repoPath] });
+      return Math.min(...(paths ?? []).map((path) => Math.max(0, ...queries.filter((q) => (q.state.data as Map<string, number | null> | undefined)?.has(path)).map((q) => q.state.dataUpdatedAt))));
+    },
+    placeholderData: warm,
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      const measured = await measureSizes(repoPath as string);
+      signal.throwIfAborted();
+      return paths
+        ? new Map([...measured].filter(([path]) => paths.includes(path)))
+        : measured;
+    },
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  };
+}
+
+export function useWorktreeSizes(
+  repoPath: string | undefined,
+  members?: string[],
+) {
+  const qc = useQueryClient();
   const partial = useStreamingSizes();
   const query = useQuery({
-    queryKey: ["worktree-sizes", repoPath],
-    queryFn: () => measureSizes(repoPath as string),
+    ...worktreeSizeOptions(qc, repoPath, members),
     enabled: Boolean(repoPath),
-    staleTime: 5 * 60 * 1000,
-    // NOT the default `retry: 3`. This query is a full filesystem walk
-    // measured in minutes on a large repository, so the default turns
-    // one rejection into FOUR sequential walks with `isFetching` true
-    // throughout -- a column of skeletons for four times the walk, and
-    // then a silent em dash. That is #769's "15+ minutes" almost
-    // exactly. A failed walk is not a flaky network call; retrying it
-    // repeats a very expensive operation to get the same answer.
-    retry: false,
   });
   // The repository on screen goes first (#1459). When it was opened
   // from All repositories, its call may still be waiting behind every
@@ -3150,7 +3267,12 @@ export function useWorktreeSizes(repoPath: string | undefined) {
   useEffect(() => {
     if (repoPath) sizeCalls.promote(repoPath);
   }, [repoPath]);
-  return { ...query, partial };
+  return {
+    ...query,
+    partial: members
+      ? new Map([...partial].filter(([path]) => members.includes(path)))
+      : partial,
+  };
 }
 
 /// Sizes for EVERY repository, landing one worktree at a time.
@@ -3177,17 +3299,21 @@ export function useWorktreeSizes(repoPath: string | undefined) {
 ///
 /// `staleTime` is long for the same reason it is on the single-repo
 /// hook: a worktree's size does not change unless its contents do.
-export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
+export function useAllWorktreeSizes(
+  repoPaths: string[],
+  enabled: boolean,
+  repos?: { path: string; worktrees: { path: string }[] }[],
+) {
+  const qc = useQueryClient();
   const streamed = useStreamingSizes();
   const results = useQueries({
     queries: repoPaths.map((path) => ({
-      queryKey: ["worktree-sizes", path],
-      queryFn: () => measureSizes(path),
+      ...worktreeSizeOptions(
+        qc,
+        path,
+        repos?.find((repo) => repo.path === path)?.worktrees.map((w) => w.path),
+      ),
       enabled,
-      staleTime: 5 * 60 * 1000,
-      // Same reason as the single-repo hook: four sequential walks of a
-      // large repository is #769's wait, not a recovery.
-      retry: false,
     })),
   });
 
@@ -3195,7 +3321,12 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   // pieces. Streamed values go in FIRST so a settled query's answer
   // wins on any key it has -- the settled set is the authoritative one,
   // and the stream is only ever an early view of the same walk.
-  const sizes = new Map<string, number | null>(streamed);
+  const currentPaths = repos
+    ? new Set(repos.flatMap((repo) => repo.worktrees.map((w) => w.path)))
+    : undefined;
+  const sizes = new Map<string, number | null>(
+    [...streamed].filter(([path]) => !currentPaths || currentPaths.has(path)),
+  );
   for (const r of results) {
     if (r.data) for (const [k, v] of r.data) sizes.set(k, v);
   }
@@ -4453,11 +4584,17 @@ export function useWorktreeDirs() {
     staleTime: Infinity,
   });
   const set = (dirs: string[]) =>
-    setWorktreeDirs(dirs).then((applied) => {
+    setWorktreeDirs(dirs).then(async (applied) => {
+      diskRefreshes.get(qc)?.clear();
+      const keys = ["worktrees", "artifacts", "worktree-sizes", "artifact-sizes", "venvs", "venv-sizes", "disk-inventory"];
+      await Promise.all(keys.map((key) => qc.cancelQueries({ queryKey: [key] })));
+      await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key], refetchType: "none" })));
       qc.setQueryData(["worktree-dirs"], applied);
+      await Promise.all(["worktrees", "artifacts", "venvs", "disk-inventory"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
+      await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
       return applied;
     });
-  return { dirs: query.data ?? [], set };
+  return { dirs: query.data ?? [], set, isLoading: query.isLoading, isError: query.isError };
 }
 
 /// The poll interval setting, and a way to change it.

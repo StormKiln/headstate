@@ -44,6 +44,7 @@ const refetchVenvsFn = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 vi.mock("../api/hooks", () => ({
+  useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }),
   // Undefined by default: the first-run state, which every other
   // assertion in this file assumes (#1152). A cached result would paint
   // a dated list instead of the live one.
@@ -180,7 +181,7 @@ describe("ArtifactsPage", () => {
     state.pending = 2;
     state.total = 5;
     render(<ArtifactsPage />);
-    expect(screen.getByText(/at least/)).toBeTruthy();
+    expect(screen.getByText(/last measured, incomplete:/)).toBeTruthy();
     expect(screen.getByText(/measuring — 3 of 5/)).toBeTruthy();
   });
 
@@ -190,7 +191,7 @@ describe("ArtifactsPage", () => {
     state.pending = 0;
     state.total = 5;
     render(<ArtifactsPage />);
-    expect(screen.queryByText(/at least/)).toBeNull();
+    expect(screen.queryByText(/last measured, incomplete:/)).toBeNull();
     expect(screen.queryByText(/measuring/)).toBeNull();
   });
 
@@ -218,7 +219,7 @@ describe("ArtifactsPage", () => {
     state.sizesFailed = 1;
     render(<ArtifactsPage />);
 
-    expect(screen.getByText(/at least/)).toBeTruthy();
+    expect(screen.getByText(/last measured, incomplete:/)).toBeTruthy();
     // And it says what is missing, which "at least" alone cannot.
     expect(screen.getByText(/could not be measured/)).toBeTruthy();
 
@@ -247,8 +248,8 @@ describe("ArtifactsPage", () => {
     render(<ArtifactsPage />);
 
     fireEvent.click(screen.getByRole("button", { name: /Remove all/ }));
-    expect(screen.getByText(/This frees at least/)).toBeTruthy();
-    expect(screen.getByText(/real figure is larger/)).toBeTruthy();
+    expect(screen.getByText(/Last measured logical file data/)).toBeTruthy();
+    expect(screen.getByText(/Some sizes are unavailable/)).toBeTruthy();
   });
 
   /// A build writing into a directory does not show up in `git status`,
@@ -887,7 +888,7 @@ describe("ArtifactsPage and roots it could not read", () => {
 
   it("says nothing when every root was readable", () => {
     render(<ArtifactsPage />);
-    expect(screen.queryByText(/could not be read/)).toBeNull();
+    expect(screen.queryByText(/Discovery is incomplete/)).toBeNull();
   });
 
   it("names an unreadable root and why, rather than omitting it", () => {
@@ -896,7 +897,7 @@ describe("ArtifactsPage and roots it could not read", () => {
     // answer about that directory.
     state.failedRoots = [{ root: "/Volumes/code", why: "Permission denied (os error 13)" }];
     render(<ArtifactsPage />);
-    expect(screen.getByText(/1 configured folder could not be read/)).toBeTruthy();
+    expect(screen.getByText(/Discovery is incomplete in 1 location/)).toBeTruthy();
     expect(screen.getByText(/\/Volumes\/code — Permission denied/)).toBeTruthy();
   });
 
@@ -907,7 +908,7 @@ describe("ArtifactsPage and roots it could not read", () => {
     state.failedRoots = [{ root: "/Volumes/code", why: "Permission denied" }];
     state.artifacts = [art({ path: "/code/proj/target" })];
     render(<ArtifactsPage />);
-    expect(screen.getByText(/could not be read/)).toBeTruthy();
+    expect(screen.getByText(/Discovery is incomplete/)).toBeTruthy();
     expect(screen.getByText(/\/code\/proj\/target/)).toBeTruthy();
   });
 });
@@ -980,4 +981,20 @@ describe("ArtifactsPage while the scan is running", () => {
     render(<ArtifactsPage />);
     expect(screen.getByText(/Looking for build output/)).toBeTruthy();
   });
+});
+
+ it("shows incomplete coverage even when no artifact was discovered", () => {
+  state.loading = false; state.failed = false; state.venvs = []; state.cached = undefined;
+  state.artifacts = []; state.failedRoots = [{root:"/fixture/deep",why:"Depth limit reached"}];
+  render(<ArtifactsPage />);
+  expect(screen.getByText(/Discovery is incomplete in 1 location/)).toBeTruthy();
+  expect(screen.getByText(/completed portion of the scan/)).toBeTruthy();
+ });
+
+it("retains discovered output after refresh fails",()=>{
+ state.loading=false;state.failed=true;state.artifacts=[art()];state.failedRoots=[];state.cached=undefined;
+ render(<ArtifactsPage/>);
+ expect(screen.getByText(/Previously discovered output remains visible/)).toBeTruthy();
+ expect(screen.getByRole("checkbox",{name:/Select \/code\/repo\/target/})).toBeTruthy();
+ state.failed=false;
 });

@@ -6,7 +6,7 @@ import type { Artifact } from "@/types/pr";
 
 const invoke = vi.hoisted(() =>
   vi.fn<(cmd: string, args?: unknown) => Promise<unknown>>((cmd, args) => {
-    if (cmd === "size_artifacts") {
+    if (cmd === "size_artifacts_report") {
       const paths = (args as { paths: string[] }).paths;
       return Promise.resolve(paths.map((p) => [p, 1024, 60]));
     }
@@ -52,7 +52,7 @@ describe("useArtifactSizes failure counting", () => {
   it("counts a rejected batch as failed rather than as answered", async () => {
     let call = 0;
     invoke.mockImplementation((cmd, args) => {
-      if (cmd !== "size_artifacts") return Promise.resolve([]);
+      if (cmd !== "size_artifacts_report") return Promise.resolve([]);
       call += 1;
       if (call === 1) return Promise.reject(new Error("permission denied"));
       const paths = (args as { paths: string[] }).paths;

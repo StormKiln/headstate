@@ -2,6 +2,8 @@
 //! calls these commands and listens for the `prs-updated` event that
 //! [`crate::poll`] emits in the background.
 
+use crate::artifacts::scan::ArtifactScan;
+
 #[tauri::command]
 pub async fn save_markdown(
     window: tauri::WebviewWindow,
@@ -1776,6 +1778,24 @@ pub async fn size_worktrees(
 /// shaped the worktree view.
 #[tauri::command]
 pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Artifact>, String> {
+    scan_artifacts_report(app)
+        .await
+        .map(|report| legacy_artifact_rows(report.artifacts))
+}
+
+fn legacy_artifact_rows(
+    artifacts: Vec<crate::artifacts::Artifact>,
+) -> Vec<crate::artifacts::Artifact> {
+    // Released companions validate the old ArtifactKind enum. New kinds
+    // are available through the report command, whose schema includes them.
+    artifacts
+        .into_iter()
+        .filter(|artifact| artifact.kind != crate::artifacts::ArtifactKind::SwiftBuild)
+        .collect()
+}
+
+#[tauri::command]
+pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, String> {
     // One budget across every filesystem scan (#1149), held by the
     // walk itself rather than by this future -- see `scan_blocking`.
     // The SAME roots the worktree view scans. A second directory setting
@@ -1811,7 +1831,10 @@ pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Arti
     // the cache holds what this scan actually found, and a root that
     // could not be read contributes nothing to it either way.
     remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out);
-    Ok(out)
+    Ok(ArtifactScan {
+        artifacts: out,
+        failed_roots: failed,
+    })
 }
 
 /// Sizes for artifact directories, as `(path, bytes, secs_since_write)`.
@@ -2057,8 +2080,24 @@ where
     .map_err(|e| e.to_string())
 }
 
+/// Older companions require numeric sizes; an incomplete measurement fails.
 #[tauri::command]
 pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
+    size_artifacts_report(paths)
+        .await?
+        .into_iter()
+        .map(|(path, bytes, age)| {
+            bytes
+                .map(|bytes| (path.clone(), bytes, age))
+                .ok_or_else(|| format!("could not completely measure {path}"))
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn size_artifacts_report(
+    paths: Vec<String>,
+) -> Result<Vec<(String, Option<u64>, Option<u64>)>, String> {
     // Held for the whole walk, by the walk -- see `scan_blocking`.
     scan_blocking(move || {
         // DIAGNOSTIC LOGGING (Settings > diagnostic log). Per-directory,
@@ -2066,14 +2105,14 @@ pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Opti
         // was slow, this says which entry made it slow.
         let started = std::time::Instant::now();
         let total = paths.len();
-        let out: Vec<(String, u64, Option<u64>)> = paths
+        let out: Vec<(String, Option<u64>, Option<u64>)> = paths
             .into_iter()
             .enumerate()
             .map(|(i, p)| {
                 let each = std::time::Instant::now();
-                let (bytes, age) = crate::artifacts::measure(std::path::Path::new(&p));
+                let (bytes, age) = crate::artifacts::measure_complete(std::path::Path::new(&p));
                 crate::diag!(
-                    "[diag] size_artifacts {}/{} {}ms {}b",
+                    "[diag] size_artifacts {}/{} {}ms {:?}b",
                     i + 1,
                     total,
                     each.elapsed().as_millis(),
@@ -12607,4 +12646,41 @@ async fn compare_config_for_caller(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod artifact_wire_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_discovery_keeps_known_rows_without_sending_new_enum_variants() {
+        let row = |kind| crate::artifacts::Artifact {
+            path: "fixture".into(),
+            repo_path: "repo".into(),
+            kind,
+            size_bytes: None,
+        };
+        let rows = legacy_artifact_rows(vec![
+            row(crate::artifacts::ArtifactKind::CargoTarget),
+            row(crate::artifacts::ArtifactKind::SwiftBuild),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, crate::artifacts::ArtifactKind::CargoTarget);
+    }
+
+    #[tokio::test]
+    async fn legacy_sizes_keep_numeric_wire_and_fail_closed_when_report_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().to_string_lossy().into_owned();
+        let report = size_artifacts_report(vec![empty.clone()]).await.unwrap();
+        assert_eq!(report[0].1, Some(0));
+        let legacy = size_artifacts(vec![empty]).await.unwrap();
+        assert_eq!(legacy[0].1, 0);
+        let missing = temp.path().join("missing").to_string_lossy().into_owned();
+        assert_eq!(
+            size_artifacts_report(vec![missing.clone()]).await.unwrap()[0].1,
+            None
+        );
+        assert!(size_artifacts(vec![missing]).await.is_err());
+    }
 }

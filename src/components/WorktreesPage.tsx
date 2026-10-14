@@ -1063,7 +1063,7 @@ function ConfirmRemoveOrphan({
                 "How much is in here could not be measured either."
               : bytes === null
                 ? "How much is in here is not known."
-                : `This frees ${formatSize(bytes)}.`}
+                : `Selected worktree contains ${formatSize(bytes)} of measured logical file data; actual reclaimed space may differ.`}
         </p>
         {/* The red sentence, and the whole reason this dialog is as
             heavy as the forced-removal one. `forceWarning` can be
@@ -1278,7 +1278,7 @@ export function WorktreesPage() {
     total: classifyTotal,
     failed: classifyUnknown,
   } = useWorktreeSafety(selected?.path, selected?.worktrees);
-  const sizesQuery = useWorktreeSizes(selected?.path);
+  const sizesQuery = useWorktreeSizes(selected?.path, selected?.worktrees.map(w => w.path));
   // The settled answer when there is one, and the sizes streamed so far
   // when there is not. Before #754 this was `data` alone, so every row
   // held a skeleton until the LARGEST tree in the repository had been
@@ -1749,6 +1749,7 @@ export function WorktreesPage() {
   } = useAllWorktreeSizes(
     (repos ?? []).map((r) => r.path),
     !filters.repo,
+    repos,
   );
 
   /// The orphan whose deletion is awaiting confirmation, or null (#845).
@@ -1967,6 +1968,8 @@ export function WorktreesPage() {
   const sessionList = sessions.list.data?.sessions;
   const occupiedBy = useMemo(() => worktreeSessions(sessionList), [sessionList]);
 
+  const refreshControls = <div className="px-4 py-2 text-xs text-muted-foreground"><button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button>{isError && repos?.length ? <p role="status">Could not scan for worktrees: {errorMessage(error)}. Previously discovered worktrees remain visible; measurements may be out of date.</p> : null}</div>;
+
   if (isLoading) {
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
@@ -1975,7 +1978,7 @@ export function WorktreesPage() {
     );
   }
 
-  if (isError) {
+  if (isError && !repos?.length) {
     return (
       <QueryError
         title="Could not scan for worktrees"
@@ -1993,6 +1996,7 @@ export function WorktreesPage() {
     if (partial) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+          {refreshControls}
           <p className="text-sm font-semibold text-[#e6edf3]">
             No repositories could be read
           </p>
@@ -2017,6 +2021,7 @@ export function WorktreesPage() {
     if (dirs.length === 0) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+          {refreshControls}
           <p className="text-sm font-semibold text-[#e6edf3]">
             Headstate does not know where your repositories are
           </p>
@@ -2029,6 +2034,7 @@ export function WorktreesPage() {
     }
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+          {refreshControls}
         <p className="text-sm font-semibold text-[#e6edf3]">No repositories found</p>
         {/* NAMES them (#952). "Set the directories to scan in Settings"
             without saying which ones are set asks the user to go and
@@ -2061,6 +2067,7 @@ export function WorktreesPage() {
       <>
       {orphanDialog}
       <div className="rounded-md border border-[#30363d]">
+        {refreshControls}
         <div className="border-b border-[#30363d] px-4 py-3">
           {/* # The orphan verdict over an incomplete walk (#951)
 
@@ -2189,6 +2196,7 @@ export function WorktreesPage() {
     const { worktrees, totalBytes, sizesComplete } = rollupRepos(withSizes);
     return (
       <div className="rounded-md border border-[#30363d]">
+        {refreshControls}
         <div className="flex items-baseline justify-between border-b border-[#30363d] px-4 py-3">
           {/* "at least" on a partial scan (#951), for the same reason the
               size total beside it already says it: both numbers were
@@ -2205,10 +2213,11 @@ export function WorktreesPage() {
             {/* "at least" while any size is still unmeasured: a total
                 that silently counts unknowns as zero is a confident
                 wrong answer. */}
-            {sizesComplete ? "" : "at least "}
-            {formatSize(totalBytes)}
+            {sizesComplete ? "" : "last measured, incomplete: "}
+            {formatSize(totalBytes)} logical
           </span>
         </div>
+        <p className="px-4 py-2 text-xs text-muted-foreground">Includes build artifacts; overlaps the Artifacts page. Logical sizes may count hard links more than once and omit unreadable files. Reclaimable allocation is unknown.</p>
         <PartialScanNotice
           unreadable={unreadable}
           consequence="the counts and the total above are floors."
@@ -2563,8 +2572,8 @@ export function WorktreesPage() {
             {safeCount > 0 && reclaim.bytes > 0 ? (
               <span className="text-[#8b949e]">
                 {" "}
-                — {reclaim.unmeasured > 0 ? "at least " : ""}
-                {formatSize(reclaim.bytes)} to reclaim
+                — {reclaim.unmeasured > 0 ? "last measured, incomplete: " : ""}
+                {formatSize(reclaim.bytes)} logical in removable worktrees
               </span>
             ) : null}
             {/* This view deletes directories on the strength of a
@@ -2722,10 +2731,13 @@ export function WorktreesPage() {
             "how much is this one holding?". */}
         {measured.length > 0 ? (
           <span className="text-xs text-[#8b949e]">
-            {sizesComplete ? "" : "at least "}
-            {formatSize(totalBytes)} total
+            {sizesComplete ? "" : "last measured, incomplete: "}
+            {formatSize(totalBytes)} logical in this filter
           </span>
         ) : null}
+
+        {refreshControls}
+        <p className="w-full text-xs text-muted-foreground">Logical file sizes include build artifacts and may omit unreadable files. Hard links and shared storage can make reclaimed space smaller. Do not add worktree and artifact totals. Pruning removes stale Git registrations, not build output.</p>
 
         {/* The three columns the row already renders, both ways (#771).
             A `<select>` rather than clickable column headers: this list

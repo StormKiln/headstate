@@ -1,3 +1,4 @@
+import { DiskUsagePanel } from "./DiskUsagePanel";
 import { useMemo, useState } from "react";
 import {
   NET_PROCESSES_POLL_MS,
@@ -2498,7 +2499,7 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
           Everything the operating system has mounted, which on macOS includes
           several read-only system volumes that share one physical disk. The
           one marked <span className="text-[#c9d1d9]">system</span> is where
-          Headstate and the OS live.
+          Headstate and the OS live. Used here is capacity minus available space; shared containers and reserved space can differ from the inventory’s volume allocation. Do not sum shared volumes.
         </p>
       </Panel>
 
@@ -2513,6 +2514,7 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
           volumes above are the whole page: see the doc comment for why
           "which of this is Headstate's" is not here either (#796) -- and
           for why a signpost to the pages that CAN act is not that. */}
+      <DiskUsagePanel />
       <ReclaimSignpost />
     </div>
   );

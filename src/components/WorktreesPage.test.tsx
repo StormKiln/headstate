@@ -1158,7 +1158,7 @@ describe("WorktreesPage", () => {
       ];
       render(<WorktreesPage />);
       expect(screen.getByText(/2 safe to remove/)).toBeTruthy();
-      expect(screen.getByText(/5(\.0)? ?GB to reclaim/)).toBeTruthy();
+      expect(screen.getByText(/5(\.0)? ?GB logical in removable worktrees/)).toBeTruthy();
     });
 
     it("does not count a row that is not safe to remove", () => {
@@ -1173,7 +1173,7 @@ describe("WorktreesPage", () => {
       // The dirty row's 9 GB must not be in the figure. Asserted on the
       // figure's own text rather than on the absence of a number, since
       // "1.0 GB" contains "10" once the space is optional.
-      expect(screen.getByText(/to reclaim/).textContent).not.toMatch(/9|10/);
+      expect(screen.getByText(/logical in removable worktrees/).textContent).not.toMatch(/9|10/);
     });
 
     it("says at least when a safe row has no measured size", () => {
@@ -1185,7 +1185,7 @@ describe("WorktreesPage", () => {
         wt({ path: "/code/b", safety: { kind: "safe" }, size_bytes: null }),
       ];
       render(<WorktreesPage />);
-      expect(screen.getByText(/to reclaim/).textContent).toMatch(/at least/);
+      expect(screen.getByText(/logical in removable worktrees/).textContent).toMatch(/last measured, incomplete:/);
     });
 
     it("says nothing when the safe rows hold nothing measurable", () => {
@@ -1193,13 +1193,13 @@ describe("WorktreesPage", () => {
       // as a measurement that came back zero.
       state.classified = [wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: null })];
       render(<WorktreesPage />);
-      expect(screen.queryByText(/to reclaim/)).toBeNull();
+      expect(screen.queryByText(/logical in removable worktrees/)).toBeNull();
     });
 
     it("says nothing when nothing is safe to remove", () => {
       state.classified = [wt({ safety: { kind: "dirty", detail: 1 }, size_bytes: 9 * 1024 ** 3 })];
       render(<WorktreesPage />);
-      expect(screen.queryByText(/to reclaim/)).toBeNull();
+      expect(screen.queryByText(/logical in removable worktrees/)).toBeNull();
     });
   });
 
@@ -2283,7 +2283,7 @@ describe("WorktreesPage", () => {
       fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
       const dialog = screen.getByRole("dialog");
       expect(within(dialog).getByText("/code/veil-coh")).toBeTruthy();
-      expect(within(dialog).getByText(/frees 2\.5 GB/i)).toBeTruthy();
+      expect(within(dialog).getByText(/contains 2\.5 GB/i)).toBeTruthy();
       expect(within(dialog).getByText(/nothing inside could be checked/i)).toBeTruthy();
       // The help text's own sentence, verbatim -- the only advice that
       // survives the click, and `title` is hover-only so the dialog is
@@ -2737,7 +2737,7 @@ describe("WorktreesPage", () => {
         view: "worktrees",
       });
       render(<WorktreesPage />);
-      expect(screen.getByText(/at least/i)).toBeTruthy();
+      expect(screen.getByText(/last measured, incomplete:/i)).toBeTruthy();
     });
   });
 
@@ -2765,14 +2765,14 @@ describe("WorktreesPage", () => {
 
     it("sums the sizes it has", () => {
       withSizes([1024, 2048]);
-      expect(screen.getByText(/3\.0 KB total|3 KB total/i)).toBeTruthy();
+      expect(screen.getByText(/3\.0 KB logical|3 KB logical/i)).toBeTruthy();
     });
 
     // Counting an unmeasured size as zero would report a confident
     // wrong number, so the total says so instead.
     it("says the total is partial while a size is missing", () => {
       withSizes([1024, null]);
-      expect(screen.getByText(/at least/i)).toBeTruthy();
+      expect(screen.getByText(/last measured, incomplete:/i)).toBeTruthy();
     });
 
     it("drops the qualifier once everything is measured", () => {
@@ -2783,7 +2783,7 @@ describe("WorktreesPage", () => {
     // Nothing measured yet is not "0 bytes" -- it is no answer at all.
     it("shows no total before any size has arrived", () => {
       withSizes([null, null]);
-      expect(screen.queryByText(/total/i)).toBeNull();
+      expect(screen.queryByText(/logical in this filter/i)).toBeNull();
     });
   });
 

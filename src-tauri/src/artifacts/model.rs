@@ -16,6 +16,7 @@ pub enum ArtifactKind {
     /// and 99.7% of it sits beside main checkouts rather than inside
     /// worktrees, which is why the worktree view could never reach it.
     CargoTarget,
+    SwiftBuild,
     NodeModules,
     /// Provider binaries, re-downloaded per module directory. Pure
     /// duplication: 37 directories clustered at ~0.8 GB each.
@@ -43,6 +44,7 @@ impl ArtifactKind {
     pub fn regenerated_by(self) -> &'static str {
         match self {
             ArtifactKind::CargoTarget => "cargo build",
+            ArtifactKind::SwiftBuild => "swift build",
             ArtifactKind::NodeModules => "npm install (or yarn)",
             ArtifactKind::DotnetBuild => "dotnet build",
             ArtifactKind::Terraform => "terraform init",
@@ -67,6 +69,7 @@ impl ArtifactKind {
     pub fn proof(self) -> ManifestProof {
         match self {
             ArtifactKind::CargoTarget => ManifestProof::Named("Cargo.toml"),
+            ArtifactKind::SwiftBuild => ManifestProof::Named("Package.swift"),
             ArtifactKind::NodeModules => ManifestProof::Named("package.json"),
             ArtifactKind::DotnetBuild => {
                 ManifestProof::AnyExtension(&["csproj", "fsproj", "vbproj"])

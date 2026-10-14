@@ -2368,15 +2368,27 @@ pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
 
 fn scan_reporting(dirs: &[String], with_safety: bool) -> RepoScan {
     let mut scan = RepoScan::default();
+    let mut common_dirs = std::collections::HashSet::new();
     for base in dirs {
-        collect_inner(Path::new(base), 0, &mut scan, with_safety);
+        let mut remaining = 10_000;
+        collect_bounded(
+            Path::new(base),
+            0,
+            &mut scan,
+            with_safety,
+            &mut common_dirs,
+            &mut remaining,
+        );
     }
+    scan.repos.sort_by(|a, b| a.path.cmp(&b.path));
+    scan.repos.dedup_by(|a, b| a.path == b.path);
     sort_for_sidebar(&mut scan.repos);
     // Sorted so the report reads the same way twice, whatever order the
     // directory scan returned entries in. `sort_for_sidebar` already
     // does this for the repos, and a report that shuffled between runs
     // would make a diff of two scans unreadable.
     scan.unreadable.sort();
+    scan.unreadable.dedup();
     scan
 }
 
@@ -3446,10 +3458,39 @@ pub fn scan_dirs_reporting(dirs: &[String]) -> RepoScan {
     scan_reporting(dirs, true)
 }
 
+#[cfg(test)]
 fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool) {
-    if depth > 2 {
+    collect_bounded(
+        dir,
+        depth,
+        out,
+        with_safety,
+        &mut std::collections::HashSet::new(),
+        &mut 10_000,
+    );
+}
+
+fn collect_bounded(
+    dir: &Path,
+    depth: usize,
+    out: &mut RepoScan,
+    with_safety: bool,
+    common_dirs: &mut std::collections::HashSet<std::path::PathBuf>,
+    remaining: &mut usize,
+) {
+    if depth > 6 || *remaining == 0 {
+        out.unreadable.push(format!(
+            "{}: discovery {} limit reached; add this folder as a scan root",
+            dir.display(),
+            if depth > 6 {
+                "depth"
+            } else {
+                "directory budget"
+            }
+        ));
         return;
     }
+    *remaining -= 1;
     // `symlink_metadata` rather than `is_dir()`, for the reason
     // `claude/overview.rs` states about `exists()`: `is_dir()` returns a
     // plain `false` for a path it could not STAT, so a directory behind a
@@ -3547,9 +3588,8 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
                 }],
             });
         }
-        return;
     }
-    if dir.join(".git").is_dir() {
+    if dir.join(".git").is_dir() || (dir.join(".git").is_file() && orphan_gitdir(dir).is_none()) {
         // The PRIMARY hole of #951, and the reason this function had to
         // gain a report at all.
         //
@@ -3568,53 +3608,86 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
         // with an empty `worktrees` would claim "this repository has no
         // worktrees", which is a confident wrong answer of the same kind.
         // The path and git's own message go in the report instead.
-        match git(dir, &["worktree", "list", "--porcelain"]) {
-            Ok(list) => {
-                let branch = default_branch(dir);
-                let worktrees = parse_porcelain(&list)
-                    .into_iter()
-                    .map(|mut w| {
-                        if with_safety {
-                            classify(&mut w, dir, &branch);
-                        }
-                        w
-                    })
-                    .collect();
-                out.repos.push(Repo {
-                    // Both existing branches reached a `.git` entry, which a
-                    // bare repository does not have.
-                    bare: false,
-                    // Gated on `with_safety` like every other subprocess
-                    // here: a scan that skipped the safety verdicts is
-                    // the fast path, and one `git stash list` per repo
-                    // would put it back on the slow one.
-                    //
-                    // ONCE PER REPOSITORY, because the stack is shared
-                    // repo-wide -- asking per worktree would be ~295
-                    // subprocesses returning the same number.
-                    stash_entries: with_safety.then(|| stash_count(dir)).flatten(),
-                    identity: repo_identity(&dir.to_string_lossy()),
-                    fetched_at: fetched_at(dir),
-                    name: dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    path: dir.to_string_lossy().into_owned(),
-                    worktrees,
-                    // The SAME string `classify` was just fed, not a
-                    // second resolution of it (#1026). Carrying what is
-                    // already in hand is what keeps the table's "up to
-                    // date with X" and the merge verdicts on the same
-                    // row from naming different refs -- the disagreement
-                    // #757 measured at nine rows in 34.
-                    default_ref: Some(branch),
-                });
+        let common = git(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .map(|p| std::path::PathBuf::from(p.trim()))
+        .map(|p| p.canonicalize().unwrap_or(p));
+        let first = common.is_none_or(|p| common_dirs.insert(p));
+        // Git canonicalizes worktree-list paths (notably /var to /private/var
+        // on macOS). Keep the discovered main-checkout spelling as the UI key,
+        // even when a linked checkout caused this common directory to be listed
+        // first. Canonical paths are for deduplication, not replacement of keys.
+        if !first && dir.join(".git").is_dir() {
+            let canonical = canonical_key(dir);
+            if let Some(repo) = out
+                .repos
+                .iter_mut()
+                .find(|repo| canonical_key(Path::new(&repo.path)) == canonical)
+            {
+                repo.path = dir.to_string_lossy().into_owned();
+                repo.name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                repo.fetched_at = fetched_at(dir);
             }
-            Err(e) => out
-                .unreadable
-                .push(format!("{}: {e}", dir.to_string_lossy())),
         }
-        return;
+        if first {
+            match git(dir, &["worktree", "list", "--porcelain"]) {
+                Ok(list) => {
+                    let branch = default_branch(dir);
+                    let worktrees: Vec<_> = parse_porcelain(&list)
+                        .into_iter()
+                        .map(|mut w| {
+                            if with_safety {
+                                classify(&mut w, dir, &branch);
+                            }
+                            w
+                        })
+                        .collect();
+                    let primary = if dir.join(".git").is_dir() {
+                        dir
+                    } else {
+                        worktrees.first().map(|w| Path::new(&w.path)).unwrap_or(dir)
+                    };
+                    out.repos.push(Repo {
+                        // Both existing branches reached a `.git` entry, which a
+                        // bare repository does not have.
+                        bare: false,
+                        // Gated on `with_safety` like every other subprocess
+                        // here: a scan that skipped the safety verdicts is
+                        // the fast path, and one `git stash list` per repo
+                        // would put it back on the slow one.
+                        //
+                        // ONCE PER REPOSITORY, because the stack is shared
+                        // repo-wide -- asking per worktree would be ~295
+                        // subprocesses returning the same number.
+                        stash_entries: with_safety.then(|| stash_count(dir)).flatten(),
+                        identity: repo_identity(&primary.to_string_lossy()),
+                        fetched_at: fetched_at(primary),
+                        name: primary
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        path: primary.to_string_lossy().into_owned(),
+                        worktrees,
+                        // The SAME string `classify` was just fed, not a
+                        // second resolution of it (#1026). Carrying what is
+                        // already in hand is what keeps the table's "up to
+                        // date with X" and the merge verdicts on the same
+                        // row from naming different refs -- the disagreement
+                        // #757 measured at nine rows in 34.
+                        default_ref: Some(branch),
+                    });
+                }
+                Err(e) => out
+                    .unreadable
+                    .push(format!("{}: {e}", dir.to_string_lossy())),
+            }
+        }
     }
     // A BARE repository -- a clone or mirror with no working tree
     // (#1142).
@@ -3745,9 +3818,13 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
             }
         };
         let p = e.path();
-        if p.file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        {
+        if p.file_name().is_some_and(|n| {
+            n.to_string_lossy().starts_with('.')
+                || matches!(
+                    n.to_str(),
+                    Some("node_modules" | "target" | "build" | "dist" | "vendor")
+                )
+        }) {
             continue;
         }
         // `file_type()` rather than `p.is_dir()`, for `caches/mod.rs`'
@@ -3762,11 +3839,20 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut RepoScan, with_safety: bool
         // which keeps the existing behaviour of not descending into a
         // linked tree: it is reachable by its real path.
         match e.file_type() {
-            Ok(ft) if ft.is_dir() => collect_inner(&p, depth + 1, out, with_safety),
+            Ok(ft) if ft.is_dir() => {
+                collect_bounded(&p, depth + 1, out, with_safety, common_dirs, remaining)
+            }
             Ok(_) => {}
             Err(err) => out
                 .unreadable
                 .push(format!("{}: {err}", p.to_string_lossy())),
+        }
+        if *remaining == 0 {
+            out.unreadable.push(format!(
+                "{}: discovery directory budget reached; add a narrower scan root",
+                dir.display()
+            ));
+            break;
         }
     }
 }
@@ -12348,5 +12434,112 @@ fn main() {
             String::from_utf8(out.stderr).unwrap().trim(),
             "probe stderr"
         );
+    }
+}
+
+#[cfg(test)]
+mod nested_discovery_tests {
+    use super::*;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "octocat@invalid")
+            .env("GIT_COMMITTER_EMAIL", "octocat@invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn unborn_wrapper_discovers_nested_product_and_external_linked_tree_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("wrapper");
+        let product = wrapper.join("products/product");
+        std::fs::create_dir_all(&product).unwrap();
+        run(&wrapper, &["init", "-q"]);
+        run(&product, &["init", "-q"]);
+        run(&product, &["commit", "--allow-empty", "-qm", "initial"]);
+        let linked = tmp.path().join("external");
+        run(
+            &product,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let scan = scan_dirs_fast_reporting(&[
+            linked.to_string_lossy().into_owned(),
+            wrapper.to_string_lossy().into_owned(),
+            product.to_string_lossy().into_owned(),
+        ]);
+        let real = product.canonicalize().unwrap();
+        let products: Vec<_> = scan
+            .repos
+            .iter()
+            .filter(|r| Path::new(&r.path).canonicalize().unwrap() == real)
+            .collect();
+        assert_eq!(products.len(), 1, "{scan:?}");
+        assert_eq!(
+            products[0].path,
+            product.to_string_lossy(),
+            "A linked-first scan must retain the discovered main checkout spelling"
+        );
+        assert_eq!(products[0].worktrees.len(), 2);
+        assert!(products[0]
+            .worktrees
+            .iter()
+            .any(|w| Path::new(&w.path).canonicalize().unwrap() == linked.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn depth_boundary_reports_a_targeted_scope_and_narrower_root_finds_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("a/b/c/d/e/f/g/product");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q"]);
+        let broad = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+        assert!(broad.is_partial());
+        assert!(broad.unreadable.iter().any(|e| e.contains("depth limit")));
+        assert_eq!(
+            scan_dirs_fast_reporting(&[repo.to_string_lossy().into_owned()])
+                .repos
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dependency_trees_are_pruned_and_directory_budget_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("node_modules/product");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q"]);
+        assert!(
+            scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()])
+                .repos
+                .is_empty()
+        );
+        let mut out = RepoScan::default();
+        collect_bounded(
+            tmp.path(),
+            0,
+            &mut out,
+            false,
+            &mut std::collections::HashSet::new(),
+            &mut 0,
+        );
+        assert!(out.is_partial());
     }
 }

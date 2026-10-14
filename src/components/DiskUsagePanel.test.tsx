@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiskObservation } from "../types/disk";
 const api = vi.hoisted(() => ({ diskStatus: vi.fn(), diskHistory: vi.fn(), diskSettings: vi.fn(), saveDiskSettings: vi.fn(), startDiskScan: vi.fn(), cancelDiskScan: vi.fn() }));
 vi.mock("../api/diskInventory", () => api);
+vi.mock("../api/hooks", () => ({ useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }) }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: vi.fn() }));
 import { DiskUsagePanel } from "./DiskUsagePanel";
 const gib = 1073741824n;
@@ -66,4 +67,17 @@ it("lets users exclude additional locations again without starting a scan", asyn
   await act(async()=>{fireEvent.click(screen.getByRole("button",{name:"Exclude additional locations from future scans"}));});
   expect(api.saveDiskSettings).toHaveBeenCalledWith({external_roots:["/fixture/builds"],additional_locations:false});
   expect(api.startDiskScan).not.toHaveBeenCalled();
+});
+
+it("keeps comparable growth and known allocation visible in a partial observation", async () => {
+ const o=sample(); o.status="partial"; o.measured=null; o.known_allocated=bytes(60); o.allocation_complete=false;
+ o.configuration=JSON.stringify([["/fixture/projects"],{external_roots:["/fixture/cache"],additional_locations:true}]);
+ o.comparison={baseline_at:50,reason:"Some locations are incomparable",changes:[{location_id:"target",path:"/fixture/output",kind:"persistent",bytes:bytes(3),reason:null}]};
+ api.diskStatus.mockResolvedValue({running:false,resumable:true,observations:[o]});
+ await show();
+ expect(screen.getByText(/At least 60.0 GiB known allocated/)).toBeTruthy();
+ expect(screen.getByText(/Some locations are incomparable/)).toBeTruthy();
+ expect(screen.getByText(/persistent: \+3.0 GiB/)).toBeTruthy();
+ expect(screen.getByText(/Recorded scan scope:.*fixture\/cache/)).toBeTruthy();
+ expect(screen.getByRole("button",{name:"Continue disk measurement"})).toBeTruthy();
 });

@@ -140,6 +140,7 @@ function rendersEmptyState(raw: string): boolean {
     />\s*No\s+[A-Za-z]/, // ">No pull requests…", ">No CLAUDE.md files…"
     /"\s*No\s+[A-Za-z]/, // in a string prop
     />\s*Nothing\s/,
+    />\s*No\s+\{[\w.]+\}\s+(found|yet|paired|listed)/, // dynamic category labels
     /No\s+\w+\s+(found|yet|paired|listed)/,
   ].some((re) => re.test(src));
   if (!copy) return false;
@@ -343,4 +344,8 @@ describe("every surface that can render 'nothing found'", () => {
         `reason (#854).`,
     ).toEqual([]);
   });
+});
+
+it("recognises a dynamic category label in a qualified empty state", () => {
+ expect(rendersEmptyState('if (rows.length === 0) return <p>No {label} found in the completed portion.</p>')).toBe(true);
 });
