@@ -147,3 +147,160 @@ async fn failed_history_save_still_publishes_current_actual_measurement() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn start_continues_bounded_observation_and_restart_keeps_durable_floor() {
+    let (_temp, db, root) = fixture();
+    for i in 0..20 {
+        std::fs::write(root.join(format!("file-{i}")), [1u8; 10]).unwrap();
+    }
+    let mut controller = controlled();
+    controller.hooks.measurement_steps = Some(9);
+    let controller = Arc::new(controller);
+    let roots = vec![root.display().to_string()];
+    controller
+        .clone()
+        .start(db.clone(), roots.clone())
+        .await
+        .unwrap();
+    let first = finished(&controller).await;
+    assert!(first.resumable);
+    assert!(first.remaining > 0);
+    assert_eq!(first.phase.as_deref(), Some("measurement"));
+    let observation_id = first.observations[0].id.clone();
+    let floor = first.observations[0].known_allocated.clone();
+    assert!(floor.is_some());
+    assert!(disk_observations::history(&open_db(&db).unwrap())
+        .unwrap()
+        .iter()
+        .any(|o| o.id == observation_id && o.known_allocated == floor));
+    let mut done = first;
+    for _ in 0..100 {
+        if !done.resumable {
+            break;
+        }
+        let started = controller
+            .clone()
+            .start(db.clone(), roots.clone())
+            .await
+            .unwrap();
+        assert!(
+            !started.observations.is_empty(),
+            "prior results survive while continuing"
+        );
+        done = finished(&controller).await;
+    }
+    assert!(!done.resumable);
+    assert_eq!(done.observations[0].id, observation_id);
+    assert_eq!(
+        done.observations[0].locations[0].logical.as_deref(),
+        Some("208")
+    );
+    // Process restart cannot resume open directory cursors, but does preserve
+    // saved partial/completed observations and creates a fresh observation.
+    let restarted = Arc::new(controlled());
+    restarted.clone().start(db.clone(), roots).await.unwrap();
+    let fresh = finished(&restarted).await;
+    assert_ne!(fresh.observations[0].id, observation_id);
+    assert_eq!(
+        fresh.observations[0].known_allocated,
+        done.observations[0].known_allocated
+    );
+}
+
+#[tokio::test]
+async fn discovery_frontier_continues_before_measurement_and_settings_reset_cursor() {
+    let (_temp, db, root) = fixture();
+    let mut deep = root.clone();
+    for _ in 0..9 {
+        deep = deep.join("nested");
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("payload"), "deep").unwrap();
+    let controller = Arc::new(controlled());
+    controller
+        .clone()
+        .start(db.clone(), vec![root.display().to_string()])
+        .await
+        .unwrap();
+    let first = finished(&controller).await;
+    assert!(first.resumable);
+    assert_eq!(first.phase.as_deref(), Some("discovery"));
+    assert_eq!(first.visited, 0);
+    controller
+        .clone()
+        .start(db.clone(), vec![root.display().to_string()])
+        .await
+        .unwrap();
+    let done = finished(&controller).await;
+    assert!(!done.resumable);
+    assert_eq!(
+        done.observations[0].locations[0].logical.as_deref(),
+        Some("12")
+    );
+    assert_eq!(first.observations[0].id, done.observations[0].id);
+    // A changed root set starts new discovery, not a cursor in the old scope.
+    controller
+        .clone()
+        .start(db.clone(), vec![root.display().to_string()])
+        .await
+        .unwrap();
+    assert!(finished(&controller).await.resumable);
+    controller
+        .clone()
+        .start(db, vec![deep.display().to_string()])
+        .await
+        .unwrap();
+    let changed = finished(&controller).await;
+    assert!(!changed.resumable);
+    assert_eq!(
+        changed.observations[0].locations[0].logical.as_deref(),
+        Some("4")
+    );
+}
+
+#[tokio::test]
+#[ignore = "Explicit read-only host inventory; HEADSTATE_DISK_ACCEPTANCE_ROOTS JSON required"]
+async fn host_inventory_bounded_continuation_acceptance() {
+    let Some(roots) = std::env::var_os("HEADSTATE_DISK_ACCEPTANCE_ROOTS") else {
+        return;
+    };
+    let roots: Vec<String> =
+        serde_json::from_str(&roots.to_string_lossy()).expect("JSON array of selected roots");
+    assert!(!roots.is_empty() && roots.len() <= MAX_ROOTS);
+    let temporary = tempfile::tempdir().unwrap();
+    let db = temporary.path().join("acceptance.sqlite");
+    open_db(&db).unwrap();
+    let mut controller = Controller::new();
+    controller.hooks.permits = Some(Arc::new(tokio::sync::Semaphore::new(1)));
+    let controller = Arc::new(controller);
+    for batch in 1..=100 {
+        controller
+            .clone()
+            .start(db.clone(), roots.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(300),
+            controller.hooks.finished.notified(),
+        )
+        .await
+        .expect("bounded batch publication");
+        let status = controller.status().unwrap();
+        assert!(status.error.is_none(), "Inventory worker failed");
+        let summary:Vec<_>=status.observations.iter().map(|o|serde_json::json!({
+            "status":o.status,"visited":o.visited,"locations":o.locations.len(),"known_allocated":o.known_allocated,
+            "allocation_complete":o.allocation_complete,"coverage_count":o.coverage.len(),
+            "incomplete_coverage_count":o.coverage.iter().filter(|c|c.affects_completeness).count(),
+            "categories":o.categories.iter().map(|c|serde_json::json!({"name":c.name,"locations":c.locations.len(),"known_allocated":c.known_allocated})).collect::<Vec<_>>()
+        })).collect();
+        println!(
+            "{}",
+            serde_json::json!({"batch":batch,"phase":status.phase,"remaining":status.remaining,"resumable":status.resumable,"observations":summary})
+        );
+        if !status.resumable {
+            return;
+        }
+    }
+    panic!("Inventory remains resumable after 100 bounded batches");
+}

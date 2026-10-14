@@ -45,7 +45,7 @@ fn growth_requires_stable_identical_scope_coverage_and_location_generation() {
     );
     let change = accounting::compare(&b, Some(&a));
     assert!(change.reason.is_none());
-    assert_eq!(change.changes[0].bytes, "4294967296");
+    assert_eq!(change.changes[0].bytes.as_deref(), Some("4294967296"));
     assert_eq!(change.baseline_at, Some(110));
     for reason in 0..7 {
         let mut altered = b.clone();
@@ -169,6 +169,9 @@ fn hardlinks_overlaps_and_alias_roots_do_not_inflate_allocation() {
         .filter_map(|l| l.logical.as_ref())
         .map(|n| n.parse::<u64>().unwrap())
         .sum();
+    // Legacy cleanup lists sum logical file lengths for both names. Their
+    // totals overlap and must not be presented as allocated/reclaimable bytes.
+    assert_eq!(crate::artifacts::measure(&root).0, 14);
     assert_eq!(logical, 7);
     assert_eq!(
         out[0].measured.as_ref().unwrap().parse::<u64>().unwrap(),
@@ -809,4 +812,512 @@ fn same_scope_partial_byte_pressure_prunes_partial_before_its_complete_baseline(
     );
     assert!(history::latest(&conn, "another-scope").unwrap().is_some());
     assert!(history::latest(&conn, "third-scope").unwrap().is_some());
+}
+
+#[test]
+fn allocation_floor_survives_unknown_and_overflow_and_history_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["known", "unknown", "overflow"] {
+        std::fs::write(dir.path().join(name), "x").unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![dir.path().display().to_string()],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    let output = measure::measure_with_facts(
+        found,
+        vec![],
+        "same".into(),
+        "floor",
+        &stop,
+        Instant::now(),
+        (
+            |_, _| {},
+            |path, metadata| {
+                let mut facts = platform::file_facts(path, metadata)?;
+                if metadata.is_file() {
+                    facts.allocated = match path.file_name().unwrap().to_str().unwrap() {
+                        "unknown" => None,
+                        "overflow" => Some(u64::MAX),
+                        _ => Some(4096),
+                    };
+                }
+                Ok(facts)
+            },
+        ),
+    );
+    let row = &output[0].locations[0];
+    assert!(row.allocated.is_none());
+    assert!(
+        row.known_allocated
+            .as_deref()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 4096
+    );
+    assert_eq!(output[0].known_allocated, row.known_allocated);
+    assert!(!output[0].allocation_complete);
+    let decoded: Observation =
+        serde_json::from_str(&serde_json::to_string(&output[0]).unwrap()).unwrap();
+    assert_eq!(decoded.locations, output[0].locations);
+    assert_eq!(decoded.known_allocated, output[0].known_allocated);
+    assert!(!decoded.allocation_complete);
+}
+
+#[test]
+fn bounded_measurement_resumes_without_duplicate_bytes_and_restarts_on_change() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..30 {
+        std::fs::write(dir.path().join(format!("file-{i}")), [1u8; 32]).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![dir.path().display().to_string()],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    let mut scan = measure::Scan::new(found.clone(), vec![], "same".into(), "batches");
+    let mut batches = 0;
+    while scan.remaining() > 0 {
+        scan.batch(
+            &stop,
+            11,
+            std::time::Duration::from_secs(10),
+            |_, _| {},
+            platform::file_facts,
+        );
+        batches += 1;
+        assert!(batches < 1000);
+        if scan.remaining() > 0 {
+            scan.resume();
+        }
+    }
+    assert!(batches > 1);
+    let result = scan.observations(&stop, platform::file_facts);
+    assert_eq!(result[0].locations[0].logical.as_deref(), Some("960"));
+    let once = measure::measure(
+        found.clone(),
+        vec![],
+        "same".into(),
+        "single",
+        &stop,
+        Instant::now(),
+        |_, _| {},
+    );
+    assert_eq!(result[0].known_allocated, once[0].known_allocated);
+    let mut scan = measure::Scan::new(found, vec![], "same".into(), "changed");
+    scan.batch(
+        &stop,
+        15,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    std::fs::write(dir.path().join("new-file"), [1u8; 40]).unwrap();
+    scan.resume();
+    scan.batch(
+        &stop,
+        1000,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    let changed = scan.observations(&stop, platform::file_facts);
+    assert_eq!(changed[0].locations[0].logical.as_deref(), Some("1000"));
+    assert!(changed[0]
+        .coverage
+        .iter()
+        .any(|n| n.reason.contains("restarted")));
+}
+
+#[test]
+fn partial_growth_retains_persistent_delta_and_labels_new_and_missing_locations() {
+    let before = observation();
+    let mut after = before.clone();
+    after.status = "partial".into();
+    after.locations[0].allocated = Some("75161927690".into());
+    let mut added = after.locations[0].clone();
+    added.id = "new".into();
+    added.path = "/fixture/new".into();
+    after.locations.push(added);
+    let comparison = accounting::compare(&after, Some(&before));
+    assert!(comparison.reason.is_some());
+    assert_eq!(
+        comparison
+            .changes
+            .iter()
+            .find(|c| c.kind == "persistent")
+            .unwrap()
+            .bytes
+            .as_deref(),
+        Some("10")
+    );
+    assert!(comparison
+        .changes
+        .iter()
+        .find(|c| c.kind == "added")
+        .unwrap()
+        .bytes
+        .is_none());
+    after.locations.remove(0);
+    let missing = accounting::compare(&after, Some(&before));
+    assert!(missing
+        .changes
+        .iter()
+        .any(|c| c.kind == "incomparable" && c.bytes.is_none()));
+}
+
+#[cfg(unix)]
+#[test]
+fn intentional_symlinks_do_not_invalidate_measured_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+    std::os::unix::fs::symlink("missing", dir.path().join("node_modules/link")).unwrap();
+    let target = dir.path().join("payload");
+    std::fs::write(&target, [1u8; 4096]).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let scan = || {
+        let found = discovery::discover(
+            &[],
+            &Settings {
+                external_roots: vec![dir.path().display().to_string()],
+                additional_locations: false,
+            },
+            &stop,
+            Instant::now(),
+        );
+        let facts =
+            platform::file_facts(dir.path(), &std::fs::metadata(dir.path()).unwrap()).unwrap();
+        let mut volume = observation().volume;
+        volume.device = facts.volume;
+        measure::measure(
+            found,
+            vec![volume],
+            "same".into(),
+            "symlinks",
+            &stop,
+            Instant::now(),
+            |_, _| {},
+        )
+    };
+    let first = scan();
+    std::fs::write(&target, [1u8; 32768]).unwrap();
+    let next = scan();
+    let comparison = accounting::compare(&next[0], Some(&first[0]));
+    assert!(
+        comparison.changes.iter().any(|c| c
+            .bytes
+            .as_deref()
+            .is_some_and(|s| s.parse::<i128>().unwrap() > 0)),
+        "{comparison:?}"
+    );
+}
+
+#[test]
+fn aggregate_overflow_is_a_qualified_floor_and_changed_exclusions_suppress_delta() {
+    let mut before = observation();
+    before.locations[0].allocated = Some(u64::MAX.to_string());
+    let mut extra = before.locations[0].clone();
+    extra.id = "extra".into();
+    extra.path = "/other".into();
+    extra.allocated = Some("1".into());
+    before.locations.push(extra);
+    accounting::summarize(&mut before);
+    assert_eq!(
+        before.known_allocated.as_deref(),
+        Some(u64::MAX.to_string().as_str())
+    );
+    assert!(!before.allocation_complete);
+    assert!(!before.categories[0].allocation_complete);
+    assert!(before.remainder.is_none());
+    assert!(before.accounting_note.as_deref().unwrap().contains("range"));
+    let mut after = before.clone();
+    after.coverage.push(Coverage {
+        affects_completeness: false,
+        path: "/fixture/output/link".into(),
+        reason: "Symbolic link intentionally excluded from allocated totals".into(),
+    });
+    let changes = accounting::compare(&after, Some(&before));
+    assert!(changes
+        .changes
+        .iter()
+        .any(|c| c.location_id == "file-generation-1"
+            && c.kind == "incomparable"
+            && c.bytes.is_none()));
+}
+
+#[test]
+fn verified_absence_reports_removed_but_replacement_is_incomparable() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent-target");
+    let mut before = observation();
+    before.locations[0].path = absent.display().to_string();
+    let mut after = before.clone();
+    after.locations.clear();
+    let removed = accounting::compare(&after, Some(&before));
+    assert_eq!(removed.changes[0].kind, "removed");
+    assert_eq!(removed.changes[0].bytes.as_deref(), Some("-75161927680"));
+    let mut replacement = before.locations[0].clone();
+    replacement.id = "replacement".into();
+    after.locations.push(replacement);
+    let replaced = accounting::compare(&after, Some(&before));
+    assert!(replaced.changes.iter().all(|c| c.bytes.is_none()));
+}
+
+#[test]
+fn many_locations_overlap_and_cancellation_preserve_allocation_across_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..128 {
+        let target = dir.path().join(format!("project-{i}")).join("node_modules");
+        std::fs::create_dir_all(&target).unwrap();
+        for j in 0..16 {
+            std::fs::write(target.join(format!("file-{j}")), [0u8; 8]).unwrap();
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![
+                dir.path().display().to_string(),
+                dir.path()
+                    .join("project-0/node_modules")
+                    .display()
+                    .to_string(),
+            ],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    assert!(found.locations.len() >= 129);
+    let mut scan = measure::Scan::new(found, vec![], "same".into(), "many");
+    scan.batch(
+        &stop,
+        500,
+        std::time::Duration::from_secs(5),
+        |_, _| {},
+        platform::file_facts,
+    );
+    let partial = scan.observations(&stop, platform::file_facts);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    scan.batch(
+        &stop,
+        500,
+        std::time::Duration::from_secs(5),
+        |_, _| {},
+        platform::file_facts,
+    );
+    assert_eq!(
+        scan.observations(&stop, platform::file_facts)[0].known_allocated,
+        partial[0].known_allocated
+    );
+    stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..200 {
+        if scan.remaining() == 0 {
+            break;
+        }
+        scan.resume();
+        scan.batch(
+            &stop,
+            500,
+            std::time::Duration::from_secs(5),
+            |_, _| {},
+            platform::file_facts,
+        );
+    }
+    assert_eq!(scan.remaining(), 0);
+    let result = scan.observations(&stop, platform::file_facts);
+    let logical: u64 = result
+        .iter()
+        .flat_map(|o| &o.locations)
+        .filter_map(|l| l.logical.as_deref())
+        .map(|s| s.parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(logical, 128 * 16 * 8);
+    assert!(result.iter().flat_map(|o| &o.locations).all(|l| l.complete));
+}
+
+#[test]
+fn resumed_validation_does_not_consume_the_new_work_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..64 {
+        std::fs::write(dir.path().join(format!("file-{i}")), [0u8; 8]).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![dir.path().display().to_string()],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    let mut scan = measure::Scan::new(found, vec![], "same".into(), "nonstarving");
+    let mut measurement_batches = 0;
+    for _ in 0..200 {
+        if scan.remaining() == 0 {
+            break;
+        }
+        let before = scan.visited;
+        scan.resume();
+        scan.batch(
+            &stop,
+            8,
+            std::time::Duration::from_secs(10),
+            |_, _| {},
+            platform::file_facts,
+        );
+        let advanced = scan.visited - before;
+        if advanced > 0 {
+            measurement_batches += 1;
+            assert!(
+                scan.remaining() == 0 || advanced >= 3,
+                "validation consumed new-work quota: advanced only {advanced}"
+            );
+        }
+    }
+    assert_eq!(
+        scan.remaining(),
+        0,
+        "scan larger than the quota must finish"
+    );
+    assert!(
+        measurement_batches <= 18,
+        "new traversal must make linear progress"
+    );
+    assert_eq!(
+        scan.observations(&stop, platform::file_facts)[0].locations[0]
+            .logical
+            .as_deref(),
+        Some("512")
+    );
+}
+
+#[test]
+fn completed_validation_survives_cancellation_before_new_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..20 {
+        std::fs::write(dir.path().join(format!("file-{i}")), [0u8; 8]).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![dir.path().display().to_string()],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    let mut scan = measure::Scan::new(found, vec![], "same".into(), "canceled-validation");
+    scan.batch(
+        &stop,
+        8,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    let previously_visited = scan.visited;
+    let mut checks = 0;
+    scan.resume();
+    scan.batch(
+        &stop,
+        8,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        |path, metadata| {
+            checks += 1;
+            if checks == previously_visited {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            platform::file_facts(path, metadata)
+        },
+    );
+    assert_eq!(scan.visited, previously_visited);
+    assert_eq!(
+        scan.phase(),
+        "measurement",
+        "completed validation must remain completed"
+    );
+    stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    scan.resume();
+    assert_eq!(
+        scan.phase(),
+        "measurement",
+        "Continue must not reset finished validation"
+    );
+    scan.batch(
+        &stop,
+        8,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    assert!(scan.visited >= previously_visited + 3);
+}
+
+#[test]
+fn checkpoint_limit_retains_known_floor_and_ends_continuation_truthfully() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..20 {
+        std::fs::write(dir.path().join(format!("file-{i}")), [0u8; 4096]).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = discovery::discover(
+        &[],
+        &Settings {
+            external_roots: vec![dir.path().display().to_string()],
+            additional_locations: false,
+        },
+        &stop,
+        Instant::now(),
+    );
+    let mut scan = measure::Scan::new(found, vec![], "same".into(), "memory-limited");
+    scan.batch(
+        &stop,
+        8,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    let before = scan.observations(&stop, platform::file_facts);
+    assert!(
+        before[0]
+            .known_allocated
+            .as_deref()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    scan.cap_state_at_current_usage();
+    scan.resume();
+    scan.batch(
+        &stop,
+        100,
+        std::time::Duration::from_secs(10),
+        |_, _| {},
+        platform::file_facts,
+    );
+    let terminal = scan.observations(&stop, platform::file_facts);
+    assert_eq!(scan.remaining(), 0);
+    assert_eq!(terminal[0].status, "partial");
+    assert_eq!(terminal[0].known_allocated, before[0].known_allocated);
+    assert!(!terminal[0].allocation_complete);
+    assert!(terminal[0].coverage.iter().any(|c| c.affects_completeness
+        && c.reason.contains("checkpoint")
+        && c.reason.contains("narrower roots")));
 }

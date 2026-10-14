@@ -943,7 +943,8 @@ export type ArtifactKind =
   | "node_modules"
   | "terraform"
   | "dotnet_build"
-  | "build_output";
+  | "build_output"
+  | "swift_build";
 
 /// One directory of regenerable build output.
 export interface Artifact {

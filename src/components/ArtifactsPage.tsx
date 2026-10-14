@@ -55,6 +55,7 @@ const REBUILD: Record<ArtifactKind, string> = {
   terraform: "terraform init",
   dotnet_build: "dotnet build",
   build_output: "the project's build",
+  swift_build: "swift build",
 };
 
 const LABEL: Record<ArtifactKind, string> = {
@@ -63,6 +64,7 @@ const LABEL: Record<ArtifactKind, string> = {
   terraform: ".terraform",
   dotnet_build: "bin / obj",
   build_output: "build output",
+  swift_build: ".build",
 };
 
 /// Recently-written directories are probably being built into right now.
@@ -178,7 +180,7 @@ function describeAge(secs: number): string {
 }
 
 export function ArtifactsPage() {
-  return <><DiskUsagePanel /><ArtifactInventory /></>;
+  return <><DiskUsagePanel defaultOpen /><ArtifactInventory /></>;
 }
 
 function ArtifactInventory() {
@@ -369,9 +371,7 @@ function ArtifactInventory() {
         role="status"
       >
         <p className="font-semibold">
-          {failedRoots.length} configured folder{failedRoots.length === 1 ? "" : "s"} could not
-          be read, so anything under {failedRoots.length === 1 ? "it" : "them"} is missing from
-          this list.
+          Discovery is incomplete in {failedRoots.length} location{failedRoots.length === 1 ? "" : "s"}. Unlisted output may still use disk space. Add a deeper folder in Settings for a targeted scan.
         </p>
         <ul className="mt-1 space-y-0.5">
           {failedRoots.map((f) => (
@@ -396,8 +396,7 @@ function ArtifactInventory() {
             because "could not scan" invites reading the last number the
             user saw as still true. */}
         <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
-          Nothing was measured, so there is no total — this is not a report that
-          your directories are clean.
+          {allArtifacts.length ? "Refresh failed. Previously discovered output remains visible; measurements may be out of date." : "Nothing was measured, so there is no total — this is not a report that your directories are clean."}
         </p>
       </QueryError>
     ) : null;
@@ -421,9 +420,9 @@ function ArtifactInventory() {
   // is about, and `artifactsError` below is unreachable without this.
   if (!isError && artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
     return (
-      <p className="p-4 text-sm text-[#8b949e]">
-        No {label} found in the scanned directories.
-      </p>
+      <div>{failedRootsNotice}<button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button><p className="p-4 text-sm text-[#8b949e]">
+        No {label} found in {failedRoots?.length ? "the completed portion of the scan" : "the scanned directories"}.
+      </p></div>
     );
   }
 
@@ -437,8 +436,10 @@ function ArtifactInventory() {
           section below is untouched and still renders, which is the whole
           reason this is a panel rather than an early return. */}
       {failedRootsNotice}
+      <button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button>
+      <p className="mb-3 text-xs text-muted-foreground">Logical sizes include file lengths, not allocated or guaranteed reclaimable space. Unreadable files can be omitted. Artifacts also appear in worktree sizes; do not add these totals. Use Disk usage above for allocation and coverage.</p>
       {artifactsError}
-      {showArtifacts && !isError ? (
+      {showArtifacts && (!isError || artifacts.length > 0) ? (
       // Wraps on the phone: six items on one 390px line broke "3
       // directories" and "4.8 GB" across lines mid-phrase.
       <div className={isMobile ? "mb-3 flex flex-wrap items-center gap-2 text-sm" : "mb-3 flex items-center gap-2 text-sm"}>
@@ -456,8 +457,8 @@ function ArtifactInventory() {
             off a total that was still partial -- and unlike a pending
             batch, a failed one never comes back to correct it. */}
         <span className="text-[#8b949e]">
-          {sizesComplete ? "" : "at least "}
-          {formatSize(totalBytes)}
+          {sizesComplete ? "" : "last measured, incomplete: "}
+          {formatSize(totalBytes)} logical in this filter
         </span>
         {/* Says WHY the total is a floor, which "at least" alone cannot.
             Not a `QueryError`: the scan succeeded and every row on this
@@ -471,7 +472,7 @@ function ArtifactInventory() {
         {failed > 0 ? (
           <span role="status" className="text-xs text-[#d29922]">
             {failed} of {total} size {failed === 1 ? "batch" : "batches"} could not be
-            measured, so every byte figure here is a floor
+            measured completely. Retained figures may be out of date; current totals are unknown
           </span>
         ) : null}
         {/* The measuring advisory has MOVED, to after the Remove buttons
@@ -659,8 +660,8 @@ function ArtifactInventory() {
                 words rather than left to a qualifier on a button. */}
             <p className="mt-3 text-sm text-[#e6edf3]">
               {sizesComplete
-                ? `This frees ${formatSize(selectedBytes)}.`
-                : `This frees at least ${formatSize(selectedBytes)} — some sizes could not be measured, so the real figure is larger.`}{" "}
+                ? `Selected output contains ${formatSize(selectedBytes)} of measured logical file data.`
+                : `Last measured logical file data: ${formatSize(selectedBytes)}. Some sizes are unavailable or out of date; current total and reclaimed space are unknown.`}{" "}
               Everything here is rebuilt by the command shown beside it — the cost is
               the rebuild, not lost work.
             </p>
@@ -763,7 +764,7 @@ function ArtifactInventory() {
           error panel is a list asserting there are no rows -- and the
           gate should say what it means rather than rely on the data
           happening to be empty. */}
-      {showArtifacts && !isError ? (
+      {showArtifacts && (!isError || artifacts.length > 0) ? (
       <ul className="flex flex-col gap-1">
         {rows.map((a) => (
           <ArtifactRow

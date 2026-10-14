@@ -17,6 +17,8 @@ const SETTINGS_KEY: &str = "disk_inventory_settings_v1";
 struct Run {
     status: Status,
     stop: Arc<AtomicBool>,
+    continuation: Option<measure::Scan>,
+    discovery: Option<(discovery::Discovery, String, String)>,
 }
 struct Controller {
     state: Mutex<Run>,
@@ -29,6 +31,7 @@ struct Controller {
 struct TestHooks {
     before_settings_write: Option<Arc<dyn Fn() + Send + Sync>>,
     before_walk: Option<Arc<dyn Fn() + Send + Sync>>,
+    measurement_steps: Option<usize>,
     permits: Option<Arc<tokio::sync::Semaphore>>,
     volumes: Option<Vec<super::model::Volume>>,
     finished: tokio::sync::Notify,
@@ -37,6 +40,8 @@ impl Controller {
     fn new() -> Self {
         Self {
             state: Mutex::new(Run {
+                continuation: None,
+                discovery: None,
                 status: Status::default(),
                 stop: Arc::new(AtomicBool::new(false)),
             }),
@@ -152,28 +157,111 @@ impl Controller {
             .unwrap_or_else(|| platform::volumes(&stop));
         #[cfg(not(test))]
         let volumes = platform::volumes(&stop);
-        let found = discovery::discover(&roots, &settings, &stop, started);
-        let mut observations = measure::measure(
-            found,
-            volumes,
-            configuration,
-            &id,
-            &stop,
-            started,
-            |visited, path| {
+        let continuation = self
+            .state
+            .lock()
+            .map_err(|_| "Scan state unavailable")?
+            .continuation
+            .take();
+        let mut discovering = None;
+        let mut scan = match continuation {
+            Some(mut scan) if scan.configuration == configuration => {
+                scan.resume();
+                scan
+            }
+            _ => {
                 if let Ok(mut state) = self.state.lock() {
-                    if state.status.run_id.as_deref() == Some(&id) {
-                        state.status.visited = visited;
-                        state.status.current_path = Some(path.into());
-                    }
+                    state.status.phase = Some("discovery".into());
                 }
-            },
-        );
+                let pending = self
+                    .state
+                    .lock()
+                    .map_err(|_| "Scan state unavailable")?
+                    .discovery
+                    .take();
+                let (found, observation_id) = match pending {
+                    Some((found, prior_configuration, observation_id))
+                        if prior_configuration == configuration =>
+                    {
+                        (
+                            discovery::resume(found, &stop, std::time::Instant::now()),
+                            observation_id,
+                        )
+                    }
+                    _ => (
+                        discovery::discover(&roots, &settings, &stop, started),
+                        id.clone(),
+                    ),
+                };
+                let view = if found.remaining() > 0 {
+                    let view = found.measurement_view();
+                    discovering = Some((found, configuration.clone(), observation_id.clone()));
+                    view
+                } else {
+                    found
+                };
+                measure::Scan::new(view, volumes, configuration, &observation_id)
+            }
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.status.phase = Some(scan.phase().into());
+        }
+        #[cfg(test)]
+        let steps = self.hooks.measurement_steps.unwrap_or(500_000);
+        #[cfg(not(test))]
+        let steps = 500_000;
+        if discovering.is_none() {
+            scan.batch(
+                &stop,
+                steps,
+                std::time::Duration::from_secs(120),
+                |visited, path| {
+                    if let Ok(mut state) = self.state.lock() {
+                        if state.status.run_id.as_deref() == Some(&id) {
+                            state.status.visited = visited;
+                            state.status.current_path = Some(path.into());
+                        }
+                    }
+                },
+                platform::file_facts,
+            );
+        }
+        let mut observations = scan.observations(&stop, platform::file_facts);
+        if let Ok(mut state) = self.state.lock() {
+            state.status.remaining = discovering
+                .as_ref()
+                .map(|(found, _, _)| found.remaining())
+                .unwrap_or_else(|| scan.remaining());
+            state.status.resumable = state.status.remaining > 0;
+            state.status.phase = Some(
+                if discovering.is_some() {
+                    "discovery"
+                } else {
+                    scan.phase()
+                }
+                .into(),
+            );
+            if let Some(discovery) = discovering {
+                state.discovery = Some(discovery);
+            } else if state.status.resumable {
+                state.continuation = Some(scan);
+            }
+        }
         match open_db(&db) {
             Ok(mut conn) => {
                 for observation in &mut observations {
                     match disk_observations::latest(&conn, &observation.volume.id) {
                         Ok(previous) => {
+                            let previous =
+                                previous.filter(|p| p.id != observation.id).or_else(|| {
+                                    disk_observations::history(&conn)
+                                        .ok()?
+                                        .into_iter()
+                                        .find(|p| {
+                                            p.volume.id == observation.volume.id
+                                                && p.id != observation.id
+                                        })
+                                });
                             observation.comparison =
                                 accounting::compare(observation, previous.as_ref())
                         }

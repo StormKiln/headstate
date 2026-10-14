@@ -31,6 +31,7 @@ const alertsFn = vi.hoisted(() => vi.fn<() => Promise<AlertReport[]>>());
 // unprimed; the CPU and Memory detail pages that DO call it are tested,
 // with a populated fixture, in `SystemHealthPage.detail.test.tsx`.
 vi.mock("../api/hooks", () => ({
+  useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }),
   // Healthy by default: the notice renders nothing, which is the
   // state every assertion in this file assumes (#1145).
   useBackgroundHealth: () => ({ data: [] }),

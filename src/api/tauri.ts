@@ -1062,7 +1062,15 @@ export const setGitLabHost = (host: string) => call<string>("set_gitlab_host", {
 ///
 /// Discovery only: every `size_bytes` comes back null. See
 /// `sizeArtifacts` for the second pass.
+export interface ArtifactScan {
+  artifacts: Artifact[];
+  failed_roots: { root: string; why: string }[];
+}
 export const scanArtifacts = () => call<Artifact[]>("scan_artifacts");
+export const scanArtifactsReport = async (): Promise<ArtifactScan> => {
+  const result = await call<ArtifactScan | Artifact[]>("scan_artifacts_report");
+  return Array.isArray(result) ? { artifacts: result, failed_roots: [] } : result;
+};
 
 /// Which stored scan to read (#1152).
 export type ScanKind = "artifacts" | "venvs" | "worktrees";
@@ -1106,6 +1114,8 @@ export const readCachedScan = (kind: ScanKind) =>
 /// `[path, bytes, secsSinceWrite]`.
 export const sizeArtifacts = (paths: string[]) =>
   call<[string, number, number | null][]>("size_artifacts", { paths });
+export const sizeArtifactsReport = (paths: string[]) =>
+  call<[string, number | null, number | null][]>("size_artifacts_report", { paths });
 
 /// Remove artifact directories. Each is re-verified at delete time, so a
 /// stale row is refused rather than acted on.

@@ -22,6 +22,7 @@ export const GROUP_LABEL: Record<ArtifactGroup, string> = {
   terraform: "Terraform providers",
   dotnet_build: ".NET build output",
   build_output: "Build output",
+  swift_build: "Swift builds",
   [VENV_GROUP]: "Poetry virtualenvs",
 };
 

@@ -41,34 +41,75 @@ use std::time::SystemTime;
 /// permission error on one file should not turn a real size into
 /// "unknown".
 pub fn measure(path: &Path) -> (u64, Option<u64>) {
+    let (bytes, age, _) = measurement(path);
+    (bytes, age)
+}
+
+/// A partial or unreadable walk is unknown, never a measured zero.
+/// Incomplete walks also cannot prove that deletion would be idle.
+pub fn measure_complete(path: &Path) -> (Option<u64>, Option<u64>) {
+    let (bytes, age, complete) = measurement(path);
+    (complete.then_some(bytes), age)
+}
+
+fn measurement(path: &Path) -> (u64, Option<u64>, bool) {
     let mut total = 0u64;
     let mut newest: Option<SystemTime> = None;
+    let mut complete = true;
     let mut stack = vec![path.to_path_buf()];
-
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                complete = false;
+                continue;
+            }
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
-        for e in entries.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             if meta.is_symlink() {
                 continue;
             }
-            if let Ok(m) = meta.modified() {
-                if newest.is_none_or(|n| m > n) {
-                    newest = Some(m);
-                }
+            match meta.modified() {
+                Ok(m) if newest.is_none_or(|n| m > n) => newest = Some(m),
+                Ok(_) => {}
+                Err(_) => complete = false,
             }
             if meta.is_dir() {
-                stack.push(e.path());
+                stack.push(entry.path());
+            } else if let Some(sum) = total.checked_add(meta.len()) {
+                total = sum;
             } else {
-                total += meta.len();
+                complete = false;
             }
         }
     }
-
-    let age = newest.and_then(|n| n.elapsed().ok()).map(|d| d.as_secs());
-    (total, age)
+    let age = complete
+        .then_some(newest)
+        .flatten()
+        .and_then(|n| n.elapsed().ok())
+        .map(|d| d.as_secs());
+    (total, age, complete)
 }
 
 /// The outcome of removing one artifact directory.
@@ -461,5 +502,43 @@ mod removal_tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].error.is_none(), "{:?}", out[0].error);
         assert!(out[1].error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod measurement_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn missing_is_unknown_but_readable_empty_is_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(measure_complete(&temp.path().join("missing")), (None, None));
+        assert_eq!(measure_complete(temp.path()), (Some(0), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_descendant_cannot_prove_size_or_idle_age() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(temp.path().join("visible"), b"data").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = std::fs::read_dir(&blocked).is_err();
+        let result = measure_complete(temp.path());
+        let legacy = measure(temp.path());
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            assert_eq!(result, (None, None));
+            assert_eq!(
+                legacy.0, 4,
+                "partial bytes remain available to legacy callers"
+            );
+            assert_eq!(
+                legacy.1, None,
+                "partial evidence must not authorize deletion"
+            );
+        }
     }
 }

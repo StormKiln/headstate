@@ -124,6 +124,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("size_worktrees", Class::Read),
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
+    ("scan_artifacts_report", Class::Read),
     ("disk_inventory_status", Class::Read),
     ("disk_inventory_history", Class::Read),
     ("disk_inventory_settings", Class::Read),
@@ -136,6 +137,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // authorises nothing: every destructive path re-verifies live.
     ("read_cached_scan", Class::Read),
     ("size_artifacts", Class::Read),
+    ("size_artifacts_report", Class::Read),
     ("scan_venvs", Class::Read),
     ("size_venvs", Class::Read),
     ("docker_state", Class::Read),

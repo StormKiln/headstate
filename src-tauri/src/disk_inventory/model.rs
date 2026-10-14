@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const METHOD: &str = "allocated-identity-v1";
+pub const METHOD: &str = "allocated-identity-v2";
 pub const MAX_ROOTS: usize = 32;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
@@ -40,6 +40,8 @@ pub struct Location {
     pub evidence: Vec<String>,
     pub logical: Option<String>,
     pub allocated: Option<String>,
+    #[serde(default)]
+    pub known_allocated: Option<String>,
     pub reclaimable: Option<String>,
     pub complete: bool,
     pub active: bool,
@@ -47,6 +49,10 @@ pub struct Location {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Category {
+    #[serde(default)]
+    pub known_allocated: Option<String>,
+    #[serde(default)]
+    pub allocation_complete: bool,
     pub name: String,
     pub allocated: Option<String>,
     pub logical: Option<String>,
@@ -56,7 +62,11 @@ pub struct Category {
 pub struct Change {
     pub location_id: String,
     pub path: String,
-    pub bytes: String,
+    pub bytes: Option<String>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Comparison {
@@ -77,6 +87,10 @@ pub struct Observation {
     pub locations: Vec<Location>,
     pub categories: Vec<Category>,
     pub coverage: Vec<Coverage>,
+    #[serde(default)]
+    pub known_allocated: Option<String>,
+    #[serde(default)]
+    pub allocation_complete: bool,
     pub measured: Option<String>,
     pub remainder: Option<String>,
     pub accounting_note: Option<String>,
@@ -86,6 +100,12 @@ pub struct Observation {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub resumable: bool,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub remaining: u64,
     pub run_id: Option<String>,
     pub running: bool,
     pub visited: u64,

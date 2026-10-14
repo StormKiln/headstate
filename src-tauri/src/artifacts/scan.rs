@@ -7,6 +7,7 @@ use std::path::Path;
 /// a tool owns the directory before it is offered for removal.
 const CANDIDATES: &[(&str, ArtifactKind)] = &[
     ("target", ArtifactKind::CargoTarget),
+    (".build", ArtifactKind::SwiftBuild),
     ("bin", ArtifactKind::DotnetBuild),
     ("obj", ArtifactKind::DotnetBuild),
     ("node_modules", ArtifactKind::NodeModules),
@@ -32,18 +33,19 @@ pub fn scan(roots: &[String]) -> Vec<Artifact> {
     scan_streaming(roots, &mut |_| {}).0
 }
 
-/// What a scan could not read.
+/// Discovery omissions, including unreadable paths, depth limits and unproved candidates.
 ///
-/// A root that failed is NOT silently omitted (#1151). The walk swallows
-/// an unreadable directory deep in a tree -- one permission-denied
-/// `node_modules` is not worth a banner -- but a whole ROOT that could
-/// not be opened means the scan did not cover what the user configured,
-/// and reporting "no build output found" for it is the confident wrong
-/// answer this codebase keeps having to remove (#846).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FailedRoot {
     pub root: String,
     pub why: String,
+}
+
+/// Coverage travels with this exact scan result, rather than a global event.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactScan {
+    pub artifacts: Vec<Artifact>,
+    pub failed_roots: Vec<FailedRoot>,
 }
 
 /// Progress, as the walk makes it.
@@ -82,67 +84,120 @@ pub fn scan_streaming(
     let mut failed = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         let dir = Path::new(root);
-        // Checked BEFORE walking, because `walk` cannot distinguish "an
-        // empty root" from "a root I could not open" -- it returns the
-        // same empty result for both.
-        match std::fs::read_dir(dir) {
-            Ok(_) => walk(dir, dir, 0, &mut out),
-            Err(e) => failed.push(FailedRoot {
-                root: root.clone(),
-                why: e.to_string(),
-            }),
-        }
+        let mut remaining = 10_000;
+        walk(dir, dir, 0, &mut out, &mut failed, &mut remaining);
         report(ScanProgress {
             roots_done: i + 1,
             roots_total: roots.len(),
             found: out.len(),
         });
     }
-    // Deterministic order, so a rescan does not visibly reshuffle rows
-    // that have not changed.
     out.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut identities = std::collections::HashSet::new();
+    out.retain(|artifact| {
+        let path = Path::new(&artifact.path);
+        identities.insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+    });
+    failed.sort_by(|a, b| (&a.root, &a.why).cmp(&(&b.root, &b.why)));
+    failed.dedup();
     (out, failed)
 }
 
-fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<Artifact>) {
-    if depth > MAX_DEPTH {
+fn omission(failed: &mut Vec<FailedRoot>, path: &Path, why: impl Into<String>) {
+    failed.push(FailedRoot {
+        root: path.to_string_lossy().into_owned(),
+        why: why.into(),
+    });
+}
+
+fn walk(
+    dir: &Path,
+    root: &Path,
+    depth: usize,
+    out: &mut Vec<Artifact>,
+    failed: &mut Vec<FailedRoot>,
+    remaining: &mut usize,
+) {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return,
+        Err(e) => {
+            omission(failed, dir, e.to_string());
+            return;
+        }
+    }
+    if *remaining == 0 {
+        omission(
+            failed,
+            dir,
+            "Discovery directory budget reached; add this folder as a scan root",
+        );
         return;
     }
-    // Swallowed deliberately, and only HERE. A permission-denied
-    // directory deep in a tree is ordinary and not worth a banner; a
-    // whole root that could not be opened is a different claim, and
-    // `scan_streaming` checks that separately before calling this.
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    *remaining -= 1;
+    // Classify the selected root too. Selection alone never supplies ownership.
+    if let Some(kind) = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| CANDIDATES.iter().find(|(n, _)| *n == name).map(|(_, k)| *k))
+    {
+        if let Some(artifact) = classify(dir, kind, root) {
+            out.push(artifact);
+        } else {
+            omission(
+                failed,
+                dir,
+                "Candidate skipped: build-output ownership could not be proved",
+            );
+        }
         return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            omission(failed, dir, e.to_string());
+            return;
+        }
     };
-    for e in entries.flatten() {
-        let Ok(meta) = e.metadata() else { continue };
-        // `read_dir`'s `metadata()` does NOT follow symlinks (verified
-        // on macOS: a link to a directory reports `is_dir() == false`),
-        // so this one check excludes both plain files and links. A link
-        // into another tree must never be walked: its bytes belong to
-        // the tree it points at, and offering removal through a path
-        // that is not what it appears to be is how a cleanup deletes
-        // something nobody pointed it at.
-        if !meta.is_dir() {
-            continue;
-        }
-        let name = e.file_name().to_string_lossy().to_string();
-        if let Some(&(_, kind)) = CANDIDATES.iter().find(|(n, _)| *n == name) {
-            if let Some(a) = classify(&e.path(), kind, root) {
-                out.push(a);
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                omission(failed, dir, e.to_string());
+                continue;
             }
-            // PRUNE either way. A directory that failed classification is
-            // still not somewhere to hunt for nested artifacts, and
-            // descending into a rejected `node_modules` is how a fast
-            // scan becomes a slow one.
+        };
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                omission(failed, &path, e.to_string());
+                continue;
+            }
+        }
+        if entry.file_name() == ".git" {
             continue;
         }
-        // `.git` holds no build output and is expensive to walk.
-        if name == ".git" {
-            continue;
+        // The old walker classified children at MAX_DEPTH, so preserve that
+        // boundary while reporting every subtree it could not inspect.
+        if depth > MAX_DEPTH {
+            omission(
+                failed,
+                &path,
+                "Discovery depth limit reached; add this folder as a scan root",
+            );
+        } else {
+            walk(&path, root, depth + 1, out, failed, remaining);
         }
-        walk(&e.path(), root, depth + 1, out);
+        if *remaining == 0 {
+            omission(
+                failed,
+                dir,
+                "Discovery directory budget reached; add this folder as a scan root",
+            );
+            break;
+        }
     }
 }
 
@@ -826,5 +881,97 @@ mod streaming_tests {
         let plain = scan(&[t.s()]);
         let (streamed, _) = scan_streaming(&[t.s()], &mut |_| {});
         assert_eq!(plain, streamed);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn explicit_target_and_swift_roots_require_proof_and_overlaps_are_unique() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(
+            tmp.path().join("Package.swift"),
+            "// swift-tools-version: 6.0",
+        )
+        .unwrap();
+        let target = tmp.path().join("target");
+        let swift = tmp.path().join(".build");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&swift).unwrap();
+        let (found, failed) = scan_streaming(
+            &[
+                target.to_string_lossy().into_owned(),
+                swift.to_string_lossy().into_owned(),
+                tmp.path().to_string_lossy().into_owned(),
+            ],
+            &mut |_| {},
+        );
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|a| a.kind == ArtifactKind::SwiftBuild));
+        assert!(failed.is_empty(), "{failed:?}");
+        fs::remove_file(tmp.path().join("Package.swift")).unwrap();
+        let (found, failed) = scan_streaming(&[swift.to_string_lossy().into_owned()], &mut |_| {});
+        assert!(found.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(!is_artifact(&swift));
+    }
+
+    #[test]
+    fn beyond_depth_limit_is_partial_and_targeted_root_recovers_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("a/b/c/d/e/f");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]").unwrap();
+        let (found, failed) =
+            scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
+        assert!(found.is_empty());
+        assert!(
+            failed
+                .iter()
+                .any(|f| Path::new(&f.root) == project && f.why.contains("depth limit")),
+            "{failed:?}"
+        );
+        let (found, failed) =
+            scan_streaming(&[project.to_string_lossy().into_owned()], &mut |_| {});
+        assert_eq!(found.len(), 1);
+        assert!(failed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_descendant_is_partial_without_losing_readable_results() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::create_dir(tmp.path().join("target")).unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = fs::read_dir(&blocked).is_err();
+        let (found, failed) =
+            scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(found.len(), 1);
+        if denied {
+            assert!(
+                failed.iter().any(|f| f.root == blocked.to_string_lossy()),
+                "{failed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_symlink_is_never_classified_or_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::create_dir(tmp.path().join("real")).unwrap();
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(tmp.path().join("real"), &target).unwrap();
+        assert!(scan(&[target.to_string_lossy().into_owned()]).is_empty());
     }
 }

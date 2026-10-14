@@ -21,6 +21,8 @@ export interface DiskLocation {
     evidence: string[];
     logical: string | null;
     allocated: string | null;
+    known_allocated?: string | null;
+    allocation_complete?: boolean;
     reclaimable: string | null;
     complete: boolean;
     active: boolean;
@@ -39,14 +41,19 @@ export interface DiskObservation {
     categories: {
         name: string;
         allocated: string | null;
+    known_allocated?: string | null;
+    allocation_complete?: boolean;
         logical: string | null;
         locations: string[];
     }[];
     coverage: {
         path: string;
+        affects_completeness?: boolean;
         reason: string;
     }[];
     measured: string | null;
+    known_allocated?: string | null;
+    allocation_complete?: boolean;
     remainder: string | null;
     accounting_note: string | null;
     approximate: boolean;
@@ -56,7 +63,9 @@ export interface DiskObservation {
         changes: {
             location_id: string;
             path: string;
-            bytes: string;
+            bytes: string | null;
+            kind?: string;
+            reason?: string | null;
         }[];
     };
     history_error: string | null;
@@ -64,6 +73,9 @@ export interface DiskObservation {
 export interface DiskStatus {
     run_id: string | null;
     running: boolean;
+    resumable?: boolean;
+    phase?: string | null;
+    remaining?: number;
     visited: number;
     current_path: string | null;
     observations: DiskObservation[];

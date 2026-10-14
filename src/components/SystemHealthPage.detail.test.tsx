@@ -1,3 +1,5 @@
+const diskApi = vi.hoisted(() => ({diskStatus: vi.fn(async () => ({running:false,observations:[],error:null})),diskHistory:vi.fn(async()=>[]),diskSettings:vi.fn(async()=>({external_roots:[],additional_locations:false})),startDiskScan:vi.fn(),saveDiskSettings:vi.fn(),cancelDiskScan:vi.fn()}));
+vi.mock("../api/diskInventory",()=>diskApi);
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,6 +54,7 @@ const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 // rest of the sample. The Worktrees, Artifacts and Docker pages own
 // those measurements and test them.
 vi.mock("../api/hooks", () => ({
+  useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }),
   // Healthy by default: the notice renders nothing, which is the
   // state every assertion in this file assumes (#1145).
   useBackgroundHealth: () => ({ data: [] }),
@@ -2109,4 +2112,12 @@ describe("the process table at phone width (#973)", () => {
     expect(count.className).toContain("shrink-0");
     expect(count.className).not.toMatch(/truncate/);
   });
+});
+
+it("opens the disk inventory from System Health without starting a scan", async () => {
+ useFilters.setState({healthPage:"disk"}); renderPage();
+ fireEvent.click(await screen.findByRole("button",{name:"Disk usage"}));
+ expect(await screen.findByText(/Repository folders:.*fixture\/projects/)).toBeTruthy();
+ expect(screen.getByRole("button",{name:"Measure disk usage"})).toBeTruthy();
+ expect(diskApi.startDiskScan).not.toHaveBeenCalled();
 });
