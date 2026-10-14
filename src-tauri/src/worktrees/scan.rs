@@ -3639,8 +3639,27 @@ fn collect_bounded(
             match git(dir, &["worktree", "list", "--porcelain"]) {
                 Ok(list) => {
                     let branch = default_branch(dir);
-                    let worktrees: Vec<_> = parse_porcelain(&list)
+                    // A linked checkout's first porcelain record can name a
+                    // bare owner. Its .git file does not make that owner a
+                    // working tree, and the container must never become a row.
+                    let bare = list
+                        .lines()
+                        .take_while(|line| !line.is_empty())
+                        .any(|line| line == "bare");
+                    let records = parse_porcelain(&list);
+                    let primary = if dir.join(".git").is_dir() {
+                        dir.to_path_buf()
+                    } else {
+                        records
+                            .first()
+                            .map(|w| Path::new(&w.path).to_path_buf())
+                            .unwrap_or_else(|| dir.to_path_buf())
+                    };
+                    let worktrees: Vec<_> = records
                         .into_iter()
+                        .filter(|w| {
+                            !bare || canonical_key(Path::new(&w.path)) != canonical_key(&primary)
+                        })
                         .map(|mut w| {
                             if with_safety {
                                 classify(&mut w, dir, &branch);
@@ -3648,15 +3667,8 @@ fn collect_bounded(
                             w
                         })
                         .collect();
-                    let primary = if dir.join(".git").is_dir() {
-                        dir
-                    } else {
-                        worktrees.first().map(|w| Path::new(&w.path)).unwrap_or(dir)
-                    };
                     out.repos.push(Repo {
-                        // Both existing branches reached a `.git` entry, which a
-                        // bare repository does not have.
-                        bare: false,
+                        bare,
                         // Gated on `with_safety` like every other subprocess
                         // here: a scan that skipped the safety verdicts is
                         // the fast path, and one `git stash list` per repo
@@ -3667,7 +3679,7 @@ fn collect_bounded(
                         // subprocesses returning the same number.
                         stash_entries: with_safety.then(|| stash_count(dir)).flatten(),
                         identity: repo_identity(&primary.to_string_lossy()),
-                        fetched_at: fetched_at(primary),
+                        fetched_at: fetched_at(&primary),
                         name: primary
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -3709,6 +3721,9 @@ fn collect_bounded(
     if dir.join("HEAD").is_file() && dir.join("objects").is_dir() {
         match git(dir, &["rev-parse", "--is-bare-repository"]) {
             Ok(answer) if answer.trim() == "true" => {
+                if !common_dirs.insert(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())) {
+                    return;
+                }
                 // Only NOW is `git worktree list` worth spawning: this
                 // is established as a repository.
                 match git(dir, &["worktree", "list", "--porcelain"]) {
@@ -11926,6 +11941,27 @@ mod bare_repository_tests {
                 "feature"
             ]
         ));
+
+        // Both root orders must return one bare owner, even when only its
+        // linked checkout was selected. Directory iteration order is not stable.
+        for roots in [vec![&wt], vec![&wt, &bare], vec![&bare, &wt]] {
+            let report = scan_dirs_fast_reporting(
+                &roots
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(report.repos.len(), 1, "one owner per common directory");
+            assert!(
+                report.repos[0].bare,
+                "linked discovery must retain bare ownership"
+            );
+            assert_eq!(
+                report.repos[0].worktrees.len(),
+                1,
+                "container is not a checkout"
+            );
+        }
 
         let mut scan = RepoScan::default();
         collect_inner(root, 0, &mut scan, false);

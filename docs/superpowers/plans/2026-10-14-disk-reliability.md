@@ -34,3 +34,7 @@ After fixing #1807, the existing large workspace completed in four batches: 572,
 Final capped host scan reproduced the same complete totals in four batches, with 264,634,368-byte maximum RSS and 49.52-second runtime while the full native suite also ran. The retained-path compaction reduced memory from the earlier 358,924,288-byte measurement.
 
 Final local regression results: 3,539 native library tests passed (59 ignored); 5,249 frontend tests passed (1 skipped); 285 mobile workspace tests passed (1 ignored); the explicit real-host acceptance test passed. Native scanner/provider/accounting and frontend refresh/coverage integration were reviewed independently. Full lint and CI/release evidence follow in the PR and epic.
+
+## Cross-platform CI follow-up (#1810)
+
+Linux CI exposed order-dependent bare-repository ownership when nested discovery enters a linked checkout first. The deterministic linked-only and reversed-root fixture failed locally before the fix. Discovery now reads the bare marker from Git porcelain, excludes the owner container from worktree rows, and deduplicates bare owners through the same common-directory set. All 176 scanner tests pass after the correction.
