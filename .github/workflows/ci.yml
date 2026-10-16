@@ -259,7 +259,7 @@ jobs:
 
       - name: Retain command diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: command-diagnostics-${{ github.job }}-${{ runner.os }}
           path: ${{ runner.temp }}/ci-diagnostics/
@@ -304,7 +304,7 @@ jobs:
         run: python3 scripts/test-rust-ci.py race
       - name: Retain Rust command diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: command-diagnostics-${{ github.job }}-${{ runner.os }}
           path: ${{ runner.temp }}/ci-diagnostics/
@@ -335,7 +335,7 @@ jobs:
           make check-contrast
       - name: Frontend diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frontend-diagnostics
           path: |
@@ -602,7 +602,7 @@ jobs:
 
       - name: Retain Linux dependency diagnostics
         if: always() && (matrix.os == 'ubuntu-latest')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: apt-diagnostics-${{ github.job }}-${{ runner.os }}
           path: ${{ runner.temp }}/ci-diagnostics/apt-*
@@ -706,7 +706,7 @@ jobs:
           cp "$APPIMAGE" Headstate-ci-verified.AppImage
       - name: Retain verified Linux AppImage
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-linux-appimage
           path: |
@@ -716,7 +716,7 @@ jobs:
           retention-days: 7
       - name: Retain command diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: command-diagnostics-${{ github.job }}-${{ runner.os }}
           path: ${{ runner.temp }}/ci-diagnostics/
@@ -927,7 +927,7 @@ jobs:
 
       - name: Retain Linux dependency diagnostics
         if: always() && (needs.mobile-changes.outputs.run == 'true')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: apt-diagnostics-${{ github.job }}-${{ runner.os }}
           path: ${{ runner.temp }}/ci-diagnostics/apt-*
@@ -1019,7 +1019,7 @@ jobs:
             echo "generated=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # The one step here with a condition of its own, so the mobile
         # gate is ANDed onto it rather than replacing it. If the steps
         # above did not run there is no generated project to upload, so
