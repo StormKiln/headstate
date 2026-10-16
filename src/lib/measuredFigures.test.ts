@@ -8,7 +8,6 @@ import claudeCodePage from "@/components/ClaudeCodePage.tsx?raw";
 import claudeMdPage from "@/components/ClaudeMdPage.tsx?raw";
 import claudeOverviewPage from "@/components/ClaudeOverviewPage.tsx?raw";
 import repositoriesPage from "@/components/RepositoriesPage.tsx?raw";
-import statsPage from "@/components/StatsPage.tsx?raw";
 
 /// A measured figure must never be rendered to a user.
 ///
@@ -37,7 +36,6 @@ const PAGES: [string, string][] = [
   ["ClaudeCodePage.tsx", claudeCodePage],
   ["ClaudeMdPage.tsx", claudeMdPage],
   ["ClaudeOverviewPage.tsx", claudeOverviewPage],
-  ["StatsPage.tsx", statsPage],
   // The repository browser (#1011). Added because its whole subject is a
   // corpus measurement -- 672 tracked files against 623,488 on disk, a
   // 256 KB bound clearing a 199 KB p99 -- and the figures belong in the

@@ -48,7 +48,6 @@ export const ALL_VIEWS = [
   // `ViewSwitcher.test.tsx` both assert every `ALL_VIEWS` id reaches
   // `VIEWS` exactly once. When they disagree about ORDER, that is now
   // expected.
-  "pr-stats",
   "my-prs",
   "to-review",
   "worktrees",
@@ -112,7 +111,6 @@ const VIEW_LABELS: Record<View, string> = {
   // its own, so there is one place to change and nothing left to drift.
   "my-prs": "My pull requests",
   "to-review": "To review",
-  "pr-stats": "PR Stats",
   "claude-md": "CLAUDE.md",
   packages: "Package updates",
   artifacts: "Artifacts",
@@ -128,39 +126,6 @@ export function viewLabel(view: View): string {
   return VIEW_LABELS[view];
 }
 
-/// Views the mobile companion does not offer, whatever is persisted.
-///
-/// A BUILD-time set, not a viewport one, for the reason `lib/target.ts`
-/// gives: "the companion does not offer this" is a statement about which
-/// app this is, and hiding by width takes a page away from a desktop
-/// user who dragged their window narrow.
-///
-/// Why this exists at all: until #794, Stats was a `panel` value, and
-/// `App.tsx` kept it off the phone by downgrading a stored
-/// `panel === "stats"` to `"list"` on every render. Promoting it to a
-/// `View` makes that downgrade dead code -- a persisted `view` is read by
-/// the switcher, the header and the body route, and patching one of them
-/// leaves the other two offering a page the phone cannot show. One set,
-/// read everywhere a view is offered or routed.
-///
-/// EMPTY as of #863: the companion now offers every view the desktop
-/// does. `pr-stats` was the only member, hidden because the companion's
-/// first release scoped it out and #794 moved it between desktop surfaces
-/// without revisiting that.
-///
-/// Kept as a mechanism rather than deleted, and that is the deliberate
-/// choice here. The set is what makes the three-call-site bug described
-/// above impossible: `App.tsx`, and `ViewSwitcher`'s collapsed button and
-/// its menu all consult it, so hiding a future view is one line here
-/// instead of three patches that can disagree. Deleting it would return
-/// the next such decision to the shape #794 had to fix. An empty set
-/// costs one allocation and `has()` returning false.
-///
-/// If you are adding a member: it must be a statement about what the
-/// COMPANION cannot do, not about screen width -- see `lib/target.ts`.
-/// And note the local-machine views (worktrees, docker, artifacts,
-/// packages, claude-md) are the companion's whole purpose and are not
-/// candidates.
 export const MOBILE_HIDDEN_VIEWS: ReadonlySet<View> = new Set<View>();
 
 /// The System Health sub-pages, in sidebar order (#687).
@@ -325,27 +290,6 @@ interface FilterStore {
   /// a persisted value.
   setFilter: <K extends keyof Filters>(key: K, value: Filters[K]) => void;
   applyPreset: (filters: Filters) => void;
-  /// Pick a PR Stats scope, and optionally a person within it (#825).
-  ///
-  /// One action rather than three `setFilter` calls, because the three keys
-  /// are ONE selection. Written separately they would render three times
-  /// and pass through states that are not selections at all -- a subject
-  /// with the previous scope still set, which is a question about the wrong
-  /// organisation. The `repo` precedent in `setFilter` is the same idea at
-  /// one key: a navigation write is atomic with its consequences.
-  ///
-  /// `subject` is `undefined` for "the viewer", which is what every row
-  /// except a Members row selects -- so clicking a repository after
-  /// clicking a person CLEARS the person rather than silently keeping them
-  /// scoped to a new repository. That is the behaviour the caller gets by
-  /// default, which is why it is a required parameter rather than an
-  /// optional one: a forgotten argument would leave a stale subject, and
-  /// the leaderboard would quietly be about one person.
-  setStatsScope: (
-    kind: Filters["statsScopeKind"],
-    value: string | undefined,
-    subject: string | undefined,
-  ) => void;
   setView: (view: View) => void;
   /// Which System Health page is open (#687).
   ///
@@ -649,22 +593,6 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   // repository is `repoPath` below, which is deliberately not here --
   // see its comment for why a path is navigation rather than a filter.
   repositories: {},
-  // PR Stats holds its own scope selection (#825): `statsScopeKind`,
-  // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
-  // through `setStatsScope`. Empty here like every other view -- the entry
-  // is what makes `filtersByView` TOTAL over `View`, and
-  // `useActiveFilters` reads `[view]` on every render, so a missing key is
-  // the undefined-crash this record exists to prevent.
-  //
-  // Between #794 and #825 this held a `repo` written by the inherited
-  // `RepoSidebar` and read by nothing. The keys changed; the reason the
-  // entry exists did not.
-  "pr-stats": {},
-  // System Health has an entry like every other view even though it
-  // has no filters to hold. `filtersByView` must be TOTAL over `View`
-  // -- `useActiveFilters` reads `[view]` and every consumer reads
-  // `.repo`/`.sort` off the result -- so a view omitted here is the
-  // undefined-crash this record exists to prevent, not a saving.
   "system-health": {},
 };
 
@@ -728,18 +656,6 @@ export const useFilters = create<FilterStore>()(
           // There is no order for a caller to get wrong if there is
           // nothing for a caller to do.
           ...(key === "repo" ? { selectedPr: null, repoPath: "", repoFile: undefined } : {}),
-        })),
-      setStatsScope: (kind, value, subject) =>
-        set((s) => ({
-          filtersByView: {
-            ...s.filtersByView,
-            [s.view]: {
-              ...s.filtersByView[s.view],
-              statsScopeKind: kind,
-              statsScopeValue: value,
-              statsSubject: subject,
-            },
-          },
         })),
       // Preset navigation replaces the filter set wholesale, so a click
       // never inherits a filter the user forgot was active and shows a
@@ -926,10 +842,8 @@ export const useFilters = create<FilterStore>()(
       // shape, leaving `filtersByView` undefined and crashing on first
       // render. Tests never caught it because they always start empty.
       //
-      // v3 (#794): Stats stopped being a `panel` value and became the
-      // `pr-stats` VIEW. A store written by v2 can hold
-      // `panel: "stats"`, which now routes nowhere -- such a user would
-      // land on the PR list with no sign their Stats page had moved.
+      // Older Stats destinations now restore My PRs. The merge below
+      // also handles the retired route in already-current v4 stores.
       //
       // v4 (#852): `panel` is gone entirely. A v3 store carries
       // `panel: "list"`, and `merge` below spreads the persisted object
@@ -953,33 +867,22 @@ export const useFilters = create<FilterStore>()(
           // falls back to the defaults rather than propagating a bad
           // state.
           const old = state as { filters?: Filters; view?: string };
-          // "dashboard" was v1's name for the stats page. v2 mapped it
-          // onto `panel: "stats"`; since #794 the destination is the
-          // view itself, so the hop through `panel` is gone and this
-          // lands where v3 would have put it anyway.
+          // The retired dashboard destination restores My PRs.
           const view: View =
             old.view === "dashboard"
-              ? "pr-stats"
+              ? "my-prs"
               : old.view === "reviewing"
                 ? "to-review"
                 : "my-prs";
           state = {
-            // The old flat filters belong to the view they were
-            // filtering. "dashboard" had none of its own -- it showed
-            // the whole account -- but `pr-stats` keeps the repo
-            // sidebar, so carrying them there is what the user had.
+            // Preserve filters while upgrading the old flat store.
             filtersByView: { ...EMPTY_FILTERS, [view]: old.filters ?? {} },
             view,
             panel: "list",
           };
         }
         if (from < 3) {
-          // v2 -> v3: a stored `panel: "stats"` meant "My PRs, showing
-          // the stats page". That destination is now a view, so move
-          // the user THERE and reset `panel` to the only value My PRs
-          // and Docker still share. Left as "stats" it would be a value
-          // no route reads, and the user would silently lose the page
-          // they closed the app on.
+          // Retire the old Stats panel without moving other views.
           const old = state as { panel?: string; view?: string };
           if (old.panel === "stats") {
             state = {
@@ -990,7 +893,7 @@ export const useFilters = create<FilterStore>()(
               // teleporting someone off Docker would be worse than
               // dropping a value that was never reachable there.
               ...(old.view === "my-prs" || old.view === undefined
-                ? { view: "pr-stats" }
+                ? { view: "my-prs" }
                 : {}),
               panel: "list",
             };
@@ -1041,7 +944,8 @@ export const useFilters = create<FilterStore>()(
         return {
           ...current,
           ...p,
-          filtersByView: { ...EMPTY_FILTERS, ...(p.filtersByView ?? {}) },
+          view: ALL_VIEWS.includes(p.view as View) ? p.view! : current.view,
+          filtersByView: Object.fromEntries(ALL_VIEWS.map(view => [view, p.filtersByView?.[view] ?? {}])) as Record<View, Filters>,
         };
       },
       partialize: (s) => ({

@@ -55,8 +55,6 @@ import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { RepoSidebar } from "./components/RepoSidebar";
-import { ViewSwitcher } from "./components/ViewSwitcher";
-import { StatsSidebar } from "./components/StatsSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
 import { ConnectionBanner } from "./components/ConnectionBanner";
@@ -81,135 +79,6 @@ import { useSourceSelection } from "./store/sourceSelection";
 import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
 
-/// The chart-carrying views, split off the launch chunk (#838, #921).
-///
-/// # An update from #921, which added the third one
-///
-/// This comment said "the two heavy views" and "the three chunks" until
-/// the Claude Code overview joined them. Measured on the same
-/// `VITE_TARGET=mobile yarn build`, and the shape of the output CHANGED
-/// rather than simply gaining a row:
-///
-/// ```text
-/// ClaudeOverviewPage    28.88 kB   recharts mentions: 2
-/// StatsPage             45.72 kB                      1
-/// SystemHealthPage      53.26 kB                      0
-/// chart                339.96 kB                     15   <- NEW, shared
-/// index (launch)       968.41 kB                      0   <- the claim
-/// ```
-///
-/// With two lazy consumers of `ui/chart` the bundler hoists the charting
-/// library into its OWN shared chunk rather than inlining it into one
-/// route. So the `15 / 0 / 0` figure quoted below is now `15` in `chart`
-/// and `0` in the launch chunk, which is the property that was ever
-/// load-bearing -- and the library is fetched once for both routes rather
-/// than twice.
-///
-/// The regression, measured by making the new route eager on purpose:
-/// the launch chunk goes **968.41 kB -> 1,337.75 kB** (+369 kB, +38%) and
-/// its `grep -c recharts` goes **0 -> 16**, with the shared `chart` chunk
-/// disappearing entirely into the launch path. `App.lazy.test.tsx` fails
-/// on that source shape, naming the route.
-///
-/// # Measured, before and after
-///
-/// The frontend shipped as ONE chunk with no dynamic imports at all, so a
-/// launch parsed every view before painting the PR list -- on a tray app
-/// whose value proposition is a fast badge. With the two routes split:
-///
-/// | | launch chunk | time to React's first commit |
-/// |---|---|---|
-/// | before | 1,378,820 B | 33.1 ms median |
-/// | after | 945,919 B | 24.8 ms median |
-///
-/// A 432,901-byte (31%) drop on the launch path and ~8ms off the median,
-/// which is about 25%. Headless Chrome, HTTP cache disabled, one browser,
-/// three warm-up loads discarded, 21 loads per side interleaved A/B so
-/// machine drift hits both equally; a second independent run of the same
-/// harness agreed (33.5 / 26.0 mean). FCP did NOT move -- 36ms to 32ms,
-/// inside the noise -- and that is expected rather than disappointing:
-/// `index.html` paints its own styled shell before any module evaluates,
-/// so FCP never saw the bundle. The number that moves is the one a user
-/// waits on, which is when the list appears.
-///
-/// # What is actually in the split chunks
-///
-/// `recharts` (9.3 MB on disk) now lands in the StatsPage chunk and is
-/// absent from the launch chunk -- verified on the build output, not
-/// inferred: `grep -c recharts` over the three chunks gives 15 / 0 / 0.
-///
-/// One correction to #838's own description while I was here. It names
-/// four recharts importers; only ONE actually imports it. `ui/chart.tsx`
-/// does, and `stats/ActivityChart` imports both it and recharts directly.
-/// `stats/Leaderboard` and `SystemHealthPage` only MENTION recharts, in
-/// comments explaining why each draws its own SVG instead
-/// (`Leaderboard.tsx:59-65`, `SystemHealthPage.tsx:173`). The split is
-/// still right -- ActivityChart lives behind the Stats route, which is
-/// where the library went -- but the health page's 51 kB chunk is its own
-/// code rather than a charting library, and a reader comparing the chunk
-/// sizes against the issue would otherwise find them inexplicable.
-///
-/// # The phone gets more out of this than the desktop
-///
-/// Before #838 the StatsPage code sat in the one chunk every phone launch
-/// parsed. It is now behind the route boundary, so a phone fetches the
-/// 382 kB chunk -- recharts included -- only when the user opens Stats,
-/// and a launch that never goes there never pays for it.
-///
-/// This paragraph said something stronger until #863: that the companion
-/// could not reach the Stats route AT ALL, so the chunk was never fetched
-/// rather than merely fetched late. That followed from `pr-stats` being in
-/// `MOBILE_HIDDEN_VIEWS`, and #863 emptied that set. The split is what
-/// makes shipping Stats to the phone cheap -- on-demand instead of on the
-/// launch path -- but "never fetched" is no longer true, and the deferral
-/// now matters MORE on the phone than it did when it was a guarantee.
-///
-/// System Health is 51 kB and carries no charting library, per the
-/// correction above.
-///
-/// Verified on the mobile build rather than assumed: `VITE_TARGET=mobile
-/// yarn build` produces the same three chunks.
-///
-/// # Why the ROUTE boundary and not the chart components
-///
-/// `React.lazy` needs a component boundary already gated behind a user
-/// action, and these two are: both are reached only by clicking a view.
-/// Splitting lower down -- lazying `ActivityChart` inside a synchronously
-/// loaded `StatsPage` -- would leave the page's own code on the launch
-/// path (381 kB of the 433 kB moved), and would put a Suspense boundary
-/// in the middle of a layout that deliberately renders its sections as
-/// each query lands (`StatsPage.tsx:12-22`). The route boundary changes
-/// no component's internals at all.
-///
-/// # Why the SIDEBARS are not lazy
-///
-/// Neither `StatsSidebar` nor `SystemHealthSidebar` imports charting code
-/// (verified by grep). Lazying them would add two more Suspense
-/// boundaries to move almost nothing, and `SystemHealthSidebar` is
-/// imported BY `SystemHealthPage` anyway (`SystemHealthPage.tsx:47` reads
-/// `healthPagesFor` from it), so splitting it would only duplicate it.
-///
-/// # Why not `manualChunks`
-///
-/// `vite.config.ts` still has no `rollupOptions`, and does not need one:
-/// the route boundary is a real boundary in the import graph, so the
-/// bundler derives the split from the code. A `manualChunks` function
-/// would be a second, hand-maintained description of the same fact, and
-/// one that goes stale silently when an import moves. `src/App.lazy.test.tsx`
-/// guards the property instead.
-///
-/// # `lucide-react` tree-shakes; checked, not assumed
-///
-/// #838 also asked whether lucide's 44 MB on disk reaches the bundle. It
-/// does not. The package ships 2,057 icon modules; `src/` imports 52
-/// distinct icons, whose own modules contain 109 `<path>` elements between
-/// them, and the built chunks hold 118 SVG path literals -- the 109 plus a
-/// handful from the app's hand-drawn SVG. If the set had shipped the count
-/// would be in the thousands. Nothing to do here, and worth recording so
-/// the 44 MB does not get re-investigated.
-const ProviderStatsPage = lazy(() =>
-  import("./components/ProviderStatsPage").then((m) => ({ default: m.ProviderStatsPage })),
-);
 const SystemHealthPage = lazy(() =>
   import("./components/SystemHealthPage").then((m) => ({
     default: m.SystemHealthPage,
@@ -291,8 +160,6 @@ export default function App() {
   const selection = useSourceSelection((s) => s.selection);
   const setSelection = useSourceSelection((s) => s.setSelection);
   const sourceRepoKey = useSourceSelection((s) => s.repoKey);
-  const [statsTab, setStatsTab] = useState<"github" | "gitlab">("github");
-  const statsProvider = selection === "both" ? statsTab : selection;
   const githubEnabled = selection !== "gitlab";
   const gitlabEnabled = selection !== "github";
   const gitlabHost = useQuery({
@@ -346,44 +213,6 @@ export default function App() {
     claudePage,
   } = useFilters();
   const isMobile = useIsMobile();
-  // A view the companion does not ship falls back to the default one.
-  //
-  // This replaces the `panel === "stats"` downgrade that stood here
-  // until #794. Stats was a `panel` value then; it is the `pr-stats`
-  // VIEW now, and `view` persists across launches exactly as `panel`
-  // did -- so a desktop closed on PR Stats would otherwise open a phone
-  // on a page the phone does not offer, with no switcher entry to leave
-  // it by since that entry is hidden too.
-  //
-  // Derived rather than written back to the store, deliberately. The
-  // phone and the desktop can share a persisted store (UI prefs sync,
-  // and a user may restore a backup), so CORRECTING the stored value
-  // would silently move the desktop off PR Stats as well. What the
-  // phone cannot show, the phone declines to show; what the desktop
-  // stored stays stored.
-  //
-  // On the BUILD, not the viewport, per `lib/target.ts`: a desktop user
-  // who drags their window under 768px keeps the page.
-  // The CAPABILITY fall-through, alongside the build-time one (#921).
-  //
-  // `ViewSwitcher` refuses to offer `claude-code` while
-  // `claude_integrations_enabled` is off (#916), overriding even the
-  // current-view escape hatch, exactly as the build-time set does -- and
-  // its comment justifies that by saying there is no page behind the
-  // entry. Giving the view a real route makes that claim false unless the
-  // ROUTE applies the same predicate, which is the three-call-site
-  // disagreement `MOBILE_HIDDEN_VIEWS` exists to prevent.
-  //
-  // Derived, never written back, for the reason the mobile case states
-  // just above: the stored value is the user's, and a desktop that later
-  // turns the capability on should land back where it was.
-  //
-  // `prefs` is undefined while `get_ui_prefs` is in flight AND if it
-  // rejects, so this falls back in both cases. That is the fail-CLOSED
-  // direction and the right one: the alternative is rendering a page for a
-  // capability we could not confirm is on. It is also what `ViewSwitcher`
-  // already does with the same value, so the two agree in the uncertain
-  // case as well as the settled ones.
   const { prefs } = useUiPrefs();
   const measurementEnabled = useMeasurementsEnabled();
   const claudeCodeOff = !prefs?.claude_integrations_enabled;
@@ -728,23 +557,6 @@ export default function App() {
       // Worktrees does, so a second sidebar would be the same rows
       // under a different name.
       <WorktreeSidebar viewCounts={{ "to-review": reviewingCount }} />
-    ) : view === "pr-stats" ? (
-      // PR Stats has its OWN sidebar now (#825), and is no longer a
-      // fall-through. It inherited `RepoSidebar` in #794 as a deliberate
-      // placeholder whose rows were "continuity and a future scope hook,
-      // not a live filter" -- `ViewSwitcher`'s doc comment said so, and
-      // said it was worth revisiting "if PR Stats is ever scoped per
-      // repo, at which point these rows stop being decoration". This is
-      // that point.
-      //
-      // The column it replaces listed repositories where the viewer has
-      // an OPEN PR (`repoCounts(prs)`), which cannot hold an
-      // organisation or a person -- so #823's second audience ("how is
-      // my team doing?") had nowhere to be asked from. This one is
-      // sourced from GitHub and consults nothing on disk.
-      statsProvider === "gitlab" ? (
-        <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3"><ViewSwitcher /></nav>
-      ) : <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
       // My PRs, and any future view that falls through. The repo rows
       // are a live filter here -- this is the view they were always
@@ -957,12 +769,7 @@ export default function App() {
               <Menu className="h-4 w-4" aria-hidden="true" />
             </button>
           ) : null}
-          {/* View selection lives in the sidebar's switcher rather than
-              as a per-page tab row here: the sidebar is already where you
-              choose what you are looking at, and a tab row repeated above
-              every page competed with it. Since #794 that is true of PR
-              Stats too -- it was the last destination reached any other
-              way. */}
+          {/* All top-level views share the sidebar's view switcher. */}
           {/* One shared label table (`viewLabel`), not a ternary chain
               here and another one elsewhere: the header and the view
               boundary must name the same page the same way, and two
@@ -971,7 +778,7 @@ export default function App() {
               "Pull requests" -- which is what the chain's default arm
               did. */}
           <h1 className="text-sm font-semibold">{viewLabel(view)}</h1>
-          {(view === "my-prs" || view === "to-review" || view === "pr-stats") ? (
+          {(view === "my-prs" || view === "to-review") ? (
             <label className="ml-3 flex items-center gap-2 text-xs text-[#8b949e]">
               Source
               <select
@@ -1029,28 +836,10 @@ export default function App() {
             page, and none of Worktrees, Branches or System health has
             any notion of a selected PR to go back to. System health
             least of all -- it is about the machine, and nothing on it
-            can be reached from a pull request.
-
-            PR Stats joins them (#794), and for a reason the others do
-            not share: it IS about pull requests, just not about one of
-            them. A whole-account summary with a single PR's detail
-            rendered over it is not a page anybody asked for. `setView`
-            clears `selectedPr`, so the switcher path could not reach
-            this anyway -- but "could not reach it today" is the wrong
-            thing for the route to rely on, since the detail branch is
-            FIRST in this chain and therefore wins over every view
-            branch below it. */}
+            can be reached from a pull request. */}
         {selectedPr &&
         view !== "worktrees" &&
         view !== "branches" &&
-        view !== "pr-stats" &&
-        // Claude Code joins them (#921), for the reason the others
-        // share: it is local state about this machine's sessions, with
-        // no notion of a selected pull request to go back to. `setView`
-        // clears `selectedPr`, so the switcher path cannot reach that
-        // today -- but this branch is FIRST in the chain and therefore
-        // wins over every view branch below, which is exactly what the
-        // `pr-stats` comment says not to rely on.
         view !== "claude-code" &&
         view !== "system-health" ? (
           <div className="p-4">
@@ -1177,28 +966,6 @@ export default function App() {
                 shift sideways as the chunk landed. */}
             <Suspense fallback={<ViewLoading />}>
               <SystemHealthPage />
-            </Suspense>
-          </div>
-        ) : view === "pr-stats" ? (
-          <div className="p-4">
-            {/* No priorities strip here: PR Stats is a read-only summary
-                of the whole account, and the strip is a triage surface
-                that belongs beside the list it acts on. Its cards already
-                surface what needs attention, and each one clicks through
-                to the list.
-
-                Keyed on `view` since #794, not on `panel`. It sits after
-                the other view branches for the same reason it sat after
-                `system-health` before: this chain is ordered, and a
-                branch that tested a DIFFERENT axis had to come last or
-                it would have swallowed every view whose panel happened
-                to be "stats". That hazard is gone now that one axis
-                decides. */}
-            {/* Suspense because the page is now a lazy chunk (#838); see
-                the `SystemHealthPage` branch above for why the boundary
-                sits inside the padded wrapper. */}
-            <Suspense fallback={<ViewLoading />}>
-              <ProviderStatsPage selection={selection} provider={statsProvider} onProviderChange={setStatsTab} gitlabHost={gitlabHost.data} />
             </Suspense>
           </div>
         ) : selection !== "github" ? (

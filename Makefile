@@ -614,13 +614,6 @@ enterprise-compare:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	ENTERPRISE_BASELINE=scripts/enterprise/baseline.json node scripts/enterprise-baseline.mjs "$(OUT)"
 
-# Real browser regression for unchanged Stats countdown chart animation (#1708).
-.PHONY: check-activity-chart
-check-activity-chart:
-	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
-	yarn vite build -c vite.harness.config.ts
-	node scripts/check-activity-chart.mjs "$(OUT)" "$(or $(ENGINE),chromium)"
-
 .PHONY: analyze-measurements
 analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
 analyze-measurements:

@@ -510,48 +510,6 @@ Clearing the build cache reclaims the space beside this number and
 turns it cold. The next build of every target starts from nothing.`,
   },
 
-  "stats-sample": {
-    title: "What these numbers are drawn from",
-    body: `Every figure here comes from a **sample of recent merged pull
-requests**, not from all of your history. Three consequences worth
-knowing before acting on any of it:
-
-- **p90 is the maximum** for a sample of ten or fewer. A new account's
-  single weekend pull request is shown with the authority of a tail
-  metric, and it is not one.
-- The repository table shows share **of that sample**, not of all time.
-- A period with few merges gives a volatile median. It will move a lot
-  next week, and the movement will not mean anything.
-
-The sample size is stated beside the figures that depend on it most.`,
-  },
-
-  "stats-deltas": {
-    title: "Reading the change cards",
-    body: `Intake and throughput are different axes, so they are not coloured the
-same way.
-
-**"Opened this week +150%"** is rendered neutral, not green. More pull
-requests arriving is not an improvement — it is more work. Only the
-merge figures are scored as better or worse.
-
-The signal worth watching is the **gap between the two lines** on the
-activity chart: opened rising while merged stays flat is a backlog
-forming, and neither number says that on its own.`,
-  },
-
-  "stats-timezone": {
-    title: "UTC day boundaries",
-    body: `Days are bucketed in **UTC**, because GitHub's date filters evaluate in
-UTC and this chart is built from them.
-
-Totals are unaffected — the shift applies uniformly. What distorts is
-the per-day shape near midnight: merging at 6pm Pacific on a Tuesday
-lands in Wednesday's bar.
-
-A real limitation rather than a rounding error, and worth knowing
-before reading anything into a single day's height.`,
-  },
 
   "scanned-dirs": {
     title: "Scanned directories",

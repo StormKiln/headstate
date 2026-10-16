@@ -1,5 +1,4 @@
 import { captureReference } from "./measurementCapture";
-import { retireStatsOwnership } from "./statsBoardRefresh";
 import { retireReviewOwnership } from "./reviewOperations";
 import { acceptDetailFacts, retireDetailOwnership } from "./detailRevalidation";
 import { useEffect, useSyncExternalStore } from "react";
@@ -30,7 +29,6 @@ export function retireSourceOwnership(qc: QueryClient, preserveSession = false) 
   owners.delete(qc);
   retireDetailOwnership(qc, !preserveSession);
   retireReviewOwnership(qc);
-  retireStatsOwnership(qc);
   const lists = entries.get(qc);
   entries.delete(qc);
   for (const value of Object.values(lists ?? {})) {

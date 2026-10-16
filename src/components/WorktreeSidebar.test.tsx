@@ -260,8 +260,10 @@ describe("WorktreeSidebar", () => {
       repos.mockReturnValue([orphanRepo("a")]);
       scan.unreadable = [UNREADABLE];
       render(<WorktreeSidebar />);
+      expect(screen.queryByText(UNREADABLE)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Show details" }));
       expect(screen.getByText(UNREADABLE)).toBeTruthy();
-      expect(screen.getByText(/floors rather than totals/i)).toBeTruthy();
+      expect(screen.getByText(/some repositories may be missing/i)).toBeTruthy();
     });
   });
 

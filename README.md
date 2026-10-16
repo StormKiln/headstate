@@ -75,38 +75,14 @@ either is set, and otherwise from `gh auth token`. It keeps that token in
 memory. If authentication is unavailable, GitHub views explain what is
 missing; there is no separate token-entry flow in Headstate.
 
-#### Token scopes
+#### Token permissions
 
-For GitHub, Headstate uses these scopes:
+The token needs access to the repositories and pull requests you use, including
+private repositories. `gh auth login` supplies the usual classic-token scopes;
+fine-grained tokens must grant the required repository permissions.
 
-| Scope | What stops working without it |
-| --- | --- |
-| `repo` | GitHub pull request access, including private repositories. |
-| `read:org` | **PR Stats only.** The sidebar lists no organizations, so an org or a team cannot be selected — which looks like having no organizations rather than like a missing permission. |
-| `gist` | Nothing in Headstate. It is in `gh auth login`'s own minimum set, so a `gh`-authenticated token has it regardless. |
-
-`gh auth login` requests all three: `repo`, `read:org` and `gist` are its
-stated minimum (`gh auth login --help`, verified on gh 2.100.0), so if you
-authenticated that way there is nothing to do.
-
-The gap is a **hand-made token**. A classic personal access token or a CI
-token in `GH_TOKEN` / `GITHUB_TOKEN` carries only the scopes it was created
-with, and `read:org` is easy to leave off — it is not needed for anything
-except PR Stats. Check what a token actually has:
-
-```
-gh api -i user 2>/dev/null | grep -i '^x-oauth-scopes:'
-```
-
-and if `read:org` is missing from a `gh`-managed token, add it in place:
-
-```
-gh auth refresh -s read:org
-```
-
-Fine-grained personal access tokens report no scopes at all through that
-header; they carry permissions instead, and the one to grant is
-**Organization permissions → Members: read**.
+PR Stats and its organization/member discovery were removed in 10.3.0. There is
+no additional organization-members permission requirement for that retired feature.
 
 ### GitLab
 
@@ -285,63 +261,6 @@ with admin access on that repository.
 **Priorities strip.** Pinned above the list: PRs blocked on *you* and
 nobody else — real merge conflicts or failing CI — so the thing you need to
 fix first doesn't get lost in a longer list. Quiet when nothing is blocked.
-
-**PR Stats.** GitHub's first entry in the view menu, answering what the
-open-PR list cannot: how much is actually getting done, whether that is improving,
-and — for a team or org lead — how the team is doing.
-
-The sidebar is a GitHub hierarchy rather than a list of local checkouts,
-because this page is about GitHub activity and a local clone is neither
-necessary nor sufficient for it:
-
-```
-Organizations
-  <org>
-    Repos     -> All repos, or one line per repository
-    Members   -> one line per member, scoping the page to that person
-Personal
-  All repos, or one line per repository
-```
-
-Every scope offers two views. **Mine** is your own figures. **Others** is
-the same measures for everyone else in scope, plus leaderboards — top
-authors, top reviewers, top by code volume.
-
-Nothing queries until you ask. Each scope sits behind an explicit load,
-which is not merely a performance nicety: at organisation scale a
-render-on-navigate would issue tens of sequential requests per sidebar
-click.
-
-Available on the iOS companion as well as the desktop.
-
-- **Four headline figures** — merged and opened this week, merged this
-  month, and median cycle time — each with its change against the previous
-  period. Every window is stated in words, because the comparison
-  deliberately excludes the current (incomplete) day: counting a partial
-  day against complete ones drags every number down.
-- **Activity chart** — opened against merged per day over 7, 14, or 30
-  days. The two series are overlaid rather than stacked; they measure
-  overlapping populations, so a stacked total would be meaningless. The gap
-  between them reads as the backlog growing or draining.
-- **Insight cards** — cycle time (median and p90), total lines changed, and
-  median PR size, computed over a sample of your most recently merged PRs
-  and labelled with that sample size.
-- **Merged by repository** — where the work actually landed, with each row
-  a way back into that repo's filtered list.
-
-The view fetches only while it is open. At the 30-day range it costs eight
-GitHub rate-limit points out of 5,000 per hour: six day-bucket chunks, plus
-the period comparisons, plus the merged-PR sample. The daily series uses aliased queries rather
-than paginating merged PRs: an aliased search costs a single point no
-matter how many aliases it carries, so a month of history is cheaper than
-one page of paginated results.
-
-The series is fetched in chunks of five days, concurrently. GitHub returns 502 Bad Gateway
-on a query that takes too long to evaluate, and search aliases are evaluated
-serially — so alias count drives elapsed time rather than being a limit of its
-own. Measured: every 502 landed at around eleven seconds regardless of shape,
-while 80 count-only aliases answered in under that and 48 node-heavy ones did
-not. Requests stay well under the deadline rather than retrying into it.
 
 **Worktrees.** Every git worktree across your checkout directories, with a
 safety verdict per row: merged, unmerged, uncommitted work, never pushed,

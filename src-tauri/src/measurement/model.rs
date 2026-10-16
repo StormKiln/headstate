@@ -218,6 +218,8 @@ pub enum ClientMeasurement {
         footer_location: FooterLocation,
         footer: Footer,
     },
+    // Retained to decode pre-10.3 diagnostic exports and older paired clients.
+    // No current PR Stats producer remains.
     StatsView {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observation: Option<StatsObservation>,
@@ -264,6 +266,7 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         affected_fields: Option<u16>,
     },
+    // Legacy diagnostic schema compatibility; no current producer.
     StatsProgress {
         scope: OpaqueId,
         days: Option<u16>,

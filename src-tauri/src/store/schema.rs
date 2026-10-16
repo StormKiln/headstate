@@ -1314,6 +1314,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE github_pr_fact_owner (list INTEGER PRIMARY KEY, owner TEXT NOT NULL);",
     // 42: bounded disk observations shared by accounting and growth.
     crate::store::disk_observations::MIGRATION_SQL,
+    // 43: retire PR Stats. Shared queue, review facts, settings, and Claude
+    // history remain intact; DROP also removes these tables' indexes.
+    "DROP TABLE IF EXISTS stats_cache;
+     DROP TABLE IF EXISTS gitlab_stats_cache;
+     DROP TABLE IF EXISTS gitlab_stats_history;
+     DROP TABLE IF EXISTS pr_history;
+     DROP TABLE IF EXISTS pr_slice;
+     DROP TABLE IF EXISTS pr_backfill_scope;
+     DROP TABLE IF EXISTS pr_backfill_page;
+     DROP TABLE IF EXISTS pr_scope_evidence;
+     DELETE FROM settings WHERE key IN ('stats_viewer', 'stats_generation');",
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -2445,6 +2456,8 @@ mod tests {
                 first_seen_at TEXT NOT NULL, last_activity_at TEXT);",
         )
         .unwrap();
+        // Include settings present in every real install; retirement migration 43 prunes its Stats keys.
+        conn.execute_batch(MIGRATIONS[2]).unwrap();
         // This partial legacy fixture must include the hook table that a
         // real schema at this version already has (migration 36 alters it).
         conn.execute_batch(MIGRATIONS[13]).unwrap();
@@ -2538,6 +2551,8 @@ mod tests {
             [],
         )
         .unwrap();
+        // Include settings present in every real install; retirement migration 43 prunes its Stats keys.
+        conn.execute_batch(MIGRATIONS[2]).unwrap();
         // This partial legacy fixture must include the hook table that a
         // real schema at this version already has (migration 36 alters it).
         conn.execute_batch(MIGRATIONS[13]).unwrap();
@@ -2649,196 +2664,6 @@ mod tests {
     fn count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM claude_hook_event", [], |r| r.get(0))
             .unwrap()
-    }
-
-    /// A v12 database gains the per-pull-request accumulation table (#1004).
-    ///
-    /// Migration-additive, like migration 12 before it: v12 is every
-    /// install that has the subagent attribution, so this is the upgrade
-    /// path the change actually ships into rather than a hypothetical one.
-    #[test]
-    fn migration_thirteen_adds_pr_history_to_a_v12_database() {
-        let conn = Connection::open_in_memory().unwrap();
-        // A v12 database: `stats_cache` exists and holds an answer, and
-        // `pr_history` does not exist at all.
-        conn.execute_batch(
-            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
-                fetched_at TEXT NOT NULL);
-             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE stats_cache (
-                key TEXT NOT NULL, window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL, total INTEGER NOT NULL,
-                complete INTEGER NOT NULL, payload TEXT NOT NULL,
-                fetched_at TEXT NOT NULL,
-                PRIMARY KEY (key, window_start, window_end));",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 12i64).unwrap();
-        // The answer cache an existing install already has must survive:
-        // #1004 adds a layer BENEATH `stats_cache`, it does not replace it.
-        conn.execute(
-            "INSERT INTO stats_cache
-               (key, window_start, window_end, total, complete, payload, fetched_at)
-             VALUES ('board|merged|*|org:X', '2026-01-01', '2026-01-31', 5, 1, '{}',
-                     '2026-02-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-
-        migrate(&conn).unwrap();
-
-        assert!(has_table(&conn, "pr_history"));
-        assert!(
-            has_table(&conn, "stats_cache"),
-            "the assembled-answer cache stays; this adds a layer beneath it"
-        );
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, MIGRATIONS.len() as i64);
-        let kept: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stats_cache", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            kept, 1,
-            "an upgrade must not cost an existing cached answer"
-        );
-
-        // Migrating a v12 database runs 13 through 18, so the table this
-        // lands on is the SLICE-keyed one: the natural key is
-        // `(scope_key, repo, number)`, one row per pull request per scope,
-        // so a second load UNIONS rather than duplicating. A table without
-        // it would double-count every overlap and inflate every author
-        // aggregate.
-        conn.execute_batch(
-            "INSERT INTO pr_history
-               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
-                author, cycle_time_hours, size, additions, deletions,
-                changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'2026-01-15','t','u','a',1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
-             INSERT OR REPLACE INTO pr_history
-               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
-                author, cycle_time_hours, size, additions, deletions,
-                changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-15','2026-01-15','o/a',1,'2026-01-15','t2','u','a',1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
-        )
-        .unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            rows, 1,
-            "one row per pull request per scope -- and note the two inserts \
-             above name DIFFERENT slices, which under #1004's key would \
-             have been two rows neither of which helped the other"
-        );
-    }
-
-    /// Migration 18 re-keys `pr_history` on slices and adds the ledger
-    /// (#1092), from a real v17 state.
-    ///
-    /// v17 is every install that has the plugin engagement rescan -- the
-    /// version shipped immediately before this -- so this is the upgrade
-    /// path the change actually takes.
-    ///
-    /// Three things are asserted, and the third is the one that matters:
-    /// the new tables exist, the answer cache SURVIVES, and the old
-    /// window-keyed rows are gone. Dropping them is deliberate (they carry
-    /// no `merged_at`, so they cannot be re-keyed into slices), and a
-    /// migration that silently kept them under a legacy interpretation
-    /// would leave two meanings for one column.
-    #[test]
-    fn migration_eighteen_re_keys_pr_history_and_adds_the_ledger() {
-        let conn = Connection::open_in_memory().unwrap();
-        // A v17 database: the window-keyed `pr_history` holds accumulated
-        // rows, and `stats_cache` holds an answer.
-        conn.execute_batch(
-            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
-                fetched_at TEXT NOT NULL);
-             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE stats_cache (
-                key TEXT NOT NULL, window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL, total INTEGER NOT NULL,
-                complete INTEGER NOT NULL, payload TEXT NOT NULL,
-                fetched_at TEXT NOT NULL,
-                PRIMARY KEY (key, window_start, window_end));
-             CREATE TABLE pr_history (
-                scope_key TEXT NOT NULL, window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL, repo TEXT NOT NULL,
-                number INTEGER NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
-                author TEXT NOT NULL, cycle_time_hours REAL NOT NULL,
-                size INTEGER NOT NULL, additions INTEGER NOT NULL,
-                deletions INTEGER NOT NULL, changed_files INTEGER NOT NULL,
-                reviews_received INTEGER NOT NULL, stored_at TEXT NOT NULL,
-                PRIMARY KEY (scope_key, window_start, window_end, repo, number));
-             INSERT INTO pr_history VALUES
-               ('k','2026-01-01','2026-01-31','o/a',1,'t','u','a',1.0,1,1,0,1,0,
-                '2026-02-01T00:00:00Z');
-             INSERT INTO stats_cache VALUES
-               ('board|merged|*|org:X','2026-01-01','2026-01-31',5,1,'{}',
-                '2026-02-01T00:00:00Z');",
-        )
-        .unwrap();
-        // This partial legacy fixture must include the hook table that a
-        // real schema at this version already has (migration 36 alters it).
-        conn.execute_batch(MIGRATIONS[13]).unwrap();
-        conn.execute_batch(MIGRATIONS[14]).unwrap();
-        conn.pragma_update(None, "user_version", 17i64).unwrap();
-
-        migrate(&conn).unwrap();
-
-        assert!(has_table(&conn, "pr_history"));
-        assert!(has_table(&conn, "pr_slice"), "the ledger must exist");
-        assert!(has_table(&conn, "pr_backfill_scope"));
-        assert!(
-            has_table(&conn, "stats_cache"),
-            "the assembled-answer cache is NOT dropped: its payloads are \
-             opaque JSON and an unparseable one already degrades to a \
-             re-fetch"
-        );
-        let kept: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stats_cache", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(kept, 1, "an upgrade must not cost an existing answer");
-
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            left, 0,
-            "the window-keyed rows go: they carry no merged_at, so there is \
-             no way to learn which day they belong to, and keeping them \
-             would mean two meanings for one column. MEASURED cost of \
-             re-fetching the worst realistic corpus: ~12 points, 0.27% of \
-             one usable hour"
-        );
-
-        // The new key really is the slice: the same pull request written
-        // from two different slices is ONE row.
-        conn.execute_batch(
-            "INSERT INTO pr_history
-               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
-                author, cycle_time_hours, size, additions, deletions,
-                changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-01','2026-01-31','o/a',1,'2026-01-15','t','u','a',
-                     1.0,1,1,0,1,0,'2026-02-01T00:00:00Z');
-             INSERT OR REPLACE INTO pr_history
-               (scope_key, slice_from, slice_to, repo, number, merged_at, title, url,
-                author, cycle_time_hours, size, additions, deletions,
-                changed_files, reviews_received, stored_at)
-             VALUES ('k','2026-01-15','2026-01-15','o/a',1,'2026-01-15','t2','u','a',
-                     1.0,1,1,0,1,0,'2026-02-02T00:00:00Z');",
-        )
-        .unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pr_history", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
-
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     /// Migration 6 adds `paired_devices` to a database that stopped at
@@ -3424,5 +3249,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+    #[test]
+    fn removing_pr_stats_preserves_shared_data_on_upgrade_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let conn = historical_db(&path, 42);
+        conn.execute_batch("INSERT INTO settings VALUES ('stats_viewer','old'), ('stats_generation','4'), ('ui_prefs','keep');
+            INSERT INTO stats_cache VALUES ('scope','2026-01-01','2026-01-02',1,1,'{}','now');
+            INSERT INTO gitlab_stats_cache VALUES ('scope','{}','now');
+            INSERT INTO gitlab_stats_history VALUES ('scope','2026-01-01','{}');
+            INSERT INTO pr_scope_evidence VALUES ('scope',1);
+            INSERT INTO github_pr_facts VALUES (1,'viewer','owner/repo',7,'node','shared-review');
+            INSERT INTO github_pr_fact_owner VALUES (1,'viewer');
+            INSERT INTO queue_scan VALUES ('github','github.com',1,'viewer',1,'queue');
+            INSERT INTO snapshot_credentials VALUES ('credential','viewer');
+            INSERT INTO claude_session(session_id,first_seen_at) VALUES ('session','now');").unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let conn = open_db(&path).unwrap();
+            for table in [
+                "stats_cache",
+                "gitlab_stats_cache",
+                "gitlab_stats_history",
+                "pr_history",
+                "pr_slice",
+                "pr_backfill_scope",
+                "pr_backfill_page",
+                "pr_scope_evidence",
+            ] {
+                assert!(!has_table(&conn, table), "retired table {table} survived");
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM settings WHERE key LIKE 'stats_%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            for (sql, expected) in [
+                ("SELECT value FROM settings WHERE key='ui_prefs'", "keep"),
+                (
+                    "SELECT payload FROM snapshot WHERE id=1",
+                    "synthetic-saved-data",
+                ),
+                ("SELECT payload FROM github_pr_facts", "shared-review"),
+                ("SELECT owner FROM github_pr_fact_owner", "viewer"),
+                ("SELECT payload FROM queue_scan", "queue"),
+                ("SELECT owner FROM snapshot_credentials", "viewer"),
+                ("SELECT first_seen_at FROM claude_session", "now"),
+            ] {
+                assert_eq!(
+                    conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_installs_have_no_pr_stats_storage() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for table in [
+            "stats_cache",
+            "gitlab_stats_cache",
+            "gitlab_stats_history",
+            "pr_history",
+            "pr_slice",
+            "pr_backfill_scope",
+            "pr_backfill_page",
+            "pr_scope_evidence",
+        ] {
+            assert!(!has_table(&conn, table));
+        }
+        assert!(has_table(&conn, "github_pr_facts"));
+        assert!(has_table(&conn, "snapshot"));
     }
 }

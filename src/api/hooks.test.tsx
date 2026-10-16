@@ -12,7 +12,6 @@ import {
   usePullRequests,
   useRefreshRequested,
   useRemoveWorktree,
-  useStats,
 } from "./hooks";
 
 function owned(prs: typeof PR_FIXTURES) {
@@ -106,25 +105,6 @@ describe("usePullRequests", () => {
     // registered here and could call setQueryData on an unmounted query
     // client.
     await expect(emit("prs-updated", [])).resolves.not.toThrow();
-  });
-});
-
-describe("useStats", () => {
-  it("returns the stats payload", async () => {
-    const stats = {
-      merged_week: 1,
-      merged_month: 4,
-      in_merge_queue: 0,
-      needs_attention: 0,
-      awaiting_review: 0,
-      ready_to_queue: 0,
-      blocked_by_comments: 0,
-    };
-    mockIPC((cmd) => (cmd === "get_stats" ? stats : undefined));
-
-    const { result } = renderHook(() => useStats(), { wrapper: makeWrapper() });
-
-    await waitFor(() => expect(result.current.data).toEqual(stats));
   });
 });
 

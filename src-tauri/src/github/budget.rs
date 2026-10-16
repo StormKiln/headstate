@@ -1,66 +1,8 @@
-//! What a scope load COST, accumulated and actually read.
+//! Shared GitHub request accounting and admission budget.
 //!
-//! The app has always asked GitHub what its requests cost. `PRS_QUERY`,
-//! `MERGED_DETAIL_QUERY` and `COUNT_QUERY` all select
-//! `rateLimit { cost remaining resetAt }`, and three of the four stats
-//! queries do not select it at all -- but the deeper problem is that
-//! NOTHING READ `cost`, anywhere, on any query. The one consumer is
-//! `client.rs:906-912`, which reads `remaining` and logs a warning below
-//! 500. So the app could tell you it was nearly out of budget, and never
-//! what had spent it.
-//!
-//! That is survivable for a poll loop whose spend is a known constant --
-//! `poll.rs:1503-1580` pins `PRS_QUERY`'s cost in a CI test precisely so
-//! it stays knowable without being measured at runtime. It is not
-//! survivable for this feature, where one sidebar click issues a number
-//! of requests that depends on how much activity the scope contains. The
-//! probe-driven slicer in `slice.rs` cannot be costed in advance by
-//! construction: how many slices it takes IS the thing it discovers.
-//!
-//! # Why an accumulator and not a log line
-//!
-//! The unit that matters to a user is the CLICK, not the request. "That
-//! org cost you 23 points" is actionable; twenty-three separate log lines
-//! each saying "cost 1" are not, and at the fan-out this feature
-//! reaches they are noise that buries the one line that mattered.
-//!
-//! So [`Budget`] is handed to a load, threaded through every request it
-//! makes, and read once at the end. `remaining` and `reset_at` are kept
-//! as the LOWEST and LATEST seen rather than the last: requests run
-//! concurrently (see `fetch.rs`), so "the last response to arrive" is a
-//! race, and the pessimistic value is the one a refusal should be based
-//! on.
-//!
-//! # On the cost model
-//!
-//! Read `poll.rs:1503-1580` before adding a field to any stats query. The
-//! short version, which that test learned the hard way: cost is driven by
-//! NESTED CONNECTIONS, not by the number of searches, and a connection
-//! nested inside another is INVISIBLE to a substring count of its parent
-//! -- adding `contexts(` inside `statusCheckRollup` took the live cost
-//! from 3 to 4 while the guard's count did not move.
-//!
-//! For this feature specifically: `additions`, `deletions` and
-//! `changedFiles` are scalars and cost nothing extra. This module said
-//! `reviews { totalCount }` was "a CONNECTION and priced per search" and
-//! that a leaderboard adding it "is not free". **Both halves are wrong**,
-//! corrected by measurement for #826 -- and correcting them here rather
-//! than only where the new code lives, because a wrong fact left in a
-//! module doc is the one a future reader finds first.
-//!
-//! What GitHub prices is the `first:` ARGUMENT, not the connection.
-//! MEASURED live 2026-09-11 on the real detail document:
-//! `reviews { totalCount }` costs 1 point at 3, 6 and 15 searches, exactly
-//! tracking a scalars-only control, while `reviews(first: 1) { totalCount }`
-//! costs 2 from 6 searches up. `labels` behaves identically both ways. So a
-//! reviewer leaderboard IS free, and `board.rs`'s module docs carry the
-//! full table.
-//!
-//! This narrows `poll.rs:1503-1580` rather than contradicting it: every
-//! connection on that test's cost list is a paged one, so its figures were
-//! right about the query it measured. The rule to apply before adding a
-//! field here is therefore "does it take `first:`", and `MEASURED_*` below
-//! records what was measured rather than what was assumed.
+//! Retained independently of PR Stats: review gates, stack reads, and
+//! worktree classification use this accumulator and its rate-limit reserve.
+//! Concurrent responses retain the lowest remaining balance and latest reset.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -656,7 +598,7 @@ impl Budget {
     /// Requests that carried no `rateLimit` object.
     ///
     /// Should be zero: every stats query selects it, and
-    /// `tests::every_stats_query_meters_itself` fails CI if one stops.
+    /// `tests::every_query_meters_itself` fails CI if one stops.
     /// Non-zero at runtime means a request failed before GitHub answered,
     /// or a query was added without the field -- and either way the
     /// accumulated spend UNDERSTATES the truth, which is the direction
@@ -1181,7 +1123,7 @@ pub(crate) mod tests {
     /// different moments.
     #[test]
     fn the_reserve_matches_the_existing_low_budget_warning() {
-        let src = include_str!("../client.rs");
+        let src = include_str!("client.rs");
         assert!(
             src.contains("remaining < 500"),
             "client.rs no longer warns at 500; RESERVE must move with it"
@@ -1244,11 +1186,7 @@ pub(crate) mod tests {
     /// metering guard for exactly the reason `VIEWER_QUERY` did. Derived
     /// SUBJECTS with an enumerated FILE list is only half a derivation.
     pub(crate) fn every_query_document() -> Vec<(&'static str, String, String)> {
-        let files = [
-            ("query.rs", include_str!("../query.rs")),
-            ("stats/query.rs", include_str!("query.rs")),
-            ("stats/tree.rs", include_str!("tree.rs")),
-        ];
+        let files = [("query.rs", include_str!("query.rs"))];
         let mut out = Vec::new();
         for (file, src) in files {
             for kind in ["pub const ", "pub fn "] {
@@ -1292,13 +1230,13 @@ pub(crate) mod tests {
     /// recorded at all, so `points` understated while `is_exact()` still
     /// returned true. That is what `budget.rs:252-255` forbids.
     #[test]
-    fn every_stats_query_meters_itself() {
+    fn every_query_meters_itself() {
         let docs = every_query_document();
         // The scan is asserted to have FOUND something, so a rename that
         // breaks the pattern fails loudly rather than passing vacuously over
         // an empty list -- which is how a derived guard dies quietly.
         assert!(
-            docs.len() >= 10,
+            docs.len() >= 8,
             "only {} query documents found; the scan is broken, not the \
              documents",
             docs.len()
@@ -1346,38 +1284,6 @@ pub(crate) mod tests {
             "VIEWER_QUERY is not a named document any more -- inlining it back \
              into client.rs puts it outside every guard in this file, which is \
              exactly how it came to be unmetered (#844)"
-        );
-    }
-
-    /// `fetch_viewer`'s point is RECORDED, not merely askable.
-    ///
-    /// Selecting `rateLimit` is half the fix; the other half is that somebody
-    /// calls `record`. The defect was both: the document did not ask, and the
-    /// call happened before `Budget::new()` so there was nothing to ask on
-    /// behalf of. A stats command calling plain `fetch_viewer` instead of
-    /// `fetch_viewer_metered` would reintroduce the second half while the
-    /// guard above still passed.
-    #[test]
-    fn the_stats_commands_meter_their_viewer_lookup() {
-        let src = include_str!("../../commands.rs");
-        // The stats commands, which are the ones inside a budgeted load.
-        // `get_viewer`, the remote gate and startup have no accumulator to
-        // report into and are outside this file.
-        let stats_region = src
-            .find("pub async fn stats_count")
-            .expect("stats_count not found in commands.rs");
-        let region = &src[stats_region..];
-        let plain = region.matches("fetch_viewer()").count();
-        assert_eq!(
-            plain, 0,
-            "{plain} stats command(s) call plain `fetch_viewer()`, which spends \
-             a rate-limit point outside any accumulator -- `Spend.points` would \
-             understate by one while `is_exact()` returned true (#844). Use \
-             `fetch_viewer_metered(&budget)`."
-        );
-        assert!(
-            region.matches("stats_viewer_metered(&budget)").count() >= 3,
-            "both stats commands that resolve the viewer must meter it"
         );
     }
 }

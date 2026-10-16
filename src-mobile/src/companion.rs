@@ -1378,13 +1378,13 @@ mod tests {
     async fn calls_are_forwarded_and_destructive_ones_carry_the_signature() {
         let (server, _, _, c) = paired().await;
         server.reply(
-            "/v1/call/get_stats",
-            Reply::json(200, json!({"merged_week": 3})),
+            "/v1/call/get_viewer",
+            Reply::json(200, json!("synthetic-viewer")),
         );
         server.reply("/v1/call/remove_orphan", Reply::json(200, json!(null)));
         assert_eq!(
-            c.call("get_stats", json!({})).await.unwrap(),
-            json!({"merged_week": 3})
+            c.call("get_viewer", json!({})).await.unwrap(),
+            json!("synthetic-viewer")
         );
         assert_eq!(
             c.call("remove_orphan", json!({"path": "/srv/x"}))
@@ -1393,11 +1393,11 @@ mod tests {
             json!(null)
         );
         let reqs = server.requests();
-        let stats = reqs
+        let read = reqs
             .iter()
-            .find(|r| r.path == "/v1/call/get_stats")
+            .find(|r| r.path == "/v1/call/get_viewer")
             .unwrap();
-        assert_eq!(stats.header("x-headstate-signature"), None);
+        assert_eq!(read.header("x-headstate-signature"), None);
         let rm = reqs
             .iter()
             .find(|r| r.path == "/v1/call/remove_orphan")
@@ -1477,12 +1477,12 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("actions are disabled"));
         // Other reads are attempted and fail honestly.
-        let err = c.call("get_stats", json!({})).await.unwrap_err();
+        let err = c.call("get_viewer", json!({})).await.unwrap_err();
         assert!(err.starts_with("octocat's laptop is unreachable:"), "{err}");
         let err = c
             .call(
-                "stats_demand",
-                json!({"request":{"op":"renew","handle":"fixture","sequence":1}}),
+                "claude_transcript_watch",
+                json!({"path":"/fixture/session.jsonl"}),
             )
             .await
             .unwrap_err();
@@ -1536,7 +1536,7 @@ mod tests {
         server.revoke(&server.requests()[0].peer_fp);
         server.end_streams();
         loop {
-            if c.call("get_stats", json!({})).await.is_err() {
+            if c.call("get_viewer", json!({})).await.is_err() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1554,7 +1554,7 @@ mod tests {
         // Whichever notices first -- the subscriber's next hello or this
         // call -- the outcome is the same state.
         let err = loop {
-            match c.call("get_stats", json!({})).await {
+            match c.call("get_viewer", json!({})).await {
                 Err(e) => break e,
                 Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             }
@@ -1566,7 +1566,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            c.call("get_stats", json!({})).await.unwrap_err(),
+            c.call("get_viewer", json!({})).await.unwrap_err(),
             "octocat's laptop no longer recognises this phone; pair again"
         );
         // The record and the name stay for the banner until re-pairing.
@@ -1607,8 +1607,8 @@ mod tests {
         }
         // One call first, so the fresh client has its address and the
         // slow call below sends no `hello` of its own to be miscounted.
-        server.reply("/v1/call/get_stats", Reply::json(200, json!({"ok": 1})));
-        c.call("get_stats", json!({})).await.unwrap();
+        server.reply("/v1/call/get_viewer", Reply::json(200, json!({"ok": 1})));
+        c.call("get_viewer", json!({})).await.unwrap();
         let streams = |s: &TestServer| {
             s.requests()
                 .iter()
@@ -1638,7 +1638,7 @@ mod tests {
         );
         // And the connection still serves other calls.
         assert_eq!(
-            c.call("get_stats", json!({})).await.unwrap(),
+            c.call("get_viewer", json!({})).await.unwrap(),
             json!({"ok": 1})
         );
     }
@@ -1683,7 +1683,7 @@ mod tests {
         );
         server.reply("/v1/events", Reply::sse(&[("prs-updated", "[]")], true));
         server.reply(
-            "/v1/call/get_stats",
+            "/v1/call/get_viewer",
             Reply::json(200, json!({"merged_week": 1})),
         );
         let qr = server.qr(&token(), Utc::now().timestamp() + 120);
@@ -1697,7 +1697,7 @@ mod tests {
         assert!(report.stale, "old desktop: shown as stale");
 
         // The read is refused, and names the desktop and the reason.
-        let err = c.call("get_stats", json!({})).await.unwrap_err();
+        let err = c.call("get_viewer", json!({})).await.unwrap_err();
         assert!(
             err.starts_with("octocat's laptop runs an older Headstate"),
             "a read against an old desktop must be refused: {err}"
@@ -1714,7 +1714,10 @@ mod tests {
         );
 
         let err = c
-            .call("stats_demand", json!({"request":{"op":"acquire"}}))
+            .call(
+                "claude_transcript_watch",
+                json!({"path":"/fixture/session.jsonl"}),
+            )
             .await
             .unwrap_err();
         assert!(err.starts_with("octocat's laptop runs an older Headstate"));
@@ -1744,12 +1747,12 @@ mod tests {
     async fn a_current_desktop_still_serves_reads() {
         let (server, _store, _rec, c) = paired().await;
         server.reply(
-            "/v1/call/get_stats",
-            Reply::json(200, json!({"merged_week": 3})),
+            "/v1/call/get_viewer",
+            Reply::json(200, json!("synthetic-viewer")),
         );
         assert_eq!(
-            c.call("get_stats", json!({})).await.unwrap(),
-            json!({"merged_week": 3}),
+            c.call("get_viewer", json!({})).await.unwrap(),
+            json!("synthetic-viewer"),
             "a desktop on the current protocol must still answer reads"
         );
     }

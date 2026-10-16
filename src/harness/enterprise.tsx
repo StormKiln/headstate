@@ -12,8 +12,6 @@ import type { SourceRefreshSnapshot } from '../api/sourceRefresh';
 import { PrList } from '../components/PrList';
 import { ReadyStrip } from '../components/ReadyStrip';
 import { PrDetailView } from '../components/PrDetailView';
-import { StatsPage } from '../components/StatsPage';
-import { useFilters } from '../store/filters';
 import type { PullRequest } from '../types/pr';
 import { telemetry, boundedPush, measurement } from './enterpriseTransport';
 import '../index.css';
@@ -32,7 +30,6 @@ const probe={sourceEvidence:()=>renderedSource,advisoryPublications,readyEligibi
  return {kind:query.queryKey[0],syntheticNumber:['ready-pushers','ready-stack'].includes(String(query.queryKey[0]))?JSON.parse(JSON.parse(String(query.queryKey[3]))[0])[3]:undefined,status:query.state.status,fetchStatus:query.state.fetchStatus,observers:query.getObserversCount(),schedule:schedule?{lastAdmittedAt:schedule.lastAdmittedAt,hasContinuation:schedule.hasContinuation,resumeBoostSpent:schedule.resumeBoostSpent,preferred:[...(schedule.claims?.values()??[])].some(Boolean)}:undefined,
   evidence:{pusher:freshness('pusher',(value?.row as {last_pusher?:{state:string}}|undefined)?.last_pusher?.state==='known'),rules:freshness('rules',(value?.row as {rules?:{state:string}}|undefined)?.rules?.state==='read'),stack:freshness('lastKnown',(value?.stack as {kind:string}|undefined)?.kind==='none')},
   measuredPusher:!!value?.pusher,measuredRules:!!value?.rules,measuredStack:!!value?.lastKnown,
-  ...(query.queryKey[0]==='stats-board'?{owner:value?.owner,viewer:value?.viewer,scopeKey:value?.scopeKey,days:query.queryKey[3],daysCovered:value?.daysCovered,daysTotal:value?.daysTotal,total:value?.total,retrieved:value?.retrieved,complete:value?.complete,accumulated:value?.accumulated,rows:value?.rows,repoCounts:value?.repoCounts,window:value?.window,stream:value?.stream,backfill:value?.backfill}:{}),
  };
 }),measurement,commits,longTasks,telemetry,started:performance.now(),firstUsefulQueue:null as number|null,fullQueue:null as number|null,refreshReviewing:()=>refreshWithState(client,'reviewing'),refreshQueues:()=>Promise.allSettled(['authored','reviewing'].map(list=>refreshWithState(client,list as 'authored'|'reviewing'))),refreshDetail:()=>client.invalidateQueries({queryKey:["pr-detail"]})};
 declare global {interface Window {__enterprise:typeof probe}}
@@ -51,7 +48,6 @@ client.getQueryCache().subscribe(event=>{
   freshRules:value?.row?.rules.state==='read'&&(value.rules?.expiresAt??0)>at,
   freshStack:value?.stack?.kind==='none'&&(value.lastKnown?.expiresAt??0)>at});
 });
-useFilters.getState().setStatsScope('org','synthetic-lab',undefined);
 export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
@@ -67,9 +63,9 @@ export function Workload(){
  const readyRows=completionProbe?(reviewing.data??[]).filter(row=>row.number>=first&&row.number<first+16):(reviewing.data??[]);
  const [selected,select]=useState<PullRequest|null>(null);const [view,setView]=useState(completionProbe?'idle':'reviewing');
  return <main className="min-h-screen bg-[#0d1117] p-5 text-[#c9d1d9]">
-  <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button><button onClick={()=>setView('stats')}>Statistics</button></nav>
+  <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button></nav>
   <output data-testid="counts">Authored {authored.data?.length??'unknown'} / Reviewing {reviewing.data?.length??'unknown'}</output>
-  {view==='idle'?null:view==='stats'?<StatsPage/>:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
+  {view==='idle'?null:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
   {convergenceScenario&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
   {convergenceScenario?<footer data-testid="inventory-footer" className="flex gap-3 text-xs"><GitHubQueueFreshness github={{list:"reviewing",receipt:source}}/></footer>:null}
  </main>;

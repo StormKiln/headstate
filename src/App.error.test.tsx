@@ -23,9 +23,6 @@ vi.mock("./api/hooks", async (orig) => {
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
   useReviewing: () => ({ data: [], isLoading: false }),
-    usePeriods: () => ({ data: undefined, isLoading: true }),
-    useHistory: () => ({ data: undefined, isLoading: true }),
-    useMergedDetail: () => ({ data: undefined, isLoading: true }),
   };
 });
 

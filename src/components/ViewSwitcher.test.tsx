@@ -86,14 +86,6 @@ describe("ViewSwitcher", () => {
     expect(screen.queryByRole("menuitem", { name: /claude code/i })).toBeNull();
   });
 
-  it("offers PR Stats first", () => {
-    expect(VIEWS[0].id).toBe("pr-stats");
-    expect(VIEWS[0].label).toBe("PR Stats");
-    // And the non-pull-request view stays last, which is the other half of
-    // the ordering rule both lists record.
-    expect(VIEWS[VIEWS.length - 1].id).toBe("system-health");
-  });
-
   beforeEach(() => {
     // The pre-fetch shape, which is what this block was written against.
     uiPrefs = undefined;

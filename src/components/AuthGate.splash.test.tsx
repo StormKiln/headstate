@@ -21,10 +21,6 @@ vi.mock("../api/tauri", async (orig) => ({
   getGitLabAuthState: () => Promise.resolve({ host: "gitlab.com", ok: false, issue: "unverified", message: "" }),
   getCached: () => Promise.resolve([]),
   refreshNow: () => Promise.reject(new Error("no auth")),
-  getStats: () => Promise.reject(new Error("no auth")),
-  getHistory: () => Promise.reject(new Error("no auth")),
-  getMergedDetail: () => Promise.reject(new Error("no auth")),
-  getPeriods: () => Promise.reject(new Error("no auth")),
 }));
 
 vi.mock("../api/hooks", async (orig) => ({

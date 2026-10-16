@@ -7,14 +7,12 @@ import { describe, expect, it } from "vitest";
 import artifactsRs from "../../src-tauri/src/artifacts/mod.rs?raw";
 import cleanupRs from "../../src-tauri/src/cleanup.rs?raw";
 import alertsRs from "../../src-tauri/src/health/alerts.rs?raw";
-import boardRs from "../../src-tauri/src/github/stats/board.rs?raw";
 import companionRs from "../../src-mobile/src/companion.rs?raw";
 import errorKindRs from "../../src-tauri/src/remote/error_kind.rs?raw";
 import eventsRs from "../../src-tauri/src/remote/events.rs?raw";
 import { ACTIVE_SECS } from "@/components/ArtifactsPage";
 import { ACTIVITY_DAYS } from "@/components/ClaudeOverviewPage";
 import { PLUGIN_ACTIVITY_DAYS } from "@/components/ClaudePluginsPage";
-import { TOP_N } from "@/components/stats/Leaderboard";
 import { ERROR_KINDS, commandError } from "./errorKind";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
@@ -212,16 +210,6 @@ describe("the health gap rule", () => {
 ///
 /// `branchName.test.ts` ↔ `apply.rs` is the pattern being copied: assert
 /// the literal, not the symbol.
-describe("the leaderboard cut", () => {
-  it("is the same number the Rust side truncates at", () => {
-    const rustTopN = rustConst(boardRs, "TOP_N", "github/stats/board.rs");
-    expect(TOP_N).toBe(rustTopN);
-    // The literal as well as the agreement, so a coordinated change to
-    // both sides still has to be a deliberate one. #826 says top five.
-    expect(TOP_N).toBe(5);
-  });
-});
-
 /// 5. The biometric-cancel marker, which existed in three hand-written
 /// copies: `companion.rs:43`, `cancelled.ts:4`, and a THIRD in
 /// `cancelled.test.ts` that compared copy 2 to copy 3 and so could never

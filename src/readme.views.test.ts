@@ -49,7 +49,6 @@ describe("the README documents every view", () => {
   /// below fails if this map and the canonical list ever disagree, so a
   /// new view cannot be silently exempted by leaving it out here.
   const HEADING: Record<(typeof ALL_VIEWS)[number], string> = {
-    "pr-stats": "PR Stats",
     "my-prs": "Pull request list",
     "to-review": "Unresolved conversations",
     worktrees: "Worktrees",

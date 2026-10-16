@@ -18,7 +18,6 @@ pub(super) struct ReadTransport {
     diagnostics: Diagnostics,
     pub(super) measurement: Option<std::sync::Arc<crate::measurement::Recorder>>,
     pub(super) admission: Admission,
-    pub(super) stats_measurement: crate::stats_measurement::Tracker,
 }
 
 impl std::fmt::Debug for ReadTransport {
@@ -109,7 +108,7 @@ enum Read<'a> {
     Graphql(&'a Value),
     Rest {
         path: &'a str,
-        budget: &'a crate::github::stats::Budget,
+        budget: &'a crate::github::budget::Budget,
     },
 }
 
@@ -164,7 +163,7 @@ impl ReadTransport {
         &self,
         client: &Octocrab,
         path: &str,
-        budget: &crate::github::stats::Budget,
+        budget: &crate::github::budget::Budget,
         context: ReadContext,
     ) -> Result<Value, ClientError> {
         self.read(client, Read::Rest { path, budget }, "rest-read", context)

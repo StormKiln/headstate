@@ -124,7 +124,7 @@ test("reachable nested type and wrapper sabotage invalidate generated output", (
   const actual = readFileSync(generatedPath, "utf8");
   for (const [path, before, after] of [
     ["src/types/pr.ts", "export interface PullRequest extends PrIdentity {", "export interface PullRequest extends PrIdentity { sabotage_required: string;"],
-    ["src/api/tauri.ts", 'call<History>("get_history"', 'call<string>("get_history"'],
+    ["src/api/tauri.ts", 'call<PrDetail>("get_pr_detail"', 'call<string>("get_pr_detail"'],
   ]) {
     const original = read(path);
     assert(original.includes(before));

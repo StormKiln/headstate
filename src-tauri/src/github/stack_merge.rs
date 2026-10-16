@@ -17,8 +17,8 @@
 //! budget runs out is `InProgress`, never `Failed` -- "we stopped watching"
 //! is not "it did not work".
 
+use super::budget::Budget;
 use super::client::GitHubClient;
-use super::stats::Budget;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;

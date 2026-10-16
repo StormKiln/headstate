@@ -438,7 +438,7 @@ async fn call_refuses_what_the_allowlist_and_the_body_rule_out() {
     assert_eq!(revoke.status, 403, "a phone cannot revoke a phone");
 
     let not_json = desktop
-        .call(&phone, "get_history", &[], Some("days=14"))
+        .call(&phone, "get_pr_detail", &[], Some("days=14"))
         .await;
     assert_eq!(not_json.status, 400);
     assert!(not_json.body.starts_with("request body is not JSON"));
@@ -477,10 +477,10 @@ async fn call_refuses_what_the_allowlist_and_the_body_rule_out() {
     assert_eq!(declined["kind"], "not-asked");
     assert_eq!(declined["message"], crate::commands::AUTH_ERR);
     *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::BadArgs {
-        command: "get_history".into(),
+        command: "get_pr_detail".into(),
         message: "missing required argument `days`".into(),
     });
-    let bad_args = desktop.call(&phone, "get_history", &[], None).await;
+    let bad_args = desktop.call(&phone, "get_pr_detail", &[], None).await;
     assert_eq!(bad_args.status, 400);
 
     desktop.handle.stop().await;
@@ -1445,7 +1445,7 @@ async fn actual_listener_preserves_distinct_and_irreversibly_retired_pairing_con
             desktop
                 .call(
                     phone,
-                    "stats_demand",
+                    "get_auth_state",
                     &[],
                     Some(r#"{"request":{"op":"acquire","principal":"forged","days":7}}"#)
                 )
@@ -1468,7 +1468,7 @@ async fn actual_listener_preserves_distinct_and_irreversibly_retired_pairing_con
         .await;
     assert_eq!(
         desktop
-            .call(&first, "stats_demand", &[], Some("{}"))
+            .call(&first, "get_auth_state", &[], Some("{}"))
             .await
             .status,
         200
@@ -1483,62 +1483,6 @@ async fn actual_listener_preserves_distinct_and_irreversibly_retired_pairing_con
         .clone();
     assert_ne!(fresh.principal(), contexts[0].principal());
     assert!(contexts[0].guard().is_err());
-    // Exercise the actual registry with capabilities admitted by the mTLS
-    // listener. A newly paired same certificate cannot renew its old handle.
-    let owner = crate::store::stats_owner::capture_verified(&desktop.conn, "fixture").unwrap();
-    let tx = rusqlite::Transaction::new_unchecked(
-        &desktop.conn,
-        rusqlite::TransactionBehavior::Immediate,
-    )
-    .unwrap();
-    let registry = crate::stats_demand::Registry::default();
-    let scope = crate::store::pr_backfill_scope::BackfillScope {
-        scope_key: "merged|*|org:fixture".into(),
-        scope_kind: "org".into(),
-        scope_value: "fixture".into(),
-        measure: "merged".into(),
-        horizon_days: 7,
-    };
-    assert!(registry
-        .acquire(
-            &tx,
-            &owner,
-            &contexts[0],
-            scope.clone(),
-            std::time::Instant::now(),
-            false
-        )
-        .is_err());
-    let lease = registry
-        .acquire(
-            &tx,
-            &owner,
-            &contexts[1],
-            scope,
-            std::time::Instant::now(),
-            false,
-        )
-        .unwrap();
-    assert!(registry
-        .update(
-            &tx,
-            &fresh,
-            &lease.handle,
-            1,
-            true,
-            std::time::Instant::now()
-        )
-        .is_err());
-    assert!(registry
-        .update(
-            &tx,
-            &contexts[1],
-            &lease.handle,
-            1,
-            false,
-            std::time::Instant::now()
-        )
-        .is_ok());
 }
 
 #[tokio::test]
@@ -1581,20 +1525,18 @@ async fn privacy_write_with_failed_reload_refuses_real_listener_before_host_disp
     assert!(desktop.host.calls.lock().unwrap().is_empty());
     assert_eq!(
         desktop
-            .call(&phone, "stats_demand", &[], Some("{}"))
+            .call(&phone, "get_auth_state", &[], Some("{}"))
             .await
             .status,
         200
     );
 }
 
-struct HeldDemandHost {
-    registry: Arc<crate::stats_demand::Registry>,
-    db: std::path::PathBuf,
+struct HeldReadHost {
     started: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
-impl CommandHost for HeldDemandHost {
+impl CommandHost for HeldReadHost {
     fn dispatch<'a>(
         &'a self,
         _command: &'a str,
@@ -1605,38 +1547,10 @@ impl CommandHost for HeldDemandHost {
         Box::pin(async move {
             self.started.notify_one();
             self.resume.notified().await;
-            let mut conn = crate::store::open_db(&self.db).map_err(|e| {
-                RemoteError::Command(crate::remote::error_kind::CommandError::classify(
-                    e.to_string(),
-                ))
+            let _guard = context.guard().map_err(|e| {
+                RemoteError::Command(crate::remote::error_kind::CommandError::classify(e))
             })?;
-            let owner = crate::store::stats_owner::current_for_verified(&conn, "fixture")
-                .unwrap()
-                .unwrap();
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            let lease = self
-                .registry
-                .acquire(
-                    &tx,
-                    &owner,
-                    context,
-                    crate::store::pr_backfill_scope::BackfillScope {
-                        scope_key: "merged|*|org:fixture".into(),
-                        scope_kind: "org".into(),
-                        scope_value: "fixture".into(),
-                        measure: "merged".into(),
-                        horizon_days: 1,
-                    },
-                    std::time::Instant::now(),
-                    false,
-                )
-                .map_err(|e| {
-                    RemoteError::Command(crate::remote::error_kind::CommandError::classify(e))
-                })?;
-            tx.commit().unwrap();
-            Ok(serde_json::to_value(lease).unwrap())
+            Ok(serde_json::json!({"ok": true}))
         })
     }
     fn notify_destructive(&self, _device_name: &str, _command: &str) {}
@@ -1644,13 +1558,7 @@ impl CommandHost for HeldDemandHost {
 
 #[tokio::test]
 async fn revoke_fences_a_request_already_admitted_by_the_real_listener() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("demand.db");
-    crate::store::stats_owner::capture_verified(&crate::store::open_db(&db).unwrap(), "fixture")
-        .unwrap();
-    let host = Arc::new(HeldDemandHost {
-        registry: Arc::new(crate::stats_demand::Registry::default()),
-        db,
+    let host = Arc::new(HeldReadHost {
         started: tokio::sync::Notify::new(),
         resume: tokio::sync::Notify::new(),
     });
@@ -1665,7 +1573,7 @@ async fn revoke_fences_a_request_already_admitted_by_the_real_listener() {
             Some(&cert),
             &fp,
             "POST",
-            "/v1/call/stats_demand",
+            "/v1/call/get_auth_state",
             &[],
             Some("{}"),
         )
@@ -1686,5 +1594,4 @@ async fn revoke_fences_a_request_already_admitted_by_the_real_listener() {
     if let Ok(reply) = result {
         assert_ne!(reply.status, 200);
     }
-    assert!(!host.registry.has_live_interest(std::time::Instant::now()));
 }

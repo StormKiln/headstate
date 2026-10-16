@@ -782,7 +782,7 @@ mod tests {
         use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, ResponseTemplate};
         // Cold start, scoped to this test: no shared budget figure read or written.
-        let _scope = crate::github::stats::budget::scoped::enter(u64::MAX);
+        let _scope = crate::github::budget::scoped::enter(u64::MAX);
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -812,7 +812,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         // Cold start, scoped to this test: no shared budget figure read or written.
-        let _scope = crate::github::stats::budget::scoped::enter(u64::MAX);
+        let _scope = crate::github::budget::scoped::enter(u64::MAX);
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -876,7 +876,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         // Cold start, scoped to this test: no shared budget figure read or written.
-        let _scope = crate::github::stats::budget::scoped::enter(u64::MAX);
+        let _scope = crate::github::budget::scoped::enter(u64::MAX);
         let server = wiremock::MockServer::start().await;
         // Answers every alias a chunk can hold with one merged PR, so
         // both chunks' branches must land.

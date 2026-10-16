@@ -84,7 +84,7 @@ const EMPTY = {
   packages: {},
   "claude-md": {},
   "claude-code": {},
-  "pr-stats": {},
+
   repositories: {},
   "system-health": {},
 } as const;

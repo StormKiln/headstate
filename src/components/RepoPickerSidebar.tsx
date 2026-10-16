@@ -67,6 +67,7 @@ export function RepoPickerSidebar({
     // `= []` as `WorktreesPage` explains: a pre-#951 test double mocks
     // only what it needs, and absent reads the same as empty here.
     unreadable = [],
+    diagnostics,
   } = useWorktrees();
   // The scan's INPUT, not its output (#952). Everything above says what
   // the walk found; only this says whether the walk had anywhere to go.
@@ -212,6 +213,8 @@ export function RepoPickerSidebar({
         {!isLoading && !isError ? (
           <PartialScanNotice
             unreadable={unreadable}
+            diagnostics={diagnostics}
+            compact
             consequence={
               repos.length === 0
                 ? "no repository could be listed from them."

@@ -78,7 +78,7 @@ export function AllRepositoriesTable() {
   // `isError` and `refetch` as well as the data (#846) -- and
   // `unreadable`, which is the whole of #1028's requirement now that the
   // reporting form exists.
-  const { data, unreadable, isLoading, isError, error, refetch } = useWorktrees();
+  const { data, unreadable, diagnostics, isLoading, isError, error, refetch } = useWorktrees();
 
   const scanned = useMemo(() => repoOverviewRows(data ?? []), [data]);
 
@@ -170,6 +170,7 @@ export function AllRepositoriesTable() {
           change (#951, #1028). */}
       <PartialScanNotice
         unreadable={unreadable}
+        diagnostics={diagnostics}
         consequence="this table is a floor rather than a complete census"
       />
       {/* A VISIBLE heading, not only the caption below (#1015).
@@ -193,7 +194,7 @@ export function AllRepositoriesTable() {
           repository -- this table's currency column is minutes old by the
           time the button is pressed, and it is a reason to OFFER the
           action, never the basis for performing it. */}
-      <UpdateAllButton count={rows.length} unreadable={unreadable} />
+      <UpdateAllButton count={rows.length} unreadable={unreadable} expectedPaths={rows.map((row) => row.path)} />
       <table className="w-full border-collapse text-sm">
         <caption className="sr-only">
           Every repository found in the scanned folders, and how its main checkout stands against

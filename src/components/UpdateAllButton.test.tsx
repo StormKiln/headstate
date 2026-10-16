@@ -46,15 +46,15 @@ describe("UpdateAllButton", () => {
   /// acting, because the table's currency column is minutes old by the
   /// time the button is pressed -- a reason to OFFER the action, never
   /// the basis for performing it.
-  it("asks the desktop to work out the set rather than sending the table's verdict", async () => {
+  it("supports legacy callers without a displayed scope snapshot", async () => {
     const run = vi.fn().mockResolvedValue(report());
     useUpdateAllRepositories.mockReturnValue(run);
     render(<UpdateAllButton count={3} unreadable={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     await waitFor(() => expect(run).toHaveBeenCalled());
-    expect(run).toHaveBeenCalledWith();
+    expect(run).toHaveBeenCalledWith(undefined);
   });
 
   /// THE cancellation test at the UI layer (#1016). Stop appears only
@@ -80,7 +80,7 @@ describe("UpdateAllButton", () => {
     // does nothing would be its own small lie.
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
     const stop = await screen.findByRole("button", { name: /stop/i });
 
     fireEvent.click(stop);
@@ -118,7 +118,7 @@ describe("UpdateAllButton", () => {
     );
     render(<UpdateAllButton count={2} unreadable={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     expect((await screen.findByRole("status")).textContent).toBe("Updated 1 · 1 already level");
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
@@ -146,7 +146,7 @@ describe("UpdateAllButton", () => {
     );
     render(<UpdateAllButton count={2} unreadable={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     expect(await screen.findByText("/code/a")).not.toBeNull();
     expect(screen.getByText(/could not resolve host github\.com/)).not.toBeNull();
@@ -165,9 +165,9 @@ describe("UpdateAllButton", () => {
     useUpdateAllRepositories.mockReturnValue(vi.fn());
     render(<UpdateAllButton count={42} unreadable={["/work: permission denied"]} />);
 
-    const button = screen.getByRole("button", { name: /update 42 readable repositories/i });
+    const button = screen.getByRole("button", { name: /update 42 repositories/i });
     expect(button.hasAttribute("disabled")).toBe(false);
-    expect(screen.queryByRole("button", { name: /update all repositories/i })).toBeNull();
+    expect(button.textContent).not.toContain("readable");
   });
 
   /// The scope of the promise is on the button, not discovered in the
@@ -188,7 +188,7 @@ describe("UpdateAllButton", () => {
     );
     render(<UpdateAllButton count={5} unreadable={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("an update run is already going"));
     expect(screen.queryByRole("status")).toBeNull();
@@ -204,9 +204,64 @@ describe("UpdateAllButton", () => {
     useUpdateAllProgress.mockReturnValue({ done: 7, total: 45 });
     render(<UpdateAllButton count={45} unreadable={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /update all repositories/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     expect(await screen.findByText(/Updating 7 of 45/)).not.toBeNull();
     finish(report());
   });
+});
+
+
+describe("bounded completion details", () => {
+  it("keeps thousands of scan notices collapsed and distinguishes them from update errors", async () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn().mockResolvedValue(report({
+      outcomes: [out("/code/actual", { state: "alreadyLevel" })],
+      unreadable: Array.from({ length: 1385 }, (_, i) => `/generated/${i}: discovery depth limit reached`),
+    })));
+    const { container } = render(<UpdateAllButton count={1} unreadable={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update 1 repository" }));
+    expect(await screen.findByText(/1 already level/)).toBeTruthy();
+    expect(container.querySelectorAll("li")).toHaveLength(0);
+    expect(screen.queryByText(/1385 directories could not be read/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(container.querySelectorAll("li").length).toBeLessThanOrEqual(50);
+    expect(screen.getByRole("list", { name: "Scan diagnostics" })).toBeTruthy();
+  });
+
+  it("bounds repository outcomes while keeping later failures accessible", async () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn().mockResolvedValue(report({
+      outcomes: Array.from({ length: 151 }, (_, i) => out(`/code/repo-${i}`, { state: "failed", error: "offline" })),
+    })));
+    const { container } = render(<UpdateAllButton count={151} unreadable={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update 151 repositories" }));
+    await screen.findByText(/151 could not be reached/);
+    expect(container.querySelectorAll("li")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /Show failed repositories/ }));
+    expect(container.querySelectorAll("li")).toHaveLength(50);
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }));
+    expect(screen.getByText("/code/repo-50")).toBeTruthy();
+  });
+});
+
+
+it("sends the displayed repository scope without cached safety verdicts", async () => {
+  const run = vi.fn().mockResolvedValue(report());
+  useUpdateAllRepositories.mockReturnValue(run);
+  render(<UpdateAllButton count={2} unreadable={[]} expectedPaths={["/code/a", "/code/b"]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Update 2 repositories" }));
+  await waitFor(() => expect(run).toHaveBeenCalledWith(["/code/a", "/code/b"]));
+});
+
+
+it("distinguishes discovery from repository update progress", async () => {
+  let finish!: (value: UpdateAllReport) => void;
+  useUpdateAllRepositories.mockReturnValue(vi.fn(() => new Promise<UpdateAllReport>(resolve => { finish = resolve; })));
+  const { rerender } = render(<UpdateAllButton count={2} unreadable={[]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Update 2 repositories" }));
+  expect(screen.getByText("Checking repository scope…")).toBeTruthy();
+  useUpdateAllProgress.mockReturnValue({ done: 0, total: 2 });
+  rerender(<UpdateAllButton count={2} unreadable={[]} />);
+  expect(screen.getByText("Updating 0 of 2…")).toBeTruthy();
+  finish(report());
+  await waitFor(() => expect(screen.queryByText("Updating 0 of 2…")).toBeNull());
 });

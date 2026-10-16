@@ -93,36 +93,12 @@ impl DispatchContext {
 mod tests {
     use super::*;
     #[test]
-    fn retirement_and_registry_selection_finish_without_lock_inversion() {
+    fn retirement_waits_for_an_admitted_operation_and_then_refuses_access() {
         let cap = PairingCapability::fresh();
         let context = DispatchContext {
             display_name: "fixture".into(),
             capability: Some(cap.clone()),
         };
-        let registry = Arc::new(crate::stats_demand::Registry::default());
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::store::migrate(&conn).unwrap();
-        let owner = crate::store::stats_owner::capture_verified(&conn, "fixture").unwrap();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
-        let lease = registry
-            .acquire(
-                &tx,
-                &owner,
-                &context,
-                crate::store::pr_backfill_scope::BackfillScope {
-                    scope_key: "merged|*|org:fixture".into(),
-                    scope_kind: "org".into(),
-                    scope_value: "fixture".into(),
-                    measure: "merged".into(),
-                    horizon_days: 1,
-                },
-                std::time::Instant::now(),
-                false,
-            )
-            .unwrap();
-        tx.commit().unwrap();
         let held = context.guard().unwrap();
         let (started, waiting) = std::sync::mpsc::channel();
         let retire = std::thread::spawn(move || {
@@ -132,35 +108,8 @@ mod tests {
         waiting
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let (done, finished) = std::sync::mpsc::channel();
-        let querying = registry.clone();
-        let query = std::thread::spawn(move || {
-            done.send(querying.has_live_interest(std::time::Instant::now()))
-                .unwrap();
-        });
         drop(held);
         retire.join().unwrap();
-        finished
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        query.join().unwrap();
-        assert!(!registry.has_live_interest(std::time::Instant::now()));
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
-        assert!(registry
-            .update(
-                &tx,
-                &context,
-                &lease.handle,
-                1,
-                false,
-                std::time::Instant::now()
-            )
-            .is_err());
-        assert!(registry
-            .pick(&tx, &owner, std::time::Instant::now(), chrono::Utc::now())
-            .unwrap()
-            .is_none());
+        assert!(context.guard().is_err());
     }
 }

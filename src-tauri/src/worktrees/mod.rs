@@ -49,4 +49,6 @@ pub use scan::{
 // -- the same reason `Repo` above carries the allow. A caller that wants
 // to destructure an outcome must be able to name its type.
 #[allow(unused_imports)]
-pub use update::{update_all_with, RepoUpdateOutcome, UpdateAllReport, UpdateResult};
+pub use update::{
+    update_all_with, validate_update_scope, RepoUpdateOutcome, UpdateAllReport, UpdateResult,
+};

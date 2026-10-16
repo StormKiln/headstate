@@ -70,7 +70,7 @@ function render(ui: ReactElement) {
 afterEach(cleanup);
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} } as const;
 
 beforeEach(() =>
   useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" }),

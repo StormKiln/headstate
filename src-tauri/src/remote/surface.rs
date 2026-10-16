@@ -89,65 +89,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
-    ("get_stats", Class::Read),
-    ("get_history", Class::Read),
-    ("get_periods", Class::Read),
-    ("get_cycle_trend", Class::Read),
-    ("get_merged_detail", Class::Read),
-    // The hardened stats layer (#824). A Read: it issues `search` and
-    // `repository.pullRequests` queries and returns counts.
-    //
-    // Exposed because the phone's stats page asks the same questions the
-    // desktop's does, and the alternative is a second copy of the
-    // slicing, metering and concurrency rules in `src-mobile` -- which
-    // is precisely the drift `health_alerts` above refuses for the same
-    // reason. The desktop's wall-clock ceiling and read-concurrency cap
-    // are inside the command, so a phone's `remote_call` inherits both.
-    ("stats_count", Class::Read),
-    // The scope hierarchy the stats sidebar renders (#825). A Read: two
-    // GraphQL lookups returning org, repository and member NAMES, and no
-    // statistics at all.
-    //
-    // Exposed for the same reason `stats_count` is, even though PR Stats is
-    // in `MOBILE_HIDDEN_VIEWS` today: the row classes a command by what it
-    // DOES, not by which screens currently call it, and a Local
-    // classification here would have to be revisited the moment the
-    // companion grows the view. Nothing about enumerating scopes is
-    // desktop-specific -- unlike `reveal_in_finder`, a phone could act on
-    // this answer perfectly well.
-    ("stats_tree", Class::Read),
-    ("gitlab_stats_tree", Class::Read),
-    ("gitlab_stats_load", Class::Read),
-    ("gitlab_stats_backfill", Class::Read),
-    // The per-author board behind the Mine and Others views (#826). A
-    // Read, and the most expensive one in this table: it probes, slices,
-    // and fetches per-PR nodes across a whole scope.
-    //
-    // Classed by what it does rather than by which screens call it, the
-    // same rule `stats_tree` above is classed by. Its wall-clock ceiling,
-    // read-concurrency cap and budget refusal all live INSIDE the command,
-    // so a phone's `remote_call` inherits every one of them -- which is
-    // the property that makes exposing the expensive path safe rather
-    // than a second set of limits to keep in sync.
-    ("stats_board", Class::Read),
-    ("stats_board_cached", Class::Read),
-    // Ephemeral bounded read interest, including mobile read recovery.
-    ("stats_demand", Class::Read),
-    // The scoped daily activity series (#826). A Read, and the cheap half
-    // of a scope page: count-only searches, no nodes.
-    ("stats_series", Class::Read),
-    // The reviews-GIVEN leaderboard (#826, restored by its reopening). A
-    // Read, and the CHEAPEST query on the stats page: one count-only
-    // `reviewed-by:<login>` search per member, all aliased into one request
-    // at 1 point -- measured 0.84-1.04s for this account's real 4-member
-    // org. No nodes, so the ~11s deadline that governs `stats_board`'s
-    // document does not bind it.
-    //
-    // Classed by what it does rather than by which screens call it, the same
-    // rule `stats_tree` above is classed by: a phone could act on a ranking
-    // of reviewers perfectly well, and its budget refusal and wall-clock
-    // ceiling live inside the command.
-    ("stats_reviewers", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
@@ -1132,91 +1073,6 @@ async fn call(
         "refresh_now" => {
             res(commands::refresh_now(app.clone(), app.state(), a.get("requestId")?).await)
         }
-        "get_stats" => res(commands::get_stats(app.state()).await),
-        "get_history" => res(commands::get_history(app.state(), a.get("days")?).await),
-        "get_periods" => res(commands::get_periods(app.state()).await),
-        "get_cycle_trend" => res(commands::get_cycle_trend(app.state()).await),
-        "get_merged_detail" => res(commands::get_merged_detail(app.state()).await),
-        "stats_count" => res(commands::stats_count(
-            app.clone(),
-            app.state(),
-            a.get("subject")?,
-            a.get("scopeKind")?,
-            a.get("scopeValue")?,
-            a.get("measure")?,
-            a.get("days")?,
-        )
-        .await),
-        "stats_tree" => res(commands::stats_tree(app.state()).await),
-        "gitlab_stats_tree" => res(commands::gitlab_stats_tree(app.clone(), a.get("host")?).await),
-        "gitlab_stats_backfill" => res(commands::gitlab_stats_backfill(
-            app.clone(),
-            a.get("host")?,
-            a.get("scope")?,
-            a.get("days")?,
-        )
-        .await),
-        "gitlab_stats_load" => res(commands::gitlab_stats_load(
-            app.clone(),
-            a.get("host")?,
-            a.get("scope")?,
-            a.get("days")?,
-            a.get("refresh")?,
-        )
-        .await),
-        // No `subject`, deliberately, and not an omission: a board asks
-        // about everyone in the scope, and a subject qualifier would render
-        // a leaderboard with one name on it. The viewer's login comes back
-        // IN the answer so the caller can split Mine from Others.
-        "stats_demand" => res(commands::stats_demand_with_context(
-            app.clone(),
-            a.get("request")?,
-            context.clone(),
-        )
-        .await),
-        "stats_board_cached" => res(commands::stats_board_cached(
-            app.clone(),
-            app.state(),
-            a.get("expectedOwner")?,
-            a.get("scopeKind")?,
-            a.get("scopeValue")?,
-            a.get("measure")?,
-            a.get("days")?,
-        )
-        .await),
-        "stats_board" => res(commands::stats_board_with_context(
-            app.clone(),
-            app.state(),
-            a.get("scopeKind")?,
-            a.get("scopeValue")?,
-            a.get("measure")?,
-            a.get("days")?,
-            context.clone(),
-        )
-        .await),
-        "stats_series" => res(commands::stats_series(
-            app.clone(),
-            app.state(),
-            a.get("subject")?,
-            a.get("scopeKind")?,
-            a.get("scopeValue")?,
-            a.get("days")?,
-        )
-        .await),
-        "stats_reviewers" => res(commands::stats_reviewers(
-            app.clone(),
-            app.state(),
-            a.get("scopeKind")?,
-            a.get("scopeValue")?,
-            // A `Vec<String>`, which `Args::get` decodes like any other
-            // shape: the key is the camelCase name the webview sends, and a
-            // missing one is an error naming it rather than a silent empty
-            // list that would produce an empty leaderboard.
-            a.get("logins")?,
-            a.get("days")?,
-            a.get("refresh")?,
-        )
-        .await),
         "get_reviewing" => {
             res(commands::get_reviewing(app.clone(), app.state(), a.get("requestId")?).await)
         }
@@ -1567,7 +1423,9 @@ async fn call(
         // re-derived inside the command, never from the caller. See the
         // command's doc -- a caller-supplied path list would make this a
         // way to pull arbitrary directories.
-        "update_all_repositories" => res(commands::update_all_repositories(app.clone()).await),
+        "update_all_repositories" => {
+            res(commands::update_all_repositories(app.clone(), a.get("expectedPaths")?).await)
+        }
         "cancel_update_all" => res(commands::cancel_update_all(app.state())),
         "fetch_refs" => res(commands::fetch_refs(a.get("path")?).await),
         // Shell out like the other sync Docker commands, so a slow
@@ -2154,5 +2012,30 @@ mod tests {
              calls; removing it would take the pull-request half of the \
              update flow with it"
         );
+    }
+    #[test]
+    fn retired_pr_stats_commands_are_not_remote_capabilities() {
+        for name in [
+            "get_stats",
+            "get_periods",
+            "get_history",
+            "get_cycle_trend",
+            "get_merged_detail",
+            "stats_count",
+            "stats_tree",
+            "stats_board",
+            "stats_board_cached",
+            "stats_demand",
+            "stats_series",
+            "stats_reviewers",
+            "gitlab_stats_tree",
+            "gitlab_stats_load",
+            "gitlab_stats_backfill",
+        ] {
+            assert!(
+                class_of(name).is_none(),
+                "retired command {name} remained callable"
+            );
+        }
     }
 }

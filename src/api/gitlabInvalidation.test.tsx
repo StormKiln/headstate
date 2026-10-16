@@ -7,11 +7,11 @@ import { prKey } from "../lib/prIdentity";
 const ipc = vi.hoisted(() => ({ handler: undefined as undefined | ((event: { payload: PrIdentity }) => void), stop: vi.fn() }));
 vi.mock("./transport", () => ({ listen: vi.fn(async (_name, handler) => { ipc.handler = handler; return ipc.stop; }) }));
 import { useGitLabInvalidation } from "./gitlabInvalidation";
-it("invalidates the changed MR and host statistics, retaining unrelated provider caches", async () => {
+it("invalidates the changed MR retaining unrelated provider caches", async () => {
   const identity: PrIdentity = { source: { provider: "gitlab", host: "gitlab.com" }, repo: "team/app", number: 7 };
   const client = new QueryClient();
-  const affected = [["gitlab-detail", prKey(identity)], ["gitlab-actions", prKey(identity)], ["stats", "gitlab", "gitlab.com", "viewer"]];
-  const unaffected = [["stats", "gitlab", "gitlab.com", "tree", 0], ["prs"], ["stats", "github"], ["stats", "gitlab", "other.example"], ["gitlab-detail", prKey({ ...identity, number: 8 })]];
+  const affected = [["gitlab-detail", prKey(identity)], ["gitlab-actions", prKey(identity)]];
+  const unaffected = [["prs"], ["gitlab-detail", prKey({ ...identity, number: 8 })]];
   for (const key of [...affected, ...unaffected]) client.setQueryData(key, "cached");
   const { unmount } = renderHook(useGitLabInvalidation, { wrapper: ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider> });
   await act(async () => { ipc.handler?.({ payload: identity }); });

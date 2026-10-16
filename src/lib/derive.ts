@@ -1,4 +1,4 @@
-import type { PullRequest, Stats } from "../types/pr";
+import type { PullRequest } from "../types/pr";
 import type { AdviceGrouping } from "./adviceGrouping";
 import { prKey } from "./prIdentity";
 import type { MyPushesMode } from "./readyPusher";
@@ -94,62 +94,11 @@ export interface Filters {
   /// a different question from "can I remove it", and it is the one
   /// that stops a user removing a tree out from under a running agent.
   occupiedOnly?: boolean;
-  /// WHERE a PR Stats question is scoped, mirroring
-  /// `github::stats::scope::Scope` (#827) rather than inventing a parallel
-  /// representation (#825 requirement 7).
-  ///
-  /// `"repo"` carries `owner/name` in `statsScopeValue`, `"org"` and
-  /// `"user"` carry a login, and `"all"` carries nothing. The kind and the
-  /// value are two fields rather than one `"org:acme"`-style string because
-  /// the Rust command takes them as two parameters (`scopeKind`,
-  /// `scopeValue`) -- a packed string would be assembled here and split
-  /// there, which is two places for the grammar to disagree.
-  ///
-  /// `undefined` means no scope has been chosen, which is NOT the same as
-  /// `"all"`: the sidebar has to be able to tell "nothing clicked yet" from
-  /// "the widest scope was deliberately clicked", because only the second
-  /// should highlight a row.
-  statsScopeKind?: "repo" | "org" | "user" | "all";
-  statsScopeValue?: string;
-  /// WHOSE PRs a PR Stats question is about -- a login, mirroring
-  /// `Subject::Login`.
-  ///
-  /// `undefined` is `Subject::Viewer`, which is the default the stats page
-  /// has always answered ("how am I doing?"). A login here is the second
-  /// audience #823 names, reached by clicking a Members row.
-  ///
-  /// Deliberately INDEPENDENT of the scope fields: "this person, in this
-  /// org" is the natural question a member row under an org heading asks,
-  /// and collapsing the two axes into one selection would make it
-  /// unaskable.
-  statsSubject?: string;
+
 }
 
-/// How many filters are narrowing the list.
-///
-/// For the phone's Filters button, which has to say how much is hidden
-/// behind it: the eight controls that sit visibly in a row on a desktop
-/// are collapsed there, so without a count the user cannot tell a bar
-/// that is filtering hard from one that is not filtering at all.
-///
-/// `query` is excluded because the search field stays visible beside the
-/// button and speaks for itself, and `sort`, `readySort` and
-/// `adviceGrouping` because arranging a list is not hiding any of it --
-/// counting any of them would make the badge argue with what the user can
-/// already see. Grouping in particular shows every finding the flat list
-/// does, so a badge saying one filter was active would be a plain lie.
-///
-/// The three `stats*` keys are excluded for the reason `repo` is excluded
-/// from the triage chips below: they are sidebar NAVIGATION, not filters
-/// narrowing a list. They live in `pr-stats`'s filter set because that is
-/// where the per-view store keeps a view's selection, and this bar never
-/// renders on that view -- but a count that would be wrong if it ever did
-/// is a trap, and excluding them costs a line.
 export function activeFilterCount(filters: Filters): number {
   const navigation = new Set<keyof Filters>([
-    "statsScopeKind",
-    "statsScopeValue",
-    "statsSubject",
   ]);
   return (Object.entries(filters) as [keyof Filters, unknown][]).filter(([key, value]) => {
     if (
@@ -573,14 +522,9 @@ export function sortPrs(prs: PullRequest[], sort: Filters["sort"] = "newest"): P
   }
 }
 
-/// Five of the seven `Stats` fields come from the PR list already in
-/// memory, at zero API cost -- the Rust `get_stats` command always returns
-/// zero for these because they are not derivable from a single GitHub
-/// search. Only `merged_week`/`merged_month` are real and stay Rust-side.
-/// Task 17's dashboard must render this, not `get_stats` directly.
 export function deriveStats(
   prs: PullRequest[],
-): Omit<Stats, "merged_week" | "merged_month"> {
+) {
   return {
     in_merge_queue: prs.filter((p) => p.in_merge_queue).length,
     needs_attention: prs.filter(needsAttention).length,

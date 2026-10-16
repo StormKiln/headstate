@@ -2,11 +2,28 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ALL_VIEWS, useFilters } from "./filters";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} } as const;
 const active = () => {
   const s = useFilters.getState();
   return s.filtersByView[s.view];
 };
+
+describe("retired Stats navigation", () => {
+  it.each(["pr-stats", "dashboard"])("restores %s as My PRs and drops its filter bucket", (view) => {
+    const merge = useFilters.persist.getOptions().merge!;
+    const current = { ...useFilters.getState(), view: "my-prs" as const };
+    const restored = merge({ view, filtersByView: { "pr-stats": { statsScopeKind: "org" }, "to-review": { repo: "team/app" } } }, current);
+    expect(restored.view).toBe("my-prs");
+    expect(restored.filtersByView).not.toHaveProperty("pr-stats");
+    expect(restored.filtersByView["to-review"].repo).toBe("team/app");
+    expect(restored.filtersByView[restored.view]).toEqual({});
+  });
+  it("retires a legacy stats panel through the migration chain", () => {
+    const migrated = useFilters.persist.getOptions().migrate!({ view: "my-prs", panel: "stats" }, 2);
+    expect(migrated).toMatchObject({ view: "my-prs" });
+    expect(migrated).not.toHaveProperty("panel");
+  });
+});
 
 describe("useFilters", () => {
   // `density` is reset here with the rest: the preset tests below set it to
@@ -89,36 +106,6 @@ describe("useFilters", () => {
     useFilters.getState().setFilter("staleOnly", true);
     useFilters.getState().reset();
     expect(active()).toEqual({ repo: "octocat/hello-world" });
-  });
-
-  /// "panel is independent of view" is GONE with the axis (#852). With one
-  /// reachable value there is no independence to test: the assertion would
-  /// hold for a constant.
-
-  // #794: PR Stats is reached by `setView`, which clears the selection
-  // and the cursor like any other view change. Pinned because the route
-  // in `App.tsx` puts the PR-detail branch FIRST, so a selection that
-  // survived the switch would render one pull request over the summary.
-  it("switching to PR Stats clears the selected pull request", () => {
-    useFilters.getState().selectPr({ repo: "octocat/hello-world", number: 7 });
-    useFilters.getState().setView("pr-stats");
-    expect(useFilters.getState().selectedPr).toBeNull();
-  });
-
-  // The sidebar decision from #794: PR Stats keeps `RepoSidebar`, so a
-  // click there has to land somewhere. It must not land in My PRs' set,
-  // or picking a repo on one would silently re-filter the other. Nothing
-  // reads `pr-stats.repo` yet -- `StatsPage` is whole-account -- but the
-  // separation is what makes adding a scope later a one-page change
-  // rather than an untangling.
-  it("keeps PR Stats filters separate from My PRs", () => {
-    useFilters.getState().setFilter("repo", "octocat/hello-world");
-    useFilters.getState().setView("pr-stats");
-    expect(active().repo).toBeUndefined();
-    useFilters.getState().setFilter("repo", "some/other-repo");
-    expect(active().repo).toBe("some/other-repo");
-    useFilters.getState().setView("my-prs");
-    expect(active().repo).toBe("octocat/hello-world");
   });
 });
 
@@ -314,18 +301,6 @@ describe("persisted state migration", () => {
     expect(out.filtersByView["my-prs"]).toEqual({ repo: "octocat/hello-world" });
   });
 
-  // Was "maps the old dashboard enum to the stats panel". v2 sent it to
-  // `panel: "stats"` because that was where the page lived; #794 moved
-  // the page to a view, so the destination moved with it -- and #852
-  // removed the axis, so the assertion is now that NO panel survives. A
-  // v1 store has to cross three migrations to get here, and the one thing
-  // it must not arrive carrying is a field the store no longer has.
-  it("maps the old dashboard enum to the PR Stats view", () => {
-    const out = migrate({ filters: {}, view: "dashboard" }, 1);
-    expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBeUndefined();
-  });
-
   it("maps the old reviewing enum to the to-review view", () => {
     const out = migrate({ filters: {}, view: "reviewing" }, 1);
     expect(out.view).toBe("to-review");
@@ -360,15 +335,6 @@ describe("persisted state migration", () => {
 describe("v2 -> v3: the stats panel becomes the PR Stats view", () => {
   const migrate = (useFilters.persist.getOptions().migrate ??
     ((s: unknown) => s)) as (s: unknown, v: number) => Record<string, unknown>;
-
-  it("moves a My PRs store that was showing stats onto the view", () => {
-    const out = migrate(
-      { filtersByView: { "my-prs": { repo: "octocat/hello-world" } }, view: "my-prs", panel: "stats" },
-      2,
-    );
-    expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBeUndefined();
-  });
 
   // The filters are left exactly where they were. PR Stats keeps the
   // repo sidebar but has its OWN entry, so a repo chosen on My PRs
@@ -436,31 +402,5 @@ describe("v2 -> v3: the stats panel becomes the PR Stats view", () => {
   it("removes the key rather than setting it undefined", () => {
     const out = migrate({ filtersByView: {}, view: "docker", panel: "builds" }, 3);
     expect(Object.prototype.hasOwnProperty.call(out, "panel")).toBe(false);
-  });
-
-  // The hazard this whole migration exists for. `filtersByView` is
-  // REPLACED into the store rather than merged, so a v2 store has no key
-  // for a view added later -- and every consumer reads `.repo` off the
-  // result. `merge` is what makes that safe; this asserts it covers the
-  // new id, because the version that did not took the app down with a
-  // black window.
-  it("a v2 store rehydrates with an entry for every view, new ones included", () => {
-    const merge = useFilters.persist.getOptions().merge!;
-    const merged = merge(
-      { filtersByView: { "my-prs": { repo: "octocat/hello-world" } }, view: "pr-stats", panel: "list" },
-      useFilters.getState(),
-    ) as { filtersByView: Record<string, unknown> };
-    expect(Object.keys(merged.filtersByView).sort()).toEqual([...ALL_VIEWS].sort());
-    expect(merged.filtersByView["pr-stats"]).toEqual({});
-  });
-
-  // A v1 store that sat unopened across BOTH changes has to run v1->v2
-  // and then v2->v3. A chain of `if (from === n)` arms would apply one
-  // and skip the other.
-  it("carries a v1 store all the way to v3", () => {
-    const out = migrate({ filters: { staleOnly: true }, view: "dashboard" }, 1);
-    expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBeUndefined();
-    expect(Object.keys(out.filtersByView as object).sort()).toEqual([...ALL_VIEWS].sort());
   });
 });

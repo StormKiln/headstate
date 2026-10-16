@@ -111,8 +111,8 @@ describe("summarise", () => {
         unreadable: ["/work: permission denied"],
       }),
     );
-    expect(line).toContain("1 directory could not be read");
-    expect(line).toContain("not every repository");
+    expect(line).toContain("Discovery incomplete");
+    expect(line).toContain("some repositories may be missing");
   });
 
   /// A cancelled run says so and still reports what it managed, rather
@@ -146,17 +146,17 @@ describe("summarise", () => {
 describe("updateAllLabel", () => {
   /// The button will not say "All" over a short census (#1025).
   it("names the number it can see when the scan fell short", () => {
-    expect(updateAllLabel(42, ["/work: permission denied"])).toBe(
-      "Update 42 readable repositories",
+    expect(updateAllLabel(42)).toBe(
+      "Update 42 repositories",
     );
-    expect(updateAllLabel(42, [])).toBe("Update All Repositories");
+    expect(updateAllLabel(42)).toBe("Update 42 repositories");
   });
 
   it("keeps the plain label when the scan was complete", () => {
-    expect(updateAllLabel(45, [])).toBe("Update All Repositories");
+    expect(updateAllLabel(45)).toBe("Update 45 repositories");
   });
 
   it("agrees with itself in the singular", () => {
-    expect(updateAllLabel(1, ["/x: denied"])).toBe("Update 1 readable repository");
+    expect(updateAllLabel(1)).toBe("Update 1 repository");
   });
 });

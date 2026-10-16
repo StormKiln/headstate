@@ -63,7 +63,6 @@ const enable = true;
 const enabled = true;
 const needs = true;
 const secs = 60;
-const days = 30;
 const path = "/home/octocat/code/hello-world";
 const repoPath = "/home/octocat/code/hello-world";
 const worktreePath = "/home/octocat/code/hello-world/.worktrees/feature-spoon";
@@ -108,7 +107,6 @@ const row = (
 /// One row per exported wrapper: the command name and argument object
 /// each one sent to `invoke` before the seam existed.
 const source = { provider: "gitlab", host: "gitlab.example" } as const;
-const gitlabStatsScope = { kind: "project", path: "octocat/hello-world" } as const;
 const ROWS: Row[] = [
   row(api.saveMarkdown, ["# masked café"], "save_markdown", {markdown: "# masked café"}),
   row(api.claudeTranscriptWatch, [path], "claude_transcript_watch", {path}),
@@ -137,7 +135,6 @@ const ROWS: Row[] = [
   row(api.resolveThread, [threadId, repo, number], "resolve_thread", { threadId, repo, number }),
   row(api.unresolveThread, [threadId, repo, number], "unresolve_thread", { threadId, repo, number }),
   row(api.replyToThread, [threadId, repo, number, body], "reply_to_thread", { threadId, repo, number, body }),
-  row(api.getStats, [], "get_stats"),
   row(api.listWorktrees, [], "list_worktrees"),
   // The repository browser (#1031, #1033). Both take the repository ROOT
   // and a repository-relative path, in that order -- the root is what the
@@ -275,10 +272,6 @@ const ROWS: Row[] = [
   row(api.setPollInterval, [secs], "set_poll_interval", { secs }),
   row(api.getReviewing, [], "get_reviewing"),
   row(api.getCachedReviewing, [], "get_cached_reviewing"),
-  row(api.getCycleTrend, [], "get_cycle_trend"),
-  row(api.getPeriods, [], "get_periods"),
-  row(api.getHistory, [days], "get_history", { days }),
-  row(api.getMergedDetail, [], "get_merged_detail"),
   row(api.getAuthState, [], "get_auth_state"),
   row(api.getGitLabAuthState, [], "get_gitlab_auth_state"),
   row(api.scanArtifacts, [], "scan_artifacts"),
@@ -445,58 +438,8 @@ const ROWS: Row[] = [
     transcriptsAllowed: true,
     revealAllowed: false,
   }),
-  // Both take no arguments: the health sample is of THIS machine and
-  // the history is bounded on the Rust side, so there is nothing for a
-  // caller to scope or to ask for more of.
-  // Argument-free: the scope hierarchy is everything the TOKEN can see, so
-  // there is nothing for a caller to narrow. #825.
-  row(api.statsTree, [], "stats_tree"),
   row(api.getGitLabHost, [], "get_gitlab_host"),
   row(api.setGitLabHost, ["gitlab.example"], "set_gitlab_host", { host: "gitlab.example" }),
-  row(api.gitlabStatsTree, ["gitlab.com"], "gitlab_stats_tree", { host: "gitlab.com" }),
-  row(api.gitlabStatsLoad, ["gitlab.com", gitlabStatsScope, days, true], "gitlab_stats_load", { host: "gitlab.com", scope: gitlabStatsScope, days, refresh: true }),
-  row(api.gitlabStatsBackfill, ["gitlab.com", gitlabStatsScope, days], "gitlab_stats_backfill", { host: "gitlab.com", scope: gitlabStatsScope, days }),
-  // The scoped stats trio (#826). Argument order matters more here than on
-  // most rows: all three take a scope kind and an optional value, and two of
-  // them take a subject as well -- so a transposed pair would send a login
-  // where a repository name belongs and come back with a plausible answer to
-  // the wrong question.
-  row(api.statsCount, ["octocat", "org", "acme", "merged", 30], "stats_count", {
-    subject: "octocat",
-    scopeKind: "org",
-    scopeValue: "acme",
-    measure: "merged",
-    days: 30,
-  }),
-  // No `subject` at all, which is the board's defining property: it asks
-  // about everyone in the scope. A subject here would render a leaderboard
-  // with one name on it.
-  row(api.statsDemand, [{op:"renew",handle:"fixture",sequence:1}], "stats_demand", {request:{op:"renew",handle:"fixture",sequence:1}}),
-  row(api.statsBoardCached, ["org", "acme", "merged", 30, {viewer:"synthetic",generation:1}], "stats_board_cached", {
-    scopeKind:"org", scopeValue:"acme", measure:"merged", days:30, expectedOwner:{viewer:"synthetic",generation:1},
-  }),
-  row(api.statsBoard, ["org", "acme", "merged", 30], "stats_board", {
-    scopeKind: "org",
-    scopeValue: "acme",
-    measure: "merged",
-    days: 30,
-  }),
-  row(api.statsSeries, ["octocat", "org", "acme", 30], "stats_series", {
-    subject: "octocat",
-    scopeKind: "org",
-    scopeValue: "acme",
-    days: 30,
-  }),
-  // The reviews-GIVEN board. No `subject` and no `measure`: it asks about
-  // everyone in `logins`, and its measure is fixed (a review counts against a
-  // pull request that MERGED, so reviewing work still in flight does not move
-  // somebody up the board).
-  row(api.statsReviewers, ["org", "acme", 30, ["octocat", "hubot"]], "stats_reviewers", {
-    scopeKind: "org",
-    scopeValue: "acme",
-    days: 30,
-    logins: ["octocat", "hubot"],
-  }),
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
   row(api.healthAlerts, [], "health_alerts"),
@@ -680,7 +623,6 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // it is open — and a hook that imported Tauri's `listen` directly would
   // work on the desktop and silently never fire on the phone, which is
   // the client with no window to leave open and wait in.
-  ["stats-backfill-progress", () => hooks.useStatsBackfill("board|merged|*|org:X", { viewer: "fixture", generation: 1 })],
   // The fifteenth (#1477). A content-free nudge that a running session's
   // transcript changed: the list's "active now" set hears every one, and
   // the open transcript's follow hears its own session's. Through the seam
@@ -780,12 +722,4 @@ describe("transport selection", () => {
     vi.resetModules();
     await expect(import("./transport")).rejects.toThrow(/VITE_TARGET/);
   });
-});
-
-it("keeps additive Stats owner metadata optional while rejecting malformed present owners", async () => {
-  const { remoteEventError } = await import("./wireContract");
-  const frame={scopeKey:"scope",daysCovered:1,daysTotal:30,collected:11,total:22,phase:{kind:"working"},nextTickAtMs:null};
-  expect(remoteEventError("stats-backfill-progress",frame)).toBeNull();
-  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:1}})).toBeNull();
-  expect(remoteEventError("stats-backfill-progress",{...frame,owner:{viewer:"alice",generation:"wrong"}})).not.toBeNull();
 });
