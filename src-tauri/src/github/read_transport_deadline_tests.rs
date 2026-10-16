@@ -1,4 +1,4 @@
-use super::super::{admission::ReadClass, client::GitHubClient, stats::Budget};
+use super::super::{admission::ReadClass, budget::Budget, client::GitHubClient};
 use super::*;
 use serde_json::json;
 use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};

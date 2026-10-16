@@ -4,26 +4,6 @@ import { ViewSwitcher } from "@/components/ViewSwitcher";
 import { current } from "@/lib/ariaCurrent";
 import { repoCounts } from "@/lib/repos";
 
-/// Repos where the user currently has open PRs, busiest first, plus an
-/// always-first "All repositories" entry that is the default (no `repo`
-/// filter set). Selecting a repo writes through the shared filter store --
-/// this component holds no filter state of its own.
-///
-/// This is the sidebar for My PRs, and the fall-through for any future
-/// view that has no column of its own. Stats used to own a pinned row at
-/// the bottom of it, outside the scroll area so it stayed reachable
-/// however many repos the list grew to. That row is gone: the destination
-/// moved into `ViewSwitcher`, which is where the rest of the app's
-/// navigation already lived.
-///
-/// It also SERVED PR Stats between #794 and #825, with the repo rows live
-/// but read by nothing. That is over: #825 gave PR Stats its own
-/// `StatsSidebar`, a GitHub-sourced hierarchy of organisations,
-/// repositories and members, because a list of repositories where the
-/// viewer has an open PR cannot hold an organisation or a person and so
-/// could not express "how is my team doing?". The `repoActive` guard below
-/// is what is left of the arrangement, and it is still worth keeping --
-/// see its comment.
 export function RepoSidebar({
   prs,
   viewCounts,
@@ -49,17 +29,6 @@ export function RepoSidebar({
   // moved because four sidebars each had a private copy of it and the two
   // newest lists reached for `aria-pressed` instead.
 
-  // My PRs is the only view whose `filters.repo` this column both writes
-  // and has read back. PR Stats was the other until #825 gave it
-  // `StatsSidebar`, and it is dropped from this list rather than left in:
-  // a highlight here would be for a filter key that view no longer uses
-  // (its scope lives in `statsScopeKind` / `statsScopeValue` now).
-  //
-  // Guarded on `view` at all because this component is the FALLBACK
-  // sidebar in `App.tsx`: any future view that falls through to it would
-  // otherwise show a repo row highlighted for a page that never reads
-  // `filters.repo` -- which is exactly the state PR Stats was in for a
-  // release.
   const repoActive = view === "my-prs";
 
   return (

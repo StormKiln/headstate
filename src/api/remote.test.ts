@@ -63,11 +63,11 @@ describe("remote transport: commands", () => {
     await expect(remote.call("get_cached")).resolves.toBe(PR_FIXTURES);
     expect(tauri.invoke).toHaveBeenCalledWith("remote_call", { command: "get_cached", args: {} });
 
-    tauri.invoke.mockResolvedValueOnce({ points: [], week_current: 0, week_previous: 0, opened_week_current: 0, opened_week_previous: 0, month_current: 0, month_previous: 0 });
-    await remote.call("get_history", { days: 14 });
+    tauri.invoke.mockResolvedValueOnce([]);
+    await remote.call("list_branches", { repoPath: "/synthetic/repo" });
     expect(tauri.invoke).toHaveBeenLastCalledWith("remote_call", {
-      command: "get_history",
-      args: { days: 14 },
+      command: "list_branches",
+      args: { repoPath: "/synthetic/repo" },
     });
   });
 
@@ -287,14 +287,4 @@ it("validates watch replies and drops malformed activity frames without retiring
   expect(cb).toHaveBeenCalledTimes(2);
   expect(cb).toHaveBeenLastCalledWith({ payload: { watch_id: "opaque", size: 11, seq: 3 } });
   stop();
-});
-
-it("accepts old registered stats boards and old progress at the real remote boundary", async () => {
-  const legacy = { viewer:"alice", scopeKey:"scope", backfill:{state:"registered",lastFrame:null}, rows:[], total:null, retrieved:0, complete:false, truncatedSlices:[], refusedFields:0, slices:0, rounds:0, spend:{points:0,requests:0,unmetered:0,remaining:null,resetAt:null}, slowest:[],largest:[],repoCounts:[],accumulated:0,accumulating:false,daysCovered:0,daysTotal:30 };
-  tauri.invoke.mockResolvedValueOnce(legacy);
-  expect(await remote.call("stats_board")).toBe(legacy);
-  const receive=vi.fn(); await remote.listen("stats-backfill-progress",receive);
-  const handler=tauri.listen.mock.calls.find(([name])=>name==="stats-backfill-progress")?.[1] as (event:{payload:unknown})=>void;
-  const frame={scopeKey:"scope",daysCovered:1,daysTotal:30,collected:17,total:20,phase:{kind:"working"},nextTickAtMs:null};
-  handler({payload:frame});expect(receive).toHaveBeenCalledWith({payload:frame});
 });

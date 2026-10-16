@@ -47,8 +47,8 @@ use super::advisory::{FAILURE_TTL, SUCCESS_TTL};
 use futures_util::{stream, StreamExt};
 use std::time::Duration;
 
+use super::budget::Budget;
 use super::client::GitHubClient;
-use super::stats::Budget;
 
 /// What the base branch's rulesets say, or why we do not know.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

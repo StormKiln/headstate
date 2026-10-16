@@ -1,3 +1,4 @@
+import type { DiscoveryDiagnostic } from "../types/pr";
 import { useId, useState } from "react";
 
 /// The banner for a worktree scan that could not read everything (#951).
@@ -47,20 +48,27 @@ export function PartialScanNotice({
   /// Advice reports checks; scans can report both read errors and scope
   /// limits, so their summary must not call every notice a read failure.
   checks,
+  collapsed = false,
+  compact = false,
+  diagnostics,
 }: {
   unreadable: readonly string[];
   consequence: string;
   checks?: { total: number };
+  collapsed?: boolean;
+  compact?: boolean;
+  diagnostics?: readonly DiscoveryDiagnostic[];
 }) {
   const [expanded, setExpanded] = useState(false);
   const [page, setPage] = useState(0);
   const detailsId = useId();
   if (unreadable.length === 0) return null;
   const n = unreadable.length;
+  const onlyLimits = diagnostics?.length === n && diagnostics.every((d) => d.kind === "depthLimit" || d.kind === "directoryBudget");
   const lead = checks
     ? `${n} of ${checks.total} checks could not run`
-    : `Scan incomplete (${n} notice${n === 1 ? "" : "s"})`;
-  const large = n > 3;
+    : onlyLimits ? "Discovery limited" : `Scan incomplete (${n} notice${n === 1 ? "" : "s"})`;
+  const large = compact || collapsed || n > 3;
   const pageSize = 50;
   const currentPage = Math.min(page, Math.ceil(n / pageSize) - 1);
   const start = currentPage * pageSize;
@@ -71,7 +79,7 @@ export function PartialScanNotice({
       className="border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]"
     >
       <p>
-        {lead}, so {consequence}
+        {compact ? (onlyLimits ? "Discovery limited. Some repositories may be missing." : "Scan incomplete. Some repositories may be missing.") : <>{lead}, so {consequence}</>}
       </p>
       {large && (
         <button

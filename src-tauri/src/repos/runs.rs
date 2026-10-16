@@ -153,6 +153,7 @@ mod tests {
             cancelled: false,
             timed_out: false,
             unreadable: vec![],
+            diagnostics: vec![],
         }
     }
 

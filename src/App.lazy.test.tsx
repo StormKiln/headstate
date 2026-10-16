@@ -40,7 +40,6 @@ import { describe, expect, it } from "vitest";
 /// a crash on first navigation to that view.
 const LAZY_ROUTES: [name: string, specifier: string][] = [
   // This route owns both providers and imports the charted GitHub page.
-  ["ProviderStatsPage", "./components/ProviderStatsPage"],
   ["SystemHealthPage", "./components/SystemHealthPage"],
   // #921. The entry that this guard's own design makes easy to forget: it
   // reads `App.tsx?raw` and checks SOURCE SHAPE, so a new charting route

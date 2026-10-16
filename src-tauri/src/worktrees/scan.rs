@@ -2287,6 +2287,28 @@ pub(super) fn default_branch(repo: &Path) -> String {
     }
 }
 
+/// A bounded discovery stop, separate from filesystem and Git failures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoveryDiagnosticKind {
+    DepthLimit,
+    DirectoryBudget,
+    ReadError,
+    GitError,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryDiagnostic {
+    pub root: String,
+    /// One example of a subtree that could not be visited.
+    pub path: String,
+    pub kind: DiscoveryDiagnosticKind,
+    /// Number of traversal boundaries encountered, not missing repositories.
+    pub count: usize,
+    pub message: String,
+}
+
 /// What a walk of the scan roots found, INCLUDING what it could not read.
 ///
 /// `Vec<Repo>` alone made "we could not read it" structurally
@@ -2311,6 +2333,8 @@ pub(super) fn default_branch(repo: &Path) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RepoScan {
     pub repos: Vec<Repo>,
+    #[serde(default)]
+    pub diagnostics: Vec<DiscoveryDiagnostic>,
     /// Paths the walk could not read, each with WHY.
     ///
     /// A message, not a count and not a boolean, for the reason
@@ -2323,6 +2347,60 @@ pub struct RepoScan {
 }
 
 impl RepoScan {
+    fn discovery_error(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        kind: DiscoveryDiagnosticKind,
+        error: impl std::fmt::Display,
+    ) {
+        let message = format!("{}: {error}", path.display());
+        self.diagnostics.push(DiscoveryDiagnostic {
+            root: root.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            kind,
+            count: 1,
+            message: message.clone(),
+        });
+        self.unreadable.push(message);
+    }
+    fn discovery_stop(&mut self, root: &Path, path: &Path, kind: DiscoveryDiagnosticKind) {
+        let root = root.to_string_lossy().into_owned();
+        let diagnostic = if let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|d| d.root == root && d.kind == kind)
+        {
+            let diagnostic = &mut self.diagnostics[index];
+            self.unreadable
+                .retain(|message| message != &diagnostic.message);
+            diagnostic.count += 1;
+            if path.to_string_lossy().as_ref() < diagnostic.path.as_str() {
+                diagnostic.path = path.to_string_lossy().into_owned();
+            }
+            diagnostic
+        } else {
+            self.diagnostics.push(DiscoveryDiagnostic {
+                root,
+                path: path.to_string_lossy().into_owned(),
+                kind,
+                count: 1,
+                message: String::new(),
+            });
+            self.diagnostics.last_mut().unwrap()
+        };
+        let reason = match diagnostic.kind {
+            DiscoveryDiagnosticKind::DepthLimit => "depth limit",
+            DiscoveryDiagnosticKind::DirectoryBudget => "directory budget",
+            DiscoveryDiagnosticKind::ReadError | DiscoveryDiagnosticKind::GitError => {
+                unreachable!("errors are not traversal stops")
+            }
+        };
+        diagnostic.message = format!("{}: discovery {reason} reached at {} traversal boundaries (for example {}); add a narrower scan root", diagnostic.root, diagnostic.count, diagnostic.path);
+        // Retained for older clients and existing partial-scan safety gates.
+        self.unreadable.push(diagnostic.message.clone());
+    }
+
     /// Whether anything at all could not be read.
     ///
     /// The UI's cue for "this list may be incomplete", and the gate on
@@ -2387,6 +2465,9 @@ fn scan_reporting(dirs: &[String], with_safety: bool) -> RepoScan {
     // directory scan returned entries in. `sort_for_sidebar` already
     // does this for the repos, and a report that shuffled between runs
     // would make a diff of two scans unreadable.
+    scan.diagnostics
+        .sort_by(|a, b| a.root.cmp(&b.root).then(a.message.cmp(&b.message)));
+    scan.diagnostics.dedup();
     scan.unreadable.sort();
     scan.unreadable.dedup();
     scan
@@ -3486,6 +3567,28 @@ fn installed_discovery_bundle(dir: &Path) -> bool {
         )
 }
 
+// Only the generated runtime layout is excluded, never all artifacts/cache/usr
+// directories. A checkout at the boundary and explicitly selected roots win.
+fn generated_runtime_boundary(dir: &Path) -> bool {
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    let name = dir.file_name().and_then(|n| n.to_str());
+    let parent_name = parent.file_name().and_then(|n| n.to_str());
+    let runtime = parent
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    runtime == Some("linux-published-runtime")
+        && ((matches!(name, Some("cache" | "data" | "config"))
+            && matches!(parent_name, Some("profile" | "profile-wrapper-env")))
+            || (name == Some("usr")
+                && parent_name == Some("squashfs-root")
+                && parent.join("AppRun").is_file()))
+        && matches!(std::fs::symlink_metadata(dir.join(".git")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && !(dir.join("HEAD").is_file() && dir.join("objects").is_dir())
+}
+
 fn collect_bounded(
     dir: &Path,
     depth: usize,
@@ -3494,19 +3597,20 @@ fn collect_bounded(
     common_dirs: &mut std::collections::HashSet<std::path::PathBuf>,
     remaining: &mut usize,
 ) {
-    if depth > 0 && installed_discovery_bundle(dir) {
+    if depth > 0 && (installed_discovery_bundle(dir) || generated_runtime_boundary(dir)) {
         return;
     }
+    let root = dir.ancestors().nth(depth).unwrap_or(dir);
     if depth > 6 || *remaining == 0 {
-        out.unreadable.push(format!(
-            "{}: discovery {} limit reached; add this folder as a scan root",
-            dir.display(),
+        out.discovery_stop(
+            root,
+            dir,
             if depth > 6 {
-                "depth"
+                DiscoveryDiagnosticKind::DepthLimit
             } else {
-                "directory budget"
-            }
-        ));
+                DiscoveryDiagnosticKind::DirectoryBudget
+            },
+        );
         return;
     }
     *remaining -= 1;
@@ -3530,8 +3634,7 @@ fn collect_bounded(
         // and nothing was hidden, so there is nothing to report.
         Ok(_) => return,
         Err(e) => {
-            out.unreadable
-                .push(format!("{}: {e}", dir.to_string_lossy()));
+            out.discovery_error(root, dir, DiscoveryDiagnosticKind::ReadError, e);
             return;
         }
     }
@@ -3714,9 +3817,7 @@ fn collect_bounded(
                         default_ref: Some(branch),
                     });
                 }
-                Err(e) => out
-                    .unreadable
-                    .push(format!("{}: {e}", dir.to_string_lossy())),
+                Err(e) => out.discovery_error(root, dir, DiscoveryDiagnosticKind::GitError, e),
             }
         }
     }
@@ -3806,9 +3907,7 @@ fn collect_bounded(
                     // read, not an absence, and no `Repo` is pushed
                     // because an empty `worktrees` would claim this one
                     // has none.
-                    Err(e) => out
-                        .unreadable
-                        .push(format!("{}: {e}", dir.to_string_lossy())),
+                    Err(e) => out.discovery_error(root, dir, DiscoveryDiagnosticKind::GitError, e),
                 }
                 return;
             }
@@ -3821,9 +3920,7 @@ fn collect_bounded(
             // repository. Reported for `scan.rs:2787`'s reason -- the
             // layout is evidence enough that something is here, and a
             // silent drop is the shortfall this function refuses.
-            Err(e) => out
-                .unreadable
-                .push(format!("{}: {e}", dir.to_string_lossy())),
+            Err(e) => out.discovery_error(root, dir, DiscoveryDiagnosticKind::GitError, e),
         }
     }
     // An unreadable scan ROOT used to yield zero repositories, and the
@@ -3833,8 +3930,7 @@ fn collect_bounded(
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            out.unreadable
-                .push(format!("{}: {e}", dir.to_string_lossy()));
+            out.discovery_error(root, dir, DiscoveryDiagnosticKind::ReadError, e);
             return;
         }
     };
@@ -3846,8 +3942,7 @@ fn collect_bounded(
         let e = match e {
             Ok(e) => e,
             Err(err) => {
-                out.unreadable
-                    .push(format!("{}: {err}", dir.to_string_lossy()));
+                out.discovery_error(root, dir, DiscoveryDiagnosticKind::ReadError, err);
                 continue;
             }
         };
@@ -3877,15 +3972,10 @@ fn collect_bounded(
                 collect_bounded(&p, depth + 1, out, with_safety, common_dirs, remaining)
             }
             Ok(_) => {}
-            Err(err) => out
-                .unreadable
-                .push(format!("{}: {err}", p.to_string_lossy())),
+            Err(err) => out.discovery_error(root, &p, DiscoveryDiagnosticKind::ReadError, err),
         }
         if *remaining == 0 {
-            out.unreadable.push(format!(
-                "{}: discovery directory budget reached; add a narrower scan root",
-                dir.display()
-            ));
+            out.discovery_stop(root, dir, DiscoveryDiagnosticKind::DirectoryBudget);
             break;
         }
     }
@@ -12623,6 +12713,95 @@ mod nested_discovery_tests {
             .repos
             .iter()
             .any(|repo| Path::new(&repo.path) == direct));
+    }
+
+    #[test]
+    fn generated_runtime_boundaries_are_quiet_and_preserve_source_and_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp
+            .path()
+            .join("artifacts/release-8.2.2/linux-published-runtime");
+        for relative in [
+            "profile/cache",
+            "profile/data",
+            "profile/config",
+            "profile-wrapper-env/cache",
+            "profile-wrapper-env/data",
+            "squashfs-root/usr",
+        ] {
+            let boundary = runtime.join(relative);
+            std::fs::create_dir_all(boundary.join("a/b/c/d/e/f/g")).unwrap();
+            std::fs::create_dir_all(runtime.join("squashfs-root")).unwrap();
+            std::fs::write(runtime.join("squashfs-root/AppRun"), "launcher").unwrap();
+        }
+        let source = runtime.join("source/product");
+        std::fs::create_dir_all(&source).unwrap();
+        run(&source, &["init", "-q"]);
+        let scan = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+        assert!(!scan.is_partial(), "{scan:?}");
+        assert_eq!(scan.repos.len(), 1);
+        let boundary = runtime.join("profile/cache");
+        let direct = boundary.join("product");
+        std::fs::create_dir_all(&direct).unwrap();
+        run(&direct, &["init", "-q"]);
+        let explicit = scan_dirs_fast_reporting(&[boundary.to_string_lossy().into_owned()]);
+        assert!(explicit
+            .repos
+            .iter()
+            .any(|repo| Path::new(&repo.path) == direct));
+        // A real checkout at the excluded boundary overrides the layout rule.
+        run(&boundary, &["init", "-q"]);
+        let broad = scan_dirs_fast_reporting(&[runtime.to_string_lossy().into_owned()]);
+        assert!(broad
+            .repos
+            .iter()
+            .any(|repo| Path::new(&repo.path) == boundary));
+        let bare = runtime.join("profile-wrapper-env/data");
+        run(&bare, &["init", "--bare", "-q"]);
+        let broad = scan_dirs_fast_reporting(&[runtime.to_string_lossy().into_owned()]);
+        assert!(broad
+            .repos
+            .iter()
+            .any(|repo| repo.bare && Path::new(&repo.path) == bare));
+    }
+
+    #[test]
+    fn depth_flood_is_one_diagnostic_per_root_and_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..128 {
+            std::fs::create_dir_all(tmp.path().join(format!("a/b/c/d/e/f/{index}/child"))).unwrap();
+        }
+        let scan = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+        assert_eq!(scan.diagnostics.len(), 1, "{scan:?}");
+        assert_eq!(scan.unreadable.len(), 1);
+        assert_eq!(
+            scan.diagnostics[0].kind,
+            DiscoveryDiagnosticKind::DepthLimit
+        );
+        assert_eq!(scan.diagnostics[0].count, 128);
+        assert!(scan.is_partial());
+    }
+
+    #[test]
+    fn real_read_and_git_failures_remain_typed_and_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(broken.join(".git")).unwrap();
+        let scan = scan_dirs_fast_reporting(&[
+            missing.to_string_lossy().into_owned(),
+            broken.to_string_lossy().into_owned(),
+        ]);
+        assert!(scan.is_partial());
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiscoveryDiagnosticKind::ReadError));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiscoveryDiagnosticKind::GitError));
+        assert_eq!(scan.unreadable.len(), scan.diagnostics.len());
     }
 
     #[test]

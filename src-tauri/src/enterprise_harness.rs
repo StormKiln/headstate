@@ -94,9 +94,6 @@ fn supported(command: &str) -> bool {
             | "review_pr_at_head"
             | "get_ui_prefs"
             | "claude_sessions_for_pr_number"
-            | "stats_count"
-            | "stats_series"
-            | "stats_reviewers"
             | "get_source_snapshot"
             | "get_cached"
             | "get_cached_reviewing"
@@ -106,11 +103,6 @@ fn supported(command: &str) -> bool {
             | "get_pr_checks"
             | "get_pr_reviews"
             | "get_review_threads"
-            | "stats_board"
-            | "stats_board_cached"
-            | "stats_tree"
-            | "stats_backfill"
-            | "stats_demand"
             | "get_pr_review_gate"
             | "approve_pr"
             | "submit_review"
@@ -293,11 +285,6 @@ async fn control(
                     app.state::<poll::ViewNeedsGithub>().0.clone(),
                     app.state::<poll::GithubSourceEnabled>().0.clone(),
                 );
-                poll::spawn_backfill(
-                    app.clone(),
-                    client,
-                    app.state::<poll::BackfillWaker>().0.clone(),
-                );
             }
         }
         "revoke" => {
@@ -328,14 +315,6 @@ async fn control(
         "wake" => d.app.state::<poll::Waker>().0.notify_one(),
         "hold-commit" => metrics::arm_commit_hold(),
         "release-commit" => metrics::release_commit_hold(),
-        "retire-account" => {
-            let conn = store::open_db(&commands::db_path(&d.app)).unwrap();
-            store::stats_owner::capture_verified(&conn, "synthetic-replacement").unwrap();
-        }
-        "restore-account" => {
-            let conn = store::open_db(&commands::db_path(&d.app)).unwrap();
-            store::stats_owner::capture_verified(&conn, "synthetic-viewer").unwrap();
-        }
         "fail-queue-write" | "recover-queue-write" => {
             let conn = store::open_db(&commands::db_path(&d.app)).unwrap();
             if action == "fail-queue-write" {
@@ -625,11 +604,9 @@ pub fn run() {
             app.manage(crate::source_poll::SourcePolls::default());
             app.manage(crate::Focused(Arc::new(AtomicBool::new(true))));
             app.manage(poll::Waker(Arc::new(Notify::new())));
-            app.manage(poll::BackfillWaker(Arc::new(Notify::new())));
             app.manage(poll::PollInterval(Arc::new(AtomicU64::new(60))));
             app.manage(poll::ViewNeedsGithub(Arc::new(AtomicBool::new(true))));
             app.manage(poll::GithubSourceEnabled(Arc::new(AtomicBool::new(true))));
-            app.manage(Arc::new(crate::stats_demand::Registry::default()));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = setup(handle.clone(), config).await {

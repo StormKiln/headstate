@@ -24,9 +24,6 @@ vi.mock("../api/hooks", async (orig) => {
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
     useReviewing: () => ({ data: reviewing, isLoading: false }),
-    usePeriods: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
-    useHistory: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
-    useMergedDetail: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
   };
 });
 
@@ -44,7 +41,7 @@ function renderApp() {
 describe("PRs to review", () => {
   it("shows the incoming count on the view switcher", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} }, view: "my-prs" } as never);
     renderApp();
     // The switcher heads the sidebar and badges the count; the old
     // bottom-pinned entry is gone.
@@ -53,7 +50,7 @@ describe("PRs to review", () => {
 
   it("lists the incoming PRs on its own view", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} }, view: "to-review" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} }, view: "to-review" } as never);
     renderApp();
     expect(screen.getByText("Someone else's PR")).toBeTruthy();
   });
@@ -63,7 +60,7 @@ describe("PRs to review", () => {
   it("scopes the repo sidebar to the reviewing list", () => {
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} },
       view: "to-review",
     } as never);
     renderApp();
@@ -75,7 +72,7 @@ describe("PRs to review", () => {
   it("offers filters on the review view, not just a flat list", () => {
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} },
       view: "to-review",
     } as never);
     renderApp();
@@ -88,7 +85,7 @@ describe("PRs to review", () => {
   // tray badge.
   it("does not let another author's red CI reach the priorities strip", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} }, view: "my-prs" } as never);
     renderApp();
     expect(screen.queryByText("Someone else's PR")).toBeNull();
   });

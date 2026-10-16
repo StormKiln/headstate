@@ -1190,6 +1190,7 @@ export function WorktreesPage() {
     // -- renders as "nothing unreadable" rather than crashing. Absent and
     // empty mean the same thing here: no shortfall was reported.
     unreadable = [],
+    diagnostics,
   } = useWorktrees();
   const partial = unreadable.length > 0;
   // The scan's INPUT (#952): whether there were any folders to walk at
@@ -2008,6 +2009,7 @@ export function WorktreesPage() {
           <div className="mx-auto mt-4 max-w-lg text-left">
             <PartialScanNotice
               unreadable={unreadable}
+            diagnostics={diagnostics}
               consequence="nothing could be listed from them."
             />
           </div>
@@ -2143,6 +2145,7 @@ export function WorktreesPage() {
             the paths go here rather than the count being hidden. */}
         <PartialScanNotice
           unreadable={unreadable}
+            diagnostics={diagnostics}
           consequence="there may be more orphans than the rows below."
         />
         {orphans.map((wt) => (
@@ -2220,6 +2223,7 @@ export function WorktreesPage() {
         <p className="px-4 py-2 text-xs text-muted-foreground">Includes build artifacts; overlaps the Artifacts page. Logical sizes may count hard links more than once and omit unreadable files. Reclaimable allocation is unknown.</p>
         <PartialScanNotice
           unreadable={unreadable}
+            diagnostics={diagnostics}
           consequence="the counts and the total above are floors."
         />
         {/* Sizes arrive one repository at a time, and this says how

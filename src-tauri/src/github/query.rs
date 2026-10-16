@@ -5,8 +5,6 @@
 //! module is the point: this file stays auditable as pure reads, and the
 //! write surface is small enough to read in one sitting.
 
-use chrono::{DateTime, Duration, Utc};
-
 /// One query returns every open PR with everything the UI needs: CI rollup,
 /// mergeability, review decision, merge-queue membership, and labels.
 /// Measured at 27 PRs in ~2.9s for 2 rate-limit points of 5000/hour.
@@ -303,226 +301,11 @@ query CheckingObservation($id: ID!) {
 ///
 /// `rateLimit` added for #824. It was the only stats query that asked
 /// GitHub for counts without asking what they cost, which mattered once
-/// anything started READING cost: `github::stats::budget` accumulates
+/// anything started READING cost: `github::budget` accumulates
 /// spend per scope load, and a request that reports no cost is counted as
 /// `unmetered` rather than guessed at 1 -- so omitting the field here
 /// would have made every total that included this query a floor instead
 /// of a figure, for no reason beyond the field being absent.
-pub const STATS_QUERY: &str = r#"
-query($week: String!, $month: String!) {
-  rateLimit { cost remaining resetAt }
-  merged_week: search(query: $week, type: ISSUE) { issueCount }
-  merged_month: search(query: $month, type: ISSUE) { issueCount }
-}"#;
-
-/// Detail on the most recent merged PRs, sampled for the insight cards.
-///
-/// 100 is the per-page maximum. It is a sample, not a census: the totals it
-/// feeds are labelled with their sample size in the UI rather than being
-/// presented as lifetime figures.
-pub const MERGED_DETAIL_QUERY: &str = r#"
-query($first: Int!) {
-  rateLimit { cost remaining resetAt }
-  merged: search(query: "is:pr author:@me is:merged", type: ISSUE, first: $first) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        createdAt
-        mergedAt
-        additions
-        deletions
-        changedFiles
-        comments { totalCount }
-        repository { nameWithOwner }
-      }
-    }
-  }
-}"#;
-
-/// Days per request when fetching history.
-///
-/// Sized for LATENCY, not just the 502 ceiling. GitHub evaluates search
-/// aliases serially, so response time scales with alias count: measured
-/// 30 aliases = 7.8s but 10 aliases = 2.8s. Chunks are fetched
-/// concurrently, so total wall-clock is roughly one chunk rather than the
-/// sum -- 30 days went from 17s serial to ~3s.
-///
-/// 5 days = 10 aliases, far under the ~44 where GitHub starts
-/// intermittently returning 502 Bad Gateway.
-pub const HISTORY_CHUNK_DAYS: i64 = 5;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeriodRanges {
-    pub week_current: (String, String),
-    pub week_previous: (String, String),
-    pub month_current: (String, String),
-    pub month_previous: (String, String),
-}
-
-fn day(d: DateTime<Utc>) -> String {
-    d.format("%Y-%m-%d").to_string()
-}
-
-/// One `search` alias per day per series, `m{i}` merged and `o{i}` opened,
-/// counting back `days` from `now`.
-///
-/// Aliased searches cost ONE rate-limit point in total regardless of how
-/// many aliases the query carries — measured against the live API at 60
-/// aliases plus 6 period aliases, cost 1. That is why this is a single
-/// query rather than paginating merged PRs, which would take 6+ sequential
-/// requests at current volume.
-pub fn history_query(now: DateTime<Utc>, days: i64) -> String {
-    history_query_range(now, 0, days)
-}
-
-/// The day buckets for `start..start+len`, keeping alias indices absolute
-/// so a chunked fetch can merge results without renumbering.
-///
-/// GitHub 502s on a query carrying too many concurrent `search` aliases.
-/// Measured: 28-36 aliases succeed 5/5, 44-46 fail INTERMITTENTLY (44
-/// succeeded once then failed twice; 46 failed once then succeeded twice),
-/// and 60 fails outright. It is a server-side timeout, not a documented
-/// limit, so the fix is to stay well below it rather than retry into it.
-pub fn history_query_range(now: DateTime<Utc>, start: i64, len: i64) -> String {
-    // `rateLimit` on every chunk (#824). Each chunk is its own request, so
-    // the cost has to be readable per chunk or a 6-chunk history fetch
-    // reports a sixth of what it spent. Free: the field is not a
-    // connection and the document still costs 1 point.
-    let mut q = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
-    for i in start..start + len {
-        let d = day(now - Duration::days(i));
-        q.push_str(&format!(
-            "  m{i}: search(query: \"is:pr author:@me is:merged merged:{d}\", type: ISSUE) {{ issueCount }}\n"
-        ));
-        q.push_str(&format!(
-            "  o{i}: search(query: \"is:pr author:@me created:{d}\", type: ISSUE) {{ issueCount }}\n"
-        ));
-    }
-    q.push_str("}\n");
-    q
-}
-
-/// Comparison windows, each ending YESTERDAY.
-///
-/// Today is still accumulating, so including it compares a partial period
-/// against complete ones and drags every delta downward. Measured on real
-/// data: including today reported +47% week-over-week where the honest
-/// full-week comparison was +66%.
-pub fn period_ranges(now: DateTime<Utc>) -> PeriodRanges {
-    let end = now - Duration::days(1);
-    let win = |offset: i64, len: i64| {
-        let e = end - Duration::days(offset);
-        (day(e - Duration::days(len - 1)), day(e))
-    };
-    PeriodRanges {
-        week_current: win(0, 7),
-        week_previous: win(7, 7),
-        month_current: win(0, 30),
-        month_previous: win(30, 30),
-    }
-}
-
-/// The day buckets plus the six period-comparison aliases, so the chart
-/// series and all four delta cards arrive in ONE request at cost 1.
-///
-/// Built by appending inside the brace `history_query` already closed, so
-/// the two are never allowed to drift out of sync.
-pub fn history_query_with_periods(now: DateTime<Utc>, days: i64) -> String {
-    history_query_range_with_periods(now, 0, days)
-}
-
-/// Just the six period-comparison aliases.
-///
-/// Split out so the delta cards can render from one small, fast request
-/// rather than waiting on the whole daily series.
-pub fn periods_query(now: DateTime<Utc>) -> String {
-    let r = period_ranges(now);
-    let mut q = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
-    let mut add = |alias: &str, filter: &str, range: &(String, String)| {
-        q.push_str(&format!(
-            "  {alias}: search(query: \"is:pr author:@me {filter}{}..{}\", type: ISSUE) {{ issueCount }}\n",
-            range.0, range.1
-        ));
-    };
-    add("week_current", "is:merged merged:", &r.week_current);
-    add("week_previous", "is:merged merged:", &r.week_previous);
-    add("opened_week_current", "created:", &r.week_current);
-    add("opened_week_previous", "created:", &r.week_previous);
-    add("month_current", "is:merged merged:", &r.month_current);
-    add("month_previous", "is:merged merged:", &r.month_previous);
-    q.push_str("}\n");
-    q
-}
-
-/// The first chunk of a chunked fetch: day buckets plus the six period
-/// aliases, which ride along at no extra cost.
-pub fn history_query_range_with_periods(now: DateTime<Utc>, start: i64, len: i64) -> String {
-    let base = history_query_range(now, start, len);
-    let inner = base
-        .strip_suffix("}\n")
-        .expect("history_query always ends with a closing brace and newline");
-    let r = period_ranges(now);
-    let mut q = String::from(inner);
-    let mut add = |alias: &str, filter: &str, range: &(String, String)| {
-        q.push_str(&format!(
-            "  {alias}: search(query: \"is:pr author:@me {filter}{}..{}\", type: ISSUE) {{ issueCount }}\n",
-            range.0, range.1
-        ));
-    };
-    add("week_current", "is:merged merged:", &r.week_current);
-    add("week_previous", "is:merged merged:", &r.week_previous);
-    add("opened_week_current", "created:", &r.week_current);
-    add("opened_week_previous", "created:", &r.week_previous);
-    add("month_current", "is:merged merged:", &r.month_current);
-    add("month_previous", "is:merged merged:", &r.month_previous);
-    q.push_str("}\n");
-    q
-}
-
-/// Cycle time for two adjacent windows, so the headline figure has a prior
-/// period to compare against.
-///
-/// Both windows in ONE aliased document at a total cost of 1 point. Each
-/// window is capped at 100 nodes, so for a busy week these are SAMPLES of
-/// that week rather than a census -- `sampled` says so, and the UI must
-/// not present the result as complete.
-pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
-    let r = period_ranges(now);
-    format!(
-        r#"query {{
-  rateLimit {{ cost remaining resetAt }}
-  current: search(query: "is:pr author:@me is:merged merged:{}..{}", type: ISSUE, first: 100) {{
-    issueCount
-    nodes {{ ... on PullRequest {{ createdAt mergedAt }} }}
-  }}
-  previous: search(query: "is:pr author:@me is:merged merged:{}..{}", type: ISSUE, first: 100) {{
-    issueCount
-    nodes {{ ... on PullRequest {{ createdAt mergedAt }} }}
-  }}
-}}"#,
-        r.week_current.0, r.week_current.1, r.week_previous.0, r.week_previous.1
-    )
-}
-
-/// Everything the detail view shows, in one request.
-///
-/// Measured at cost 1 including per-check contexts. Fetched on open
-/// rather than in the poll loop: it is per-PR and only needed while the
-/// view is on screen.
-///
-/// Deliberately no file diff and no commit history. Headstate is for
-/// deciding and acting; reviewing code belongs in GitHub or an editor,
-/// and fetching a diff here would cost far more than a point.
-///
-/// `rateLimit` added for #844. It was one of two documents the
-/// hand-written list in `budget::tests::every_stats_query_meters_itself`
-/// never covered, and the derived replacement found it immediately -- which
-/// is the whole argument for deriving the list. RE-MEASURED live 2026-09-11
-/// on this document extracted verbatim (`gh api graphql`, `pktstorm/headstate`
-/// PR 786, 3 runs): **cost 1** in 1.25-1.52s, confirming the figure this
-/// comment already claimed and that the field is free.
 pub const PR_DETAIL_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
   viewer { login }
@@ -1002,140 +785,6 @@ pub fn membership_confirmation_query(count: usize) -> String {
 mod tests {
     use super::*;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
-
-    #[test]
-    fn builds_two_aliases_per_day() {
-        let q = history_query(at("2026-08-20T14:00:00Z"), 30);
-        assert_eq!(q.matches("search(").count(), 60);
-        assert!(q.contains("m0: search"));
-        assert!(q.contains("o29: search"));
-    }
-
-    #[test]
-    fn counts_back_from_today() {
-        let q = history_query(at("2026-08-20T14:00:00Z"), 2);
-        assert!(q.contains("merged:2026-08-20"));
-        assert!(q.contains("merged:2026-08-19"));
-    }
-
-    // Naive day arithmetic breaks across month ends; this pins the
-    // behaviour chrono gives us.
-    #[test]
-    fn crosses_a_leap_day() {
-        let q = history_query(at("2024-03-01T00:30:00Z"), 2);
-        assert!(q.contains("merged:2024-02-29"));
-    }
-
-    // The current day is incomplete, so counting it against full prior
-    // weeks understates the trend. Windows end yesterday.
-    #[test]
-    fn period_windows_exclude_today_and_do_not_overlap() {
-        let r = period_ranges(at("2026-08-20T14:00:00Z"));
-        assert_eq!(
-            r.week_current,
-            ("2026-08-13".to_string(), "2026-08-19".to_string())
-        );
-        assert_eq!(
-            r.week_previous,
-            ("2026-08-06".to_string(), "2026-08-12".to_string())
-        );
-    }
-
-    #[test]
-    fn month_windows_are_thirty_days_each() {
-        let r = period_ranges(at("2026-08-20T14:00:00Z"));
-        assert_eq!(
-            r.month_current,
-            ("2026-07-21".to_string(), "2026-08-19".to_string())
-        );
-        assert_eq!(
-            r.month_previous,
-            ("2026-06-21".to_string(), "2026-07-20".to_string())
-        );
-    }
-
-    // The combined query must stay valid GraphQL: exactly one top-level
-    // brace pair, with the period aliases INSIDE it.
-    /// The README states the chunk size in prose. It drifted once already
-    /// -- it claimed 15 days and three points after HISTORY_CHUNK_DAYS
-    /// became 5 and the cost became 8 -- so the doc is pinned to the
-    /// constant rather than trusted to be updated by hand.
-    #[test]
-    fn the_readme_matches_the_chunk_constant() {
-        let readme = include_str!("../../../README.md");
-        let spelled = match HISTORY_CHUNK_DAYS {
-            5 => "five",
-            7 => "seven",
-            10 => "ten",
-            15 => "fifteen",
-            n => panic!("add a spelling for {n} days"),
-        };
-        assert!(
-            readme.contains(&format!("chunks of {spelled} days")),
-            "README does not describe {HISTORY_CHUNK_DAYS}-day chunks"
-        );
-    }
-
-    // GitHub 502s on too many concurrent search aliases, intermittently
-    // from ~44, and latency scales with alias count besides. A chunk must
-    // stay well under that ceiling at whatever HISTORY_CHUNK_DAYS is set to.
-    #[test]
-    fn a_chunk_stays_under_the_alias_ceiling() {
-        let now = at("2026-08-20T14:00:00Z");
-        let first = history_query_range_with_periods(now, 0, HISTORY_CHUNK_DAYS);
-        let rest = history_query_range(now, HISTORY_CHUNK_DAYS, HISTORY_CHUNK_DAYS);
-        // Two aliases per day, plus six period aliases in the first chunk.
-        let per_chunk = (HISTORY_CHUNK_DAYS * 2) as usize;
-        assert_eq!(first.matches("search(").count(), per_chunk + 6);
-        assert_eq!(rest.matches("search(").count(), per_chunk);
-        // Derived from the constant, so changing the chunk size cannot
-        // silently drift past the ceiling.
-        assert!(
-            first.matches("search(").count() <= 40,
-            "chunk too close to the ~44-alias 502 ceiling"
-        );
-    }
-
-    // Alias indices must be ABSOLUTE, or merging chunks would overwrite
-    // day 0 with day 15 and silently corrupt the series.
-    #[test]
-    fn chunk_alias_indices_are_absolute() {
-        let now = at("2026-08-20T14:00:00Z");
-        let rest = history_query_range(now, 15, 3);
-        assert!(rest.contains("m15: search"));
-        assert!(rest.contains("m17: search"));
-        assert!(!rest.contains("m0: search"));
-        // And the dates line up with the absolute index.
-        assert!(rest.contains("merged:2026-08-05"));
-    }
-
-    #[test]
-    fn combined_query_is_balanced_and_complete() {
-        let q = history_query_with_periods(at("2026-08-20T14:00:00Z"), 3);
-        assert_eq!(q.matches('{').count(), q.matches('}').count());
-        assert_eq!(q.matches("search(").count(), 12); // 3 days x 2 + 6 periods
-        assert!(q.trim_end().ends_with('}'));
-        assert!(q.contains("week_current: search"));
-        assert!(q.contains("month_previous: search"));
-        // The transition from the last day bucket to the first period
-        // alias must not carry a closing top-level brace. Alias lines end
-        // in "}" from "{ issueCount }", so check the line itself.
-        // Alias lines end in "}" from "{ issueCount }", so a substring
-        // check is meaningless here. What matters: exactly ONE bare
-        // closing brace, and it is the last line.
-        let bare: Vec<usize> = q
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| l.trim() == "}")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(bare.len(), 1, "exactly one top-level closing brace");
-        assert_eq!(bare[0], q.lines().count() - 1, "and it closes the query");
-    }
-
     /// The review-thread fix lives in the QUERY, and the mapper's tests
     /// cannot see it: they feed `map_detail` a JSON literal, so they pass
     /// just as happily against a document that never asks for
@@ -1548,66 +1197,6 @@ mod tests {
         out.into_iter().collect()
     }
 
-    /// Deleting `issueCount` from `cycle_trend_query` turns a SAMPLE into a
-    /// census, and nothing else notices.
-    ///
-    /// `map_cycle_trend` (`map.rs:666-686`) computes
-    /// `sampled: cur_n > cur_len` from `issueCount`, through
-    /// `as_u64().unwrap_or(0)`. Drop the field and `cur_n` is 0, so
-    /// `0 > 100` is false, `sampled` flips to FALSE, and a 100-PR sample of
-    /// a busy week is presented as the complete week -- a median cycle time
-    /// labelled as the week's, computed from an arbitrary 100 of N.
-    ///
-    /// The three mapper tests (`map.rs:1334`, `:1358`, `:1371`) cannot catch
-    /// it: they feed `json!` literals that supply `issueCount` themselves,
-    /// which is exactly the hole
-    /// `the_detail_query_asks_for_every_thread_and_its_true_count` above
-    /// describes for review threads and `stats/query.rs:550` closes for the
-    /// detail slice. This is the same guard for the same property.
-    #[test]
-    fn the_cycle_trend_query_asks_for_every_field_its_mapper_reads() {
-        let q = cycle_trend_query(at("2026-08-20T14:00:00Z"));
-        for f in fields_read_by(&["map_cycle_trend", "median_hours"]) {
-            assert!(
-                q.contains(&f),
-                "map_cycle_trend reads `{f}` and cycle_trend_query does not select it; \
-                 a field the mapper defaults would be silently missing"
-            );
-        }
-    }
-
-    /// And `issueCount` must sit on the SAME connection as the nodes it
-    /// qualifies, per window.
-    ///
-    /// The derived guard above asserts the document mentions `issueCount`; it
-    /// cannot tell `current` from `previous`, so dropping it from ONE window
-    /// would still pass. `sampled` is an OR over both windows, so one window
-    /// losing its count silently halves the check.
-    ///
-    /// The same nesting assertion `stats/query.rs:550`
-    /// (`a_detail_slice_reports_its_true_total_beside_its_nodes`) makes for
-    /// its slices, for the same reason: the count and the node list have to
-    /// describe the same search or the comparison between them means nothing.
-    #[test]
-    fn a_cycle_window_reports_its_true_total_beside_its_nodes() {
-        let q = cycle_trend_query(at("2026-08-20T14:00:00Z"));
-        for window in ["current: search", "previous: search"] {
-            let body = q
-                .split_once(window)
-                .unwrap_or_else(|| panic!("the {window} alias"))
-                .1;
-            let before_nodes = body
-                .split_once("nodes")
-                .unwrap_or_else(|| panic!("{window} nodes"))
-                .0;
-            assert!(
-                before_nodes.contains("issueCount"),
-                "{window} must select issueCount beside its nodes, or a 100-PR \
-                 sample of that window reads as the complete window"
-            );
-        }
-    }
-
     /// Deleting `pageInfo` from `PR_CHECKS_PAGE_QUERY` stops the cursor loop
     /// after page 1 while all three of its tests pass.
     ///
@@ -1664,24 +1253,6 @@ mod tests {
         // because `client.rs`'s own wiremock router matches on it: renaming
         // the operation would silently stop routing the mocks.
         assert!(q.contains("query ChecksPage"), "the operation name is read");
-    }
-
-    /// `MERGED_DETAIL_QUERY` had NO text assertion at all (#847's table).
-    ///
-    /// It is the insight-card sample, and every figure on those cards is a
-    /// scalar off a node: drop `additions` and the size distribution reads as
-    /// zeros rather than as missing, because `map_merged_detail` defaults
-    /// each field. Derived from the mapper, so a card added later cannot
-    /// reach a document that does not feed it.
-    #[test]
-    fn the_merged_detail_query_asks_for_every_field_its_mapper_reads() {
-        for f in fields_read_by(&["map_merged_detail"]) {
-            assert!(
-                MERGED_DETAIL_QUERY.contains(&f),
-                "map_merged_detail reads `{f}` and MERGED_DETAIL_QUERY does not \
-                 select it; the card would render a default as a measurement"
-            );
-        }
     }
 
     /// `COUNT_QUERY`'s `matching:` alias, pinned against its reader.
@@ -1748,98 +1319,6 @@ mod tests {
                 .0
                 .contains("login"),
             "login must be selected INSIDE viewer"
-        );
-    }
-
-    /// `STATS_QUERY` carries both aliases its reader reads, count-only.
-    ///
-    /// `fetch_stats` reads `merged_week` and `merged_month` by name, so a
-    /// renamed alias reads as a zero rather than as a failure -- the same
-    /// property `the_count_query_alias_matches_its_reader` pins for
-    /// `COUNT_QUERY`, which is its sibling and was guarded while this was
-    /// not (#854).
-    #[test]
-    fn the_stats_query_aliases_match_their_reader() {
-        for alias in ["merged_week: search", "merged_month: search"] {
-            assert!(
-                STATS_QUERY.contains(alias),
-                "fetch_stats reads the `{alias}` alias by name; renaming it here makes \
-                 the dashboard read 0 merged pull requests rather than fail"
-            );
-        }
-        assert!(STATS_QUERY.contains("issueCount"));
-        // COUNT-only, which is the whole reason this document is separate
-        // from `PRS_QUERY`. `nodes` here would resolve the per-PR fields
-        // that make the list query cost 6 points instead of 1.
-        assert!(
-            !STATS_QUERY.contains("nodes"),
-            "nodes here would resolve the per-PR fields this document exists to avoid"
-        );
-    }
-
-    /// `periods_query` carries all six aliases `fetch_periods` reads.
-    ///
-    /// Six, derived from the READER rather than listed here, so an alias
-    /// added to `Periods` demands its place in the document on the next
-    /// `cargo test`. `fetch_periods` reads each one by a string literal, so
-    /// the read set is extractable exactly the way `fields_read_by` does it
-    /// for a mapper -- and a missing alias renders as a zeroed period,
-    /// which is a delta card claiming a change that did not happen.
-    ///
-    /// `combined_query_is_balanced_and_complete` already checks two of
-    /// these names on `history_query_with_periods`, the document that
-    /// appends them. It never checked `periods_query`, which is the
-    /// standalone request the delta cards fire on their own (#854).
-    #[test]
-    fn the_periods_query_carries_every_alias_its_reader_reads() {
-        let q = periods_query(at("2026-08-20T14:00:00Z"));
-        // The reader's own source, scoped to `fetch_periods`.
-        //
-        // Line endings normalised first: a Windows checkout with
-        // `core.autocrlf` has CRLF, so the `"\n    pub async fn "` scope
-        // terminator below would find nothing and the body would run to
-        // the end of the file. The `found == 6` assertion would still
-        // catch that here, but relying on a downstream count to cover a
-        // broken scope is how a guard reads the wrong region and reports
-        // a defect at a location that does not have one. Observed on the
-        // `platform (windows-latest)` job by `health::runaway`'s guard.
-        let client = include_str!("client.rs").replace("\r\n", "\n");
-        let client = client.as_str();
-        let from = client
-            .find("pub async fn fetch_periods(")
-            .expect("fetch_periods not found in client.rs");
-        let body = &client[from..];
-        let end = body[1..]
-            .find("\n    pub async fn ")
-            .map_or(body.len(), |j| j + 1);
-        let body = &body[..end];
-
-        let mut found = 0usize;
-        for line in body.lines() {
-            // `count("week_current")?` -- the alias as a quoted literal.
-            let Some((_, rest)) = line.split_once("count(\"") else {
-                continue;
-            };
-            let Some((alias, _)) = rest.split_once('"') else {
-                continue;
-            };
-            found += 1;
-            assert!(
-                q.contains(&format!("{alias}: search")),
-                "fetch_periods reads the `{alias}` alias and periods_query does not \
-                 emit it; the delta card would render a zero as a real period"
-            );
-        }
-        assert_eq!(
-            found, 6,
-            "six period aliases are expected; found {found} -- the scan is broken, \
-             not the document"
-        );
-        // And count-only: these are six searches in one request precisely
-        // because none of them resolves a node.
-        assert!(
-            !q.contains("nodes"),
-            "nodes would make six aliased searches resolve per-PR fields"
         );
     }
 
@@ -1996,104 +1475,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_graphql_document_has_a_shape_guard() {
-        /// Documents with no shape guard, and why.
-        ///
-        /// An explicit, reviewed list with a reason each -- the form this
-        /// codebase insists on over a looser pattern
-        /// (`check-privacy.sh:120`, ~40 false positives from one
-        /// unanchored regex).
-        const NO_SHAPE_GUARD: &[(&str, &str)] = &[
-            // Delegators: their body forwards to another builder, so the
-            // document -- and its guard -- live one level down.
-            (
-                "history_query",
-                "delegates to history_query_range, which is guarded",
-            ),
-            (
-                "history_query_with_periods",
-                "delegates to history_query_range_with_periods",
-            ),
-        ];
-
-        let docs = crate::github::stats::budget::tests::every_query_document();
-        // Every test source that could hold a guard. The guards live beside
-        // the documents they check, which is where this codebase puts them.
-        //
-        // Line endings normalised: a Windows checkout with `core.autocrlf`
-        // has CRLF, so the `"\n#[cfg(test)]"` split below would find
-        // nothing, the closure would return `false` for every file, and
-        // EVERY document would be reported unguarded. A loud false
-        // positive on one platform -- which is the direction to be wrong
-        // in, but still a red job nobody can reproduce locally.
-        // `health::runaway`'s guard records observing this exact hazard on
-        // the `platform (windows-latest)` job.
-        let guards: Vec<String> = [
-            include_str!("query.rs"),
-            include_str!("stats/query.rs"),
-            include_str!("stats/tree.rs"),
-            include_str!("stats/board.rs"),
-            include_str!("../poll.rs"),
-        ]
-        .iter()
-        .map(|s| s.replace("\r\n", "\n"))
-        .collect();
-
-        let mut unguarded = Vec::new();
-        for (file, name, _) in &docs {
-            if NO_SHAPE_GUARD.iter().any(|(n, _)| n == name) {
-                continue;
-            }
-            // A guard is a `fn` in a test module whose BODY names this
-            // document. Scoped to a function body rather than searched
-            // file-wide, because every one of these files defines its own
-            // documents and would therefore "name" all of them.
-            let guarded = guards.iter().any(|src| {
-                let Some((_, tests)) = src.split_once("\n#[cfg(test)]") else {
-                    return false;
-                };
-                tests.split("    fn ").skip(1).any(|body| {
-                    // Only the portion before the next test attribute, so a
-                    // mention in the NEXT test's doc comment does not count
-                    // for this one.
-                    let body = body.split("\n    #[").next().unwrap_or(body);
-                    let uses = body
-                        .lines()
-                        .filter(|l| !l.trim_start().starts_with("//"))
-                        .any(|l| l.contains(name.as_str()));
-                    uses && (body.contains("contains(") || body.contains("split_once("))
-                })
-            });
-            if !guarded {
-                unguarded.push(format!("{file}'s {name}"));
-            }
-        }
-
-        // Guards the guard: a broken derivation would report nothing to
-        // check, and a broken guard-detector would report everything.
-        assert!(
-            docs.len() >= 10,
-            "only {} document(s) derived; the scan is broken, not the documents",
-            docs.len()
-        );
-        assert!(
-            unguarded.is_empty(),
-            "these GraphQL documents have no test asserting their shape:\n  {}\n\n\
-             No mapper test can see a missing field: they feed `json!` literals that \
-             supply the field themselves, so the document can stop asking for it and \
-             the suite stays green (#847). What that costs is a PARTIAL answer \
-             presented as a complete one -- drop `issueCount` from a window and \
-             `map_cycle_trend` reports a 100-PR sample of a busy week as the whole \
-             week. Add a test asserting the fields its reader reads, deriving them \
-             with `fields_read_by` where the reader is a `map_*` function, plus a \
-             nesting assertion where a count has to sit beside the nodes it \
-             qualifies. If the document genuinely needs none, add it to \
-             NO_SHAPE_GUARD with a reason (#854).",
-            unguarded.join("\n  ")
-        );
-    }
-
     /// #1407: the list query asks for what `ready_at` reads, and ONLY the
     /// ready-for-review event.
     ///
@@ -2229,5 +1610,85 @@ mod tests {
         ] {
             assert!(q.contains(f), "PR_STACK_UP_QUERY must select `{f}`");
         }
+    }
+    #[test]
+    fn every_graphql_document_has_a_shape_guard() {
+        /// Documents with no shape guard, and why.
+        ///
+        /// An explicit, reviewed list with a reason each -- the form this
+        /// codebase insists on over a looser pattern
+        /// (`check-privacy.sh:120`, ~40 false positives from one
+        /// unanchored regex).
+        const NO_SHAPE_GUARD: &[(&str, &str)] = &[];
+
+        let docs = crate::github::budget::tests::every_query_document();
+        // Every test source that could hold a guard. The guards live beside
+        // the documents they check, which is where this codebase puts them.
+        //
+        // Line endings normalised: a Windows checkout with `core.autocrlf`
+        // has CRLF, so the `"\n#[cfg(test)]"` split below would find
+        // nothing, the closure would return `false` for every file, and
+        // EVERY document would be reported unguarded. A loud false
+        // positive on one platform -- which is the direction to be wrong
+        // in, but still a red job nobody can reproduce locally.
+        // `health::runaway`'s guard records observing this exact hazard on
+        // the `platform (windows-latest)` job.
+        let guards: Vec<String> = [include_str!("query.rs"), include_str!("../poll.rs")]
+            .iter()
+            .map(|s| s.replace("\r\n", "\n"))
+            .collect();
+
+        let mut unguarded = Vec::new();
+        for (file, name, _) in &docs {
+            if NO_SHAPE_GUARD.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            // A guard is a `fn` in a test module whose BODY names this
+            // document. Scoped to a function body rather than searched
+            // file-wide, because every one of these files defines its own
+            // documents and would therefore "name" all of them.
+            let guarded = guards.iter().any(|src| {
+                let Some((_, tests)) = src.split_once("\n#[cfg(test)]") else {
+                    return false;
+                };
+                tests.split("    fn ").skip(1).any(|body| {
+                    // Only the portion before the next test attribute, so a
+                    // mention in the NEXT test's doc comment does not count
+                    // for this one.
+                    let body = body.split("\n    #[").next().unwrap_or(body);
+                    let uses = body
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .any(|l| l.contains(name.as_str()));
+                    uses && (body.contains("contains(") || body.contains("split_once("))
+                })
+            });
+            if !guarded {
+                unguarded.push(format!("{file}'s {name}"));
+            }
+        }
+
+        // Guards the guard: a broken derivation would report nothing to
+        // check, and a broken guard-detector would report everything.
+        assert!(
+            docs.len() >= 8,
+            "only {} document(s) derived; the scan is broken, not the documents",
+            docs.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these GraphQL documents have no test asserting their shape:\n  {}\n\n\
+             No mapper test can see a missing field: they feed `json!` literals that \
+             supply the field themselves, so the document can stop asking for it and \
+             the suite stays green (#847). What that costs is a PARTIAL answer \
+             presented as a complete one -- drop `issueCount` from a window and \
+             `map_cycle_trend` reports a 100-PR sample of a busy week as the whole \
+             week. Add a test asserting the fields its reader reads, deriving them \
+             with `fields_read_by` where the reader is a `map_*` function, plus a \
+             nesting assertion where a count has to sit beside the nodes it \
+             qualifies. If the document genuinely needs none, add it to \
+             NO_SHAPE_GUARD with a reason (#854).",
+            unguarded.join("\n  ")
+        );
     }
 }

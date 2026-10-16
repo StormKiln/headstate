@@ -1,4 +1,4 @@
-import type { BranchDeleteFrame, BranchScanFrame, PullRequest, StatsBackfillFrame, Worktree, WorktreeRemovalFrame } from "../types/pr";
+import type { BranchDeleteFrame, BranchScanFrame, PullRequest, Worktree, WorktreeRemovalFrame } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
 import type { TranscriptActivity, SessionActivity } from "../types/transcript";
@@ -35,7 +35,6 @@ export interface RemoteEvents {
   "branch-delete-progress": BranchDeleteFrame;
   "worktree-size": [string, number | null];
   "worktree-safety": Worktree;
-  "stats-backfill-progress": StatsBackfillFrame;
   "claude-session-activity": SessionActivity;
   "claude-transcript-activity": TranscriptActivity;
 }

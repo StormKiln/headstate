@@ -1,3 +1,4 @@
+import type { DiscoveryDiagnostic } from "../types/pr";
 import type { MeasurementStatus, MeasurementExportReceipt, ClientMeasurement, MeasurementCapture } from "../types/measurement";
 import type { TranscriptWatch } from "../types/transcript";
 /// Typed wrappers around the Tauri command surface in
@@ -14,7 +15,6 @@ import type { TranscriptWatch } from "../types/transcript";
 /// `invoke`; see `transport.ts`.
 
 import { call } from "./transport";
-import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
 import type {
@@ -52,7 +52,6 @@ import type {
   VenvRemoval,
   ArtifactRemoval,
   Assessment,
-  CycleTrend,
   DanglingVolume,
   DockerBuild,
   DockerDiskUsage,
@@ -60,23 +59,14 @@ import type {
   DockerState,
   Footprint,
   HealthSample,
-  History,
   ImageRemovalOutcome,
-  MergedDetail,
   NetProcess,
-  Periods,
   PrDetail,
   PrStack,
   PullRequest,
   ReviewGates,
   PusherAsk,
   RowPusher,
-  Stats,
-  StatsBoard,
-  StatsOutcome,
-  StatsSeries,
-  StatsReviewers,
-  StatsTree,
   Worktree,
   WorktreeScan,
   RepoTree,
@@ -348,133 +338,6 @@ export const replyToThread = (
   number: number,
   body: string,
 ) => call<void>("reply_to_thread", { threadId, repo, number, body });
-
-/// `Stats.merged_week`/`merged_month` are real; the other five fields
-/// always come back zero today. Does not persist to SQLite.
-export const getStats = () => call<Stats>("get_stats");
-
-/// The scope hierarchy the PR Stats sidebar renders (#825): organisations
-/// with their repositories and members, plus the viewer's own repositories.
-///
-/// Sourced from GitHub, never from a local checkout. Carries NO statistics --
-/// two requests, 2 rate-limit points total, measured -- because discovery is
-/// cheap and measurement waits for a click (`hooks.ts:712-717`).
-export const gitlabStatsTree = (host: string) => call<GitLabStatsTree>("gitlab_stats_tree", { host });
-export const gitlabStatsLoad = (host: string, scope: GitLabScope, days: number, refresh: boolean) => call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh });
-export const gitlabStatsBackfill = (host: string, scope: GitLabScope, days: number) => call<GitLabBackfill>("gitlab_stats_backfill", { host, scope, days });
-
-export const statsTree = () => call<StatsTree>("stats_tree");
-
-/// A COMPLETE count of pull requests for one subject and scope (#824).
-///
-/// The first wrapper on the hardened stats layer. #827 shipped the command
-/// with no caller, deliberately -- "shipping the command now is what makes
-/// the layer reachable and testable rather than dead code waiting on two
-/// other PRs" -- and this is #826 becoming that caller.
-///
-/// `subject` is a login, or `undefined` for the VIEWER -- not for everyone.
-/// "Everyone" is a different question and is `statsBoard`'s; the Rust side
-/// rejects an empty string rather than reading it as either.
-///
-/// The answer carries its own completeness (`complete`, `slices`,
-/// `unretrievable`), because a count assembled from slices must not be
-/// readable as a plain number without it.
-export const statsCount = (
-  subject: string | undefined,
-  scopeKind: string,
-  scopeValue: string | undefined,
-  measure: "merged" | "opened",
-  days: number,
-) =>
-  call<StatsOutcome>("stats_count", {
-    subject,
-    scopeKind,
-    scopeValue,
-    measure,
-    days,
-  });
-
-/// The scope's per-author board: the numbers behind Mine and Others, and
-/// the three leaderboards (#826).
-///
-/// The EXPENSIVE call in this feature, and the one a click pays for: it
-/// probes the window, slices anything over the 1,000-result cap, and fetches
-/// per-PR nodes for every slice. Refused before it starts if the rate-limit
-/// budget is near its reserve, because the thing being protected is the poll
-/// loop's standing obligation.
-///
-/// No `subject` parameter, deliberately. A board asks about EVERYONE in the
-/// scope and ranks them; constraining it to one author renders a board with
-/// one name on it. `viewer` comes back in the answer so Mine and Others can
-/// be split from the one load rather than measured twice -- two loads could
-/// disagree, and a Mine figure that contradicts the viewer's own row on the
-/// leaderboard beside it is a contradiction a reader cannot resolve.
-export const statsBoard = (
-  scopeKind: string,
-  scopeValue: string | undefined,
-  measure: "merged" | "opened",
-  days: number,
-) => call<StatsBoard>("stats_board", { scopeKind, scopeValue, measure, days });
-
-/** Never falls back to the provider-loading command on an older backend. */
-export const statsBoardCached = (scopeKind: string, scopeValue: string | undefined, measure: "merged" | "opened", days: number, expectedOwner: import("../types/pr").StatsOwner) =>
-  call<import("../types/pr").StatsBoardReadback>("stats_board_cached", { scopeKind, scopeValue, measure, days, expectedOwner });
-
-/// The scoped daily opened/merged series (#826).
-///
-/// The cheap half of a scope page: count-only searches, no per-PR nodes, so
-/// it lands in about a second per ten days where a board over a busy
-/// organisation is seconds of node fetching. A SEPARATE command for exactly
-/// that reason -- `StatsPage` renders each query as it arrives rather than
-/// behind one gate, which is the pattern `StatsPage.tsx:12-22` records.
-///
-/// `subject` IS accepted here, unlike on the board, and the asymmetry is the
-/// point: a chart is about one line, so "this person, in this org" is a
-/// legitimate and cheap question. `undefined` means the whole scope.
-export const statsSeries = (
-  subject: string | undefined,
-  scopeKind: string,
-  scopeValue: string | undefined,
-  days: number,
-) => call<StatsSeries>("stats_series", { subject, scopeKind, scopeValue, days });
-
-/// The reviews-GIVEN leaderboard: who reviewed the most in a scope (#826).
-///
-/// One `reviewed-by:<login>` search per person, all aliased into ONE request.
-/// MEASURED live 2026-09-11 against `org:FNX-Labs`: cost **1** at 4, 10 and
-/// 36 aliases, at 0.84-1.04s, 1.26-1.50s and 3.62-4.15s -- so alias count is
-/// free on rate limit and linear in latency, and this account's real 4-member
-/// org is one request and one point. The cheapest query on the page.
-///
-/// # Why `logins` is an argument rather than something Rust derives
-///
-/// The roster is already on screen: `statsTree` enumerated it for the sidebar
-/// at 2 points, and the caller holds `org.members` for the scope the user
-/// clicked. Re-fetching it here would spend a request to re-derive a list the
-/// frontend has, and the two reads could disagree with the Members rows
-/// beside the board if a roster changed between them.
-///
-/// The honest consequence, which the UI states rather than this wrapper
-/// hiding: the board covers the people in the list, not everyone who
-/// reviewed. An outside collaborator or a bot is absent because nothing
-/// enumerated them.
-///
-/// # What this is NOT
-///
-/// Not `statsBoard`'s review figure. That one reads `reviews { totalCount }`
-/// off pull request nodes, which counts reviews a PR RECEIVED and credits its
-/// AUTHOR -- so the two boards name different people on the same data.
-/// MEASURED: a `reviewed-by:<viewer>` search over an org window returned two
-/// pull requests, each authored by SOMEBODY ELSE and each carrying one review.
-/// So the author leads the received board and the reviewer the given one. Both
-/// ship, each labelled for what it measures.
-export const statsReviewers = (
-  scopeKind: string,
-  scopeValue: string | undefined,
-  days: number,
-  logins: string[],
-  refresh?: boolean,
-) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins, ...(refresh === undefined ? {} : { refresh }) });
 
 /// Repos and their worktrees, WITHOUT safety classification, and what the
 /// walk could not read.
@@ -1033,22 +896,6 @@ export const getReviewing = () => call<PullRequest[]>("get_reviewing");
 /// The last successful review list, straight from SQLite. Never talks
 /// to GitHub.
 export const getCachedReviewing = () => call<CachedSnapshot>("get_cached_reviewing");
-
-/// Median cycle time this week against last, in one request.
-export const getCycleTrend = () => call<CycleTrend>("get_cycle_trend");
-
-/// The period comparisons alone -- one small request (~1.6s) so the delta
-/// cards paint without waiting on the daily series.
-export const getPeriods = () => call<Periods>("get_periods");
-
-/// The daily opened/merged series plus period comparisons. Fetched as
-/// concurrent chunks on the Rust side. `days` is clamped to 1..=90.
-export const getHistory = (days: number) => call<History>("get_history", { days });
-
-/// Aggregates over the most recent 100 merged PRs. A separate command from
-/// `getHistory` on purpose: it is the more expensive of the two and only
-/// the insight row needs it, so a failure here must not blank the chart.
-export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
@@ -2078,6 +1925,7 @@ export interface RepoUpdateOutcome {
 /// repository in the scan, in the scan's order — never an aggregate, and
 /// a caller wanting "12 of 45" derives it from this.
 export interface UpdateAllReport {
+  diagnostics?: DiscoveryDiagnostic[];
   outcomes: RepoUpdateOutcome[];
   /// The user stopped it. Not a failure: the repositories fast-forwarded
   /// before the stop really were.
@@ -2097,14 +1945,14 @@ export interface UpdateAllReport {
 
 /// Fast-forward every repository in the configured scan roots.
 ///
-/// Takes NO path list: the set is re-derived from the scan roots inside
-/// the command, because the table's verdict is minutes old by the time
-/// the button is pressed and may decide what to OFFER, never what to DO.
+/// The optional displayed scope is checked against a fresh scan before any
+/// update. Cached branch/safety verdicts are never accepted. Older clients
+/// may omit the snapshot and use the freshly discovered scope.
 ///
 /// Resolves with an outcome per repository rather than throwing on the
 /// first refusal. Partial completion is the design, not the exception.
-export const updateAllRepositories = () =>
-  call<UpdateAllReport>("update_all_repositories");
+export const updateAllRepositories = (expectedPaths?: readonly string[]) =>
+  call<UpdateAllReport>("update_all_repositories", expectedPaths ? { expectedPaths } : undefined);
 
 /// Ask the Update All run to stop.
 ///
@@ -2341,12 +2189,6 @@ export function saveMarkdown(markdown: string): Promise<ExportOutcome> {
   }
   return call<ExportOutcome>('save_markdown', {markdown});
 }
-
-export type StatsDemandRequest =
-  | { op: "acquire"; scopeKind: string; scopeValue?: string; measure: "merged" | "opened"; days: number }
-  | { op: "renew" | "release"; handle: string; sequence: number };
-export interface StatsDemandReceipt { handle: string; owner: import("../types/pr").StatsOwner }
-export const statsDemand = (request: StatsDemandRequest) => call<StatsDemandReceipt>("stats_demand", { request });
 
 export const measurementStatus = () => call<MeasurementStatus>("measurement_status");
 export const exportMeasurements = () => call<MeasurementExportReceipt>("measurement_export");

@@ -55,7 +55,6 @@ const CASES = [
   ["PR list", "my-prs", {}],
   ["To review", "to-review", {}],
   ["PR detail", "my-prs", { selectedPr: { repo: "octocat/repo-3", number: 1003 } }],
-  ["PR Stats", "pr-stats", {}],
   ["Worktrees", "worktrees", {}],
   ["Repositories", "repositories", {}],
   ["Claude sessions", "claude-code", { claudePage: "sessions" }],

@@ -18,10 +18,10 @@
 //! QUALIFIED ("at least"), never discarded and never printed as exact.
 
 use super::advisory::{Measurement, StackKey, FAILURE_TTL, SUCCESS_TTL};
+use super::budget::Budget;
 use super::client::GitHubClient;
 use super::model::{PrStack, StackMember};
 use super::query::{PR_STACK_QUERY, PR_STACK_UP_QUERY};
-use super::stats::Budget;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,

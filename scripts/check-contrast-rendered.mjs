@@ -29,7 +29,7 @@ try {
         await page.addScriptTag({ content: axe.source });
         if (fixture === 'controls') {
             await page.getByText('/fixture/git', { exact: true }).waitFor();
-            await page.locator('[aria-current="true"] span').filter({ hasText: 'your account' }).waitFor();
+            await page.locator('[aria-current="true"] span').filter({ hasText: 'All repositories' }).waitFor();
             const asked = page.getByTestId('transcript-header-asked');
             await asked.tap();
             if (await asked.count() !== 1)

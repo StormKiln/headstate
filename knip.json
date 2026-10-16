@@ -20,9 +20,7 @@
     "scripts/enterprise-run.mjs",
     "scripts/enterprise-smoke.mjs",
     "scripts/enterprise/*.test.mjs",
-    "scripts/enterprise-baseline.mjs",
-    "src/harness/activityChart.tsx",
-    "scripts/check-activity-chart.mjs"
+    "scripts/enterprise-baseline.mjs"
   ],
   "project": [
     "src/**/*.{ts,tsx}"

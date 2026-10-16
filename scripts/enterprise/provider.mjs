@@ -1,3 +1,4 @@
+import {statsRequestReasons} from './stats-retirement.mjs';
 import {observeHoldReadiness} from './convergence-action.mjs';
 import {createServer} from 'node:http';import {parseDocument,project} from './graphql.mjs';
 export const manifest={schema:1,seed:9001,repositories:50,members:50,openPrs:200,authored:50,reviewing:150,overlap:0,historicalMerged:250};
@@ -37,7 +38,7 @@ export async function startProvider({convergence=false}={}) {
    for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    const responseDelay=fault.delays?.shift()??fault.delay;
    const input=req.url==='/graphql'?JSON.parse(raw):null,doc=input?parseDocument(input.query,input.variables):null;
-   const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];entry.queryName=queryName;
+   const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];entry.queryName=queryName;entry.statsRequestReasons=statsRequestReasons(doc,queryName,req.url);
    const targeted=rule=>rule&&rule.remaining>0&&doc?.selection.some(f=>{if(f.name!=='search'||(rule.list&&!String(f.args.query).includes(rule.list==='reviewing'?'review-requested:@me':'author:@me')))return false;if(rule.waitForTail&&!rule.tailSeen){if(f.args.after)rule.tailSeen=true;return false;}return !Object.hasOwn(rule,'after')||(f.args.after??null)===rule.after;});
    const holdRule=fault.holdSearch;let holdSearch=targeted(holdRule);
    const failSearch=targeted(fault.failSearch);if(failSearch)fault.failSearch.remaining--;
@@ -84,7 +85,7 @@ export async function startProvider({convergence=false}={}) {
       const q=f.args.query??'';const rows=searchRows(data.rows,q);
       const start=Number(String(f.args.after??'cursor-0').split('-').at(-1)),end=Math.min(rows.length,start+(f.args.first??25));
       entry.searches??=[];entry.searches.push({query:q,after:f.args.after??null,ids:rows.slice(start,end).map(row=>row.id)});
-      if((fault.mode==='partial'||(fault.historyPartial&&q.includes('is:merged')))&&start>0)pageRefusal=true;
+      if(fault.mode==='partial'&&start>0)pageRefusal=true;
       return {...connection(rows.slice(start,end)),issueCount:rows.length,pageInfo:{hasNextPage:end<rows.length,endCursor:`cursor-${end}`}};
      }
      if(['enqueuePullRequest','dequeuePullRequest','convertPullRequestToDraft','markPullRequestReadyForReview','closePullRequest','mergePullRequest'].includes(f.name)){
@@ -117,14 +118,14 @@ export async function startProvider({convergence=false}={}) {
    entry.materializedAt=performance.now();
    if(holdSearch&&holdRule.observeReady){entry.holdEligibility=await observeHoldReadiness(holdRule.observeReady);holdSearch=entry.holdEligibility.eligible===true;}
    if(holdSearch){holdSearch=fault.holdSearch===holdRule&&holdRule.remaining>0;if(holdSearch)holdRule.remaining--;}
-   if(fault.hold||holdSearch||(fault.holdHistory&&historyRead)){entry.held=true;await new Promise(resolve=>held.push(resolve));entry.released=true;}
+   if(fault.hold||holdSearch){entry.held=true;await new Promise(resolve=>held.push(resolve));entry.released=true;}
    if(responseDelay)await new Promise(r=>setTimeout(r,responseDelay));
    entry.status=200;res.writeHead(200,{'content-type':'application/json','x-ratelimit-remaining':String(entry.remaining)});res.end(JSON.stringify({data:response}));
   }catch(error){entry.status=500;entry.error='unsupported-fixture';res.writeHead(500,{'content-type':'application/json'});res.end(JSON.stringify({error:'unsupported synthetic operation'}));console.error('provider fixture:',error.message);}
   finally {active--;entry.elapsed=performance.now()-started;entry.terminal??='response-sent';}
  });
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
- return {url:`http://127.0.0.1:${server.address().port}`,ledger,fault,data,manifest:convergence?convergenceManifest:manifest,get lost(){return lost;},get heldCount(){return held.length;},release(){fault.hold=false;fault.holdHistory=false;fault.holdSearch=undefined;for(const release of held.splice(0))release();},close:()=>new Promise(r=>server.close(r))};
+ return {url:`http://127.0.0.1:${server.address().port}`,ledger,fault,data,manifest:convergence?convergenceManifest:manifest,get lost(){return lost;},get heldCount(){return held.length;},release(){fault.hold=false;fault.holdSearch=undefined;for(const release of held.splice(0))release();},close:()=>new Promise(r=>server.close(r))};
 }
 
 export function searchRows(rows,q){

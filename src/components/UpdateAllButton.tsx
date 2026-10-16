@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { toast } from "sonner";
+import { PartialScanNotice } from "./PartialScanNotice";
 import {
   useCancelUpdateAll,
   useUpdateAllProgress,
@@ -26,9 +27,9 @@ import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
 /// Every precondition is re-derived inside the command at the moment of
 /// acting, per repository. The table's currency column was computed when
 /// the table was drawn -- possibly minutes ago, and across 45 rows some
-/// have certainly stopped being true since. This button therefore sends
-/// no list and no verdict: it asks the desktop to work out the set and
-/// the state for itself.
+/// have certainly stopped being true since. The button sends the displayed
+/// scope, never cached verdicts. The desktop rescans and refuses a changed
+/// scope before checking each repository and acting.
 ///
 /// # Over a partial scan it does not say "All" (#1025)
 ///
@@ -41,27 +42,30 @@ import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
 /// before clicking still learns the set was short.
 export function UpdateAllButton({
   count,
-  unreadable,
+  expectedPaths,
 }: {
   /// How many repositories the table can see. The button names this
   /// number when the scan fell short.
   count: number;
   /// What the scan could not read, carried from `RepoScan.unreadable`.
   unreadable: readonly string[];
+  expectedPaths?: readonly string[];
 }) {
   const update = useUpdateAllRepositories();
   const cancel = useCancelUpdateAll();
-  const progress = useUpdateAllProgress();
+  const [runId, setRunId] = useState(0);
+  const progress = useUpdateAllProgress(runId);
   const [running, setRunning] = useState(false);
   const [report, setReport] = useState<UpdateAllReport | null>(null);
 
   const run = () => {
+    setRunId((previous) => previous + 1);
     setRunning(true);
     // The previous run's report is cleared on START, not on completion:
     // leaving the last result on screen beside a live progress bar would
     // let a user read a stale summary as this run's answer.
     setReport(null);
-    update()
+    update(expectedPaths)
       .then(setReport)
       .catch((e: unknown) => {
         // The run itself failing -- a refused second run, a scan that
@@ -87,7 +91,7 @@ export function UpdateAllButton({
           disabled={running || count === 0}
           className="rounded-md border border-[#30363d] px-3 py-1 text-sm text-[#e6edf3] disabled:opacity-50"
         >
-          {updateAllLabel(count, unreadable)}
+          {updateAllLabel(count)}
         </button>
         {/* Cancel appears only while a run is going, and it is the
             difference between a feature and a 22-minute hang: MEASURED,
@@ -111,7 +115,7 @@ export function UpdateAllButton({
           {running
             ? progress
               ? `Updating ${progress.done} of ${progress.total}…`
-              : "Updating…"
+              : "Checking repository scope…"
             : null}
         </span>
       </div>
@@ -148,26 +152,15 @@ function UpdateAllReportPanel({ report }: { report: UpdateAllReport }) {
         {summarise(report)}
       </p>
       {needsAttention.length > 0 ? (
-        <OutcomeList title="Could not be reached" outcomes={needsAttention} />
+        <OutcomeList title="Could not be reached" detailLabel="failed repositories" outcomes={needsAttention} />
       ) : null}
       {skipped.length > 0 ? <OutcomeList title="Skipped" outcomes={skipped} /> : null}
       {notAttempted.length > 0 ? (
         <OutcomeList title="Not attempted" outcomes={notAttempted} />
       ) : null}
-      {/* The scan's shortfall, repeated here (#1025). Rendered as a
-          DIRECTORY count and visibly not a repository outcome: an
-          unreadable directory is a hole in the list, not a row in it, and
-          summing it into a per-repository count would invent rows for
-          things that were never enumerated. */}
-      {t.unreadable > 0 ? (
-        <ul className="mt-2 list-none space-y-1">
-          {report.unreadable.map((u) => (
-            <li key={u} className="font-mono text-xs text-[#8b949e]">
-              {u}
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      {t.unreadable > 0 && (
+        <PartialScanNotice unreadable={report.unreadable} diagnostics={report.diagnostics} consequence="some repositories may be missing." collapsed />
+      )}
     </div>
   );
 }
@@ -178,19 +171,39 @@ function UpdateAllReportPanel({ report }: { report: UpdateAllReport }) {
 /// category label: "could not update" says nothing, while git's refusal
 /// usually names the host, the permission or the ref. The category is
 /// ADDITIONAL -- it is this list's heading -- never a replacement.
-function OutcomeList({ title, outcomes }: { title: string; outcomes: RepoUpdateOutcome[] }) {
+function OutcomeList({ title, detailLabel = title.toLowerCase() + " repositories", outcomes }: {
+  title: string;
+  detailLabel?: string;
+  outcomes: RepoUpdateOutcome[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [page, setPage] = useState(0);
+  const id = useId();
+  const large = outcomes.length > 3;
+  const pageSize = 50;
+  const current = Math.min(page, Math.ceil(outcomes.length / pageSize) - 1);
+  const start = current * pageSize;
   return (
     <div className="mt-2">
       <h3 className="text-xs font-semibold text-[#8b949e]">{title}</h3>
-      <ul className="mt-1 space-y-1">
-        {outcomes.map((o) => (
-          <li key={o.path} className="text-xs text-[#8b949e]">
-            <span className="font-mono text-[#e6edf3]">{o.path}</span>
-            {" — "}
-            {reasonOf(o)}
-          </li>
-        ))}
-      </ul>
+      {large && <button type="button" aria-expanded={expanded} aria-controls={id}
+        className="text-xs underline" onClick={() => { setExpanded(!expanded); setPage(0); }}>
+        {expanded ? "Hide" : "Show"} {detailLabel} ({outcomes.length})
+      </button>}
+      {(!large || expanded) && <div id={id}>
+        <ul tabIndex={0} aria-label={title} className="mt-1 max-h-48 space-y-1 overflow-y-auto">
+          {outcomes.slice(start, start + pageSize).map((o) => (
+            <li key={o.path} className="break-all text-xs text-[#8b949e]">
+              <span className="font-mono text-[#e6edf3]">{o.path}</span>{" — "}{reasonOf(o)}
+            </li>
+          ))}
+        </ul>
+        {outcomes.length > pageSize && <div className="mt-2 flex gap-2 text-xs">
+          <span aria-live="polite">{start + 1}–{Math.min(start + pageSize, outcomes.length)} of {outcomes.length}</span>
+          <button type="button" disabled={current === 0} onClick={() => setPage(current - 1)}>Previous</button>
+          <button type="button" disabled={start + pageSize >= outcomes.length} onClick={() => setPage(current + 1)}>Next</button>
+        </div>}
+      </div>}
     </div>
   );
 }

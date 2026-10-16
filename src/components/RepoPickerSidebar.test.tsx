@@ -210,6 +210,8 @@ describe("RepoPickerSidebar", () => {
       repos.mockReturnValue([]);
       scan.unreadable = [UNREADABLE];
       render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.queryByText(UNREADABLE)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Show details" }));
       expect(screen.getByText(UNREADABLE)).toBeTruthy();
     });
 
@@ -222,7 +224,7 @@ describe("RepoPickerSidebar", () => {
       scan.unreadable = [UNREADABLE];
       render(<RepoPickerSidebar reviewingCount={0} />);
       expect(screen.getByText("alpha")).toBeTruthy();
-      expect(screen.getByText(/may not be all of them/i)).toBeTruthy();
+      expect(screen.getByText(/some repositories may be missing/i)).toBeTruthy();
     });
 
     /// And silent when there is nothing to report, or the banner becomes

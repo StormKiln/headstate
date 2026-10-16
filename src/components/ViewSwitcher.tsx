@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, Bot, ChevronDown, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { MOBILE_HIDDEN_VIEWS, type View, useFilters, viewLabel } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
@@ -16,9 +16,6 @@ import { useIsMobile } from "../lib/useIsMobile";
 /// time rather than being stored pre-sorted, so the two cannot disagree
 /// about where a heading goes.
 export const GROUPS = [
-  // "Pull requests" leads because `my-prs` is the default view and the
-  // app's premise, and because #823's PR Stats-first rule is a statement
-  // about this group's contents leading the menu.
   { id: "pull-requests", label: "Pull requests" },
   // "Repos", not "Repositories", and #1023 is what forced the choice.
   //
@@ -81,18 +78,6 @@ export type Group = (typeof GROUPS)[number]["id"];
 /// The remaining fields are genuinely this file's: an icon and a group
 /// mean nothing to the store.
 const VIEW_ENTRIES: { id: View; Icon: typeof GitPullRequest; group: Group }[] = [
-  // FIRST in the menu, per #823 -- and still first once grouped, because
-  // it leads the group that leads `GROUPS`. See `ALL_VIEWS` in
-  // `store/filters.ts` for why this leads; note that since #1017 the two
-  // lists are no longer kept in a shared order, so what a user sees is
-  // this array read group by group rather than top to bottom.
-  //
-  // "PR Stats", not "Stats" (#794). The bare word had the sidebar's
-  // context to lean on -- it sat under a list of repositories with open
-  // pull requests in them. In a flat menu beside "System health" it
-  // would read as stats about the machine, which is the one thing it is
-  // not about.
-  { id: "pr-stats", Icon: BarChart3, group: "pull-requests" },
   { id: "my-prs", Icon: GitPullRequest, group: "pull-requests" },
   { id: "to-review", Icon: Eye, group: "pull-requests" },
   { id: "worktrees", Icon: FolderGit2, group: "repos" },
@@ -144,62 +129,8 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; grou
 /// control that appears to work and silently does not.
 export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
 
-/// The top-level view control, at the head of the sidebar.
-///
-/// Collapsed it names the CURRENT view; expanded it lists them all. It
-/// replaces the "Awaiting your review" entry that was pinned to the
-/// sidebar's bottom, which was a flat list masquerading as a peer of the
-/// repo rows.
-///
-/// PR Stats joined this menu in #794, reversing the rule that used to
-/// stand here: that Stats was a panel of My PRs rather than a view, and
-/// that listing it here would imply it has its own repo sidebar. Both
-/// halves were true; the conclusion was wrong.
-///
-/// What decided it is that the pinned row was the only navigation in the
-/// app that was not in this menu, so "where do I go to see something
-/// else" had two answers -- and the bottom-left corner is where a
-/// reader looks last. Being a sub-page of My PRs was an implementation
-/// fact (`panel`), not something the user could see: nothing about the
-/// stats page is scoped to the My PRs list, and the rest of `panel`
-/// (Docker's images-versus-builds) is a genuine tab pair in a way
-/// list-versus-whole-account-summary never was.
-///
-/// The implication about the sidebar was the real question, and it has now
-/// been answered twice. #794 gave PR Stats the `RepoSidebar` it had
-/// inherited as a panel, on the reasoning that an inert repo list was a
-/// smaller lie than the blank column the issue offered -- while recording
-/// that `StatsPage` did not read `filters.repo`, so the rows were
-/// continuity and "a future scope hook, not a live filter", and that this
-/// was "worth revisiting if PR Stats is ever scoped per repo, at which
-/// point these rows stop being decoration".
-///
-/// #825 is that revisit, and the prediction held: PR Stats now has its own
-/// `StatsSidebar`, and the rows are live. The column is a GitHub-sourced
-/// hierarchy of organisations, their repositories and their members, so
-/// "how is my team doing?" (#823's second audience) is askable from it. The
-/// old rows could not express that -- they came from `repoCounts(prs)`,
-/// repositories where the viewer has an OPEN PR, which holds neither an
-/// organisation nor a person and omits any repository that is quiet today.
-///
-/// What survives from #794 unchanged: a selection writes to `pr-stats`'s
-/// OWN filter set, which is why the view has an entry in `EMPTY_FILTERS`.
-/// The keys are `statsScopeKind` / `statsScopeValue` / `statsSubject` now
-/// rather than `repo`, and they are navigation rather than filters -- see
-/// `activeFilterCount`, which excludes them for the same reason it excludes
-/// `repo`.
 export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>> }) {
   const { view: storedView, setView } = useFilters();
-  // The SAME fallback `App.tsx` applies, and it has to be the same or the
-  // collapsed control names a page that is not on screen: the companion
-  // renders My PRs for a stored `pr-stats` (the view is declined, not
-  // rewritten, so the desktop sharing the store keeps it), and a button
-  // reading "PR Stats" above the PR list is worse than either.
-  //
-  // Derived here rather than passed in as a prop: five sidebars render
-  // this component, and a prop would be five call sites that have to
-  // remember. One rule, read from the store, in both places that route on
-  // it.
   const view =
     IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
   const [open, setOpen] = useState(false);

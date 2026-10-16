@@ -41,6 +41,7 @@ export function WorktreeSidebar({
     // predating #951 mocks only the fields it cares about, and absent
     // means the same as empty -- no shortfall reported.
     unreadable = [],
+    diagnostics,
   } = useWorktrees();
   const partial = unreadable.length > 0;
   // The scan's INPUT (#952), so the empty arm below can tell "nowhere to
@@ -145,6 +146,8 @@ export function WorktreeSidebar({
         {!isLoading && !isError ? (
           <PartialScanNotice
             unreadable={unreadable}
+            diagnostics={diagnostics}
+            compact
             consequence="the counts below are floors rather than totals."
           />
         ) : null}

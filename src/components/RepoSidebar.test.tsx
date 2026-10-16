@@ -44,6 +44,12 @@ describe("RepoSidebar on the companion", () => {
 });
 
 describe("RepoSidebar", () => {
+  it("shows a count badge per repo, busiest first in DOM order", () => {
+    render(<RepoSidebar prs={PR_FIXTURES} />);
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "My pull requests", "All repositories3", "octocat/hello-world2", "octocat/spoon-knife1",
+    ]);
+  });
   it("lists only repos that currently have PRs", () => {
     render(<RepoSidebar prs={PR_FIXTURES} />);
     expect(screen.getByText("octocat/hello-world")).toBeDefined();
@@ -75,21 +81,6 @@ describe("RepoSidebar", () => {
     expect(useFilters.getState().filtersByView[useFilters.getState().view].repo).toBeUndefined();
   });
 
-  it("shows a count badge per repo, busiest first in DOM order", () => {
-    render(<RepoSidebar prs={PR_FIXTURES} />);
-    const buttons = screen.getAllByRole("button");
-    // The view switcher heads the sidebar, then the repo rows, and
-    // nothing after them. The pinned Stats row that used to close this
-    // list is gone (#794) -- PR Stats is a switcher entry now, which is
-    // where "Awaiting your review" went before it.
-    expect(buttons.map((b) => b.textContent)).toEqual([
-      "My pull requests",
-      "All repositories3",
-      "octocat/hello-world2",
-      "octocat/spoon-knife1",
-    ]);
-  });
-
   /// The repo rows are the LAST thing in the column now. Asserting this
   /// rather than just the absence of a Stats button is the point: the row
   /// sat outside the scrolling region in a bordered block of its own, and
@@ -103,47 +94,6 @@ describe("RepoSidebar", () => {
     // block left behind it.
     const nav = container.querySelector("nav")!;
     expect(nav.lastElementChild?.className).toContain("overflow-y-auto");
-  });
-
-  /// This column no longer serves PR Stats (#825), which has its own
-  /// `StatsSidebar`, so it must NOT highlight a repo row for that view.
-  ///
-  /// The inverse of the assertion this replaces, and the replacement is
-  /// the point rather than a deletion: between #794 and #825 the rows were
-  /// live on PR Stats and read by nothing, and the highlight was defended
-  /// as "the honest thing to render: it says what was clicked". Now that
-  /// the view has a column whose rows DO something, a highlight here would
-  /// be for a filter key (`repo`) that PR Stats no longer uses -- its
-  /// scope lives in `statsScopeKind` / `statsScopeValue`.
-  ///
-  /// Kept as a rendered assertion rather than trusting `repoActive`,
-  /// because `App.tsx` is what stops this component reaching PR Stats at
-  /// all and a routing change could quietly bring it back.
-  it("does not highlight a repo row on PR Stats, which has its own sidebar", () => {
-    useFilters.setState({ view: "pr-stats" });
-    render(<RepoSidebar prs={PR_FIXTURES} />);
-
-    fireEvent.click(screen.getByRole("button", { name: /octocat\/hello-world/ }));
-
-    // The write still lands in PR Stats' own filter set -- `setFilter`
-    // writes `[view]` and that is not this component's business -- but
-    // nothing reads `repo` for that view any more, so nothing lights up.
-    expect(useFilters.getState().filtersByView["my-prs"].repo).toBeUndefined();
-    expect(
-      screen.getByRole("button", { name: /octocat\/hello-world/ }).className,
-    ).not.toContain("bg-[#1f6feb]");
-    // And "All repositories" must not claim to be selected either: a view
-    // this column does not serve should look unselected all the way down,
-    // rather than defaulting to a highlight on the first row.
-    expect(screen.getByText("All repositories").closest("button")?.className).not.toContain(
-      "bg-[#1f6feb]",
-    );
-    // And the same in the accessible layer (#852), which is the half a
-    // `className` assertion cannot see: a row that is not serving this view
-    // must not announce itself as the current location either.
-    expect(
-      screen.getByText("All repositories").closest("button")?.getAttribute("aria-current"),
-    ).toBeNull();
   });
 
   /// #852: selection was conveyed by BACKGROUND COLOUR ALONE.
@@ -186,16 +136,6 @@ describe("RepoSidebar", () => {
       render(<RepoSidebar prs={PR_FIXTURES} />);
       const rows = screen.getAllByRole("button");
       expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
-    });
-
-    /// The `repoActive` guard applies to the accessible layer too: on a view
-    /// this column does not serve, NO row is current. That guard exists
-    /// because PR Stats was in exactly that state for a release.
-    it("marks nothing as current on a view it does not serve", () => {
-      useFilters.setState({ view: "pr-stats" });
-      render(<RepoSidebar prs={PR_FIXTURES} />);
-      const rows = screen.getAllByRole("button");
-      expect(rows.some((r) => r.getAttribute("aria-current") !== null)).toBe(false);
     });
   });
 });

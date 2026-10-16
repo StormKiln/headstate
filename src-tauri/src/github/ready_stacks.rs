@@ -1002,7 +1002,7 @@ mod tests {
     // or a mutex held across an await.
     #[test]
     fn a_stack_response_updates_quota_before_the_next_advisory_batch() {
-        super::super::stats::budget::scoped::with(520, || {
+        super::super::budget::scoped::with(520, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1028,14 +1028,14 @@ mod tests {
                     let second = ready_stacks(&client, vec![row(6)]).await.unwrap();
                     assert_eq!(second[0].stack, PrStack::Unknown);
                     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-                    assert_eq!(super::super::stats::budget::observed_remaining(), Some(499));
+                    assert_eq!(super::super::budget::observed_remaining(), Some(499));
                 });
         });
     }
 
     #[test]
     fn advisory_walk_stops_at_the_reserve_and_keeps_partial_membership() {
-        super::super::stats::budget::scoped::with(520, || {
+        super::super::budget::scoped::with(520, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1074,14 +1074,14 @@ mod tests {
             }
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
-        assert_eq!(super::super::stats::budget::observed_remaining(), Some(499));
+        assert_eq!(super::super::budget::observed_remaining(), Some(499));
                 });
         });
     }
 
     #[test]
     fn explicit_detail_stack_reads_are_metered_without_the_advisory_reserve_gate() {
-        super::super::stats::budget::scoped::with(499, || {
+        super::super::budget::scoped::with(499, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1106,7 +1106,7 @@ mod tests {
                         .fetch_pr_stack("demo", "widgets", 5)
                         .await;
                     assert!(matches!(stack, PrStack::Stacked { .. }));
-                    assert_eq!(super::super::stats::budget::observed_remaining(), Some(498));
+                    assert_eq!(super::super::budget::observed_remaining(), Some(498));
                 });
         });
     }

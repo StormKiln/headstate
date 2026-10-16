@@ -3,7 +3,7 @@ import { GitLabViewerProvider } from "./api/authAvailability";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PullRequest, StatsTree } from "./types/pr";
+import type { PullRequest } from "./types/pr";
 import { PR_FIXTURES, prWithState } from "./fixtures/prs";
 import { useFilters } from "./store/filters";
 import { useSourceSelection } from "./store/sourceSelection";
@@ -16,7 +16,6 @@ const measurements = vi.hoisted(() => vi.fn<(_batch: readonly unknown[]) => Prom
 vi.mock("./api/tauri", async importOriginal => ({
   ...await importOriginal<typeof import("./api/tauri")>(), recordClientMeasurements: measurements,
 }));
-const mockStatsTree = vi.fn<() => StatsTree | undefined>(() => undefined);
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
 const mockReviewError = vi.fn<() => Error | null>(() => null);
@@ -119,7 +118,6 @@ vi.mock("./api/hooks", () => ({
   // pending: these tests are about what the PR Stats page body renders, and
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
-  useStatsTree: () => ({ data: mockStatsTree(), isPending: false, error: null }),
   useReviewing: () => ({ data: mockReviewing(), staleSecs: null, isLoading: mockReviewLoading(), isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing()?.length ?? 0 }),
@@ -147,30 +145,9 @@ vi.mock("./api/hooks", () => ({
   // its no-selection branch here for the same reason it would in the app --
   // a stub returning true would have this suite rendering a scope page for a
   // scope that does not exist.
-  scopeIsLoadable: (s: unknown) => !!s,
-  useScopedCounts: () => ({
-    merged: undefined,
-    opened: undefined,
-    pending: 2,
-    failed: 0,
-    error: undefined,
-    refetch: () => {},
-  }),
-  useStatsSeries: () => ({ data: undefined, isError: false, refetch: () => {} }),
-  useStatsBoard: () => ({ data: undefined, isError: false, refetch: () => {} }),
-  useStatsReviewers: () => ({
-    data: undefined,
-    isError: false,
-    isPending: true,
-    refetch: () => {},
-  }),
   // The account-wide page's four (#826's reopening). Reached here because
   // `StatsPage` routes to it when nothing is selected, which is this suite's
   // state -- so these are the hooks the PR Stats route actually mounts.
-  usePeriods: () => ({ data: undefined, isError: false, refetch: () => {} }),
-  useHistory: () => ({ data: undefined, isError: false, refetch: () => {} }),
-  useMergedDetail: () => ({ data: undefined, isError: false, refetch: () => {} }),
-  useCycleTrend: () => ({ data: undefined, isError: false, refetch: () => {} }),
 }));
 
 const { default: App } = await import("./App");
@@ -213,8 +190,6 @@ const { default: App } = await import("./App");
 /// SHELL (the switcher entry, and the `<h1>` at `App.tsx:529`, which is
 /// driven by `view` alone), not on the lazy page's body.
 await Promise.all([
-  import("./components/ProviderStatsPage"),
-  import("./components/StatsPage"),
   import("./components/SystemHealthPage"),
 ]);
 
@@ -267,7 +242,7 @@ describe("assembled auth and PR status", () => {
 describe("App — priorities strip scoping", () => {
   afterEach(() => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     vi.clearAllMocks();
   });
 
@@ -288,7 +263,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
 
     // Scope to the strip: the selected repo's PR also appears in the list
@@ -324,7 +299,7 @@ describe("App — priorities strip scoping", () => {
     ]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
 
     // One pull request in scope, so the denominator is 1 -- not 3.
@@ -361,77 +336,10 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
 
     expect(screen.getByText(/Needs your attention \(2\)/)).toBeDefined();
-  });
-
-  /// PR Stats is a read-only summary, not a triage surface -- the strip
-  /// belongs beside the list it acts on. Asserting the strip is ABSENT
-  /// rather than just that cards render: an extra panel above the cards
-  /// would still pass a cards-are-present check.
-  ///
-  /// Set through `view` since #794, not `panel`. The page is routed on
-  /// one axis now, and a test that still set the old panel value would
-  /// render the PR list and pass for the wrong reason.
-  /// `async` since #838: `StatsPage` is a `React.lazy` chunk, so its
-  /// content arrives after the synchronous render rather than in it. The
-  /// assertion is unchanged in substance -- the strip must be absent while
-  /// the page's OWN content is present -- but a bare `getByText` straight
-  /// after `render` would run against the Suspense fallback and fail for a
-  /// reason that has nothing to do with the strip.
-  ///
-  /// `act` rather than `findByText` since #898. `findByText` polls against
-  /// a 1000ms budget, and with the import unsettled that budget was the
-  /// real assertion: it held locally, where the import takes single-digit
-  /// milliseconds, and failed on CI. The module is now pre-imported at the
-  /// top of this file, so the only thing left to wait for is React's next
-  /// commit -- which `act` flushes, with no clock involved. See the
-  /// pre-import's comment for why the timeout was not simply raised.
-  ///
-  /// The absence check stays SYNCHRONOUS and stays first: if the strip
-  /// rendered it would render eagerly, so checking for it before the lazy
-  /// content lands is the stronger ordering. That ordering is why the flush
-  /// sits between the two checks rather than inside `renderApp` -- hoisting
-  /// it into the helper would let the page commit before the first check and
-  /// quietly retire the eager-tree half of this test. It is then repeated
-  /// after the page commits, so the absence cannot pass merely because the
-  /// page had not arrived yet.
-  it("shows no priorities strip on the PR Stats view", async () => {
-    const blocked = prWithState("failure", "mergeable", "none", {
-      number: 101,
-      repo: "octocat/hello-world",
-      title: "Blocked in one repo",
-    });
-    mockPrs.mockReturnValue([blocked]);
-
-    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "pr-stats" } as never);
-    renderApp();
-
-    expect(screen.queryByText(/Needs your attention/)).toBeNull();
-    // The stats content itself still renders, so this is proving the strip
-    // is absent from a populated page rather than from a blank one.
-    //
-    // The assertion is on the account-wide page's caveat line rather than on
-    // a figure, because this suite stubs every hook as pending. With no scope
-    // selected the view now renders the ACCOUNT-WIDE page (#826's reopening
-    // restored it and made it the default) rather than the scope prompt it
-    // showed between #829 and that reopening -- and the caveat line is
-    // StatsPage's own content either way, which is what makes the absence of
-    // the strip meaningful.
-    //
-    // The flush is an empty `act`: the lazy module is already resolved (see
-    // the pre-import at the top of this file), so this only lets React
-    // commit the resolved component. It waits on the scheduler, not on a
-    // deadline, which is the difference that makes this test insensitive to
-    // how loaded the runner is.
-    await act(async () => {});
-    expect(screen.getByText(/across every organization/i)).toBeDefined();
-    // And still absent once the lazy page has actually committed: the check
-    // above could only see the eager tree.
-    expect(screen.queryByText(/Needs your attention/)).toBeNull();
   });
 
   /// A repo selection scopes the strip; a label filter must not. Something
@@ -447,7 +355,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([blocked, ...PR_FIXTURES]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
 
     const strip = screen.getByText(/Needs your attention/).closest("section");
@@ -527,7 +435,7 @@ describe("opening a pull request from To review", () => {
       view: "to-review",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
     });
   });
 
@@ -573,7 +481,7 @@ describe("Ready inventory availability", () => {
     useFilters.setState({
       view: "to-review",
       selectedPr: null,
-      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
     });
   });
 
@@ -628,7 +536,7 @@ describe("an incomplete refresh", () => {
       view: "my-prs",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
     });
   });
 
@@ -706,12 +614,12 @@ describe("the Claude Code route is gated on the capability", () => {
   afterEach(() => {
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
   });
 
   const at = (view: string) => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} }, view } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view } as never);
     return renderApp();
   };
 
@@ -752,33 +660,6 @@ describe("the Claude Code route is gated on the capability", () => {
   });
 });
 
-
-describe("source statistics navigation", () => {
-  afterEach(() => {
-    mockStatsTree.mockReturnValue(undefined);
-    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
-  });
-
-  it("shows GitHub scopes only while the GitHub statistics tab is active", async () => {
-    mockStatsTree.mockReturnValue({
-      viewer: "octocat", orgs: [], orgsTotal: 0, personal: [], personalTotal: 0,
-      refusedFields: 0, spend: { points: 0, requests: 0, unmetered: 0, remaining: null, resetAt: null },
-    });
-    useFilters.setState({ view: "pr-stats", selectedPr: null });
-    useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
-    renderApp();
-    await act(async () => {});
-    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "GitLab MR Stats" }));
-    expect(screen.getByRole("heading", { name: /GitLab MR Stats/ })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Everything/ })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "GitHub PR Stats" }));
-    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
-    expect(screen.queryByRole("heading", { name: /GitLab MR Stats/ })).toBeNull();
-  });
-});
 
 describe("review request source scope", () => {
   afterEach(() => {

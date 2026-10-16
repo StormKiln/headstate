@@ -314,8 +314,8 @@ async fn exhausted_graphql_response_keeps_usable_data_and_blocks_the_next_read()
 #[tokio::test]
 async fn rest_get_retries_once_and_meters_the_refused_attempt() {
     use headstate_lib::github::{
+        budget::Budget,
         gates::{base_rules, BaseRules},
-        stats::Budget,
     };
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -344,8 +344,8 @@ async fn rest_get_retries_once_and_meters_the_refused_attempt() {
 #[tokio::test]
 async fn graphql_secondary_cooldown_blocks_rest_without_dispatch() {
     use headstate_lib::github::{
+        budget::Budget,
         gates::{base_rules, BaseRules},
-        stats::Budget,
     };
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -402,8 +402,8 @@ async fn successful_exhausted_reads_keep_the_last_answer() {
 #[tokio::test]
 async fn rest_secondary_cooldown_blocks_both_resources_without_another_dispatch() {
     use headstate_lib::github::{
+        budget::Budget,
         gates::{base_rules, BaseRules},
-        stats::Budget,
     };
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -439,8 +439,8 @@ async fn rest_secondary_cooldown_blocks_both_resources_without_another_dispatch(
 #[tokio::test]
 async fn primary_resource_quotas_are_independent_without_secondary_cooldown() {
     use headstate_lib::github::{
+        budget::Budget,
         gates::{base_rules, BaseRules},
-        stats::Budget,
     };
     for exhausted_graphql in [true, false] {
         let server = MockServer::start().await;

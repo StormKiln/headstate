@@ -279,6 +279,25 @@ and the next person to pull "5.12" got the old build with every fixed bug
 apparently still broken. Whoever merges the last PR owns cutting the tag,
 or says out loud that they are not.
 
+### Workflow lint stalls on macOS (#1826)
+
+Homebrew actionlint 1.7.12 can deadlock while passing shell scripts to
+shellcheck: it writes to a pipe before starting the child, and concurrent
+workers can fill Darwin pipe buffers. The upstream fix starts the reader
+before feeding the script. If workflow lint hangs with that version, build
+the pinned fix in a temporary directory and run the full gate with it:
+
+```sh
+lint_tools=$(mktemp -d)
+GOBIN="$lint_tools" go install github.com/rhysd/actionlint/cmd/actionlint@fd33e9f582a01a02885c93ae3775e1190cf63653
+PATH="$lint_tools:$PATH" make lint
+```
+
+This requires Go and network access. It does not replace the installed tool
+or disable shellcheck, workflow validation, or any other gate. The fix is
+[upstream issue 650](https://github.com/rhysd/actionlint/issues/650); use a
+released version containing it once available.
+
 ## Cutting a release
 
 Releases are driven entirely by tags. There is nothing to click and no

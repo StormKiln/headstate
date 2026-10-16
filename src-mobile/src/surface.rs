@@ -56,30 +56,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
-    ("get_stats", Class::Read),
-    ("get_history", Class::Read),
-    ("get_periods", Class::Read),
-    ("get_cycle_trend", Class::Read),
-    ("get_merged_detail", Class::Read),
-    // The hardened stats layer (#824). A Read; the desktop's timeout and
-    // read-concurrency cap live inside the command, so this inherits both.
-    ("stats_count", Class::Read),
-    // The stats scope hierarchy (#825). A Read; names only, no statistics.
-    ("stats_tree", Class::Read),
-    ("gitlab_stats_tree", Class::Read),
-    ("gitlab_stats_load", Class::Read),
-    ("gitlab_stats_backfill", Class::Read),
-    // The Mine/Others per-author board (#826). A Read; the desktop's
-    // ceiling, concurrency cap and budget refusal are inside the command.
-    ("stats_board", Class::Read),
-    ("stats_board_cached", Class::Read),
-    // Ephemeral bounded read interest, including mobile read recovery.
-    ("stats_demand", Class::Read),
-    // The scoped daily activity series (#826). A Read; count-only.
-    ("stats_series", Class::Read),
-    // The reviews-GIVEN leaderboard (#826). A Read; one count-only
-    // `reviewed-by:<login>` search per member, aliased into one request.
-    ("stats_reviewers", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),

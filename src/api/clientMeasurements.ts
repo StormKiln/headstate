@@ -12,7 +12,6 @@ export function publishClientMeasurements(batch:ClientMeasurement[]) {
   return IS_MOBILE_BUILD ? recordPhoneMeasurements(batch.map(value=>{
     switch(value.kind){
       case "mounted_review":return {...value,receipt:undefined,scope:undefined};
-      case "stats_view":return {...value,scope:undefined};
       case "transcript_view":return {...value,operation:undefined};
     }
   })) : recordClientMeasurements(batch);

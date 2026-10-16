@@ -3,7 +3,7 @@
 This opt-in driver boots a real zero-window Wry application, production scheduler,
 read admission, SQLite stores, command services and authenticated paired mTLS/SSE.
 The browser mounts production `ReadyStrip`, `PrList`, `PrDetailView` (including
-`ReviewThreads`, `ReviewBox` and `PrActions`) and `StatsPage`. Desktop commands use
+`ReviewThreads`, `ReviewBox` and `PrActions`). Desktop commands use
 an authenticated test bridge; paired commands cross the real listener. Neither
 adapter returns canned product answers. Filesystem/Claude controls alone are
 explicitly disabled through `localTools={false}`; ordinary app defaults stay true.
@@ -30,10 +30,10 @@ ENTERPRISE_DRIVER="$PWD/src-tauri/target/debug/enterprise-driver" \
 
 `ENTERPRISE_DRIVER` overrides the local binary path; set it when using a shared
 Cargo target. Modes: `authored` (actual PrList and authored detail in both roles), `gate` (mounted actions and continuity), `fault` (rate,
-partial/offline recovery, outer-write abort, pairing/owner retirement and reply
-ordering), `retirement`, `contention` (real SQLite writer), `crash` (SIGKILL inside
+partial/offline recovery, outer-write abort, pairing retirement and reply
+ordering), `retirement` (pairing revocation/repair), `crash` (SIGKILL inside
 outer transaction), `offline` (retained restart), `load` (approval during held
-production historical backfill), `baseline`, `soak`. For restart only, set
+production reviewing-search transport), `baseline`, `soak`. For restart only, set
 `PROFILE` to a retained synthetic profile; it is copied, not overwritten.
 
 ```sh
@@ -54,10 +54,9 @@ SLAs. WebKit unsupported long-task observations are null. Five samples support
 median/range, not a robust p95. Action pending/confirmed samples are separate.
 
 The soak uses real 60-second production cadence for at least 30 minutes. It
-extends up to 45 minutes for external close/merge, all demanded closed-day history
-and Ready pusher/rules/stack observations, then fails explicitly if unfinished. Extend the
+extends up to 45 minutes for external close/merge, Ready pusher/rules/stack observations, then fails explicitly if unfinished. Extend the
 run policy with evidence if more time is required; do not claim convergence from
-inventory alone. It also checks complete cache reads and a 125-second unchanged
+inventory alone. It also checks a 125-second unchanged
 active-detail window. No accelerated clock or repeated wake/refetch loop runs in
 the measured soak. Manual detail invalidation used for thread-movement tests is
 labelled manual; cross-role approval uses automatic production source publication
@@ -75,8 +74,7 @@ These costs do not predict GitHub costs. `aliases` means root aliases only.
 
 The bounded native recorder (65536 pending events), provider ledger and browser
 arrays (100000 entries each) invalidate a run on loss. Read submissions, received
-headers, body terminals and Stats Spend are separate; pre-header failures may
-have zero Spend. Reconciliation checks scope terminals, four read/two background
+headers and body terminals are separate; pre-header failures have no response receipt. Reconciliation checks scope terminals, four read/two background
 ceilings (writes separate), and provider receipts against actual submissions.
 Slot release is not equivalent to producer cancellation. Intentional crash runs
 retain explicit unfinished scopes instead of claiming clean shutdown.
@@ -93,3 +91,12 @@ observer regression alongside production Rust fault tests. Full native browser
 fault/soak runs remain explicit supported-host gates; a green CI unit suite alone
 is not integrated acceptance. Baseline values are same-host profiling-build
 observations and must not be treated as macOS runner latency SLAs.
+
+PR Stats and its convergence, cache, demand-lease, account-owner retirement and
+Stats-triggered writer-contention scenarios are retired. Existing synthetic
+history rows, profiles, baseline data and screenshots remain retained evidence.
+Every current run records `statsRetirement` with zero received historical/Stats
+documents and zero retired bridge commands; a nonzero count fails acceptance.
+Classification runs before injected provider faults, so failed requests count too.
+Warm replay accepts retained legacy close-day metadata without mounting or calling
+Stats; new runs retain exact external close/merge timestamps.

@@ -38,8 +38,6 @@ pub mod remote;
 pub mod report;
 pub mod repos;
 pub mod source_poll;
-pub mod stats_demand;
-mod stats_measurement;
 pub mod store;
 pub mod tools;
 pub mod tray;
@@ -325,9 +323,6 @@ pub fn run() {
             commands::get_cached,
             commands::get_cached_reviewing,
             commands::refresh_now,
-            commands::get_stats,
-            commands::get_history,
-            commands::get_periods,
             commands::get_reviewing,
             commands::count_reviewing,
             commands::get_pr_detail,
@@ -491,18 +486,6 @@ pub fn run() {
             commands::prune_worktrees,
             commands::size_worktrees,
             commands::set_view_needs_github,
-            commands::get_cycle_trend,
-            commands::get_merged_detail,
-            commands::stats_count,
-            commands::stats_tree,
-            commands::gitlab_stats_tree,
-            commands::gitlab_stats_load,
-            commands::gitlab_stats_backfill,
-            commands::stats_board,
-            commands::stats_board_cached,
-            commands::stats_demand,
-            commands::stats_series,
-            commands::stats_reviewers,
             commands::get_auth_state,
             remote::pairing::issue_pairing_token,
             remote::pairing::get_remote_connection_addresses,
@@ -587,9 +570,6 @@ pub fn run() {
             // to signal even when nothing is listening for it.
             let waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::Waker(waker.clone()));
-            let backfill_waker = Arc::new(tokio::sync::Notify::new());
-            app.manage(poll::BackfillWaker(backfill_waker.clone()));
-            app.manage(Arc::new(stats_demand::Registry::default()));
             app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
@@ -1112,16 +1092,6 @@ pub fn run() {
                         }
                     });
                 }
-                // The PR Stats backfill (#1092, #1093), BESIDE the poll
-                // loop rather than inside its tick.
-                //
-                // `poll::TICK_TIMEOUT`'s margin under `MIN_FOCUSED_SECS`
-                // is load-bearing, and `budget::RESERVE` exists to protect
-                // the poll loop -- so a consumer placed inside that loop
-                // would both spend the margin and make the protection
-                // self-referential. `spawn_backfill`'s own docs carry the
-                // argument in full.
-                poll::spawn_backfill(handle.clone(), client.clone(), backfill_waker);
                 poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 

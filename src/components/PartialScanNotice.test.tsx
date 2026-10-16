@@ -51,3 +51,13 @@ describe("PartialScanNotice", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });
+
+
+it("describes a grouped traversal boundary without claiming unreadable files", () => {
+  const message = "root: 128 depth boundaries; choose a narrower scan root";
+  render(<PartialScanNotice unreadable={[message]} diagnostics={[{ root: "root", path: "root/deep", kind: "depthLimit", count: 128, message }]} consequence="counts may be incomplete." compact />);
+  expect(screen.getByText("Discovery limited. Some repositories may be missing.")).toBeTruthy();
+  expect(screen.queryByText(message)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+  expect(screen.getByText(message)).toBeTruthy();
+});

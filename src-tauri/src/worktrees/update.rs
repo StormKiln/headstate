@@ -56,6 +56,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Refuse a changed repository set before a bulk action touches any checkout.
+/// Canonical paths admit aliases and overlapping roots without widening scope.
+pub fn validate_update_scope(expected: &[String], actual: &[String]) -> Result<(), String> {
+    fn keys(paths: &[String]) -> Result<std::collections::BTreeSet<std::path::PathBuf>, String> {
+        paths.iter().map(|path| std::fs::canonicalize(path).map_err(|error| format!("Could not verify repository scope at {path}: {error}; refresh the repository list"))).collect()
+    }
+    if keys(expected)? != keys(actual)? {
+        return Err("Repository discovery changed since this list was displayed; refresh the repository list before updating".into());
+    }
+    Ok(())
+}
+
 /// How long a whole run may take before it stops by itself.
 ///
 /// A ceiling around the RUN, not around each call, and the distinction is
@@ -190,6 +202,7 @@ pub struct RepoUpdateOutcome {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAllReport {
+    pub diagnostics: Vec<super::scan::DiscoveryDiagnostic>,
     /// One entry per input, in the input's order.
     pub outcomes: Vec<RepoUpdateOutcome>,
     /// Whether the user stopped it. Distinct from an error: the
@@ -300,6 +313,38 @@ fn classify_for_update(path: &str) -> Verdict {
         // that cannot be stat'd is false for a permission error too, and
         // both belong on the side that needs attention.
         return Verdict::Fail("that directory is missing".into());
+    }
+
+    // Git searches parents, so a valid git command is not proof that the
+    // supplied directory is a primary checkout. Check before any fetch/pull.
+    if !dir.join(".git").is_dir() && !dir.join(".git").is_file() {
+        return Verdict::Skip("not a primary repository checkout".into());
+    }
+    match git(dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(root)
+            if std::fs::canonicalize(root.trim())
+                .ok()
+                .zip(dir.canonicalize().ok())
+                .is_some_and(|(root, dir)| root == dir) => {}
+        Ok(_) => return Verdict::Skip("not a primary repository checkout".into()),
+        Err(error) => return Verdict::Fail(error),
+    }
+    let git_dir = git(dir, &["rev-parse", "--path-format=absolute", "--git-dir"]);
+    let common_dir = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    match (git_dir, common_dir) {
+        (Ok(git_dir), Ok(common_dir)) => {
+            match (
+                std::fs::canonicalize(git_dir.trim()),
+                std::fs::canonicalize(common_dir.trim()),
+            ) {
+                (Ok(git_dir), Ok(common_dir)) if git_dir == common_dir => {}
+                _ => return Verdict::Skip("not a primary repository checkout".into()),
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => return Verdict::Fail(error),
     }
 
     // A detached HEAD FIRST, because every check below asks a question
@@ -519,6 +564,7 @@ pub fn update_all_with(
     }
 
     UpdateAllReport {
+        diagnostics: Vec::new(),
         outcomes,
         cancelled,
         timed_out,
@@ -598,6 +644,136 @@ mod tests {
     fn only(report: &UpdateAllReport) -> &UpdateResult {
         assert_eq!(report.outcomes.len(), 1, "one input, one outcome");
         &report.outcomes[0].result
+    }
+
+    #[test]
+    fn scope_comparison_accepts_aliases_duplicates_and_rejects_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let a = first.to_string_lossy().into_owned();
+        let b = second.to_string_lossy().into_owned();
+        let alias = first.join(".").to_string_lossy().into_owned();
+        assert!(validate_update_scope(&[a.clone(), alias], std::slice::from_ref(&a)).is_ok());
+        assert!(validate_update_scope(std::slice::from_ref(&a), &[a.clone(), b]).is_err());
+        assert!(validate_update_scope(std::slice::from_ref(&a), &[]).is_err());
+        assert!(validate_update_scope(
+            &[tmp.path().join("missing").to_string_lossy().into_owned()],
+            &[a]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn descendants_and_linked_default_branches_are_never_updated() {
+        let (_tmp, origin, clone) = origin_and_clone();
+        let descendant = clone.join("ordinary/subdir");
+        std::fs::create_dir_all(&descendant).unwrap();
+        let before = git(&clone, &["rev-parse", "HEAD"]).unwrap();
+        advance(&origin);
+        let report = update_all_with(
+            &[descendant.to_string_lossy().into_owned()],
+            vec![],
+            &never_stop(),
+            |_, _| {},
+        );
+        assert!(matches!(only(&report), UpdateResult::Skipped { .. }));
+        assert_eq!(git(&clone, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(
+            !clone.join(".git/FETCH_HEAD").exists(),
+            "even fetching is forbidden for an arbitrary descendant"
+        );
+        // Put main in the linked checkout: a branch-name guard alone would
+        // allow it, so this proves target identity independently of branch.
+        run(&clone, &["checkout", "-qb", "feature"]);
+        let linked = clone.parent().unwrap().join("linked");
+        run(
+            &clone,
+            &["worktree", "add", linked.to_str().unwrap(), "main"],
+        );
+        let report = update_all_with(
+            &[linked.to_string_lossy().into_owned()],
+            vec![],
+            &never_stop(),
+            |_, _| {},
+        );
+        assert!(matches!(only(&report), UpdateResult::Skipped { .. }));
+        assert_eq!(git(&linked, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(
+            git(&clone, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "feature"
+        );
+        assert!(!linked.join("b.txt").exists());
+        assert!(!clone.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn bare_and_orphan_targets_are_refused_without_creating_fetch_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("bare.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        run(&bare, &["init", "--bare", "-q"]);
+        let orphan = tmp.path().join("orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let marker = "gitdir: ../missing/.git/worktrees/orphan\n";
+        std::fs::write(orphan.join(".git"), marker).unwrap();
+        std::fs::write(orphan.join("notes"), "keep this").unwrap();
+        let head = std::fs::read(bare.join("HEAD")).unwrap();
+        let report = update_all_with(
+            &[
+                bare.to_string_lossy().into_owned(),
+                orphan.to_string_lossy().into_owned(),
+            ],
+            vec![],
+            &never_stop(),
+            |_, _| {},
+        );
+        assert!(report.outcomes.iter().all(|o| matches!(
+            o.result,
+            UpdateResult::Skipped { .. } | UpdateResult::Failed { .. }
+        )));
+        assert_eq!(std::fs::read(bare.join("HEAD")).unwrap(), head);
+        assert!(!bare.join("FETCH_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(orphan.join(".git")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            std::fs::read_to_string(orphan.join("notes")).unwrap(),
+            "keep this"
+        );
+    }
+
+    #[test]
+    fn a_separate_git_directory_primary_checkout_can_update() {
+        let (_tmp, origin, clone) = origin_and_clone();
+        let metadata = clone.parent().unwrap().join("separate-metadata");
+        run(
+            &clone,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                metadata.to_str().unwrap(),
+            ],
+        );
+        assert!(clone.join(".git").is_file());
+        advance(&origin);
+        let report = update_all_with(
+            &[clone.to_string_lossy().into_owned()],
+            vec![],
+            &never_stop(),
+            |_, _| {},
+        );
+        assert!(
+            matches!(only(&report), UpdateResult::Updated { .. }),
+            "{report:?}"
+        );
+        assert!(clone.join("b.txt").is_file());
     }
 
     /// The happy path, so the refusal tests below cannot be satisfied by

@@ -68,21 +68,6 @@ pub mod keys {
     /// and that is never something an upgrade should switch on.
     pub const ALLOW_PHONE_CONNECTIONS: &str = "allow_phone_connections";
 
-    /// The login `fetch_viewer` last returned, as a JSON string.
-    ///
-    /// Exists so `store::stats::note_viewer` can tell a token swap from
-    /// an ordinary load. `stats_cache` keys resolve `@me` to whoever was
-    /// current when the row was written, and #840 found the `clear` that
-    /// handles a changed identity had no caller at all -- the comparison
-    /// needs somewhere to remember the previous answer, and this is it.
-    ///
-    /// A LOGIN, never a token: the token is `gh`'s to hold, and this file
-    /// is an unencrypted SQLite database beside the rest of the app's
-    /// state. A login is already visible in every cache key in the same
-    /// table.
-    pub const STATS_GENERATION: &str = "stats_generation";
-    pub const STATS_VIEWER: &str = "stats_viewer";
-
     /// How far into `~/.claude/headstate/sessions.jsonl` the hook handoff
     /// consumer has read, as a JSON integer of bytes (#913).
     ///

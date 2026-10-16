@@ -4,16 +4,9 @@
 //! Reads by default; writes only on explicit user action. The mutation
 //! transport is `graphql_mutation` below, used solely by `mutate.rs`.
 
-use super::map::{
-    map_cycle_trend, map_detail, map_history, map_list, map_merged_detail, map_rate_limit,
-    map_search, map_viewer,
-};
-use super::model::{CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats};
-use super::query::{
-    cycle_trend_query, history_query_range, history_query_range_with_periods, periods_query,
-    COUNT_QUERY, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY, PRS_QUERY, PR_DETAIL_QUERY, STATS_QUERY,
-};
-use chrono::{DateTime, Duration, Utc};
+use super::map::{map_detail, map_list, map_rate_limit, map_search, map_viewer};
+use super::model::{PrDetail, PullRequest};
+use super::query::{COUNT_QUERY, PRS_QUERY, PR_DETAIL_QUERY};
 use futures_util::{stream, StreamExt};
 use octocrab::Octocrab;
 use serde_json::json;
@@ -228,13 +221,6 @@ fn is_transport_error(e: &octocrab::Error) -> bool {
 /// so halving the page halves the spend as well as the server-side work.
 const PAGE_SIZE: u32 = 25;
 
-/// Page sizes for the MERGED-DETAIL query, which is a different shape
-/// and keeps its ladder: it fetches far fewer fields per item, so it
-/// does not hit the timeout the PR search does, and a smaller sample
-/// there costs accuracy rather than completeness.
-const PAGE_FULL: u32 = 100;
-const PAGE_REDUCED: u32 = 50;
-
 /// A ceiling on how many pages one search will fetch.
 ///
 /// 10 pages is 250 pull requests, far past any real review queue. It
@@ -302,24 +288,6 @@ fn expected_drift(boundaries: u64, failed_pages: u64) -> u64 {
 const AUTHORED_OPEN: &str = "is:pr is:open author:@me";
 const REVIEW_REQUESTED: &str = "is:pr is:open review-requested:@me";
 
-/// Whether GitHub gave up rather than objected.
-///
-/// A 502, or a body that will not parse -- which is what a 502 looks
-/// like from the client, since its body is empty or HTML and serde
-/// fails on byte one. Both mean "try asking for less"; a 401 or a
-/// malformed query means "asking again changes nothing".
-fn server_gave_up(e: &ClientError) -> bool {
-    match e {
-        ClientError::Shared(error) => server_gave_up(error),
-        ClientError::NotJson(_) => true,
-        ClientError::Api(octocrab::Error::GitHub { source, .. }) => {
-            source.status_code.is_server_error()
-        }
-        ClientError::Api(octocrab::Error::Serde { .. } | octocrab::Error::Json { .. }) => true,
-        _ => false,
-    }
-}
-
 /// `Clone` is cheap: `Octocrab` is an `Arc` internally, so a clone
 /// shares the same connection pool rather than opening another. That is
 /// what lets the paged search spawn its requests concurrently.
@@ -330,7 +298,6 @@ pub struct GitHubClient {
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
-    pub(crate) reviewer_receipts: Arc<super::stats::reviewer_receipts::Reads>,
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
@@ -577,30 +544,12 @@ impl GitHubClient {
         view.read_context = Some(context);
         view
     }
-    /// Bulk loads may finish warming their shared cache after navigation, but
-    /// cannot occupy the two slots reserved for visible foreground reads.
-    pub(crate) fn with_bulk_reads(&self) -> Self {
-        let mut view = self.clone();
-        view.read_class = super::admission::ReadClass::Background;
-        if let Some(context) = &mut view.read_context {
-            context.class = super::admission::ReadClass::Background;
-        }
-        // Class-only: preserve parent bounds and the load's existing overall
-        // timeout; default per-request deadlines still begin at each read.
-        view
-    }
-
     pub(super) fn with_scan_context(&self, context: super::admission::ReadContext) -> Self {
         let mut view = self.clone();
         view.read_context = Some(context);
         view
     }
 
-    pub(crate) fn stats_deadline(&self) -> Option<tokio::time::Instant> {
-        self.read_context
-            .as_ref()
-            .map(|_| self.read_context().deadline)
-    }
     pub(crate) fn read_context(&self) -> super::admission::ReadContext {
         let mut context = self
             .read_context
@@ -631,26 +580,6 @@ impl GitHubClient {
             .map_or(usize::MAX, |a| a.remaining())
     }
 
-    pub(crate) fn stats_observation(
-        &self,
-        owner: &crate::store::stats_owner::StatsOwner,
-        key: &str,
-        from: &str,
-        to: &str,
-    ) -> Option<crate::stats_measurement::Observation> {
-        let source = self
-            .read_transport
-            .measurement
-            .clone()
-            .map(crate::stats_measurement::Source::Shared)
-            .or_else(|| {
-                crate::measurement_desktop::recorder()
-                    .map(crate::stats_measurement::Source::Desktop)
-            });
-        self.read_transport
-            .stats_measurement
-            .scope(source, owner, key, from, to)
-    }
     pub(crate) fn measurement_recorder(&self) -> Option<&crate::measurement::Recorder> {
         self.read_transport.recorder()
     }
@@ -665,9 +594,10 @@ impl GitHubClient {
         self.read_transport.admission.snapshot()
     }
 
-    pub(crate) fn request_budget(&self) -> super::stats::Budget {
-        super::stats::Budget::with_transport(self.read_transport.clone())
+    pub(crate) fn request_budget(&self) -> super::budget::Budget {
+        super::budget::Budget::with_transport(self.read_transport.clone())
     }
+    #[cfg(test)]
     pub(crate) fn observed_remaining(&self) -> Option<u64> {
         self.read_transport
             .admission
@@ -683,7 +613,6 @@ impl GitHubClient {
             searches: Arc::new(Searches::default()),
             scans: Arc::default(),
             viewer: Arc::default(),
-            reviewer_receipts: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
@@ -1342,30 +1271,6 @@ impl GitHubClient {
         ))
     }
 
-    /// Median cycle time this week against last, in one request.
-    pub async fn fetch_cycle_trend(&self, now: DateTime<Utc>) -> Result<CycleTrend, ClientError> {
-        let v = self
-            .graphql_partial_ok(&json!({ "query": cycle_trend_query(now) }))
-            .await?;
-        // Both window totals, before mapping (#854). `map_cycle_trend`
-        // reads each `issueCount` through `unwrap_or(0)` and derives
-        // `sampled` from it, so a refused count does not merely zero a
-        // number: `0 > 100` is false, `sampled` flips to FALSE, and a
-        // 100-PR sample of a busy week is presented as the complete week.
-        // That is exactly the silent-census failure #847's shape guard
-        // exists to stop a missing FIELD causing, arriving here through a
-        // refused one instead.
-        let refused = refused_fields(&v);
-        for window in ["current", "previous"] {
-            Self::reject_missing_count_after_refusals(
-                v[window]["issueCount"].as_u64(),
-                refused,
-                "cycle-time window total",
-            )?;
-        }
-        Ok(map_cycle_trend(&v))
-    }
-
     /// Run a mutation, treating ANY error as failure.
     ///
     /// Deliberately unlike `graphql_partial_ok`, which keeps `data` when
@@ -1518,7 +1423,7 @@ impl GitHubClient {
     pub(super) async fn rest_get(
         &self,
         path: &str,
-        budget: &crate::github::stats::Budget,
+        budget: &crate::github::budget::Budget,
     ) -> Result<serde_json::Value, ClientError> {
         self.read_transport
             .get(&self.octocrab, path, budget, self.read_context())
@@ -1541,7 +1446,7 @@ impl GitHubClient {
         &self,
         path: &str,
         body: &serde_json::Value,
-        budget: &crate::github::stats::Budget,
+        budget: &crate::github::budget::Budget,
     ) -> Result<(u16, serde_json::Value), ClientError> {
         let mut admission = self
             .read_transport
@@ -1856,7 +1761,7 @@ impl GitHubClient {
                     .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
                     .await?;
                 if let Some((remaining, _)) = map_rate_limit(&v) {
-                    crate::github::stats::budget::note_remaining(remaining);
+                    crate::github::budget::note_remaining(remaining);
                 }
                 let viewer = map_viewer(&v)
                     .filter(|v| !v.is_empty())
@@ -1886,9 +1791,32 @@ impl GitHubClient {
     /// -- so there is nothing for them to report into, and inventing a
     /// throwaway `Budget` to discard would be accounting theatre. They still
     /// feed their authenticated client transport quota observations.
+    pub async fn stats_graphql(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.graphql_partial_ok(body).await
+    }
+
+    pub async fn stats_viewer_metered(
+        &self,
+        budget: &crate::github::budget::Budget,
+    ) -> Result<String, ClientError> {
+        // The immutable client owns the token. Never reuse disk identity or
+        // another client's login, and never cache a failed lookup.
+        tokio::time::timeout_at(
+            self.read_context().deadline,
+            self.viewer
+                .get_or_try_init(|| self.fetch_viewer_metered(budget)),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
+        .cloned()
+    }
+
     pub async fn fetch_viewer_metered(
         &self,
-        budget: &crate::github::stats::Budget,
+        budget: &crate::github::budget::Budget,
     ) -> Result<String, ClientError> {
         let v = self
             .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
@@ -1901,22 +1829,6 @@ impl GitHubClient {
             .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
         self.persist_verified_viewer(&viewer).await;
         Ok(viewer)
-    }
-
-    pub async fn stats_viewer_metered(
-        &self,
-        budget: &crate::github::stats::Budget,
-    ) -> Result<String, ClientError> {
-        // The immutable client owns the token. Never reuse disk identity or
-        // another client's login, and never cache a failed lookup.
-        tokio::time::timeout_at(
-            self.read_context().deadline,
-            self.viewer
-                .get_or_try_init(|| self.fetch_viewer_metered(budget)),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
-        .cloned()
     }
 
     /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
@@ -1934,7 +1846,7 @@ impl GitHubClient {
         owner: &str,
         name: &str,
         branches: &[String],
-        budget: &crate::github::stats::Budget,
+        budget: &crate::github::budget::Budget,
     ) -> Result<serde_json::Value, ClientError> {
         let mut vars = serde_json::Map::new();
         vars.insert("owner".into(), json!(owner));
@@ -1999,217 +1911,9 @@ impl GitHubClient {
             // (`the_reserve_matches_the_existing_low_budget_warning` pins
             // that), so the user cannot get a warning from one and a refusal
             // from the other at different moments.
-            crate::github::stats::budget::note_remaining(remaining);
+            crate::github::budget::note_remaining(remaining);
         }
         Ok(self.owned_list_evidence(&v, map_search(&v)))
-    }
-
-    /// The two historical counters. The other five dashboard numbers are
-    /// derived from the PR list in the frontend and cost no extra request.
-    pub async fn fetch_stats(&self, now: DateTime<Utc>) -> Result<Stats, ClientError> {
-        let week = (now - Duration::days(7)).format("%Y-%m-%d").to_string();
-        let month = (now - Duration::days(30)).format("%Y-%m-%d").to_string();
-        let v = self
-            .graphql_partial_ok(&json!({
-                "query": STATS_QUERY,
-                "variables": {
-                    "week": format!("is:pr author:@me is:merged merged:>={week}"),
-                    "month": format!("is:pr author:@me is:merged merged:>={month}"),
-                }
-            }))
-            .await?;
-        // Both counts, or an error: a refused alias reported as 0 merged
-        // pull requests is a confident claim about a quiet week (#854).
-        let refused = refused_fields(&v);
-        Ok(Stats {
-            merged_week: Self::reject_missing_count_after_refusals(
-                v["merged_week"]["issueCount"].as_u64(),
-                refused,
-                "weekly merged count",
-            )?,
-            merged_month: Self::reject_missing_count_after_refusals(
-                v["merged_month"]["issueCount"].as_u64(),
-                refused,
-                "monthly merged count",
-            )?,
-            ..Stats::default()
-        })
-    }
-
-    /// The chart's daily merged/opened series plus all four period-delta
-    /// cards, in one request built by `history_query_with_periods`.
-    /// Day-bucket chunks, fetched CONCURRENTLY and merged.
-    ///
-    /// GitHub evaluates search aliases serially, so one large query is slow
-    /// (measured: 30 aliases = 7.8s). Small chunks in parallel finish in
-    /// roughly the time of the slowest one -- 30 days dropped from 17s to
-    /// ~3s. Chunk count is bounded by `days / HISTORY_CHUNK_DAYS`, so at the
-    /// 90-day clamp this is 18 concurrent requests at 1 point each.
-    async fn fetch_history_values(
-        &self,
-        now: DateTime<Utc>,
-        days: i64,
-        with_periods: bool,
-    ) -> Result<serde_json::Value, ClientError> {
-        let mut set = tokio::task::JoinSet::new();
-        let mut start = 0;
-        while start < days {
-            let len = (days - start).min(HISTORY_CHUNK_DAYS);
-            let q = if start == 0 && with_periods {
-                history_query_range_with_periods(now, start, len)
-            } else {
-                history_query_range(now, start, len)
-            };
-            let client = self.clone();
-            set.spawn(async move { client.graphql_partial_ok(&json!({ "query": q })).await });
-            start += len;
-        }
-
-        let mut merged = serde_json::Map::new();
-        // Refusals are SUMMED across chunks rather than overwritten.
-        //
-        // `__refused` is a TOP-LEVEL key, not an alias, so the blanket
-        // insert below made the last refusing chunk win -- in
-        // `join_next` completion order, which is non-deterministic, so a
-        // complete chunk finishing last erased every refusal before it
-        // (#854). The stats layer found and fixed this exact bug in its
-        // own chunked merge (`stats/fetch.rs:948`, pinned by
-        // `refusals_across_chunks_are_summed_not_overwritten`); this is
-        // the legacy history path that never received it.
-        let mut refused = 0usize;
-        while let Some(joined) = set.join_next().await {
-            // A panicked task would otherwise be swallowed and show up as a
-            // silently short series, so it is surfaced as an error.
-            let chunk = joined.map_err(|e| ClientError::Join(e.to_string()))??;
-            refused += refused_fields(&chunk);
-            if let Some(obj) = chunk.as_object() {
-                // Alias indices are absolute, so chunks merge in any
-                // completion order without renumbering or clobbering.
-                for (k, val) in obj {
-                    merged.insert(k.clone(), val.clone());
-                }
-            }
-        }
-        // Re-stated under the key the readers use, so the merged value
-        // carries the TOTAL. Inserted only when non-zero, matching
-        // `graphql_partial_ok`'s own shape -- an absent key means no
-        // refusal, and a present zero would be a different claim.
-        if refused > 0 {
-            merged.insert("__refused".into(), refused.into());
-        }
-        Ok(serde_json::Value::Object(merged))
-    }
-
-    /// Just the period comparisons -- one small request so the delta cards
-    /// can render without waiting on the daily series.
-    pub async fn fetch_periods(&self, now: DateTime<Utc>) -> Result<Periods, ClientError> {
-        let v = self
-            .graphql_partial_ok(&json!({ "query": periods_query(now) }))
-            .await?;
-        // Each alias consults the refusal count rather than defaulting to
-        // zero (#854): a zeroed period is a delta card claiming a change
-        // that did not happen, against a figure GitHub never supplied.
-        let refused = refused_fields(&v);
-        let count = |k: &str| {
-            Self::reject_missing_count_after_refusals(v[k]["issueCount"].as_u64(), refused, k)
-        };
-        Ok(Periods {
-            week_current: count("week_current")?,
-            week_previous: count("week_previous")?,
-            opened_week_current: count("opened_week_current")?,
-            opened_week_previous: count("opened_week_previous")?,
-            month_current: count("month_current")?,
-            month_previous: count("month_previous")?,
-        })
-    }
-
-    pub async fn fetch_history(
-        &self,
-        now: DateTime<Utc>,
-        days: i64,
-    ) -> Result<History, ClientError> {
-        // Chunked because GitHub 502s on a query with too many concurrent
-        // `search` aliases -- see HISTORY_CHUNK_DAYS. The first chunk also
-        // carries the six period aliases, so a 30-day fetch is six requests
-        // and two rate-limit points rather than one request that fails.
-        let v = self.fetch_history_values(now, days, true).await?;
-        // The period aliases consult the refusal count, as `fetch_periods`
-        // does, and for the same reason (#854). `points` is left to
-        // `map_history`, which already reports a missing day as a gap
-        // rather than as a zero.
-        let refused = refused_fields(&v);
-        let count = |k: &str| {
-            Self::reject_missing_count_after_refusals(v[k]["issueCount"].as_u64(), refused, k)
-        };
-        Ok(History {
-            points: map_history(&v, days, now),
-            week_current: count("week_current")?,
-            week_previous: count("week_previous")?,
-            opened_week_current: count("opened_week_current")?,
-            opened_week_previous: count("opened_week_previous")?,
-            month_current: count("month_current")?,
-            month_previous: count("month_previous")?,
-        })
-    }
-
-    /// A sample of the most recent merged PRs, for the insight cards.
-    /// The merged-PR sample behind the insight cards.
-    ///
-    /// The most expensive query the app makes: `additions`, `deletions`
-    /// and `changedFiles` are computed per pull request, so GitHub
-    /// calculates a diff for each of 100. MEASURED live at 6.5s, against
-    /// 2.7s for the same query without those three fields -- they are
-    /// roughly 60% of it, and a reported log showed this query returning
-    /// 124 RESOURCE_LIMITS_EXCEEDED errors.
-    ///
-    /// The fields stay: the insight cards genuinely display them. The
-    /// SAMPLE shrinks on failure instead, and only on failure -- halving
-    /// it moved the mean from 321 to 356 lines in one measurement, which
-    /// is a real accuracy cost to pay only when the alternative is no
-    /// answer at all.
-    pub async fn fetch_merged_detail(&self) -> Result<MergedDetail, ClientError> {
-        let v = match self.merged_detail_page(PAGE_FULL).await {
-            Err(e) if server_gave_up(&e) => {
-                log::warn!(
-                    "GitHub could not answer a {PAGE_FULL}-item merged query ({e}); \
-                     retrying with {PAGE_REDUCED} -- the averages will be over a smaller sample"
-                );
-                self.merged_detail_page(PAGE_REDUCED).await?
-            }
-            other => other?,
-        };
-        Ok(map_merged_detail(&v))
-    }
-
-    async fn merged_detail_page(&self, first: u32) -> Result<serde_json::Value, ClientError> {
-        self.graphql_partial_ok(&json!({
-            "query": MERGED_DETAIL_QUERY,
-            "variables": { "first": first },
-        }))
-        .await
-    }
-
-    /// One stats-layer GraphQL request, with this module's partial-success
-    /// handling.
-    ///
-    /// The stats layer (`github::stats`) needs the same treatment every
-    /// query here gets -- `data` kept alongside `errors`, a 502 reported
-    /// as `NotJson` rather than as a serde failure, `RESOURCE_LIMITS_
-    /// EXCEEDED` surfaced rather than escalated -- and must not grow its
-    /// own copy of it. `client.rs:1094-1175` is 80 lines of hard-won
-    /// behaviour and a second implementation would drift from it silently.
-    ///
-    /// Public, unlike `graphql_partial_ok`, because the stats layer is a
-    /// sibling module rather than a method on this type: its documents are
-    /// built from a subject and a scope, so they cannot be `const`s here.
-    /// The NAME is what keeps that honest -- a stats request is
-    /// identifiable in a call graph, and this cannot become a general
-    /// "run any GraphQL" escape hatch without being renamed first.
-    pub async fn stats_graphql(
-        &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, ClientError> {
-        self.graphql_partial_ok(body).await
     }
 }
 
@@ -2220,15 +1924,6 @@ impl GitHubClient {
 /// is one of the things #824 item 8 requires.
 pub fn refused_fields_of(v: &serde_json::Value) -> usize {
     refused_fields(v)
-}
-
-/// Whether GitHub gave up rather than objected -- see `server_gave_up`.
-///
-/// Exported for the stats layer's degradation ladder, which inherits
-/// `fetch_merged_detail`'s rule (`client.rs:1024-1050`) rather than
-/// reimplementing the question "is asking for less likely to help".
-pub fn server_gave_up_on(e: &ClientError) -> bool {
-    server_gave_up(e)
 }
 
 /// Direct-node errors use [checking, field, ...]. Preserve their readiness
@@ -3022,7 +2717,7 @@ mod tests {
                     let network_started = Instant::now();
                     let result = if metered {
                         client
-                            .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                            .fetch_viewer_metered(&crate::github::budget::Budget::new())
                             .await
                     } else {
                         client.fetch_viewer().await
@@ -3120,7 +2815,7 @@ mod tests {
             .await;
         assert_eq!(
             client
-                .fetch_viewer_metered(&crate::github::stats::Budget::new())
+                .fetch_viewer_metered(&crate::github::budget::Budget::new())
                 .await
                 .unwrap(),
             "synthetic-current-login"
@@ -3831,30 +3526,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stats_viewer_reuses_only_this_clients_verified_identity() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"data":{"viewer":{"login":"alice"}}})),
-            )
-            .mount(&server)
-            .await;
-        let client = client_for(&server).await;
-        assert_eq!(client.fetch_viewer().await.unwrap(), "alice");
-        let before = server.received_requests().await.unwrap().len();
-        let budget = crate::github::stats::Budget::new();
-        assert_eq!(
-            client.clone().stats_viewer_metered(&budget).await.unwrap(),
-            "alice"
-        );
-        assert_eq!(server.received_requests().await.unwrap().len(), before);
-        let other = client_for(&server).await;
-        other.stats_viewer_metered(&budget).await.unwrap();
-        assert_eq!(server.received_requests().await.unwrap().len(), before + 1);
-    }
-
     /// The verification must be wired into the CALLER, not merely exist.
     ///
     /// `verify_resolved` can be perfectly correct and perfectly unused:
@@ -4514,36 +4185,6 @@ mod tests {
         assert!(client_for(&server).await.fetch_reviewing().await.is_ok());
     }
 
-    /// The most expensive query the app makes, and the one a reported
-    /// log showed returning 124 RESOURCE_LIMITS_EXCEEDED errors. It
-    /// needs the same fallback the pull request query got.
-    #[tokio::test]
-    async fn the_merged_sample_shrinks_when_github_gives_up() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .and(body_string_contains("\"first\":100"))
-            .respond_with(ResponseTemplate::new(502).set_body_raw("", "text/html"))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .and(body_string_contains("\"first\":50"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"merged": {"nodes": []}}
-            })))
-            .mount(&server)
-            .await;
-
-        // Reaching the reduced page at all is the assertion: the full
-        // one 502s, and without the fallback this is an error.
-        assert!(client_for(&server)
-            .await
-            .fetch_merged_detail()
-            .await
-            .is_ok());
-    }
-
     #[tokio::test]
     async fn an_auth_failure_is_not_retried_smaller() {
         let server = MockServer::start().await;
@@ -4562,46 +4203,6 @@ mod tests {
             .await
             .is_err());
         // `expect(1)` is verified on drop: a second attempt fails the test.
-    }
-
-    #[tokio::test]
-    async fn fetch_stats_maps_the_aliased_counts() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "merged_week": { "issueCount": 4 },
-                    "merged_month": { "issueCount": 11 }
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        let stats = client_for(&server)
-            .await
-            .fetch_stats(Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(stats.merged_week, 4);
-        assert_eq!(stats.merged_month, 11);
-        assert_eq!(stats.in_merge_queue, 0);
-    }
-
-    #[tokio::test]
-    async fn fetch_stats_api_error_is_returned_not_panicked_on() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        assert!(client_for(&server)
-            .await
-            .fetch_stats(Utc::now())
-            .await
-            .is_err());
     }
 
     /// Rate-limit exhaustion is named, not left as a generic failure the
@@ -5044,97 +4645,6 @@ mod tests {
                 .contains("Could not resolve to a Repository"),
             "message must reach the user: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn fetch_history_maps_buckets_and_periods() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {
-                    "m0": {"issueCount": 5}, "o0": {"issueCount": 7},
-                    "m1": {"issueCount": 3}, "o1": {"issueCount": 4},
-                    "week_current": {"issueCount": 183},
-                    "week_previous": {"issueCount": 110},
-                    "opened_week_current": {"issueCount": 190},
-                    "opened_week_previous": {"issueCount": 120},
-                    "month_current": {"issueCount": 571},
-                    "month_previous": {"issueCount": 515}
-                }
-            })))
-            .mount(&server)
-            .await;
-        let c = client_for(&server).await;
-        let now = DateTime::parse_from_rfc3339("2026-08-20T14:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let h = c.fetch_history(now, 2).await.unwrap();
-        assert_eq!(h.points.len(), 2);
-        assert_eq!(h.points[1].merged, 5);
-        assert_eq!(h.week_current, 183);
-        assert_eq!(h.week_previous, 110);
-        assert_eq!(h.month_current, 571);
-    }
-
-    #[tokio::test]
-    async fn fetch_history_api_error_is_returned_not_panicked_on() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        assert!(client_for(&server)
-            .await
-            .fetch_history(Utc::now(), 7)
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_merged_detail_maps_the_response() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {
-                    "merged": {"nodes": [
-                        {"createdAt":"2026-08-19T10:00:00Z","mergedAt":"2026-08-19T12:00:00Z",
-                         "additions":100,"deletions":20,"changedFiles":3,
-                         "reviews":{"totalCount":1},"comments":{"totalCount":2},
-                         "repository":{"nameWithOwner":"acme/alpha"}}
-                    ]}
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        let d = client_for(&server)
-            .await
-            .fetch_merged_detail()
-            .await
-            .unwrap();
-        assert_eq!(d.sample_size, 1);
-        assert_eq!(d.additions, 100);
-        assert_eq!(d.cycle_time_hours, vec![2.0]);
-    }
-
-    #[tokio::test]
-    async fn fetch_merged_detail_api_error_is_returned_not_panicked_on() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        assert!(client_for(&server)
-            .await
-            .fetch_merged_detail()
-            .await
-            .is_err());
     }
 
     /// A pull request can carry more checks than one page returns, and a
@@ -5702,133 +5212,6 @@ mod tests {
         );
     }
 
-    // Exercises the real fetch path against the LIVE API, exactly as the
-    // Tauri commands do. #[ignore]d so CI never depends on network or a
-    // token; run manually with `cargo test --lib live_ -- --ignored`.
-    #[tokio::test]
-    #[ignore]
-    async fn live_fetch_history_and_detail() {
-        let out = std::process::Command::new("gh")
-            .args(["auth", "token"])
-            .output()
-            .expect("gh auth token");
-        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let c = GitHubClient::new(crate::auth::build_client(&token).unwrap());
-
-        let tp = std::time::Instant::now();
-        let p = c.fetch_periods(Utc::now()).await.unwrap();
-        println!(
-            "TIMING fetch_periods = {:?} (week {}/{})",
-            tp.elapsed(),
-            p.week_current,
-            p.week_previous
-        );
-
-        let t0 = std::time::Instant::now();
-        // The detail view's payload, through the real client.
-        if let Ok(d) = c.fetch_pr_detail("pktstorm/headstate", 165).await {
-            println!(
-                "DETAIL #{} \"{}\" checks={} comments={} body={}b status={:?}",
-                d.number,
-                &d.title[..d.title.len().min(30)],
-                d.checks.len(),
-                d.comments.len(),
-                d.body.len(),
-                d.merge_status
-            );
-            assert!(!d.title.is_empty(), "title must be populated");
-            assert!(!d.checks.is_empty(), "checks must be populated");
-        }
-
-        let (authored, reviewing) = c.fetch_prs_and_reviewing().await.unwrap();
-        println!("AUTHORED={} REVIEWING={}", authored.len(), reviewing.len());
-        {
-            use std::collections::BTreeMap;
-            let mut by: BTreeMap<String, usize> = BTreeMap::new();
-            for p in &authored {
-                *by.entry(format!("{:?}", p.merge_status)).or_default() += 1;
-            }
-            println!("MERGE_STATUS {by:?}");
-            assert!(
-                authored
-                    .iter()
-                    .any(|p| p.merge_status != crate::github::model::MergeStateStatus::Unknown),
-                "mergeStateStatus must be populated, not all Unknown"
-            );
-        }
-        let stacked: Vec<_> = authored
-            .iter()
-            .filter(|p| p.base_ref != "main" && p.base_ref != "master")
-            .collect();
-        let no_ci = authored
-            .iter()
-            .filter(|p| p.ci == crate::github::model::CiState::None)
-            .count();
-        println!("STACKED={} NO_CI={}", stacked.len(), no_ci);
-        if let Some(p) = stacked.first() {
-            println!("  e.g. {} -> {}", p.head_ref, p.base_ref);
-        }
-        assert!(
-            authored.iter().all(|p| !p.base_ref.is_empty()),
-            "base_ref must be populated"
-        );
-        assert!(!authored.is_empty());
-
-        let t = c.fetch_cycle_trend(Utc::now()).await.unwrap();
-        println!(
-            "CYCLE cur={:.2}h ({} merged) prev={:.2}h ({} merged) sampled={}",
-            t.current_hours, t.current_count, t.previous_hours, t.previous_count, t.sampled
-        );
-
-        let h = c.fetch_history(Utc::now(), 30).await.unwrap();
-        println!("TIMING fetch_history(30) = {:?}", t0.elapsed());
-        println!(
-            "POINTS={} WEEK={}/{} MONTH={}/{}",
-            h.points.len(),
-            h.week_current,
-            h.week_previous,
-            h.month_current,
-            h.month_previous
-        );
-        assert_eq!(h.points.len(), 30);
-        // Ascending by date: the chart plots time left to right.
-        assert!(h.points.windows(2).all(|w| w[0].date <= w[1].date));
-
-        let d = c.fetch_merged_detail().await.unwrap();
-        println!(
-            "SLOWEST={} LARGEST={} top_slow={:.1}h top_big={} lines",
-            d.slowest.len(),
-            d.largest.len(),
-            d.slowest.first().map(|p| p.cycle_time_hours).unwrap_or(0.0),
-            d.largest.first().map(|p| p.size).unwrap_or(0)
-        );
-        assert!(!d.slowest.is_empty(), "outliers must be populated");
-        assert!(
-            d.slowest.iter().all(|p| !p.url.is_empty()),
-            "each needs a link"
-        );
-        println!(
-            "SAMPLE={} LINES={} SIZES={} REPOS={} CYCLES={}",
-            d.sample_size,
-            d.additions + d.deletions,
-            d.pr_sizes.len(),
-            d.repo_counts.len(),
-            d.cycle_time_hours.len()
-        );
-        assert!(d.sample_size > 0);
-        // Both vectors must be sorted or percentile() silently lies.
-        assert!(
-            d.pr_sizes.windows(2).all(|w| w[0] <= w[1]),
-            "pr_sizes unsorted"
-        );
-        assert!(
-            d.cycle_time_hours.windows(2).all(|w| w[0] <= w[1]),
-            "cycle times unsorted"
-        );
-        // Repo counts descend, so the table's first row is the busiest.
-        assert!(d.repo_counts.windows(2).all(|w| w[0].merged >= w[1].merged));
-    }
-
     /// Every `graphql_partial_ok` call site consults the refusal count.
     ///
     /// # What it enforces
@@ -5907,10 +5290,6 @@ mod tests {
             (
                 "fetch_viewer_metered",
                 "as `fetch_viewer`; this one also records the spend",
-            ),
-            (
-                "merged_detail_page",
-                "one page for `fetch_merged_detail`, which maps the result",
             ),
             // The stats layer's door. Its readers each call
             // `refused_fields_of`, which a scan of this file cannot see.
@@ -6031,7 +5410,7 @@ mod tests {
         // `every_stats_query_meters_itself` asserts the same way and for
         // the same reason.
         assert!(
-            seen.len() >= 10,
+            seen.len() >= 9,
             "only {} `graphql_partial_ok` call site(s) found; the scan is broken, not \
              the code",
             seen.len()

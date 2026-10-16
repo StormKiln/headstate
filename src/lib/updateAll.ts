@@ -112,29 +112,11 @@ export function summarise(report: UpdateAllReport): string {
   let line = parts.join(" · ");
   if (report.cancelled) line = `Stopped. ${line}`;
   else if (report.timedOut) line = `Timed out. ${line}`;
-  if (t.unreadable > 0) {
-    line += `. ${t.unreadable} ${
-      t.unreadable === 1 ? "directory" : "directories"
-    } could not be read, so this was not every repository`;
-  }
+  if (t.unreadable > 0) line += ". Discovery incomplete; some repositories may be missing";
   return line;
 }
 
-/// The button's own label, which must not say "All" over a short census
-/// (#1025).
-///
-/// "Update All Repositories" over a scan that could not read three
-/// directories is a lie about scope, and nothing in the sequence is
-/// false: the table lists 42, the button updates 42, the report says 42
-/// of 42, and the user closes the app believing all 45 are level. They
-/// have been given a reason to stop checking.
-///
-/// So the button names the number it can actually SEE when the scan fell
-/// short, and keeps the plain label when it did not. It stays ENABLED
-/// either way: disabling it would let one unreadable directory block
-/// updating 42 perfectly good repositories, trading a lie for a broken
-/// feature.
-export function updateAllLabel(count: number, unreadable: readonly string[]): string {
-  if (unreadable.length === 0) return "Update All Repositories";
-  return `Update ${count} readable ${count === 1 ? "repository" : "repositories"}`;
+/// Name the visible scope regardless of discovery completeness.
+export function updateAllLabel(count: number): string {
+  return `Update ${count} ${count === 1 ? "repository" : "repositories"}`;
 }

@@ -54,11 +54,6 @@ vi.mock("./api/hooks", () => ({
   // view is opened, so an idle shape is what the page actually renders
   // on arrival. A populated mock here would assert a loaded page that
   // the real app reaches only after six round trips to the desktop.
-  useStatsTree: () => ({ data: undefined, isLoading: false, isSuccess: false }),
-  useStatsBoard: () => ({ data: undefined, isLoading: false, isSuccess: false }),
-  useStatsSeries: () => ({ data: undefined, isLoading: false, isSuccess: false }),
-  useStatsReviewers: () => ({ data: undefined, isLoading: false, isSuccess: false }),
-  useScopedCounts: () => ({ data: undefined, isLoading: false, isSuccess: false }),
   useNotifyPrefs: () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },
     set: () => Promise.resolve(),
@@ -72,33 +67,6 @@ vi.mock("./api/hooks", () => ({
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
   useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
-  useCycleTrend: () => ({ data: undefined }),
-  usePeriods: () => ({
-    data: {
-      week_current: 5,
-      week_previous: 3,
-      opened_week_current: 6,
-      opened_week_previous: 4,
-      month_current: 20,
-      month_previous: 18,
-    },
-    isLoading: false,
-    isError: false,
-    refetch: () => {},
-  }),
-  useHistory: () => ({
-    data: {
-      points: [],
-      week_current: 0,
-      week_previous: 0,
-      opened_week_current: 0,
-      opened_week_previous: 0,
-      month_current: 0,
-      month_previous: 0,
-    },
-    isLoading: false,
-  }),
-  useMergedDetail: () => ({ data: undefined, isLoading: false }),
 }));
 
 const connection = vi.hoisted(() => ({ current: { kind: "local" } as ConnectionState }));
@@ -139,7 +107,7 @@ const EMPTY = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {}, "claude-code": {}, "pr-stats": {}, "system-health": {},
+  "claude-md": {}, "claude-code": {},  "system-health": {},
 };
 
 beforeEach(() => {
@@ -163,20 +131,12 @@ describe("App shell on the desktop", () => {
   it("renders the repo sidebar inline, with no menu button and no banner", () => {
     stubViewport(1400);
     connection.current = {
-      kind: "connected",
-      desktop: "octocat's laptop",
-      lastPoll: null,
-      protocolVersion: REQUIRED_PROTOCOL_VERSION,
-      stale: false,
+      kind: "connected", desktop: "octocat's laptop", lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
     };
     renderApp();
     const nav = screen.getByRole("navigation");
     expect(within(nav).getByText("All repositories")).toBeTruthy();
-    // "PR Stats" is inside the view switcher's menu now, not pinned to
-    // the column (#794), so it is not in the DOM until the menu opens.
-    // What this test is about is the SHELL -- inline sidebar, no menu
-    // button, no banner -- so it checks the switcher is present and
-    // leaves what the menu holds to `ViewSwitcher`'s own tests.
     expect(within(nav).getByRole("button", { name: /my pull requests/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /open navigation/i })).toBeNull();
     expect(screen.queryByText(/octocat's laptop/)).toBeNull();
@@ -382,84 +342,6 @@ describe("Stats on the companion build", () => {
       app.unmount();
       vi.useRealTimers();
     }
-  });
-
-  /// #863 ships PR Stats to the companion, reversing #794's
-  /// classification. These four tests are the inverted form of the four
-  /// that pinned the hiding; they are kept as a group so a future change
-  /// of heart has one place to look.
-  ///
-  /// The entry must be in the MENU, not merely reachable by a stored
-  /// value: a page you cannot navigate to is not shipped.
-  it("offers a PR Stats entry in the view switcher", async () => {
-    stubViewport(390);
-    await renderMobileApp();
-    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
-    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    const nav = within(screen.getByRole("navigation"));
-    fireEvent.click(nav.getByRole("button", { name: /my pull requests/i }));
-    expect(nav.getByRole("menuitem", { name: /pr stats/i })).toBeTruthy();
-    // A view the phone already had, so this proves the menu rendered
-    // rather than that every query matches.
-    expect(nav.getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
-  });
-
-  /// The case that motivated #863: a desktop closed on PR Stats, and the
-  /// phone picks up the same persisted `view`. It now opens ON that page
-  /// instead of silently showing the list.
-  it("opens on PR Stats when that was the stored view", async () => {
-    useFilters.setState({ view: "pr-stats" } as never);
-    stubViewport(390);
-    await renderMobileApp();
-    await waitFor(() =>
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("PR Stats"),
-    );
-  });
-
-  /// Unchanged by #863, and still worth asserting: nothing rewrites the
-  /// persisted value. It passed when the phone DECLINED the stored view
-  /// and it passes now that the phone honours it -- which is the point,
-  /// because the phone and desktop can share a store and a write here
-  /// would move the desktop too.
-  it("leaves the stored view alone rather than rewriting it", async () => {
-    useFilters.setState({ view: "pr-stats" } as never);
-    stubViewport(390);
-    await renderMobileApp();
-    expect(useFilters.getState().view).toBe("pr-stats");
-  });
-
-  /// Two components route on `view` and must agree. The old hazard was a
-  /// collapsed button reading "PR Stats" above a PR list; the new one is
-  /// the mirror image -- a button still reading "My pull requests" above
-  /// the Stats page. One set read by both is what rules out each.
-  it("names the page it is actually showing in the switcher", async () => {
-    useFilters.setState({ view: "pr-stats" } as never);
-    stubViewport(390);
-    await renderMobileApp();
-    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
-    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    const nav = within(screen.getByRole("navigation"));
-    expect(nav.getByRole("button", { name: /pr stats/i })).toBeTruthy();
-  });
-
-  it("keeps PR Stats on a narrow DESKTOP window", async () => {
-    // The case the viewport guard got wrong (#598): a desktop dragged
-    // under 768px still has every page a desktop has.
-    vi.stubEnv("VITE_TARGET", "desktop");
-    vi.resetModules();
-    const { default: DesktopApp } = await import("./App");
-    stubViewport(390);
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <DesktopApp />
-      </QueryClientProvider>,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
-    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    const nav = within(screen.getByRole("navigation"));
-    fireEvent.click(nav.getByRole("button", { name: /my pull requests/i }));
-    expect(nav.getByRole("menuitem", { name: /pr stats/i })).toBeTruthy();
   });
 });
 

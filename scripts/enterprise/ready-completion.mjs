@@ -24,7 +24,7 @@ export function assertCompletionDeadline(coverage,expected,elapsedMs,ceilingMs){
 }
 export async function runReadyCompletion({pages,provider,result,out,control,nativeCall}){
  const began=performance.now(),ceilingMs=900000,expected=Array.from({length:16},(_,i)=>51+i);
- const evidence={ceilingMs,clock:'real30s selection / real60s Stats',layout:'desktop production ReadyStrip16; paired production Stats after brief disjoint Ready interest',expected,setup:[],snapshots:[],periods:[]};
+ const evidence={ceilingMs,clock:'real30s selection',layout:'desktop production ReadyStrip16; paired authored list after brief disjoint Ready interest',expected,setup:[],snapshots:[],periods:[]};
  const save=()=>writeFile(resolve(out,'ready-completion.json'),JSON.stringify(evidence,null,2));
  const events=async()=>{const text=await readFile(resolve(out,'profile/native.ndjson'),'utf8');return text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(JSON.parse);};
  const row=n=>provider.data.rows.find(row=>row.number===n);
@@ -48,7 +48,7 @@ export async function runReadyCompletion({pages,provider,result,out,control,nati
   assert.ok(firstDown);
   await pages[1].getByRole('button',{name:'To Review',exact:true}).click();
   await pages[1].waitForFunction(()=>window.__enterprise.telemetry.some(e=>e.kind==='call'&&e.name.startsWith('get_ready_')));
-  await pages[1].getByRole('button',{name:'Statistics',exact:true}).click();
+  await pages[1].getByRole('button',{name:'My PRs',exact:true}).click();
   await delay(65000);
   evidence.controlledSetupMs=performance.now()-began;
   await pages[0].getByRole('button',{name:'To Review',exact:true}).click();
