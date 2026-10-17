@@ -704,7 +704,11 @@ fn import_generation(
     )?;
     let mut source_changed = false;
     for (path, size, modified) in &scan.source_fingerprints {
-        if super::transcript::fingerprint(path).ok().as_ref() != Some(&(*size, modified.clone())) {
+        if super::transcript::discovery_fingerprint(path, control)
+            .ok()
+            .as_ref()
+            != Some(&(*size, modified.clone()))
+        {
             source_changed = true;
             out.unreadable_files.push(format!(
                 "{}: changed during discovery; previous derived facts retained",
@@ -713,7 +717,9 @@ fn import_generation(
         }
     }
     if source_changed {
-        out.population.status = PopulationStatus::Invalidated;
+        out.population.status = control
+            .stop_reason()
+            .unwrap_or(PopulationStatus::Invalidated);
         return Ok(out);
     }
 

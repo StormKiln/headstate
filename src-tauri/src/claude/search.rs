@@ -754,10 +754,15 @@ pub(crate) fn index_pass_controlled(
         .source_fingerprints
         .iter()
         .all(|(path, size, modified)| {
-            super::transcript::fingerprint(path).ok().as_ref() == Some(&(*size, modified.clone()))
+            super::transcript::discovery_fingerprint(path, control)
+                .ok()
+                .as_ref()
+                == Some(&(*size, modified.clone()))
         });
     if !discovery_current {
-        out.population.status = super::transcript::PopulationStatus::Invalidated;
+        out.population.status = control
+            .stop_reason()
+            .unwrap_or(super::transcript::PopulationStatus::Invalidated);
         out.scan_unreadable
             .push("corpus changed since discovery; prior index entries retained".into());
     }

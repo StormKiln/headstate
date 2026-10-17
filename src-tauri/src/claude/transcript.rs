@@ -153,6 +153,123 @@ pub(crate) fn fingerprint(path: &Path) -> std::io::Result<(i64, String)> {
     Ok((metadata.len() as i64, modified))
 }
 
+#[cfg(test)]
+#[test]
+fn disappearing_discovery_source_is_partial_not_an_omitted_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut walk = Walk::default();
+    snapshot_source(
+        &dir.path().join("vanished"),
+        &PopulationControl::discovery(),
+        &mut walk,
+    );
+    assert_eq!(walk.unreadable.len(), 1);
+    assert!(walk.source_fingerprints.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn directory_discovery_fingerprint_records_names_and_types_not_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = PopulationControl::discovery();
+    let empty = discovery_fingerprint(dir.path(), &control).unwrap();
+    std::fs::write(dir.path().join("first.jsonl"), "{}").unwrap();
+    let first = discovery_fingerprint(dir.path(), &control).unwrap();
+    assert_ne!(empty, first);
+    // Equal entry count and file size: membership itself must be recorded.
+    let original_modified = std::fs::metadata(dir.path()).unwrap().modified().unwrap();
+    std::fs::rename(
+        dir.path().join("first.jsonl"),
+        dir.path().join("other.jsonl"),
+    )
+    .unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Opening a directory requires backup semantics; setting its timestamp
+        // requires FILE_WRITE_ATTRIBUTES, without requesting content access.
+        options.custom_flags(0x02000000).access_mode(0x100);
+    }
+    options
+        .open(dir.path())
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    let renamed = discovery_fingerprint(dir.path(), &control).unwrap();
+    assert_ne!(first, renamed);
+    // Directory snapshots describe membership, not content or modification time.
+    std::fs::write(dir.path().join("other.jsonl"), "changed content").unwrap();
+    assert_eq!(
+        renamed,
+        discovery_fingerprint(dir.path(), &control).unwrap()
+    );
+    std::fs::remove_file(dir.path().join("other.jsonl")).unwrap();
+    std::fs::create_dir(dir.path().join("other.jsonl")).unwrap();
+    assert_ne!(
+        renamed,
+        discovery_fingerprint(dir.path(), &control).unwrap()
+    );
+    control.cancel();
+    assert!(discovery_fingerprint(dir.path(), &control).is_err());
+}
+
+/// Directory timestamps are not reliable membership certificates (notably on
+/// Windows). Compare the actual immediate names and entry kinds instead. This
+/// is used once per directory at discovery and once at publication, never by
+/// the per-file usage/index ledgers. Native name bytes preserve non-UTF-8 names.
+pub(crate) fn discovery_fingerprint(
+    path: &Path,
+    control: &PopulationControl,
+) -> std::io::Result<(i64, String)> {
+    let check_cancelled = || {
+        if control.stopped() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "corpus discovery cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return fingerprint(path);
+    }
+    // Retain timestamp evidence as an additional conservative fence against
+    // remove/re-add races; membership remains necessary when it does not change.
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        check_cancelled()?;
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let kind = if kind.is_dir() {
+            1u8
+        } else if kind.is_file() {
+            2
+        } else if kind.is_symlink() {
+            3
+        } else {
+            4
+        };
+        entries.push((entry.file_name().as_encoded_bytes().to_vec(), kind));
+    }
+    check_cancelled()?;
+    entries.sort_unstable();
+    let signature = serde_json::to_string(&entries).map_err(std::io::Error::other)?;
+    Ok((
+        entries.len() as i64,
+        format!("directory:{modified}:{signature}"),
+    ))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PopulationStatus {
@@ -685,7 +802,7 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
         return out;
     }
 
-    snapshot_source(root, &mut out);
+    snapshot_source(root, control, &mut out);
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         // The root does not exist: the honest answer for a machine that
@@ -696,6 +813,12 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
         // of `~/.claude`.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             out.absent_root = Some(root.display().to_string());
+            // Only this confirmed missing root is an honest empty corpus.
+            // Missing entries during a directory certificate remain partial.
+            out.unreadable.clear();
+            if control.stopped() {
+                out.unreadable.push("corpus discovery cancelled".into());
+            }
             return out;
         }
         Err(e) => {
@@ -704,7 +827,9 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
             // loud. Reported to the caller as a failure to READ, which is
             // a different statement from "you have no sessions" -- the
             // distinction this module exists to keep.
-            out.unreadable.push(format!("{}: {e}", root.display()));
+            if out.unreadable.is_empty() {
+                out.unreadable.push(format!("{}: {e}", root.display()));
+            }
             return out;
         }
     };
@@ -734,11 +859,14 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
                 continue;
             }
         }
-        snapshot_source(&dir, &mut out);
+        let unreadable_before = out.unreadable.len();
+        snapshot_source(&dir, control, &mut out);
         let inner = match std::fs::read_dir(&dir) {
             Ok(i) => i,
             Err(e) => {
-                out.unreadable.push(format!("{}: {e}", dir.display()));
+                if out.unreadable.len() == unreadable_before {
+                    out.unreadable.push(format!("{}: {e}", dir.display()));
+                }
                 continue;
             }
         };
@@ -784,7 +912,7 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
                     Ok(m) => out.session_bytes += m.len(),
                     Err(_) => out.unsized_files += 1,
                 }
-                snapshot_source(&p, &mut out);
+                snapshot_source(&p, control, &mut out);
                 out.files.push(p);
             }
         }
@@ -792,12 +920,11 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
     out
 }
 
-fn snapshot_source(path: &Path, out: &mut Walk) {
-    match fingerprint(path) {
+fn snapshot_source(path: &Path, control: &PopulationControl, out: &mut Walk) {
+    match discovery_fingerprint(path, control) {
         Ok((size, modified)) => out
             .source_fingerprints
             .push((path.to_path_buf(), size, modified)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => out
             .unreadable
             .push(format!("{}: discovery fingerprint: {e}", path.display())),
