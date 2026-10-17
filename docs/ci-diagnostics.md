@@ -101,7 +101,11 @@ Vitest/Node artifacts; it does not broaden their upload to any OS log directory.
 
 `status: unavailable` is an absence of evidence, not a clean native stack.
 Its reason distinguishes missing/unreadable reports, directory access, scan
-bounds and unsupported platforms. OS report generation or runner shutdown can
+bounds and unsupported platforms. Fixed numeric `rejectionCounts` identify
+selection failures without copying report values or paths; `scanCounts` counts
+entries and candidates. These describe only the final poll (`countsScope`), so
+repeated observations are not presented as distinct files. Numeric `window`
+bounds and the bounded poll count identify the collection window. OS report generation or runner shutdown can
 prevent capture entirely. A captured unsymbolized image offset can still be
 useful but does not identify a cause by itself.
 
@@ -122,3 +126,28 @@ The parser follows Apple's [IPS format documentation](https://developer.apple.co
 Passing this synthetic test verifies the collection path, not a correction for
 the intermittent frontend crash. A future real crash must identify a failing
 native path before a runtime or pool change is justified.
+
+
+### 10.6 hosted recurrence
+
+Merge-queue run `39037370433`, candidate `b6b03d1cf43c1496405925b61b90d18bb4943430`,
+terminated Node PID 4774 with SIGSEGV/139 at 2026-10-17 13:42:36 UTC.
+329 of 342 discovered test files printed completed results. No assertion failure
+or complete result JSON was captured. The collector returned `unavailable` with
+`no_matching_report`; no native stack was obtained. This does not establish OOM,
+a particular test defect, or failure of the OS to generate a report: selection
+can also reject a report. #1887 adds bounded numeric selection evidence to
+separate these cases without retaining raw crash data.
+
+The same product branch passed all ten PR checks in run `39035784098`.
+The failed merge candidate remains ineligible for release; a later passing run
+cannot erase its failed attempt. No runtime, pool, retry, heap, timeout or test
+assertion changes are justified by this recurrence. Root-cause issue #1754 stays
+open under sustained-reliability epic #1851 after the diagnostic improvement.
+
+The separate hosted synthetic acceptance run `39037909055` passed on the
+already-disqualified diagnostic commit: its sanitized artifact contains a
+matching synthetic SIGSEGV with two symbolized frames. This proves that the
+hosted OS/report-selector path can work for the small compiled fixture. It does
+not reproduce pinned Node/Vitest or explain why the real process yielded no
+selected report. The next discriminating experiment belongs to #1754.

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name('collect-frontend-crash.py')
 
@@ -51,6 +52,77 @@ class NativeEvidence(unittest.TestCase):
     def collect(self, **kwargs):
         return self.collector.collect([self.root], 123, self.start, self.start + 2, wait_seconds=0, **kwargs)
 
+    def test_collection_window_and_last_poll_counts_distinguish_absent_from_rejected(self):
+        empty = self.collect()
+        self.assertEqual(empty['window'], {'started': self.start, 'ended': self.start + 2})
+        self.assertEqual(empty['scanCounts']['candidates'], 0)
+        self.assertEqual(sum(empty['rejectionCounts'].values()), 0)
+        cases = [({'pid': 999}, 'wrongPid'), ({'procName': 'PRIVATE_CANARY'}, 'wrongProcess'),
+                 ({'captureTime': 'PRIVATE_CANARY'}, 'invalidCaptureTime'),
+                 ({'captureTime': '2026-10-10 12:00:01.000 +0000'}, 'outsideWindow'),
+                 ({'threads': []}, 'invalidStack')]
+        for changes, key in cases:
+            with self.subTest(key=key):
+                self.write_report({**report(), **changes})
+                result = self.collect()
+                self.assertEqual(result['scanCounts']['candidates'], 1)
+                self.assertEqual(result['rejectionCounts'][key], 1)
+                self.assertEqual(sum(result['rejectionCounts'].values()), 1)
+                self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+        self.write_report()
+        result = self.collect()
+        self.assertEqual(result['status'], 'captured')
+        self.assertEqual(result['window'], empty['window'])
+        self.assertEqual(result['scanCounts']['candidates'], 1)
+        self.assertEqual(sum(result['rejectionCounts'].values()), 0)
+
+    def test_file_rejections_are_fixed_numeric_categories_without_raw_data(self):
+        path = self.write_report(name='node-PRIVATE_CANARY.ips')
+        for content, key in [('PRIVATE_CANARY', 'parseError'),
+                             (json.dumps({'bug_type': 'PRIVATE_CANARY'}) + '\n{}', 'unsupportedHeader'),
+                             ('x' * (2 * 1024 * 1024 + 1), 'oversized')]:
+            with self.subTest(key=key):
+                path.write_text(content)
+                result = self.collect()
+                self.assertEqual(result['rejectionCounts'][key], 1)
+                self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+                self.assertTrue(all(type(value) is int and 0 <= value <= 1025
+                                    for value in result['rejectionCounts'].values()))
+        path.unlink()
+        self.write_report(name='PRIVATE_CANARY.ips')
+        result = self.collect()
+        self.assertEqual(result['rejectionCounts']['filename'], 1)
+        self.assertEqual(result['scanCounts']['candidates'], 0)
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+
+    def test_read_error_retains_count_without_exception_details(self):
+        self.write_report()
+        with patch.object(self.collector, 'read_report', side_effect=OSError('PRIVATE_CANARY')):
+            result = self.collect()
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['scanCounts']['candidates'], 1)
+        self.assertEqual(result['rejectionCounts']['readError'], 1)
+        self.assertEqual(result['rejectionCounts']['parseError'], 0)
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+
+    def test_directory_access_failure_retains_only_numeric_count(self):
+        result = self.collector.collect([self.root / 'PRIVATE_CANARY'], 123,
+                                        self.start, self.start + 2, wait_seconds=0)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['rejectionCounts']['directoryError'], 1)
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+
+    def test_polling_does_not_multiply_rejected_file_counts(self):
+        self.write_report(report(pid=999))
+        now = [0.0]
+        result = self.collector.collect([self.root], 123, self.start, self.start + 2,
+                                        wait_seconds=1, clock=lambda: now[0],
+                                        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        self.assertEqual(result['countsScope'], 'last_poll')
+        self.assertEqual(result['scanCounts']['candidates'], 1)
+        self.assertEqual(result['rejectionCounts']['wrongPid'], 1)
+        self.assertGreater(result['polls'], 1)
+
     def test_matching_report_retains_stack_but_not_private_fields(self):
         self.write_report()
         result = self.collect()
@@ -73,11 +145,15 @@ class NativeEvidence(unittest.TestCase):
     def test_rejects_stale_files_symlinks_and_oversized_reports(self):
         path = self.write_report()
         os.utime(path, (self.start - 100, self.start - 100))
-        self.assertEqual(self.collect()['status'], 'unavailable')
+        result = self.collect()
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['rejectionCounts']['stale'], 1)
         path.unlink()
         target = self.write_report(name='private.ips')
         path.symlink_to(target)
-        self.assertEqual(self.collect()['status'], 'unavailable')
+        result = self.collect()
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['rejectionCounts']['notRegular'], 1)
         path.unlink()
         path.write_bytes(b'x' * (2 * 1024 * 1024 + 1))
         os.utime(path, (self.start + 1, self.start + 1))
@@ -130,6 +206,9 @@ class NativeEvidence(unittest.TestCase):
         result = self.collect()
         self.assertEqual(result['status'], 'unavailable')
         self.assertEqual(result['reason'], 'scan_limit')
+        self.assertEqual(result['scanCounts']['entries'], 1025)
+        self.assertEqual(result['rejectionCounts']['filename'], 1024)
+        self.assertEqual(result['window']['started'], self.start)
 
     def test_candidate_budget_reports_unavailable(self):
         for index in range(17):
@@ -137,6 +216,9 @@ class NativeEvidence(unittest.TestCase):
         result = self.collect()
         self.assertEqual(result['status'], 'unavailable')
         self.assertEqual(result['reason'], 'candidate_limit')
+        self.assertEqual(result['scanCounts']['candidates'], 17)
+        self.assertEqual(result['rejectionCounts']['wrongPid'], 16)
+        self.assertEqual(result['window']['ended'], self.start + 2)
 
 
 def native_smoke(output):
