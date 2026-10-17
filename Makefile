@@ -59,6 +59,8 @@ check-native-ios:
 	python3 scripts/check-native.py ios
 
 deny-mobile:
+	python3 scripts/check-mobile-zip-scope.test.py
+	python3 scripts/check-mobile-zip-scope.py
 	cd src-mobile && cargo deny check
 
 # The step-up crate was the one with a lockfile and no advisory check at
