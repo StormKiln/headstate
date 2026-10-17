@@ -951,7 +951,7 @@ pub fn subagent_children(
          FROM claude_subagent a
          LEFT JOIN claude_session s ON s.session_id = a.session_id
          WHERE a.parent_session_id = ?1
-         ORDER BY s.last_activity_at IS NULL, s.last_activity_at DESC",
+         ORDER BY s.last_activity_at DESC",
     )?;
     let rows = stmt.query_map([session_id], |r| {
         Ok(SubagentChild {
@@ -1207,18 +1207,23 @@ struct Stored {
     opening_prompt: Option<String>,
 }
 
+const STORED_ROWS_SQL: &str =
+    "SELECT session_id, name, cwd, git_branch, claude_version, transcript_path,
+                first_seen_at, last_activity_at, opening_prompt
+         FROM claude_session
+         ORDER BY last_activity_at DESC, first_seen_at DESC";
+const RUNS_SQL: &str = "SELECT session_id, pid, pid_start_time, ended_at, end_reason
+         FROM claude_run ORDER BY session_id, started_at DESC";
+
 fn stored_rows(conn: &Connection) -> Result<Vec<Stored>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         // Ordered newest-activity-first in SQL, matching the index
-        // migration 11 created for exactly this query
-        // (`claude_session_activity`). A session with NO recorded
+        // migration 46 aligns with both activity and first-seen ties.
+        // SQLite DESC places NULL last. A session with NO recorded
         // activity sorts last rather than first: `NULL` is "we never saw
         // a timestamp", and letting it sort as the newest would put the
         // two sessions we know least about at the top of the list.
-        "SELECT session_id, name, cwd, git_branch, claude_version, transcript_path,
-                first_seen_at, last_activity_at, opening_prompt
-         FROM claude_session
-         ORDER BY last_activity_at IS NULL, last_activity_at DESC, first_seen_at DESC",
+        STORED_ROWS_SQL,
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(Stored {
@@ -1301,8 +1306,7 @@ pub fn runs_by_session(
         // one that reported a clean `SessionEnd` -- and `derive`'s
         // fall-through arm then said it "reported that it ended", which
         // for a crashed run is the one thing that is definitely false.
-        "SELECT session_id, pid, pid_start_time, ended_at, end_reason
-         FROM claude_run ORDER BY started_at DESC",
+        RUNS_SQL,
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -2005,6 +2009,56 @@ mod tests {
         let got = stored_rows(&conn).unwrap();
         let ids: Vec<&str> = got.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, ["new", "old", "undated"]);
+    }
+
+    #[test]
+    fn list_queries_use_indexes_without_temporary_sorts() {
+        let conn = db();
+        for sql in [STORED_ROWS_SQL, RUNS_SQL] {
+            let plans = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                !plans.iter().any(|p| p.contains("TEMP B-TREE")),
+                "{plans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_ties_keep_first_seen_order_and_all_session_runs() {
+        let conn = db();
+        for (id, activity, first) in [
+            ("tied-old", Some("2026-09-01"), "2026-01-01"),
+            ("undated-old", None, "2026-01-01"),
+            ("tied-new", Some("2026-09-01"), "2026-02-01"),
+            ("undated-new", None, "2026-02-01"),
+        ] {
+            conn.execute("INSERT INTO claude_session(session_id, first_seen_at, last_activity_at) VALUES(?1, ?2, ?3)", rusqlite::params![id, first, activity]).unwrap();
+            for (pid, started) in [(1, "2026-01-01"), (2, "2026-03-01"), (3, "2026-02-01")] {
+                conn.execute(
+                    "INSERT INTO claude_run(session_id, pid, started_at) VALUES(?1, ?2, ?3)",
+                    rusqlite::params![id, pid, started],
+                )
+                .unwrap();
+            }
+        }
+        let rows = stored_rows(&conn).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tied-new", "tied-old", "undated-new", "undated-old"]
+        );
+        let runs = runs_by_session(&conn).unwrap();
+        assert_eq!(runs.len(), 4);
+        for values in runs.values() {
+            assert_eq!(values.iter().map(|r| r.pid).collect::<Vec<_>>(), [2, 3, 1]);
+        }
     }
 
     /// A failed registry read reaches the list, and every row's liveness
