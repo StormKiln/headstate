@@ -223,12 +223,31 @@ struct Source {
     len: u64,
     modified: Option<std::time::SystemTime>,
     created: Option<std::time::SystemTime>,
+    // Older Windows checkpoints lacked identity. None differs from a fresh
+    // handle identity, forcing replay instead of trusting timestamp collisions.
+    #[serde(default)]
+    handle_identity: Option<HandleIdentity>,
     #[cfg(unix)]
     identity: (u64, u64),
     #[cfg(unix)]
     changed: (i64, i64),
 }
 impl Source {
+    fn read(file: &std::fs::File) -> std::io::Result<Self> {
+        let source = Self::of(&file.metadata()?);
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                handle_identity: Some(windows_handle_identity(file)?),
+                ..source
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(source)
+        }
+    }
+
     fn of(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
@@ -236,6 +255,7 @@ impl Source {
             len: meta.len(),
             modified: meta.modified().ok(),
             created: meta.created().ok(),
+            handle_identity: None,
             #[cfg(unix)]
             identity: (meta.dev(), meta.ino()),
             #[cfg(unix)]
@@ -243,12 +263,58 @@ impl Source {
         }
     }
     fn same_file(&self, other: &Self) -> bool {
+        if self.handle_identity != other.handle_identity {
+            return false;
+        }
         #[cfg(unix)]
         if self.identity != other.identity {
             return false;
         }
         self.created == other.created
     }
+}
+
+// FILE_ID_INFO uses the volume plus all 128 file-ID bits. The older 64-bit
+// GetFileInformationByHandle index is not guaranteed unique on ReFS.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HandleIdentity {
+    volume: u64,
+    id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &std::fs::File) -> std::io::Result<HandleIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let mut identity = HandleIdentity {
+        volume: 0,
+        id: [0; 16],
+    };
+    // SAFETY: file keeps its OS handle alive. FILE_ID_INFO is repr(C), 24 bytes;
+    // the API writes at most that size through this live exclusive pointer.
+    // FileIdInfo is 0x12. Failure is an unreadable source, never a weaker
+    // timestamp-only fallback. No pointer or handle ownership is transferred.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            0x12,
+            std::ptr::from_mut(&mut identity).cast(),
+            std::mem::size_of::<HandleIdentity>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(identity)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,7 +449,7 @@ fn read_from_observed(
     after_read: impl FnOnce(),
 ) -> std::io::Result<FileRead> {
     let mut file = std::fs::File::open(path)?;
-    let before = Source::of(&file.metadata()?);
+    let before = Source::read(&file)?;
     let mut cp = original.clone();
     let mut out = FileRead {
         links: Vec::new(),
@@ -523,8 +589,10 @@ fn read_from_observed(
             }
         }
         after_read();
-        let after = Source::of(&file.metadata()?);
-        let path_after = Source::of(&std::fs::metadata(path)?);
+        let after = Source::read(&file)?;
+        // Re-open the path: metadata alone cannot distinguish a same-size
+        // Windows rename with colliding creation/modification timestamps.
+        let path_after = Source::read(&std::fs::File::open(path)?)?;
         if before != after || before != path_after {
             return Err(std::io::Error::other(
                 "source changed while reading; retained previous checkpoint",
@@ -911,7 +979,13 @@ mod tests {
                 }
             })
             .unwrap();
-            assert!(read.error.as_deref().unwrap().contains("source changed"));
+            assert!(
+                read.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("source changed")),
+                "source mutation must reject the read: rename={rename}, error={:?}",
+                read.error
+            );
             assert_eq!(read.checkpoint, original);
             assert!(read.links.is_empty());
             assert!(read.consumed > 0 && read.consumed <= BYTES_PER_PASS);
@@ -1129,6 +1203,63 @@ mod tests {
                 "record's preceding delimiter changed, partial={partial}"
             );
         }
+    }
+
+    #[test]
+    fn equal_metadata_does_not_make_distinct_handle_identities_the_same_source() {
+        let (_dir, project, _conn) = fixture();
+        let path = project.join("s1.jsonl");
+        append(&path, &[filler()]);
+        let mut a = serde_json::to_value(Source::of(&std::fs::metadata(&path).unwrap())).unwrap();
+        let mut b = a.clone();
+        a["handle_identity"] =
+            serde_json::json!({"volume":7,"id":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]});
+        b["handle_identity"] =
+            serde_json::json!({"volume":7,"id":[2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]});
+        let a: Source = serde_json::from_value(a).unwrap();
+        let b: Source = serde_json::from_value(b).unwrap();
+        assert!(
+            !a.same_file(&b),
+            "timestamps and length cannot identify a file object"
+        );
+        assert_ne!(
+            a, b,
+            "post-read acceptance must detect a different path handle"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handles_distinguish_files_when_other_source_fields_collide() {
+        let (_dir, project, _conn) = fixture();
+        let first_path = project.join("first.jsonl");
+        let second_path = project.join("second.jsonl");
+        std::fs::write(&first_path, b"identical bytes").unwrap();
+        std::fs::write(&second_path, b"identical bytes").unwrap();
+        let first = std::fs::File::open(&first_path).unwrap();
+        let second = std::fs::File::open(&second_path).unwrap();
+        let a = Source::read(&first).unwrap();
+        let mut b = Source::read(&second).unwrap();
+        assert!(a.handle_identity.is_some());
+        assert_ne!(
+            a.handle_identity, b.handle_identity,
+            "actual kernel file identities must differ"
+        );
+        // Force a deterministic timestamp collision while retaining real OS
+        // identities. The concurrent-rename test exercises final-path reopening.
+        b.created = a.created;
+        b.modified = a.modified;
+        assert_eq!(a.len, b.len);
+        assert!(!a.same_file(&b));
+        assert_ne!(a, b);
+        let mut legacy_json = serde_json::to_value(&a).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("handle_identity");
+        let legacy: Source = serde_json::from_value(legacy_json).unwrap();
+        assert!(!legacy.same_file(&a), "legacy Windows cursor must replay");
+        assert_eq!(std::mem::size_of::<HandleIdentity>(), 24);
     }
 
     fn link_line(session: &str, repo: &str, n: u64) -> String {
