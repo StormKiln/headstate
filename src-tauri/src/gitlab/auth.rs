@@ -186,6 +186,7 @@ pub(super) async fn verified_identity(
     type Identity = (serde_json::Value, super::process_session::Token);
     static READS: LazyLock<super::coalesce::Reads<Result<Identity, super::detail::DetailIssue>>> =
         LazyLock::new(super::coalesce::Reads::default);
+    let _waiter = context.identity_waiter();
     let (body, token) = tokio::time::timeout_at(
         context.deadline,
         READS.run_checked(
@@ -234,6 +235,62 @@ pub(crate) fn with_known_viewer<T>(host: &str, read: impl FnOnce(Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_promotes_coalesced_identity_under_background_saturation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+echo call >> "$0.calls"
+printf 'HTTP/2 200\n\n{"id":1,"username":"fixture"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _registered = super::super::test_support::register(&program, "/bin/sh");
+        {
+            use super::super::transport::{Class, Context};
+            let bg = Context::new(
+                &program,
+                "promotion.example",
+                Class::Background,
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            );
+            let held_a = bg.admit(false).await.unwrap();
+            let held_b = bg.admit(false).await.unwrap();
+            let leader = verified_identity(&program, "promotion.example", &bg);
+            tokio::pin!(leader);
+            // Poll the leader into admission before the foreground joins.
+            tokio::select! { biased;
+                _ = &mut leader => panic!("background identity escaped saturation"),
+                _ = std::future::ready(()) => {}
+            }
+            let mut fg = bg.clone();
+            fg.class = Class::Foreground;
+            fg.deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let (background, foreground) = tokio::join!(
+                leader,
+                verified_identity(&program, "promotion.example", &fg)
+            );
+            assert!(
+                foreground.is_ok(),
+                "foreground must promote the shared request"
+            );
+            assert!(background.is_ok());
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            drop((held_a, held_b));
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

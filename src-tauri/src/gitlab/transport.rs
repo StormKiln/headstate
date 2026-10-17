@@ -190,6 +190,7 @@ pub(super) async fn api(
         command.args(["--input", "-", "--header", "Content-Type: application/json"]);
     }
     let identity = endpoint == "user" && method == "GET";
+    let _waiter = identity.then(|| context.identity_waiter()).flatten();
     let mut dispatched = false;
     let work = async {
         let _identity = if identity {

@@ -36,6 +36,16 @@ pub struct Owner {
     total: Arc<Semaphore>,
     background: Arc<Semaphore>,
     pub identity: tokio::sync::Mutex<()>,
+    identity_foreground: AtomicUsize,
+    identity_changed: tokio::sync::Notify,
+}
+pub(super) struct IdentityWaiter(Arc<Owner>);
+impl Drop for IdentityWaiter {
+    fn drop(&mut self) {
+        if self.0.identity_foreground.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.identity_changed.notify_waiters();
+        }
+    }
 }
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 type Owners = HashMap<(PathBuf, String), Arc<Owner>>;
@@ -148,6 +158,8 @@ impl Context {
                 total: Arc::new(Semaphore::new(4)),
                 background: Arc::new(Semaphore::new(2)),
                 identity: tokio::sync::Mutex::new(()),
+                identity_foreground: AtomicUsize::new(0),
+                identity_changed: tokio::sync::Notify::new(),
             });
             if admitted {
                 owners.insert(key, owner.clone());
@@ -175,27 +187,56 @@ impl Context {
             .generation
             == self.generation
     }
+    pub(super) fn identity_waiter(&self) -> Option<IdentityWaiter> {
+        if self.class != Class::Foreground || !self.current() || Instant::now() >= self.deadline {
+            return None;
+        }
+        if self
+            .owner
+            .identity_foreground
+            .fetch_add(1, Ordering::AcqRel)
+            == 0
+        {
+            self.owner.identity_changed.notify_waiters();
+        }
+        Some(IdentityWaiter(self.owner.clone()))
+    }
     pub async fn admit(&self, identity: bool) -> Result<Permit, ()> {
         // Check cooldown before joining a semaphore queue, and again at dispatch.
         self.eligible(identity)?;
-        let background = if self.class != Class::Foreground {
-            Some(
-                tokio::time::timeout_at(
-                    self.deadline,
-                    self.owner.background.clone().acquire_owned(),
-                )
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?,
-            )
-        } else {
-            None
+        let (background, total) = loop {
+            let changed = self.owner.identity_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let foreground = self.class == Class::Foreground
+                || (identity && self.owner.identity_foreground.load(Ordering::Acquire) > 0);
+            let acquire = async {
+                let background = if foreground {
+                    None
+                } else {
+                    Some(
+                        self.owner
+                            .background
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| ())?,
+                    )
+                };
+                let total = self
+                    .owner
+                    .total
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ())?;
+                Ok::<_, ()>((background, total))
+            };
+            tokio::select! { biased;
+                _ = &mut changed, if identity => continue,
+                result = tokio::time::timeout_at(self.deadline, acquire) => break result.map_err(|_| ())??,
+            }
         };
-        let total =
-            tokio::time::timeout_at(self.deadline, self.owner.total.clone().acquire_owned())
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
         self.eligible(identity)?;
         let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.generation != self.generation || state.probe || Instant::now() >= self.deadline {
@@ -270,15 +311,17 @@ impl Permit {
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if s.generation != self.context.generation
-            || matches!((s.reset, reset), (Some(old), Some(new)) if new < old)
-        {
+        if s.generation != self.context.generation {
             return;
         }
-        if let Some(reset) = reset {
-            s.reset = Some(reset);
+        let older_quota = matches!((s.reset, reset), (Some(old), Some(new)) if new < old);
+        if !older_quota {
+            if let Some(reset) = reset {
+                s.reset = Some(reset);
+            }
         }
-        if status == 429 || remaining == Some(0) {
+        // Quota windows are ordered, but a fresh throttle remains authoritative.
+        if status == 429 || (!older_quota && remaining == Some(0)) {
             let duration = retry
                 .or_else(|| {
                     reset.map(|epoch| {
@@ -367,6 +410,83 @@ impl Drop for Permit {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_identity_waiter_restores_background_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let bg = Context::new(
+            &dir.path().join("glab"),
+            "cancel.example",
+            Class::Background,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let a = bg.admit(false).await.unwrap();
+        let b = bg.admit(false).await.unwrap();
+        let mut fg = bg.clone();
+        fg.class = Class::Foreground;
+        let c = fg.admit(false).await.unwrap();
+        let d = fg.admit(false).await.unwrap();
+        let demand = fg.identity_waiter().unwrap();
+        let queued = bg.admit(true);
+        tokio::pin!(queued);
+        tokio::select! { biased;
+            _ = &mut queued => panic!("total capacity exhausted"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(demand);
+        drop((c, d));
+        tokio::select! { biased;
+            _ = &mut queued => panic!("cancelled demand cannot retain foreground priority"),
+            _ = std::future::ready(()) => {}
+        }
+        drop((a, b));
+        assert!(queued.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn older_quota_exhaustion_without_fresh_throttle_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::new(
+            &dir.path().join("glab"),
+            "old-quota.example",
+            Class::Foreground,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let permit = context.admit(false).await.unwrap();
+        let reset = chrono::Utc::now().timestamp() as u64 + 3600;
+        permit.observe(200, Some(100), Some(reset), None);
+        permit.observe(200, Some(0), Some(reset - 60), None);
+        drop(permit);
+        assert!(context.admit(false).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_throttle_with_older_quota_reset_still_blocks_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::new(
+            &dir.path().join("glab"),
+            "throttle.example",
+            Class::Foreground,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let permit = context.admit(false).await.unwrap();
+        let reset = chrono::Utc::now().timestamp() as u64 + 3600;
+        permit.observe(200, Some(100), Some(reset), None);
+        permit.observe(
+            429,
+            Some(99),
+            Some(reset - 60),
+            Some(Duration::from_secs(120)),
+        );
+        drop(permit);
+        assert!(context.admit(false).await.is_err());
+        let state = context.owner.state.lock().unwrap();
+        assert_eq!(state.reset, Some(reset));
+        assert_eq!(
+            state.blocked,
+            Some(Instant::now() + Duration::from_secs(120))
+        );
+    }
+
     #[tokio::test]
     async fn verified_cli_owner_qualifies_offline_cache_without_new_admission() {
         use crate::{
