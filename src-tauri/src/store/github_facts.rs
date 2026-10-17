@@ -247,6 +247,7 @@ fn apply_inner(
             keep.push(row);
             continue;
         };
+        let previous = evidence.clone();
         // A targeted read can positively advance the head before the next
         // inventory page. Keep other head-dependent facts explicitly unknown.
         if let Some(head) = evidence
@@ -364,7 +365,7 @@ fn apply_inner(
         });
         if evidence.facts.is_empty() {
             conn.execute("DELETE FROM github_pr_facts WHERE list=?1 AND owner=?2 AND repo=?3 AND number=?4 AND node_id=?5", params![list.id(),owner.to_lowercase(),row.repo.to_lowercase(),row.number.to_string(),row.id])?;
-        } else {
+        } else if evidence != previous {
             conn.execute("UPDATE github_pr_facts SET payload=?1 WHERE list=?2 AND owner=?3 AND repo=?4 AND number=?5 AND node_id=?6", params![serde_json::to_string(&evidence)?,list.id(),owner.to_lowercase(),row.repo.to_lowercase(),row.number.to_string(),row.id])?;
         }
         if !terminal {
@@ -410,6 +411,57 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn enterprise_replay_only_writes_changed_version_floors() {
+        let conn = db();
+        let mut inventory = Vec::new();
+        for n in 1..=150 {
+            let mut node = raw();
+            node["id"] = json!(format!("PR_synthetic_{n}"));
+            node["number"] = json!(n);
+            let row = rows(node.clone()).remove(0);
+            save(&conn, &row, &node);
+            inventory.push(row);
+        }
+        conn.execute_batch(
+            "CREATE TABLE fact_write_count(n INTEGER NOT NULL);
+            INSERT INTO fact_write_count VALUES(0);
+            CREATE TRIGGER count_fact_update AFTER UPDATE ON github_pr_facts
+            BEGIN UPDATE fact_write_count SET n=n+1; END;",
+        )
+        .unwrap();
+        let count = || {
+            conn.query_row("SELECT n FROM fact_write_count", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let original = inventory.clone();
+        apply(&conn, CachedList::Reviewing, "viewer", &mut inventory).unwrap();
+        assert_eq!(
+            count(),
+            0,
+            "unchanged enterprise inventory must not rewrite its journals"
+        );
+        inventory[0].updated_at = "2026-10-01T11:00:00Z".parse().unwrap();
+        inventory[0].in_merge_queue = true;
+        apply(&conn, CachedList::Reviewing, "viewer", &mut inventory).unwrap();
+        assert_eq!(
+            count(),
+            1,
+            "only the advanced provider version changes evidence"
+        );
+        let mut lagging = original;
+        apply(&conn, CachedList::Reviewing, "viewer", &mut lagging).unwrap();
+        assert!(
+            lagging[0].in_merge_queue,
+            "version floor still rejects the old page"
+        );
+        assert_eq!(
+            count(),
+            1,
+            "replaying stale pages must not write unchanged floors"
+        );
+    }
+
     #[test]
     fn held_and_equal_version_lists_cannot_undo_queue_but_newer_can() {
         let conn = db();
