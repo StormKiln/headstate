@@ -3,7 +3,7 @@ vi.mock("@tanstack/react-query", async original => {
   const client = new actual.QueryClient();
   return { ...actual, useQueryClient: () => client };
 });
-vi.mock("../api/reviewOperations", () => ({ reviewAccountGeneration: () => 0, useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
+vi.mock("../api/reviewOperations", () => ({ useReviewAccountGeneration: () => 0, useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
 vi.mock("@/api/useReadyStacks", () => ({ useReadyStacks: () => ({ of: (pr: PrDetail) => pr.stack, refetch: async () => [], isFetching: false }) }));
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

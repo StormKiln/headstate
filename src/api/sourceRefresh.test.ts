@@ -189,3 +189,25 @@ describe("accepted measurement receipt lineage", () => {
     expect(state.snapshot().prs).toEqual(rows(2));
   });
 });
+
+
+it("publishes once for duplicate/stale event and command receipts, but retains new evidence", () => {
+  let publications = 0;
+  let receipts = 0;
+  const state = new SourceRefreshState(() => receipts++);
+  state.subscribe(() => publications++);
+  state.accept(update(3));
+  const first = state.snapshot();
+  state.accept(update(3));
+  state.resolve(state.start("same"), { request_id: "same", update: update(2) });
+  expect(publications).toBe(1);
+  expect(state.snapshot()).toBe(first);
+  state.accept(update(4, null, { prs: rows(3), last_received_at: "2026-10-17T00:00:00Z" }));
+  expect(publications).toBe(2);
+  expect(state.snapshot().prs).toBe(first.prs);
+  expect(receipts).toBe(2);
+  state.accept(update(5, "rate limited", { prs: null }));
+  expect(publications).toBe(3);
+  expect(state.snapshot().prs).toBe(first.prs);
+  expect(state.snapshot().error).toBe("rate limited");
+});

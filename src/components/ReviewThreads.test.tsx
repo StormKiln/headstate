@@ -1,6 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import type { ReviewThread } from "@/types/pr";
+
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 const resolve = vi.fn(() => Promise.resolve());
 const unresolve = vi.fn(() => Promise.resolve());
@@ -295,4 +298,29 @@ it("preserves intentional closed disclosure and never takes focus from another c
   expect(screen.getByRole("button", { name: /first.ts/ })).toBe(toggle);
   expect(toggle.getAttribute("aria-expanded")).toBe("false");
   expect(document.activeElement).toBe(other);
+});
+
+
+describe("retired conversation actions", () => {
+  it.each(["resolve", "reply", "reopen"])("does not publish a late %s result into the next detail", async action => {
+    for (const fail of [false, true]) {
+      vi.clearAllMocks();
+      let finish!: () => void;
+      let reject!: (error: Error) => void;
+      const pending = new Promise<void>((done, failed) => { finish = done; reject = failed; });
+      const command = action === "resolve" ? resolve : action === "reply" ? reply : unresolve;
+      command.mockImplementationOnce(() => pending);
+      const first = view([thread({ is_resolved: action === "reopen" })]);
+      if (action === "reopen") fireEvent.click(screen.getByRole("button", { expanded: false }));
+      if (action === "reply") fireEvent.change(screen.getByRole("textbox"), { target: { value: "old draft" } });
+      fireEvent.click(screen.getByRole("button", { name: action === "resolve" ? "Resolve conversation" : action === "reply" ? "Reply" : "Reopen" }));
+      first.unmount();
+      const next = view([thread({ id: "next-thread" })]);
+      await act(async () => { if (fail) reject(new Error("old failure")); else finish(); });
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.error).not.toHaveBeenCalled();
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+      next.unmount();
+    }
+  });
 });

@@ -3,7 +3,7 @@ vi.mock("@tanstack/react-query", async original => {
   const client = new actual.QueryClient();
   return { ...actual, useQueryClient: () => client };
 });
-vi.mock("../api/reviewOperations", () => ({ reviewAccountGeneration: () => 0, useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
+vi.mock("../api/reviewOperations", () => ({ useReviewAccountGeneration: () => 0, useReviewOperation: () => undefined, useReleaseCheckedReview: () => vi.fn() }));
 vi.mock("@/api/useReadyStacks", () => ({ useReadyStacks: () => ({ of: (pr: PrDetail) => pr.stack, refetch: async () => [], isFetching: false }) }));
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -837,7 +837,7 @@ describe("PrDetailView", () => {
     const bar = container.querySelector(".sticky") as HTMLElement;
     expect(bar.className).toContain("sticky");
     expect(bar.className).not.toContain("top-0");
-    expect(bar.style.top).toBe("var(--app-header-h, 0px)");
+    expect(bar.style.top).toBe("calc(var(--app-header-h, 0px) + var(--pr-find-h, 0px))");
   });
 
   /// Requested after the first pass deliberately left it out. GitHub

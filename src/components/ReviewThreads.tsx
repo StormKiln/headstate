@@ -1,5 +1,6 @@
+import { usePrFindExpanded } from "./prFindContext";
 import { commentKeys } from "../lib/commentIdentity";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronRight, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
 import type { ReviewThread } from "@/types/pr";
@@ -123,9 +124,13 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
   // Only the INITIAL state, so a later toggle still wins: `forceOpen`
   // opens a card that the user can then close, rather than pinning it
   // open and taking the control away.
-  const [open, setOpen] = useState(actionable || forceOpen);
+  const findExpanded = usePrFindExpanded();
+  const [manualOpen, setOpen] = useState(actionable || forceOpen);
+  const open = manualOpen || findExpanded;
   const [reply, setReply] = useState("");
   const [busy, setBusy] = useState(false);
+  const active = useRef(true);
+  useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
 
   const resolve = useResolveThread();
   const unresolve = useUnresolveThread();
@@ -135,11 +140,13 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
     setBusy(true);
     p.then(
       () => {
+        if (!active.current) return;
         setBusy(false);
         if (submitted !== undefined) setReply(current => current === submitted ? "" : current);
         toast.success(ok);
       },
       (e: unknown) => {
+        if (!active.current) return;
         setBusy(false);
         // GitHub's own refusal is the useful part -- a generic message
         // hides which permission was missing.
@@ -155,13 +162,15 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
+        disabled={findExpanded}
+        aria-description={findExpanded ? "Clear Find to collapse this content." : undefined}
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-[#161b22]"
       >
         <ChevronRight
           className={`h-3.5 w-3.5 shrink-0 text-[#8b949e] transition-transform ${open ? "rotate-90" : ""}`}
           aria-hidden="true"
         />
-        <span className="min-w-0 flex-1 truncate font-mono text-[#e6edf3]">
+        <span data-pr-find-text className="min-w-0 flex-1 truncate font-mono text-[#e6edf3]">
           {location(thread)}
         </span>
         {/* Outdated is its own state, never folded into resolved: the
@@ -187,7 +196,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
           <div className="flex flex-col gap-3">
             {thread.comments.map((c, i) => (
               <div key={keys[i]}>
-                <p className="mb-1 text-xs text-[#8b949e]">
+                <p data-pr-find-text className="mb-1 text-xs text-[#8b949e]">
                   {c.author} · {relativeTime(c.created_at)}
                 </p>
                 <Markdown>{c.body}</Markdown>

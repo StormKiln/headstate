@@ -1,6 +1,6 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { PrFind } from "./PrFind";
 import { commentKeys } from "../lib/commentIdentity";
-import { reviewAccountGeneration, useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
+import { useReviewAccountGeneration, useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
 import { useDetailActionsDiag } from "@/api/diag";
 import { useReadyStacks } from "@/api/useReadyStacks";
 import { commandError } from "@/lib/errorKind";
@@ -19,7 +19,7 @@ import {
   useViewer,
 } from "../api/hooks";
 import { gateVerdict } from "../lib/reviewGates";
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import type { ClaudePrLink } from "../types/pr";
 import { useFilters } from "../store/filters";
@@ -56,8 +56,8 @@ function CheckRow({ name, state, url }: { name: string; state: string; url: stri
   const body = (
     <>
       <Icon className={`h-3.5 w-3.5 shrink-0 ${tone}`} aria-hidden="true" />
-      <span className="min-w-0 flex-1 truncate">{name}</span>
-      <span className={`shrink-0 text-xs ${tone}`}>{state}</span>
+      <span data-pr-find-text className="min-w-0 flex-1 truncate">{name}</span>
+      <span data-pr-find-text className={`shrink-0 text-xs ${tone}`}>{state}</span>
     </>
   );
 
@@ -218,7 +218,14 @@ function SessionLinks({ links }: { links: readonly ClaudePrLink[] }) {
 /// tool: no file diff, no commit history, no posting comments. Headstate
 /// is for deciding and acting; reviewing code belongs in GitHub or an
 /// editor, and the header's GitHub link covers the rest.
-export function PrDetailView({
+type PrDetailViewProps = { repo: string; number: number; onBack: () => void; localTools?: boolean };
+
+export function PrDetailView(props: PrDetailViewProps) {
+  const generation = useReviewAccountGeneration();
+  return <PrDetailIdentity key={JSON.stringify([props.repo.toLowerCase(), props.number, generation])} {...props} />;
+}
+
+function PrDetailIdentity({
   localTools = true,
   repo,
   number,
@@ -229,6 +236,8 @@ export function PrDetailView({
   onBack: () => void;
   localTools?: boolean;
 }) {
+  const active = useRef(true);
+  useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   // `isPlaceholderData` is true while this is the clicked row's own data
   // standing in for the fetch (#790). `isLoading` is false in that state
   // -- TanStack reports `success` on placeholder data -- which is exactly
@@ -256,7 +265,6 @@ export function PrDetailView({
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
   const { data: viewer } = useViewer();
-  const queryClient = useQueryClient();
   // The base branch's review rules (#1451, #1454). Undefined while pending
   // and when unreadable alike -- both render nothing new -- so `gate` is
   // all-null until a rule is actually READ.
@@ -336,6 +344,7 @@ export function PrDetailView({
         : review(pr.id, pr.repo, pr.number, verdict, body, pr.head_oid, viewer);
     submit.then(
       (receipt) => {
+        if (!active.current) return;
         done();
         // The after-approve state: an approval that will not count toward
         // merging still reads "Approved", so the toast says what it means
@@ -348,6 +357,7 @@ export function PrDetailView({
         });
       },
       (e: unknown) => {
+        if (!active.current) return;
         done();
         // GitHub's refusal is the useful part -- "Can not approve
         // your own pull request" tells the user exactly what
@@ -399,15 +409,6 @@ export function PrDetailView({
   const commentKeysForPr = commentKeys(pr.comments);
   const commentEntries = foldSuperseded(pr.comments);
   const commentIds = new Map(pr.comments.map((c, i) => [c, commentKeysForPr[i]]));
-  // Only the actual reading boundary resets browser/local disclosure state.
-  // Viewer lookup resolving initially is not an account switch; the existing
-  // generation advances only when a previously known GitHub account changes.
-  let providerHost = "github.com";
-  try { providerHost = new URL(pr.url).host; } catch { /* Legacy fixtures may omit a usable URL. */ }
-  const readingIdentity = JSON.stringify([
-    "github", providerHost,
-    repo.toLowerCase(), number, reviewAccountGeneration(queryClient),
-  ]);
   const commentsTruncated = pr.comment_count > pr.comments.length;
 
   /// The pinned actions, built once so the phone and desktop headers
@@ -486,7 +487,8 @@ export function PrDetailView({
     // is both hard to read and what made every section feel crammed
     // against its neighbour. The sticky header opts out via `-mx-4` so
     // it still spans the panel.
-    <div key={readingIdentity} className="mx-auto flex max-w-4xl flex-col gap-3">
+    <div className="mx-auto flex max-w-4xl flex-col gap-3">
+      <PrFind partial={isPlaceholderData || commentsTruncated || !!incompleteChecks || pr.checks_total > pr.checks.length || pr.review_threads_total > pr.review_threads.length || pr.review_threads.some(t => t.comment_count > t.comments.length)}>
       {isError ? <div role="alert" className="rounded border border-[#30363d] p-3 text-sm">
         <p className="font-medium">{approvedByViewer && operation?.state === "acknowledged" ? "Approval saved. Merge readiness could not be refreshed." : "Could not refresh this pull request. Showing previously loaded details."}</p>
         <p>{commandError(errorMessage(error) ?? "Refresh unavailable").message}</p>
@@ -541,7 +543,7 @@ export function PrDetailView({
             ? "sticky z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2 [&_a]:min-h-11 [&_button]:min-h-11 [&_button]:min-w-11"
             : "sticky z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
         }
-        style={{ top: "var(--app-header-h, 0px)" }}
+        style={{ top: "calc(var(--app-header-h, 0px) + var(--pr-find-h, 0px))" }}
       >
         <button
           type="button"
@@ -585,14 +587,14 @@ export function PrDetailView({
       </div>
 
       <div>
-        <h2 className="text-lg font-semibold leading-snug text-[#e6edf3]">
+        <h2 data-pr-find-text className="text-lg font-semibold leading-snug text-[#e6edf3]">
           {pr.title} <span className="font-normal text-[#8b949e]">#{pr.number}</span>
         </h2>
         {/* ONE metadata line, not two stacked paragraphs. The branch
             pair and the diff size are the same kind of fact about the
             same pull request, and splitting them across two lines was
             half the vertical noise above the fold. */}
-        <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-xs text-[#8b949e]">
+        <p data-pr-find-text className="mt-1 flex flex-wrap items-center gap-x-1.5 text-xs text-[#8b949e]">
           <span>
             {pr.author} wants to merge <span className="font-mono">{pr.head_ref}</span> into{" "}
             <span className="font-mono">{pr.base_ref}</span>
@@ -719,10 +721,12 @@ export function PrDetailView({
                   setRerunning(true);
                   rerun(pr.repo, pr.number, rerunnable).then(
                     () => {
+                      if (!active.current) return;
                       setRerunning(false);
                       toast.success(`Re-running failed checks on #${pr.number}`);
                     },
                     (e: unknown) => {
+                      if (!active.current) return;
                       setRerunning(false);
                       // GitHub's refusal is the useful part: "This
                       // workflow run cannot be retried" says exactly why
@@ -945,11 +949,13 @@ export function PrDetailView({
                   const refId = pr.head_ref_id as string;
                   setDeleting(false);
                   deleteBranch(refId, pr.repo, pr.number, pr.head_ref, true).then(
-                    () => toast.success(`Deleted ${pr.head_ref}`),
-                    (e: unknown) =>
+                    () => { if (active.current) toast.success(`Deleted ${pr.head_ref}`); },
+                    (e: unknown) => {
+                      if (!active.current) return;
                       toast.error(`Could not delete ${pr.head_ref}`, {
                         description: e instanceof Error ? e.message : String(e),
-                      }),
+                      });
+                    },
                   );
                 }}
                 className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
@@ -964,6 +970,7 @@ export function PrDetailView({
           </DialogContent>
         </Dialog>
       ) : null}
+      </PrFind>
     </div>
   );
 }

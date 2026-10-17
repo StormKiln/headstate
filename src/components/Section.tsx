@@ -1,3 +1,4 @@
+import { usePrFindExpanded } from "./prFindContext";
 import { useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 
@@ -29,7 +30,9 @@ export function Section({
   defaultOpen?: boolean;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const findExpanded = usePrFindExpanded();
+  const [manualOpen, setOpen] = useState(defaultOpen);
+  const open = manualOpen || findExpanded;
 
   return (
     <section className="overflow-hidden rounded-md border border-[#30363d]">
@@ -38,6 +41,8 @@ export function Section({
           type="button"
           onClick={() => setOpen((o) => !o)}
           aria-expanded={open}
+        disabled={findExpanded}
+        aria-description={findExpanded ? "Clear Find to collapse this content." : undefined}
           className="flex flex-1 items-center gap-2 text-left text-sm font-semibold text-[#e6edf3]"
         >
           <ChevronRight

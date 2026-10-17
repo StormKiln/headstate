@@ -57,6 +57,14 @@ export function releaseCheckedReview(qc: QueryClient, repo: string, number: numb
   const id = key(repo, number, head);
   if (s.operations.get(id)?.state === "unresolved") { s.operations.delete(id); changed(s); }
 }
+export function useReviewAccountGeneration() {
+  const qc = useQueryClient();
+  const s = store(qc);
+  return useSyncExternalStore(
+    listener => { s.listeners.add(listener); return () => { s.listeners.delete(listener); }; },
+    () => s.accountRevision,
+  );
+}
 export function reviewAccountGeneration(qc: QueryClient) { return store(qc).accountRevision; }
 export function reviewReadGeneration(qc: QueryClient) { return store(qc).revision; }
 // One latest receipt belongs to the existing detail query. An acknowledgement

@@ -1,4 +1,4 @@
-import { createContext, useContext } from "react";
+import { createContext, useContext, memo } from "react";
 import type { ReactNode } from "react";
 import { ExternalLink } from "./ExternalLink";
 import { PROSE, clean } from "./markdownProse";
@@ -100,9 +100,9 @@ const COMPONENTS: Components = {
 /// Remote images ARE loaded, which is a deliberate call: screenshots in
 /// PR descriptions are most of the value, at the cost of a hostile
 /// comment learning the reader's IP.
-export function Markdown({ children }: { children: string }) {
+export const Markdown = memo(function Markdown({ children }: { children: string }) {
   return (
-    <div className="text-sm leading-relaxed text-[#e6edf3]">
+    <div data-pr-find-text className="text-sm leading-relaxed text-[#e6edf3]">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, SCHEMA]]}
@@ -112,7 +112,7 @@ export function Markdown({ children }: { children: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 /// The block's chrome belongs to the `<pre>`, not to this.
 ///
