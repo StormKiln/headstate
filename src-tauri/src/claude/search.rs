@@ -1080,19 +1080,21 @@ mod tests {
         let database = dir.path().join("fair.db");
         let mut conn = crate::store::open_db(&database).unwrap();
         conn.execute_batch("CREATE TRIGGER fail_prefix BEFORE INSERT ON claude_index_ledger WHEN NEW.session_id <> 's100' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
-        let first = index_pass(&mut conn, &scan).unwrap();
+        // Count/restart fairness is independent of wall-clock runner speed.
+        let control = super::super::transcript::PopulationControl::discovery();
+        let first = index_pass_controlled(&mut conn, &scan, &control).unwrap();
         assert_eq!(first.indexed, 0);
         assert_eq!(first.write_failures.len(), 100);
         drop(conn);
         let mut conn = crate::store::open_db(&database).unwrap();
-        let second = index_pass(&mut conn, &scan).unwrap();
+        let second = index_pass_controlled(&mut conn, &scan, &control).unwrap();
         assert_eq!(
             second.indexed, 1,
             "a failed prefix must not hide the stable last file after restart"
         );
         assert!(second.is_partial());
         conn.execute_batch("DROP TRIGGER fail_prefix").unwrap();
-        index_pass(&mut conn, &scan).unwrap();
+        index_pass_controlled(&mut conn, &scan, &control).unwrap();
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r
                 .get::<_, i64>(0))

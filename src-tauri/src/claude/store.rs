@@ -1146,7 +1146,7 @@ mod tests {
         let path = dir.path().join("usage-fair.db");
         let mut conn = crate::store::open_db(&path).unwrap();
         conn.execute_batch("CREATE TRIGGER fail_usage_prefix BEFORE INSERT ON claude_session_usage WHEN NEW.session_id <> 's100' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
-        let control = super::super::transcript::PopulationControl::default();
+        let control = super::super::transcript::PopulationControl::discovery();
         let first = usage_pass(&mut conn, &scan, &control).unwrap();
         assert_eq!(first.population.completed, 0);
         assert_eq!(first.write_failures.len(), 100);
@@ -1219,7 +1219,10 @@ mod tests {
         let mut conn = Connection::open(&database).unwrap();
         crate::store::migrate(&conn).unwrap();
         let scan = super::super::transcript::corpus(dir.path());
-        let control = super::super::transcript::PopulationControl::default();
+        // This spans several live passes and a restart. File-count bounds and
+        // merge semantics must not depend on the machine finishing all of them
+        // within one production pass's 60-second deadline.
+        let control = super::super::transcript::PopulationControl::discovery();
         let first = metadata_pass(&mut conn, &scan, &control).unwrap();
         assert_eq!(first.completed, 100);
         assert_eq!(first.status, PopulationStatus::Deferred);
@@ -1237,7 +1240,9 @@ mod tests {
         assert_eq!(profile.by_directory[0].cwd, "/work");
         assert_eq!(profile.by_directory[0].sessions, 100);
         std::fs::write(project.join("1.jsonl"), "{\"cwd\":\"/updated\",\"gitBranch\":\"topic\",\"timestamp\":\"2026-10-15T00:00:00Z\"}\n").unwrap();
-        metadata_pass(&mut conn, &scan, &control).unwrap();
+        let changed = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(changed.status, PopulationStatus::Complete);
+        assert_eq!(changed.unchanged, 100);
         assert_eq!(
             conn.query_row(
                 "SELECT git_branch FROM claude_session WHERE session_id='1'",
@@ -1251,7 +1256,9 @@ mod tests {
         conn.execute("UPDATE claude_session SET name='my name',cwd='/newer-hook',last_activity_at='2026-10-16T00:00:00Z' WHERE session_id='0'", []).unwrap();
         std::fs::write(project.join("0.jsonl"), r#"{"type":"user","cwd":"/old-disk","gitBranch":"changed","timestamp":"2026-10-02T00:00:00Z","message":{"content":"changed ask"}}
 "#).unwrap();
-        metadata_pass(&mut conn, &scan, &control).unwrap();
+        let changed = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(changed.status, PopulationStatus::Complete);
+        assert_eq!(changed.unchanged, 100);
         let row: (String,String,String,String) = conn.query_row("SELECT name,cwd,last_activity_at,opening_prompt FROM claude_session WHERE session_id='0'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(
             row,
@@ -1272,6 +1279,64 @@ mod tests {
     }
 
     #[test]
+    fn metadata_timeout_retains_facts_and_checkpoint_until_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timeout.jsonl");
+        std::fs::write(&path, "{\"cwd\":\"/before\"}\n").unwrap();
+        let scan = Scan {
+            sessions: vec![Transcript {
+                session_id: "timeout".into(),
+                path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut conn = db();
+        let control = super::super::transcript::PopulationControl::discovery();
+        assert_eq!(
+            metadata_pass(&mut conn, &scan, &control).unwrap().completed,
+            1
+        );
+        let checkpoint = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key='claude_metadata_checkpoint:timeout'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let accepted = checkpoint(&conn);
+        std::fs::write(&path, "{\"cwd\":\"/changed-directory\"}\n").unwrap();
+        let expired = control.with_budget(std::time::Duration::ZERO);
+        let stopped = metadata_pass(&mut conn, &scan, &expired).unwrap();
+        assert_eq!(stopped.status, PopulationStatus::TimedOut);
+        assert_eq!(stopped.completed, 0);
+        assert_eq!(checkpoint(&conn), accepted);
+        assert_eq!(
+            conn.query_row(
+                "SELECT cwd FROM claude_session WHERE session_id='timeout'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "/before"
+        );
+        let recovered = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(recovered.status, PopulationStatus::Complete);
+        assert_eq!(recovered.unchanged, 0);
+        assert_ne!(checkpoint(&conn), accepted);
+        assert_eq!(
+            conn.query_row(
+                "SELECT cwd FROM claude_session WHERE session_id='timeout'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "/changed-directory"
+        );
+    }
+
+    #[test]
     fn metadata_checkpoint_failure_rolls_back_row_and_retries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.jsonl");
@@ -1286,7 +1351,7 @@ mod tests {
         };
         let mut conn = db();
         conn.execute_batch("CREATE TRIGGER reject_metadata BEFORE INSERT ON settings WHEN NEW.key LIKE 'claude_metadata_checkpoint:%' BEGIN SELECT RAISE(FAIL,'checkpoint rejected'); END;").unwrap();
-        let control = super::super::transcript::PopulationControl::default();
+        let control = super::super::transcript::PopulationControl::discovery();
         assert_eq!(metadata_pass(&mut conn, &scan, &control).unwrap().failed, 1);
         assert_eq!(
             conn.query_row("SELECT count(*) FROM claude_session", [], |r| r
