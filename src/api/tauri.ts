@@ -1373,6 +1373,7 @@ export const claudeRestartList = () => call<ClaudeRestartList>("claude_restart_l
 /// what it covers, and a truncated measurement makes the whole figure a
 /// floor.
 export interface ClaudeUsageProfile {
+  metadataPopulation?: PopulationProgress | null;
   population?: PopulationProgress | null;
   freshSessions?: number;
   staleSessions?: number;

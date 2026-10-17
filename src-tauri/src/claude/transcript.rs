@@ -393,7 +393,7 @@ pub(crate) fn stored_progress(
 }
 
 pub(crate) fn cancel_stored_progress(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    for lane in ["import", "usage", "index"] {
+    for lane in ["import", "metadata", "usage", "index"] {
         let mut progress = stored_progress(conn, lane)?.unwrap_or_default();
         progress.status = PopulationStatus::Cancelled;
         let generation = population_generation(conn, lane)?;
@@ -1039,7 +1039,19 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
     extract_controlled(path, &PopulationControl::default())
 }
 
-fn extract_controlled(path: &Path, control: &PopulationControl) -> Result<Transcript, String> {
+#[cfg(test)]
+#[test]
+fn metadata_head_byte_budget_rejects_oversized_record_without_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.jsonl");
+    std::fs::write(&path, "x".repeat(2 * 1024 * 1024 + 10)).unwrap();
+    assert!(extract_controlled(&path, &PopulationControl::default()).is_err());
+}
+
+pub(crate) fn extract_controlled(
+    path: &Path,
+    control: &PopulationControl,
+) -> Result<Transcript, String> {
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1066,16 +1078,31 @@ fn extract_controlled(path: &Path, control: &PopulationControl) -> Result<Transc
     // (record 3-6 for `cwd`, up to 33 for the title) and the first
     // `cwd` must not stop a scan that has not yet found a name.
     {
-        let mut reader = BufReader::new(ControlledReader {
-            inner: &mut file,
-            control,
-        });
+        // Bound bytes as well as record count: one JSONL record can contain
+        // an arbitrarily large attachment. Never checkpoint a truncated head.
+        const HEAD_BYTES: u64 = 2 * 1024 * 1024;
+        let mut reader = BufReader::new(
+            ControlledReader {
+                inner: &mut file,
+                control,
+            }
+            .take(HEAD_BYTES + 1),
+        );
+        let mut head_bytes = 0_u64;
         let mut line = String::new();
         for i in 0..HEAD_RECORDS {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(n) => {
+                    head_bytes += n as u64;
+                    if head_bytes > HEAD_BYTES {
+                        return Err(format!(
+                            "{}: metadata head exceeds byte budget",
+                            path.display()
+                        ));
+                    }
+                }
                 // A single undecodable line ends the head scan rather
                 // than the whole extraction: whatever was already found
                 // is still true, and the tail seek is independent of it.
@@ -1168,6 +1195,9 @@ fn extract_controlled(path: &Path, control: &PopulationControl) -> Result<Transc
         out.last_activity_at = newest_timestamp(&mut file, size, TAIL_BYTES_RETRY);
     }
 
+    if control.stopped() {
+        return Err(format!("{}: metadata population stopped", path.display()));
+    }
     Ok(out)
 }
 
@@ -1180,7 +1210,7 @@ fn newest_timestamp(file: &mut std::fs::File, size: u64, window: u64) -> Option<
     let start = size.saturating_sub(window);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    file.take(window).read_to_end(&mut buf).ok()?;
 
     let text = String::from_utf8_lossy(&buf);
     let mut lines: &str = &text;

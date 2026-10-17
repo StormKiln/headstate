@@ -12,10 +12,10 @@ vi.mock("./transport", async (original) => ({ ...await original<object>(), liste
 vi.mock("./tauri", async (original) => ({ ...await original<object>(), claudeUsageProfile: read }));
 afterEach(() => { cleanup(); vi.useRealTimers(); focusManager.setFocused(undefined); read.mockReset(); events.listen.mockClear(); events.stop.mockClear(); events.handler = undefined; });
 
-it("shares unfinished polling, stops when complete, and does not poll while hidden", async () => {
+it.each(["population", "metadataPopulation"])("shares unfinished %s polling, stops when complete, and does not poll while hidden", async (lane) => {
   vi.useFakeTimers();
   focusManager.setFocused(true);
-  read.mockResolvedValue({ population: { status: "deferred" } });
+  read.mockResolvedValue({ population: { status: "complete" }, [lane]: { status: "deferred" } });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   const view = renderHook(() => [useClaudeUsageProfile(), useClaudeUsageProfile()], { wrapper });

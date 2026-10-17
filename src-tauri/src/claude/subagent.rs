@@ -573,31 +573,44 @@ fn pr_link_in(line: &str, session_id: &str) -> Option<PrLink> {
 ///
 /// Every line pays two substring tests at most. A line is parsed only if
 /// it contains `gh pr create` and `"tool_use"`, or -- only while a create
-/// is pending -- `"tool_result"` and `/pull/`. The `pr-link` gate is the
+/// is pending -- `"tool_result"`. Matching terminal results resolve pending
+/// state even without a URL. The `pr-link` gate is the
 /// one [`pr_link_in`] already had.
 ///
 /// The pending set is per FILE: a `tool_use_id` is only meaningful inside
-/// the transcript that issued it. An incremental read that stops between
-/// a create and its result loses that pairing, and the `pr-link` record is
-/// what still links it; see `claude::linkscan`.
-#[derive(Debug, Default)]
+/// the transcript that issued it. Incremental readers persist this bounded
+/// continuation with their byte checkpoint; see `claude::linkscan`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LinkReader {
-    pending: std::collections::HashSet<String>,
+    pending: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    overflow: bool,
 }
 
 impl LinkReader {
-    /// The link this line records, if any.
-    pub(crate) fn line(&mut self, line: &str, session_id: &str) -> Option<PrLink> {
+    pub(crate) fn pending_ids(&self) -> impl Iterator<Item = &str> {
+        self.pending.iter().map(String::as_str)
+    }
+
+    pub(crate) fn has_pending(&self, id: &str) -> bool {
+        self.pending.contains(id)
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Every link this record proves, in content-block order.
+    pub(crate) fn line_links(&mut self, line: &str, session_id: &str) -> Vec<PrLink> {
         if let Some(link) = pr_link_in(line, session_id) {
-            return Some(link);
+            return vec![link];
         }
         if line.contains("gh pr create") && line.contains("\"tool_use\"") {
             self.note_creates(line);
-            return None;
+            return Vec::new();
         }
-        if self.pending.is_empty() || !line.contains("\"tool_result\"") || !line.contains("/pull/")
-        {
-            return None;
+        if self.pending.is_empty() || !line.contains("\"tool_result\"") {
+            return Vec::new();
         }
         self.created(line, session_id)
     }
@@ -617,15 +630,24 @@ impl LinkReader {
                     .and_then(|c| c.as_str())
                     .is_some_and(|c| c.contains("gh pr create"));
             if let (true, Some(id)) = (is_create, b.get("id").and_then(|i| i.as_str())) {
-                self.pending.insert(id.to_string());
+                if id.len() > 512 || (self.pending.len() >= 256 && !self.pending.contains(id)) {
+                    self.overflow = true;
+                } else {
+                    self.pending.insert(id.to_string());
+                }
             }
         }
     }
 
     /// The pull request a pending create's successful result names.
-    fn created(&mut self, line: &str, session_id: &str) -> Option<PrLink> {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        let blocks = v.pointer("/message/content")?.as_array()?;
+    fn created(&mut self, line: &str, session_id: &str) -> Vec<PrLink> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Vec::new();
+        };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        let mut links = Vec::new();
         for b in blocks {
             if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
                 continue;
@@ -647,7 +669,7 @@ impl LinkReader {
             let (Some((repo, number, url)), None) = (urls.next(), urls.next()) else {
                 continue;
             };
-            return Some(PrLink {
+            links.push(PrLink {
                 session_id: session_id.to_string(),
                 repo,
                 number,
@@ -658,7 +680,7 @@ impl LinkReader {
                     .map(str::to_string),
             });
         }
-        None
+        links
     }
 }
 
@@ -769,8 +791,13 @@ pub(crate) fn build_with_progress(
             // records are scattered through the file rather than in the
             // head -- so a second pass would double a 969 ms cost to
             // collect something already streaming past.
-            if let Some(link) = links.line(&line, &session_id) {
-                map.pr_links.push(link);
+            map.pr_links.extend(links.line_links(&line, &session_id));
+            if links.overflowed() {
+                map.unreadable.push(format!(
+                    "{}: pending PR-create checkpoint exceeds 256 IDs or a 512-byte ID",
+                    path.display()
+                ));
+                break;
             }
             let Some((at, ids)) = mentions_in(&line) else {
                 continue;

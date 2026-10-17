@@ -120,6 +120,7 @@ pub mod preview;
 #[cfg(test)]
 mod read_bench;
 pub mod registry;
+pub(crate) mod retry_queue;
 pub mod search;
 pub mod sessions;
 pub mod settings;

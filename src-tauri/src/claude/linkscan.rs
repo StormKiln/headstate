@@ -1,63 +1,40 @@
-//! Pull request links written since the last import, found without one
-//! (#1557).
+//! Incremental PR links with durable parser continuation (#1557, #1864).
 //!
-//! # The gap this closes
+//! The live pass reuses the corpus listing and resumes accepted transcript
+//! checkpoints. Offsets, pending create IDs, partial JSONL records, source
+//! evidence and links commit in one SQLite transaction. Import resets the
+//! baseline in its accepted graph transaction; absent a baseline, this lane
+//! does not run. Old offset-only settings replay once to establish evidence.
 //!
-//! `claude_session_pr` is rewritten whole by the transcript import
-//! (`store::import`), which runs once per app session and on Rescan. The
-//! import has to stay the owner of that table -- it is the only pass that
-//! can remove a link whose transcript was deleted -- but on its own it
-//! leaves every PR opened after it unfindable until the next one. #1545
-//! measured one PR in that gap on the owner's machine, and it is the PR a
-//! user is most likely to look up: the one they just opened.
+//! # Source evidence (#1865, #1875)
 //!
-//! # What this does instead of a second import
+//! Before seeking an existing offset, compare source identity/metadata and
+//! the trailing accepted block. Replacements replay with empty parser state.
+//! A matching trailing block alone does NOT prove append-only continuity:
+//! the suffix from the earliest pending create or partial record (including
+//! its preceding delimiter) is verified before combining old and new records.
+//! This proves the absence of intervening terminal results as well as the call.
+//! A long-unresolved call can therefore require a large, resumable suffix read. Remaining history
+//! gets a bounded rotating checksum audit to detect middle rewrites eventually.
+//! Audits finish despite ordinary appends; completed unchanged files return to
+//! zero body reads. Opened-handle and path metadata must agree after reading.
 //!
-//! A light, INCREMENTAL link read on the live pass's 60-second tick
-//! (`commands::claude_live_pass`), over the corpus listing that pass
-//! already takes. It reads only bytes the import did not:
+//! # Bounds and persistence
 //!
-//! - A file with a cursor is read from its cursor to its current size.
-//!   Claude Code appends, so after the first read this is just the new
-//!   records.
-//! - A file with no cursor is read from the start if it was modified at
-//!   or after the last import began, and skipped if it was not: the
-//!   import read all of it.
-//! - A file smaller than its cursor was replaced, and is read again from
-//!   the start.
+//! Parsing, trailing checks, semantic-state proofs and historical audits all
+//! spend the same per-pass byte budget, including reads preceding an error.
+//! Partial checks and records resume across ticks/restart. Records above16MiB
+//! discard through their newline. Pending create IDs have count/length limits;
+//! overflow reports deferred/unreadable without advancing the prior checkpoint.
 //!
-//! It only ADDS links (`INSERT OR IGNORE`, which keeps the earlier
-//! `first_seen_at` the import may already hold). Removing links stays the
-//! import's job.
+//! Settings store one JSON cursor. Its path set grows with files read since
+//! import, checksums grow with accepted bytes (one per4KiB), and each file can
+//! retain one bounded partial record. Pruning removes unlisted paths. This is
+//! proportional checkpoint storage, not a constant-sized or corpus-wide cap.
 //!
-//! # Bounded
-//!
-//! [`BYTES_PER_PASS`] bytes per pass across all files, newest-modified
-//! first, so the session a user was just in is read before older ones.
-//! A cursor stops at the last COMPLETE line: a record Claude Code is
-//! still writing is read whole on the next pass, never half-parsed and
-//! skipped.
-//!
-//! # Partial is not nothing
-//!
-//! A pass that runs out of budget keeps everything it read: its links are
-//! committed and every file's cursor advances as far as that file was
-//! read, so the next pass resumes rather than starts over. The files it
-//! did not reach are counted in [`Refreshed::deferred`].
-//!
-//! # Where the cursor lives
-//!
-//! In the `settings` table, as one JSON value under
-//! [`crate::store::settings::keys::CLAUDE_PR_LINK_CURSOR`], not in a
-//! table of its own: a migration would make a 7.9.2 database refuse to
-//! open under 7.9.1, and the value only ever holds files modified since
-//! the last import -- a handful, not the corpus. It is cleared by every
-//! import (see [`reset`]), and until the first import has set it, a pass
-//! does nothing at all: without an import to measure from, "modified
-//! since" has no reference point, and guessing one would either skip
-//! links or read the whole corpus.
-//!
-//! Nothing here writes to `~/.claude`. Transcripts are opened read-only.
+//! Incremental ingestion only ADDS links, preserving existing first-seen
+//! timestamps. Authoritative graph replacement owns removing associations
+//! whose source changed or disappeared. No transcript is opened for writing.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -65,6 +42,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::store::settings;
 
@@ -94,8 +72,10 @@ pub struct Cursor {
     /// When the last import BEGAN, in ms since the epoch. A file last
     /// modified before this was read whole by that import.
     pub since_ms: i64,
-    /// Transcript path -> bytes read, always at a line boundary.
+    /// Transcript path -> accepted bytes (partial lines live in checkpoints).
     pub offsets: BTreeMap<String, u64>,
+    #[serde(default)]
+    checkpoints: BTreeMap<String, Checkpoint>,
 }
 
 /// What one pass did.
@@ -118,11 +98,9 @@ pub struct Refreshed {
 
 /// Start the cursor over from an import that began at `since_ms`.
 ///
-/// Called AFTER the import committed. Anything a pass wrote before that
-/// is forgotten, which is safe: a file modified since `since_ms` is read
-/// again from the start, and every insert is idempotent. The reverse
-/// order could keep a cursor for bytes whose links the import's rewrite
-/// had just removed.
+/// Called in the accepted graph transaction. Anything a pass wrote before
+/// that is forgotten safely: files modified since `since_ms` replay, and
+/// graph publication cannot commit without its matching continuation.
 pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::StoreError> {
     settings::set(
         conn,
@@ -130,6 +108,7 @@ pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::Store
         &Cursor {
             since_ms,
             offsets: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
         },
     )
 }
@@ -151,66 +130,63 @@ pub fn refresh(
         return Ok(out);
     };
 
-    // What each file needs reading from, newest-modified first.
-    let mut todo: Vec<(i64, &super::Transcript, u64, u64)> = Vec::new();
+    let mut todo = Vec::new();
     for t in &scan.sessions {
-        let meta = match std::fs::metadata(&t.path) {
-            Ok(m) => m,
-            Err(e) => {
-                out.unreadable
-                    .push(format!("{}: could not read its size: {e}", t.path));
-                continue;
+        match std::fs::metadata(&t.path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(i64::MAX);
+                if !cursor.offsets.contains_key(&t.path)
+                    && mtime.saturating_add(MTIME_SLACK_MS) < cursor.since_ms
+                {
+                    continue;
+                }
+                todo.push((mtime, t));
             }
-        };
-        let size = meta.len();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            // An unreadable mtime reads as "modified now": the safe
-            // direction, for the reason `MTIME_SLACK_MS` gives.
-            .unwrap_or(i64::MAX);
-        let from = match cursor.offsets.get(&t.path) {
-            Some(&o) if o == size => continue,
-            Some(&o) if o < size => o,
-            Some(_) => 0,
-            None if mtime.saturating_add(MTIME_SLACK_MS) < cursor.since_ms => continue,
-            None => 0,
-        };
-        todo.push((mtime, t, from, size));
+            Err(e) => out
+                .unreadable
+                .push(format!("{}: could not stat it: {e}", t.path)),
+        }
     }
     todo.sort_by_key(|a| std::cmp::Reverse(a.0));
-
     let mut links = Vec::new();
     let mut left = budget;
-    for (_, t, from, size) in todo {
+    for (_, t) in todo {
         if left == 0 {
             out.deferred += 1;
             continue;
         }
-        match read_from(Path::new(&t.path), &t.session_id, from, size, left, budget) {
+        // Old offset-only settings replay once: they cannot establish source
+        // continuity or reconstruct an unfinished create/result pairing.
+        let checkpoint = cursor.checkpoints.get(&t.path).cloned().unwrap_or_default();
+        match read_from(Path::new(&t.path), &t.session_id, checkpoint, left) {
             Ok(read) => {
                 left = left.saturating_sub(read.consumed);
                 out.bytes_read += read.consumed;
-                out.files_read += 1;
-                if read.to < size && left == 0 {
-                    out.deferred += 1;
+                out.files_read += usize::from(read.consumed > 0);
+                out.deferred += usize::from(read.deferred);
+                if let Some(error) = read.error {
+                    out.unreadable.push(format!("{}: {error}", t.path));
                 }
                 links.extend(read.links);
-                cursor.offsets.insert(t.path.clone(), read.to);
+                cursor.offsets.insert(t.path.clone(), read.checkpoint.to);
+                cursor.checkpoints.insert(t.path.clone(), read.checkpoint);
             }
             Err(e) => out
                 .unreadable
                 .push(format!("{}: could not read it: {e}", t.path)),
         }
     }
-
-    // A cursor for a file that is no longer listed would only grow the
-    // value; the file cannot be read from again.
     let listed: std::collections::HashSet<&str> =
         scan.sessions.iter().map(|t| t.path.as_str()).collect();
     cursor.offsets.retain(|p, _| listed.contains(p.as_str()));
+    cursor
+        .checkpoints
+        .retain(|p, _| listed.contains(p.as_str()));
 
     // The links and the cursor that says they were read, in ONE
     // transaction: a cursor committed without its links would skip them
@@ -235,73 +211,925 @@ pub fn refresh(
     Ok(out)
 }
 
-/// What reading one file found.
-struct FileRead {
-    links: Vec<super::subagent::PrLink>,
-    /// Bytes taken out of the budget.
-    consumed: u64,
-    /// The new cursor: a line boundary.
-    to: u64,
+// Checksums cover ALL accepted bytes. Growth checks the last block before
+// seeking; a rotating bounded audit detects middle rewrites eventually. It
+// finishes even while appends continue, and stops reading unchanged bodies
+// once that audit is complete. Incremental ingestion still only ADDS links;
+// authoritative import owns removing associations from replaced transcripts.
+const BLOCK: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Source {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+impl Source {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            created: meta.created().ok(),
+            #[cfg(unix)]
+            identity: (meta.dev(), meta.ino()),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        if self.identity != other.identity {
+            return false;
+        }
+        self.created == other.created
+    }
 }
 
-/// Read `path` from `from` towards `size`, taking at most `left` bytes.
-///
-/// `whole` is the full per-pass budget. A single line longer than that
-/// could never be read whole by any pass, so it is stepped over instead:
-/// the cursor moves past what was read, and the rest of that line is
-/// read next time as unparseable noise up to its newline. Without this, a
-/// file whose next line is 20 MB would pin its cursor forever.
-fn read_from(
-    path: &Path,
-    session_id: &str,
-    from: u64,
-    size: u64,
-    left: u64,
-    whole: u64,
-) -> std::io::Result<FileRead> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(from))?;
-    let limit = (size - from).min(left);
-    let mut reader = std::io::BufReader::new(file.take(limit));
-    let mut reader_links = super::subagent::LinkReader::default();
-    let mut out = FileRead {
-        links: Vec::new(),
-        consumed: 0,
-        to: from,
-    };
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)? as u64;
-        if n == 0 {
-            break;
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Checkpoint {
+    to: u64,
+    source: Option<Source>,
+    parser: super::subagent::LinkReader,
+    /// Complete source record supporting each still-unresolved create.
+    #[serde(default)]
+    pending_origins: BTreeMap<String, (u64, u64)>,
+    #[serde(default)]
+    provenance: Provenance,
+    discarding_line: bool,
+    line_buffer: Vec<u8>,
+    hashes: Vec<String>,
+    tail: Vec<u8>,
+    last_block: Vec<u8>,
+    // Validation of the trailing anchor may span tiny-budget ticks.
+    anchor_checked: usize,
+    anchor_source: Option<Source>,
+    audit_next: usize,
+    audit_end: usize,
+    audit_buffer: Vec<u8>,
+    audit_source: Option<Source>,
+}
+/// Source proof for carried semantic state is stronger than the eventual
+/// historical audit: it MUST finish before any new bytes reach the parser.
+/// One suffix from the earliest pending call/partial record, with one bounded
+/// block buffer, resumes across ticks/restarts. Its intervening records matter:
+/// a terminal result inserted there would invalidate the saved pending state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Provenance {
+    source: Option<Source>,
+    ranges: Vec<(usize, usize)>,
+    range: usize,
+    block: usize,
+    buffer: Vec<u8>,
+}
+impl Provenance {
+    fn complete(&self) -> bool {
+        self.range == self.ranges.len()
+    }
+}
+
+impl Checkpoint {
+    fn prepare_provenance(&mut self, source: &Source) {
+        if self.provenance.source.as_ref() == Some(source) {
+            return;
         }
-        out.consumed += n;
-        if buf.last() != Some(&b'\n') {
-            // An incomplete line: the end of what Claude Code has written
-            // so far, or the end of the budget. Left for the next pass --
-            // unless it is one line bigger than any pass, see above.
-            if out.to == from && n == whole {
-                out.to = from + n;
-            }
-            break;
+        let mut start = self.pending_origins.values().map(|&(start, _)| start).min();
+        if !self.line_buffer.is_empty() {
+            let partial_start = self.to - self.line_buffer.len() as u64;
+            start = Some(start.map_or(partial_start, |start| start.min(partial_start)));
         }
-        out.to += n;
-        // A torn or non-UTF-8 line is not a failure of the file; the
-        // import takes the same view.
-        if let Ok(line) = std::str::from_utf8(&buf) {
-            if let Some(link) = reader_links.line(line.trim_end_matches(['\n', '\r']), session_id) {
-                out.links.push(link);
+        // Pending means BOTH a create was seen and no later terminal result
+        // consumed it. Prove that entire suffix, including the record delimiter.
+        // The trailing partial block is already checked by the anchor.
+        let merged: Vec<_> = start
+            .into_iter()
+            .filter_map(|start| {
+                let first = (start.saturating_sub(1) / BLOCK as u64) as usize;
+                (first < self.hashes.len()).then_some((first, self.hashes.len()))
+            })
+            .collect();
+        self.provenance = Provenance {
+            source: Some(source.clone()),
+            block: merged.first().map_or(0, |r| r.0),
+            ranges: merged,
+            range: 0,
+            buffer: Vec::new(),
+        };
+    }
+
+    fn note_pending_origins(&mut self, start: u64) {
+        let parser = &self.parser;
+        self.pending_origins.retain(|id, _| parser.has_pending(id));
+        for id in parser.pending_ids() {
+            self.pending_origins
+                .entry(id.to_string())
+                .or_insert((start, self.to));
+        }
+    }
+
+    fn anchor(&self) -> &[u8] {
+        if self.tail.is_empty() {
+            &self.last_block
+        } else {
+            &self.tail
+        }
+    }
+    fn accept_bytes(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let n = (BLOCK - self.tail.len()).min(bytes.len());
+            self.tail.extend_from_slice(&bytes[..n]);
+            bytes = &bytes[n..];
+            if self.tail.len() == BLOCK {
+                self.hashes.push(digest(&self.tail));
+                self.last_block = std::mem::take(&mut self.tail);
             }
         }
     }
+}
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+struct FileRead {
+    links: Vec<super::subagent::PrLink>,
+    consumed: u64,
+    checkpoint: Checkpoint,
+    deferred: bool,
+    error: Option<String>,
+}
+
+fn read_from(
+    path: &Path,
+    session_id: &str,
+    original: Checkpoint,
+    budget: u64,
+) -> std::io::Result<FileRead> {
+    read_from_observed(path, session_id, original, budget, || {})
+}
+
+fn read_from_observed(
+    path: &Path,
+    session_id: &str,
+    original: Checkpoint,
+    budget: u64,
+    after_read: impl FnOnce(),
+) -> std::io::Result<FileRead> {
+    let mut file = std::fs::File::open(path)?;
+    let before = Source::of(&file.metadata()?);
+    let mut cp = original.clone();
+    let mut out = FileRead {
+        links: Vec::new(),
+        consumed: 0,
+        checkpoint: original,
+        deferred: false,
+        error: None,
+    };
+    let attempt = (|| -> std::io::Result<Checkpoint> {
+        let changed = cp.source.as_ref() != Some(&before);
+        if cp
+            .parser
+            .pending_ids()
+            .any(|id| !cp.pending_origins.contains_key(id))
+            || cp.source.as_ref().is_some_and(|s| {
+                !s.same_file(&before) || before.len < cp.to || (changed && before.len == s.len)
+            })
+        {
+            cp = Checkpoint::default();
+        }
+        if changed && cp.audit_next == cp.audit_end {
+            cp.audit_next = 0;
+            cp.audit_end = cp.hashes.len();
+            cp.audit_source = Some(before.clone());
+        }
+        if cp.anchor_source.as_ref() != Some(&before) {
+            cp.anchor_checked = 0;
+            cp.anchor_source = Some(before.clone());
+            cp.audit_buffer.clear();
+        }
+        // Validate the anchor in bounded pieces, retaining progress on a stable
+        // source. No offset or pending parser state is trusted before it matches.
+        let anchor_len = cp.anchor().len();
+        if changed && cp.anchor_checked < anchor_len {
+            let n = (anchor_len - cp.anchor_checked).min(budget as usize);
+            file.seek(SeekFrom::Start(
+                cp.to - anchor_len as u64 + cp.anchor_checked as u64,
+            ))?;
+            let mut bytes = vec![0; n];
+            read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+            if bytes != cp.anchor()[cp.anchor_checked..cp.anchor_checked + n] {
+                cp = Checkpoint::default();
+            } else {
+                cp.anchor_checked += n;
+            }
+        }
+        let anchor_ready = !changed || cp.anchor_checked == cp.anchor().len();
+        if anchor_ready && changed {
+            cp.prepare_provenance(&before);
+            while !cp.provenance.complete() && out.consumed < budget {
+                let proof = &mut cp.provenance;
+                let n = (BLOCK - proof.buffer.len()).min((budget - out.consumed) as usize);
+                file.seek(SeekFrom::Start(
+                    (proof.block * BLOCK + proof.buffer.len()) as u64,
+                ))?;
+                let mut bytes = vec![0; n];
+                read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+                proof.buffer.extend(bytes);
+                if proof.buffer.len() == BLOCK {
+                    if digest(&proof.buffer) != cp.hashes[proof.block] {
+                        cp = Checkpoint::default();
+                        break;
+                    }
+                    proof.buffer.clear();
+                    proof.block += 1;
+                    if proof.block == proof.ranges[proof.range].1 {
+                        proof.range += 1;
+                        if !proof.complete() {
+                            proof.block = proof.ranges[proof.range].0;
+                        }
+                    }
+                }
+            }
+        }
+        let parser_ready = anchor_ready && (!changed || cp.provenance.complete());
+        if parser_ready && cp.audit_next < cp.audit_end && out.consumed < budget {
+            let n = (BLOCK - cp.audit_buffer.len()).min((budget - out.consumed) as usize);
+            file.seek(SeekFrom::Start(
+                (cp.audit_next * BLOCK + cp.audit_buffer.len()) as u64,
+            ))?;
+            let mut bytes = vec![0; n];
+            read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+            cp.audit_buffer.extend(bytes);
+            if cp.audit_buffer.len() == BLOCK {
+                if digest(&cp.audit_buffer) != cp.hashes[cp.audit_next] {
+                    cp = Checkpoint::default();
+                } else {
+                    cp.audit_next += 1;
+                    cp.audit_buffer.clear();
+                }
+            }
+        }
+        if parser_ready && out.consumed < budget && cp.to < before.len {
+            file.seek(SeekFrom::Start(cp.to))?;
+            let limit = (before.len - cp.to).min(budget - out.consumed);
+            let already_read = out.consumed;
+            let mut reader = std::io::BufReader::new(CountedRead {
+                inner: (&mut file).take(limit),
+                consumed: 0,
+            });
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let result = reader.read_until(b'\n', &mut buf);
+                out.consumed = already_read + reader.get_ref().consumed;
+                let n = result? as u64;
+                if n == 0 {
+                    break;
+                }
+                let complete = buf.last() == Some(&b'\n');
+                cp.accept_bytes(&buf);
+                cp.to += n;
+                if cp.discarding_line {
+                    cp.discarding_line = !complete;
+                    continue;
+                }
+                if cp.line_buffer.len().saturating_add(buf.len()) > BYTES_PER_PASS as usize {
+                    cp.line_buffer.clear();
+                    cp.discarding_line = !complete;
+                    continue;
+                }
+                cp.line_buffer.extend_from_slice(&buf);
+                if !complete {
+                    break;
+                }
+                if let Ok(line) = std::str::from_utf8(&cp.line_buffer) {
+                    out.links.extend(
+                        cp.parser
+                            .line_links(line.trim_end_matches(['\n', '\r']), session_id),
+                    );
+                }
+                cp.note_pending_origins(cp.to - cp.line_buffer.len() as u64);
+                cp.line_buffer.clear();
+                if cp.parser.overflowed() {
+                    return Err(std::io::Error::other("pending PR-create checkpoint exceeds 256 IDs or a 512-byte ID; retained previous checkpoint"));
+                }
+            }
+        }
+        after_read();
+        let after = Source::of(&file.metadata()?);
+        let path_after = Source::of(&std::fs::metadata(path)?);
+        if before != after || before != path_after {
+            return Err(std::io::Error::other(
+                "source changed while reading; retained previous checkpoint",
+            ));
+        }
+        // A cycle started before later appends must finish, then audit again:
+        // restarting it on each append would starve its later blocks.
+        if cp.audit_next == cp.audit_end && cp.audit_source.as_ref().is_some_and(|s| s != &before) {
+            cp.audit_next = 0;
+            cp.audit_end = cp.hashes.len();
+            cp.audit_source = Some(before.clone());
+        }
+        out.deferred = !parser_ready || cp.to < before.len || cp.audit_next < cp.audit_end;
+        // Do not bless new metadata before ALL carried parser state is proved.
+        if parser_ready {
+            cp.source = Some(before);
+        }
+        Ok(cp)
+    })();
+    match attempt {
+        Ok(cp) => out.checkpoint = cp,
+        Err(error) => {
+            out.links.clear();
+            out.error = Some(error.to_string());
+            out.deferred = true;
+        }
+    }
     Ok(out)
+}
+
+struct CountedRead<R> {
+    inner: R,
+    consumed: u64,
+}
+impl<R: Read> Read for CountedRead<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        self.consumed += n as u64;
+        Ok(n)
+    }
+}
+fn read_exact_counted(
+    file: &mut std::fs::File,
+    buffer: &mut [u8],
+    consumed: &mut u64,
+) -> std::io::Result<()> {
+    let mut reader = CountedRead {
+        inner: file,
+        consumed: 0,
+    };
+    let result = reader.read_exact(buffer);
+    *consumed += reader.consumed;
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn create_line(id: &str) -> String {
+        serde_json::json!({"message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"gh pr create --fill"}}]}}).to_string()
+    }
+
+    fn result_line(id: &str, error: bool) -> String {
+        serde_json::json!({"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":error,"content":"https://github.com/acme/api/pull/77"}]}}).to_string()
+    }
+
+    #[test]
+    fn pairing_survives_tick_restart_and_budget_boundary() {
+        for boundary in [false, true] {
+            let (dir, project, mut conn) = fixture();
+            let root = dir.path().join("projects");
+            let path = project.join("s1.jsonl");
+            let call = create_line("create-1");
+            append(&path, std::slice::from_ref(&call));
+            if boundary {
+                append(&path, &[result_line("create-1", false)]);
+            }
+            reset(&conn, 0).unwrap();
+            refresh(
+                &mut conn,
+                &crate::claude::corpus(&root),
+                call.len() as u64 + 1,
+            )
+            .unwrap();
+            drop(conn);
+            let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            if !boundary {
+                append(&path, &[result_line("create-1", false)]);
+            }
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert_eq!(linked(&conn, 77), ["s1"], "boundary={boundary}");
+            assert_eq!(
+                refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS)
+                    .unwrap()
+                    .links_added,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_replays_same_size_larger_and_truncate_regrow() {
+        for mode in 0..3 {
+            let (dir, project, mut conn) = fixture();
+            let root = dir.path().join("projects");
+            let path = project.join("s1.jsonl");
+            append(&path, &[link_line("s1", "acme/api", 11)]);
+            reset(&conn, 0).unwrap();
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            let mut replacement = format!("{}\n", link_line("s1", "acme/api", 22));
+            if mode > 0 {
+                replacement.push_str(&format!("{}\n", filler()));
+            }
+            if mode == 1 {
+                let other = project.join("replacement");
+                std::fs::write(&other, replacement).unwrap();
+                std::fs::rename(other, &path).unwrap();
+            } else {
+                std::fs::write(&path, replacement).unwrap();
+            }
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert_eq!(linked(&conn, 22), ["s1"], "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn invalid_results_cannot_reuse_a_pending_create_after_restart() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(
+            &path,
+            &[
+                create_line("failed"),
+                create_line("empty"),
+                create_line("valid"),
+            ],
+        );
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        drop(conn);
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        append(
+            &path,
+            &[
+                result_line("unrelated", false),
+                result_line("failed", true),
+                result_line("empty", false)
+                    .replace("https://github.com/acme/api/pull/77", "no URL"),
+                "{torn tool_result".into(),
+            ],
+        );
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(linked(&conn, 77).is_empty());
+        append(
+            &path,
+            &[result_line("failed", false), result_line("empty", false)],
+        );
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(
+            linked(&conn, 77).is_empty(),
+            "terminal error/no-URL results consume their IDs"
+        );
+        append(&path, &[result_line("valid", false)]);
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 77), ["s1"]);
+    }
+
+    #[test]
+    fn failed_checkpoint_commit_rolls_back_links_and_parser_together() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &[create_line("create-1")]);
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let before = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+        append(&path, &[result_line("create-1", false)]);
+        conn.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON settings BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;").unwrap();
+        assert!(refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).is_err());
+        assert!(linked(&conn, 77).is_empty());
+        assert_eq!(
+            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
+            before
+        );
+        conn.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap();
+        drop(conn);
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 77), ["s1"]);
+    }
+
+    #[test]
+    fn legacy_offsets_replay_to_reconstruct_pending_pairing() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &[create_line("old"), result_line("old", false)]);
+        let offsets = BTreeMap::from([(
+            path.to_string_lossy().to_string(),
+            std::fs::metadata(&path).unwrap().len(),
+        )]);
+        settings::set(
+            &conn,
+            settings::keys::CLAUDE_PR_LINK_CURSOR,
+            &serde_json::json!({"since_ms":0,"offsets":offsets}),
+        )
+        .unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 77), ["s1"]);
+    }
+
+    #[test]
+    fn replacement_drops_pending_create_from_previous_source() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &[create_line("old")]);
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", filler(), result_line("old", false)),
+        )
+        .unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(linked(&conn, 77).is_empty());
+    }
+
+    #[test]
+    fn middle_rewrite_with_preserved_tail_and_growth_is_eventually_replayed() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        let original = format!("{padding}{}\n{padding}", link_line("s1", "acme/api", 11));
+        std::fs::write(&path, &original).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let replacement = original.replace(
+            &link_line("s1", "acme/api", 11),
+            &link_line("s1", "acme/api", 22),
+        );
+        std::fs::write(&path, format!("{replacement}{}\n", filler())).unwrap();
+        for _ in 0..100 {
+            let got = refresh(&mut conn, &crate::claude::corpus(&root), 300).unwrap();
+            assert!(got.bytes_read <= 300);
+            drop(conn);
+            conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            if !linked(&conn, 22).is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            linked(&conn, 22),
+            ["s1"],
+            "middle rewrite must not evade anchor checks forever"
+        );
+        for _ in 0..100 {
+            if refresh(&mut conn, &crate::claude::corpus(&root), 1024)
+                .unwrap()
+                .deferred
+                == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS)
+                .unwrap()
+                .bytes_read,
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_append_reads_bounded_evidence_then_warm_ticks_read_nothing() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &vec![filler(); 1000]);
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let link = link_line("s1", "acme/api", 88);
+        append(&path, std::slice::from_ref(&link));
+        let got = refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 88), ["s1"]);
+        assert!(got.bytes_read <= 2 * BLOCK as u64 + link.len() as u64 + 1);
+        for _ in 0..100 {
+            if refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS)
+                .unwrap()
+                .deferred
+                == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS)
+                .unwrap()
+                .bytes_read,
+            0
+        );
+    }
+
+    #[test]
+    fn tiny_budgets_retain_partial_records_and_anchor_validation() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &[create_line("tiny")]);
+        reset(&conn, 0).unwrap();
+        for _ in 0..200 {
+            refresh(&mut conn, &crate::claude::corpus(&root), 1).unwrap();
+        }
+        append(&path, &[result_line("tiny", false)]);
+        for _ in 0..500 {
+            let got = refresh(&mut conn, &crate::claude::corpus(&root), 1).unwrap();
+            assert!(got.bytes_read <= 1);
+            if !linked(&conn, 77).is_empty() {
+                break;
+            }
+        }
+        assert_eq!(linked(&conn, 77), ["s1"]);
+    }
+
+    #[test]
+    fn pending_overflow_is_explicit_and_retains_previous_checkpoint() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(
+            &path,
+            &(0..257)
+                .map(|i| create_line(&format!("id-{i}")))
+                .collect::<Vec<_>>(),
+        );
+        reset(&conn, 0).unwrap();
+        let got = refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(got.unreadable.len(), 1);
+        assert!(got.unreadable[0].contains("256 IDs"));
+        assert_eq!(got.deferred, 1);
+        let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.offsets.get(path.to_str().unwrap()), Some(&0));
+    }
+
+    #[test]
+    fn oversized_line_suffix_is_not_parsed_as_a_new_record() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; BYTES_PER_PASS as usize + 1])
+            .unwrap();
+        writeln!(file, "{}", link_line("s1", "acme/api", 55)).unwrap();
+        writeln!(file, "{}", link_line("s1", "acme/api", 66)).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS + 1).unwrap();
+        drop(conn);
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(linked(&conn, 55).is_empty());
+        assert_eq!(linked(&conn, 66), ["s1"]);
+    }
+
+    #[test]
+    fn concurrent_append_or_rename_retains_old_checkpoint_and_retries() {
+        for rename in [false, true] {
+            let (_dir, project, _conn) = fixture();
+            let path = project.join("s1.jsonl");
+            append(&path, &[link_line("s1", "acme/api", 11)]);
+            let original = Checkpoint::default();
+            let read = read_from_observed(&path, "s1", original.clone(), BYTES_PER_PASS, || {
+                if rename {
+                    let replacement = project.join("replacement");
+                    append(&replacement, &[link_line("s1", "acme/api", 22)]);
+                    std::fs::rename(replacement, &path).unwrap();
+                } else {
+                    append(&path, &[link_line("s1", "acme/api", 22)]);
+                }
+            })
+            .unwrap();
+            assert!(read.error.as_deref().unwrap().contains("source changed"));
+            assert_eq!(read.checkpoint, original);
+            assert!(read.links.is_empty());
+            assert!(read.consumed > 0 && read.consumed <= BYTES_PER_PASS);
+            let retry = read_from(&path, "s1", read.checkpoint, BYTES_PER_PASS).unwrap();
+            assert!(retry.links.iter().any(|l| l.number == 22));
+        }
+    }
+
+    #[test]
+    fn every_successful_result_in_one_record_is_linked_by_live_and_full_scan() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        append(&path, &[create_line("first"), create_line("second")]);
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&result_line("first", false)).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&result_line("second", false).replace("pull/77", "pull/78"))
+                .unwrap();
+        append(&path, &[serde_json::json!({"message":{"content":[first["message"]["content"][0], second["message"]["content"][0]]}}).to_string()]);
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 77), ["s1"]);
+        assert_eq!(linked(&conn, 78), ["s1"]);
+        let map = super::super::subagent::build(&[path]);
+        assert_eq!(map.pr_links.len(), 2);
+    }
+
+    #[test]
+    fn pending_create_cannot_pair_across_a_middle_rewrite() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        let original = format!("{padding}{}\n{padding}", create_line("reused"));
+        std::fs::write(&path, &original).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let rewritten = original.replace("gh pr create", "gh pr status");
+        std::fs::write(
+            &path,
+            format!("{rewritten}{}\n", result_line("reused", false)),
+        )
+        .unwrap();
+        for _ in 0..100 {
+            let got = refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert!(
+                linked(&conn, 77).is_empty(),
+                "no source version proves this pairing"
+            );
+            if got.deferred == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn partial_record_cannot_combine_bytes_across_a_middle_rewrite() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        let partial = format!(
+            r#"{{"type":"pr-link","prNumber":77,"prUrl":"u","prRepository":"acme/api","padding":"{}"#,
+            "x".repeat(BLOCK * 3)
+        );
+        let original = format!("{padding}{partial}");
+        std::fs::write(&path, &original).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let rewritten = original.replace("pr-link", "no-link");
+        std::fs::write(&path, format!("{rewritten}\"}}\n")).unwrap();
+        for _ in 0..100 {
+            let got = refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert!(
+                linked(&conn, 77).is_empty(),
+                "the completed source contains no PR-link record"
+            );
+            if got.deferred == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn pending_origin_proof_resumes_with_small_budgets_and_restart() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        std::fs::write(
+            &path,
+            format!("{padding}{}\n{padding}", create_line("stable")),
+        )
+        .unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        append(&path, &[result_line("stable", false)]);
+        let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
+            .unwrap()
+            .unwrap();
+        let checkpoint = cursor
+            .checkpoints
+            .get(path.to_str().unwrap())
+            .unwrap()
+            .clone();
+        let ordinary = read_from(&path, "s1", checkpoint, BYTES_PER_PASS).unwrap();
+        assert!(ordinary.links.iter().any(|l| l.number == 77));
+        assert!(
+            ordinary.consumed < 4 * BLOCK as u64,
+            "proof must skip history before the earliest pending record"
+        );
+        for _ in 0..200 {
+            let got = refresh(&mut conn, &crate::claude::corpus(&root), 257).unwrap();
+            assert!(got.bytes_read <= 257);
+            drop(conn);
+            conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            if !linked(&conn, 77).is_empty() {
+                break;
+            }
+        }
+        assert_eq!(linked(&conn, 77), ["s1"]);
+    }
+
+    #[test]
+    fn resolved_then_reused_id_gets_the_new_create_origin() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        let before_last = format!(
+            "{}\n{}\n{padding}",
+            create_line("reuse"),
+            result_line("reuse", true)
+        );
+        let original = format!("{before_last}{}\n{padding}", create_line("reuse"));
+        std::fs::write(&path, original).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let rewritten_last = create_line("reuse").replace("gh pr create", "gh pr status");
+        std::fs::write(
+            &path,
+            format!(
+                "{before_last}{rewritten_last}\n{padding}{}\n",
+                result_line("reuse", false)
+            ),
+        )
+        .unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(linked(&conn, 77).is_empty());
+    }
+
+    #[test]
+    fn inserted_terminal_result_invalidates_old_pending_state() {
+        let (dir, project, mut conn) = fixture();
+        let root = dir.path().join("projects");
+        let path = project.join("s1.jsonl");
+        let padding = format!("{}\n", filler()).repeat(40);
+        let slot = filler();
+        let prefix = format!("{padding}{}\n{padding}", create_line("old"));
+        std::fs::write(&path, format!("{prefix}{slot}\n{padding}")).unwrap();
+        reset(&conn, 0).unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        let terminal = result_line("old", true);
+        assert!(terminal.len() <= slot.len());
+        let replacement_slot = format!("{terminal}{}", " ".repeat(slot.len() - terminal.len()));
+        std::fs::write(
+            &path,
+            format!(
+                "{prefix}{replacement_slot}\n{padding}{}\n",
+                result_line("old", false)
+            ),
+        )
+        .unwrap();
+        refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+        assert!(
+            linked(&conn, 77).is_empty(),
+            "replacement's terminal result already consumed this ID"
+        );
+    }
+
+    #[test]
+    fn rewritten_record_delimiter_invalidates_carried_parser_state() {
+        for partial in [false, true] {
+            let (dir, project, mut conn) = fixture();
+            let root = dir.path().join("projects");
+            let path = project.join("s1.jsonl");
+            let prefix = format!("{}\n", "x".repeat(BLOCK * 2 - 1));
+            let (record, continuation) = if partial {
+                (
+                    format!(
+                        r#"{{"type":"pr-link","prNumber":77,"prUrl":"u","prRepository":"acme/api","padding":"{}"#,
+                        "x".repeat(BLOCK * 3)
+                    ),
+                    "\"}\n".to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "{}\n{}",
+                        create_line("old"),
+                        format!("{}\n", filler()).repeat(40)
+                    ),
+                    format!("{}\n", result_line("old", false)),
+                )
+            };
+            std::fs::write(&path, format!("{prefix}{record}")).unwrap();
+            reset(&conn, 0).unwrap();
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            let rewritten_prefix = "x".repeat(prefix.len());
+            std::fs::write(&path, format!("{rewritten_prefix}{record}{continuation}")).unwrap();
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert!(
+                linked(&conn, 77).is_empty(),
+                "record's preceding delimiter changed, partial={partial}"
+            );
+        }
+    }
 
     fn link_line(session: &str, repo: &str, n: u64) -> String {
         format!(
