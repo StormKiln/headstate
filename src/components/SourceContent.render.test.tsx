@@ -39,12 +39,14 @@ it("renders each of 150 loaded collapsed comments once per Find session, not per
   counts.markdown = 0;
   render(<PrFind>{Array.from({ length: 150 }, (_, i) => <CommentRow key={i} author={`reader${i}`} createdAt="2026-10-17" body={`Needle ${i} **rendered** evidence`} />)}</PrFind>);
   expect(counts.markdown).toBe(0);
-  fireEvent.click(screen.getByRole("button", { name: "Find in pull request" }));
+  // Avoid computing accessible names for all 150 comment toggles in this
+  // render-count test; the toolbar controls have unique text/labels.
+  fireEvent.click(screen.getByText("Find in pull request", { selector: "button" }));
   const box = screen.getByRole("searchbox");
   fireEvent.change(box, { target: { value: "needle" } });
   await screen.findByText("1 of 150"); expect(counts.markdown).toBe(150);
   fireEvent.change(box, { target: { value: "needle 14" } });
   await screen.findByText("1 of 11"); expect(counts.markdown).toBe(150);
-  fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+  fireEvent.click(screen.getByLabelText("Next match", { selector: "button" }));
   expect(counts.markdown).toBe(150);
 });
