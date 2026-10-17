@@ -1335,6 +1335,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE claude_index_state ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE claude_index_ledger ADD COLUMN source_path TEXT NOT NULL DEFAULT '';
     ALTER TABLE claude_index_ledger ADD COLUMN mtime_ns TEXT NOT NULL DEFAULT '';",
+    // 45: direct FTS row identity. Preserve every historical row, including
+    // duplicate/null session ids; authoritative reindex removes all its rows.
+    "CREATE TABLE claude_fts_identity (rowid INTEGER PRIMARY KEY, session_id TEXT);
+     CREATE INDEX claude_fts_identity_session ON claude_fts_identity(session_id);
+     INSERT INTO claude_fts_identity(rowid, session_id)
+        SELECT rowid, session_id FROM claude_transcript_fts;",
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -2104,6 +2110,46 @@ mod tests {
         assert_eq!(
             count("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH '{body} : hidden'"),
             0
+        );
+    }
+
+    #[test]
+    fn fts_identity_migration_preserves_duplicate_and_null_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(44) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 44).unwrap();
+        conn.execute_batch(
+            "INSERT INTO claude_transcript_fts(rowid, session_id, body, body_masked) VALUES
+            (3, 'same', 'first original', 'first masked'),
+            (8, 'same', 'second original', 'second masked'),
+            (9, NULL, 'orphan original', 'orphan masked');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT rowid, session_id FROM claude_fts_identity ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (3, Some("same".into())),
+                (8, Some("same".into())),
+                (9, None)
+            ]
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'masked'", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_fts_identity", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
 
