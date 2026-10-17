@@ -79,17 +79,20 @@ pub fn record(conn: &Connection, s: &Sample) -> Result<(), StoreError> {
 /// apart in time -- which is what lets the chart draw it as a gap rather
 /// than interpolating a flat line through hours nobody measured.
 pub fn history(conn: &Connection) -> Result<Vec<Sample>, StoreError> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM health_samples", [], |r| r.get(0))?;
-    // `max(1)`: with fewer rows than buckets every row is its own
-    // bucket, and a stride of 0 would divide by zero.
-    let stride = (total / MAX_POINTS as i64).max(1);
+    // Divide ordinal positions into MAX_POINTS - 1 intervals and keep the
+    // first row plus every interval transition. This includes both endpoints
+    // and never exceeds the cap, even when the row count is not divisible.
+    // COUNT and row numbering share one SQLite snapshot.
     let mut stmt = conn.prepare(
         "SELECT detail FROM (
-             SELECT detail, ROW_NUMBER() OVER (ORDER BY sampled_at) - 1 AS n
+             SELECT detail, ROW_NUMBER() OVER (ORDER BY sampled_at) - 1 AS n,
+                    COUNT(*) OVER () AS total
              FROM health_samples
-         ) WHERE n % ?1 = 0 ORDER BY n",
+         ) WHERE total <= ?1 OR n = 0
+             OR (n * (?1 - 1)) / (total - 1) > ((n - 1) * (?1 - 1)) / (total - 1)
+         ORDER BY n",
     )?;
-    let rows = stmt.query_map(params![stride], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![MAX_POINTS as i64], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         // A row that does not parse is skipped rather than failing the
@@ -341,6 +344,40 @@ mod tests {
         // Oldest first, and strictly increasing.
         for w in got.windows(2) {
             assert!(w[0].sampled_at < w[1].sampled_at, "out of order");
+        }
+    }
+
+    #[test]
+    fn sampling_caps_non_divisible_sizes_and_preserves_endpoints_and_absence() {
+        let c = conn();
+        for total in [0, 1, 119, 120, 121, 239, 240, 1439, 1440, 5000] {
+            c.execute("DELETE FROM health_samples", []).unwrap();
+            let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+            let mut expected = Vec::new();
+            for i in 0..total {
+                // Actual gaps survive sampling; no interpolated timestamps.
+                let at = (base + chrono::Duration::seconds(i * 17)).to_rfc3339();
+                let mut value = sample(&at);
+                value.cpu_percent = None;
+                c.execute(
+                    "INSERT INTO health_samples (sampled_at, detail) VALUES (?1, ?2)",
+                    params![at, serde_json::to_string(&value).unwrap()],
+                )
+                .unwrap();
+                expected.push(at);
+            }
+            let got = history(&c).unwrap();
+            assert_eq!(got.len(), (total as usize).min(MAX_POINTS), "size {total}");
+            let times: Vec<_> = got.iter().map(|s| s.sampled_at.clone()).collect();
+            if total <= MAX_POINTS as i64 {
+                assert_eq!(times, expected);
+            } else {
+                assert_eq!(times.first(), expected.first());
+                assert_eq!(times.last(), expected.last());
+                assert!(times.windows(2).all(|w| w[0] < w[1]));
+                assert!(times.iter().all(|t| expected.contains(t)));
+            }
+            assert!(got.iter().all(|s| s.cpu_percent.is_none()));
         }
     }
 

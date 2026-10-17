@@ -28,6 +28,8 @@ pub mod scans;
 mod schema;
 pub mod settings;
 pub mod source_cache;
+#[cfg(test)]
+mod sqlite_efficiency;
 
 pub use cache::{load_snapshot, load_snapshot_marked, save_snapshot, CachedList, CachedSnapshot};
 pub use schema::{open_db, StoreError};

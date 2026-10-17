@@ -1335,6 +1335,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE claude_index_state ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE claude_index_ledger ADD COLUMN source_path TEXT NOT NULL DEFAULT '';
     ALTER TABLE claude_index_ledger ADD COLUMN mtime_ns TEXT NOT NULL DEFAULT '';",
+    // 45: direct FTS row identity. Preserve every historical row, including
+    // duplicate/null session ids; authoritative reindex removes all its rows.
+    "CREATE TABLE claude_fts_identity (rowid INTEGER PRIMARY KEY, session_id TEXT);
+     CREATE INDEX claude_fts_identity_session ON claude_fts_identity(session_id);
+     INSERT INTO claude_fts_identity(rowid, session_id)
+        SELECT rowid, session_id FROM claude_transcript_fts;",
+    // 46: DESC already puts NULL activity last. Include the first-seen tie
+    // breaker so the session list does not build a temporary sorting tree.
+    "DROP INDEX IF EXISTS claude_session_activity;
+     CREATE INDEX claude_session_activity ON claude_session(last_activity_at DESC, first_seen_at DESC);",
+
+    // 47: publication writes only changed transcripts; NULL payload keeps
+    // legacy offset membership without pretending it proves source continuity.
+    "CREATE TABLE claude_link_baseline (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), since_ms INTEGER NOT NULL);
+     CREATE TABLE claude_link_checkpoint (path TEXT PRIMARY KEY, offset TEXT NOT NULL, payload TEXT);",
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -1398,6 +1413,9 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         if !(interrupted && i == version as usize) {
             tx.execute_batch(sql)?;
+        }
+        if i == 46 {
+            crate::claude::linkscan::migrate_legacy(&tx)?;
         }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
     }
@@ -2104,6 +2122,46 @@ mod tests {
         assert_eq!(
             count("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH '{body} : hidden'"),
             0
+        );
+    }
+
+    #[test]
+    fn fts_identity_migration_preserves_duplicate_and_null_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(44) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 44).unwrap();
+        conn.execute_batch(
+            "INSERT INTO claude_transcript_fts(rowid, session_id, body, body_masked) VALUES
+            (3, 'same', 'first original', 'first masked'),
+            (8, 'same', 'second original', 'second masked'),
+            (9, NULL, 'orphan original', 'orphan masked');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT rowid, session_id FROM claude_fts_identity ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (3, Some("same".into())),
+                (8, Some("same".into())),
+                (9, None)
+            ]
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'masked'", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_fts_identity", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
 

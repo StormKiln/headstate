@@ -732,10 +732,7 @@ pub(crate) fn index_pass_controlled(
         // reader never sees the gap between them -- a session that
         // vanished mid-pass would otherwise read as "indexed, no
         // content", which is a false negative dressed as a real answer.
-        if let Err(e) = tx.execute(
-            "DELETE FROM claude_transcript_fts WHERE session_id = ?1",
-            rusqlite::params![&t.session_id],
-        ) {
+        if let Err(e) = remove_index_rows(&tx, &t.session_id) {
             out.write_failures.push(format!(
                 "{}: could not clear its old index: {e}",
                 t.session_id
@@ -749,6 +746,16 @@ pub(crate) fn index_pass_controlled(
         ) {
             out.write_failures
                 .push(format!("{}: could not index it: {e}", t.session_id));
+            continue;
+        }
+        if let Err(e) = tx.execute(
+            "INSERT INTO claude_fts_identity(rowid, session_id) VALUES (last_insert_rowid(), ?1)",
+            [&t.session_id],
+        ) {
+            out.write_failures.push(format!(
+                "{}: could not record its index identity: {e}",
+                t.session_id
+            ));
             continue;
         }
         if let Err(e) = tx.execute(
@@ -820,10 +827,7 @@ pub(crate) fn index_pass_controlled(
         .into_iter()
         .filter(|_| discovery_current && !scan.is_partial() && scan.absent_root.is_none())
     {
-        tx.execute(
-            "DELETE FROM claude_transcript_fts WHERE session_id = ?1",
-            rusqlite::params![&id],
-        )?;
+        remove_index_rows(&tx, &id)?;
         tx.execute(
             "DELETE FROM claude_index_ledger WHERE session_id = ?1",
             rusqlite::params![&id],
@@ -838,6 +842,21 @@ pub(crate) fn index_pass_controlled(
     out.elapsed_ms = started.elapsed().as_millis() as u64;
     finalize_index(conn, generation, &mut out)?;
     Ok(out)
+}
+
+/// Called only inside the caller's fenced transaction, alongside body/ledger
+/// publication. Lookup is indexed and retains historical duplicate identities.
+fn remove_index_rows(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM claude_transcript_fts WHERE rowid IN
+            (SELECT rowid FROM claude_fts_identity WHERE session_id = ?1)",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM claude_fts_identity WHERE session_id = ?1",
+        [session_id],
+    )?;
+    Ok(())
 }
 
 fn finalize_index(conn: &Connection, generation: i64, out: &mut Indexed) -> rusqlite::Result<()> {
@@ -1299,6 +1318,78 @@ mod tests {
             )
             .unwrap();
         assert!(body.contains("retainedneedle"), "{body}");
+    }
+
+    #[test]
+    fn identity_failure_rolls_back_body_and_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "retainedneedle");
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        let identity: i64 = conn
+            .query_row(
+                "SELECT rowid FROM claude_fts_identity WHERE session_id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        write_session(dir.path(), "project", "old", "replacementneedle longer");
+        conn.execute_batch("CREATE TRIGGER reject_identity BEFORE INSERT ON claude_fts_identity BEGIN SELECT RAISE(ABORT, 'synthetic identity failure'); END;").unwrap();
+        let result = index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        assert_eq!(result.indexed, 0);
+        assert_eq!(result.write_failures.len(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT rowid FROM claude_fts_identity WHERE session_id='old'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            identity
+        );
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM claude_transcript_fts WHERE rowid=?1",
+                [identity],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(body.contains("retainedneedle"));
+        conn.execute_batch("DROP TRIGGER reject_identity").unwrap();
+        assert_eq!(
+            index_pass(&mut conn, &crate::claude::corpus(dir.path()))
+                .unwrap()
+                .indexed,
+            1
+        );
+    }
+
+    #[test]
+    fn direct_identity_deletion_removes_duplicates_but_not_neighbors() {
+        let mut conn = db();
+        for (id, body) in [("same", "first"), ("same", "second"), ("neighbor", "safe")] {
+            conn.execute(
+                "INSERT INTO claude_transcript_fts(session_id, body) VALUES (?1, ?2)",
+                [id, body],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO claude_fts_identity(rowid, session_id) VALUES(last_insert_rowid(), ?1)", [id]).unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        remove_index_rows(&tx, "same").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_fts_identity", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT body FROM claude_transcript_fts", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "safe"
+        );
     }
 
     /// THE TEST. A query against a partially built index reports the
