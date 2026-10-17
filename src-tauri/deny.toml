@@ -1,6 +1,7 @@
-# Scoped to macOS: the full cross-platform graph reports findings from
-# GTK/X11/Windows crates that never compile here, and a permanently red
-# gate is an ignored gate.
+# Default graph covers macOS. `make deny` also audits Windows separately:
+# a combined target graph unions Unix updater archive features into Windows,
+# reporting a ZIP edge that the actual Windows build does not compile.
+# Linux GTK dependencies require separate platform triage.
 [graph]
 targets = [
   { triple = "aarch64-apple-darwin" },

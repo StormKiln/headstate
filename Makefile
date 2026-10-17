@@ -220,7 +220,10 @@ bench-worktrees-browser:
 # `src-tauri/deny.toml` had no target at all, which is why a supply-chain
 # failure was only ever reachable by pushing.
 deny:
+	python3 scripts/check-updater-features.test.py
+	python3 scripts/check-updater-features.py
 	cd src-tauri && cargo deny check
+	cd src-tauri && cargo deny --target x86_64-pc-windows-msvc check
 
 # The race check, matching CI's `Race check` step exactly (ci.yml):
 # three runs of the library tests at eight threads.

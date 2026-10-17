@@ -255,7 +255,7 @@ tauri-plugin-log = "2.9.1"
 # public key in `tauri.conf.json` -- separate from Apple code signing
 # (#23) and not a substitute for it: this proves the archive came from
 # our release pipeline, not that macOS trusts the app.
-tauri-plugin-updater = "2"
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 # The updater needs to restart the app to apply an update.
 tauri-plugin-process = "2"
 log = "0.4.34"
@@ -362,6 +362,11 @@ sysinfo = { version = "0.39", default-features = false, features = ["system", "d
 # Unix only. Windows has no nice, so the reader returns `None` there and
 # the rules treat that as "cannot say" rather than as zero -- the same
 # absent-is-not-zero rule the rest of `health` follows.
+# Windows updates are signed standalone NSIS EXEs; ZIP extraction is unused.
+# Keep archive support for the existing Unix update formats only.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tauri-plugin-updater = { version = "2", default-features = false, features = ["zip"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
