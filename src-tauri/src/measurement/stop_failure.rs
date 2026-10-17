@@ -416,7 +416,7 @@ mod tests {
         r.set_enabled(false);
         assert!(r.failure_observer.lock().unwrap().sessions.is_empty());
         let old = root.join("old");
-        r.export_to(old.clone()).await.unwrap();
+        crate::measurement::tests::await_writer(r.export_to(old.clone())).unwrap();
         let text = std::fs::read_to_string(old).unwrap();
         assert!(text.contains("eviction"));
         assert!(text.contains("clock_anomaly"));
@@ -453,7 +453,7 @@ mod tests {
         r.failure_hook("s", Some(900), true);
         r.failure_sample("s", Some((2, "b".into())), false, Some(2000), Some(900));
         let path = root.join("report");
-        r.export_to(path.clone()).await.unwrap();
+        crate::measurement::tests::await_writer(r.export_to(path.clone())).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("retrospective_pair"));
         assert!(text.contains("censored"));
