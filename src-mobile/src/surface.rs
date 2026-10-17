@@ -208,6 +208,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // why it asks the desktop -- see the desktop table for the full
     // reasoning.
     ("claude_import_transcripts", Class::Read),
+    ("claude_cancel_population", Class::Read),
     // Content search over the DESKTOP's transcript corpus (#1203). Read:
     // it walks the desktop's `~/.claude/projects` without writing to it
     // and queries the desktop's own FTS5 index. The phone has no

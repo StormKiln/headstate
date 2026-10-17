@@ -1325,6 +1325,16 @@ const MIGRATIONS: &[&str] = &[
      DROP TABLE IF EXISTS pr_backfill_page;
      DROP TABLE IF EXISTS pr_scope_evidence;
      DELETE FROM settings WHERE key IN ('stats_viewer', 'stats_generation');",
+    // 44: usage measurements are accepted with their source fingerprint.
+    "CREATE TABLE claude_usage_ledger (
+        session_id TEXT PRIMARY KEY, path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL, mtime_ns TEXT NOT NULL, fresh INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE claude_population_generation (lane TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+    CREATE TABLE claude_population_state (lane TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    ALTER TABLE claude_index_state ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE claude_index_ledger ADD COLUMN source_path TEXT NOT NULL DEFAULT '';
+    ALTER TABLE claude_index_ledger ADD COLUMN mtime_ns TEXT NOT NULL DEFAULT '';",
 ];
 
 /// The only legacy repairs supported here are scripts that were already

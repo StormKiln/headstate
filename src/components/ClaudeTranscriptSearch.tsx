@@ -1,3 +1,5 @@
+import { CorpusProgress } from "./CorpusProgress";
+import type { PopulationProgress } from "../types/pr";
 /// Content search over the transcript corpus (#1203, epic #1121).
 ///
 /// The app has always held 1,482 transcripts and 0.83 GB of text and
@@ -52,12 +54,14 @@ function CoverageLine({
   unreadable,
   truncated,
   lastIndexedAt,
+  population,
 }: {
   indexed: number;
   total: number;
   unreadable: string[];
   truncated: number;
   lastIndexedAt: string | null;
+  population?: PopulationProgress | null;
 }) {
   // No pass has run at all. Not "0 of 0 searchable", which would read as
   // a complete index of an empty corpus -- the most reassuring possible
@@ -65,16 +69,20 @@ function CoverageLine({
   if (total === 0) {
     return (
       <p className="text-[11px] text-[#8b949e]">
-        {lastIndexedAt === null
+        <CorpusProgress progress={population} />{population ? " " : ""}
+        {population?.total_known && population.status === "complete"
+          ? "No session transcripts were found."
+          : lastIndexedAt === null
           ? "The transcript index has not run yet, so nothing is searchable so far."
           : "The size of the transcript corpus is not known yet, so how much is searchable cannot be stated."}
       </p>
     );
   }
 
-  const complete = indexed >= total && unreadable.length === 0;
+  const complete = indexed >= total && unreadable.length === 0 && (!population || (population.status === "complete" && population.total_known));
   return (
     <p className="text-[11px] text-[#8b949e]">
+      <CorpusProgress progress={population} />{population ? " " : ""}
       {complete ? (
         <>All {total.toLocaleString()} sessions are searchable.</>
       ) : (
@@ -149,6 +157,7 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
           unreadable={cov.unreadable}
           truncated={cov.truncated}
           lastIndexedAt={cov.last_indexed_at}
+          population={cov.population}
         />
       ) : coverage.isError ? (
         <p role="status" className="text-[11px] text-[#d29922]">

@@ -1,3 +1,4 @@
+import { CorpusProgress } from "./CorpusProgress";
 import { AlertTriangle, Bot, ClipboardList, FolderX, Play, RotateCw } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -1033,13 +1034,18 @@ function UsageProfileCard() {
   // tokens" is indistinguishable from a quiet month, and on this page
   // that argues for a conclusion nobody measured.
   if (isError || !data) return null;
-  if (data.sessionsMeasured === 0) return null;
+  if (data.sessionsMeasured === 0) {
+    return data.population && data.population.status !== "complete" ? (
+      <Card className="px-4 text-xs text-[#8b949e]"><CorpusProgress progress={data.population} /></Card>
+    ) : null;
+  }
 
   const n = (v: number) => v.toLocaleString();
   // The floor idiom this codebase already uses everywhere a measurement
   // is short (`ArtifactsPage`, `WorktreesPage`, `ClaudeMdPage`).
+  const retained = (data.staleSessions ?? 0) > 0 || (data.unknownSessions ?? 0) > 0;
   const qualify = (v: number) =>
-    data.sessionsTruncated > 0 ? `at least ${n(v)}` : n(v);
+    !retained && data.sessionsTruncated > 0 ? `at least ${n(v)}` : n(v);
 
   return (
     <Card className="px-4">
@@ -1049,9 +1055,17 @@ function UsageProfileCard() {
             covers, and saying so is what makes the number usable. */}
         summed over {n(data.sessionsMeasured)} measured session
         {data.sessionsMeasured === 1 ? "" : "s"}
-        {data.sessionsTruncated > 0
+        {!retained && data.sessionsTruncated > 0
           ? ` — ${n(data.sessionsTruncated)} stopped at the read budget, so these are floors`
           : ""}
+      </div>
+
+      <div className="text-xs text-[#8b949e]">
+        {data.freshSessions !== undefined ? (
+          <p>{data.freshSessions.toLocaleString()} current, {(data.staleSessions ?? 0).toLocaleString()} stale, {(data.unknownSessions ?? 0).toLocaleString()} not checked.</p>
+        ) : null}
+        {retained ? <p>Last accepted measurements; these totals may differ from the files now on disk.</p> : null}
+        <CorpusProgress progress={data.population} />
       </div>
 
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">

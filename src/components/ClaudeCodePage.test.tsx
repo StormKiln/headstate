@@ -28,6 +28,7 @@ const toastSuccess = vi.hoisted(() => vi.fn());
 /// would read this machine's own registry and could signal a live pid.
 const proposeFn = vi.hoisted(() => vi.fn());
 const stopFn = vi.hoisted(() => vi.fn());
+const cancelPopulationFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const refetchFn = vi.hoisted(() => vi.fn());
 
@@ -40,6 +41,7 @@ const state = vi.hoisted(() => ({
   imported: undefined as ClaudeImported | undefined,
   importFailed: false,
   importFetching: false,
+  population: undefined as import("../types/pr").PopulationProgress | undefined,
   /// A FIXED `now`, which is the point: the page must never read the
   /// clock during render. Every relative time below is computed from
   /// this, so a `Date.now()` creeping in would make these assertions
@@ -122,6 +124,8 @@ const state = vi.hoisted(() => ({
 
 vi.mock("../api/hooks", () => ({
   useSessionActivity: () => state.activeNow,
+  useClaudeUsageProfile: () => ({ data: state.population ? { population: state.population } : undefined }),
+  useClaudeIndexCoverage: () => ({ data: undefined }),
   // Empty by default, which is what every assertion in this file about
   // "Copy resume command" assumes (#1126). Set per-test to reach the
   // launch path.
@@ -142,6 +146,7 @@ vi.mock("../api/hooks", () => ({
     },
     now: state.now,
     rescan: rescanFn,
+    cancelPopulation: cancelPopulationFn,
   }),
   // The #920 jump reads the SAME query the Worktrees page does, so a
   // session detail costs a cache hit rather than a second scan.
@@ -514,6 +519,7 @@ const costState = (over: Partial<ClaudeCostState> = {}): ClaudeCostState => ({
 });
 
 beforeEach(() => {
+  state.population = undefined;
   // BEFORE `session()` below, which repopulates it: a detail left over
   // from a previous test would answer for an id this one never defined,
   // which is exactly the cross-talk the map exists to make visible.
@@ -4525,4 +4531,36 @@ it("opens bounded possible process details on a narrow desktop without adding co
     expect(screen.getByText(/pid 42 · folder unknown/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Stop/ })).toBeNull();
   } finally { cleanup(); stubViewport(null); }
+});
+
+it("cancels the native population operation while a scan is running", () => {
+  state.importFetching = true;
+  render(<ClaudeCodePage />);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel scan" }));
+  expect(cancelPopulationFn).toHaveBeenCalledOnce();
+});
+
+it("reports database-only import failures without inventing unreadable files", () => {
+  state.imported = imported({ sessions: 2, write_failures: ["write failed"] });
+  render(<ClaudeCodePage />);
+  expect(screen.getByText(/1 database writes failed/)).toBeTruthy();
+  expect(screen.queryByText(/0 could not be/)).toBeNull();
+});
+
+it("keeps pause and current progress available after a bounded scan returns", () => {
+  state.importFetching = false;
+  state.population = { phase: "usage", status: "deferred", total: 10, total_known: true, completed: 4, unchanged: 2, failed: 0, remaining: 6 };
+  render(<ClaudeCodePage />);
+  expect(screen.getByText(/4 sessions measured of 10/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Pause scan" }));
+  expect(cancelPopulationFn).toHaveBeenCalledOnce();
+  state.population = undefined;
+});
+
+it("offers explicit resume after native cancellation", () => {
+  state.population = { phase: "usage", status: "cancelled", total: 10, total_known: true, completed: 4, unchanged: 2, failed: 0, remaining: 6 };
+  render(<ClaudeCodePage />);
+  fireEvent.click(screen.getByRole("button", { name: "Resume scan" }));
+  expect(rescanFn).toHaveBeenCalledOnce();
+  state.population = undefined;
 });

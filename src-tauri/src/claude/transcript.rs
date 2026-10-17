@@ -142,6 +142,265 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn fingerprint(path: &Path) -> std::io::Result<(i64, String)> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string();
+    Ok((metadata.len() as i64, modified))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PopulationStatus {
+    #[default]
+    Complete,
+    Running,
+    Deferred,
+    Cancelled,
+    TimedOut,
+    Failed,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PopulationPhase {
+    Discovery,
+    Metadata,
+    #[default]
+    Usage,
+    Index,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopulationProgress {
+    #[serde(default)]
+    pub phase: PopulationPhase,
+    pub status: PopulationStatus,
+    pub total: u64,
+    pub total_known: bool,
+    pub completed: u64,
+    pub unchanged: u64,
+    pub failed: u64,
+    pub remaining: u64,
+}
+
+impl PopulationProgress {
+    pub(crate) fn new(total: usize, total_known: bool) -> Self {
+        Self {
+            total: total as u64,
+            total_known,
+            remaining: total as u64,
+            ..Default::default()
+        }
+    }
+    pub(crate) fn finish(&mut self) {
+        self.remaining = self.total.saturating_sub(self.completed);
+        if self.status == PopulationStatus::Complete {
+            self.status = if self.failed > 0 {
+                PopulationStatus::Failed
+            } else if self.remaining > 0 || !self.total_known {
+                PopulationStatus::Deferred
+            } else {
+                PopulationStatus::Complete
+            };
+        }
+    }
+}
+
+type PopulationKey = (String, String, i64);
+static ACTIVE_POPULATION: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PopulationKey>>,
+> = std::sync::LazyLock::new(Default::default);
+fn population_key(conn: &rusqlite::Connection, lane: &str, generation: i64) -> PopulationKey {
+    let database = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("memory:{conn:p}"));
+    (database, lane.to_owned(), generation)
+}
+pub(crate) struct PopulationActivity(PopulationKey);
+impl PopulationActivity {
+    pub(crate) fn new(conn: &rusqlite::Connection, lane: &str, generation: i64) -> Self {
+        let key = population_key(conn, lane, generation);
+        ACTIVE_POPULATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        Self(key)
+    }
+}
+impl Drop for PopulationActivity {
+    fn drop(&mut self) {
+        ACTIVE_POPULATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+pub(crate) fn persist_progress(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    generation: i64,
+    progress: &PopulationProgress,
+) -> rusqlite::Result<()> {
+    let mut progress = progress.clone();
+    if progress.status == PopulationStatus::Complete && progress.remaining > 0 {
+        progress.status = PopulationStatus::Running;
+    }
+    progress.finish();
+    let payload = serde_json::to_string(&progress)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    conn.execute("INSERT INTO claude_population_state (lane,payload) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM claude_population_generation WHERE lane=?1 AND generation=?3) ON CONFLICT(lane) DO UPDATE SET payload=excluded.payload", rusqlite::params![lane,payload,generation])?;
+    Ok(())
+}
+
+pub(crate) fn stored_progress(
+    conn: &rusqlite::Connection,
+    lane: &str,
+) -> rusqlite::Result<Option<PopulationProgress>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT payload,(SELECT generation FROM claude_population_generation WHERE lane=?1) FROM claude_population_state WHERE lane=?1", [lane], |r| {
+        let payload: String = r.get(0)?;
+        let generation: i64 = r.get(1)?;
+        let mut progress: PopulationProgress = serde_json::from_str(&payload).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        if progress.status == PopulationStatus::Running && !ACTIVE_POPULATION.lock().unwrap_or_else(|e| e.into_inner()).contains(&population_key(conn, lane, generation)) { progress.status = PopulationStatus::Deferred; }
+        Ok(progress)
+    }).optional()
+}
+
+pub(crate) fn cancel_stored_progress(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for lane in ["import", "usage", "index"] {
+        let mut progress = stored_progress(conn, lane)?.unwrap_or_default();
+        progress.status = PopulationStatus::Cancelled;
+        let generation = population_generation(conn, lane)?;
+        persist_progress(conn, lane, generation, &progress)?;
+    }
+    conn.execute("UPDATE claude_index_state SET incomplete=1 WHERE id=1", [])?;
+    Ok(())
+}
+
+/// Cancellation and a finite wall-clock budget shared with blocking corpus work.
+#[derive(Clone)]
+pub(crate) struct PopulationControl {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wakeup: std::sync::Arc<tokio::sync::Notify>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl Default for PopulationControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Default::default(),
+            wakeup: Default::default(),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        }
+    }
+}
+
+impl PopulationControl {
+    pub(crate) fn discovery() -> Self {
+        Self {
+            cancelled: Default::default(),
+            wakeup: Default::default(),
+            deadline: None,
+        }
+    }
+    pub(crate) fn bounded(&self) -> Self {
+        self.with_budget(std::time::Duration::from_secs(60))
+    }
+    pub(crate) fn with_budget(&self, budget: std::time::Duration) -> Self {
+        Self {
+            cancelled: self.cancelled.clone(),
+            wakeup: self.wakeup.clone(),
+            deadline: Some(std::time::Instant::now() + budget),
+        }
+    }
+    pub(crate) fn stop_reason(&self) -> Option<PopulationStatus> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            Some(PopulationStatus::Cancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            Some(PopulationStatus::TimedOut)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wakeup.notify_waiters();
+    }
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.wakeup.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+}
+
+pub(crate) struct ControlledReader<'a, R> {
+    pub(crate) inner: R,
+    pub(crate) control: &'a PopulationControl,
+}
+
+impl<R: Read> Read for ControlledReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.control.stopped() {
+            return Err(std::io::Error::other("corpus population cancelled"));
+        }
+        let n = buffer.len().min(64 * 1024);
+        self.inner.read(&mut buffer[..n])
+    }
+}
+
+/// Dropped with the async caller, including when its future is cancelled.
+pub(crate) struct CancelPopulation(pub(crate) PopulationControl);
+impl Drop for CancelPopulation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+pub(crate) fn population_generation(
+    conn: &rusqlite::Connection,
+    lane: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row("INSERT INTO claude_population_generation (lane,generation) VALUES (?1,1) ON CONFLICT(lane) DO UPDATE SET generation=generation+1 RETURNING generation", [lane], |r| r.get(0))
+}
+
+pub(crate) fn generation_current(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    generation: i64,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT generation=?2 FROM claude_population_generation WHERE lane=?1",
+        rusqlite::params![lane, generation],
+        |r| r.get(0),
+    )
+}
+
 /// How far into a transcript to look for `cwd` and the title.
 ///
 /// See the module docs: `cwd` is deepest at record 6 and `ai-title` at
@@ -304,6 +563,8 @@ pub struct Transcript {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scan {
     pub sessions: Vec<Transcript>,
+    #[serde(skip)]
+    pub(crate) source_fingerprints: Vec<(PathBuf, i64, String)>,
     /// `.jsonl` files under a `subagents/` directory or otherwise nested
     /// below `<slug>/<file>`. Not failures -- correctly excluded work,
     /// counted so the exclusion is visible and testable rather than
@@ -417,9 +678,14 @@ pub fn projects_dir() -> Option<PathBuf> {
 ///
 /// Returns [`Walk`]. An unreadable project directory is reported, never
 /// silently treated as empty: it may hold any number of sessions.
-fn session_files(root: &Path) -> Walk {
+fn session_files(root: &Path, control: &PopulationControl) -> Walk {
     let mut out = Walk::default();
+    if control.stopped() {
+        out.unreadable.push("corpus discovery cancelled".into());
+        return out;
+    }
 
+    snapshot_source(root, &mut out);
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         // The root does not exist: the honest answer for a machine that
@@ -443,13 +709,32 @@ fn session_files(root: &Path) -> Walk {
         }
     };
 
-    for slug in entries.flatten() {
+    for slug in entries {
+        if control.stopped() {
+            out.unreadable.push("corpus discovery cancelled".into());
+            break;
+        }
+        let slug = match slug {
+            Ok(entry) => entry,
+            Err(e) => {
+                out.unreadable
+                    .push(format!("{}: directory entry: {e}", root.display()));
+                continue;
+            }
+        };
         let dir = slug.path();
         // `file_type` rather than `metadata` so a symlinked project
         // directory is not followed into an arbitrary tree.
-        if !slug.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
+        match slug.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                out.unreadable
+                    .push(format!("{}: entry type: {e}", dir.display()));
+                continue;
+            }
         }
+        snapshot_source(&dir, &mut out);
         let inner = match std::fs::read_dir(&dir) {
             Ok(i) => i,
             Err(e) => {
@@ -457,15 +742,34 @@ fn session_files(root: &Path) -> Walk {
                 continue;
             }
         };
-        for f in inner.flatten() {
+        for f in inner {
+            if control.stopped() {
+                out.unreadable.push("corpus discovery cancelled".into());
+                break;
+            }
+            let f = match f {
+                Ok(entry) => entry,
+                Err(e) => {
+                    out.unreadable
+                        .push(format!("{}: directory entry: {e}", dir.display()));
+                    continue;
+                }
+            };
             let p = f.path();
-            let Ok(ft) = f.file_type() else { continue };
+            let ft = match f.file_type() {
+                Ok(kind) => kind,
+                Err(e) => {
+                    out.unreadable
+                        .push(format!("{}: entry type: {e}", p.display()));
+                    continue;
+                }
+            };
             if ft.is_dir() {
                 // A per-session directory: `<slug>/<session-id>/` holding
                 // `subagents/`. Counting what is underneath is what makes
                 // the exclusion a number the tests can assert on, so it
                 // cannot regress into an invisible behaviour.
-                let (found, bytes) = count_jsonl(&p);
+                let (found, bytes) = count_jsonl(&p, control);
                 out.nested += found;
                 out.subagent_bytes += bytes;
                 continue;
@@ -480,11 +784,24 @@ fn session_files(root: &Path) -> Walk {
                     Ok(m) => out.session_bytes += m.len(),
                     Err(_) => out.unsized_files += 1,
                 }
+                snapshot_source(&p, &mut out);
                 out.files.push(p);
             }
         }
     }
     out
+}
+
+fn snapshot_source(path: &Path, out: &mut Walk) {
+    match fingerprint(path) {
+        Ok((size, modified)) => out
+            .source_fingerprints
+            .push((path.to_path_buf(), size, modified)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => out
+            .unreadable
+            .push(format!("{}: discovery fingerprint: {e}", path.display())),
+    }
 }
 
 /// What one walk of the transcript tree found.
@@ -497,6 +814,7 @@ fn session_files(root: &Path) -> Walk {
 #[derive(Default)]
 struct Walk {
     files: Vec<PathBuf>,
+    source_fingerprints: Vec<(PathBuf, i64, String)>,
     /// `.jsonl` files below `<slug>/<file>`, correctly excluded.
     nested: usize,
     /// Bytes across the session transcripts in `files` (#1135).
@@ -525,15 +843,21 @@ struct Walk {
 /// Failures are not reported: this counts files we are deliberately NOT
 /// importing, so being unable to count one costs a slightly low number in
 /// a diagnostic, not a missing session.
-fn count_jsonl(dir: &Path) -> (usize, u64) {
+fn count_jsonl(dir: &Path, control: &PopulationControl) -> (usize, u64) {
     let mut n = 0;
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
+        if control.stopped() {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
         for e in entries.flatten() {
+            if control.stopped() {
+                break;
+            }
             let p = e.path();
             match e.file_type() {
                 Ok(t) if t.is_dir() => stack.push(p),
@@ -585,6 +909,10 @@ fn field(v: &serde_json::Value, key: &str) -> Option<String> {
 /// the unreadable case ("we could not read it"), and keeps the resume
 /// handle available either way.
 pub fn extract(path: &Path) -> Result<Transcript, String> {
+    extract_controlled(path, &PopulationControl::default())
+}
+
+fn extract_controlled(path: &Path, control: &PopulationControl) -> Result<Transcript, String> {
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -611,7 +939,10 @@ pub fn extract(path: &Path) -> Result<Transcript, String> {
     // (record 3-6 for `cwd`, up to 33 for the title) and the first
     // `cwd` must not stop a scan that has not yet found a name.
     {
-        let mut reader = BufReader::new(&mut file);
+        let mut reader = BufReader::new(ControlledReader {
+            inner: &mut file,
+            control,
+        });
         let mut line = String::new();
         for i in 0..HEAD_RECORDS {
             line.clear();
@@ -760,8 +1091,20 @@ fn newest_timestamp(file: &mut std::fs::File, size: u64, window: u64) -> Option<
 /// The full-rescan entry point. Reports what it could not read rather
 /// than presenting a short list as a complete one -- see the module docs.
 pub fn scan(root: &Path) -> Scan {
+    scan_controlled(root, &PopulationControl::discovery())
+}
+
+pub(crate) fn scan_controlled(root: &Path, control: &PopulationControl) -> Scan {
+    scan_with_progress(root, control, &mut |_| {})
+}
+
+pub(crate) fn scan_with_progress(
+    root: &Path,
+    control: &PopulationControl,
+    progress: &mut dyn FnMut(PopulationProgress),
+) -> Scan {
     let t0 = std::time::Instant::now();
-    let walk = session_files(root);
+    let walk = session_files(root, control);
 
     let mut out = Scan {
         subagent_files_skipped: walk.nested,
@@ -770,11 +1113,21 @@ pub fn scan(root: &Path) -> Scan {
         unsized_files: walk.unsized_files,
         unreadable_dirs: walk.unreadable,
         absent_root: walk.absent_root,
+        source_fingerprints: walk.source_fingerprints,
         ..Default::default()
     };
 
+    let mut observed = PopulationProgress::new(walk.files.len(), out.unreadable_dirs.is_empty());
+    observed.phase = PopulationPhase::Discovery;
+    observed.status = PopulationStatus::Running;
+    progress(observed.clone());
     for f in &walk.files {
-        match extract(f) {
+        if control.stopped() {
+            out.unreadable_files
+                .push("corpus discovery cancelled".into());
+            return out;
+        }
+        match extract_controlled(f, control) {
             Ok(t) => {
                 if t.cwd_record.is_some_and(|r| r > 1) {
                     out.metadata_beyond_first_record += 1;
@@ -799,7 +1152,11 @@ pub fn scan(root: &Path) -> Scan {
     // behind the rescan button, and would be ruinous in the session
     // list's 10-second poll -- which is exactly why the poll reads the
     // stored answer instead of deriving one.
-    out.subagents = super::subagent::build(&walk.files);
+    out.subagents = super::subagent::build_with_progress(&walk.files, control, &mut |completed| {
+        observed.completed = completed as u64;
+        observed.remaining = observed.total.saturating_sub(observed.completed);
+        progress(observed.clone());
+    });
 
     // Newest first: the session someone wants is almost always the one
     // they were just in. A session with no timestamp sorts last rather
@@ -883,8 +1240,12 @@ pub fn scan(root: &Path) -> Scan {
 /// Never. A missing root is [`Scan::absent_root`] and an unreadable one
 /// is `unreadable_dirs`, exactly as in [`scan`].
 pub fn corpus(root: &Path) -> Scan {
+    corpus_controlled(root, &PopulationControl::default())
+}
+
+pub(crate) fn corpus_controlled(root: &Path, control: &PopulationControl) -> Scan {
     let t0 = std::time::Instant::now();
-    let walk = session_files(root);
+    let walk = session_files(root, control);
 
     let mut out = Scan {
         subagent_files_skipped: walk.nested,
@@ -893,6 +1254,7 @@ pub fn corpus(root: &Path) -> Scan {
         unsized_files: walk.unsized_files,
         unreadable_dirs: walk.unreadable,
         absent_root: walk.absent_root,
+        source_fingerprints: walk.source_fingerprints,
         ..Default::default()
     };
 
@@ -1030,6 +1392,57 @@ mod tests {
     /// pass it -- see `a_first_record_only_reader_finds_nothing` directly
     /// below, which runs that implementation against this same fixture
     /// and gets `None` for every field.
+    #[test]
+    fn running_population_becomes_deferred_when_its_process_work_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.db");
+        let conn = crate::store::open_db(&path).unwrap();
+        let reader = crate::store::open_db(&path).unwrap();
+        let generation = population_generation(&conn, "usage").unwrap();
+        let active = PopulationActivity::new(&conn, "usage", generation);
+        persist_progress(
+            &conn,
+            "usage",
+            generation,
+            &PopulationProgress::new(10, true),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_progress(&reader, "usage").unwrap().unwrap().status,
+            PopulationStatus::Running
+        );
+        drop(active);
+        assert_eq!(
+            stored_progress(&reader, "usage").unwrap().unwrap().status,
+            PopulationStatus::Deferred
+        );
+        cancel_stored_progress(&conn).unwrap();
+        assert_eq!(
+            stored_progress(&reader, "usage").unwrap().unwrap().status,
+            PopulationStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn discovery_reports_its_observed_denominator_and_respects_pre_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        for name in ["one", "two"] {
+            std::fs::write(project.join(format!("{name}.jsonl")), "{}\n").unwrap();
+        }
+        let control = PopulationControl::discovery();
+        let mut progress = Vec::new();
+        scan_with_progress(dir.path(), &control, &mut |p| progress.push(p));
+        assert_eq!(progress.last().unwrap().total, 2);
+        assert_eq!(progress.last().unwrap().completed, 2);
+        assert!(progress.last().unwrap().total_known);
+        control.cancel();
+        let cancelled = corpus_controlled(&dir.path().join("not-present"), &control);
+        assert!(cancelled.is_partial());
+        assert!(cancelled.absent_root.is_none());
+    }
+
     #[test]
     fn metadata_is_not_in_the_first_record() {
         let t = Tmp::new("record5");

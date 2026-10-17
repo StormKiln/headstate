@@ -29,6 +29,7 @@ import type {
   DeleteOutcome,
   ClaudeMdScan,
   ClaudeImported,
+  PopulationProgress,
   ClaudeIndexCoverage,
   ClaudeSearchAnswer,
   ClaudeOverview,
@@ -1186,6 +1187,8 @@ export const readClaudeMd = (path: string) => call<string>("read_claude_md", { p
 
 /// Rescan `~/.claude/projects` into our own cache. Returns what it read
 /// AND what it could not read.
+export const claudeCancelPopulation = () => call<boolean>("claude_cancel_population");
+
 export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import_transcripts");
 
 /// Search the transcript corpus by content (#1203).
@@ -1370,6 +1373,10 @@ export const claudeRestartList = () => call<ClaudeRestartList>("claude_restart_l
 /// what it covers, and a truncated measurement makes the whole figure a
 /// floor.
 export interface ClaudeUsageProfile {
+  population?: PopulationProgress | null;
+  freshSessions?: number;
+  staleSessions?: number;
+  unknownSessions?: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;

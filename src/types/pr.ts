@@ -1372,7 +1372,19 @@ interface ResumeCommand {
 /// non-empty `unreadable_dirs` means "we could not read your history",
 /// which must not render as "you have no sessions". Opposite remedies,
 /// and the second is alarming when it is false.
+export interface PopulationProgress {
+  status: "running" | "complete" | "deferred" | "cancelled" | "timed_out" | "failed" | "invalidated";
+  phase?: "discovery" | "metadata" | "usage" | "index";
+  total: number;
+  total_known: boolean;
+  completed: number;
+  unchanged: number;
+  failed: number;
+  remaining: number;
+}
+
 export interface ClaudeImported {
+  population?: PopulationProgress | null;
   /// Sessions written (inserted or updated).
   sessions: number;
   /// Rows the database refused, with why.
@@ -1419,6 +1431,7 @@ export interface ClaudeImported {
 /// sessions indexed so far". A percentage cannot be put in that sentence
 /// and a progress bar cannot be read out loud.
 export interface ClaudeIndexCoverage {
+  population?: PopulationProgress | null;
   /// Sessions whose content is in the index right now.
   indexed: number;
   /// Session transcripts found on disk. The denominator. Zero means the

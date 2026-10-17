@@ -47,10 +47,10 @@
 //! therefore has zero runs, which the liveness layer reports as unknown
 //! rather than dead -- honest, because we never watched that process.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::subagent::{Kind, Parent};
-use super::transcript::{Scan, Transcript};
+use super::transcript::{PopulationProgress, PopulationStatus, Scan, Transcript};
 
 /// What an import changed, and what it could not read.
 ///
@@ -60,6 +60,8 @@ use super::transcript::{Scan, Transcript};
 /// that only reaches a log line is a count nobody sees.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Imported {
+    #[serde(default)]
+    pub population: super::transcript::PopulationProgress,
     /// Sessions written (inserted or updated).
     pub sessions: usize,
     /// Rows the database refused, with why. Counted, not swallowed: a
@@ -123,7 +125,8 @@ impl Imported {
     /// belongs. Raising the list-level banner for it would tell the user
     /// their session list is short when it is complete.
     pub fn is_partial(&self) -> bool {
-        !self.unreadable_dirs.is_empty()
+        self.population.status != PopulationStatus::Complete
+            || !self.unreadable_dirs.is_empty()
             || !self.unreadable_files.is_empty()
             || !self.write_failures.is_empty()
     }
@@ -383,6 +386,19 @@ pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlit
         },
     )?;
 
+    let (fresh, stale): (i64, i64) = conn.query_row("SELECT COALESCE(SUM(l.fresh=1),0),COALESCE(SUM(l.fresh=0),0) FROM claude_session_usage u JOIN claude_usage_ledger l ON l.session_id=u.session_id", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    out.fresh_sessions = fresh as u64;
+    out.stale_sessions = stale as u64;
+    out.unknown_sessions = out
+        .sessions_measured
+        .saturating_sub(out.fresh_sessions + out.stale_sessions);
+    out.population = super::transcript::stored_progress(conn, "usage")?;
+    if let Some(discovery) = super::transcript::stored_progress(conn, "import")? {
+        if discovery.status == PopulationStatus::Running {
+            out.population = Some(discovery);
+        }
+    }
+
     let mut q = conn.prepare(
         "SELECT model, SUM(messages) FROM claude_session_model
           GROUP BY model ORDER BY SUM(messages) DESC",
@@ -422,15 +438,186 @@ pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlit
     Ok(out)
 }
 
-/// Write a completed [`Scan`] into `claude_session`.
-///
-/// One transaction, so a rescan interrupted halfway leaves the previous
-/// contents rather than a half-merged list. Per-session write failures
-/// are collected and reported instead of aborting the import: one
-/// malformed row must not cost the user the other 1,429.
+/// Continue changed usage measurements from durable per-file checkpoints.
+pub(crate) fn usage_pass(
+    conn: &mut Connection,
+    scan: &Scan,
+    control: &super::transcript::PopulationControl,
+) -> rusqlite::Result<Imported> {
+    let generation = super::transcript::population_generation(conn, "usage")?;
+    let _activity = super::transcript::PopulationActivity::new(conn, "usage", generation);
+    let mut out = Imported {
+        unreadable_dirs: scan.unreadable_dirs.clone(),
+        unreadable_files: scan.unreadable_files.clone(),
+        ..Default::default()
+    };
+    populate_usage(
+        conn,
+        &scan.sessions,
+        control,
+        generation,
+        &mut out,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    Ok(out)
+}
+
+fn populate_usage(
+    conn: &mut Connection,
+    sessions: &[Transcript],
+    control: &super::transcript::PopulationControl,
+    generation: i64,
+    out: &mut Imported,
+    now: &str,
+) -> rusqlite::Result<()> {
+    out.population = PopulationProgress::new(
+        sessions.len() + out.unreadable_files.len(),
+        out.unreadable_dirs.is_empty(),
+    );
+    out.population.failed = out.unreadable_files.len() as u64;
+    super::transcript::persist_progress(conn, "usage", generation, &out.population)?;
+    let observed: std::collections::HashSet<&str> =
+        sessions.iter().map(|t| t.session_id.as_str()).collect();
+    let fresh_ids = conn
+        .prepare("SELECT session_id FROM claude_usage_ledger WHERE fresh=1")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in fresh_ids
+        .iter()
+        .filter(|id| !observed.contains(id.as_str()))
+    {
+        conn.execute("UPDATE claude_usage_ledger SET fresh=0 WHERE session_id=?1 AND fresh<>0 AND EXISTS(SELECT 1 FROM claude_population_generation WHERE lane='usage' AND generation=?2)", rusqlite::params![id,generation])?;
+    }
+    let mut todo = Vec::new();
+    let mut checked = std::collections::HashSet::new();
+    // Classify every observed source before the bounded reads, so changed
+    // files waiting for a later pass cannot masquerade as fresh measurements.
+    for t in sessions {
+        if control.stopped() || !super::transcript::generation_current(conn, "usage", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        checked.insert(t.session_id.as_str());
+        let path = std::path::Path::new(&t.path);
+        let before = match super::transcript::fingerprint(path) {
+            Ok(value) => value,
+            Err(e) => {
+                conn.execute(
+                    "UPDATE claude_usage_ledger SET fresh=0 WHERE session_id=?1 AND fresh<>0 AND EXISTS(SELECT 1 FROM claude_population_generation WHERE lane='usage' AND generation=?2)",
+                    rusqlite::params![&t.session_id,generation],
+                )?;
+                out.unreadable_files
+                    .push(format!("{}: could not measure usage source: {e}", t.path));
+                out.population.failed += 1;
+                continue;
+            }
+        };
+        let known: Option<(String, i64, String, bool)> = conn.query_row("SELECT path,size_bytes,mtime_ns,fresh FROM claude_usage_ledger WHERE session_id=?1", [&t.session_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        if known.as_ref() == Some(&(t.path.clone(), before.0, before.1.clone(), true)) {
+            out.population.completed += 1;
+            out.population.unchanged += 1;
+            continue;
+        }
+        conn.execute("INSERT INTO claude_usage_ledger(session_id,path,size_bytes,mtime_ns,fresh) SELECT ?1,?2,?3,?4,0 WHERE EXISTS(SELECT 1 FROM claude_population_generation WHERE lane='usage' AND generation=?5) ON CONFLICT(session_id) DO UPDATE SET fresh=0 WHERE fresh<>0", rusqlite::params![t.session_id,t.path,before.0,before.1,generation])?;
+        todo.push((t, before));
+    }
+    // Cancellation cannot leave unvisited retained measurements labelled current.
+    for id in fresh_ids.iter().filter(|id| !checked.contains(id.as_str())) {
+        conn.execute("UPDATE claude_usage_ledger SET fresh=0 WHERE session_id=?1 AND fresh<>0 AND EXISTS(SELECT 1 FROM claude_population_generation WHERE lane='usage' AND generation=?2)", rusqlite::params![id,generation])?;
+    }
+    for (t, before) in todo.into_iter().take(super::search::SESSIONS_PER_PASS) {
+        if control.stopped() || !super::transcript::generation_current(conn, "usage", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        let path = std::path::Path::new(&t.path);
+        let u = match super::usage::read_and_sum_cancellable(path, None, &|| control.stopped()) {
+            Ok(u) => u,
+            Err(e) => {
+                if let Some(reason) = control.stop_reason() {
+                    out.population.status = reason;
+                    break;
+                }
+                out.unreadable_files.push(e);
+                out.population.failed += 1;
+                continue;
+            }
+        };
+        if super::transcript::fingerprint(path).ok().as_ref() != Some(&before) {
+            out.population.status = PopulationStatus::Invalidated;
+            out.unreadable_files
+                .push(format!("{}: changed while measuring usage", t.path));
+            continue;
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if control.stopped() || !super::transcript::generation_current(&tx, "usage", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        let result = record_usage(&tx, &t.session_id, &u, now).and_then(|()| {
+            tx.execute("INSERT INTO claude_usage_ledger(session_id,path,size_bytes,mtime_ns,fresh) VALUES (?1,?2,?3,?4,1) ON CONFLICT(session_id) DO UPDATE SET path=?2,size_bytes=?3,mtime_ns=?4,fresh=1", rusqlite::params![t.session_id,t.path,before.0,before.1]).map(|_| ())
+        });
+        match result {
+            Ok(()) => {
+                out.population.completed += 1;
+                super::transcript::persist_progress(&tx, "usage", generation, &out.population)?;
+                tx.commit()?;
+            }
+            Err(e) => {
+                out.write_failures
+                    .push(format!("{}: could not store usage: {e}", t.session_id));
+                out.population.failed += 1;
+            }
+        }
+    }
+    out.population.finish();
+    super::transcript::persist_progress(conn, "usage", generation, &out.population)?;
+    Ok(())
+}
+
+/// Accept stable metadata and usage per file; replace the corpus-derived
+/// graph atomically only when discovery is still valid. Failed graph writes
+/// retain the previous graph without discarding accepted local checkpoints.
 pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::Error> {
+    import_controlled(
+        conn,
+        scan,
+        &super::transcript::PopulationControl::discovery(),
+    )
+}
+
+pub(crate) fn import_controlled(
+    conn: &mut Connection,
+    scan: Scan,
+    control: &super::transcript::PopulationControl,
+) -> Result<Imported, rusqlite::Error> {
+    let generation = super::transcript::population_generation(conn, "import")?;
+    let _activity = super::transcript::PopulationActivity::new(conn, "import", generation);
+    let out = import_generation(conn, scan, control, generation)?;
+    super::transcript::persist_progress(conn, "import", generation, &out.population)?;
+    Ok(out)
+}
+
+fn import_generation(
+    conn: &mut Connection,
+    scan: Scan,
+    control: &super::transcript::PopulationControl,
+    generation: i64,
+) -> Result<Imported, rusqlite::Error> {
+    let complete =
+        !scan.is_partial() && scan.absent_root.is_none() && scan.subagents.unreadable.is_empty();
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
+        population: PopulationProgress::new(
+            scan.sessions.len() + scan.unreadable_files.len(),
+            scan.unreadable_dirs.is_empty(),
+        ),
         subagent_files_skipped: scan.subagent_files_skipped,
         session_bytes: scan.session_bytes,
         subagent_bytes: scan.subagent_bytes,
@@ -454,15 +641,91 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
         }
     }
 
-    let tx = conn.transaction()?;
+    let mut metadata_progress =
+        PopulationProgress::new(scan.sessions.len(), out.unreadable_dirs.is_empty());
+    metadata_progress.phase = super::transcript::PopulationPhase::Metadata;
+    super::transcript::persist_progress(conn, "import", generation, &metadata_progress)?;
+    // Session metadata is local to one file: stable neighbors remain useful
+    // even when a changing source prevents whole-corpus graph publication.
     for t in &scan.sessions {
+        let source = scan
+            .source_fingerprints
+            .iter()
+            .find(|(path, _, _)| path == std::path::Path::new(&t.path));
+        if let Some((path, size, modified)) = source {
+            if super::transcript::fingerprint(path).ok().as_ref()
+                != Some(&(*size, modified.clone()))
+            {
+                continue;
+            }
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if control.stopped() || !super::transcript::generation_current(&tx, "import", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            out.population.finish();
+            return Ok(out);
+        }
         match upsert(&tx, t, &now) {
-            Ok(()) => out.sessions += 1,
+            Ok(()) => {
+                metadata_progress.completed += 1;
+                if metadata_progress.completed.is_multiple_of(25)
+                    || metadata_progress.completed == metadata_progress.total
+                {
+                    super::transcript::persist_progress(
+                        &tx,
+                        "import",
+                        generation,
+                        &metadata_progress,
+                    )?;
+                }
+                tx.commit()?;
+                out.sessions += 1;
+            }
             Err(e) => out
                 .write_failures
-                .push(format!("{}: could not store it: {e}", t.session_id)),
+                .push(format!("{}: could not store metadata: {e}", t.session_id)),
         }
     }
+    // End metadata reporting before body reads so the usage lane owns live progress.
+    metadata_progress.finish();
+    super::transcript::persist_progress(conn, "import", generation, &metadata_progress)?;
+    let usage_generation = super::transcript::population_generation(conn, "usage")?;
+    let _usage_activity =
+        super::transcript::PopulationActivity::new(conn, "usage", usage_generation);
+    populate_usage(
+        conn,
+        &scan.sessions,
+        &control.bounded(),
+        usage_generation,
+        &mut out,
+        &now,
+    )?;
+    let mut source_changed = false;
+    for (path, size, modified) in &scan.source_fingerprints {
+        if super::transcript::fingerprint(path).ok().as_ref() != Some(&(*size, modified.clone())) {
+            source_changed = true;
+            out.unreadable_files.push(format!(
+                "{}: changed during discovery; previous derived facts retained",
+                path.display()
+            ));
+        }
+    }
+    if source_changed {
+        out.population.status = PopulationStatus::Invalidated;
+        return Ok(out);
+    }
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if control.stopped() || !super::transcript::generation_current(&tx, "import", generation)? {
+        out.population.status = control
+            .stop_reason()
+            .unwrap_or(PopulationStatus::Invalidated);
+        out.population.finish();
+        return Ok(out);
+    }
+    let failures_before_graph = out.write_failures.len();
 
     // The attribution, rewritten WHOLE rather than upserted (#1002).
     //
@@ -473,16 +736,17 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
     // would leave the stale conclusion in place with nothing to remove
     // it, so the table is cleared and re-stated by the pass that owns it.
     //
-    // Inside the same transaction as the sessions, so a reader never sees
-    // a list whose rows and whose attributions came from different scans.
+    // Metadata has independent per-file checkpoints. Only the derived graph
+    // is replaced as one snapshot; a graph failure retains its prior snapshot.
     // The pull-request links, on the same terms and for the same reason
     // (#1132). They are derived from the corpus as a whole: a transcript
     // deleted since the last scan should take its links with it, and an
     // upsert would leave them behind with nothing to remove them.
     //
-    // Inside this transaction so a reader never sees sessions and links
-    // from different scans.
-    tx.execute("DELETE FROM claude_session_pr", [])?;
+    // Links and attribution share this transaction and roll back together.
+    if complete {
+        tx.execute("DELETE FROM claude_session_pr", [])?;
+    }
     for l in &scan.subagents.pr_links {
         if let Err(e) = tx.execute(
             "INSERT OR REPLACE INTO claude_session_pr
@@ -505,75 +769,10 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
         }
     }
 
-    // Token usage, measured on the same pass (#1134).
-    //
-    // BOUNDED per session by `summarise`, not `summarise_whole`: the
-    // budget is what keeps the whole-corpus read at 3.8 s, and a
-    // truncated measurement is carried as a floor rather than dropped.
-    // A session whose transcript is gone keeps whatever was measured
-    // last -- absent is not zero.
-    for t in &scan.sessions {
-        // A transcript that could not be read leaves the PREVIOUS
-        // measurement in place rather than writing zeros over it: absent
-        // is not zero, and a session whose file is temporarily
-        // unreadable has not suddenly cost nothing.
-        let Ok(u) = super::usage::summarise(std::path::Path::new(&t.path)) else {
-            continue;
-        };
-        if let Err(e) = record_usage(&tx, &t.session_id, &u, &now) {
-            out.write_failures
-                .push(format!("{}: could not store its usage: {e}", t.session_id));
-        }
+    if complete {
+        tx.execute("DELETE FROM claude_subagent", [])?;
     }
-
-    // THE BACKFILL (#1213). Only the rows the bulk pass had to truncate.
-    //
-    // Measured on a real machine: 14 of 1,453 sessions exceed the
-    // budget, and those 14 hold 53.6% of all session bytes. Every one
-    // of them currently reports a floor for the question -- "what did
-    // this cost" -- that is asked about long sessions above all others.
-    //
-    // Bounded by construction rather than by a cap: the set is the
-    // truncated rows, it shrinks to empty as they are measured, and a
-    // re-measured session is not returned again. At the 160 ms #1086
-    // measured for the 76.7 MB worst case this is seconds of work,
-    // once -- not the 3.8 s whole-corpus read `BUDGET_BYTES` exists to
-    // prevent, which nothing here performs.
-    //
-    // Runs AFTER the loop above so a session measured fresh this pass
-    // is backfilled in the same transaction rather than waiting for
-    // the next one.
-    let by_id: std::collections::HashMap<&str, &str> = scan
-        .sessions
-        .iter()
-        .map(|t| (t.session_id.as_str(), t.path.as_str()))
-        .collect();
-    match truncated_sessions(&tx) {
-        Ok(ids) => {
-            for id in ids {
-                // A truncated row whose transcript is not in this scan
-                // is skipped, not cleared: the file may be on a volume
-                // that was not mounted, and its last measurement is
-                // still the best thing known about it.
-                let Some(path) = by_id.get(id.as_str()) else {
-                    continue;
-                };
-                if let Err(e) = backfill_one(&tx, &id, std::path::Path::new(path), &now) {
-                    out.write_failures
-                        .push(format!("{id}: could not re-measure its usage: {e}"));
-                }
-            }
-        }
-        // Reported rather than swallowed: a backfill that could not
-        // even list its work leaves every floor in place, and a silent
-        // skip would make that indistinguishable from having no work.
-        Err(e) => out
-            .write_failures
-            .push(format!("could not list truncated sessions: {e}")),
-    }
-
-    tx.execute("DELETE FROM claude_subagent", [])?;
-    for t in &scan.sessions {
+    for t in scan.sessions.iter().filter(|_| complete) {
         let Kind::Subagent { agent_id } = Kind::classify(t.cwd.as_deref()) else {
             continue;
         };
@@ -598,6 +797,13 @@ pub fn import(conn: &mut Connection, scan: Scan) -> Result<Imported, rusqlite::E
             ));
         }
     }
+    if out.write_failures.len() > failures_before_graph {
+        out.population.status = PopulationStatus::Failed;
+        out.population.failed += (out.write_failures.len() - failures_before_graph) as u64;
+        out.subagents = 0;
+        out.subagents_attributed = 0;
+        return Ok(out);
+    }
     tx.commit()?;
     Ok(out)
 }
@@ -611,6 +817,529 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn interrupted_or_incomplete_discovery_does_not_call_retained_usage_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut session = t("s");
+        session.path = path.to_string_lossy().into_owned();
+        let complete = Scan {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        let mut conn = db();
+        for cancelled in [false, true] {
+            usage_pass(
+                &mut conn,
+                &complete,
+                &super::super::transcript::PopulationControl::default(),
+            )
+            .unwrap();
+            assert_eq!(usage_profile(&conn).unwrap().fresh_sessions, 1);
+            let control = super::super::transcript::PopulationControl::default();
+            let partial = Scan {
+                unreadable_dirs: vec!["unavailable project".into()],
+                ..Default::default()
+            };
+            if cancelled {
+                control.cancel();
+            }
+            let result = usage_pass(
+                &mut conn,
+                if cancelled { &complete } else { &partial },
+                &control,
+            )
+            .unwrap();
+            assert!(result.is_partial());
+            let profile = usage_profile(&conn).unwrap();
+            assert_eq!(profile.sessions_measured, 1);
+            assert_eq!(profile.fresh_sessions, 0);
+            assert_eq!(profile.stale_sessions, 1);
+        }
+    }
+
+    #[test]
+    fn typed_population_distinguishes_cancellation_deadline_and_dirty_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut session = t("s");
+        session.path = path.to_string_lossy().into_owned();
+        let scan = Scan {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        let mut conn = db();
+        let control = super::super::transcript::PopulationControl::default();
+        usage_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(usage_profile(&conn).unwrap().fresh_sessions, 1);
+        let expired = control.with_budget(std::time::Duration::ZERO);
+        let result = usage_pass(&mut conn, &scan, &expired).unwrap();
+        assert_eq!(
+            result.population.status,
+            super::super::transcript::PopulationStatus::TimedOut
+        );
+        std::fs::write(&path, "{}\n{}\n").unwrap();
+        let cancel = control.clone();
+        super::super::usage::READ_OBSERVER
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(move |_| cancel.cancel())));
+        let result = usage_pass(&mut conn, &scan, &control).unwrap();
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            result.population.status,
+            super::super::transcript::PopulationStatus::Cancelled
+        );
+        assert_eq!(result.population.total, 1);
+        assert_eq!(result.population.completed, 0);
+        assert_eq!(result.population.remaining, 1);
+        let profile = usage_profile(&conn).unwrap();
+        assert_eq!(profile.sessions_measured, 1);
+        assert_eq!(profile.fresh_sessions, 0);
+        assert_eq!(profile.stale_sessions, 1);
+    }
+
+    #[test]
+    fn review_corpus_failed_graph_replacement_retains_prior_links_and_attribution() {
+        let mut conn = db();
+        let mut child = t("child");
+        child.cwd = Some(agent_cwd("cccccccc3333"));
+        let mut map = crate::claude::subagent::Map::default();
+        map_note(&mut map, "cccccccc3333", "parent", "2026-09-14T01:00:00Z");
+        map.pr_links.push(crate::claude::subagent::PrLink {
+            session_id: "parent".into(),
+            repo: "octocat/hello-world".into(),
+            number: 1,
+            url: "https://github.com/octocat/hello-world/pull/1".into(),
+            first_seen_at: None,
+        });
+        let scan = Scan {
+            sessions: vec![t("parent"), child],
+            subagents: map,
+            ..Default::default()
+        };
+        import(&mut conn, scan.clone()).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_link BEFORE INSERT ON claude_session_pr BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(import(&mut conn, scan.clone()).unwrap().is_partial());
+        assert_eq!(prs_for_session(&conn, "parent").unwrap().len(), 1);
+        conn.execute_batch("DROP TRIGGER reject_link; CREATE TRIGGER reject_parent BEFORE INSERT ON claude_subagent BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(import(&mut conn, scan).unwrap().is_partial());
+        assert_eq!(
+            conn.query_row(
+                "SELECT parent_session_id FROM claude_subagent WHERE session_id='child'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn review_corpus_one_changing_file_does_not_starve_stable_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("stable.jsonl"), "{}\n").unwrap();
+        let changing = project.join("changing.jsonl");
+        std::fs::write(&changing, "{}\n").unwrap();
+        let scan = super::super::transcript::scan(dir.path());
+        std::fs::write(&changing, "{}\n{}\n").unwrap();
+        let mut conn = db();
+        let result = import(&mut conn, scan).unwrap();
+        assert!(result.is_partial());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM claude_session WHERE session_id='stable'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM claude_session WHERE session_id='changing'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn usage_population_is_bounded_and_resumes_without_reopening_completed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for n in 0..101 {
+            let path = dir.path().join(format!("{n}.jsonl"));
+            std::fs::write(&path, "{}\n").unwrap();
+            let mut session = t(&n.to_string());
+            session.path = path.to_string_lossy().into_owned();
+            sessions.push(session);
+        }
+        let scan = Scan {
+            sessions,
+            ..Default::default()
+        };
+        let mut conn = db();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reads.clone();
+        super::super::usage::READ_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| observed.set(observed.get() + 1)))
+        });
+        assert!(usage_pass(
+            &mut conn,
+            &scan,
+            &super::super::transcript::PopulationControl::default()
+        )
+        .unwrap()
+        .is_partial());
+        assert_eq!(reads.get(), 100);
+        reads.set(0);
+        assert!(!usage_pass(
+            &mut conn,
+            &scan,
+            &super::super::transcript::PopulationControl::default()
+        )
+        .unwrap()
+        .is_partial());
+        assert_eq!(reads.get(), 1);
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    #[test]
+    fn empty_directory_discovery_race_cannot_delete_accepted_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("empty-project");
+        std::fs::create_dir(&project).unwrap();
+        let old = super::super::transcript::scan(dir.path());
+        std::fs::write(project.join("new.jsonl"), "{}\n").unwrap();
+        let mut conn = db();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url) VALUES ('new','octocat/hello-world',1,'https://github.com/octocat/hello-world/pull/1')", []).unwrap();
+        let result = import(&mut conn, old).unwrap();
+        assert!(result.is_partial());
+        assert_eq!(prs_for_session(&conn, "new").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn changed_discovery_source_cannot_replace_accepted_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let path = project.join("session.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let scan = super::super::transcript::scan(dir.path());
+        std::fs::write(&path, "{}\n{}\n").unwrap();
+        let mut conn = db();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url) VALUES ('session','octocat/hello-world',1,'https://github.com/octocat/hello-world/pull/1')", []).unwrap();
+        let result = import(&mut conn, scan).unwrap();
+        assert!(result.is_partial());
+        assert_eq!(prs_for_session(&conn, "session").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paused_usage_reader_allows_competing_writer_and_rejects_superseded_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let mut conn = crate::store::open_db(&db_path).unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .unwrap();
+        let mut session = t("s");
+        session.path = path.to_string_lossy().into_owned();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            super::super::usage::READ_OBSERVER.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    if first {
+                        first = false;
+                        ready_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                }))
+            });
+            let result = import(
+                &mut conn,
+                Scan {
+                    sessions: vec![session],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+            result
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let writer = crate::store::open_db(&db_path).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let advanced = super::super::transcript::population_generation(&writer, "usage");
+        resume_tx.send(()).unwrap();
+        assert!(advanced.is_ok(), "reader held SQLite writer: {advanced:?}");
+        assert!(worker.join().unwrap().is_partial());
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT COUNT(*) FROM claude_usage_ledger WHERE fresh=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            writer
+                .query_row("SELECT COUNT(*) FROM claude_session_usage", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn profile_shows_usage_progress_after_metadata_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("progress.db");
+        let mut conn = crate::store::open_db(&db_path).unwrap();
+        let reader = crate::store::open_db(&db_path).unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut session = t("s");
+        session.path = path.to_string_lossy().into_owned();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        super::super::usage::READ_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(usage_profile(&reader).unwrap().population.unwrap());
+            }));
+        });
+        let result = import(
+            &mut conn,
+            Scan {
+                sessions: vec![session],
+                ..Default::default()
+            },
+        );
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+        result.unwrap();
+        let observed = observed.lock().unwrap();
+        assert!(!observed.is_empty());
+        assert!(
+            observed.iter().all(
+                |p| p.phase == super::super::transcript::PopulationPhase::Usage
+                    && p.status == PopulationStatus::Running
+                    && p.total == 1
+                    && p.completed == 0
+            ),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_usage_pass_restarts_from_accepted_file_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for id in ["first", "second"] {
+            let path = dir.path().join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n",
+            )
+            .unwrap();
+            let mut session = t(id);
+            session.path = path.to_string_lossy().into_owned();
+            sessions.push(session);
+        }
+        let mut conn = db();
+        let control = super::super::transcript::PopulationControl::default();
+        let cancel = control.clone();
+        let mut reads = 0;
+        super::super::usage::READ_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                reads += 1;
+                if reads == 2 {
+                    cancel.cancel();
+                }
+            }))
+        });
+        let scan = Scan {
+            sessions,
+            ..Default::default()
+        };
+        let result = usage_pass(&mut conn, &scan, &control).unwrap();
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+        assert!(result.is_partial());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM claude_usage_ledger WHERE fresh=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reads.clone();
+        super::super::usage::READ_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| observed.set(observed.get() + 1)))
+        });
+        usage_pass(
+            &mut conn,
+            &scan,
+            &super::super::transcript::PopulationControl::default(),
+        )
+        .unwrap();
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(reads.get(), 1, "restart reads only the uncommitted file");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM claude_usage_ledger WHERE fresh=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn unchanged_oversized_usage_is_not_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.jsonl");
+        let line = "{\"type\":\"assistant\",\"message\":{\"model\":\"test\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n";
+        std::fs::write(
+            &path,
+            line.repeat((super::super::usage::BUDGET_BYTES as usize / line.len()) + 2),
+        )
+        .unwrap();
+        let mut session = t("large");
+        session.path = path.to_string_lossy().into_owned();
+        let mut conn = db();
+        let bytes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let observed = bytes.clone();
+        super::super::usage::READ_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |n| observed.set(observed.get() + n)))
+        });
+        conn.execute_batch("CREATE TABLE usage_writes(n INTEGER); INSERT INTO usage_writes VALUES(0); CREATE TRIGGER count_usage AFTER INSERT ON claude_session_usage BEGIN UPDATE usage_writes SET n=n+1; END;").unwrap();
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![session.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes.get() as u64, std::fs::metadata(&path).unwrap().len());
+        bytes.set(0);
+        conn.execute("UPDATE usage_writes SET n=0", []).unwrap();
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![session.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT n FROM usage_writes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(bytes.get(), 0, "unchanged import performs zero body reads");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![session],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT n FROM usage_writes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(bytes.get() as u64, std::fs::metadata(&path).unwrap().len());
+        super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    #[test]
+    fn partial_discovery_preserves_links_and_attribution() {
+        let mut conn = db();
+        let mut child = t("child");
+        child.cwd = Some(agent_cwd("cccccccc3333"));
+        let mut map = crate::claude::subagent::Map::default();
+        map_note(&mut map, "cccccccc3333", "parent", "2026-09-14T01:00:00Z");
+        map.pr_links.push(crate::claude::subagent::PrLink {
+            session_id: "parent".into(),
+            repo: "octocat/hello-world".into(),
+            number: 1,
+            url: "https://github.com/octocat/hello-world/pull/1".into(),
+            first_seen_at: None,
+        });
+        import(
+            &mut conn,
+            Scan {
+                sessions: vec![t("parent"), child.clone()],
+                subagents: map,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut failed_map = crate::claude::subagent::Map::default();
+        failed_map.unreadable.push("failed map".into());
+        for partial in [
+            Scan {
+                sessions: vec![child],
+                unreadable_dirs: vec!["unknown subtree".into()],
+                ..Default::default()
+            },
+            Scan {
+                subagents: failed_map,
+                ..Default::default()
+            },
+        ] {
+            import(&mut conn, partial).unwrap();
+            assert_eq!(prs_for_session(&conn, "parent").unwrap().len(), 1);
+            let parent: String = conn
+                .query_row(
+                    "SELECT parent_session_id FROM claude_subagent WHERE session_id = 'child'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent, "parent");
+        }
+        import(&mut conn, Scan::default()).unwrap();
+        assert!(prs_for_session(&conn, "parent").unwrap().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_subagent", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     fn t(id: &str) -> Transcript {
@@ -1018,12 +1747,17 @@ mod tests {
     #[test]
     fn a_map_read_failure_does_not_claim_the_list_is_short() {
         let mut conn = db();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut session = t("s1");
+        session.path = path.to_string_lossy().into_owned();
         let mut map = crate::claude::subagent::Map::default();
         map.unreadable.push("/x/y.jsonl: could not open it".into());
         let out = import(
             &mut conn,
             Scan {
-                sessions: vec![t("s1")],
+                sessions: vec![session],
                 subagents: map,
                 ..Default::default()
             },
@@ -1106,10 +1840,15 @@ mod tests {
     #[test]
     fn what_could_not_be_read_survives_the_storage_boundary() {
         let mut conn = db();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut session = t("s1");
+        session.path = path.to_string_lossy().into_owned();
         let got = import(
             &mut conn,
             Scan {
-                sessions: vec![t("s1")],
+                sessions: vec![session],
                 subagent_files_skipped: 1370,
                 unreadable_dirs: vec!["/x/secret: Permission denied".into()],
                 unreadable_files: vec!["/x/a.jsonl: Permission denied".into()],

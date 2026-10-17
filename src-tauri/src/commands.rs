@@ -4909,63 +4909,229 @@ pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthS
     }
 }
 
-/// Import the Claude Code transcripts already on disk (#914, epic #910).
-///
-/// A FULL rescan of `~/.claude/projects`, every time. That is the whole
-/// design and it is a measurement, not a shortcut: extracting all 1,430
-/// real sessions on the development machine costs well under a second,
-/// because each transcript is a bounded head read plus one 16 KB tail
-/// seek rather than a whole-file read of an 881 MB corpus. At that price
-/// there is no cache to invalidate, no stored offset to get wrong, and no
-/// filesystem watcher to fail silently -- which on macOS a dead FSEvents
-/// stream does, producing exactly the "watch that fails" the epic's own
-/// constraints warn about.
-///
-/// `elapsed_ms` comes back in the result so that claim stays checkable on
-/// a machine other than the one it was measured on.
-///
-/// # Why this is safe to call at startup
-///
-/// It is read-only against `~/.claude` -- those transcripts are Claude
-/// Code's data and the file `claude --resume` depends on -- and one
-/// transaction against our own cache. `spawn_blocking` keeps the disk
-/// walk off the async runtime.
-///
-/// # Absent is not zero
-///
-/// [`Imported`] carries `unreadable_dirs`, `unreadable_files` and
-/// `write_failures` as data. An empty session list with a non-empty
-/// `unreadable_dirs` means "we could not read your history", which the UI
-/// must not render as "you have no sessions": the two have opposite
-/// remedies and the second is alarming when it is false.
-///
-/// `absent_root` is the THIRD answer and it is not one of those (#970): a
-/// `~/.claude/projects` that does not exist is the honest empty answer for
-/// a machine that has never run Claude Code, so it travels in its own
-/// field and `is_partial()` stays false. Before that it arrived in
-/// `unreadable_dirs`, and a new user's first sentence about this feature
-/// was "0 sessions read, but 1 could not be".
-///
-/// [`Imported`]: crate::claude::store::Imported
+#[derive(Default)]
+struct PopulationRegistry {
+    paused: bool,
+    next_id: u64,
+    active: std::collections::HashMap<u64, crate::claude::transcript::PopulationControl>,
+}
+impl PopulationRegistry {
+    fn register(&mut self, control: crate::claude::transcript::PopulationControl) -> u64 {
+        if self.paused {
+            control.cancel();
+        }
+        self.next_id += 1;
+        self.active.insert(self.next_id, control);
+        self.next_id
+    }
+    fn cancel(&mut self) {
+        self.paused = true;
+        for control in self.active.values() {
+            control.cancel();
+        }
+    }
+}
+static CLAUDE_POPULATION: std::sync::LazyLock<std::sync::Mutex<PopulationRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(PopulationRegistry::default()));
+struct PopulationRegistration(u64);
+impl Drop for PopulationRegistration {
+    fn drop(&mut self) {
+        CLAUDE_POPULATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .remove(&self.0);
+    }
+}
+fn register_population(
+    control: &crate::claude::transcript::PopulationControl,
+) -> PopulationRegistration {
+    PopulationRegistration(
+        CLAUDE_POPULATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(control.clone()),
+    )
+}
+fn population_paused() -> bool {
+    CLAUDE_POPULATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .paused
+}
+
+/// Cancel corpus work and pause its automatic continuation until explicit import.
+#[tauri::command]
+pub async fn claude_cancel_population(app: tauri::AppHandle) -> Result<bool, String> {
+    CLAUDE_POPULATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cancel();
+    let db = db_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&db).map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let registry = CLAUDE_POPULATION.lock().unwrap_or_else(|e| e.into_inner());
+        // A newer explicit resume wins over this delayed persistence task.
+        if registry.paused {
+            crate::claude::transcript::cancel_stored_progress(&tx).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn admit_population(
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    control: &crate::claude::transcript::PopulationControl,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
+    tokio::select! {
+        biased;
+        () = control.cancelled() => Ok(None),
+        permit = slots.acquire_owned() => {
+            let permit = permit.map_err(|e| e.to_string())?;
+            if control.stopped() { Ok(None) } else { Ok(Some(permit)) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corpus_cancel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_cancelled_import_cannot_revive_when_a_new_import_resumes() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut registry = PopulationRegistry::default();
+        let queued = crate::claude::transcript::PopulationControl::discovery();
+        registry.register(queued.clone());
+        registry.cancel();
+        registry.paused = false;
+        let resumed = crate::claude::transcript::PopulationControl::discovery();
+        registry.register(resumed.clone());
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            admit_population(slots.clone(), &queued),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(cancelled.is_none());
+        slots.add_permits(1);
+        assert!(admit_population(slots, &resumed).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn explicit_cancel_pauses_only_registered_corpus_work_until_resume() {
+        let mut registry = PopulationRegistry::default();
+        let active = crate::claude::transcript::PopulationControl::discovery();
+        let unrelated = crate::claude::transcript::PopulationControl::default();
+        registry.register(active.clone());
+        registry.cancel();
+        assert_eq!(
+            active.stop_reason(),
+            Some(crate::claude::transcript::PopulationStatus::Cancelled)
+        );
+        assert!(!unrelated.stopped());
+        let next_tick = crate::claude::transcript::PopulationControl::default();
+        registry.register(next_tick.clone());
+        assert!(next_tick.stopped());
+        registry.paused = false;
+        let resumed = crate::claude::transcript::PopulationControl::discovery();
+        registry.register(resumed.clone());
+        assert!(!resumed.stopped());
+    }
+}
+
+static CLAUDE_POPULATION_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
+
+/// Discover local transcripts with cooperative cancellation. Stable metadata and
+/// usage commit per file; whole-corpus links and attribution publish atomically.
+/// Partial discovery retains prior derived facts and reports qualified progress.
 #[tauri::command]
 pub async fn claude_import_transcripts(
     app: tauri::AppHandle,
 ) -> Result<crate::claude::store::Imported, String> {
+    let control = crate::claude::transcript::PopulationControl::discovery();
+    let registration = {
+        let mut registry = CLAUDE_POPULATION.lock().unwrap_or_else(|e| e.into_inner());
+        registry.paused = false;
+        PopulationRegistration(registry.register(control.clone()))
+    };
+    let _cancel = crate::claude::transcript::CancelPopulation(control.clone());
     let db = db_path(&app);
+    let Some(permit) = admit_population(CLAUDE_POPULATION_SLOTS.clone(), &control).await? else {
+        return Ok(crate::claude::store::Imported {
+            population: crate::claude::transcript::PopulationProgress {
+                status: crate::claude::transcript::PopulationStatus::Cancelled,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    };
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let _registration = registration;
         // Taken BEFORE the scan reads a byte: a transcript appended while
         // the scan runs has an mtime after this, so the live pass's
         // incremental link read covers it (#1557).
         let since_ms = chrono::Utc::now().timestamp_millis();
-        let scan = crate::claude::scan_default()?;
+        let root = crate::claude::transcript::projects_dir()
+            .ok_or_else(|| "no home directory".to_string())?;
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-        let imported = crate::claude::store::import(&mut conn, scan).map_err(|e| e.to_string())?;
+        let mut attempts = 0;
+        let imported = loop {
+            let generation = crate::claude::transcript::population_generation(&conn, "import")
+                .map_err(|e| e.to_string())?;
+            let _activity =
+                crate::claude::transcript::PopulationActivity::new(&conn, "import", generation);
+            let initial = crate::claude::transcript::PopulationProgress {
+                phase: crate::claude::transcript::PopulationPhase::Discovery,
+                status: crate::claude::transcript::PopulationStatus::Running,
+                ..Default::default()
+            };
+            crate::claude::transcript::persist_progress(&conn, "import", generation, &initial)
+                .map_err(|e| e.to_string())?;
+            let mut last_progress: Option<std::time::Instant> = None;
+            let scan =
+                crate::claude::transcript::scan_with_progress(&root, &control, &mut |progress| {
+                    if last_progress
+                        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(100))
+                        || progress.completed == progress.total
+                    {
+                        if let Err(e) = crate::claude::transcript::persist_progress(
+                            &conn, "import", generation, &progress,
+                        ) {
+                            log::warn!("claude: could not checkpoint discovery progress: {e}");
+                        }
+                        last_progress = Some(std::time::Instant::now());
+                    }
+                });
+            let imported = crate::claude::store::import_controlled(&mut conn, scan, &control)
+                .map_err(|e| e.to_string())?;
+            attempts += 1;
+            // At most one discovery restart. Persisted local checkpoints survive;
+            // an unstable corpus returns useful partial data without caching its graph.
+            if imported.population.status
+                != crate::claude::transcript::PopulationStatus::Invalidated
+                || attempts >= 2
+                || control.stopped()
+            {
+                break imported;
+            }
+        };
         // After the import committed, never before: see `linkscan::reset`.
         // A failure costs freshness, not links -- the import has just
         // written them all -- so it is logged rather than failing the
         // import it followed.
-        if let Err(e) = crate::claude::linkscan::reset(&conn, since_ms) {
-            log::warn!("claude: could not reset the pull request link cursor: {e}");
+        if !imported.is_partial() && imported.subagent_map_unreadable.is_empty() {
+            if let Err(e) = crate::claude::linkscan::reset(&conn, since_ms) {
+                log::warn!("claude: could not reset the pull request link cursor: {e}");
+            }
         }
         Ok(imported)
     })
@@ -5061,10 +5227,13 @@ pub async fn claude_search_transcripts(
                     rusqlite::params![total, chrono::Utc::now().to_rfc3339()],
                 );
                 scan.unreadable_files
+                    .into_iter()
+                    .chain(scan.unreadable_dirs)
+                    .collect()
             }
             Err(e) => {
                 log::warn!("claude: could not re-scan the corpus for search coverage: {e}");
-                Vec::new()
+                vec![format!("corpus discovery failed: {e}")]
             }
         };
         crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable, matching)
@@ -5093,8 +5262,13 @@ pub async fn claude_index_coverage(
         // here, and the listing computes it from the same `fs::metadata`
         // failure `extract` reports, without opening a transcript.
         let unreadable = crate::claude::corpus_default()
-            .map(|s| s.unreadable_files)
-            .unwrap_or_default();
+            .map(|s| {
+                s.unreadable_files
+                    .into_iter()
+                    .chain(s.unreadable_dirs)
+                    .collect()
+            })
+            .unwrap_or_else(|e| vec![format!("corpus discovery failed: {e}")]);
         crate::claude::search::coverage(&conn, unreadable).map_err(|e| e.to_string())
     })
     .await
@@ -5367,6 +5541,7 @@ pub async fn claude_event_profile(
 /// let a UI render a sweep against a stale consumption or vice versa.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeLiveState {
+    pub usage_population: Option<crate::claude::transcript::PopulationProgress>,
     /// What the hook's handoff file contributed.
     pub handoff: crate::claude::handoff::Consumed,
     /// What the registry sweep contributed, including crashes found.
@@ -5427,9 +5602,19 @@ pub struct ClaudeLiveState {
 #[tauri::command]
 pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, String> {
     let db = db_path(&app);
-    tauri::async_runtime::spawn_blocking(move || claude_live_pass(&db))
+    let permit = CLAUDE_POPULATION_SLOTS
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let control = crate::claude::transcript::PopulationControl::default();
+    let _cancel = crate::claude::transcript::CancelPopulation(control.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        claude_live_pass_controlled(&db, &control)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// One pass over both live sources, synchronously (#947).
@@ -5444,6 +5629,18 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
 /// Sync on purpose: both callers already have a blocking context. The
 /// command wraps it in `spawn_blocking`, and the timer is its own thread.
 pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String> {
+    let _permit = CLAUDE_POPULATION_SLOTS
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "corpus population busy; retry on the next tick".to_string())?;
+    claude_live_pass_controlled(db, &crate::claude::transcript::PopulationControl::default())
+}
+
+fn claude_live_pass_controlled(
+    db: &std::path::Path,
+    control: &crate::claude::transcript::PopulationControl,
+) -> Result<ClaudeLiveState, String> {
+    let _registration = register_population(control);
     {
         let home = crate::auth::home_dir()
             .ok_or_else(|| "no home directory, so ~/.claude cannot be read".to_string())?;
@@ -5543,14 +5740,21 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
         // inputs from the scan survive the switch. See `corpus`'s own
         // doc for why stopping before the file reads cannot lose an
         // unreadable transcript.
-        let indexed = match crate::claude::corpus_default() {
-            Ok(scan) => {
-                // Pull request links written since the last import
-                // (#1557), over the same listing: bounded, incremental,
-                // and a failure here fails neither the pass nor the
-                // index. `claude::linkscan` carries the design. Counts
-                // only in the log -- never a path or a link.
-                match crate::claude::linkscan::refresh(
+        let mut usage_population = None;
+        let indexed = if population_paused() {
+            None
+        } else {
+            match crate::claude::transcript::projects_dir()
+                .map(|root| crate::claude::transcript::corpus_controlled(&root, control))
+                .ok_or_else(|| "no home directory".to_string())
+            {
+                Ok(scan) => {
+                    // Pull request links written since the last import
+                    // (#1557), over the same listing: bounded, incremental,
+                    // and a failure here fails neither the pass nor the
+                    // index. `claude::linkscan` carries the design. Counts
+                    // only in the log -- never a path or a link.
+                    match crate::claude::linkscan::refresh(
                     &mut conn,
                     &scan,
                     crate::claude::linkscan::BYTES_PER_PASS,
@@ -5563,21 +5767,29 @@ pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String>
                     Ok(_) => {}
                     Err(e) => log::warn!("claude: the pull request link pass failed: {e}"),
                 }
-                match crate::claude::search::index_pass(&mut conn, &scan) {
-                    Ok(done) => Some(done),
-                    Err(e) => {
-                        log::warn!("claude: the transcript index pass failed: {e}");
-                        None
+                    match crate::claude::store::usage_pass(&mut conn, &scan, control) {
+                        Ok(result) => {
+                            usage_population = Some(result.population);
+                        }
+                        Err(e) => log::warn!("claude: usage population failed: {e}"),
+                    }
+                    match crate::claude::search::index_pass_controlled(&mut conn, &scan, control) {
+                        Ok(done) => Some(done),
+                        Err(e) => {
+                            log::warn!("claude: the transcript index pass failed: {e}");
+                            None
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                log::warn!("claude: could not scan the corpus to index it: {e}");
-                None
+                Err(e) => {
+                    log::warn!("claude: could not scan the corpus to index it: {e}");
+                    None
+                }
             }
         };
 
         Ok(ClaudeLiveState {
+            usage_population,
             handoff,
             sweep,
             running: swept.running,

@@ -389,6 +389,7 @@ pub fn run() {
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::claude_import_transcripts,
+            commands::claude_cancel_population,
             commands::claude_search_transcripts,
             commands::claude_index_coverage,
             commands::claude_sessions,
@@ -911,6 +912,9 @@ pub fn run() {
                             match commands::claude_live_pass(&commands::db_path(&app_handle)) {
                                 Ok(state) => {
                                     background::CLAUDE_LIVE.ok(background::now_ms());
+                                    // Receipt only: observers re-read cheap stored summaries.
+                                    // No paths, transcript content or provider reads.
+                                    let _ = app_handle.emit("claude-population-updated", ());
                                     // ---- "your session died" (#979) ----
                                     //
                                     // `crashed_sessions` and NOT a query
