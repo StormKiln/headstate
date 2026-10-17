@@ -47,6 +47,8 @@
 //! therefore has zero runs, which the liveness layer reports as unknown
 //! rather than dead -- honest, because we never watched that process.
 
+mod graph;
+
 use rusqlite::{Connection, OptionalExtension};
 
 use super::subagent::{Kind, Parent};
@@ -873,52 +875,7 @@ fn import_generation(
         return Ok(out);
     }
     let failures_before_graph = out.write_failures.len();
-
-    // The attribution, rewritten WHOLE rather than upserted (#1002).
-    //
-    // The map is one derived artefact over the whole corpus: a session
-    // that was unattributed last scan can resolve on this one because
-    // some OTHER transcript grew a mention, and one that was attributed
-    // can stop being so if its parent's transcript is deleted. An upsert
-    // would leave the stale conclusion in place with nothing to remove
-    // it, so the table is cleared and re-stated by the pass that owns it.
-    //
-    // Metadata has independent per-file checkpoints. Only the derived graph
-    // is replaced as one snapshot; a graph failure retains its prior snapshot.
-    // The pull-request links, on the same terms and for the same reason
-    // (#1132). They are derived from the corpus as a whole: a transcript
-    // deleted since the last scan should take its links with it, and an
-    // upsert would leave them behind with nothing to remove them.
-    //
-    // Links and attribution share this transaction and roll back together.
-    if complete {
-        tx.execute("DELETE FROM claude_session_pr", [])?;
-    }
-    for l in &scan.subagents.pr_links {
-        if let Err(e) = tx.execute(
-            "INSERT OR REPLACE INTO claude_session_pr
-                 (session_id, repo, number, url, first_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            // `as i64`: SQLite integers are signed, and a PR number is
-            // never near the boundary -- GitHub's largest is six digits.
-            rusqlite::params![
-                l.session_id,
-                l.repo,
-                l.number as i64,
-                l.url,
-                l.first_seen_at
-            ],
-        ) {
-            out.write_failures.push(format!(
-                "{}: could not store its pull request link: {e}",
-                l.session_id
-            ));
-        }
-    }
-
-    if complete {
-        tx.execute("DELETE FROM claude_subagent", [])?;
-    }
+    let mut parents = Vec::new();
     for t in scan.sessions.iter().filter(|_| complete) {
         let Kind::Subagent { agent_id } = Kind::classify(t.cwd.as_deref()) else {
             continue;
@@ -929,20 +886,24 @@ fn import_generation(
             Parent::Unattributed { why } => (None, Some(why)),
         };
         out.subagents += 1;
-        if parent.is_some() {
-            out.subagents_attributed += 1;
-        }
-        if let Err(e) = tx.execute(
-            "INSERT INTO claude_subagent
-                (session_id, agent_id, parent_session_id, why, resolved_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![t.session_id, agent_id, parent, why, now],
-        ) {
-            out.write_failures.push(format!(
-                "{}: could not store which session spawned it: {e}",
-                t.session_id
-            ));
-        }
+        out.subagents_attributed += usize::from(parent.is_some());
+        parents.push(graph::Attribution {
+            session_id: t.session_id.clone(),
+            agent_id,
+            parent,
+            why,
+        });
+    }
+    // Links and attribution still publish atomically under the source fence.
+    // Only semantic differences mutate rows; partial scans retain missing edges.
+    if let Err(error) = graph::publish(
+        &tx,
+        &scan.subagents.pr_links,
+        complete.then_some(parents.as_slice()),
+        &now,
+    ) {
+        out.write_failures
+            .push(format!("could not publish derived session graph: {error}"));
     }
     if out.write_failures.len() > failures_before_graph {
         out.population.status = PopulationStatus::Failed;
@@ -1073,6 +1034,83 @@ mod tests {
         assert_eq!(profile.stale_sessions, 1);
     }
 
+    fn synthetic_graph() -> Scan {
+        let mut child = t("child");
+        child.cwd = Some(agent_cwd("cccccccc3333"));
+        let mut map = crate::claude::subagent::Map::default();
+        map_note(&mut map, "cccccccc3333", "parent", "2026-09-14T01:00:00Z");
+        map.pr_links.push(crate::claude::subagent::PrLink {
+            session_id: "parent".into(),
+            repo: "octocat/hello-world".into(),
+            number: 1,
+            url: "https://github.com/octocat/hello-world/pull/1".into(),
+            first_seen_at: None,
+        });
+        Scan {
+            sessions: vec![t("parent"), child],
+            subagents: map,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unchanged_graph_has_zero_mutations_and_keeps_resolution_time() {
+        let mut conn = db();
+        let mut scan = synthetic_graph();
+        import(&mut conn, scan.clone()).unwrap();
+        conn.execute("UPDATE claude_subagent SET resolved_at='accepted-time'", [])
+            .unwrap();
+        conn.execute_batch("CREATE TABLE graph_mutations(name TEXT, op TEXT);")
+            .unwrap();
+        for table in ["claude_session_pr", "claude_subagent"] {
+            for op in ["INSERT", "UPDATE", "DELETE"] {
+                conn.execute_batch(&format!("CREATE TRIGGER count_{table}_{op} AFTER {op} ON {table} BEGIN INSERT INTO graph_mutations VALUES('{table}', '{op}'); END;")).unwrap();
+            }
+        }
+        // Intermediate duplicate entries must not cause transient graph writes:
+        // current import semantics are final incoming value wins for each key.
+        let mut earlier = scan.subagents.pr_links[0].clone();
+        earlier.url = "https://github.com/octocat/hello-world/pull/old".into();
+        scan.subagents.pr_links.insert(0, earlier);
+        import(&mut conn, scan.clone()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM graph_mutations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT resolved_at FROM claude_subagent", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "accepted-time"
+        );
+        scan.subagents.pr_links.last_mut().unwrap().first_seen_at = Some("new evidence".into());
+        import(&mut conn, scan.clone()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM graph_mutations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            prs_for_session(&conn, "parent").unwrap()[0]
+                .first_seen_at
+                .as_deref(),
+            Some("new evidence")
+        );
+        conn.execute("DELETE FROM graph_mutations", []).unwrap();
+        scan.subagents.pr_links.clear();
+        import(&mut conn, scan).unwrap();
+        assert!(prs_for_session(&conn, "parent").unwrap().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM graph_mutations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn review_corpus_failed_graph_replacement_retains_prior_links_and_attribution() {
         let mut conn = db();
@@ -1087,17 +1125,20 @@ mod tests {
             url: "https://github.com/octocat/hello-world/pull/1".into(),
             first_seen_at: None,
         });
-        let scan = Scan {
+        let mut scan = Scan {
             sessions: vec![t("parent"), child],
             subagents: map,
             ..Default::default()
         };
         import(&mut conn, scan.clone()).unwrap();
+        scan.subagents.pr_links[0].number = 2;
+        scan.sessions[1].cwd = Some(agent_cwd("dddddddd4444"));
         conn.execute_batch("CREATE TRIGGER reject_link BEFORE INSERT ON claude_session_pr BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         assert!(import(&mut conn, scan.clone()).unwrap().is_partial());
         assert_eq!(prs_for_session(&conn, "parent").unwrap().len(), 1);
         conn.execute_batch("DROP TRIGGER reject_link; CREATE TRIGGER reject_parent BEFORE INSERT ON claude_subagent BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         assert!(import(&mut conn, scan).unwrap().is_partial());
+        assert_eq!(prs_for_session(&conn, "parent").unwrap()[0].number, 1);
         assert_eq!(
             conn.query_row(
                 "SELECT parent_session_id FROM claude_subagent WHERE session_id='child'",
