@@ -352,3 +352,5 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod population_schedule;

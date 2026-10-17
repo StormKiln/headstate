@@ -9,6 +9,8 @@ function label(task: string): string {
   switch (task) {
     case "health-sampler":
       return "The health sampler";
+    case "claude-index":
+      return "The transcript search index";
     case "claude-live":
       return "The Claude Code session reader";
     default:
@@ -81,7 +83,9 @@ export function BackgroundHealthNotice({
           <p className="mt-0.5 text-[#8b949e]">
             {t.task === "health-sampler"
               ? "The app has been running, so any gap in the chart below is missing data rather than time the app was closed."
-              : "Session history and crash detection have not been updating."}{" "}
+              : t.task === "claude-index"
+                ? "Transcript search results may be incomplete."
+                : "Session history and crash detection have not been updating."}{" "}
             {t.last_success_ms === null
               ? "It has not succeeded once since the app started."
               : `Last succeeded ${ago(t.last_success_ms, now)}.`}

@@ -24,6 +24,20 @@ pub fn get<T: DeserializeOwned>(conn: &Connection, key: &str) -> Result<Option<T
     Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
 }
 
+/// Read durable control/checkpoint state without treating corruption as absence.
+pub(crate) fn get_strict<T: DeserializeOwned>(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<T>, StoreError> {
+    let raw: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    raw.map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+        .transpose()
+}
+
 /// Write a setting, replacing any previous value.
 pub fn set<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<(), StoreError> {
     conn.execute(
@@ -68,6 +82,11 @@ pub mod keys {
     /// and that is never something an upgrade should switch on.
     pub const ALLOW_PHONE_CONNECTIONS: &str = "allow_phone_connections";
 
+    /// Durable pause, cleared only by an explicit resume. Read strictly.
+    pub const CLAUDE_POPULATION_PAUSED: &str = "claude_population_paused";
+    /// First processing lane on the next pass, advanced before bounded work.
+    pub const CLAUDE_POPULATION_NEXT_LANE: &str = "claude_population_next_lane";
+
     /// How far into `~/.claude/headstate/sessions.jsonl` the hook handoff
     /// consumer has read, as a JSON integer of bytes (#913).
     ///
@@ -81,10 +100,9 @@ pub mod keys {
     /// How far the incremental pull request link read has got since the
     /// last transcript import (#1557), as `claude::linkscan::Cursor`.
     ///
-    /// Absent until the first import sets it, and a pass does nothing
-    /// until then. An unreadable value is treated as absent for the same
-    /// reason: the next import sets it again, and no link is skipped in
-    /// the meantime -- the import still writes them all.
+    /// Absent until the first import sets it. Strict reads distinguish
+    /// absence from corruption or database failure; errors retain the cursor
+    /// and surface a diagnostic instead of pretending population never began.
     pub const CLAUDE_PR_LINK_CURSOR: &str = "claude_pr_link_cursor";
 }
 
@@ -98,6 +116,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = open_db(&dir.path().join("t.db")).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn strict_state_distinguishes_absence_corruption_and_database_failure() {
+        let (_d, conn) = db();
+        assert_eq!(get_strict::<bool>(&conn, "control").unwrap(), None);
+        set(&conn, "control", &true).unwrap();
+        assert_eq!(get_strict::<bool>(&conn, "control").unwrap(), Some(true));
+        conn.execute("UPDATE settings SET value='broken' WHERE key='control'", [])
+            .unwrap();
+        assert!(get_strict::<bool>(&conn, "control").is_err());
+        conn.execute("DROP TABLE settings", []).unwrap();
+        assert!(get_strict::<bool>(&conn, "control").is_err());
     }
 
     #[test]

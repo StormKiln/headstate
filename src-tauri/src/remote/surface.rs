@@ -1212,7 +1212,9 @@ async fn call(
         // `async` since #1090: an unbounded `read_to_string` dispatched
         // inline held this listener for the length of the file.
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
-        "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
+        "claude_import_transcripts" => {
+            res(commands::claude_import_transcripts(app.clone(), a.get("resume")?).await)
+        }
         "claude_cancel_population" => res(commands::claude_cancel_population(app.clone()).await),
         // Both query matchers read the `Matching` `privacy::admit` wrote
         // (#1519), failing closed to masked when it is absent.

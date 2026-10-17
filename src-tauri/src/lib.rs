@@ -529,7 +529,10 @@ pub fn run() {
                 Ok(token) => {
                     match tauri::async_runtime::block_on(async { auth::build_client(&token) }) {
                         Ok(octocrab) => {
-                            let client = Arc::new(GitHubClient::new(octocrab).with_credential(&token, commands::db_path(&handle)));
+                            let client = Arc::new(
+                                GitHubClient::new(octocrab)
+                                    .with_credential(&token, commands::db_path(&handle)),
+                            );
                             (
                                 AuthState {
                                     ok: true,
@@ -594,9 +597,15 @@ pub fn run() {
             let needs_gh = Arc::new(AtomicBool::new(true));
             app.manage(poll::ViewNeedsGithub(needs_gh.clone()));
             let github_source_enabled = Arc::new(AtomicBool::new(
-                store::open_db(&commands::db_path(&handle)).ok()
-                    .and_then(|c| store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION).ok().flatten())
-                    .as_deref() != Some("gitlab"),
+                store::open_db(&commands::db_path(&handle))
+                    .ok()
+                    .and_then(|c| {
+                        store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION)
+                            .ok()
+                            .flatten()
+                    })
+                    .as_deref()
+                    != Some("gitlab"),
             ));
             app.manage(poll::GithubSourceEnabled(github_source_enabled.clone()));
             let gitlab_selected = store::open_db(&commands::db_path(&handle))
@@ -611,10 +620,12 @@ pub fn run() {
                 .ok()
                 .and_then(|conn| gitlab::host::read_host(&conn).ok());
             let gitlab_control = Arc::new(gitlab::poll::Control::new(
-                saved_gitlab_host.filter(|_| gitlab_selected).map(|host| identity::Source {
-                    provider: identity::Provider::Gitlab,
-                    host,
-                }),
+                saved_gitlab_host
+                    .filter(|_| gitlab_selected)
+                    .map(|host| identity::Source {
+                        provider: identity::Provider::Gitlab,
+                        host,
+                    }),
             ));
             app.manage(gitlab_control.clone());
             // Which repositories have a background update run going,
@@ -955,53 +966,17 @@ pub fn run() {
                                         }
                                     }
 
-                                    // ---- Indexing failures (#1203) ----
-                                    //
-                                    // Through #1145's mechanism, which
-                                    // is what this loop already has. A
-                                    // transcript that could not be
-                                    // indexed is a known gap in what a
-                                    // search can cover, and a gap
-                                    // nobody is told about becomes an
-                                    // unexplained "no matches" the next
-                                    // time somebody searches for
-                                    // something that is in it.
-                                    //
-                                    // `indexed: None` -- the pass could
-                                    // not run at all -- is a failure
-                                    // too, and a worse one: no session
-                                    // was indexed and coverage is
-                                    // frozen wherever it stood.
-                                    match &state.indexed {
-                                        Some(done) if done.is_partial() => {
-                                            let why = format!(
-                                                "{} transcript(s) could not be indexed,                                                  {} row(s) refused",
-                                                done.all_unreadable().len(),
-                                                done.write_failures.len()
-                                            );
-                                            log::warn!("claude: index pass incomplete: {why}");
-                                            if background::CLAUDE_INDEX.failed(why) {
-                                                use tauri::Emitter;
-                                                let _ = app_handle.emit(
-                                                    "background-degraded",
-                                                    background::CLAUDE_INDEX.snapshot(),
-                                                );
-                                            }
-                                        }
-                                        Some(_) => {
-                                            background::CLAUDE_INDEX.ok(background::now_ms());
-                                        }
-                                        None => {
-                                            let why =
-                                                "the transcript index pass could not run".to_string();
-                                            if background::CLAUDE_INDEX.failed(why) {
-                                                use tauri::Emitter;
-                                                let _ = app_handle.emit(
-                                                    "background-degraded",
-                                                    background::CLAUDE_INDEX.snapshot(),
-                                                );
-                                            }
-                                        }
+                                    // Deferred work and deliberate stops are neutral; only
+                                    // actual index faults affect background health.
+                                    if state.index_health.record_health(
+                                        &background::CLAUDE_INDEX,
+                                        background::now_ms(),
+                                    ) {
+                                        use tauri::Emitter;
+                                        let _ = app_handle.emit(
+                                            "background-degraded",
+                                            background::CLAUDE_INDEX.snapshot(),
+                                        );
                                     }
 
                                     // Logged only when it did something.
@@ -1085,18 +1060,30 @@ pub fn run() {
                         match c.fetch_viewer().await {
                             Ok(login) => {
                                 log::info!("signed in as {login}");
-                                for list in [store::CachedList::Authored, store::CachedList::Reviewing] {
-                                    let mut update = identity_app.state::<source_poll::SourcePolls>()
-                                        .snapshot(&identity::Source::default(), list).await;
+                                for list in
+                                    [store::CachedList::Authored, store::CachedList::Reviewing]
+                                {
+                                    let mut update = identity_app
+                                        .state::<source_poll::SourcePolls>()
+                                        .snapshot(&identity::Source::default(), list)
+                                        .await;
                                     update.owner = Some(login.clone());
                                     let _ = identity_app.emit("source-poll-status", update);
                                 }
-                            },
+                            }
                             Err(e) => log::warn!("could not read the signed-in account: {e}"),
                         }
                     });
                 }
-                poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
+                poll::spawn(
+                    handle,
+                    client,
+                    focused,
+                    waker,
+                    interval,
+                    needs_gh,
+                    github_source_enabled,
+                );
             }
 
             tray::setup_tray(&app.handle().clone())?;
