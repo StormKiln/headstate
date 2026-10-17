@@ -653,11 +653,18 @@ pub(crate) fn index_pass_controlled(
 
     out.remaining = todo.len().saturating_sub(SESSIONS_PER_PASS);
 
+    super::retry_queue::rotate_pending(conn, "index", &mut todo, |item| &item.0.session_id)?;
+
     for (t, size, mtime) in todo.into_iter().take(SESSIONS_PER_PASS) {
         if control.stopped() || !super::transcript::generation_current(conn, "index", generation)? {
             out.population.status = control
                 .stop_reason()
                 .unwrap_or(super::transcript::PopulationStatus::Invalidated);
+            finalize_index(conn, generation, &mut out)?;
+            return Ok(out);
+        }
+        if !super::retry_queue::checkpoint_attempt(conn, "index", generation, &t.session_id)? {
+            out.population.status = super::transcript::PopulationStatus::Invalidated;
             finalize_index(conn, generation, &mut out)?;
             return Ok(out);
         }
@@ -1059,6 +1066,41 @@ mod tests {
         assert!(!coverage(&conn, result.all_unreadable())
             .unwrap()
             .is_complete());
+    }
+
+    #[test]
+    fn failed_prefix_does_not_starve_index_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..101 {
+            write_session(dir.path(), "project", &format!("s{n:03}"), "fairneedle");
+        }
+        let mut scan = crate::claude::corpus(dir.path());
+        scan.sessions
+            .sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let database = dir.path().join("fair.db");
+        let mut conn = crate::store::open_db(&database).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_prefix BEFORE INSERT ON claude_index_ledger WHEN NEW.session_id <> 's100' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        // Count/restart fairness is independent of wall-clock runner speed.
+        let control = super::super::transcript::PopulationControl::discovery();
+        let first = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert_eq!(first.indexed, 0);
+        assert_eq!(first.write_failures.len(), 100);
+        drop(conn);
+        let mut conn = crate::store::open_db(&database).unwrap();
+        let second = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert_eq!(
+            second.indexed, 1,
+            "a failed prefix must not hide the stable last file after restart"
+        );
+        assert!(second.is_partial());
+        conn.execute_batch("DROP TRIGGER fail_prefix").unwrap();
+        index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            101
+        );
     }
 
     #[test]

@@ -392,6 +392,7 @@ pub fn usage_profile(conn: &Connection) -> Result<super::usage::Profile, rusqlit
     out.unknown_sessions = out
         .sessions_measured
         .saturating_sub(out.fresh_sessions + out.stale_sessions);
+    out.metadata_population = super::transcript::stored_progress(conn, "metadata")?;
     out.population = super::transcript::stored_progress(conn, "usage")?;
     if let Some(discovery) = super::transcript::stored_progress(conn, "import")? {
         if discovery.status == PopulationStatus::Running {
@@ -462,6 +463,133 @@ pub(crate) fn usage_pass(
     Ok(out)
 }
 
+pub(crate) fn metadata_pass(
+    conn: &mut Connection,
+    scan: &Scan,
+    control: &super::transcript::PopulationControl,
+) -> rusqlite::Result<PopulationProgress> {
+    use super::transcript::{
+        generation_current, persist_progress, PopulationActivity, PopulationPhase,
+    };
+    let generation = super::transcript::population_generation(conn, "metadata")?;
+    let _activity = PopulationActivity::new(conn, "metadata", generation);
+    let mut progress = PopulationProgress::new(
+        scan.sessions.len() + scan.unreadable_files.len(),
+        scan.unreadable_dirs.is_empty() && scan.absent_root.is_none(),
+    );
+    progress.phase = PopulationPhase::Metadata;
+    progress.failed = scan.unreadable_files.len() as u64;
+    persist_progress(conn, "metadata", generation, &progress)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut todo = Vec::new();
+    for source in &scan.sessions {
+        if control.stopped() || !generation_current(conn, "metadata", generation)? {
+            progress.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        let before = match super::transcript::fingerprint(std::path::Path::new(&source.path)) {
+            Ok(value) => value,
+            Err(_) => {
+                progress.failed += 1;
+                continue;
+            }
+        };
+        let key = format!("claude_metadata_checkpoint:{}", source.session_id);
+        let fingerprint = serde_json::to_string(&(&source.path, &before))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let known: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key=?1", [&key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if known.as_ref() == Some(&fingerprint) {
+            progress.completed += 1;
+            progress.unchanged += 1;
+        } else {
+            todo.push((source, before, key, fingerprint));
+        }
+    }
+    super::retry_queue::rotate_pending(conn, "metadata", &mut todo, |entry| &entry.0.session_id)?;
+    for (source, before, key, fingerprint) in
+        todo.into_iter().take(super::search::SESSIONS_PER_PASS)
+    {
+        if control.stopped() || !generation_current(conn, "metadata", generation)? {
+            progress.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        if !super::retry_queue::checkpoint_attempt(
+            conn,
+            "metadata",
+            generation,
+            &source.session_id,
+        )? {
+            progress.status = PopulationStatus::Invalidated;
+            break;
+        }
+        let path = std::path::Path::new(&source.path);
+        let mut metadata = match super::transcript::extract_controlled(path, control) {
+            Ok(value) => value,
+            Err(_) => {
+                if let Some(reason) = control.stop_reason() {
+                    progress.status = reason;
+                    break;
+                }
+                progress.failed += 1;
+                continue;
+            }
+        };
+        if super::transcript::fingerprint(path).ok().as_ref() != Some(&before) {
+            progress.failed += 1;
+            continue;
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if control.stopped() || !generation_current(&tx, "metadata", generation)? {
+            progress.status = control
+                .stop_reason()
+                .unwrap_or(PopulationStatus::Invalidated);
+            break;
+        }
+        // A newer hook may have updated the working context after this disk
+        // snapshot. Preserve those facts; upsert still widens activity bounds
+        // and never replaces a user's name.
+        let previous: Option<Option<String>> = tx
+            .query_row(
+                "SELECT last_activity_at FROM claude_session WHERE session_id=?1",
+                [&source.session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if previous.flatten().as_ref().is_some_and(|latest| {
+            metadata
+                .last_activity_at
+                .as_ref()
+                .is_none_or(|disk| latest > disk)
+        }) {
+            metadata.cwd = None;
+            metadata.git_branch = None;
+            metadata.claude_version = None;
+        }
+        let result = upsert(&tx, &metadata, &now).and_then(|()| {
+            tx.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![key,fingerprint]).map(|_| ())
+        });
+        match result {
+            Ok(()) => {
+                progress.completed += 1;
+                persist_progress(&tx, "metadata", generation, &progress)?;
+                tx.commit()?;
+            }
+            Err(_) => progress.failed += 1,
+        }
+    }
+    progress.finish();
+    persist_progress(conn, "metadata", generation, &progress)?;
+    Ok(progress)
+}
+
 fn populate_usage(
     conn: &mut Connection,
     sessions: &[Transcript],
@@ -527,6 +655,7 @@ fn populate_usage(
     for id in fresh_ids.iter().filter(|id| !checked.contains(id.as_str())) {
         conn.execute("UPDATE claude_usage_ledger SET fresh=0 WHERE session_id=?1 AND fresh<>0 AND EXISTS(SELECT 1 FROM claude_population_generation WHERE lane='usage' AND generation=?2)", rusqlite::params![id,generation])?;
     }
+    super::retry_queue::rotate_pending(conn, "usage", &mut todo, |item| &item.0.session_id)?;
     for (t, before) in todo.into_iter().take(super::search::SESSIONS_PER_PASS) {
         if control.stopped() || !super::transcript::generation_current(conn, "usage", generation)? {
             out.population.status = control
@@ -535,6 +664,10 @@ fn populate_usage(
             break;
         }
         let path = std::path::Path::new(&t.path);
+        if !super::retry_queue::checkpoint_attempt(conn, "usage", generation, &t.session_id)? {
+            out.population.status = PopulationStatus::Invalidated;
+            break;
+        }
         let u = match super::usage::read_and_sum_cancellable(path, None, &|| control.stopped()) {
             Ok(u) => u,
             Err(e) => {
@@ -597,9 +730,20 @@ pub(crate) fn import_controlled(
     scan: Scan,
     control: &super::transcript::PopulationControl,
 ) -> Result<Imported, rusqlite::Error> {
+    // Callers with a pre-discovery timestamp use import_controlled_since.
+    // Zero safely replays sources when the scan's start time is unknown.
+    import_controlled_since(conn, scan, control, 0)
+}
+
+pub(crate) fn import_controlled_since(
+    conn: &mut Connection,
+    scan: Scan,
+    control: &super::transcript::PopulationControl,
+    since_ms: i64,
+) -> Result<Imported, rusqlite::Error> {
     let generation = super::transcript::population_generation(conn, "import")?;
     let _activity = super::transcript::PopulationActivity::new(conn, "import", generation);
-    let out = import_generation(conn, scan, control, generation)?;
+    let out = import_generation(conn, scan, control, generation, since_ms)?;
     super::transcript::persist_progress(conn, "import", generation, &out.population)?;
     Ok(out)
 }
@@ -609,6 +753,7 @@ fn import_generation(
     scan: Scan,
     control: &super::transcript::PopulationControl,
     generation: i64,
+    since_ms: i64,
 ) -> Result<Imported, rusqlite::Error> {
     let complete =
         !scan.is_partial() && scan.absent_root.is_none() && scan.subagents.unreadable.is_empty();
@@ -810,6 +955,12 @@ fn import_generation(
         out.subagents_attributed = 0;
         return Ok(out);
     }
+    if complete {
+        // Graph publication and its continuation are one accepted snapshot.
+        // Usage can still be deferred without disabling future link discovery.
+        super::linkscan::reset(&tx, since_ms)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    }
     tx.commit()?;
     Ok(out)
 }
@@ -977,6 +1128,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_prefix_does_not_starve_usage_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = (0..101)
+            .map(|n| {
+                let mut session = t(&format!("s{n:03}"));
+                let path = dir.path().join(format!("s{n:03}.jsonl"));
+                std::fs::write(&path, "{}\n").unwrap();
+                session.path = path.to_string_lossy().into_owned();
+                session
+            })
+            .collect();
+        let scan = Scan {
+            sessions,
+            ..Default::default()
+        };
+        let path = dir.path().join("usage-fair.db");
+        let mut conn = crate::store::open_db(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_usage_prefix BEFORE INSERT ON claude_session_usage WHEN NEW.session_id <> 's100' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        let control = super::super::transcript::PopulationControl::discovery();
+        let first = usage_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(first.population.completed, 0);
+        assert_eq!(first.write_failures.len(), 100);
+        drop(conn);
+        let mut conn = crate::store::open_db(&path).unwrap();
+        let second = usage_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(
+            second.population.completed, 1,
+            "failed neighbors must not starve usage after restart"
+        );
+        assert!(second.is_partial());
+        conn.execute_batch("DROP TRIGGER fail_usage_prefix")
+            .unwrap();
+        let recovered = usage_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(recovered.population.completed, 101);
+        assert!(!recovered.is_partial());
+    }
+
+    #[test]
     fn usage_population_is_bounded_and_resumes_without_reopening_completed_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut sessions = Vec::new();
@@ -1015,6 +1204,211 @@ mod tests {
         .is_partial());
         assert_eq!(reads.get(), 1);
         super::super::usage::READ_OBSERVER.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    #[test]
+    fn live_metadata_is_bounded_checkpointed_and_preserves_newer_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        for n in 0..101 {
+            std::fs::write(project.join(format!("{n}.jsonl")), r#"{"type":"user","cwd":"/work","gitBranch":"main","timestamp":"2026-10-01T00:00:00Z","message":{"content":"opening ask"}}
+"#).unwrap();
+        }
+        let database = dir.path().join("metadata.db");
+        let mut conn = Connection::open(&database).unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let scan = super::super::transcript::corpus(dir.path());
+        // This spans several live passes and a restart. File-count bounds and
+        // merge semantics must not depend on the machine finishing all of them
+        // within one production pass's 60-second deadline.
+        let control = super::super::transcript::PopulationControl::discovery();
+        let first = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(first.completed, 100);
+        assert_eq!(first.status, PopulationStatus::Deferred);
+        assert_eq!(
+            usage_profile(&conn).unwrap().metadata_population,
+            Some(first)
+        );
+        drop(conn);
+        let mut conn = Connection::open(&database).unwrap();
+        let second = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(second.completed, 101);
+        assert_eq!(second.unchanged, 100);
+        usage_pass(&mut conn, &scan, &control).unwrap();
+        let profile = usage_profile(&conn).unwrap();
+        assert_eq!(profile.by_directory[0].cwd, "/work");
+        assert_eq!(profile.by_directory[0].sessions, 100);
+        std::fs::write(project.join("1.jsonl"), "{\"cwd\":\"/updated\",\"gitBranch\":\"topic\",\"timestamp\":\"2026-10-15T00:00:00Z\"}\n").unwrap();
+        let changed = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(changed.status, PopulationStatus::Complete);
+        assert_eq!(changed.unchanged, 100);
+        assert_eq!(
+            conn.query_row(
+                "SELECT git_branch FROM claude_session WHERE session_id='1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "topic"
+        );
+
+        conn.execute("UPDATE claude_session SET name='my name',cwd='/newer-hook',last_activity_at='2026-10-16T00:00:00Z' WHERE session_id='0'", []).unwrap();
+        std::fs::write(project.join("0.jsonl"), r#"{"type":"user","cwd":"/old-disk","gitBranch":"changed","timestamp":"2026-10-02T00:00:00Z","message":{"content":"changed ask"}}
+"#).unwrap();
+        let changed = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(changed.status, PopulationStatus::Complete);
+        assert_eq!(changed.unchanged, 100);
+        let row: (String,String,String,String) = conn.query_row("SELECT name,cwd,last_activity_at,opening_prompt FROM claude_session WHERE session_id='0'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            row,
+            (
+                "my name".into(),
+                "/newer-hook".into(),
+                "2026-10-16T00:00:00Z".into(),
+                "changed ask".into()
+            )
+        );
+        let warm = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(warm.unchanged, 101);
+        control.cancel();
+        assert_eq!(
+            metadata_pass(&mut conn, &scan, &control).unwrap().status,
+            PopulationStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn metadata_timeout_retains_facts_and_checkpoint_until_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timeout.jsonl");
+        std::fs::write(&path, "{\"cwd\":\"/before\"}\n").unwrap();
+        let scan = Scan {
+            sessions: vec![Transcript {
+                session_id: "timeout".into(),
+                path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut conn = db();
+        let control = super::super::transcript::PopulationControl::discovery();
+        assert_eq!(
+            metadata_pass(&mut conn, &scan, &control).unwrap().completed,
+            1
+        );
+        let checkpoint = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key='claude_metadata_checkpoint:timeout'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let accepted = checkpoint(&conn);
+        std::fs::write(&path, "{\"cwd\":\"/changed-directory\"}\n").unwrap();
+        let expired = control.with_budget(std::time::Duration::ZERO);
+        let stopped = metadata_pass(&mut conn, &scan, &expired).unwrap();
+        assert_eq!(stopped.status, PopulationStatus::TimedOut);
+        assert_eq!(stopped.completed, 0);
+        assert_eq!(checkpoint(&conn), accepted);
+        assert_eq!(
+            conn.query_row(
+                "SELECT cwd FROM claude_session WHERE session_id='timeout'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "/before"
+        );
+        let recovered = metadata_pass(&mut conn, &scan, &control).unwrap();
+        assert_eq!(recovered.status, PopulationStatus::Complete);
+        assert_eq!(recovered.unchanged, 0);
+        assert_ne!(checkpoint(&conn), accepted);
+        assert_eq!(
+            conn.query_row(
+                "SELECT cwd FROM claude_session WHERE session_id='timeout'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "/changed-directory"
+        );
+    }
+
+    #[test]
+    fn metadata_checkpoint_failure_rolls_back_row_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.jsonl");
+        std::fs::write(&path, "{\"cwd\":\"/work\"}\n").unwrap();
+        let scan = Scan {
+            sessions: vec![Transcript {
+                session_id: "new".into(),
+                path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut conn = db();
+        conn.execute_batch("CREATE TRIGGER reject_metadata BEFORE INSERT ON settings WHEN NEW.key LIKE 'claude_metadata_checkpoint:%' BEGIN SELECT RAISE(FAIL,'checkpoint rejected'); END;").unwrap();
+        let control = super::super::transcript::PopulationControl::discovery();
+        assert_eq!(metadata_pass(&mut conn, &scan, &control).unwrap().failed, 1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_session", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER reject_metadata").unwrap();
+        assert_eq!(
+            metadata_pass(&mut conn, &scan, &control).unwrap().completed,
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT cwd FROM claude_session", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "/work"
+        );
+    }
+
+    #[test]
+    fn graph_cursor_write_failure_rolls_back_graph() {
+        let mut conn = db();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url) VALUES ('old','o/r',1,'https://github.com/o/r/pull/1')", []).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_cursor BEFORE INSERT ON settings WHEN NEW.key='claude_pr_link_cursor' BEGIN SELECT RAISE(FAIL,'cursor rejected'); END;").unwrap();
+        assert!(import(&mut conn, Scan::default()).is_err());
+        assert_eq!(prs_for_session(&conn, "old").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn accepted_graph_starts_links_with_deferred_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        for n in 0..101 {
+            std::fs::write(project.join(format!("{n}.jsonl")), "{}\n").unwrap();
+        }
+        let mut conn = db();
+        let result = import(&mut conn, super::super::transcript::scan(dir.path())).unwrap();
+        assert_eq!(result.population.status, PopulationStatus::Deferred);
+        use std::io::Write;
+        let mut source = std::fs::OpenOptions::new()
+            .append(true)
+            .open(project.join("0.jsonl"))
+            .unwrap();
+        writeln!(source, "{{\"type\":\"pr-link\",\"sessionId\":\"0\",\"prNumber\":918,\"prUrl\":\"https://github.com/o/r/pull/918\",\"prRepository\":\"o/r\"}}").unwrap();
+        let refresh = super::super::linkscan::refresh(
+            &mut conn,
+            &super::super::transcript::corpus(dir.path()),
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(
+            !refresh.not_started,
+            "accepted graph must install a cursor despite usage backlog"
+        );
+        assert_eq!(prs_for_session(&conn, "0").unwrap()[0].number, 918);
     }
 
     #[test]

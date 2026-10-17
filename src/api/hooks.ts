@@ -2155,9 +2155,9 @@ export function useClaudeUsageProfile(enabled = true, importing = false) {
     enabled,
     staleTime: 29_000,
     refetchInterval: (query) => {
-      const status = query.state.data?.population?.status;
-      if (enabled && (importing || status === "running")) return 1_000;
-      return enabled && (status === "deferred" || status === "invalidated" || status === "timed_out") ? 30_000 : false;
+      const statuses = [query.state.data?.metadataPopulation?.status, query.state.data?.population?.status];
+      if (enabled && (importing || statuses.includes("running"))) return 1_000;
+      return enabled && statuses.some((status) => status === "deferred" || status === "invalidated" || status === "timed_out") ? 30_000 : false;
     },
     retry: false,
   });

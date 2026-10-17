@@ -1225,7 +1225,7 @@ function Banners({
 }) {
   const usage = useClaudeUsageProfile(true, imported.isFetching);
   const index = useClaudeIndexCoverage();
-  const progress = [usage.data?.population, index.data?.population].filter((p) => p != null);
+  const progress = [usage.data?.metadataPopulation, usage.data?.population, index.data?.population].filter((p) => p != null);
   const actionable = progress.length > 0 ? progress : [imported.data?.population];
   const unfinished = actionable.some((p) => p && ["running", "deferred", "timed_out", "invalidated"].includes(p.status));
   const paused = !unfinished && actionable.some((p) => p?.status === "cancelled");

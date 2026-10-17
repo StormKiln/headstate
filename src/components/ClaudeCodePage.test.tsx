@@ -41,6 +41,7 @@ const state = vi.hoisted(() => ({
   imported: undefined as ClaudeImported | undefined,
   importFailed: false,
   importFetching: false,
+  metadataPopulation: undefined as import("../types/pr").PopulationProgress | undefined,
   population: undefined as import("../types/pr").PopulationProgress | undefined,
   /// A FIXED `now`, which is the point: the page must never read the
   /// clock during render. Every relative time below is computed from
@@ -124,7 +125,7 @@ const state = vi.hoisted(() => ({
 
 vi.mock("../api/hooks", () => ({
   useSessionActivity: () => state.activeNow,
-  useClaudeUsageProfile: () => ({ data: state.population ? { population: state.population } : undefined }),
+  useClaudeUsageProfile: () => ({ data: state.population || state.metadataPopulation ? { population: state.population, metadataPopulation: state.metadataPopulation } : undefined }),
   useClaudeIndexCoverage: () => ({ data: undefined }),
   // Empty by default, which is what every assertion in this file about
   // "Copy resume command" assumes (#1126). Set per-test to reach the
@@ -4563,4 +4564,11 @@ it("offers explicit resume after native cancellation", () => {
   fireEvent.click(screen.getByRole("button", { name: "Resume scan" }));
   expect(rescanFn).toHaveBeenCalledOnce();
   state.population = undefined;
+});
+
+it("reports live metadata progress separately from usage", () => {
+  state.metadataPopulation = { phase: "metadata", status: "deferred", total: 101, total_known: true, completed: 100, unchanged: 0, failed: 0, remaining: 1 };
+  render(<ClaudeCodePage />);
+  expect(screen.getByText(/100 sessions stored of 101/)).toBeTruthy();
+  state.metadataPopulation = undefined;
 });

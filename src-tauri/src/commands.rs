@@ -5111,8 +5111,9 @@ pub async fn claude_import_transcripts(
                         last_progress = Some(std::time::Instant::now());
                     }
                 });
-            let imported = crate::claude::store::import_controlled(&mut conn, scan, &control)
-                .map_err(|e| e.to_string())?;
+            let imported =
+                crate::claude::store::import_controlled_since(&mut conn, scan, &control, since_ms)
+                    .map_err(|e| e.to_string())?;
             attempts += 1;
             // At most one discovery restart. Persisted local checkpoints survive;
             // an unstable corpus returns useful partial data without caching its graph.
@@ -5124,15 +5125,6 @@ pub async fn claude_import_transcripts(
                 break imported;
             }
         };
-        // After the import committed, never before: see `linkscan::reset`.
-        // A failure costs freshness, not links -- the import has just
-        // written them all -- so it is logged rather than failing the
-        // import it followed.
-        if !imported.is_partial() && imported.subagent_map_unreadable.is_empty() {
-            if let Err(e) = crate::claude::linkscan::reset(&conn, since_ms) {
-                log::warn!("claude: could not reset the pull request link cursor: {e}");
-            }
-        }
         Ok(imported)
     })
     .await
@@ -5541,6 +5533,7 @@ pub async fn claude_event_profile(
 /// let a UI render a sweep against a stale consumption or vice versa.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeLiveState {
+    pub metadata_population: Option<crate::claude::transcript::PopulationProgress>,
     pub usage_population: Option<crate::claude::transcript::PopulationProgress>,
     /// What the hook's handoff file contributed.
     pub handoff: crate::claude::handoff::Consumed,
@@ -5740,6 +5733,7 @@ fn claude_live_pass_controlled(
         // inputs from the scan survive the switch. See `corpus`'s own
         // doc for why stopping before the file reads cannot lose an
         // unreadable transcript.
+        let mut metadata_population = None;
         let mut usage_population = None;
         let indexed = if population_paused() {
             None
@@ -5767,6 +5761,10 @@ fn claude_live_pass_controlled(
                     Ok(_) => {}
                     Err(e) => log::warn!("claude: the pull request link pass failed: {e}"),
                 }
+                    match crate::claude::store::metadata_pass(&mut conn, &scan, control) {
+                        Ok(progress) => metadata_population = Some(progress),
+                        Err(e) => log::warn!("claude: metadata population failed: {e}"),
+                    }
                     match crate::claude::store::usage_pass(&mut conn, &scan, control) {
                         Ok(result) => {
                             usage_population = Some(result.population);
@@ -5789,6 +5787,7 @@ fn claude_live_pass_controlled(
         };
 
         Ok(ClaudeLiveState {
+            metadata_population,
             usage_population,
             handoff,
             sweep,

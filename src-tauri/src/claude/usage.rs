@@ -1539,6 +1539,8 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     #[serde(default)]
+    pub metadata_population: Option<super::transcript::PopulationProgress>,
+    #[serde(default)]
     pub population: Option<super::transcript::PopulationProgress>,
     #[serde(default)]
     pub fresh_sessions: u64,

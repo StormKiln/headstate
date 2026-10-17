@@ -45,6 +45,7 @@ export interface RemoteEvents {
 /// generation instead of silently skipping it.
 export interface RemoteOnlyReplies {
   claude_poll_live: {
+    metadata_population?: PopulationProgress | null;
     usage_population?: PopulationProgress | null;
     handoff: {
       runs: number; sessions: number; unparseable: string[]; unknown_version: number;
