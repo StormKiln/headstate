@@ -1343,7 +1343,7 @@ const MIGRATIONS: &[&str] = &[
         SELECT rowid, session_id FROM claude_transcript_fts;",
     // 46: DESC already puts NULL activity last. Include the first-seen tie
     // breaker so the session list does not build a temporary sorting tree.
-    "DROP INDEX claude_session_activity;
+    "DROP INDEX IF EXISTS claude_session_activity;
      CREATE INDEX claude_session_activity ON claude_session(last_activity_at DESC, first_seen_at DESC);",
 
 ];
