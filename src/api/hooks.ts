@@ -2080,17 +2080,18 @@ export function useClaudeSessions(enabled: boolean) {
   });
 
   // The one-shot import. `staleTime: Infinity` so it does not re-run on
-  // a remount within the session; the "Rescan" button invalidates it
+  // a remount within the session; the "Rescan" button fetches it
   // explicitly when the user wants a fresh read of disk.
   const imported = useQuery<ClaudeImported>({
     queryKey: ["claude-import"],
-    queryFn: claudeImportTranscripts,
+    queryFn: () => claudeImportTranscripts(false),
     enabled,
     staleTime: Infinity,
     retry: false,
   });
 
   const qc = useQueryClient();
+  const rescanInFlight = useRef<Promise<void> | null>(null);
   return {
     list,
     imported,
@@ -2106,14 +2107,33 @@ export function useClaudeSessions(enabled: boolean) {
     /// Re-read `~/.claude/projects` and then the list. Both, in that
     /// order: a rescan that did not refresh the list would leave the
     /// user looking at the rows from before it.
-    rescan: async () => {
-      await qc.invalidateQueries({ queryKey: ["claude-import"] });
-      await qc.invalidateQueries({ queryKey: ["claude-sessions"] });
-      // The pull request links are rewritten by the same import (#1545),
-      // so their lookups go too rather than waiting out their minute.
-      await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] });
-      await qc.invalidateQueries({ queryKey: ["claude-usage-profile"] });
-      await qc.invalidateQueries({ queryKey: ["claude-index-coverage"] });
+    rescan: () => {
+      if (rescanInFlight.current) return rescanInFlight.current;
+      const scan = (async () => {
+        await qc.cancelQueries({ queryKey: ["claude-import"] });
+        try {
+          // Use the same query lifecycle so the page observes pending/error
+          // while retaining the last receipt and the independently stored list.
+          await qc.fetchQuery({
+            queryKey: ["claude-import"],
+            queryFn: () => claudeImportTranscripts(true),
+            staleTime: 0,
+            retry: false,
+          });
+        } catch {
+          // The query error is rendered by Banners; event handlers need not
+          // rethrow an already-visible failure as an unhandled rejection.
+          return;
+        }
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: ["claude-sessions"] }),
+          qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] }),
+          qc.invalidateQueries({ queryKey: ["claude-usage-profile"] }),
+          qc.invalidateQueries({ queryKey: ["claude-index-coverage"] }),
+        ]);
+      })();
+      rescanInFlight.current = scan.finally(() => { rescanInFlight.current = null; });
+      return rescanInFlight.current;
     },
   };
 }

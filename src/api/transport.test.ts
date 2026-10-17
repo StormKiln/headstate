@@ -340,7 +340,7 @@ const ROWS: Row[] = [
   // `~/.claude/projects` before reading a byte. That guard, not the
   // absence of a parameter, is what keeps them from being "read anything
   // and send it back".
-  row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
+  row(api.claudeImportTranscripts, [], "claude_import_transcripts", { resume: false }),
   row(api.claudeCancelPopulation, [], "claude_cancel_population"),
   // #1203. `Class::Read`: it walks `~/.claude/projects` without writing
   // and queries our own FTS5 index. The away-from-desk case is the same
@@ -476,6 +476,11 @@ describe("tauri.ts wrappers through the transport", () => {
   it("routes correlated reviewing refreshes through get_reviewing", async () => {
     await api.refreshSource("reviewing", "request-2");
     expect(local.call).toHaveBeenCalledWith("get_reviewing", { requestId: "request-2" });
+  });
+
+  it("sends explicit population resume intent through the transport", async () => {
+    await api.claudeImportTranscripts(true);
+    expect(local.call).toHaveBeenCalledWith("claude_import_transcripts", { resume: true });
   });
 
   it("covers every wrapper tauri.ts exports", () => {

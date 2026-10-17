@@ -124,4 +124,11 @@ describe("BackgroundHealthNotice", () => {
     expect(screen.getByText(/The health sampler/)).toBeTruthy();
     expect(screen.getByText(/The Claude Code session reader/)).toBeTruthy();
   });
+  it("describes index failure without claiming session history stopped", () => {
+    render(<BackgroundHealthNotice tasks={[task({ task: "claude-index", degraded: true, consecutive_failures: 2 })]} now={NOW} />);
+    expect(screen.getByText(/The transcript search index/)).toBeTruthy();
+    expect(screen.getByText(/Transcript search results may be incomplete/)).toBeTruthy();
+    expect(screen.queryByText(/Session history and crash detection/)).toBeNull();
+  });
+
 });
