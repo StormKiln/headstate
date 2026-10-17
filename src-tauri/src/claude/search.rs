@@ -450,9 +450,10 @@ fn readable_text_controlled(
     path: &Path,
     budget: u64,
     control: &super::transcript::PopulationControl,
-) -> Result<Readable, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
+) -> Result<Readable, IndexReadError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        IndexReadError::Fault(format!("{}: could not open it: {e}", path.display()))
+    })?;
     let reader = super::transcript::ControlledReader {
         inner: file,
         control,
@@ -464,7 +465,7 @@ fn readable_text_controlled(
     let mut line = String::new();
     loop {
         if control.stopped() {
-            return Err(format!("{}: indexing cancelled", path.display()));
+            return Err(IndexReadError::Stopped(control.stop_reason().unwrap()));
         }
         line.clear();
         let n = match reader.read_line(&mut line) {
@@ -473,9 +474,18 @@ fn readable_text_controlled(
             // One undecodable line ends the read rather than failing the
             // session: whatever was gathered is still true text, and it
             // is recorded as truncated so the shortfall is visible.
-            Err(_) => {
-                out.truncated = true;
-                break;
+            Err(e) => {
+                if let Some(reason) = super::transcript::stopped_error(&e) {
+                    return Err(IndexReadError::Stopped(reason));
+                }
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    out.truncated = true;
+                    break;
+                }
+                return Err(IndexReadError::Fault(format!(
+                    "{}: could not read it: {e}",
+                    path.display()
+                )));
             }
         };
         read += n as u64;
@@ -488,6 +498,12 @@ fn readable_text_controlled(
         }
     }
     Ok(out)
+}
+
+#[derive(Debug)]
+enum IndexReadError {
+    Stopped(super::transcript::PopulationStatus),
+    Fault(String),
 }
 
 /// One transcript's searchable text, as [`readable_text_controlled`] extracts it.
@@ -564,10 +580,7 @@ pub(crate) fn index_pass_controlled(
 
     let started = std::time::Instant::now();
     let mut out = Indexed {
-        population: super::transcript::PopulationProgress::new(
-            scan.sessions.len() + scan.unreadable_files.len(),
-            scan.unreadable_dirs.is_empty(),
-        ),
+        population: scan.population_progress(),
         // Carried through from the scan rather than dropped at this
         // boundary, for the reason the field's own doc gives: a session
         // the scan could not read is as absent from the index as one
@@ -581,6 +594,9 @@ pub(crate) fn index_pass_controlled(
         ..Default::default()
     };
     out.population.phase = super::transcript::PopulationPhase::Index;
+    if let Some(reason) = scan.stop_reason {
+        out.population.status = reason;
+    }
     super::transcript::persist_progress(conn, "index", generation, &out.population)?;
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -593,7 +609,7 @@ pub(crate) fn index_pass_controlled(
     conn.execute(
         "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at, incomplete)
          VALUES (1, ?1, ?2, 1)
-         ON CONFLICT(id) DO UPDATE SET corpus_sessions = ?1, last_pass_at = ?2, incomplete = 1",
+         ON CONFLICT(id) DO UPDATE SET corpus_sessions = CASE WHEN ?3 THEN ?1 ELSE MAX(corpus_sessions, ?1) END, last_pass_at = ?2, incomplete = 1",
         // The denominator counts the transcripts that EXIST, not the
         // ones that parsed. A file the scan could not read is still a
         // session on disk the user may be searching for, and leaving it
@@ -601,7 +617,8 @@ pub(crate) fn index_pass_controlled(
         // on a machine holding two transcripts.
         rusqlite::params![
             (scan.sessions.len() + scan.unreadable_files.len()) as i64,
-            &now
+            &now,
+            out.population.total_known
         ],
     )?;
 
@@ -670,9 +687,12 @@ pub(crate) fn index_pass_controlled(
         }
         let text = match readable_text_controlled(Path::new(&t.path), INDEX_BUDGET_BYTES, control) {
             Ok(v) => v,
-            Err(e) => {
-                // THE reporting path #1145 asked for. Counted, carried
-                // out, and never a silent skip.
+            Err(IndexReadError::Stopped(reason)) => {
+                out.population.status = reason;
+                finalize_index(conn, generation, &mut out)?;
+                return Ok(out);
+            }
+            Err(IndexReadError::Fault(e)) => {
                 out.unreadable.push(e);
                 continue;
             }
@@ -684,11 +704,19 @@ pub(crate) fn index_pass_controlled(
 
         // File I/O precedes writer admission. Dropping a failed transaction
         // rolls back the body and its fingerprint together.
-        let after = super::transcript::fingerprint(Path::new(&t.path)).ok();
-        if after.as_ref() != Some(&(size, mtime.clone())) {
-            out.unreadable
-                .push(format!("{}: changed while indexing", t.path));
-            continue;
+        match super::transcript::fingerprint(Path::new(&t.path)) {
+            Ok(after) if after == (size, mtime.clone()) => {}
+            Ok(_) => {
+                out.population.status = super::transcript::PopulationStatus::Invalidated;
+                continue;
+            }
+            Err(error) => {
+                out.unreadable.push(format!(
+                    "{}: could not validate indexed source: {error}",
+                    t.path
+                ));
+                continue;
+            }
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
@@ -757,21 +785,27 @@ pub(crate) fn index_pass_controlled(
         .filter(|id| !present.contains(id.as_str()))
         .cloned()
         .collect();
-    let discovery_current = scan
-        .source_fingerprints
-        .iter()
-        .all(|(path, size, modified)| {
-            super::transcript::discovery_fingerprint(path, control)
-                .ok()
-                .as_ref()
-                == Some(&(*size, modified.clone()))
-        });
-    if !discovery_current {
-        out.population.status = control
-            .stop_reason()
-            .unwrap_or(super::transcript::PopulationStatus::Invalidated);
-        out.scan_unreadable
-            .push("corpus changed since discovery; prior index entries retained".into());
+    let mut discovery_current = scan.stop_reason.is_none();
+    for (path, size, modified) in &scan.source_fingerprints {
+        match super::transcript::discovery_fingerprint(path, control) {
+            Ok(actual) if actual == (*size, modified.clone()) => {}
+            Ok(_) => {
+                discovery_current = false;
+            }
+            Err(error) => {
+                discovery_current = false;
+                if let Some(reason) = super::transcript::stopped_error(&error) {
+                    out.population.status = reason;
+                    break;
+                }
+                out.scan_unreadable
+                    .push(format!("{}: discovery validation: {error}", path.display()));
+            }
+        }
+    }
+    if !discovery_current && out.population.status == super::transcript::PopulationStatus::Complete
+    {
+        out.population.status = super::transcript::PopulationStatus::Invalidated;
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
@@ -812,6 +846,33 @@ fn finalize_index(conn: &Connection, generation: i64, out: &mut Indexed) -> rusq
     out.population.failed = (out.unreadable.len() + out.write_failures.len()) as u64;
     out.population.finish();
     super::transcript::persist_progress(conn, "index", generation, &out.population)
+}
+
+/// Refresh foreground coverage without treating a partial listing as the corpus.
+/// A stopped discovery is incomplete coverage, not an operational-health fault.
+pub(crate) fn observe_discovery(
+    conn: &Connection,
+    scan: &super::Scan,
+) -> rusqlite::Result<Vec<String>> {
+    let progress = scan.population_progress();
+    conn.execute(
+        "INSERT INTO claude_index_state(id, corpus_sessions, last_pass_at, incomplete)
+         VALUES(1, ?1, COALESCE((SELECT last_pass_at FROM claude_index_state WHERE id=1), ?3), 1)
+         ON CONFLICT(id) DO UPDATE SET
+           corpus_sessions = CASE WHEN ?2 THEN ?1 ELSE MAX(corpus_sessions, ?1) END,
+           incomplete = CASE WHEN ?2 THEN incomplete ELSE 1 END",
+        rusqlite::params![
+            progress.total as i64,
+            progress.total_known,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(scan
+        .unreadable_files
+        .iter()
+        .chain(&scan.unreadable_dirs)
+        .cloned()
+        .collect())
 }
 
 /// What the index currently covers.
@@ -1012,6 +1073,117 @@ mod tests {
     }
 
     #[test]
+    fn foreground_stopped_discovery_does_not_replace_authoritative_total() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["first", "second"] {
+            write_session(dir.path(), "project", id, "accepted");
+        }
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        write_session(dir.path(), "project", "new", "unseenneedle");
+        let scan = crate::claude::Scan {
+            stop_reason: Some(super::super::transcript::PopulationStatus::TimedOut),
+            ..Default::default()
+        };
+        let unreadable = observe_discovery(&conn, &scan).unwrap();
+        assert!(unreadable.is_empty(), "a deadline is not an IO failure");
+        let cov = coverage(&conn, unreadable.clone()).unwrap();
+        assert_eq!(cov.total, 2);
+        assert!(!cov.is_complete());
+        let answer = search(&conn, "unseenneedle", 20, unreadable, Matching::Unmasked).unwrap();
+        assert!(!matches!(answer.verdict, Verdict::None));
+        let complete = crate::claude::corpus(dir.path());
+        observe_discovery(&conn, &complete).unwrap();
+        assert_eq!(coverage(&conn, Vec::new()).unwrap().total, 3);
+        index_pass(&mut conn, &complete).unwrap();
+        assert!(coverage(&conn, Vec::new()).unwrap().is_complete());
+    }
+
+    #[test]
+    fn stopped_discovery_preserves_last_total_and_never_licenses_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["first", "second"] {
+            write_session(dir.path(), "project", id, "accepted");
+        }
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        assert!(coverage(&conn, Vec::new()).unwrap().is_complete());
+        write_session(dir.path(), "project", "new", "unseenneedle");
+        for reason in [
+            super::super::transcript::PopulationStatus::Cancelled,
+            super::super::transcript::PopulationStatus::TimedOut,
+        ] {
+            let scan = crate::claude::Scan {
+                stop_reason: Some(reason),
+                ..Default::default()
+            };
+            let done = index_pass_controlled(
+                &mut conn,
+                &scan,
+                &super::super::transcript::PopulationControl::discovery(),
+            )
+            .unwrap();
+            assert_eq!(done.population.status, reason);
+            assert!(!done.population.total_known);
+            let cov = coverage(&conn, Vec::new()).unwrap();
+            assert_eq!(cov.total, 2);
+            assert!(!cov.is_complete());
+            let answer = search(&conn, "unseenneedle", 20, Vec::new(), Matching::Unmasked).unwrap();
+            assert!(!matches!(answer.verdict, Verdict::None));
+        }
+    }
+
+    #[test]
+    fn bounded_corpus_converges_without_reporting_background_failures() {
+        use crate::background::{IndexOutcome, Task};
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..205 {
+            write_session(dir.path(), "project", &format!("s{n:03}"), "needle");
+        }
+        let scan = crate::claude::corpus(dir.path());
+        let mut conn = db();
+        let task = Task::new("fixture-index");
+        let control = super::super::transcript::PopulationControl::discovery();
+        for pass in 1..=3 {
+            let done = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+            let outcome = IndexOutcome::from_index(Ok(&done));
+            assert_eq!(
+                outcome,
+                if pass < 3 {
+                    IndexOutcome::Deferred
+                } else {
+                    IndexOutcome::Healthy
+                }
+            );
+            assert!(!outcome.record_health(&task, pass));
+            assert_eq!(task.snapshot().total_failures, 0);
+            assert_eq!(task.snapshot().last_success_ms, Some(pass));
+        }
+        assert!(coverage(&conn, Vec::new()).unwrap().is_complete());
+    }
+
+    #[test]
+    fn stopped_discovery_is_neutral_but_prior_real_scan_fault_is_not() {
+        use crate::background::IndexOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let control = super::super::transcript::PopulationControl::discovery();
+        control.cancel();
+        let mut scan = super::super::transcript::corpus_controlled(dir.path(), &control);
+        assert!(scan.is_partial());
+        assert!(scan.unreadable_dirs.is_empty());
+        let mut conn = db();
+        let done = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert_eq!(IndexOutcome::from_index(Ok(&done)), IndexOutcome::Cancelled);
+        scan.unreadable_dirs
+            .push("project: permission denied".into());
+        let done = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert!(matches!(
+            IndexOutcome::from_index(Ok(&done)),
+            IndexOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
     fn stale_listing_discovery_race_cannot_delete_newer_index() {
         let dir = tempfile::tempdir().unwrap();
         write_session(dir.path(), "project", "old", "oldneedle");
@@ -1021,6 +1193,10 @@ mod tests {
         index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
         let result = index_pass(&mut conn, &old).unwrap();
         assert!(result.is_partial());
+        assert_eq!(
+            crate::background::IndexOutcome::from_index(Ok(&result)),
+            crate::background::IndexOutcome::Invalidated
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM claude_index_ledger WHERE session_id='new'",

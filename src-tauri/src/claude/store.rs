@@ -448,6 +448,7 @@ pub(crate) fn usage_pass(
     let generation = super::transcript::population_generation(conn, "usage")?;
     let _activity = super::transcript::PopulationActivity::new(conn, "usage", generation);
     let mut out = Imported {
+        population: scan.population_progress(),
         unreadable_dirs: scan.unreadable_dirs.clone(),
         unreadable_files: scan.unreadable_files.clone(),
         ..Default::default()
@@ -473,10 +474,10 @@ pub(crate) fn metadata_pass(
     };
     let generation = super::transcript::population_generation(conn, "metadata")?;
     let _activity = PopulationActivity::new(conn, "metadata", generation);
-    let mut progress = PopulationProgress::new(
-        scan.sessions.len() + scan.unreadable_files.len(),
-        scan.unreadable_dirs.is_empty() && scan.absent_root.is_none(),
-    );
+    let mut progress = scan.population_progress();
+    // Metadata coverage keeps the existing absent-root qualification; an
+    // import on a machine with no history is still a complete empty list.
+    progress.total_known &= scan.absent_root.is_none();
     progress.phase = PopulationPhase::Metadata;
     progress.failed = scan.unreadable_files.len() as u64;
     persist_progress(conn, "metadata", generation, &progress)?;
@@ -598,10 +599,9 @@ fn populate_usage(
     out: &mut Imported,
     now: &str,
 ) -> rusqlite::Result<()> {
-    out.population = PopulationProgress::new(
-        sessions.len() + out.unreadable_files.len(),
-        out.unreadable_dirs.is_empty(),
-    );
+    // The caller carries typed discovery status and denominator knowledge.
+    // Rebuilding this from unreadable errors would turn a stopped empty scan
+    // into a successful 0/0 receipt.
     out.population.failed = out.unreadable_files.len() as u64;
     super::transcript::persist_progress(conn, "usage", generation, &out.population)?;
     let observed: std::collections::HashSet<&str> =
@@ -759,10 +759,7 @@ fn import_generation(
         !scan.is_partial() && scan.absent_root.is_none() && scan.subagents.unreadable.is_empty();
     let now = chrono::Utc::now().to_rfc3339();
     let mut out = Imported {
-        population: PopulationProgress::new(
-            scan.sessions.len() + scan.unreadable_files.len(),
-            scan.unreadable_dirs.is_empty(),
-        ),
+        population: scan.population_progress(),
         subagent_files_skipped: scan.subagent_files_skipped,
         session_bytes: scan.session_bytes,
         subagent_bytes: scan.subagent_bytes,
@@ -786,8 +783,7 @@ fn import_generation(
         }
     }
 
-    let mut metadata_progress =
-        PopulationProgress::new(scan.sessions.len(), out.unreadable_dirs.is_empty());
+    let mut metadata_progress = out.population.clone();
     metadata_progress.phase = super::transcript::PopulationPhase::Metadata;
     super::transcript::persist_progress(conn, "import", generation, &metadata_progress)?;
     // Session metadata is local to one file: stable neighbors remain useful
@@ -974,6 +970,25 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn empty_stopped_discovery_receipts_keep_unknown_total_and_stop_status() {
+        let mut conn = db();
+        for status in [PopulationStatus::Cancelled, PopulationStatus::TimedOut] {
+            let scan = Scan {
+                stop_reason: Some(status),
+                ..Default::default()
+            };
+            let control = super::super::transcript::PopulationControl::discovery();
+            let metadata = metadata_pass(&mut conn, &scan, &control).unwrap();
+            let usage = usage_pass(&mut conn, &scan, &control).unwrap().population;
+            for progress in [metadata, usage] {
+                assert_eq!(progress.status, status);
+                assert!(!progress.total_known);
+                assert_eq!(progress.completed, 0);
+            }
+        }
     }
 
     #[test]

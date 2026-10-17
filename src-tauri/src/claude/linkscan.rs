@@ -83,6 +83,9 @@ pub struct Cursor {
 pub struct Refreshed {
     /// No import has set a cursor yet, so nothing was read.
     pub not_started: bool,
+    /// Cancellation/deadline or a newer generation discarded this pass's staged
+    /// work. Previously committed links and parser checkpoints are unchanged.
+    pub stopped: Option<super::transcript::PopulationStatus>,
     /// Files read from, in whole or in part.
     pub files_read: usize,
     /// Transcript bytes consumed.
@@ -102,6 +105,7 @@ pub struct Refreshed {
 /// that is forgotten safely: files modified since `since_ms` replay, and
 /// graph publication cannot commit without its matching continuation.
 pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::StoreError> {
+    super::transcript::population_generation(conn, "links")?;
     settings::set(
         conn,
         settings::keys::CLAUDE_PR_LINK_CURSOR,
@@ -122,9 +126,32 @@ pub fn refresh(
     scan: &super::Scan,
     budget: u64,
 ) -> Result<Refreshed, crate::store::StoreError> {
+    refresh_controlled(
+        conn,
+        scan,
+        budget,
+        &super::transcript::PopulationControl::discovery(),
+    )
+}
+
+/// Cancellation is cooperative, including evidence reads and oversized records.
+/// Read outside a write transaction, then fence atomic publication against both
+/// pause/cancel and an accepted graph reset. A commit that wins the cancellation
+/// race remains valid; stale work cannot publish after its database fence.
+pub(crate) fn refresh_controlled(
+    conn: &mut Connection,
+    scan: &super::Scan,
+    budget: u64,
+    control: &super::transcript::PopulationControl,
+) -> Result<Refreshed, crate::store::StoreError> {
     let mut out = Refreshed::default();
+    if let Some(reason) = control.stop_reason() {
+        out.stopped = Some(reason);
+        return Ok(out);
+    }
+    let generation = super::transcript::population_generation(conn, "links")?;
     let Some(mut cursor) =
-        settings::get::<Cursor>(conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap_or(None)
+        settings::get_strict::<Cursor>(conn, settings::keys::CLAUDE_PR_LINK_CURSOR)?
     else {
         out.not_started = true;
         return Ok(out);
@@ -132,6 +159,10 @@ pub fn refresh(
 
     let mut todo = Vec::new();
     for t in &scan.sessions {
+        if let Some(reason) = control.stop_reason() {
+            out.stopped = Some(reason);
+            return Ok(out);
+        }
         match std::fs::metadata(&t.path) {
             Ok(meta) => {
                 let mtime = meta
@@ -156,6 +187,10 @@ pub fn refresh(
     let mut links = Vec::new();
     let mut left = budget;
     for (_, t) in todo {
+        if let Some(reason) = stopped(conn, control, generation)? {
+            out.stopped = Some(reason);
+            return Ok(out);
+        }
         if left == 0 {
             out.deferred += 1;
             continue;
@@ -163,12 +198,23 @@ pub fn refresh(
         // Old offset-only settings replay once: they cannot establish source
         // continuity or reconstruct an unfinished create/result pairing.
         let checkpoint = cursor.checkpoints.get(&t.path).cloned().unwrap_or_default();
-        match read_from(Path::new(&t.path), &t.session_id, checkpoint, left) {
+        match read_from_controlled(
+            Path::new(&t.path),
+            &t.session_id,
+            checkpoint,
+            left,
+            control,
+            || {},
+        ) {
             Ok(read) => {
                 left = left.saturating_sub(read.consumed);
                 out.bytes_read += read.consumed;
                 out.files_read += usize::from(read.consumed > 0);
                 out.deferred += usize::from(read.deferred);
+                if let Some(reason) = control.stop_reason() {
+                    out.stopped = Some(reason);
+                    return Ok(out);
+                }
                 if let Some(error) = read.error {
                     out.unreadable.push(format!("{}: {error}", t.path));
                 }
@@ -181,17 +227,28 @@ pub fn refresh(
                 .push(format!("{}: could not read it: {e}", t.path)),
         }
     }
-    let listed: std::collections::HashSet<&str> =
-        scan.sessions.iter().map(|t| t.path.as_str()).collect();
-    cursor.offsets.retain(|p, _| listed.contains(p.as_str()));
-    cursor
-        .checkpoints
-        .retain(|p, _| listed.contains(p.as_str()));
+    if !scan.is_partial() {
+        let listed: std::collections::HashSet<&str> =
+            scan.sessions.iter().map(|t| t.path.as_str()).collect();
+        cursor.offsets.retain(|p, _| listed.contains(p.as_str()));
+        cursor
+            .checkpoints
+            .retain(|p, _| listed.contains(p.as_str()));
+    }
 
     // The links and the cursor that says they were read, in ONE
     // transaction: a cursor committed without its links would skip them
     // for good.
-    let tx = conn.transaction()?;
+    observe("before_publish");
+    if let Some(reason) = control.stop_reason() {
+        out.stopped = Some(reason);
+        return Ok(out);
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(reason) = stopped(&tx, control, generation)? {
+        out.stopped = Some(reason);
+        return Ok(out);
+    }
     for l in &links {
         out.links_added += tx.execute(
             "INSERT OR IGNORE INTO claude_session_pr
@@ -207,8 +264,42 @@ pub fn refresh(
         )?;
     }
     settings::set(&tx, settings::keys::CLAUDE_PR_LINK_CURSOR, &cursor)?;
+    observe("before_commit");
+    if let Some(reason) = stopped(&tx, control, generation)? {
+        out.links_added = 0;
+        out.stopped = Some(reason);
+        return Ok(out);
+    }
     tx.commit()?;
     Ok(out)
+}
+
+fn stopped(
+    conn: &Connection,
+    control: &super::transcript::PopulationControl,
+    generation: i64,
+) -> Result<Option<super::transcript::PopulationStatus>, crate::store::StoreError> {
+    if let Some(reason) = control.stop_reason() {
+        return Ok(Some(reason));
+    }
+    Ok(
+        (!super::transcript::generation_current(conn, "links", generation)?)
+            .then_some(super::transcript::PopulationStatus::Invalidated),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
+}
+fn observe(_stage: &str) {
+    #[cfg(test)]
+    OBSERVER.with(|observer| {
+        if let Some(callback) = observer.borrow_mut().as_mut() {
+            callback(_stage);
+        }
+    });
 }
 
 // Checksums cover ALL accepted bytes. Growth checks the last block before
@@ -432,6 +523,7 @@ struct FileRead {
     error: Option<String>,
 }
 
+#[cfg(test)]
 fn read_from(
     path: &Path,
     session_id: &str,
@@ -441,11 +533,30 @@ fn read_from(
     read_from_observed(path, session_id, original, budget, || {})
 }
 
+#[cfg(test)]
 fn read_from_observed(
     path: &Path,
     session_id: &str,
     original: Checkpoint,
     budget: u64,
+    after_read: impl FnOnce(),
+) -> std::io::Result<FileRead> {
+    read_from_controlled(
+        path,
+        session_id,
+        original,
+        budget,
+        &super::transcript::PopulationControl::discovery(),
+        after_read,
+    )
+}
+
+fn read_from_controlled(
+    path: &Path,
+    session_id: &str,
+    original: Checkpoint,
+    budget: u64,
+    control: &super::transcript::PopulationControl,
     after_read: impl FnOnce(),
 ) -> std::io::Result<FileRead> {
     let mut file = std::fs::File::open(path)?;
@@ -489,7 +600,7 @@ fn read_from_observed(
                 cp.to - anchor_len as u64 + cp.anchor_checked as u64,
             ))?;
             let mut bytes = vec![0; n];
-            read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+            read_exact_counted(&mut file, &mut bytes, &mut out.consumed, control)?;
             if bytes != cp.anchor()[cp.anchor_checked..cp.anchor_checked + n] {
                 cp = Checkpoint::default();
             } else {
@@ -506,7 +617,7 @@ fn read_from_observed(
                     (proof.block * BLOCK + proof.buffer.len()) as u64,
                 ))?;
                 let mut bytes = vec![0; n];
-                read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+                read_exact_counted(&mut file, &mut bytes, &mut out.consumed, control)?;
                 proof.buffer.extend(bytes);
                 if proof.buffer.len() == BLOCK {
                     if digest(&proof.buffer) != cp.hashes[proof.block] {
@@ -531,7 +642,7 @@ fn read_from_observed(
                 (cp.audit_next * BLOCK + cp.audit_buffer.len()) as u64,
             ))?;
             let mut bytes = vec![0; n];
-            read_exact_counted(&mut file, &mut bytes, &mut out.consumed)?;
+            read_exact_counted(&mut file, &mut bytes, &mut out.consumed, control)?;
             cp.audit_buffer.extend(bytes);
             if cp.audit_buffer.len() == BLOCK {
                 if digest(&cp.audit_buffer) != cp.hashes[cp.audit_next] {
@@ -549,6 +660,7 @@ fn read_from_observed(
             let mut reader = std::io::BufReader::new(CountedRead {
                 inner: (&mut file).take(limit),
                 consumed: 0,
+                control,
             });
             let mut buf = Vec::new();
             loop {
@@ -623,13 +735,19 @@ fn read_from_observed(
     Ok(out)
 }
 
-struct CountedRead<R> {
+struct CountedRead<'a, R> {
     inner: R,
     consumed: u64,
+    control: &'a super::transcript::PopulationControl,
 }
-impl<R: Read> Read for CountedRead<R> {
+impl<R: Read> Read for CountedRead<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buffer)?;
+        observe("read");
+        if self.control.stopped() {
+            return Err(std::io::Error::other("link population stopped"));
+        }
+        let limit = buffer.len().min(64 * 1024);
+        let n = self.inner.read(&mut buffer[..limit])?;
         self.consumed += n as u64;
         Ok(n)
     }
@@ -638,10 +756,12 @@ fn read_exact_counted(
     file: &mut std::fs::File,
     buffer: &mut [u8],
     consumed: &mut u64,
+    control: &super::transcript::PopulationControl,
 ) -> std::io::Result<()> {
     let mut reader = CountedRead {
         inner: file,
         consumed: 0,
+        control,
     };
     let result = reader.read_exact(buffer);
     *consumed += reader.consumed;
@@ -652,6 +772,291 @@ fn read_exact_counted(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn partial_listing_preserves_checkpoint_and_malformed_cursor_is_an_error() {
+        let (dir, project, mut conn) = fixture();
+        append(&project.join("s1.jsonl"), &[create_line("pending")]);
+        reset(&conn, 0).unwrap();
+        refresh(
+            &mut conn,
+            &crate::claude::corpus(&dir.path().join("projects")),
+            BYTES_PER_PASS,
+        )
+        .unwrap();
+        let before = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+        let partial = super::super::Scan {
+            unreadable_dirs: vec!["injected discovery failure".into()],
+            ..Default::default()
+        };
+        refresh(&mut conn, &partial, BYTES_PER_PASS).unwrap();
+        assert_eq!(
+            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
+            before
+        );
+        drop(conn);
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        append(&project.join("s1.jsonl"), &[result_line("pending", false)]);
+        refresh(
+            &mut conn,
+            &crate::claude::corpus(&dir.path().join("projects")),
+            BYTES_PER_PASS,
+        )
+        .unwrap();
+        assert_eq!(linked(&conn, 77), ["s1"]);
+        // Only a complete listing may remove an absent source's continuation.
+        refresh(&mut conn, &super::super::Scan::default(), BYTES_PER_PASS).unwrap();
+        assert!(
+            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
+                .unwrap()
+                .unwrap()
+                .checkpoints
+                .is_empty()
+        );
+        settings::set(
+            &conn,
+            settings::keys::CLAUDE_PR_LINK_CURSOR,
+            &"not a cursor",
+        )
+        .unwrap();
+        assert!(refresh(&mut conn, &partial, BYTES_PER_PASS).is_err());
+    }
+
+    #[test]
+    fn stopped_refresh_retains_cursor_and_links() {
+        for timed_out in [false, true] {
+            let (dir, project, mut conn) = fixture();
+            append(
+                &project.join("s1.jsonl"),
+                &[link_line("s1", "acme/api", 77)],
+            );
+            reset(&conn, 0).unwrap();
+            let before =
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            let control = super::super::transcript::PopulationControl::discovery();
+            let control = if timed_out {
+                control.with_budget(std::time::Duration::ZERO)
+            } else {
+                control.cancel();
+                control
+            };
+            let result = refresh_controlled(
+                &mut conn,
+                &crate::claude::corpus(&dir.path().join("projects")),
+                BYTES_PER_PASS,
+                &control,
+            )
+            .unwrap();
+            assert!(result.stopped.is_some());
+            assert_eq!(result.bytes_read, 0);
+            assert!(linked(&conn, 77).is_empty());
+            assert_eq!(
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
+                before
+            );
+        }
+    }
+
+    struct ObserveGuard;
+    impl Drop for ObserveGuard {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = None);
+        }
+    }
+    fn observing(callback: impl FnMut(&str) + 'static) -> ObserveGuard {
+        OBSERVER.with(|observer| *observer.borrow_mut() = Some(Box::new(callback)));
+        ObserveGuard
+    }
+
+    #[test]
+    fn cancellation_at_read_or_publication_rolls_back_staged_links() {
+        for stage in ["read", "before_publish", "before_commit"] {
+            let (dir, project, mut conn) = fixture();
+            let path = project.join("s1.jsonl");
+            append(&path, &[link_line("s1", "acme/api", 77)]);
+            // No newline: cancellation must be checked within read_until too.
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&vec![b'x'; 256 * 1024])
+                .unwrap();
+            reset(&conn, 0).unwrap();
+            let before =
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            let control = super::super::transcript::PopulationControl::discovery();
+            let cancel = control.clone();
+            let mut reads = 0;
+            let observer = observing(move |event| {
+                if event == "read" {
+                    reads += 1;
+                }
+                if event == stage && (stage != "read" || reads == 2) {
+                    cancel.cancel();
+                }
+            });
+            let result = refresh_controlled(
+                &mut conn,
+                &crate::claude::corpus(&dir.path().join("projects")),
+                BYTES_PER_PASS,
+                &control,
+            )
+            .unwrap();
+            drop(observer);
+            assert_eq!(
+                result.stopped,
+                Some(super::super::transcript::PopulationStatus::Cancelled)
+            );
+            assert_eq!(result.links_added, 0);
+            assert!(result.unreadable.is_empty());
+            if stage == "read" {
+                assert!(result.bytes_read > 0 && result.bytes_read <= 64 * 1024);
+            }
+            assert!(linked(&conn, 77).is_empty());
+            assert_eq!(
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
+                before
+            );
+            refresh(
+                &mut conn,
+                &crate::claude::corpus(&dir.path().join("projects")),
+                BYTES_PER_PASS,
+            )
+            .unwrap();
+            assert_eq!(linked(&conn, 77), ["s1"]);
+        }
+    }
+
+    #[test]
+    fn newer_generation_or_graph_reset_wins_over_inflight_reader() {
+        for reset_graph in [false, true] {
+            let (dir, project, mut conn) = fixture();
+            append(
+                &project.join("s1.jsonl"),
+                &[link_line("s1", "acme/api", 77)],
+            );
+            reset(&conn, 0).unwrap();
+            let mut writer = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let mut once = false;
+            let observer = observing(move |stage| {
+                if stage == "read" && !once {
+                    once = true;
+                    let tx = writer
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .unwrap();
+                    if reset_graph {
+                        reset(&tx, 12345).unwrap();
+                    } else {
+                        super::super::transcript::population_generation(&tx, "links").unwrap();
+                    }
+                    tx.commit().unwrap();
+                }
+            });
+            let result = refresh_controlled(
+                &mut conn,
+                &crate::claude::corpus(&dir.path().join("projects")),
+                BYTES_PER_PASS,
+                &super::super::transcript::PopulationControl::discovery(),
+            )
+            .unwrap();
+            drop(observer);
+            assert_eq!(
+                result.stopped,
+                Some(super::super::transcript::PopulationStatus::Invalidated)
+            );
+            assert!(linked(&conn, 77).is_empty());
+            let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
+                .unwrap()
+                .unwrap();
+            assert!(cursor.offsets.is_empty());
+            assert_eq!(cursor.since_ms, if reset_graph { 12345 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn interrupted_proof_and_audit_retain_checkpoint_across_restart() {
+        for pending in [false, true] {
+            let (dir, project, mut conn) = fixture();
+            let root = dir.path().join("projects");
+            let path = project.join("s1.jsonl");
+            if pending {
+                append(&path, &[create_line("pending")]);
+            }
+            append(&path, &[" ".repeat(32 * 1024)]);
+            reset(&conn, 0).unwrap();
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            let before =
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            append(
+                &path,
+                &[if pending {
+                    result_line("pending", false)
+                } else {
+                    link_line("s1", "acme/api", 77)
+                }],
+            );
+            let control = super::super::transcript::PopulationControl::discovery();
+            let cancel = control.clone();
+            let mut reads = 0;
+            let observer = observing(move |stage| {
+                if stage == "read" {
+                    reads += 1;
+                    if reads == 2 {
+                        cancel.cancel();
+                    }
+                }
+            });
+            let result = refresh_controlled(
+                &mut conn,
+                &crate::claude::corpus(&root),
+                BYTES_PER_PASS,
+                &control,
+            )
+            .unwrap();
+            drop(observer);
+            assert_eq!(
+                result.stopped,
+                Some(super::super::transcript::PopulationStatus::Cancelled)
+            );
+            assert!(result.bytes_read > 0);
+            assert_eq!(
+                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
+                before
+            );
+            assert!(linked(&conn, 77).is_empty());
+            drop(conn);
+            let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
+            assert_eq!(linked(&conn, 77), ["s1"]);
+        }
+    }
+
+    #[test]
+    fn cursor_missing_malformed_and_database_failure_are_distinct() {
+        let (_dir, _project, mut conn) = fixture();
+        let scan = super::super::Scan::default();
+        assert!(
+            refresh(&mut conn, &scan, BYTES_PER_PASS)
+                .unwrap()
+                .not_started
+        );
+        settings::set(
+            &conn,
+            settings::keys::CLAUDE_PR_LINK_CURSOR,
+            &"malformed cursor",
+        )
+        .unwrap();
+        assert!(matches!(
+            refresh(&mut conn, &scan, BYTES_PER_PASS),
+            Err(crate::store::StoreError::Json(_))
+        ));
+        conn.execute_batch("DROP TABLE settings").unwrap();
+        assert!(matches!(
+            refresh(&mut conn, &scan, BYTES_PER_PASS),
+            Err(crate::store::StoreError::Db(_))
+        ));
+    }
 
     fn create_line(id: &str) -> String {
         serde_json::json!({"message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"gh pr create --fill"}}]}}).to_string()

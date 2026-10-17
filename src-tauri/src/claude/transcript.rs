@@ -225,10 +225,9 @@ pub(crate) fn discovery_fingerprint(
 ) -> std::io::Result<(i64, String)> {
     let check_cancelled = || {
         if control.stopped() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "corpus discovery cancelled",
-            ))
+            Err(std::io::Error::other(PopulationStopped(
+                control.stop_reason().unwrap(),
+            )))
         } else {
             Ok(())
         }
@@ -393,7 +392,7 @@ pub(crate) fn stored_progress(
 }
 
 pub(crate) fn cancel_stored_progress(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    for lane in ["import", "metadata", "usage", "index"] {
+    for lane in ["import", "metadata", "usage", "index", "links"] {
         let mut progress = stored_progress(conn, lane)?.unwrap_or_default();
         progress.status = PopulationStatus::Cancelled;
         let generation = population_generation(conn, lane)?;
@@ -439,6 +438,14 @@ impl PopulationControl {
             deadline: Some(std::time::Instant::now() + budget),
         }
     }
+    pub(crate) fn with_slice_budget(&self, budget: std::time::Duration) -> Self {
+        let mut slice = self.with_budget(budget);
+        slice.deadline = match (self.deadline, slice.deadline) {
+            (Some(parent), Some(child)) => Some(parent.min(child)),
+            (_, child) => child,
+        };
+        slice
+    }
     pub(crate) fn stop_reason(&self) -> Option<PopulationStatus> {
         if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             Some(PopulationStatus::Cancelled)
@@ -476,6 +483,22 @@ impl PopulationControl {
     }
 }
 
+/// Distinguish deliberate scheduling stops from genuine read errors.
+#[derive(Debug)]
+pub(crate) struct PopulationStopped(pub(crate) PopulationStatus);
+impl std::fmt::Display for PopulationStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "corpus population stopped: {:?}", self.0)
+    }
+}
+impl std::error::Error for PopulationStopped {}
+pub(crate) fn stopped_error(error: &std::io::Error) -> Option<PopulationStatus> {
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<PopulationStopped>())
+        .map(|e| e.0)
+}
+
 pub(crate) struct ControlledReader<'a, R> {
     pub(crate) inner: R,
     pub(crate) control: &'a PopulationControl,
@@ -484,7 +507,9 @@ pub(crate) struct ControlledReader<'a, R> {
 impl<R: Read> Read for ControlledReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.control.stopped() {
-            return Err(std::io::Error::other("corpus population cancelled"));
+            return Err(std::io::Error::other(PopulationStopped(
+                self.control.stop_reason().unwrap(),
+            )));
         }
         let n = buffer.len().min(64 * 1024);
         self.inner.read(&mut buffer[..n])
@@ -679,6 +704,8 @@ pub struct Transcript {
 /// remedies and the first one is alarming if it is false.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scan {
+    #[serde(skip)]
+    pub(crate) stop_reason: Option<PopulationStatus>,
     pub sessions: Vec<Transcript>,
     #[serde(skip)]
     pub(crate) source_fingerprints: Vec<(PathBuf, i64, String)>,
@@ -764,6 +791,18 @@ pub struct Scan {
 }
 
 impl Scan {
+    /// Seed each lane with discovery completeness, even when no file was seen.
+    pub(crate) fn population_progress(&self) -> PopulationProgress {
+        let mut progress = PopulationProgress::new(
+            self.sessions.len() + self.unreadable_files.len(),
+            self.stop_reason.is_none() && self.unreadable_dirs.is_empty(),
+        );
+        if let Some(reason) = self.stop_reason {
+            progress.status = reason;
+        }
+        progress
+    }
+
     /// Whether anything at all could not be read.
     ///
     /// The UI's cue for "this list may be incomplete". Deliberately NOT a
@@ -776,7 +815,9 @@ impl Scan {
     /// its owner the list is "incomplete by an unknown amount" accuses the
     /// app of a failure that did not happen.
     pub fn is_partial(&self) -> bool {
-        !self.unreadable_dirs.is_empty() || !self.unreadable_files.is_empty()
+        self.stop_reason.is_some()
+            || !self.unreadable_dirs.is_empty()
+            || !self.unreadable_files.is_empty()
     }
 }
 
@@ -798,7 +839,7 @@ pub fn projects_dir() -> Option<PathBuf> {
 fn session_files(root: &Path, control: &PopulationControl) -> Walk {
     let mut out = Walk::default();
     if control.stopped() {
-        out.unreadable.push("corpus discovery cancelled".into());
+        out.stop_reason = control.stop_reason();
         return out;
     }
 
@@ -817,7 +858,7 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
             // Missing entries during a directory certificate remain partial.
             out.unreadable.clear();
             if control.stopped() {
-                out.unreadable.push("corpus discovery cancelled".into());
+                out.stop_reason = control.stop_reason();
             }
             return out;
         }
@@ -836,7 +877,7 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
 
     for slug in entries {
         if control.stopped() {
-            out.unreadable.push("corpus discovery cancelled".into());
+            out.stop_reason = control.stop_reason();
             break;
         }
         let slug = match slug {
@@ -872,7 +913,7 @@ fn session_files(root: &Path, control: &PopulationControl) -> Walk {
         };
         for f in inner {
             if control.stopped() {
-                out.unreadable.push("corpus discovery cancelled".into());
+                out.stop_reason = control.stop_reason();
                 break;
             }
             let f = match f {
@@ -925,9 +966,12 @@ fn snapshot_source(path: &Path, control: &PopulationControl, out: &mut Walk) {
         Ok((size, modified)) => out
             .source_fingerprints
             .push((path.to_path_buf(), size, modified)),
-        Err(e) => out
-            .unreadable
-            .push(format!("{}: discovery fingerprint: {e}", path.display())),
+        Err(e) => match stopped_error(&e) {
+            Some(reason) => out.stop_reason = Some(reason),
+            None => out
+                .unreadable
+                .push(format!("{}: discovery fingerprint: {e}", path.display())),
+        },
     }
 }
 
@@ -940,6 +984,7 @@ fn snapshot_source(path: &Path, control: &PopulationControl, out: &mut Walk) {
 /// swapped at a call site.
 #[derive(Default)]
 struct Walk {
+    stop_reason: Option<PopulationStatus>,
     files: Vec<PathBuf>,
     source_fingerprints: Vec<(PathBuf, i64, String)>,
     /// `.jsonl` files below `<slug>/<file>`, correctly excluded.
@@ -1268,6 +1313,7 @@ pub(crate) fn scan_with_progress(
         session_bytes: walk.session_bytes,
         subagent_bytes: walk.subagent_bytes,
         unsized_files: walk.unsized_files,
+        stop_reason: walk.stop_reason,
         unreadable_dirs: walk.unreadable,
         absent_root: walk.absent_root,
         source_fingerprints: walk.source_fingerprints,
@@ -1280,8 +1326,7 @@ pub(crate) fn scan_with_progress(
     progress(observed.clone());
     for f in &walk.files {
         if control.stopped() {
-            out.unreadable_files
-                .push("corpus discovery cancelled".into());
+            out.stop_reason = control.stop_reason();
             return out;
         }
         match extract_controlled(f, control) {
@@ -1409,6 +1454,7 @@ pub(crate) fn corpus_controlled(root: &Path, control: &PopulationControl) -> Sca
         session_bytes: walk.session_bytes,
         subagent_bytes: walk.subagent_bytes,
         unsized_files: walk.unsized_files,
+        stop_reason: walk.stop_reason,
         unreadable_dirs: walk.unreadable,
         absent_root: walk.absent_root,
         source_fingerprints: walk.source_fingerprints,

@@ -161,6 +161,56 @@ impl Task {
     }
 }
 
+/// Separate a successful bounded pass from a scheduling stop or real fault.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IndexOutcome {
+    Healthy,
+    Deferred,
+    Paused,
+    #[default]
+    Busy,
+    Cancelled,
+    TimedOut,
+    Invalidated,
+    Failed(String),
+}
+
+impl IndexOutcome {
+    pub fn from_index(result: Result<&crate::claude::search::Indexed, &str>) -> Self {
+        use crate::claude::transcript::PopulationStatus;
+        let done = match result {
+            Ok(done) => done,
+            Err(error) => return Self::Failed(error.to_owned()),
+        };
+        // Faults take precedence over a later cancellation or deadline.
+        let faults = done.all_unreadable();
+        if !faults.is_empty() {
+            return Self::Failed(faults.join("; "));
+        }
+        match done.population.status {
+            PopulationStatus::Failed => Self::Failed("Transcript indexing failed".into()),
+            PopulationStatus::Cancelled => Self::Cancelled,
+            PopulationStatus::TimedOut => Self::TimedOut,
+            PopulationStatus::Invalidated => Self::Invalidated,
+            PopulationStatus::Running | PopulationStatus::Deferred => Self::Deferred,
+            PopulationStatus::Complete if done.remaining > 0 => Self::Deferred,
+            PopulationStatus::Complete => Self::Healthy,
+        }
+    }
+
+    /// Return true only when an actual fault warrants a degradation event.
+    pub fn record_health(&self, task: &Task, now_ms: u64) -> bool {
+        match self {
+            Self::Healthy | Self::Deferred => {
+                task.ok(now_ms);
+                false
+            }
+            Self::Failed(reason) => task.failed(reason.clone()),
+            _ => false,
+        }
+    }
+}
+
 /// The health sampler loop, which writes a row every 60 s.
 pub static HEALTH_SAMPLER: Task = Task::new("health-sampler");
 
@@ -213,6 +263,65 @@ mod tests {
     /// pass in one order and fail in another.
     fn task() -> Task {
         Task::new("t")
+    }
+
+    #[test]
+    fn scheduling_outcomes_preserve_health_without_fabricating_success() {
+        let task = task();
+        task.failed("disk full");
+        let before = task.snapshot();
+        for _ in 0..5 {
+            for outcome in [
+                IndexOutcome::Paused,
+                IndexOutcome::Busy,
+                IndexOutcome::Cancelled,
+                IndexOutcome::TimedOut,
+                IndexOutcome::Invalidated,
+            ] {
+                assert!(!outcome.record_health(&task, 123));
+                assert_eq!(task.snapshot(), before);
+            }
+        }
+        assert!(IndexOutcome::Failed("still full".into()).record_health(&task, 124));
+        assert!(!IndexOutcome::Healthy.record_health(&task, 125));
+        assert_eq!(task.snapshot().last_success_ms, Some(125));
+    }
+
+    #[test]
+    fn successful_bounded_pass_breaks_consecutive_faults() {
+        let task = task();
+        IndexOutcome::Failed("read failure".into()).record_health(&task, 1);
+        IndexOutcome::Deferred.record_health(&task, 2);
+        assert_eq!(task.snapshot().last_success_ms, Some(2));
+        assert!(!IndexOutcome::Failed("new failure".into()).record_health(&task, 3));
+        assert_eq!(task.snapshot().consecutive_failures, 1);
+        assert_eq!(task.snapshot().total_failures, 2);
+    }
+
+    #[test]
+    fn real_faults_win_over_later_scheduling_stops() {
+        use crate::claude::{search::Indexed, transcript::PopulationStatus};
+        for status in [
+            PopulationStatus::Cancelled,
+            PopulationStatus::TimedOut,
+            PopulationStatus::Invalidated,
+        ] {
+            let mut done = Indexed::default();
+            done.population.status = status;
+            assert!(!matches!(
+                IndexOutcome::from_index(Ok(&done)),
+                IndexOutcome::Failed(_)
+            ));
+            done.unreadable.push("permission denied".into());
+            assert_eq!(
+                IndexOutcome::from_index(Ok(&done)),
+                IndexOutcome::Failed("permission denied".into())
+            );
+        }
+        assert_eq!(
+            IndexOutcome::from_index(Err("database locked")),
+            IndexOutcome::Failed("database locked".into())
+        );
     }
 
     #[test]

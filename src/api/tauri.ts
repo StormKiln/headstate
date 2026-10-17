@@ -1189,7 +1189,7 @@ export const readClaudeMd = (path: string) => call<string>("read_claude_md", { p
 /// AND what it could not read.
 export const claudeCancelPopulation = () => call<boolean>("claude_cancel_population");
 
-export const claudeImportTranscripts = () => call<ClaudeImported>("claude_import_transcripts");
+export const claudeImportTranscripts = (resume = false) => call<ClaudeImported>("claude_import_transcripts", { resume });
 
 /// Search the transcript corpus by content (#1203).
 ///

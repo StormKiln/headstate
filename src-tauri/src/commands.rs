@@ -4931,33 +4931,64 @@ impl PopulationRegistry {
         }
     }
 }
+fn admit_population_state(
+    conn: &mut rusqlite::Connection,
+    registry: &std::sync::Mutex<PopulationRegistry>,
+    control: &crate::claude::transcript::PopulationControl,
+    resume: bool,
+) -> Result<u64, String> {
+    // All durable admission/cancellation operations take the database write
+    // lock before the registry lock. No stale pause read can race a resume.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let stored = settings::get_strict::<bool>(&tx, settings::keys::CLAUDE_POPULATION_PAUSED)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let paused = if resume && !control.stopped() {
+        settings::set(&tx, settings::keys::CLAUDE_POPULATION_PAUSED, &false)
+            .map_err(|e| e.to_string())?;
+        false
+    } else {
+        stored || registry.paused
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    registry.paused = paused;
+    Ok(registry.register(control.clone()))
+}
+
+fn persist_population_pause(
+    conn: &mut rusqlite::Connection,
+    registry: &std::sync::Mutex<PopulationRegistry>,
+) -> Result<(), String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if registry.paused {
+        settings::set(&tx, settings::keys::CLAUDE_POPULATION_PAUSED, &true)
+            .map_err(|e| e.to_string())?;
+        crate::claude::transcript::cancel_stored_progress(&tx).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 static CLAUDE_POPULATION: std::sync::LazyLock<std::sync::Mutex<PopulationRegistry>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(PopulationRegistry::default()));
-struct PopulationRegistration(u64);
-impl Drop for PopulationRegistration {
+struct PopulationRegistration<'a> {
+    id: u64,
+    registry: &'a std::sync::Mutex<PopulationRegistry>,
+}
+impl Drop for PopulationRegistration<'_> {
     fn drop(&mut self) {
-        CLAUDE_POPULATION
+        self.registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active
-            .remove(&self.0);
+            .remove(&self.id);
     }
-}
-fn register_population(
-    control: &crate::claude::transcript::PopulationControl,
-) -> PopulationRegistration {
-    PopulationRegistration(
-        CLAUDE_POPULATION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .register(control.clone()),
-    )
-}
-fn population_paused() -> bool {
-    CLAUDE_POPULATION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .paused
 }
 
 /// Cancel corpus work and pause its automatic continuation until explicit import.
@@ -4970,15 +5001,7 @@ pub async fn claude_cancel_population(app: tauri::AppHandle) -> Result<bool, Str
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&db).map_err(|e| e.to_string())?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
-        let registry = CLAUDE_POPULATION.lock().unwrap_or_else(|e| e.into_inner());
-        // A newer explicit resume wins over this delayed persistence task.
-        if registry.paused {
-            crate::claude::transcript::cancel_stored_progress(&tx).map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-        }
+        persist_population_pause(&mut conn, &CLAUDE_POPULATION)?;
         Ok(true)
     })
     .await
@@ -5002,6 +5025,239 @@ async fn admit_population(
 #[cfg(test)]
 mod corpus_cancel_tests {
     use super::*;
+    #[test]
+    fn durable_pause_survives_reopen_and_automatic_admission_until_explicit_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pause.db");
+        let mut conn = open_db(&path).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let old = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(&mut conn, &registry, &old, false).unwrap();
+        registry.lock().unwrap().cancel();
+        persist_population_pause(&mut conn, &registry).unwrap();
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        let restarted = std::sync::Mutex::new(PopulationRegistry::default());
+        let automatic = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(&mut conn, &restarted, &automatic, false).unwrap();
+        assert!(
+            automatic.stopped(),
+            "automatic admission after restart must remain paused"
+        );
+        let explicit = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(&mut conn, &restarted, &explicit, true).unwrap();
+        assert!(!explicit.stopped());
+        assert!(old.stopped());
+        assert!(automatic.stopped());
+        let next = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(
+            &mut conn,
+            &std::sync::Mutex::new(PopulationRegistry::default()),
+            &next,
+            false,
+        )
+        .unwrap();
+        assert!(!next.stopped());
+    }
+
+    #[test]
+    fn delayed_cancel_persistence_cannot_override_explicit_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("pause.db")).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        registry.lock().unwrap().cancel();
+        let resumed = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(&mut conn, &registry, &resumed, true).unwrap();
+        persist_population_pause(&mut conn, &registry).unwrap();
+        assert!(
+            !settings::get_strict::<bool>(&conn, settings::keys::CLAUDE_POPULATION_PAUSED)
+                .unwrap()
+                .unwrap_or(false)
+        );
+        assert!(!resumed.stopped());
+    }
+
+    #[test]
+    fn automatic_live_pass_does_not_touch_corpus_while_durably_paused_or_busy() {
+        use crate::background::IndexOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("pause.db")).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        registry.lock().unwrap().cancel();
+        persist_population_pause(&mut conn, &registry).unwrap();
+        let restarted = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // A non-directory would produce a scan fault if admission reached it.
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, "do not scan").unwrap();
+        let paused = populate_live_corpus(
+            &mut conn,
+            Some(&root),
+            &crate::claude::transcript::PopulationControl::default(),
+            &restarted,
+            &slots,
+        );
+        assert_eq!(paused.index_health, IndexOutcome::Paused);
+        assert!(paused.indexed.is_none() && paused.metadata.is_none() && paused.usage.is_none());
+        let resume = crate::claude::transcript::PopulationControl::discovery();
+        admit_population_state(&mut conn, &restarted, &resume, true).unwrap();
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let busy = populate_live_corpus(
+            &mut conn,
+            Some(&root),
+            &crate::claude::transcript::PopulationControl::default(),
+            &restarted,
+            &slots,
+        );
+        assert_eq!(busy.index_health, IndexOutcome::Busy);
+        assert!(busy.indexed.is_none());
+        drop(permit);
+    }
+
+    #[test]
+    fn expensive_usage_cannot_keep_index_behind_it_across_ticks_and_restart() {
+        use crate::claude::population_schedule::Lane;
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("small.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"small\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"searchable fairness fixture\"}}\n").unwrap();
+        let path = dir.path().join("fair.db");
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut conn = open_db(&path).unwrap();
+        settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &2usize).unwrap();
+        let mut expired = false;
+        let first = populate_live_corpus_with_controls(
+            &mut conn,
+            Some(&root),
+            &PopulationControl::default(),
+            &registry,
+            &slots,
+            &mut |lane, root| {
+                if lane == Lane::Usage {
+                    expired = true;
+                }
+                if expired {
+                    root.with_budget(std::time::Duration::ZERO)
+                } else {
+                    lane.control(root)
+                }
+            },
+        );
+        assert_eq!(first.usage.unwrap().status, PopulationStatus::TimedOut);
+        assert_eq!(
+            first.indexed.unwrap().population.status,
+            PopulationStatus::TimedOut
+        );
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        expired = false;
+        let second = populate_live_corpus_with_controls(
+            &mut conn,
+            Some(&root),
+            &PopulationControl::default(),
+            &registry,
+            &slots,
+            &mut |lane, root| {
+                if lane == Lane::Usage {
+                    expired = true;
+                }
+                if expired {
+                    root.with_budget(std::time::Duration::ZERO)
+                } else {
+                    lane.control(root)
+                }
+            },
+        );
+        let indexed = second.indexed.unwrap();
+        assert_eq!(indexed.population.status, PopulationStatus::Complete);
+        assert_eq!(indexed.population.completed, 1);
+        assert_eq!(second.usage.unwrap().status, PopulationStatus::TimedOut);
+        assert_eq!(
+            second.index_health,
+            crate::background::IndexOutcome::Healthy
+        );
+    }
+
+    #[test]
+    fn live_history_is_consumed_even_when_corpus_is_paused_or_busy() {
+        use crate::claude::transcript::PopulationControl;
+        for paused in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::auth::test_home::set(home.path());
+            let path = home.path().join("history.db");
+            let mut conn = open_db(&path).unwrap();
+            let registry = std::sync::Mutex::new(PopulationRegistry::default());
+            if paused {
+                registry.lock().unwrap().cancel();
+                persist_population_pause(&mut conn, &registry).unwrap();
+            }
+            let handoff = crate::claude::handoff::path_in(home.path());
+            std::fs::create_dir_all(handoff.parent().unwrap()).unwrap();
+            std::fs::write(&handoff, concat!(r#"{"v":1,"event":"SessionStart","session_id":"synthetic-history","ppid":777,"ts":"2026-01-01T00:00:00Z","source":"startup"}"#, "\n")).unwrap();
+            let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            let state = claude_live_pass_with_population(
+                &path,
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            )
+            .unwrap();
+            assert_eq!(state.handoff.runs, 1);
+            assert_eq!(
+                state.index_health,
+                if paused {
+                    crate::background::IndexOutcome::Paused
+                } else {
+                    crate::background::IndexOutcome::Busy
+                }
+            );
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM claude_run WHERE session_id='synthetic-history'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_resume_never_clears_durable_pause() {
+        use crate::claude::transcript::PopulationControl;
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("pause.db")).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        registry.lock().unwrap().cancel();
+        persist_population_pause(&mut conn, &registry).unwrap();
+        let cancelled = PopulationControl::discovery();
+        cancelled.cancel();
+        admit_population_state(&mut conn, &registry, &cancelled, true).unwrap();
+        assert!(
+            settings::get_strict::<bool>(&conn, settings::keys::CLAUDE_POPULATION_PAUSED)
+                .unwrap()
+                .unwrap()
+        );
+        conn.execute_batch("CREATE TRIGGER reject_resume BEFORE UPDATE ON settings WHEN NEW.key='claude_population_paused' BEGIN SELECT RAISE(FAIL, 'synthetic resume rejection'); END;").unwrap();
+        let resumed = PopulationControl::discovery();
+        assert!(admit_population_state(&mut conn, &registry, &resumed, true).is_err());
+        assert!(registry.lock().unwrap().paused);
+        assert!(
+            settings::get_strict::<bool>(&conn, settings::keys::CLAUDE_POPULATION_PAUSED)
+                .unwrap()
+                .unwrap()
+        );
+        conn.execute_batch("DROP TRIGGER reject_resume; UPDATE settings SET value='broken' WHERE key='claude_population_paused';").unwrap();
+        assert!(
+            admit_population_state(&mut conn, &registry, &PopulationControl::default(), false)
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn queued_cancelled_import_cannot_revive_when_a_new_import_resumes() {
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
@@ -5055,15 +5311,28 @@ static CLAUDE_POPULATION_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::
 #[tauri::command]
 pub async fn claude_import_transcripts(
     app: tauri::AppHandle,
+    resume: Option<bool>,
 ) -> Result<crate::claude::store::Imported, String> {
     let control = crate::claude::transcript::PopulationControl::discovery();
-    let registration = {
-        let mut registry = CLAUDE_POPULATION.lock().unwrap_or_else(|e| e.into_inner());
-        registry.paused = false;
-        PopulationRegistration(registry.register(control.clone()))
-    };
     let _cancel = crate::claude::transcript::CancelPopulation(control.clone());
     let db = db_path(&app);
+    let admission_db = db.clone();
+    let admission_control = control.clone();
+    let registration = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db(&admission_db).map_err(|e| e.to_string())?;
+        admit_population_state(
+            &mut conn,
+            &CLAUDE_POPULATION,
+            &admission_control,
+            resume.unwrap_or(false),
+        )
+        .map(|id| PopulationRegistration {
+            id,
+            registry: &CLAUDE_POPULATION,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let Some(permit) = admit_population(CLAUDE_POPULATION_SLOTS.clone(), &control).await? else {
         return Ok(crate::claude::store::Imported {
             population: crate::claude::transcript::PopulationProgress {
@@ -5205,23 +5474,7 @@ pub async fn claude_search_transcripts(
         // a background timer.
         let unreadable = match crate::claude::corpus_default() {
             Ok(scan) => {
-                // The denominator is refreshed here as well as in the
-                // index pass, so a session created since the last pass
-                // makes the index read as INCOMPLETE rather than
-                // letting a stale "complete" license a "no matches"
-                // about a session that was never indexed.
-                let total = (scan.sessions.len() + scan.unreadable_files.len()) as i64;
-                let _ = conn.execute(
-                    "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at)
-                     VALUES (1, ?1, COALESCE(
-                        (SELECT last_pass_at FROM claude_index_state WHERE id = 1), ?2))
-                     ON CONFLICT(id) DO UPDATE SET corpus_sessions = ?1",
-                    rusqlite::params![total, chrono::Utc::now().to_rfc3339()],
-                );
-                scan.unreadable_files
-                    .into_iter()
-                    .chain(scan.unreadable_dirs)
-                    .collect()
+                crate::claude::search::observe_discovery(&conn, &scan).map_err(|e| e.to_string())?
             }
             Err(e) => {
                 log::warn!("claude: could not re-scan the corpus for search coverage: {e}");
@@ -5253,14 +5506,12 @@ pub async fn claude_index_coverage(
         // `corpus_default` (#1246): only `unreadable_files` is read
         // here, and the listing computes it from the same `fs::metadata`
         // failure `extract` reports, without opening a transcript.
-        let unreadable = crate::claude::corpus_default()
-            .map(|s| {
-                s.unreadable_files
-                    .into_iter()
-                    .chain(s.unreadable_dirs)
-                    .collect()
-            })
-            .unwrap_or_else(|e| vec![format!("corpus discovery failed: {e}")]);
+        let unreadable = match crate::claude::corpus_default() {
+            Ok(scan) => {
+                crate::claude::search::observe_discovery(&conn, &scan).map_err(|e| e.to_string())?
+            }
+            Err(e) => vec![format!("corpus discovery failed: {e}")],
+        };
         crate::claude::search::coverage(&conn, unreadable).map_err(|e| e.to_string())
     })
     .await
@@ -5533,6 +5784,8 @@ pub async fn claude_event_profile(
 /// let a UI render a sweep against a stale consumption or vice versa.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeLiveState {
+    #[serde(skip)]
+    pub(crate) index_health: crate::background::IndexOutcome,
     pub metadata_population: Option<crate::claude::transcript::PopulationProgress>,
     pub usage_population: Option<crate::claude::transcript::PopulationProgress>,
     /// What the hook's handoff file contributed.
@@ -5595,19 +5848,11 @@ pub struct ClaudeLiveState {
 #[tauri::command]
 pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, String> {
     let db = db_path(&app);
-    let permit = CLAUDE_POPULATION_SLOTS
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| e.to_string())?;
     let control = crate::claude::transcript::PopulationControl::default();
     let _cancel = crate::claude::transcript::CancelPopulation(control.clone());
-    tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        claude_live_pass_controlled(&db, &control)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || claude_live_pass_controlled(&db, &control))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// One pass over both live sources, synchronously (#947).
@@ -5622,10 +5867,6 @@ pub async fn claude_poll_live(app: tauri::AppHandle) -> Result<ClaudeLiveState, 
 /// Sync on purpose: both callers already have a blocking context. The
 /// command wraps it in `spawn_blocking`, and the timer is its own thread.
 pub fn claude_live_pass(db: &std::path::Path) -> Result<ClaudeLiveState, String> {
-    let _permit = CLAUDE_POPULATION_SLOTS
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| "corpus population busy; retry on the next tick".to_string())?;
     claude_live_pass_controlled(db, &crate::claude::transcript::PopulationControl::default())
 }
 
@@ -5633,7 +5874,15 @@ fn claude_live_pass_controlled(
     db: &std::path::Path,
     control: &crate::claude::transcript::PopulationControl,
 ) -> Result<ClaudeLiveState, String> {
-    let _registration = register_population(control);
+    claude_live_pass_with_population(db, control, &CLAUDE_POPULATION, &CLAUDE_POPULATION_SLOTS)
+}
+
+fn claude_live_pass_with_population(
+    db: &std::path::Path,
+    control: &crate::claude::transcript::PopulationControl,
+    registry: &std::sync::Mutex<PopulationRegistry>,
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<ClaudeLiveState, String> {
     {
         let home = crate::auth::home_dir()
             .ok_or_else(|| "no home directory, so ~/.claude cannot be read".to_string())?;
@@ -5689,113 +5938,132 @@ fn claude_live_pass_controlled(
             log::warn!("claude: could not persist the handoff offset: {e}");
         }
 
-        // ---- The transcript content index (#1203) ----
-        //
-        // Here, on the pass that already walks the corpus, because that
-        // is the cheapest steady state: the alternative designs were an
-        // on-demand index (a first search over 0.83 GB is not
-        // interactive) and a one-off backfill (which still needs an
-        // incremental path afterwards, so it is this plus an extra
-        // mode).
-        //
-        // BOUNDED at `SESSIONS_PER_PASS`, so this never becomes a
-        // whole-corpus read on a 60-second loop and never blocks the UI:
-        // a cold corpus reaches full coverage over about fifteen passes,
-        // and every search in the meantime reports the coverage it
-        // actually had.
-        //
-        // A failure here does NOT fail the pass. The live state above is
-        // already computed and is still true; refusing all of it because
-        // the content index could not run would trade a working session
-        // list for a missing one. The failure travels as data instead --
-        // `indexed: None` -- which is the distinction this file's own
-        // "absent is not zero" section draws for every other field.
-        //
-        // `corpus_default` and NOT `scan_default` (#1246). The index
-        // pass needs each session's path, its id, and the unreadable
-        // set; it takes its own `fs::metadata` per file because the
-        // ledger is keyed on `(size, mtime)`. It reads no other field.
-        // `scan_default` would additionally open every transcript for a
-        // head read and a tail seek AND hand the list to
-        // `subagent::build`, which reads all 0.84 GB end to end -- all
-        // of it discarded at this call.
-        //
-        // Measured on the real corpus, release, warm, four consecutive
-        // rounds: the full scan is 878-935 ms and the listing is 49-60
-        // ms, for the same 1,510 sessions each time. The added cost of
-        // #1203 on this loop was ~885 ms per tick and is now ~56 ms --
-        // 0.09% of the 60-second tick this pass actually runs on, which
-        // is the cadence #1246's framing should have used.
-        //
-        // The denominator and `unreadable_files` are unchanged by this,
-        // which is the part that matters: `search::Coverage::is_complete`
-        // is what licenses the words "no matches", and both of its
-        // inputs from the scan survive the switch. See `corpus`'s own
-        // doc for why stopping before the file reads cannot lose an
-        // unreadable transcript.
-        let mut metadata_population = None;
-        let mut usage_population = None;
-        let indexed = if population_paused() {
-            None
-        } else {
-            match crate::claude::transcript::projects_dir()
-                .map(|root| crate::claude::transcript::corpus_controlled(&root, control))
-                .ok_or_else(|| "no home directory".to_string())
-            {
-                Ok(scan) => {
-                    // Pull request links written since the last import
-                    // (#1557), over the same listing: bounded, incremental,
-                    // and a failure here fails neither the pass nor the
-                    // index. `claude::linkscan` carries the design. Counts
-                    // only in the log -- never a path or a link.
-                    match crate::claude::linkscan::refresh(
-                    &mut conn,
-                    &scan,
-                    crate::claude::linkscan::BYTES_PER_PASS,
-                ) {
-                    Ok(r) if r.deferred > 0 => log::info!(
-                        "claude: pull request links: {} added this pass, {} files left for the next",
-                        r.links_added,
-                        r.deferred
-                    ),
-                    Ok(_) => {}
-                    Err(e) => log::warn!("claude: the pull request link pass failed: {e}"),
-                }
-                    match crate::claude::store::metadata_pass(&mut conn, &scan, control) {
-                        Ok(progress) => metadata_population = Some(progress),
-                        Err(e) => log::warn!("claude: metadata population failed: {e}"),
-                    }
-                    match crate::claude::store::usage_pass(&mut conn, &scan, control) {
-                        Ok(result) => {
-                            usage_population = Some(result.population);
-                        }
-                        Err(e) => log::warn!("claude: usage population failed: {e}"),
-                    }
-                    match crate::claude::search::index_pass_controlled(&mut conn, &scan, control) {
-                        Ok(done) => Some(done),
-                        Err(e) => {
-                            log::warn!("claude: the transcript index pass failed: {e}");
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("claude: could not scan the corpus to index it: {e}");
-                    None
-                }
-            }
-        };
+        // History and crash detection stay available even when corpus work is
+        // paused, cancelled or waiting for admission.
+        let root = crate::claude::transcript::projects_dir();
+        let population = populate_live_corpus(&mut conn, root.as_deref(), control, registry, slots);
 
         Ok(ClaudeLiveState {
-            metadata_population,
-            usage_population,
+            index_health: population.index_health,
+            metadata_population: population.metadata,
+            usage_population: population.usage,
             handoff,
             sweep,
             running: swept.running,
             unconfirmed: swept.unknown,
-            indexed,
+            indexed: population.indexed,
         })
     }
+}
+
+#[derive(Default)]
+struct LivePopulation {
+    indexed: Option<crate::claude::search::Indexed>,
+    metadata: Option<crate::claude::transcript::PopulationProgress>,
+    usage: Option<crate::claude::transcript::PopulationProgress>,
+    index_health: crate::background::IndexOutcome,
+}
+
+fn populate_live_corpus(
+    conn: &mut rusqlite::Connection,
+    root: Option<&std::path::Path>,
+    control: &crate::claude::transcript::PopulationControl,
+    registry: &std::sync::Mutex<PopulationRegistry>,
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> LivePopulation {
+    populate_live_corpus_with_controls(conn, root, control, registry, slots, &mut |lane, root| {
+        lane.control(root)
+    })
+}
+
+fn populate_live_corpus_with_controls(
+    conn: &mut rusqlite::Connection,
+    root: Option<&std::path::Path>,
+    control: &crate::claude::transcript::PopulationControl,
+    registry: &std::sync::Mutex<PopulationRegistry>,
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    control_for_lane: &mut impl FnMut(
+        crate::claude::population_schedule::Lane,
+        &crate::claude::transcript::PopulationControl,
+    ) -> crate::claude::transcript::PopulationControl,
+) -> LivePopulation {
+    use crate::background::IndexOutcome;
+    use crate::claude::population_schedule::{processing_order, Lane};
+    use crate::claude::transcript::PopulationStatus;
+    let mut out = LivePopulation::default();
+    let id = match admit_population_state(conn, registry, control, false) {
+        Ok(id) => id,
+        Err(error) => {
+            out.index_health = IndexOutcome::Failed(error);
+            return out;
+        }
+    };
+    let _registration = PopulationRegistration { id, registry };
+    if control.stopped() {
+        out.index_health = if registry.lock().unwrap_or_else(|e| e.into_inner()).paused {
+            IndexOutcome::Paused
+        } else if control.stop_reason() == Some(PopulationStatus::TimedOut) {
+            IndexOutcome::TimedOut
+        } else {
+            IndexOutcome::Cancelled
+        };
+        return out;
+    }
+    let Ok(_permit) = slots.clone().try_acquire_owned() else {
+        out.index_health = IndexOutcome::Busy;
+        return out;
+    };
+    let Some(root) = root else {
+        out.index_health = IndexOutcome::Failed("No transcript directory is available".into());
+        return out;
+    };
+    let scan = crate::claude::transcript::corpus_controlled(root, control);
+    let order = match processing_order(conn) {
+        Ok(order) => order,
+        Err(error) => {
+            out.index_health = IndexOutcome::Failed(error.to_string());
+            return out;
+        }
+    };
+    // Rotation is persisted before work: timeout or interruption cannot pin an
+    // expensive usage source ahead of the index forever. Each slice shares the
+    // root cancellation and is capped by its remaining deadline.
+    for lane in order {
+        let lane_control = control_for_lane(lane, control);
+        match lane {
+            Lane::Links => match crate::claude::linkscan::refresh_controlled(
+                conn,
+                &scan,
+                crate::claude::linkscan::BYTES_PER_PASS,
+                &lane_control,
+            ) {
+                Ok(done) if !done.unreadable.is_empty() => log::warn!(
+                    "claude: link population: {} source failures",
+                    done.unreadable.len()
+                ),
+                Ok(_) => {}
+                Err(error) => log::warn!("claude: link population failed: {error}"),
+            },
+            Lane::Metadata => match crate::claude::store::metadata_pass(conn, &scan, &lane_control)
+            {
+                Ok(progress) => out.metadata = Some(progress),
+                Err(error) => log::warn!("claude: metadata population failed: {error}"),
+            },
+            Lane::Usage => match crate::claude::store::usage_pass(conn, &scan, &lane_control) {
+                Ok(done) => out.usage = Some(done.population),
+                Err(error) => log::warn!("claude: usage population failed: {error}"),
+            },
+            Lane::Index => {
+                let result =
+                    crate::claude::search::index_pass_controlled(conn, &scan, &lane_control)
+                        .map_err(|e| e.to_string());
+                out.index_health =
+                    IndexOutcome::from_index(result.as_ref().map_err(String::as_str));
+                out.indexed = result.ok();
+            }
+        }
+    }
+    out
 }
 
 /// Aggregates for the Claude Code overview page (#921, epic #910).
