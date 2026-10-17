@@ -16,7 +16,16 @@ version = 2
 # unic-* crates reach us only through tauri-utils -> urlpattern, are
 # "unmaintained" notices rather than vulnerabilities, and have no safe
 # upgrade. Revisit when Tauri moves urlpattern off unic.
+# ZIP extraction in the pinned libsodium 1.24.0 source is ONLY a Windows
+# MSVC fallback. iOS/Android compile signed tar.gz sources; failure never
+# falls back to ZIP. make deny-mobile verifies exact registry checksums,
+# phone target scope, and the sole build-only dependency edge before audit.
+# ZIP >=9 is not published at time of triage. Remove these acceptances via
+# #1829 when a compatible patched dependency exists; any scope drift fails.
 ignore = [
+  "RUSTSEC-2026-0367",  # unreachable ZIP permission extraction on phone targets
+  "RUSTSEC-2026-0368",  # unreachable ZIP symlink extraction on phone targets
+  "RUSTSEC-2026-0369",  # unreachable ZIP chmod extraction on phone targets
   "RUSTSEC-2025-0075",  # unic-char-range unmaintained
   "RUSTSEC-2025-0080",  # unic-common unmaintained
   "RUSTSEC-2025-0081",  # unic-char-property unmaintained

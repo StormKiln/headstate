@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 // writes; awaiting on an idle paused runtime would auto-advance that deadline.
 // The wall-clock guard bounds pending polls without changing production time;
 // it does not interrupt synchronous filesystem work or the writer's drop join.
-fn await_writer<T>(future: impl Future<Output = T>) -> T {
+pub(super) fn await_writer<T>(future: impl Future<Output = T>) -> T {
     struct ResumeClock;
     impl Drop for ResumeClock {
         fn drop(&mut self) {
