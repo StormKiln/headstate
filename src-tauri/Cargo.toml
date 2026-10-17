@@ -25,7 +25,7 @@ muda = { version = "0.19.3", default-features = false, features = ["gtk"] }
 [dependencies]
 tauri-plugin-dialog = "=2.7.3"
 # FilePath is the picker result; this compatible line preserves Tauri 2.11.
-tauri-plugin-fs = "=2.5.2"
+tauri-plugin-fs = "=2.6.0"
 tempfile = "3.27"
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
