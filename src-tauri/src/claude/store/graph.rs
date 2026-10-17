@@ -112,9 +112,9 @@ mod tests {
                     let mut links: Vec<_> = (0..count)
                         .map(|i| PrLink {
                             session_id: format!("s{i}"),
-                            repo: "synthetic/repo".into(),
+                            repo: "octocat/hello-world".into(),
                             number: i as u64,
-                            url: format!("https://github.com/synthetic/repo/pull/{i}"),
+                            url: format!("https://github.com/octocat/hello-world/pull/{i}"),
                             first_seen_at: None,
                         })
                         .collect();

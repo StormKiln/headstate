@@ -4571,6 +4571,13 @@ fn suggestion(f: &Finding) -> String {
         (
             "src-tauri/claude/search.rs",
             "real_corpus",
+            "remove_index_rows",
+            ".execute(",
+            "removes FTS rows only through the caller's probe-owned TempDir database connection",
+        ),
+        (
+            "src-tauri/claude/search.rs",
+            "real_corpus",
             "index_pass_controlled",
             ".execute(",
             "indexes only through the caller's probe-owned TempDir database connection",

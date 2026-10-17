@@ -1432,7 +1432,7 @@ mod tests {
     fn graph_cursor_write_failure_rolls_back_graph() {
         let mut conn = db();
         conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url) VALUES ('old','o/r',1,'https://github.com/o/r/pull/1')", []).unwrap();
-        conn.execute_batch("CREATE TRIGGER reject_cursor BEFORE INSERT ON settings WHEN NEW.key='claude_pr_link_cursor' BEGIN SELECT RAISE(FAIL,'cursor rejected'); END;").unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_cursor BEFORE INSERT ON claude_link_baseline BEGIN SELECT RAISE(FAIL,'cursor rejected'); END;").unwrap();
         assert!(import(&mut conn, Scan::default()).is_err());
         assert_eq!(prs_for_session(&conn, "old").unwrap().len(), 1);
     }

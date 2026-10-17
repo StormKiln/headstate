@@ -27,10 +27,10 @@
 //! discard through their newline. Pending create IDs have count/length limits;
 //! overflow reports deferred/unreadable without advancing the prior checkpoint.
 //!
-//! Settings store one JSON cursor. Its path set grows with files read since
-//! import, checksums grow with accepted bytes (one per4KiB), and each file can
-//! retain one bounded partial record. Pruning removes unlisted paths. This is
-//! proportional checkpoint storage, not a constant-sized or corpus-wide cap.
+//! A small baseline and per-source rows replace the legacy settings cursor.
+//! Only changed sources serialize and write their evidence. Checksums grow
+//! with accepted bytes (one per4KiB), and each file retains one bounded partial
+//! record. Complete listings prune missing paths; partial listings retain them.
 //!
 //! Incremental ingestion only ADDS links, preserving existing first-seen
 //! timestamps. Authoritative graph replacement owns removing associations
@@ -44,7 +44,12 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use crate::store::settings;
+mod storage;
+#[cfg(test)]
+pub(crate) use storage::checkpoint_cursor;
+pub(crate) use storage::migrate_legacy;
 
 /// How many transcript bytes one pass may read.
 ///
@@ -104,17 +109,20 @@ pub struct Refreshed {
 /// Called in the accepted graph transaction. Anything a pass wrote before
 /// that is forgotten safely: files modified since `since_ms` replay, and
 /// graph publication cannot commit without its matching continuation.
+/// Standalone callers receive the same atomicity through an owned transaction.
 pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::StoreError> {
+    if conn.is_autocommit() {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        reset(&tx, since_ms)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    migrate_legacy(conn)?;
     super::transcript::population_generation(conn, "links")?;
-    settings::set(
-        conn,
-        settings::keys::CLAUDE_PR_LINK_CURSOR,
-        &Cursor {
-            since_ms,
-            offsets: BTreeMap::new(),
-            checkpoints: BTreeMap::new(),
-        },
-    )
+    conn.execute("DELETE FROM claude_link_checkpoint", [])?;
+    conn.execute("INSERT INTO claude_link_baseline VALUES(1, ?1) ON CONFLICT(singleton) DO UPDATE SET since_ms=excluded.since_ms", [since_ms])?;
+    Ok(())
 }
 
 /// One bounded pass over the listed corpus.
@@ -150,12 +158,15 @@ pub(crate) fn refresh_controlled(
         return Ok(out);
     }
     let generation = super::transcript::population_generation(conn, "links")?;
-    let Some(mut cursor) =
-        settings::get_strict::<Cursor>(conn, settings::keys::CLAUDE_PR_LINK_CURSOR)?
-    else {
+    migrate_legacy(conn)?;
+    let Some(since_ms) = storage::baseline(conn)? else {
         out.not_started = true;
         return Ok(out);
     };
+    let offsets = storage::offsets(conn)?;
+    // Decode one source at a time. Staged strings still scale with the changed
+    // sources (and one large source remains large), never every warm source.
+    let mut changed = Vec::new();
 
     let mut todo = Vec::new();
     for t in &scan.sessions {
@@ -171,8 +182,7 @@ pub(crate) fn refresh_controlled(
                     .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(i64::MAX);
-                if !cursor.offsets.contains_key(&t.path)
-                    && mtime.saturating_add(MTIME_SLACK_MS) < cursor.since_ms
+                if !offsets.contains_key(&t.path) && mtime.saturating_add(MTIME_SLACK_MS) < since_ms
                 {
                     continue;
                 }
@@ -197,7 +207,8 @@ pub(crate) fn refresh_controlled(
         }
         // Old offset-only settings replay once: they cannot establish source
         // continuity or reconstruct an unfinished create/result pairing.
-        let checkpoint = cursor.checkpoints.get(&t.path).cloned().unwrap_or_default();
+        let original = storage::checkpoint(conn, &t.path)?;
+        let checkpoint = original.clone().unwrap_or_default();
         match read_from_controlled(
             Path::new(&t.path),
             &t.session_id,
@@ -219,21 +230,26 @@ pub(crate) fn refresh_controlled(
                     out.unreadable.push(format!("{}: {error}", t.path));
                 }
                 links.extend(read.links);
-                cursor.offsets.insert(t.path.clone(), read.checkpoint.to);
-                cursor.checkpoints.insert(t.path.clone(), read.checkpoint);
+                if original.as_ref() != Some(&read.checkpoint)
+                    || offsets.get(&t.path) != Some(&read.checkpoint.to)
+                {
+                    changed.push((
+                        t.path.clone(),
+                        read.checkpoint.to,
+                        serde_json::to_string(&read.checkpoint)?,
+                    ));
+                }
             }
             Err(e) => out
                 .unreadable
                 .push(format!("{}: could not read it: {e}", t.path)),
         }
     }
+    let mut removed = Vec::new();
     if !scan.is_partial() {
         let listed: std::collections::HashSet<&str> =
             scan.sessions.iter().map(|t| t.path.as_str()).collect();
-        cursor.offsets.retain(|p, _| listed.contains(p.as_str()));
-        cursor
-            .checkpoints
-            .retain(|p, _| listed.contains(p.as_str()));
+        removed.extend(offsets.keys().filter(|p| !listed.contains(p.as_str())));
     }
 
     // The links and the cursor that says they were read, in ONE
@@ -263,7 +279,12 @@ pub(crate) fn refresh_controlled(
             ],
         )?;
     }
-    settings::set(&tx, settings::keys::CLAUDE_PR_LINK_CURSOR, &cursor)?;
+    for (path, offset, payload) in changed {
+        storage::put(&tx, &path, offset, Some(&payload))?;
+    }
+    for path in removed {
+        tx.execute("DELETE FROM claude_link_checkpoint WHERE path=?1", [path])?;
+    }
     observe("before_commit");
     if let Some(reason) = stopped(&tx, control, generation)? {
         out.links_added = 0;
@@ -774,6 +795,31 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn checkpoint_rows_do_not_rewrite_unchanged_sources() {
+        let (dir, project, mut conn) = fixture();
+        append(&project.join("s1.jsonl"), &[filler()]);
+        append(&project.join("s2.jsonl"), &[filler()]);
+        reset(&conn, 0).unwrap();
+        let scan = crate::claude::corpus(&dir.path().join("projects"));
+        refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        conn.execute_batch("CREATE TEMP TABLE changed(path TEXT); CREATE TEMP TRIGGER checkpoint_changes AFTER UPDATE ON claude_link_checkpoint BEGIN INSERT INTO changed VALUES(new.path); END;").unwrap();
+        let warm = refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        assert_eq!(warm.bytes_read, 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM changed", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        append(&project.join("s1.jsonl"), &[filler()]);
+        refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM changed", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn partial_listing_preserves_checkpoint_and_malformed_cursor_is_an_error() {
         let (dir, project, mut conn) = fixture();
         append(&project.join("s1.jsonl"), &[create_line("pending")]);
@@ -784,16 +830,13 @@ mod tests {
             BYTES_PER_PASS,
         )
         .unwrap();
-        let before = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+        let before = checkpoint_cursor(&conn).unwrap();
         let partial = super::super::Scan {
             unreadable_dirs: vec!["injected discovery failure".into()],
             ..Default::default()
         };
         refresh(&mut conn, &partial, BYTES_PER_PASS).unwrap();
-        assert_eq!(
-            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
-            before
-        );
+        assert_eq!(checkpoint_cursor(&conn).unwrap(), before);
         drop(conn);
         let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
         append(&project.join("s1.jsonl"), &[result_line("pending", false)]);
@@ -806,13 +849,11 @@ mod tests {
         assert_eq!(linked(&conn, 77), ["s1"]);
         // Only a complete listing may remove an absent source's continuation.
         refresh(&mut conn, &super::super::Scan::default(), BYTES_PER_PASS).unwrap();
-        assert!(
-            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
-                .unwrap()
-                .unwrap()
-                .checkpoints
-                .is_empty()
-        );
+        assert!(checkpoint_cursor(&conn)
+            .unwrap()
+            .unwrap()
+            .checkpoints
+            .is_empty());
         settings::set(
             &conn,
             settings::keys::CLAUDE_PR_LINK_CURSOR,
@@ -831,8 +872,7 @@ mod tests {
                 &[link_line("s1", "acme/api", 77)],
             );
             reset(&conn, 0).unwrap();
-            let before =
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            let before = checkpoint_cursor(&conn).unwrap();
             let control = super::super::transcript::PopulationControl::discovery();
             let control = if timed_out {
                 control.with_budget(std::time::Duration::ZERO)
@@ -850,10 +890,7 @@ mod tests {
             assert!(result.stopped.is_some());
             assert_eq!(result.bytes_read, 0);
             assert!(linked(&conn, 77).is_empty());
-            assert_eq!(
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
-                before
-            );
+            assert_eq!(checkpoint_cursor(&conn).unwrap(), before);
         }
     }
 
@@ -882,8 +919,7 @@ mod tests {
                 .write_all(&vec![b'x'; 256 * 1024])
                 .unwrap();
             reset(&conn, 0).unwrap();
-            let before =
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            let before = checkpoint_cursor(&conn).unwrap();
             let control = super::super::transcript::PopulationControl::discovery();
             let cancel = control.clone();
             let mut reads = 0;
@@ -913,10 +949,7 @@ mod tests {
                 assert!(result.bytes_read > 0 && result.bytes_read <= 64 * 1024);
             }
             assert!(linked(&conn, 77).is_empty());
-            assert_eq!(
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
-                before
-            );
+            assert_eq!(checkpoint_cursor(&conn).unwrap(), before);
             refresh(
                 &mut conn,
                 &crate::claude::corpus(&dir.path().join("projects")),
@@ -966,9 +999,7 @@ mod tests {
                 Some(super::super::transcript::PopulationStatus::Invalidated)
             );
             assert!(linked(&conn, 77).is_empty());
-            let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
-                .unwrap()
-                .unwrap();
+            let cursor = checkpoint_cursor(&conn).unwrap().unwrap();
             assert!(cursor.offsets.is_empty());
             assert_eq!(cursor.since_ms, if reset_graph { 12345 } else { 0 });
         }
@@ -986,8 +1017,7 @@ mod tests {
             append(&path, &[" ".repeat(32 * 1024)]);
             reset(&conn, 0).unwrap();
             refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
-            let before =
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+            let before = checkpoint_cursor(&conn).unwrap();
             append(
                 &path,
                 &[if pending {
@@ -1020,10 +1050,7 @@ mod tests {
                 Some(super::super::transcript::PopulationStatus::Cancelled)
             );
             assert!(result.bytes_read > 0);
-            assert_eq!(
-                settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
-                before
-            );
+            assert_eq!(checkpoint_cursor(&conn).unwrap(), before);
             assert!(linked(&conn, 77).is_empty());
             drop(conn);
             let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
@@ -1176,15 +1203,12 @@ mod tests {
         append(&path, &[create_line("create-1")]);
         reset(&conn, 0).unwrap();
         refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
-        let before = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap();
+        let before = checkpoint_cursor(&conn).unwrap();
         append(&path, &[result_line("create-1", false)]);
-        conn.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON settings BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;").unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON claude_link_checkpoint BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;").unwrap();
         assert!(refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).is_err());
         assert!(linked(&conn, 77).is_empty());
-        assert_eq!(
-            settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR).unwrap(),
-            before
-        );
+        assert_eq!(checkpoint_cursor(&conn).unwrap(), before);
         conn.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap();
         drop(conn);
         let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
@@ -1205,7 +1229,7 @@ mod tests {
         settings::set(
             &conn,
             settings::keys::CLAUDE_PR_LINK_CURSOR,
-            &serde_json::json!({"since_ms":0,"offsets":offsets}),
+            &serde_json::json!({"since_ms":i64::MAX,"offsets":offsets}),
         )
         .unwrap();
         refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
@@ -1342,9 +1366,7 @@ mod tests {
         assert_eq!(got.unreadable.len(), 1);
         assert!(got.unreadable[0].contains("256 IDs"));
         assert_eq!(got.deferred, 1);
-        let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
-            .unwrap()
-            .unwrap();
+        let cursor = checkpoint_cursor(&conn).unwrap().unwrap();
         assert_eq!(cursor.offsets.get(path.to_str().unwrap()), Some(&0));
     }
 
@@ -1489,9 +1511,7 @@ mod tests {
         reset(&conn, 0).unwrap();
         refresh(&mut conn, &crate::claude::corpus(&root), BYTES_PER_PASS).unwrap();
         append(&path, &[result_line("stable", false)]);
-        let cursor = settings::get::<Cursor>(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR)
-            .unwrap()
-            .unwrap();
+        let cursor = checkpoint_cursor(&conn).unwrap().unwrap();
         let checkpoint = cursor
             .checkpoints
             .get(path.to_str().unwrap())

@@ -1346,6 +1346,10 @@ const MIGRATIONS: &[&str] = &[
     "DROP INDEX IF EXISTS claude_session_activity;
      CREATE INDEX claude_session_activity ON claude_session(last_activity_at DESC, first_seen_at DESC);",
 
+    // 47: publication writes only changed transcripts; NULL payload keeps
+    // legacy offset membership without pretending it proves source continuity.
+    "CREATE TABLE claude_link_baseline (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), since_ms INTEGER NOT NULL);
+     CREATE TABLE claude_link_checkpoint (path TEXT PRIMARY KEY, offset TEXT NOT NULL, payload TEXT);",
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -1409,6 +1413,9 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         if !(interrupted && i == version as usize) {
             tx.execute_batch(sql)?;
+        }
+        if i == 46 {
+            crate::claude::linkscan::migrate_legacy(&tx)?;
         }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
     }
