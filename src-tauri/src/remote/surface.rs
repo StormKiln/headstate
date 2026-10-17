@@ -323,6 +323,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // costs a bounded head read plus a 16 KB tail seek, and the ceiling
     // lives inside the command rather than in this table.
     ("claude_import_transcripts", Class::Read),
+    ("claude_cancel_population", Class::Read),
     // Content search over the transcript corpus (#1203). Read: it walks
     // `~/.claude/projects` without writing to it and queries the FTS5
     // index in Headstate's own cache. The one write it makes is to our
@@ -1212,6 +1213,7 @@ async fn call(
         // inline held this listener for the length of the file.
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?).await),
         "claude_import_transcripts" => res(commands::claude_import_transcripts(app.clone()).await),
+        "claude_cancel_population" => res(commands::claude_cancel_population(app.clone()).await),
         // Both query matchers read the `Matching` `privacy::admit` wrote
         // (#1519), failing closed to masked when it is absent.
         "claude_search_transcripts" => res(commands::claude_search_transcripts(

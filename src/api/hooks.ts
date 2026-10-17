@@ -1,3 +1,4 @@
+import { observeCorpusPopulation } from "./corpusPopulationEvents";
 import { observeTranscript } from "./transcriptMeasurement";
 import { beginCaptureWrite, acceptCaptureWrite } from "./measurementCapture";
 import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
@@ -141,6 +142,7 @@ import {
   checkPackages,
   readClaudeMd,
   claudeImportTranscripts,
+  claudeCancelPopulation,
   claudeOverview,
   claudeCoverage,
   claudePlugins,
@@ -2094,6 +2096,13 @@ export function useClaudeSessions(enabled: boolean) {
     imported,
     /// `now`, resolved once per poll rather than per render.
     now: list.dataUpdatedAt,
+    cancelPopulation: async () => {
+      await claudeCancelPopulation();
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["claude-usage-profile"] }),
+        qc.invalidateQueries({ queryKey: ["claude-index-coverage"] }),
+      ]);
+    },
     /// Re-read `~/.claude/projects` and then the list. Both, in that
     /// order: a rescan that did not refresh the list would leave the
     /// user looking at the rows from before it.
@@ -2103,6 +2112,8 @@ export function useClaudeSessions(enabled: boolean) {
       // The pull request links are rewritten by the same import (#1545),
       // so their lookups go too rather than waiting out their minute.
       await qc.invalidateQueries({ queryKey: ["claude-sessions-for-pr-number"] });
+      await qc.invalidateQueries({ queryKey: ["claude-usage-profile"] });
+      await qc.invalidateQueries({ queryKey: ["claude-index-coverage"] });
     },
   };
 }
@@ -2134,14 +2145,20 @@ export function useClaudeSessions(enabled: boolean) {
 /// credible shape, which is precisely what this feature is filed against.
 /// Token usage across every measured session (#1134).
 ///
-/// `staleTime: Infinity`: the rows change only when the import pass
-/// rewrites them, and the overview already refetches on a rescan.
-export function useClaudeUsageProfile(enabled = true) {
+/// Re-read the cheap stored summary while background population advances.
+export function useClaudeUsageProfile(enabled = true, importing = false) {
+  const client = useQueryClient();
+  useEffect(() => enabled ? observeCorpusPopulation(client) : undefined, [client, enabled]);
   return useQuery<ClaudeUsageProfile>({
     queryKey: ["claude-usage-profile"],
     queryFn: claudeUsageProfile,
     enabled,
-    staleTime: Infinity,
+    staleTime: 29_000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.population?.status;
+      if (enabled && (importing || status === "running")) return 1_000;
+      return enabled && (status === "deferred" || status === "invalidated" || status === "timed_out") ? 30_000 : false;
+    },
     retry: false,
   });
 }
@@ -2273,6 +2290,8 @@ export function useClaudeTranscriptSearch(query: string, enabled = true) {
 /// is working exactly as designed and would have finished in ten
 /// minutes.
 export function useClaudeIndexCoverage(enabled = true) {
+  const client = useQueryClient();
+  useEffect(() => enabled ? observeCorpusPopulation(client) : undefined, [client, enabled]);
   return useQuery<ClaudeIndexCoverage>({
     queryKey: ["claude-index-coverage"],
     queryFn: () => claudeIndexCoverage(),

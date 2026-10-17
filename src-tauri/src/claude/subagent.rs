@@ -713,10 +713,29 @@ fn pr_url(line: &str) -> Option<(String, u64, String)> {
 /// not cost the attribution of every other agent, and the count is
 /// carried so the UI can say the rollup may be short.
 pub fn build(paths: &[PathBuf]) -> Map {
+    build_controlled(paths, &super::transcript::PopulationControl::default())
+}
+
+pub(crate) fn build_controlled(
+    paths: &[PathBuf],
+    control: &super::transcript::PopulationControl,
+) -> Map {
+    build_with_progress(paths, control, &mut |_| {})
+}
+
+pub(crate) fn build_with_progress(
+    paths: &[PathBuf],
+    control: &super::transcript::PopulationControl,
+    progress: &mut dyn FnMut(usize),
+) -> Map {
     use std::io::BufRead;
 
     let mut map = Map::default();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if control.stopped() {
+            map.unreadable.push("parent map discovery cancelled".into());
+            break;
+        }
         let mut links = LinkReader::default();
         let session_id = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_owned(),
@@ -730,8 +749,15 @@ pub fn build(paths: &[PathBuf]) -> Map {
                 continue;
             }
         };
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::new(super::transcript::ControlledReader {
+            inner: file,
+            control,
+        });
         for line in reader.lines() {
+            if control.stopped() {
+                map.unreadable.push("parent map discovery cancelled".into());
+                break;
+            }
             let Ok(line) = line else {
                 // A torn or non-UTF-8 line mid-file is not a failure of
                 // the file: Claude Code appends concurrently.
@@ -759,6 +785,7 @@ pub fn build(paths: &[PathBuf]) -> Map {
                 );
             }
         }
+        progress(index + 1);
     }
     // DEDUPLICATED, and this is not cosmetic. Measured on the real
     // corpus: 11,000+ `pr-link` records across 36 files, because a
@@ -823,6 +850,14 @@ mod tests {
             .join(format!("{AGENT_PREFIX}{agent}"))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn cancelled_parent_map_is_unknown_not_a_complete_empty_map() {
+        let control = super::super::transcript::PopulationControl::default();
+        control.cancel();
+        let result = build_controlled(&[PathBuf::from("unread.jsonl")], &control);
+        assert!(!result.unreadable.is_empty());
     }
 
     #[test]

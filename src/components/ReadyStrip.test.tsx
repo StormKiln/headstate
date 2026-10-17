@@ -108,7 +108,8 @@ describe("ReadyStrip", () => {
       ...payload, revision: 2, receipt_revision: 2, prs: [{ ...ready }], measurement_receipt: { ...token, id: 3 },
     } }));
     expect(cache!.getQueryData(["reviewing"])).toBe(first);
-    expect(observed!.prs).not.toBe(first);
+    // Semantic row equality now shares the array; receipt metadata still advances.
+    expect(observed!.prs).toBe(first);
     expect(observed!.measurementReceipt?.id).toBe(acknowledged ? 3 : undefined);
     await act(async () => eventHandlers.get("source-poll-status")?.({ payload: { ...payload, revision: 3, receipt_revision: 2, phase: "fetching", prs: null } }));
     expect(observed!.measurementReceipt?.id).toBe(acknowledged ? 3 : undefined);

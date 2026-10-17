@@ -1,3 +1,4 @@
+import { replaceEqualDeep } from "@tanstack/react-query";
 import type { MeasurementReference } from "../types/measurement";
 import type { SourceSnapshot } from "./tauri";
 import type { PullRequest } from "../types/pr";
@@ -79,8 +80,11 @@ export class SourceRefreshState {
   };
   private publish(prs = this.value.prs, fromProvider = false) {
     const providerAge = this.providerAt ? Math.max(0, Math.floor((Date.now() - Date.parse(this.providerAt)) / 1000)) : 0;
-    this.value = { measurementReceipt: this.measurementReceipt, lastReceivedAt: this.providerAt, phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained };
-    for (const listener of this.listeners) listener();
+    const next = replaceEqualDeep(this.value, { measurementReceipt: this.measurementReceipt, lastReceivedAt: this.providerAt, phase: this.phase, staleSecs: providerAge > 3600 ? providerAge : null, prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, session: this.session, coverage: this.coverage, ...this.retained });
+    if (next !== this.value) {
+      this.value = next;
+      for (const listener of this.listeners) listener();
+    }
     // Display patches and status-only publications are not provider evidence.
     // Deliver the accepted rows themselves, never a later patched snapshot.
     if (fromProvider && prs !== undefined) this.onProviderRows?.({ rows: prs, session: this.session, coverage: this.coverage });

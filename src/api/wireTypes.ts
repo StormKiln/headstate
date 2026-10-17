@@ -1,4 +1,4 @@
-import type { BranchDeleteFrame, BranchScanFrame, PullRequest, Worktree, WorktreeRemovalFrame } from "../types/pr";
+import type { PopulationProgress, BranchDeleteFrame, BranchScanFrame, PullRequest, Worktree, WorktreeRemovalFrame } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
 import type { TranscriptActivity, SessionActivity } from "../types/transcript";
@@ -9,6 +9,7 @@ import type { SourcePollUpdate, UpdateRunDone } from "./tauri";
 /// different projections. Optional fields preserve independently shipped older
 /// desktops; present fields still have to be valid. Unknown additions survive.
 export interface RemoteEvents {
+  "claude-population-updated": null;
   "prs-updated": PullRequest[];
   "reviewing-updated": PullRequest[];
   "poll-state": string;
@@ -44,6 +45,7 @@ export interface RemoteEvents {
 /// generation instead of silently skipping it.
 export interface RemoteOnlyReplies {
   claude_poll_live: {
+    usage_population?: PopulationProgress | null;
     handoff: {
       runs: number; sessions: number; unparseable: string[]; unknown_version: number;
       without_session_id: number; without_pid: number; unvalidated: number;
@@ -57,6 +59,7 @@ export interface RemoteOnlyReplies {
     running: LiveRecord[];
     unconfirmed: LiveRecord[];
     indexed: {
+      population?: PopulationProgress;
       indexed: number; unchanged: number; unreadable: string[]; scan_unreadable: string[];
       write_failures: string[]; truncated: number; remaining: number; elapsed_ms: number;
     } | null;

@@ -298,10 +298,46 @@ pub struct GitHubClient {
     searches: Arc<Searches>,
     pub(super) scans: Arc<super::scan::Reads>,
     viewer: Arc<tokio::sync::OnceCell<String>>,
+    viewer_demand: Arc<std::sync::Mutex<ViewerDemand>>,
     pub(super) advisory: Arc<super::advisory::Advisory>,
     read_transport: Arc<super::read_transport::ReadTransport>,
     read_context: Option<super::admission::ReadContext>,
     read_class: super::admission::ReadClass,
+}
+
+// The OnceCell still owns exactly one initializer. Waiters change only its
+// queued admission class; dispatch and each caller retain their original bounds.
+struct ViewerDemand {
+    foreground: usize,
+    priority: tokio::sync::watch::Sender<bool>,
+}
+impl Default for ViewerDemand {
+    fn default() -> Self {
+        Self {
+            foreground: 0,
+            priority: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+impl ViewerDemand {
+    fn publish_class(&self) {
+        let foreground = self.foreground > 0;
+        self.priority.send_if_modified(|priority| {
+            if *priority == foreground {
+                return false;
+            }
+            *priority = foreground;
+            true
+        });
+    }
+}
+struct ViewerWaiter(Arc<std::sync::Mutex<ViewerDemand>>);
+impl Drop for ViewerWaiter {
+    fn drop(&mut self) {
+        let mut demand = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        demand.foreground -= 1;
+        demand.publish_class();
+    }
 }
 
 struct CredentialBinding {
@@ -613,6 +649,7 @@ impl GitHubClient {
             searches: Arc::new(Searches::default()),
             scans: Arc::default(),
             viewer: Arc::default(),
+            viewer_demand: Arc::default(),
             advisory: Arc::default(),
             read_transport: Arc::default(),
             read_context: None,
@@ -1725,6 +1762,63 @@ impl GitHubClient {
         Ok(detail)
     }
 
+    async fn with_viewer_demand<T>(
+        &self,
+        context: super::admission::ReadContext,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut live = context.live.clone();
+        let mut waiter = None;
+        tokio::pin!(work);
+        loop {
+            let effective = match &mut live {
+                Some(receiver) => *receiver.borrow_and_update(),
+                None => Some(super::admission::LiveRead {
+                    class: context.class,
+                    deadline: context.deadline,
+                }),
+            };
+            let foreground = effective.is_some_and(|demand| {
+                demand.class == super::admission::ReadClass::Foreground
+                    && demand.deadline > Instant::now()
+            });
+            if foreground && waiter.is_none() {
+                let mut demand = self.viewer_demand.lock().unwrap_or_else(|e| e.into_inner());
+                demand.foreground += 1;
+                demand.publish_class();
+                waiter = Some(ViewerWaiter(self.viewer_demand.clone()));
+            } else if !foreground {
+                waiter = None;
+            }
+            // A scan waiting on the OnceCell still has live consumers. Observe
+            // their priority here even though only the initializer enters HTTP.
+            tokio::select! { biased;
+                changed = async {
+                    match &mut live {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        drop(waiter);
+                        return work.await;
+                    }
+                }
+                _ = tokio::time::sleep_until(effective.map_or(context.deadline, |demand| demand.deadline)), if waiter.is_some() => {
+                    waiter = None;
+                }
+                result = &mut work => return result,
+            }
+        }
+    }
+
+    fn viewer_initializer(&self) -> Self {
+        let mut context = self.read_context();
+        let demand = self.viewer_demand.lock().unwrap_or_else(|e| e.into_inner());
+        context.identity_priority = Some(demand.priority.subscribe());
+        self.with_scan_context(context)
+    }
+
     /// The PR list together with GitHub's own match count.
     ///
     /// `PRS_QUERY` is `first: 100` with no pagination, and it already
@@ -1754,21 +1848,26 @@ impl GitHubClient {
             self.persist_viewer_binding(viewer, true).await;
             return Ok(viewer.clone());
         }
-        tokio::time::timeout_at(
-            self.read_context().deadline,
-            self.viewer.get_or_try_init(|| async {
-                let v = self
-                    .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
-                    .await?;
-                if let Some((remaining, _)) = map_rate_limit(&v) {
-                    crate::github::budget::note_remaining(remaining);
-                }
-                let viewer = map_viewer(&v)
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))?;
-                self.persist_verified_viewer(&viewer).await;
-                Ok(viewer)
-            }),
+        let context = self.read_context();
+        self.with_viewer_demand(
+            context.clone(),
+            tokio::time::timeout_at(
+                context.deadline,
+                self.viewer.get_or_try_init(|| async {
+                    let initializer = self.viewer_initializer();
+                    let v = initializer
+                        .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
+                        .await?;
+                    if let Some((remaining, _)) = map_rate_limit(&v) {
+                        crate::github::budget::note_remaining(remaining);
+                    }
+                    let viewer = map_viewer(&v).filter(|v| !v.is_empty()).ok_or_else(|| {
+                        ClientError::Graphql("no viewer login in response".into())
+                    })?;
+                    self.persist_verified_viewer(&viewer).await;
+                    Ok(viewer)
+                }),
+            ),
         )
         .await
         .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
@@ -1804,10 +1903,15 @@ impl GitHubClient {
     ) -> Result<String, ClientError> {
         // The immutable client owns the token. Never reuse disk identity or
         // another client's login, and never cache a failed lookup.
-        tokio::time::timeout_at(
-            self.read_context().deadline,
-            self.viewer
-                .get_or_try_init(|| self.fetch_viewer_metered(budget)),
+        let context = self.read_context();
+        self.with_viewer_demand(
+            context.clone(),
+            tokio::time::timeout_at(
+                context.deadline,
+                self.viewer.get_or_try_init(|| async {
+                    self.viewer_initializer().fetch_viewer_metered(budget).await
+                }),
+            ),
         )
         .await
         .map_err(|_| ClientError::Timeout(SEARCH_BUDGET.as_secs()))?
@@ -3042,6 +3146,250 @@ mod tests {
                 .await
                 .expect("the synchronized queued-persistence probe must finish");
         });
+    }
+
+    #[tokio::test]
+    async fn cold_viewer_follower_scan_can_promote_shared_initializer() {
+        use super::super::admission::{Bucket, LiveRead, ReadClass, ReadContext};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let mut context =
+            ReadContext::new(ReadClass::Background, std::time::Duration::from_secs(3));
+        let a = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, context.clone())
+            .await
+            .unwrap();
+        let b = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, context.clone())
+            .await
+            .unwrap();
+        let demand = Some(LiveRead {
+            class: ReadClass::Background,
+            deadline: context.deadline,
+        });
+        let (_leader_live, receiver) = tokio::sync::watch::channel(demand);
+        context.live = Some(receiver);
+        let background = client.with_scan_context(context.clone());
+        let leader = background.fetch_viewer();
+        tokio::pin!(leader);
+        tokio::select! { biased;
+            _ = &mut leader => panic!("background saturated"),
+            _ = std::future::ready(()) => {}
+        }
+        let (follower_live, receiver) = tokio::sync::watch::channel(demand);
+        context.live = Some(receiver);
+        let joined = client.with_scan_context(context);
+        let follower = joined.fetch_viewer();
+        tokio::pin!(follower);
+        tokio::select! { biased;
+            _ = &mut follower => panic!("initializer is still queued"),
+            _ = std::future::ready(()) => {}
+        }
+        follower_live.send_modify(|demand| demand.as_mut().unwrap().class = ReadClass::Foreground);
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(leader, follower)
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.unwrap(), "fixture");
+        assert_eq!(second.unwrap(), "fixture");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        drop((a, b));
+    }
+
+    #[tokio::test]
+    async fn cold_viewer_preserves_existing_scan_promotion() {
+        use super::super::admission::{Bucket, LiveRead, ReadClass, ReadContext};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let mut context =
+            ReadContext::new(ReadClass::Background, std::time::Duration::from_secs(3));
+        let a = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, context.clone())
+            .await
+            .unwrap();
+        let b = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, context.clone())
+            .await
+            .unwrap();
+        let (live, receiver) = tokio::sync::watch::channel(Some(LiveRead {
+            class: ReadClass::Background,
+            deadline: context.deadline,
+        }));
+        context.live = Some(receiver);
+        let background = client.with_scan_context(context);
+        let leader = background.fetch_viewer();
+        tokio::pin!(leader);
+        tokio::select! { biased;
+            _ = &mut leader => panic!("background saturated"),
+            _ = std::future::ready(()) => {}
+        }
+        live.send_modify(|demand| demand.as_mut().unwrap().class = ReadClass::Foreground);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), leader)
+                .await
+                .unwrap()
+                .unwrap(),
+            "fixture"
+        );
+        drop((a, b));
+    }
+
+    #[tokio::test]
+    async fn cancelled_viewer_joiner_restores_background_priority() {
+        use super::super::admission::{Bucket, ReadClass, ReadContext};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).await;
+        let background = client.with_read_context(ReadContext::new(
+            ReadClass::Background,
+            std::time::Duration::from_secs(3),
+        ));
+        let a = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, background.read_context())
+            .await
+            .unwrap();
+        let b = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, background.read_context())
+            .await
+            .unwrap();
+        let c = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, client.read_context())
+            .await
+            .unwrap();
+        let d = client
+            .read_transport
+            .admission
+            .read(Bucket::Graphql, client.read_context())
+            .await
+            .unwrap();
+        let leader = background.fetch_viewer();
+        tokio::pin!(leader);
+        tokio::select! { biased;
+            _ = &mut leader => panic!("background saturated"),
+            _ = std::future::ready(()) => {}
+        }
+        {
+            let follower = client.fetch_viewer();
+            tokio::pin!(follower);
+            tokio::select! { biased;
+                _ = &mut follower => panic!("total saturated"),
+                _ = std::future::ready(()) => {}
+            }
+            tokio::select! { biased;
+                _ = &mut leader => panic!("total saturated"),
+                _ = std::future::ready(()) => {}
+            }
+        }
+        drop((c, d));
+        tokio::select! { biased;
+            _ = &mut leader => panic!("cancelled foreground cannot promote background"),
+            _ = std::future::ready(()) => {}
+        }
+        {
+            let demand = client.viewer_demand.lock().unwrap();
+            assert_eq!(demand.foreground, 0);
+            assert!(!*demand.priority.borrow());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        drop((a, b));
+        assert_eq!(leader.await.unwrap(), "fixture");
+        // Independent immutable account owners cannot inherit the cached login.
+        assert!(client_for(&server).await.viewer.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn cold_viewer_foreground_promotes_background_initializer() {
+        use super::super::admission::{Bucket, ReadClass, ReadContext};
+        for metered in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":{"viewer":{"login":"fixture"}}})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client_for(&server).await;
+            let context =
+                ReadContext::new(ReadClass::Background, std::time::Duration::from_secs(3));
+            let held_a = client
+                .read_transport
+                .admission
+                .read(Bucket::Graphql, context.clone())
+                .await
+                .unwrap();
+            let held_b = client
+                .read_transport
+                .admission
+                .read(Bucket::Graphql, context.clone())
+                .await
+                .unwrap();
+            let background = client.with_read_context(context);
+            let budget = crate::github::budget::Budget::seeded_for_test(100, 0);
+            let leader = async {
+                if metered {
+                    background.stats_viewer_metered(&budget).await
+                } else {
+                    background.fetch_viewer().await
+                }
+            };
+            tokio::pin!(leader);
+            tokio::select! { biased;
+                _ = &mut leader => panic!("background identity escaped saturation"),
+                _ = std::future::ready(()) => {}
+            }
+            let foreground = client.with_read_context(ReadContext::new(
+                ReadClass::Foreground,
+                std::time::Duration::from_secs(1),
+            ));
+            let (bg, fg) = tokio::join!(leader, foreground.fetch_viewer());
+            assert!(
+                fg.is_ok(),
+                "foreground cannot wait behind background admission: {fg:?}"
+            );
+            assert!(bg.is_ok());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            drop((held_a, held_b));
+        }
     }
 
     #[tokio::test]

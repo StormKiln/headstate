@@ -1,3 +1,5 @@
+import { useClaudeUsageProfile, useClaudeIndexCoverage } from "../api/hooks";
+import { CorpusProgress } from "./CorpusProgress";
 import { PossibleProcessEvidence } from "./PossibleProcessEvidence";
 import { possibleProcessLabel } from "@/lib/possibleProcesses";
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
@@ -251,7 +253,7 @@ import { SessionTabs } from "./transcript/SessionTabs";
 /// first and an error arm after it is unreachable in the case it exists
 /// for.
 export function ClaudeCodePage() {
-  const { list, imported, now, rescan } = useClaudeSessions(true);
+  const { list, imported, now, rescan, cancelPopulation } = useClaudeSessions(true);
   const { all, matched } = useMatchedSessions();
   const selected = useFilters((f) => f.claudeSelected);
   const selectSession = useFilters((f) => f.selectClaudeSession);
@@ -315,6 +317,7 @@ export function ClaudeCodePage() {
         registryUnnamed={list.data?.registry_unnamed ?? []}
         imported={imported}
         onRescan={rescan}
+        onCancel={cancelPopulation}
       />
       <div className={isMobile ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1"}>
         {/* The phone's mount point for the list (#939). On the desktop it
@@ -1211,13 +1214,21 @@ function Banners({
   registryUnnamed,
   imported,
   onRescan,
+  onCancel,
 }: {
   registryFailure: string | null;
   registryUnreadable: string[];
   registryUnnamed: string[];
   imported: ReturnType<typeof useClaudeSessions>["imported"];
   onRescan: () => Promise<void>;
+  onCancel: () => Promise<void>;
 }) {
+  const usage = useClaudeUsageProfile(true, imported.isFetching);
+  const index = useClaudeIndexCoverage();
+  const progress = [usage.data?.population, index.data?.population].filter((p) => p != null);
+  const actionable = progress.length > 0 ? progress : [imported.data?.population];
+  const unfinished = actionable.some((p) => p && ["running", "deferred", "timed_out", "invalidated"].includes(p.status));
+  const paused = !unfinished && actionable.some((p) => p?.status === "cancelled");
   const partial =
     imported.data &&
     (imported.data.unreadable_dirs.length > 0 ||
@@ -1297,17 +1308,28 @@ function Banners({
           sessions below are whatever was already stored, so newer ones may be missing.
         </div>
       ) : null}
+      {progress.map((p, i) => <div key={i} className="text-xs text-[#8b949e]"><CorpusProgress progress={p} /></div>)}
+      {progress.length === 0 && imported.data?.population ? (
+        <div className="text-xs text-[#8b949e]">Last scan: <CorpusProgress progress={imported.data.population} /></div>
+      ) : null}
       {partial && imported.data ? (
         <div
           role="status"
           className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
         >
-          {imported.data.sessions.toLocaleString()} sessions read, but{" "}
-          {imported.data.unreadable_dirs.length + imported.data.unreadable_files.length} could
-          not be — this list is incomplete by an unknown amount.
+          {imported.data.sessions.toLocaleString()} sessions read.
+          {imported.data.unreadable_dirs.length + imported.data.unreadable_files.length > 0
+            ? ` ${imported.data.unreadable_dirs.length + imported.data.unreadable_files.length} could not be read — this list is incomplete by an unknown amount.`
+            : ""}
+          {imported.data.write_failures.length > 0 ? ` ${imported.data.write_failures.length.toLocaleString()} database writes failed; previously accepted records are retained.` : ""}
         </div>
       ) : null}
       <div className="flex items-center gap-2">
+        {imported.isFetching || unfinished ? (
+          <button type="button" className="tap-target text-xs text-[#e6edf3]" onClick={() => {
+            void onCancel().catch((e: unknown) => toast.error("Could not cancel the scan", { description: errorMessage(e) }));
+          }}>{imported.isFetching ? "Cancel scan" : "Pause scan"}</button>
+        ) : null}
         <button
           type="button"
           onClick={() => void onRescan()}
@@ -1328,7 +1350,7 @@ function Banners({
             ? imported.data === undefined
               ? "Scanning…"
               : "Rescanning…"
-            : "Rescan transcripts"}
+            : paused ? "Resume scan" : "Rescan transcripts"}
         </button>
         {/* The measurement, shown rather than only claimed -- the same
             reason `Scan` carries `elapsed_ms`: it keeps the "no

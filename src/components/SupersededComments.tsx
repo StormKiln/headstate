@@ -1,3 +1,4 @@
+import { usePrFindExpanded } from "./prFindContext";
 import { commentKeys } from "../lib/commentIdentity";
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
@@ -24,7 +25,9 @@ export function SupersededGroup({
   comments: readonly PrComment[];
   truncated: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const findExpanded = usePrFindExpanded();
+  const [manualOpen, setOpen] = useState(false);
+  const open = manualOpen || findExpanded;
   const keys = commentKeys(comments);
   const label = supersededLabel(comments.length, truncated);
 
@@ -34,6 +37,8 @@ export function SupersededGroup({
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
+        disabled={findExpanded}
+        aria-description={findExpanded ? "Clear Find to collapse this content." : undefined}
         // `tap-target`: the 44px floor on a phone, and nothing on the
         // desktop (the class is scoped to the phone breakpoint).
         className="tap-target flex w-fit items-center gap-1.5 rounded px-1 py-0.5 text-xs text-[#8b949e] hover:bg-[#161b22] hover:text-[#e6edf3]"

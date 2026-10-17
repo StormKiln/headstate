@@ -25,6 +25,7 @@ pub struct ReadContext {
     pub(crate) first_attempt: Option<FirstAttempt>,
     pub(crate) advisory_context: Option<crate::remote::context::DispatchContext>,
     pub(super) live: Option<tokio::sync::watch::Receiver<Option<LiveRead>>>,
+    pub(super) identity_priority: Option<tokio::sync::watch::Receiver<bool>>,
 }
 impl ReadContext {
     pub fn new(class: ReadClass, budget: Duration) -> Self {
@@ -35,6 +36,7 @@ impl ReadContext {
             first_attempt: None,
             advisory_context: None,
             live: None,
+            identity_priority: None,
         }
     }
 }
@@ -447,8 +449,9 @@ impl Admission {
         context: ReadContext,
     ) -> Result<Attempt<'_>, ClientError> {
         let mut live = context.live.clone();
+        let mut identity_priority = context.identity_priority.clone();
         loop {
-            let demand = match &mut live {
+            let mut demand = match &mut live {
                 Some(receiver) => (*receiver.borrow_and_update())
                     .ok_or_else(|| refused("shared read has no live consumers"))?,
                 None => LiveRead {
@@ -456,6 +459,13 @@ impl Admission {
                     deadline: context.deadline,
                 },
             };
+            // Identity sharing composes with (and never replaces) scan demand.
+            if identity_priority
+                .as_mut()
+                .is_some_and(|priority| *priority.borrow_and_update())
+            {
+                demand.class = ReadClass::Foreground;
+            }
             let deadline = demand.deadline;
             let acquire = async {
                 loop {
@@ -518,21 +528,29 @@ impl Admission {
                 }
             };
             let wait = tokio::time::timeout_at(deadline, acquire);
-            if let Some(receiver) = &mut live {
-                tokio::select! {
-                    biased;
-                    changed = receiver.changed() => {
-                        if changed.is_err() { return Err(refused("shared read demand closed")); }
-                        // Dropping only this pre-dispatch acquisition releases
-                        // any partial permits; attempts have not been debited.
-                        continue;
+            tokio::select! {
+                biased;
+                changed = async {
+                    match &mut live {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
                     }
-                    result = wait => return result.map_err(|_| refused("read deadline elapsed before dispatch"))?,
+                } => {
+                    if changed.is_err() { return Err(refused("shared read demand closed")); }
+                    continue;
                 }
-            } else {
-                return wait
-                    .await
-                    .map_err(|_| refused("read deadline elapsed before dispatch"))?;
+                changed = async {
+                    match &mut identity_priority {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() { return Err(refused("identity demand closed")); }
+                    continue;
+                }
+                // Only pre-dispatch acquisition is restarted. Partial permits
+                // are released and no attempts have yet been debited.
+                result = wait => return result.map_err(|_| refused("read deadline elapsed before dispatch"))?,
             }
         }
     }

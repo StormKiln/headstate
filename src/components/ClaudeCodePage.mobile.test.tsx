@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  PopulationProgress,
   ClaudeSession,
   ClaudeSessionDetail,
   ClaudeSessionList,
@@ -47,9 +48,11 @@ vi.mock("@/lib/target", () => ({ IS_MOBILE_BUILD: true, IS_DESKTOP_BUILD: false 
 const copyFn = vi.hoisted(() => vi.fn(() => Promise.resolve(null as string | null)));
 const revealFn = vi.hoisted(() => vi.fn(() => Promise.resolve("/code/app")));
 const refetchFn = vi.hoisted(() => vi.fn());
+const cancelPopulationFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const rescanFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 
 const state = vi.hoisted(() => ({
+  population: undefined as PopulationProgress | undefined,
   list: undefined as ClaudeSessionList | undefined,
   now: Date.parse("2026-09-13T12:00:00Z"),
   /// #959 and #982. Both commands are `Class::Read`, so unlike the two
@@ -79,6 +82,8 @@ const state = vi.hoisted(() => ({
 vi.mock("../api/hooks", () => ({
   // #1477's "active now" set: no session nudged in this file.
   useSessionActivity: () => new Set<string>(),
+  useClaudeUsageProfile: () => ({ data: state.population ? { population: state.population } : undefined }),
+  useClaudeIndexCoverage: () => ({ data: undefined }),
   // #1280's reverse lookup. `off` -- nothing typed here is a pull
   // request reference -- which is what every assertion in this file
   // assumes; `ClaudeCodePage.test.tsx` is where the other states are
@@ -99,6 +104,7 @@ vi.mock("../api/hooks", () => ({
     imported: { data: undefined, isError: false, isFetching: false, error: undefined },
     now: state.now,
     rescan: rescanFn,
+    cancelPopulation: cancelPopulationFn,
   }),
   useWorktrees: () => ({ data: undefined, isError: false, error: undefined }),
   useClaudeSessionUsage: (path: string | null) => ({
@@ -216,6 +222,9 @@ const listOf = (sessions: ClaudeSession[]): ClaudeSessionList => ({
 });
 
 beforeEach(() => {
+  state.population = undefined;
+  cancelPopulationFn.mockClear();
+  rescanFn.mockClear();
   state.details.clear();
   state.detailAskedFor = [];
   state.list = listOf([session()]);
@@ -686,4 +695,16 @@ it("shows possible processes on the phone list without hover or process authorit
   expect(screen.getAllByText(/pid 4242 · folder unknown/).length).toBeGreaterThan(0);
   expect(screen.getAllByText(/folder truncated/).length).toBeGreaterThan(0);
   expect(screen.queryByRole("button", { name: /^Stop/ })).toBeNull();
+});
+
+it("shows remote progress and pauses or resumes corpus work on the phone", () => {
+  state.population = { phase: "usage", status: "running", total: 10, total_known: true, completed: 3, unchanged: 2, failed: 0, remaining: 7 };
+  const view = render(<ClaudeCodePage />);
+  expect(screen.getByText(/3 sessions measured of 10/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Pause scan" }));
+  expect(cancelPopulationFn).toHaveBeenCalledOnce();
+  state.population = { ...state.population, status: "cancelled" };
+  view.rerender(<ClaudeCodePage />);
+  fireEvent.click(screen.getByRole("button", { name: "Resume scan" }));
+  expect(rescanFn).toHaveBeenCalledOnce();
 });

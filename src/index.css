@@ -316,3 +316,7 @@ body,
   padding-right: env(safe-area-inset-right);
 }
 
+
+::highlight(pr-find) { background: #9e6a03; color: #ffffff; }
+::highlight(pr-find-active) { background: #f2cc60; color: #0d1117; }
+[data-pr-find-active] { outline: 1px solid #d29922; outline-offset: 4px; }

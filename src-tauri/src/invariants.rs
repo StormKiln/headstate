@@ -1893,6 +1893,133 @@ static TABLE: &str = HIT_none_3;
         );
     }
 
+    /// Follow only a function's returned bare call, never incidental setup calls.
+    /// Blocking closures may retain an admission permit before that final call.
+    fn command_tail_delegates(src: &str) -> std::collections::BTreeMap<String, String> {
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<_> = src.lines().collect();
+        let mut out = std::collections::BTreeMap::new();
+        for (i, line) in lines.iter().enumerate() {
+            if is_comment(line) || fn_declared(line).is_none() {
+                continue;
+            }
+            let Some((name, first, end)) = fn_around(&lines, i) else {
+                continue;
+            };
+            if first != i {
+                continue;
+            }
+            let code: Vec<_> = lines[first..end]
+                .iter()
+                .filter(|line| !is_comment(line) && !line.trim().is_empty())
+                .map(|line| line.trim())
+                .collect();
+            let tail = if let Some(at) = code
+                .iter()
+                .position(|line| line.contains("spawn_blocking(move || "))
+            {
+                let after = code[at].split_once("spawn_blocking(move || ").unwrap().1;
+                if after.starts_with('{') {
+                    let Some(close) = code
+                        .iter()
+                        .enumerate()
+                        .skip(at + 1)
+                        .find(|(_, line)| line.starts_with("})"))
+                        .map(|(at, _)| at)
+                    else {
+                        continue;
+                    };
+                    code[close - 1]
+                } else {
+                    after
+                }
+            } else {
+                let Some(tail) = code.iter().rev().find(|line| **line != "}") else {
+                    continue;
+                };
+                tail
+            };
+            let Some((target, _)) = tail.split_once('(') else {
+                continue;
+            };
+            if !target.is_empty()
+                && target
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.insert(name.to_owned(), target.to_owned());
+            }
+        }
+        let declared: std::collections::BTreeSet<_> = lines
+            .iter()
+            .filter(|line| !is_comment(line))
+            .filter_map(|line| fn_declared(line))
+            .collect();
+        out.retain(|_, target| declared.contains(target.as_str()));
+        out
+    }
+
+    fn desktop_delegate_targets(
+        delegates_to: &std::collections::BTreeMap<String, String>,
+        rust: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let rust = rust
+            .lines()
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut desktop_targets: std::collections::BTreeSet<String> = delegates_to
+            .keys()
+            .filter(|name| rust.contains(&format!("commands::{name}(")))
+            .cloned()
+            .collect();
+        loop {
+            let additions: Vec<_> = desktop_targets
+                .iter()
+                .filter_map(|name| delegates_to.get(name))
+                .filter(|target| !desktop_targets.contains(*target))
+                .cloned()
+                .collect();
+            if additions.is_empty() {
+                break;
+            }
+            desktop_targets.extend(additions);
+        }
+        desktop_targets
+    }
+
+    #[test]
+    fn command_tail_delegation_tracks_guarded_closures_and_shared_wrappers() {
+        let source = "pub async fn command() {\n    spawn_blocking(move || {\n        let _permit = permit;\n        shared(&db, &control)\n    })\n    .await\n}\npub fn timer() {\n    let _permit = acquire();\n    shared(db, &control)\n}\nfn unrelated() {\n    shared(db, &control);\n    Ok(())\n}\nfn shared() {\n    Ok(())\n}\n";
+        let calls = command_tail_delegates(source);
+        assert!(desktop_delegate_targets(&calls, "commands::timer(db)").contains("shared"));
+        assert!(!desktop_delegate_targets(&calls, "").contains("shared"));
+        assert!(!desktop_delegate_targets(&calls, "// commands::timer(db)").contains("shared"));
+        assert!(!desktop_delegate_targets(&calls, "commands::unrelated(db)").contains("shared"));
+
+        assert_eq!(calls.get("command").map(String::as_str), Some("shared"));
+        assert_eq!(calls.get("timer").map(String::as_str), Some("shared"));
+        assert_ne!(calls.get("unrelated").map(String::as_str), Some("shared"));
+        let sabotaged = source.replace("    shared(db, &control)\n", "    Ok(())\n");
+        assert_ne!(
+            command_tail_delegates(&sabotaged)
+                .get("timer")
+                .map(String::as_str),
+            Some("shared")
+        );
+        let commented = source.replace(
+            "        shared(&db, &control)",
+            "        // shared(&db, &control)\n        Ok(())",
+        );
+        assert_ne!(
+            command_tail_delegates(&commented)
+                .get("command")
+                .map(String::as_str),
+            Some("shared")
+        );
+        assert_eq!(command_tail_delegates(&source.replace('\n', "\r\n")), calls);
+    }
+
     // ---- Invariant 8: a wall-clock test that disclaims one -----------------
 
     /// A test whose doc comment disclaims a timing threshold does not
@@ -2489,29 +2616,26 @@ static TABLE: &str = HIT_none_3;
         // A command whose body is a thin wrapper over a shared function
         // is reachable when that FUNCTION is called, not the command.
         // `claude_poll_live` is the case: it and the background timer
-        // both call `claude_live_pass`, so the ordering rules inside it
+        // converge on `claude_live_pass_controlled`, so its ordering rules
         // exist once rather than twice (#947). Requiring the command
         // name here would push a caller into wrapping the async command
         // just to satisfy a guard, which is the wrong shape.
         //
         // Discovered from the source rather than listed: the body of a
-        // one-line delegating command names the function it forwards to,
-        // so a command is also reachable if some production Rust calls
-        // any `fn` that `commands.rs` shows it delegating to.
+        // command's returned call names its delegated function, including
+        // a blocking closure that holds an admission permit. Follow the
+        // timer's returned-call chain too, without counting setup helpers.
         let commands_src =
             std::fs::read_to_string(manifest.join("src/commands.rs")).expect("read commands.rs");
-        let delegates_to = |name: &str| -> Option<String> {
-            let at = commands_src.find(&format!("pub async fn {name}("))?;
-            let body = &commands_src[at..];
-            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
-            // `spawn_blocking(move || some_fn(..))` -- the shape the
-            // extraction in #947 produced. Everything after the marker,
-            // up to the first `(`, is the delegated function's name.
-            let marker = "spawn_blocking(move || ";
-            let after = body.split_once(marker)?.1;
-            let name = after.split_once('(')?.0.trim();
-            (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
-        };
+        let delegates_to = command_tail_delegates(&commands_src);
+        let desktop_targets = desktop_delegate_targets(&delegates_to, &rust);
+        assert!(desktop_targets.contains("claude_live_pass_controlled"));
+        let without_timer = rust.replace("commands::claude_live_pass(", "removed_live_pass(");
+        assert!(
+            !desktop_delegate_targets(&delegates_to, &without_timer)
+                .contains("claude_live_pass_controlled"),
+            "removing the actual desktop timer call must remove shared live-pass reachability"
+        );
 
         // EMPTY, and #964 is why.
         //
@@ -2552,8 +2676,10 @@ static TABLE: &str = HIT_none_3;
                 continue;
             }
             // The delegation case described above.
-            if let Some(target) = delegates_to(name) {
-                if !target.is_empty() && rust.contains(&format!("commands::{target}(")) {
+            if let Some(target) = delegates_to.get(name) {
+                if desktop_targets.contains(target)
+                    || rust.contains(&format!("commands::{target}("))
+                {
                     continue;
                 }
             }
@@ -4445,16 +4571,16 @@ fn suggestion(f: &Finding) -> String {
         (
             "src-tauri/claude/search.rs",
             "real_corpus",
-            "real_corpus",
-            ".execute_batch(",
-            "checkpoints the probe-owned TempDir database",
+            "index_pass_controlled",
+            ".execute(",
+            "indexes only through the caller's probe-owned TempDir database connection",
         ),
         (
             "src-tauri/claude/search.rs",
             "real_corpus",
-            "index_pass",
-            ".execute(",
-            "indexes into the probe-owned TempDir database",
+            "real_corpus",
+            ".execute_batch(",
+            "checkpoints the probe-owned TempDir database",
         ),
         (
             "src-tauri/claudemd/advice/transcripts.rs",

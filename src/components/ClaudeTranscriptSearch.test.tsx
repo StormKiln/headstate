@@ -243,3 +243,17 @@ describe("hits", () => {
     expect(screen.getByText(/only the first 8 mb of this transcript was indexed/i)).toBeTruthy();
   });
 });
+
+it("does not claim complete coverage when the population pass was cancelled", () => {
+  state.coverage = coverage({ population: { status: "cancelled", total: 1482, total_known: true, completed: 1482, unchanged: 1482, failed: 0, remaining: 0 } });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.queryByText(/All 1,482 sessions are searchable/)).toBeNull();
+  expect(screen.getByText(/Scan cancelled/)).toBeTruthy();
+});
+
+it("distinguishes a known empty corpus from an unknown denominator", () => {
+  state.coverage = coverage({ indexed: 0, total: 0, population: { status: "complete", total: 0, total_known: true, completed: 0, unchanged: 0, failed: 0, remaining: 0 } });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.getByText(/No session transcripts were found/)).toBeTruthy();
+  expect(screen.queryByText(/size of the transcript corpus is not known/)).toBeNull();
+});

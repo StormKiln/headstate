@@ -643,3 +643,55 @@ it.each(["head", "base"] as const)("never enables Merge from a clean approval re
   await waitFor(() => expect(screen.getAllByRole("button", { name: "Merge" }).every(button => !button.matches(":disabled"))).toBe(true));
   expect(pending).toHaveLength(2);
 });
+
+it.each(["pr", "account"])("isolates pending re-run and its late settlement across a %s switch", async identity => {
+  const base = invoke.getMockImplementation()!;
+  const pending: (() => void)[] = [];
+  invoke.mockImplementation((name, args) => {
+    if (name === "get_pr_detail") return Promise.resolve({ ...detail(args?.number as number), checks: [{ name: "failed CI", state: "failure", run_id: 55, url: "" }] });
+    if (name === "rerun_checks") return new Promise<void>(resolve => pending.push(resolve));
+    return base(name, args);
+  });
+  const view = mount(); await loadedChecks();
+  fireEvent.click(screen.getByRole("button", { name: "Re-run failed" }));
+  await waitFor(() => expect(pending).toHaveLength(1));
+  expect(screen.getByRole("button", { name: "Working…" }).matches(":disabled")).toBe(true);
+  if (identity === "pr") view.rerender(<QueryClientProvider client={qc}><PrDetailView repo="octocat/hello-world" number={8} onBack={() => {}} /></QueryClientProvider>);
+  else await act(async () => qc.setQueryData(["viewer"], "another-reviewer"));
+  await screen.findByRole("button", { name: "Re-run failed" });
+  fireEvent.click(screen.getByRole("button", { name: "Re-run failed" }));
+  await waitFor(() => expect(pending).toHaveLength(2));
+  await act(async () => pending[0]());
+  expect(screen.getByRole("button", { name: "Working…" }).matches(":disabled")).toBe(true);
+  await act(async () => pending[1]());
+  await screen.findByRole("button", { name: "Re-run failed" });
+  async function loadedChecks() { await screen.findByText("failed CI"); await waitFor(() => expect(qc.getQueryData(["viewer"])).toBe("reviewer")); }
+});
+
+it.each([1200, 390])("searches the mounted PR without fetching or losing drafts at width %s", async width => {
+  stubViewport(width);
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation((name, args) => name === "get_pr_detail" ? Promise.resolve({
+    ...detail(args?.number as number), body: "Description needle **phrase**",
+    comments: [{ id: "C_1", author: "robot", body: "Collapsed needle **phrase**", created_at: "2026-10-17T00:00:00Z" }, { id: "C_2", author: "human", body: "Other discussion", created_at: "2026-10-17T01:00:00Z" }], comment_count: 5,
+  }) : base(name, args));
+  const view = mount(); await screen.findByText("Description needle", { exact: false });
+  const draft = screen.getByRole("textbox") as HTMLTextAreaElement;
+  fireEvent.change(draft, { target: { value: "Keep my review draft" } }); draft.focus();
+  const before = invoke.mock.calls.length;
+  fireEvent.keyDown(window, { key: "f", metaKey: true });
+  const search = await screen.findByRole("searchbox", { name: "Find in pull request" });
+  fireEvent.change(search, { target: { value: "needle phrase" } });
+  await screen.findByText("1 of 2");
+  fireEvent.keyDown(search, { key: "Enter" });
+  expect(screen.getByText("2 of 2")).toBeTruthy();
+  expect(screen.getByText(/Some content is not loaded/)).toBeTruthy();
+  await act(async () => qc.setQueryData(key, { ...qc.getQueryData<PrDetail>(key)!, merge_status: "blocked" }));
+  expect(screen.getByText("2 of 2")).toBeTruthy();
+  expect(document.activeElement).toBe(search);
+  fireEvent.keyDown(search, { key: "Escape" });
+  expect(document.activeElement).toBe(draft); expect(draft.value).toBe("Keep my review draft");
+  expect(invoke.mock.calls.length).toBe(before);
+  view.rerender(<QueryClientProvider client={qc}><PrDetailView repo="octocat/hello-world" number={8} onBack={() => {}} /></QueryClientProvider>);
+  expect(screen.queryByRole("searchbox")).toBeNull();
+});

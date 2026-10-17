@@ -169,6 +169,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "claude-session-activity",
     // Opaque watch ID, byte size, sequence only; shares the main activity event cap.
     "claude-transcript-activity",
+    // Payload-free receipt for already-allowlisted local population summaries.
+    "claude-population-updated",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

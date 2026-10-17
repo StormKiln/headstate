@@ -1058,6 +1058,21 @@ describe("the token usage card", () => {
     expect(screen.getByText(/summed over 3 measured sessions/)).toBeTruthy();
   });
 
+  it("shows unfinished population even before any usage was measured", () => {
+    state.usage = profile({ sessionsMeasured: 0, population: { status: "deferred", total: 5, total_known: true, completed: 0, unchanged: 0, failed: 0, remaining: 5 } });
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText(/Scan has work remaining/)).toBeTruthy();
+    expect(screen.queryByText("Tokens across your sessions")).toBeNull();
+  });
+
+  it("labels retained measurements without claiming a current floor", () => {
+    state.usage = profile({ sessionsTruncated: 1, freshSessions: 1, staleSessions: 1, unknownSessions: 1 });
+    render(<ClaudeOverviewPage />);
+    expect(screen.getByText(/1 current, 1 stale, 1 not checked/)).toBeTruthy();
+    expect(screen.getByText(/Last accepted measurements/)).toBeTruthy();
+    expect(screen.queryByText("at least 2,000")).toBeNull();
+  });
+
   /// A truncated measurement makes the whole sum a FLOOR, and the card
   /// uses the "at least" idiom this codebase already applies wherever a
   /// measurement is short.

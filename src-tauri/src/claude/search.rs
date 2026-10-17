@@ -88,7 +88,7 @@
 //! Not luck; the reason is worth stating so it is not lost.
 //!
 //! **0.06 GB, not 0.83 GB.** #1203 expected "a second copy of 881 MB of
-//! text in the database". It is 7% of that, because [`readable_text`]
+//! text in the database". It is 7% of that, because [`readable_text_controlled`]
 //! indexes the human text -- user prompts and assistant messages -- and
 //! not the raw JSONL. The uuids, key names, tool payloads and base64
 //! blobs that make up most of a transcript's bytes are not things
@@ -292,6 +292,8 @@ pub struct Hit {
 /// sentences the UI writes name them individually.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Coverage {
+    #[serde(default)]
+    pub population: Option<super::transcript::PopulationProgress>,
     /// Sessions whose content is in the index right now.
     pub indexed: u64,
     /// Session transcripts the last scan found on disk. The
@@ -368,6 +370,8 @@ impl Coverage {
 /// not a silent absence.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Indexed {
+    #[serde(default)]
+    pub population: super::transcript::PopulationProgress,
     /// Sessions whose content was written to the index this pass.
     pub indexed: usize,
     /// Sessions skipped because the ledger says they are unchanged.
@@ -411,7 +415,8 @@ pub struct Indexed {
 impl Indexed {
     /// Whether anything could not be read or written.
     pub fn is_partial(&self) -> bool {
-        !self.unreadable.is_empty()
+        self.population.status != super::transcript::PopulationStatus::Complete
+            || !self.unreadable.is_empty()
             || !self.scan_unreadable.is_empty()
             || !self.write_failures.is_empty()
     }
@@ -425,6 +430,7 @@ impl Indexed {
     pub fn all_unreadable(&self) -> Vec<String> {
         let mut out = self.unreadable.clone();
         out.extend(self.scan_unreadable.iter().cloned());
+        out.extend(self.write_failures.iter().cloned());
         out
     }
 }
@@ -440,15 +446,26 @@ impl Indexed {
 ///
 /// Returns the text twice: as written, and masked as a phone would be
 /// shown it (#1519), each string masked on its own -- see [`Readable`].
-fn readable_text(path: &Path, budget: u64) -> Result<Readable, String> {
+fn readable_text_controlled(
+    path: &Path,
+    budget: u64,
+    control: &super::transcript::PopulationControl,
+) -> Result<Readable, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let reader = super::transcript::ControlledReader {
+        inner: file,
+        control,
+    };
+    let mut reader = BufReader::new(std::io::Read::take(reader, budget));
 
     let mut out = Readable::default();
     let mut read: u64 = 0;
     let mut line = String::new();
     loop {
+        if control.stopped() {
+            return Err(format!("{}: indexing cancelled", path.display()));
+        }
         line.clear();
         let n = match reader.read_line(&mut line) {
             Ok(0) => break,
@@ -473,7 +490,7 @@ fn readable_text(path: &Path, budget: u64) -> Result<Readable, String> {
     Ok(out)
 }
 
-/// One transcript's searchable text, as [`readable_text`] extracts it.
+/// One transcript's searchable text, as [`readable_text_controlled`] extracts it.
 #[derive(Debug, Default)]
 struct Readable {
     /// The text as written: what the desktop's own search matches.
@@ -534,15 +551,37 @@ fn collect_text(v: &serde_json::Value, out: &mut Readable) {
 ///
 /// Every failure is carried out, never swallowed. See [`Indexed`].
 pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, rusqlite::Error> {
+    index_pass_controlled(conn, scan, &super::transcript::PopulationControl::default())
+}
+
+pub(crate) fn index_pass_controlled(
+    conn: &mut Connection,
+    scan: &super::Scan,
+    control: &super::transcript::PopulationControl,
+) -> Result<Indexed, rusqlite::Error> {
+    let generation = super::transcript::population_generation(conn, "index")?;
+    let _activity = super::transcript::PopulationActivity::new(conn, "index", generation);
+
     let started = std::time::Instant::now();
     let mut out = Indexed {
+        population: super::transcript::PopulationProgress::new(
+            scan.sessions.len() + scan.unreadable_files.len(),
+            scan.unreadable_dirs.is_empty(),
+        ),
         // Carried through from the scan rather than dropped at this
         // boundary, for the reason the field's own doc gives: a session
         // the scan could not read is as absent from the index as one
         // this pass could not read.
-        scan_unreadable: scan.unreadable_files.clone(),
+        scan_unreadable: scan
+            .unreadable_files
+            .iter()
+            .chain(&scan.unreadable_dirs)
+            .cloned()
+            .collect(),
         ..Default::default()
     };
+    out.population.phase = super::transcript::PopulationPhase::Index;
+    super::transcript::persist_progress(conn, "index", generation, &out.population)?;
     let now = chrono::Utc::now().to_rfc3339();
 
     // The corpus size this pass observed, recorded FIRST and
@@ -552,9 +591,9 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
     // -- a complete index of nothing, which is exactly the reassuring
     // lie this module exists to prevent.
     conn.execute(
-        "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at)
-         VALUES (1, ?1, ?2)
-         ON CONFLICT(id) DO UPDATE SET corpus_sessions = ?1, last_pass_at = ?2",
+        "INSERT INTO claude_index_state (id, corpus_sessions, last_pass_at, incomplete)
+         VALUES (1, ?1, ?2, 1)
+         ON CONFLICT(id) DO UPDATE SET corpus_sessions = ?1, last_pass_at = ?2, incomplete = 1",
         // The denominator counts the transcripts that EXIST, not the
         // ones that parsed. A file the scan could not read is still a
         // session on disk the user may be searching for, and leaving it
@@ -570,39 +609,35 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
     // session: 1,482 point lookups against a 60-second budget is work
     // that buys nothing over one scan of a table with one row per
     // session.
-    let mut known: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
+    let mut known: std::collections::HashMap<String, (i64, String, String)> =
+        std::collections::HashMap::new();
     {
-        let mut q =
-            conn.prepare("SELECT session_id, size_bytes, mtime_ms FROM claude_index_ledger")?;
+        let mut q = conn.prepare(
+            "SELECT session_id, size_bytes, mtime_ns, source_path FROM claude_index_ledger",
+        )?;
         let rows = q.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (id, size, mtime) = row?;
-            known.insert(id, (size, mtime));
+            let (id, size, mtime, path) = row?;
+            known.insert(id, (size, mtime, path));
         }
     }
 
     // Which sessions need work, decided before any file is opened.
-    let mut todo: Vec<(&super::Transcript, i64, i64)> = Vec::new();
+    let mut todo: Vec<(&super::Transcript, i64, String)> = Vec::new();
     for t in &scan.sessions {
         let path = Path::new(&t.path);
         // A transcript whose metadata cannot be read is a known gap, not
         // a skip: it is reported here rather than silently left out of
         // the index, because a session missing from the index for an
         // unstated reason becomes an unexplained "no matches" later.
-        let (size, mtime) = match std::fs::metadata(path).and_then(|m| {
-            let mtime = m
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            Ok((m.len() as i64, mtime))
-        }) {
+        let (size, mtime) = match super::transcript::fingerprint(path) {
             Ok(v) => v,
             Err(e) => {
                 out.unreadable
@@ -611,16 +646,22 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
             }
         };
         match known.get(&t.session_id) {
-            Some((s, m)) if *s == size && *m == mtime => out.unchanged += 1,
+            Some((s, m, p)) if *s == size && *m == mtime && *p == t.path => out.unchanged += 1,
             _ => todo.push((t, size, mtime)),
         }
     }
 
     out.remaining = todo.len().saturating_sub(SESSIONS_PER_PASS);
 
-    let tx = conn.transaction()?;
     for (t, size, mtime) in todo.into_iter().take(SESSIONS_PER_PASS) {
-        let text = match readable_text(Path::new(&t.path), INDEX_BUDGET_BYTES) {
+        if control.stopped() || !super::transcript::generation_current(conn, "index", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(super::transcript::PopulationStatus::Invalidated);
+            finalize_index(conn, generation, &mut out)?;
+            return Ok(out);
+        }
+        let text = match readable_text_controlled(Path::new(&t.path), INDEX_BUDGET_BYTES, control) {
             Ok(v) => v,
             Err(e) => {
                 // THE reporting path #1145 asked for. Counted, carried
@@ -634,6 +675,23 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
             out.truncated += 1;
         }
 
+        // File I/O precedes writer admission. Dropping a failed transaction
+        // rolls back the body and its fingerprint together.
+        let after = super::transcript::fingerprint(Path::new(&t.path)).ok();
+        if after.as_ref() != Some(&(size, mtime.clone())) {
+            out.unreadable
+                .push(format!("{}: changed while indexing", t.path));
+            continue;
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
+            out.population.status = control
+                .stop_reason()
+                .unwrap_or(super::transcript::PopulationStatus::Invalidated);
+            drop(tx);
+            finalize_index(conn, generation, &mut out)?;
+            return Ok(out);
+        }
         // FTS5 has no partial-row update, so a re-index deletes and
         // re-inserts. Both statements in the same transaction, so a
         // reader never sees the gap between them -- a session that
@@ -660,11 +718,11 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
         }
         if let Err(e) = tx.execute(
             "INSERT INTO claude_index_ledger
-                (session_id, size_bytes, mtime_ms, truncated, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                (session_id, size_bytes, mtime_ms, truncated, indexed_at, mtime_ns, source_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(session_id) DO UPDATE SET
-                size_bytes = ?2, mtime_ms = ?3, truncated = ?4, indexed_at = ?5",
-            rusqlite::params![&t.session_id, size, mtime, truncated as i64, &now],
+                size_bytes = ?2, mtime_ms = ?3, truncated = ?4, indexed_at = ?5, mtime_ns = ?6, source_path = ?7",
+            rusqlite::params![&t.session_id, size, (mtime.parse::<u128>().unwrap_or_default() / 1_000_000) as i64, truncated as i64, &now, &mtime, &t.path],
         ) {
             out.write_failures.push(format!(
                 "{}: could not record that it is indexed: {e}",
@@ -673,6 +731,9 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
             continue;
         }
         out.indexed += 1;
+        out.population.completed = (out.indexed + out.unchanged) as u64;
+        super::transcript::persist_progress(&tx, "index", generation, &out.population)?;
+        tx.commit()?;
     }
 
     // Sessions whose transcript is GONE leave the index, so a search
@@ -689,20 +750,61 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
         .filter(|id| !present.contains(id.as_str()))
         .cloned()
         .collect();
-    for id in stale {
-        let _ = tx.execute(
+    let discovery_current = scan
+        .source_fingerprints
+        .iter()
+        .all(|(path, size, modified)| {
+            super::transcript::discovery_fingerprint(path, control)
+                .ok()
+                .as_ref()
+                == Some(&(*size, modified.clone()))
+        });
+    if !discovery_current {
+        out.population.status = control
+            .stop_reason()
+            .unwrap_or(super::transcript::PopulationStatus::Invalidated);
+        out.scan_unreadable
+            .push("corpus changed since discovery; prior index entries retained".into());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
+        out.population.status = control
+            .stop_reason()
+            .unwrap_or(super::transcript::PopulationStatus::Invalidated);
+        drop(tx);
+        finalize_index(conn, generation, &mut out)?;
+        return Ok(out);
+    }
+    for id in stale
+        .into_iter()
+        .filter(|_| discovery_current && !scan.is_partial() && scan.absent_root.is_none())
+    {
+        tx.execute(
             "DELETE FROM claude_transcript_fts WHERE session_id = ?1",
             rusqlite::params![&id],
-        );
-        let _ = tx.execute(
+        )?;
+        tx.execute(
             "DELETE FROM claude_index_ledger WHERE session_id = ?1",
             rusqlite::params![&id],
-        );
+        )?;
     }
 
+    tx.execute(
+        "UPDATE claude_index_state SET incomplete=?1 WHERE id=1",
+        [i64::from(out.is_partial() || out.remaining > 0)],
+    )?;
     tx.commit()?;
     out.elapsed_ms = started.elapsed().as_millis() as u64;
+    finalize_index(conn, generation, &mut out)?;
     Ok(out)
+}
+
+fn finalize_index(conn: &Connection, generation: i64, out: &mut Indexed) -> rusqlite::Result<()> {
+    out.population.completed = (out.indexed + out.unchanged) as u64;
+    out.population.unchanged = out.unchanged as u64;
+    out.population.failed = (out.unreadable.len() + out.write_failures.len()) as u64;
+    out.population.finish();
+    super::transcript::persist_progress(conn, "index", generation, &out.population)
 }
 
 /// What the index currently covers.
@@ -711,7 +813,10 @@ pub fn index_pass(conn: &mut Connection, scan: &super::Scan) -> Result<Indexed, 
 /// search is run -- "1,482 sessions searchable" is worth saying on an
 /// empty search box, and a number that only appears alongside results
 /// cannot be shown then.
-pub fn coverage(conn: &Connection, unreadable: Vec<String>) -> Result<Coverage, rusqlite::Error> {
+pub fn coverage(
+    conn: &Connection,
+    mut unreadable: Vec<String>,
+) -> Result<Coverage, rusqlite::Error> {
     let indexed: i64 =
         conn.query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r.get(0))?;
     let truncated: i64 = conn.query_row(
@@ -719,16 +824,20 @@ pub fn coverage(conn: &Connection, unreadable: Vec<String>) -> Result<Coverage, 
         [],
         |r| r.get(0),
     )?;
-    let state: Option<(i64, Option<String>)> = conn
+    let state: Option<(i64, Option<String>, bool)> = conn
         .query_row(
-            "SELECT corpus_sessions, last_pass_at FROM claude_index_state WHERE id = 1",
+            "SELECT corpus_sessions, last_pass_at, incomplete FROM claude_index_state WHERE id = 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let (total, last_indexed_at) = state.unwrap_or((0, None));
+    let (total, last_indexed_at, incomplete) = state.unwrap_or((0, None, true));
+    if incomplete && unreadable.is_empty() && indexed >= total {
+        unreadable.push("index population has unfinished or failed work".into());
+    }
 
     Ok(Coverage {
+        population: super::transcript::stored_progress(conn, "index")?,
         indexed: indexed as u64,
         total: total as u64,
         unreadable,
@@ -893,6 +1002,85 @@ mod tests {
         ));
         std::fs::write(&p, lines).unwrap();
         p
+    }
+
+    #[test]
+    fn stale_listing_discovery_race_cannot_delete_newer_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "oldneedle");
+        let old = crate::claude::corpus(dir.path());
+        write_session(dir.path(), "project", "new", "newneedle");
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        let result = index_pass(&mut conn, &old).unwrap();
+        assert!(result.is_partial());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM claude_index_ledger WHERE session_id='new'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn cancellation_retains_accepted_index_and_persists_incomplete_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "acceptedneedle");
+        let mut conn = db();
+        let scan = crate::claude::corpus(dir.path());
+        index_pass(&mut conn, &scan).unwrap();
+        let control = super::super::transcript::PopulationControl::default();
+        control.cancel();
+        let result = index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        assert!(result.is_partial());
+        assert!(!coverage(&conn, Vec::new()).unwrap().is_complete());
+        let resumed = index_pass(&mut conn, &scan).unwrap();
+        assert_eq!(resumed.unchanged, 1);
+        assert_eq!(resumed.indexed, 0);
+        assert!(coverage(&conn, Vec::new()).unwrap().is_complete());
+    }
+
+    #[test]
+    fn partial_discovery_preserves_prior_index_and_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "retainedneedle");
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        let partial = crate::claude::Scan {
+            unreadable_dirs: vec!["project: permission denied".into()],
+            ..Default::default()
+        };
+        let result = index_pass(&mut conn, &partial).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'retainedneedle'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        assert!(!coverage(&conn, result.all_unreadable())
+            .unwrap()
+            .is_complete());
+    }
+
+    #[test]
+    fn failed_ledger_write_rolls_back_body_and_commits_neighbor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "retainedneedle");
+        let mut conn = db();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        write_session(dir.path(), "project", "old", "replacementneedle longer");
+        write_session(dir.path(), "project", "neighbor", "neighborneedle");
+        conn.execute_batch("CREATE TRIGGER reject_ledger BEFORE UPDATE ON claude_index_ledger WHEN NEW.session_id = 'old' BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let result = index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        assert_eq!(result.indexed, 1);
+        assert_eq!(result.write_failures.len(), 1);
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM claude_transcript_fts WHERE session_id = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(body.contains("retainedneedle"), "{body}");
     }
 
     /// THE TEST. A query against a partially built index reports the
@@ -1920,6 +2108,7 @@ mod tests {
     #[test]
     fn a_stale_denominator_is_not_a_huge_backlog() {
         let cov = Coverage {
+            population: None,
             indexed: 10,
             total: 4,
             ..Default::default()

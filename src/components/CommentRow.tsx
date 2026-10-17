@@ -1,3 +1,4 @@
+import { usePrFindExpanded } from "./prFindContext";
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { Markdown } from "./Markdown";
@@ -23,7 +24,9 @@ export function CommentRow({
   body: string;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const findExpanded = usePrFindExpanded();
+  const [manualOpen, setOpen] = useState(defaultOpen);
+  const open = manualOpen || findExpanded;
   const preview = commentPreview(body);
 
   return (
@@ -32,6 +35,8 @@ export function CommentRow({
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
+        disabled={findExpanded}
+        aria-description={findExpanded ? "Clear Find to collapse this content." : undefined}
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-[#161b22]"
       >
         <ChevronRight
@@ -40,7 +45,7 @@ export function CommentRow({
           }`}
           aria-hidden="true"
         />
-        <span className="shrink-0 font-semibold text-[#e6edf3]">{author}</span>
+        <span data-pr-find-text className="shrink-0 font-semibold text-[#e6edf3]">{author}</span>
         <span className="shrink-0 text-[#8b949e]">{relativeTime(createdAt)}</span>
         {preview ? (
           <>

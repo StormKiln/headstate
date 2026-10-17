@@ -341,6 +341,7 @@ const ROWS: Row[] = [
   // absence of a parameter, is what keeps them from being "read anything
   // and send it back".
   row(api.claudeImportTranscripts, [], "claude_import_transcripts"),
+  row(api.claudeCancelPopulation, [], "claude_cancel_population"),
   // #1203. `Class::Read`: it walks `~/.claude/projects` without writing
   // and queries our own FTS5 index. The away-from-desk case is the same
   // one the session list serves -- the phone has no transcripts of its
@@ -573,6 +574,7 @@ describe("tauri.ts wrappers through the transport", () => {
 /// to each. The remote transport will re-emit them under these names,
 /// so the hooks must reach them through the seam and nowhere else.
 const POLL_EVENTS: [string, () => unknown][] = [
+  ["claude-population-updated", hooks.useClaudeUsageProfile],
   ["claude-transcript-activity", () => useTranscriptWatch(new TranscriptFollower(vi.fn()), path, true)],
   ["prs-updated", hooks.usePullRequests],
   ["poll-state", hooks.usePollState],

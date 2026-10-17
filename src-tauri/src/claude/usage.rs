@@ -534,6 +534,14 @@ pub fn summarise_whole(path: &Path) -> Result<Usage, String> {
     read_and_sum(path, None)
 }
 
+#[cfg(test)]
+type ReadObserver = std::cell::RefCell<Option<Box<dyn FnMut(usize)>>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static READ_OBSERVER: ReadObserver = const { std::cell::RefCell::new(None) };
+}
+
 /// The shared reader. `budget` of `None` reads to the end of the file.
 ///
 /// One body rather than two, because every rule this module enforces --
@@ -541,6 +549,14 @@ pub fn summarise_whole(path: &Path) -> Result<Usage, String> {
 /// saturating adds -- has to hold identically on both paths, and two
 /// copies is how one of them quietly stops holding.
 fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
+    read_and_sum_cancellable(path, budget, &|| false)
+}
+
+pub(crate) fn read_and_sum_cancellable(
+    path: &Path,
+    budget: Option<u64>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Usage, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("{}: could not open it: {e}", path.display()))?;
     let file_bytes = file
@@ -549,20 +565,30 @@ fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
         .len();
 
     let mut buf = Vec::new();
-    match budget {
-        Some(limit) => (&mut file)
-            .take(limit)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?,
-        // No `take`. The file is read to its end, so `truncated` below is
-        // false and `bytes_read == file_bytes` -- unless the file GREW
-        // between the `metadata` call and the read, which is real for a
-        // live session and is handled by the `<` comparison rather than by
-        // an equality assumption.
-        None => file
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?,
-    };
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if cancelled() {
+            return Err(format!("{}: usage measurement cancelled", path.display()));
+        }
+        let remaining = budget.unwrap_or(u64::MAX).saturating_sub(buf.len() as u64);
+        if remaining == 0 {
+            break;
+        }
+        let count = remaining.min(chunk.len() as u64) as usize;
+        let n = file
+            .read(&mut chunk[..count])
+            .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        #[cfg(test)]
+        READ_OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(n);
+            }
+        });
+    }
 
     let mut out = Usage {
         bytes_read: buf.len() as u64,
@@ -591,6 +617,9 @@ fn read_and_sum(path: &Path, budget: Option<u64>) -> Result<Usage, String> {
 
     let mut models: Vec<ModelCount> = Vec::new();
     for line in lines {
+        if cancelled() {
+            return Err(format!("{}: usage measurement cancelled", path.display()));
+        }
         // The `cost-state` pre-filter (#1210), tested before the token
         // one because the two select disjoint records and the token
         // filter would reject this line. See the doc above on why
@@ -824,6 +853,20 @@ mod tests {
         format!(
             r#"{{"type":"assistant","message":{{"role":"assistant","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":{read},"cache_creation_input_tokens":{create},"service_tier":"standard"}}}}}}"#
         )
+    }
+
+    #[test]
+    fn cancellation_during_a_whole_file_read_returns_no_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.jsonl");
+        std::fs::write(&path, vec![b' '; 9 * 1024 * 1024]).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = read_and_sum_cancellable(&path, None, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]
@@ -1489,10 +1532,20 @@ mod tests {
 /// carried no usage block at all, and a session whose read stopped at
 /// `BUDGET_BYTES`. Each understates the sum, so each is reported
 /// alongside it rather than folded in silently -- the rule `usage.rs`
-/// already applies per session with `truncated`.
+/// already applies per session with `truncated`. Retained measurements whose
+/// source cannot currently be validated are reported separately as stale or
+/// unknown; their values may exceed or understate the current source.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
+    #[serde(default)]
+    pub population: Option<super::transcript::PopulationProgress>,
+    #[serde(default)]
+    pub fresh_sessions: u64,
+    #[serde(default)]
+    pub stale_sessions: u64,
+    #[serde(default)]
+    pub unknown_sessions: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -1501,7 +1554,8 @@ pub struct Profile {
     /// Sessions with a stored measurement -- the denominator.
     pub sessions_measured: u64,
     /// Sessions whose measurement stopped at the budget, so their
-    /// figures are floors and therefore so is this total.
+    /// figures cover only their measured prefix. Freshness is separate:
+    /// retained stale measurements do not establish a current corpus floor.
     pub sessions_truncated: u64,
     /// Models across every measured session, most messages first.
     pub models: Vec<ModelCount>,
@@ -1521,7 +1575,9 @@ pub struct DirectoryUsage {
 }
 
 impl Profile {
-    /// Whether every figure here is a floor rather than a total.
+    /// Whether any stored measurement stopped at its byte budget.
+    /// This does not establish freshness; inspect stale/unknown session counts
+    /// before treating retained sums as current totals or lower bounds.
     pub fn partial(&self) -> bool {
         self.sessions_truncated > 0
     }
