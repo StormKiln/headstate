@@ -1,0 +1,11 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {validateMixedPair} from './mixed.mjs';import {createMixedPlan} from './mixed-restart.mjs';import {defaultWorkload} from './workload.mjs';import {initialOracle,advanceOracle,digest,expectedChurnReady} from './churn-plan.mjs';
+function pair(){
+ const workload={...defaultWorkload,scenario:'mixed',scheduleVersion:'mixed-v1'},plan=createMixedPlan(workload);let oracle=initialOracle(plan);const receipts=[];
+ const run=(kind)=>({pass:true,shutdown:{clean:true,telemetryLost:false},exit:{code:0},statsRetirement:{providerRequests:0,commands:0},parentObservation:{lost:false},provenance:{code:'same',node:{version:'v24',modules:'137',executableSha256:'same'}},workload,warm:kind==='resumed',process:{pid:kind==='initial'?100:101,nonce:kind},mixed:{kind,pass:true,overlap:[{passId:1}],planHash:digest(plan),oracle:structuredClone(oracle),receipts:structuredClone(receipts),corpus:{stored:{paused:kind==='initial'}},pauseAfterRestart:true,cachedCorpus:{before:0,after:0},consumerWitnesses:[{role:'desktop'},{role:'paired'}],finalClients:Array.from({length:2},()=>({lost:false,ready:expectedChurnReady(oracle),facts:oracle.rows.filter(r=>r.terminal==='open'&&(r.authored||r.requested)).map(r=>({...r,list:r.authored?'authored':'reviewing'}))}))}});
+ let initial;for(const event of plan.events){const receipt=event.kind==='approve'?{ok:true,identity:event.identity,head:event.previousHead}:undefined;if(receipt)receipts.push({revision:event.revision,receipt});oracle=advanceOracle(oracle,event,receipt);if(event.revision===3)initial=run('initial');}return [initial,run('resumed')];
+}
+test('mixed pair independently validates two process obligations and both clients',()=>validateMixedPair(...pair()));
+test('mixed pair rejects missing clients, reused process, cache IO, skipped action and lost evidence',()=>{
+ for(const corrupt of [p=>p[0].mixed.overlap=[],p=>p[1].provenance.node.modules='other',p=>p[1].mixed.finalClients=[],p=>p[0].mixed.finalClients.pop(),p=>p[1].mixed.consumerWitnesses.pop(),p=>p[1].process=p[0].process,p=>p[1].mixed.cachedCorpus.after=1,p=>p[1].mixed.receipts.pop(),p=>p[1].mixed.finalClients[0].lost=true,p=>p[1].mixed.finalClients[1].ready=[],p=>p[1].provenance.code='other']){const p=pair();corrupt(p);assert.throws(()=>validateMixedPair(...p));}
+});

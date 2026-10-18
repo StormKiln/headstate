@@ -56,3 +56,6 @@ export function createNativeReader(path){
   for(const event of events){assert.ok(Number.isSafeInteger(event.seq)&&event.seq>=nextSequence&&!pending.has(event.seq),'native duplicate/invalid sequence');pending.set(event.seq,event);}const ordered=[];while(pending.has(nextSequence)){ordered.push(pending.get(nextSequence));pending.delete(nextSequence++);}assert.ok(pending.size<=1024,'native sequence gap bounded');return ordered;
  }finally{await file.close();}};
 }
+
+// Shared read-only observation/navigation for the mixed integration adapter.
+export {snapshot,navigate,mountContinuity,assertContinuity};

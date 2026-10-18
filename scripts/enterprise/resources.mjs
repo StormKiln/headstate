@@ -1,3 +1,4 @@
+import {summarizeMixedResources} from './mixed-resources.mjs';
 import assert from 'node:assert/strict';
 
 export const resourceCoverage=Object.freeze({
@@ -9,7 +10,7 @@ export const resourceCoverage=Object.freeze({
  memorySemantics:'native RSS and Chromium renderer JS heap include telemetry; application-only/browser-process/WebKit heap unknown',
  holes:['unscoped writes','SQLite WITHOUT ROWID callbacks','SQLite REPLACE implicit deletes','SQLite truncate DELETE optimization','directory enumeration','stat/fingerprint reads','SQLite reads','physical disk IO'],
 });
-export const phaseContracts=Object.freeze({startup:['startup'],mixed:['idle','unchanged_refresh','active_ingestion','churn_restart']});
+export const phaseContracts=Object.freeze({startup:['startup'],mixed:['idle','unchanged_refresh','active_ingestion','churn_restart'],mixed_initial:['idle','unchanged_refresh','active_ingestion','churn_restart'],mixed_resumed:['churn_restart']});
 const median=values=>{const sorted=[...values].sort((a,b)=>a-b);return sorted.length%2?sorted[Math.floor(sorted.length/2)]:(sorted[sorted.length/2-1]+sorted[sorted.length/2])/2;};
 const number=(v,label)=>{assert.ok(Number.isSafeInteger(v)&&v>=0,`${label}: nonnegative safe integer required`);return v;};
 function measured(v,label,{absent=false}={}){
@@ -107,6 +108,7 @@ export function summarizeResources(evidence,engine){
 export function validateResourceResult(result){
  assert.ok(result.resources?.evidence,'raw phase evidence required');
  assert.equal(result.resources.evidence.contract,result.mode==='mixed'?'mixed':'startup','applicable resource phase contract');
+ if(result.resources.evidence.schema===2){assert.equal(result.mode,'mixed');assert.equal(result.warm,result.resources.evidence.segments[0].warm,'initial cold/warm identity');assert.deepEqual(result.resources.summary,summarizeMixedResources(result.resources.evidence,result.engine),'segmented resource summary must reconcile raw phases');return result.resources;}
  assert.deepEqual(result.resources.summary,summarizeResources(result.resources.evidence,result.engine),'resource summary must reconcile raw phases');
  return result.resources;
 }

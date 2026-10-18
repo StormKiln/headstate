@@ -1,3 +1,5 @@
+import {ClaudeCoveragePanel} from '../components/ClaudeCoveragePanel';
+import {ClaudeTranscriptSearch} from '../components/ClaudeTranscriptSearch';
 import {churnRowFacts} from './enterpriseFacts';
 import { Profiler, useLayoutEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -17,6 +19,7 @@ import type { PullRequest } from '../types/pr';
 import { telemetry, boundedPush, measurement } from './enterpriseTransport';
 import '../index.css';
 const descriptor=await fetch('/workload.json').then(response=>{if(!response.ok)throw Error('Validated workload descriptor unavailable');return response.json();});
+const mixedScenario=new URL(location.href).searchParams.get('scenario')==='mixed';
 const churnScenario=new URL(location.href).searchParams.get('scenario')==='churn';
 let renderedFacts:unknown[]=[];
 const commits:{phase:string;actual:number;base:number;started:number;at:number}[]=[];
@@ -56,7 +59,7 @@ export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
   // Observe exactly what the production hooks render, including retained startup data.
-  if(churnScenario||convergenceScenario||new URL(location.href).searchParams.get('scenario')==='quota')renderedSource=source;
+  if(churnScenario||mixedScenario||convergenceScenario||new URL(location.href).searchParams.get('scenario')==='quota')renderedSource=source;
   renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
   renderedFacts=[...(authored.data??[]).map(row=>({...churnRowFacts(row),list:'authored'})),...(reviewing.data??[]).map(row=>({...churnRowFacts(row),list:'reviewing'}))];
   renderedReadyEligibility=(reviewing.data??[]).filter(readyForReview).map(row=>`${row.repo}/${row.number}`).sort();
@@ -71,7 +74,8 @@ export function Workload(){
   <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button></nav>
   <output data-testid="counts">Authored {authored.data?.length??'unknown'} / Reviewing {reviewing.data?.length??'unknown'}</output>
   {view==='idle'?null:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
-  {(convergenceScenario||churnScenario)&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
+  {mixedScenario?<section aria-label="Stored synthetic corpus"><ClaudeCoveragePanel/><ClaudeTranscriptSearch/></section>:null}
+  {(convergenceScenario||churnScenario||mixedScenario)&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
   {convergenceScenario?<footer data-testid="inventory-footer" className="flex gap-3 text-xs"><GitHubQueueFreshness github={{list:"reviewing",receipt:source}}/></footer>:null}
  </main>;
 }

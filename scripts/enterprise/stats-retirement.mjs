@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 
 export function validateEnterpriseMode(mode) {
- const modes=['churn','churn-restart','quota','gate','authored','fault','retirement','crash','offline','load','baseline','soak','tail','tail-warm','convergence','convergence-restart','ready-progress','ready-completion','ready-dual-desktop','ready-dual-paired','ready-dual-lifecycle-desktop','ready-dual-lifecycle-paired'];
+ const modes=['mixed','mixed-preparation','mixed-initial','mixed-resumed','churn','churn-restart','quota','gate','authored','fault','retirement','crash','offline','load','baseline','soak','tail','tail-warm','convergence','convergence-restart','ready-progress','ready-completion','ready-dual-desktop','ready-dual-paired','ready-dual-lifecycle-desktop','ready-dual-lifecycle-paired'];
  assert.ok(modes.includes(mode),`Unsupported enterprise mode: ${mode}. Stats-only convergence and writer-contention modes are retired.`);
 }
 

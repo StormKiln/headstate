@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,readdir} from 'node:fs/promises';
 import {spawn} from 'node:child_process';import {resolve} from 'node:path';
-import {resourceBatchPlan,deriveResourceLimits,validateResourceLimits,compareObserverPair} from './enterprise/resource-batch.mjs';
+import {resourceBatchPlan,resourceBatchInvocation,deriveResourceLimits,validateResourceLimits,compareObserverPair} from './enterprise/resource-batch.mjs';
 const root=resolve(process.argv[2]),stage=process.argv[3]??'calibrate';
 const plan=resourceBatchPlan(stage);
 const policy=stage==='validate'?JSON.parse(await readFile(process.argv[4],'utf8')):undefined;
@@ -11,8 +11,8 @@ await mkdir(root,{recursive:true});assert.equal((await readdir(root)).length,0,'
 await writeFile(resolve(root,'plan.json'),JSON.stringify({stage,plan,policy},null,2));
 const runs=[];
 for(const item of plan){
- const out=resolve(root,item.name);const previous=resolve(root,`${stage}-${item.sample}-cold`,'profile');
- const code=await new Promise((done,reject)=>{const p=spawn(process.execPath,['scripts/enterprise-run.mjs',out,'chromium','mixed',...(item.warm?[previous]:[])],{stdio:'inherit',env:{...process.env,ENTERPRISE_RESOURCE_DISABLED:item.arm==='disabled'?'1':'0'}});p.once('error',reject);p.once('exit',done);});
+ const out=resolve(root,item.name);const invocation=resourceBatchInvocation(item,out);
+ const code=await new Promise((done,reject)=>{const p=spawn(process.execPath,invocation.args,{stdio:'inherit',env:{...process.env,...invocation.env}});p.once('error',reject);p.once('exit',done);});
  const run=JSON.parse(await readFile(resolve(out,'result.json'),'utf8'));runs.push({...run,artifact:out,batch:item});await writeFile(resolve(root,'runs.json'),JSON.stringify(runs,null,2));assert.equal(code,0,'failed run retained');assert.equal(run.pass,true);
  if(policy)validateResourceLimits(run,policy);
 }

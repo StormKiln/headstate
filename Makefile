@@ -665,3 +665,9 @@ measure-enterprise-discovery:
 measure-enterprise-checkpoints:
 	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_staging_matrix -- --ignored --exact --nocapture
 	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_links_and_growth_measurement -- --ignored --exact --nocapture
+
+.PHONY: test-enterprise-mixed
+test-enterprise-mixed:
+	node --test scripts/enterprise/mixed*.test.mjs
+	cd src-tauri && cargo test --features enterprise-harness --lib commands::enterprise_corpus::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib enterprise_harness::corpus

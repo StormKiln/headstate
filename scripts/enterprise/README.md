@@ -223,9 +223,9 @@ parent sampling file remain retained. Recorder loss, required unknown probes,
 missing boundaries, incompatible coverage, duplicate sequences and native sampler
 gaps over 2.5 intervals reject the result.
 
-The mixed adapter in Task8 must explicitly bracket `idle`, `unchanged_refresh`,
+The mixed adapter explicitly brackets `idle`, `unchanged_refresh`,
 `active_ingestion` and `churn_restart` with authenticated controls named
-`resource-<phase>-start` and `resource-<phase>-end`, and collect the existing browser
+`resource-<phase>-start` and `resource-<phase>-end`, and collects the existing browser
 resource observer using `startPhase(phase, control)` and `endPhase(phase, control)`.
 These methods issue the native boundary controls and record explicit browser
 boundary samples for each role. `stop()` returns raw samples plus Node monotonic
@@ -236,17 +236,23 @@ start/end sample per role/phase, at most 2.5 intervals between samples, and comp
 boundary coverage. Native and Node phase duration must reconcile inside the
 request/response brackets (2 ms clock rounding allowance); no guessed clock offset
 is treated as exact. WebKit follows the same sampling/coverage protocol while heap
-capability remains unknown. It must produce `resources.evidence.contract = "mixed"`, the
-same schema/coverage/sampler fields and a reconciled summary. Startup is not a
-substitute for mixed load. The batch foundation requires these additional witnesses:
+capability remains unknown. The wrapper uses schema2, contract `mixed`, and exactly
+ordered `initial`/`resumed` native process segments. Each segment retains schema1
+raw native/browser evidence under `mixed_initial` (four phases) or `mixed_resumed`
+(`churn_restart` only). Startup schema1 is unchanged. Different native PID and
+handshake nonce are required. Native clocks, sequence namespaces and cumulative
+counters remain local: active durations/read bytes/mutations sum, peaks take the
+maximum, and memory drift remains per segment. No offset or continuous memory
+trend is invented across restart. The batch requires these additional witnesses:
 
 - `resourceIdentity`: generated `manifestSha256`, exact `toolchain`, and `phasePlan`
-  mapping the four phase names to fixed requested durations in milliseconds.
+  mapping the four phase names to summed fixed requested durations, plus exact
+  `segmentPhasePlan` durations. `calibrationEligible` must be true.
 - `mixedOutcome`: independent product/provider/corpus outcome facts, equal across
   observer A/B arms. This must come from actual mixed-workload assertions.
 - Existing normalized workload/environment fields, `warm`, the exact native binary
   SHA-256, and independent `parentObservation` fields. Source revision may change as
-  provenance; host, browser, build class, workload, phase plan and capability must match. Actual mixed phase duration must be within the requested duration and 2.5 seconds above it; larger scheduling overruns reject comparability.
+  provenance; host, browser, build class, workload, phase plan and capability must match. Each local phase duration must be within the requested duration and 2.5 seconds above it; larger scheduling overruns reject comparability. The combined restart phase allows the sum of those two local tolerances.
 
 `make enterprise-resources OUT=<new batch> RESOURCE_STAGE=calibrate` reserves five
 cold and five warm Chromium fixed150 mixed observations on macOS arm64. It derives
@@ -258,9 +264,9 @@ the same compiled binary; it skips resource hooks, counters, sampler, timing and
 measurement. The independent parent samples native RSS, Node RSS and DB/WAL in both
 arms and reports wall time, artifact size and existing native command durations.
 Tracing and ordinary product telemetry remain identical. Disabled observation is
-not a valid startup/resource baseline. These commands deliberately reject until the
-real mixed adapter supplies its witnesses; no calibration envelope has been claimed
-by the foundation smoke tests.
+not a valid startup/resource baseline. Set `ENTERPRISE_MIXED_PHASE_PLAN` to the approved fixed-plan JSON before a batch;
+exploratory runs deliberately cannot calibrate. No calibration envelope is claimed
+by helper or exploratory tests.
 
 `make measure-enterprise-discovery` runs only the two exact synthetic discovery
 probes, retains their generated fixtures, and asserts zero transcript body reads.
@@ -367,3 +373,67 @@ request/draft/queue/terminal/approval, and observation state, unknown/retained/d
 field sets, ready-at qualification and confirmed-review head/review/unresolved/read
 qualification. It excludes every timestamp and receipt metadata. Field sets are
 canonicalized; previously seen semantic values cannot renew progress by alternating.
+
+
+### Actual mixed corpus and restart workflow
+
+`make enterprise-run OUT=<new retained directory> ENGINE=chromium MODE=mixed`
+runs an exploratory cold source and actual process restart. Optional
+`ENTERPRISE_MIXED_WARM=1` first runs an independent unmeasured real process to
+populate the initial corpus and unapproved PR cache. Every warm sample prepares
+its own baseline; it never copies a previously mutated cold profile. Preparation
+requests, wall time and parent observations are retained separately. A fixed phase
+plan has `schema:1` and `segments.initial` (idle, unchanged_refresh,
+active_ingestion, churn_restart) and `segments.resumed` (churn_restart), durations
+in milliseconds. Until native timing supports and the controller approves those
+values, omit the plan and retain `calibrationEligible:false`.
+
+The profile remains at one marked generated path for both native processes.
+After clean shutdown, the initial segment saves an immutable whole-profile copy
+and hashes; restart checks those bytes, source result, independent oracle,
+manifest and exact native/UI/harness provenance before opening the database.
+Persisted PR approval/request and corpus authority are checked with zero provider
+IO. Durable pause survives restart; only the explicit resume control wakes the
+ordinary population worker. Complete raw native recorder validation precedes
+resource selection; concurrent recorder arrival ordering follows the Task7
+bounded reorder and per-slot lifecycle contract above.
+
+Before fixture bodies exist, an authenticated one-time control invokes the real
+empty rooted import to establish production link baseline authority. A repeat,
+nonempty root or existing corpus authority is rejected. The marked root contains
+128 normal transcripts plus large, malformed and unreadable cases. Only existing
+stored production coverage/search consumers are mounted; no HOME discovery UI is
+enabled. Both clients open and approve current-head PRs during population and
+read actual FTS results. Exact token/link/index/source facts come from the
+independent fixture manifest. The fixed synthetic link-checkpoint trigger must
+actually fire; prior link/checkpoint/byte/digest authority remains unchanged while
+metadata, index and usage advance. Actual permission-read failure is required.
+Owned shutdown removes the trigger and restores permissions, cancels and joins
+blocking work before recording a clean exit. Fault/control receipts are harness
+effects, separately retained from product observations.
+
+
+Frozen mixed resource limits include a stable key for every allowlisted native
+callback table and insert/update/delete count, plus transaction counts. The table
+list is checked against the native recorder allowlist. After validation of lossless
+scoped raw transaction evidence, an absent callback key means zero callbacks in
+that scope; unscoped writes, WITHOUT ROWID and other declared callback holes stay
+unknown. Unknown or unclassified table callbacks reject calibration/validation.
+Count headroom is twice the observed maximum plus one occurrence, with an observed
+zero locked to zero. Size/time headroom remains separately unit-specific. Per-segment
+positive RSS median growth is budgeted independently; it is not a continuous trend
+across process restart.
+
+
+Mixed provenance also records actual Node version, module ABI and executable hash;
+these participate in source/restart and toolchain equality. The owned shutdown
+wait retains its finite join timeout but clears the losing timer after a quick
+exit. Baseline `corpus-pass` native scopes wrap the actual blocking population
+call, mark the real returned indexed count, and exclude cadence sleep. These
+three records are identical with the optional resource observer disabled. Cold
+integration requires an actual PR detail/review native command interval, identified
+by the UI reply callId, to overlap a completed positive-work pass on the same native
+clock. Warm/resumed overlap is reported only when observed; their stored-cache,
+append, recovery and restart obligations still apply. The cold scenario opens its
+PR before the legitimate worker start, then approves during pending population;
+there are no forced ticks or injected delays.
