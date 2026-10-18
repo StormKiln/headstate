@@ -34,6 +34,6 @@ export async function runChurn({pages,provider,result,out,control,workload,state
   if(state&&!evidence.integrationOnly){while(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)+performance.now()-activeStarted<evidence.requiredActiveMs){await delay(5000);await observe();}}
   assert.ok(provider.ledger.length<=evidence.policy.maxDocumentsPerSegment,'bounded documents per segment');
   evidence.activeSegmentsMs=[...evidence.activeSegmentsMs,performance.now()-activeStarted];
-  evidence.segmentPass=true;evidence.planComplete=oracle.revision===plan.events.length;evidence.endRevision=oracle.revision;evidence.remaining=plan.events.slice(oracle.revision).map(e=>e.revision);evidence.sustainedPass=evidence.planComplete&&!evidence.integrationOnly&&evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)>=evidence.requiredActiveMs;return {plan,oracle,receipts,activeSegmentsMs:evidence.activeSegmentsMs};
+  evidence.segmentPass=true;evidence.planComplete=oracle.revision===plan.events.length;evidence.endRevision=oracle.revision;evidence.remaining=plan.events.slice(oracle.revision).map(e=>e.revision);evidence.sustainedPass=evidence.planComplete&&!evidence.integrationOnly&&evidence.sourceReadyCoverage==='all-checkpoints-in-this-segment'&&evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)>=evidence.requiredActiveMs;return {plan,oracle,receipts,activeSegmentsMs:evidence.activeSegmentsMs};
  }finally{evidence.oracle=oracle;await save();}
 }

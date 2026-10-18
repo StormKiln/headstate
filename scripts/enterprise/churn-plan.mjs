@@ -37,6 +37,7 @@ export function assertAcceptedFacts(previous,next){
  for(const row of next.facts){const before=previous.facts.find(r=>r.identity===row.identity&&r.head===row.head);if(before?.approved)assert.equal(row.approved,true,'current-head accepted approval must not regress');}
 }
 export function assertSustainedChurn(evidence){
+ assert.equal(evidence.readyCoverage,'all-checkpoints-in-this-segment');assert.equal(evidence.sourceReadyCoverage,'all-checkpoints-in-this-segment','source Ready coverage required for final matrix');
  assert.equal(evidence.segmentPass,true);assert.equal(evidence.planComplete,true);assert.equal(evidence.sustainedPass,true);assert.equal(evidence.integrationOnly,false,'integration-only cannot qualify sustained churn');assert.deepEqual(evidence.remaining,[]);
  assert.ok(Array.isArray(evidence.activeSegmentsMs)&&evidence.activeSegmentsMs.length>0);for(const value of evidence.activeSegmentsMs)assert.ok(Number.isFinite(value)&&value>=0,'measured active durations required');assert.ok(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)>=1800000,'at least 30 active minutes excluding restart downtime');
 }
