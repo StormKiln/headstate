@@ -2252,10 +2252,13 @@ export function useClaudeSubagentRollup(sessionId: string | null) {
 /// wrong answer with the same credible shape (#846), and here it is worse
 /// than usual because zero is also a perfectly ordinary real value.
 export function useClaudeSessionEvents(sessionId: string | null) {
+  const client = useQueryClient();
+  const enabled = sessionId !== null && sessionId !== "";
+  useEffect(() => enabled ? observeCorpusPopulation(client) : undefined, [client, enabled]);
   return useQuery<ClaudeObservation>({
     queryKey: ["claude-session-events", sessionId],
     queryFn: () => claudeSessionEvents(sessionId as string),
-    enabled: sessionId !== null && sessionId !== "",
+    enabled,
     staleTime: Infinity,
     retry: false,
   });
@@ -2266,6 +2269,8 @@ export function useClaudeSessionEvents(sessionId: string | null) {
 /// `enabled` on the caller, because the overview page asks for it only
 /// when it is actually showing that section.
 export function useClaudeEventProfile(enabled = true) {
+  const client = useQueryClient();
+  useEffect(() => enabled ? observeCorpusPopulation(client) : undefined, [client, enabled]);
   return useQuery<ClaudeCorpus>({
     queryKey: ["claude-event-profile"],
     queryFn: () => claudeEventProfile(),
@@ -2293,6 +2298,9 @@ export function useClaudeEventProfile(enabled = true) {
 /// partial answer is the thing the user is being asked to trust.
 export function useClaudeTranscriptSearch(query: string, enabled = true) {
   const trimmed = query.trim();
+  const client = useQueryClient();
+  const observing = enabled && trimmed.length > 0;
+  useEffect(() => observing ? observeCorpusPopulation(client) : undefined, [client, observing]);
   return useQuery<ClaudeSearchAnswer>({
     queryKey: ["claude-transcript-search", trimmed],
     queryFn: () => claudeSearchTranscripts(trimmed),

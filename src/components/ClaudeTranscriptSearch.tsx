@@ -127,7 +127,9 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          setQuery(draft);
+          const trimmed = draft.trim();
+          if (trimmed && trimmed === query) void search.refetch({ cancelRefetch: false });
+          else setQuery(trimmed);
         }}
         className="flex gap-2"
       >
@@ -173,8 +175,9 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
           role="status"
           className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
         >
-          The transcript search could not run ({errorMessage(search.error)}). Nothing was
-          searched.
+          {search.data !== undefined
+            ? `Could not refresh the search (${errorMessage(search.error)}). Showing the previous search result.`
+            : `The transcript search could not run (${errorMessage(search.error)}). Nothing was searched.`}
         </p>
       ) : null}
 

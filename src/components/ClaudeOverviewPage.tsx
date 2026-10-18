@@ -790,7 +790,7 @@ function RestartExportCard() {
 /// arm never renders as zeros — on a machine whose history predates the
 /// hooks that is the state of the entire corpus, so a grid of zeros here
 /// would be the original defect at full scale.
-function TroubleProfileCard() {
+export function TroubleProfileCard() {
   const { data, isError, error, isLoading } = useClaudeEventProfile();
 
   return (
@@ -799,7 +799,12 @@ function TroubleProfileCard() {
       <div className="text-xs text-[#8b949e]">
         what the hooks recorded across every session
       </div>
-      {isError ? (
+      {isError && data !== undefined ? (
+        <p role="status" className="mt-2 text-xs text-[#d29922]">
+          Could not refresh failures and denials ({errorMessage(error)}). Showing the previous record.
+        </p>
+      ) : null}
+      {isError && data === undefined ? (
         <div className="py-6 text-center text-sm text-[#8b949e]">
           Could not read what the hooks recorded, so failures and denials are unknown
           {errorMessage(error) ? ` (${errorMessage(error)})` : ""}.

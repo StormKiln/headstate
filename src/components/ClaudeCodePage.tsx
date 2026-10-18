@@ -3175,13 +3175,18 @@ function formatMb(bytes: number): string {
 /// something going wrong, and the wording here must not imply otherwise.
 /// They get their own heading, their own count and neutral verbs — "auto
 /// mode declined", never "blocked" or "failed".
-function SessionTrouble({ sessionId }: { sessionId: string }) {
+export function SessionTrouble({ sessionId }: { sessionId: string }) {
   const { data, isError, error, isLoading } = useClaudeSessionEvents(sessionId);
 
   return (
     <section className="rounded-md border border-[#30363d] bg-[#161b22] p-3">
       <h3 className="text-xs font-semibold text-[#e6edf3]">What went wrong in it</h3>
-      {isError ? (
+      {isError && data !== undefined ? (
+        <p role="status" className="mt-2 text-xs text-[#d29922]">
+          Could not refresh failures and denials ({errorMessage(error)}). Showing the previous record.
+        </p>
+      ) : null}
+      {isError && data === undefined ? (
         // NOT zeros. A failed read and a clean session have opposite
         // remedies, and the second is a claim this cannot make.
         <p className="mt-2 text-xs text-[#8b949e]">
