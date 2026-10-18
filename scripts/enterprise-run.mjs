@@ -1,3 +1,4 @@
+import {expectedRevocationFailures} from './enterprise/revocation-evidence.mjs';
 import {nodeRuntimeIdentity,waitForProcess} from './enterprise/mixed-runtime.mjs';
 import {assertMixedOverlap} from './enterprise/mixed-overlap.mjs';
 import {runMixed} from './enterprise/mixed.mjs';
@@ -54,6 +55,7 @@ const parentSample=()=>{parentPending=parentPending.then(async()=>{
  });return parentPending;};
 await parentSample();const parentTimer=setInterval(()=>void parentSample(),1000);
 async function artifactBytes(directory){let total=0;for(const entry of await readdir(directory,{withFileTypes:true})){const path=resolve(directory,entry.name);if(entry.isDirectory())total+=await artifactBytes(path);else if(entry.isFile())total+=(await stat(path)).size;}return total;}
+let revocationWindow;const revocationResponses=[];
 const nativeCall=(role,command,args={})=>{bridgeCommands.push(command);return fetch(`${bridge}/call/${role}/${command}`,{method:'POST',headers:{'x-enterprise-secret':secret,'content-type':'application/json'},body:JSON.stringify(args)});};
 const control=async action=>{const r=await fetch(`${bridge}/control/${action}`,{method:'POST',headers:{'x-enterprise-secret':secret}});assert.equal(r.status,200);return r.json();};
 try {
@@ -71,14 +73,14 @@ try {
  if(churnRestart)await captureChurnCache({nativeCall,provider,state:churnRestart,out});
  if(convergenceRestart)await captureRestartCache({nativeCall,provider,state:convergenceRestart,out});
  proxy=createServer(async(req,res)=>{try{
-  const pathname=new URL(req.url,'http://127.0.0.1').pathname;
+  const pathname=new URL(req.url,'http://127.0.0.1').pathname;const requestStarted=performance.now();
   if(pathname==='/workload.json'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(workload));return;}
   if(pathname.startsWith('/bridge/')){
    let body='';for await(const c of req)body+=c;
    if(pathname.includes('/call/'))bridgeCommands.push(pathname.split('/').at(-1));
    const up=await fetch(bridge+pathname.slice(7),{method:req.method,headers:{'x-enterprise-secret':secret,'content-type':'application/json'},...(req.method==='POST'?{body}:{})});
    res.writeHead(up.status,{'content-type':up.headers.get('content-type')??'application/json'});
-   if(pathname.includes('/events/')){const stream=Readable.fromWeb(up.body);stream.on('error',()=>{if(!closing&&mode!=='crash')result.errors.push({kind:'unexpected-native-event-stream-close'});res.destroy();});stream.pipe(res);res.on('close',()=>stream.destroy());}else {res.end(await up.text());}return;
+   if(pathname.includes('/events/')){const stream=Readable.fromWeb(up.body);stream.on('error',()=>{if(!closing&&mode!=='crash')result.errors.push({kind:'unexpected-native-event-stream-close'});res.destroy();});stream.pipe(res);res.on('close',()=>stream.destroy());}else {const text=await up.text();if(revocationWindow&&pathname==='/bridge/call/paired/get_pr_detail'){let value;try{value=JSON.parse(text);}catch{}revocationResponses.push({role:'paired',command:'get_pr_detail',started:requestStarted,completed:performance.now(),status:up.status,error:value?.error,callId:value?.callId});}res.end(text);}return;
   }
   const file=resolve('dist-harness-enterprise','.'+(pathname==='/'?'/harness/enterprise.html':pathname));assert.ok(file.startsWith(resolve('dist-harness-enterprise')+'/'));
   res.writeHead(200,{'content-type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.woff2':'font/woff2'})[extname(file)]??'application/octet-stream'});res.end(await readFile(file));
@@ -212,12 +214,35 @@ try {
   await control('recover-queue-write');await pages[0].evaluate(()=>window.__enterprise.refreshQueues());
   result.phases.push({name:'sqlite-aborted-outer-write',applied:true,exercised:true,converged:true,retained:true});
   }
+  const pairedDetail=async()=>{await pages[1].getByText('Synthetic description 52',{exact:false}).waitFor();await pages[1].getByRole('button',{name:'Approved',exact:true}).first().waitFor();assert.equal(await pages[1].getByTestId('counts').textContent(),'Authored 50 / Reviewing 150');};
+  const revocationContinuity={};
+  if(mode==='fault'){await pairedDetail();revocationContinuity.before=true;revocationWindow={start:performance.now(),confirmed:false};}
   await control('revoke');
   for(let n=0;n<100;n++){if((await control('status')).pairedClosed)break;await delay(100);}
   assert.equal((await control('status')).pairedClosed,true);
+  if(mode==='fault'){
+   revocationWindow.confirmed=true;
+   // A bounded real user read makes revocation/recovery coverage deterministic.
+   await pages[1].getByRole('button',{name:'Refresh',exact:true}).first().click();
+   await pages[1].getByText('paired transport closed',{exact:true}).waitFor();
+   await pairedDetail();revocationContinuity.during=true;
+   revocationWindow.end=performance.now();assert.ok(revocationWindow.end-revocationWindow.start<=30000,'bounded deliberate revocation');
+  }
   const refused=await fetch(`${bridge}/call/paired/get_viewer`,{method:'POST',headers:{'x-enterprise-secret':secret,'content-type':'application/json'},body:'{}'});assert.ok(!refused.ok,'retired certificate refused');
   await control('repair');
   const repaired=await fetch(`${bridge}/call/paired/get_viewer`,{method:'POST',headers:{'x-enterprise-secret':secret,'content-type':'application/json'},body:'{}'});assert.equal(repaired.status,200);
+  if(mode==='fault'){
+   revocationContinuity.repaired=true;
+   await pages[1].getByRole('button',{name:'Retry refresh',exact:true}).click();
+   await pages[1].getByText('paired transport closed',{exact:true}).waitFor({state:'hidden'});
+   await pages[1].getByRole('button',{name:'Retry refresh',exact:true}).waitFor({state:'hidden'});
+   await pairedDetail();revocationContinuity.after=true;revocationContinuity.errorCleared=true;
+   const native=(await readFile(resolve(profile,'native.ndjson'),'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+   const failures=(await pages[1].evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.ok===false))).map(call=>({...call,role:'paired'}));
+   const expected=expectedRevocationFailures({window:revocationWindow,responses:revocationResponses,native,failures,continuity:revocationContinuity});
+   result.expectedFailures.push(...expected);result.revocation={window:revocationWindow,responses:revocationResponses,continuity:revocationContinuity,expectedCallIds:expected.map(call=>call.callId)};
+   revocationWindow=undefined;
+  }
   result.phases.push({name:'actual-mtls-revoke-same-certificate-repair',applied:true,exercised:true,converged:true});
   const outOfOrderFrom=provider.ledger.length;provider.fault.delays=[500,0];
   const replies=await Promise.all([nativeCall('desktop','get_pr_detail',{repo:'synthetic-lab/repo-3',number:53}),nativeCall('paired','get_pr_detail',{repo:'synthetic-lab/repo-4',number:54})]);for(const r of replies)assert.equal(r.status,200);
@@ -248,7 +273,7 @@ try {
  for(const [i,page] of pages.entries()) {
   const failed=await page.evaluate(()=>window.__enterprise.telemetry.filter(e=>e.kind==='call'&&e.ok===false&&e.name!=='diag_log'));
   if(mode==='offline')result.expectedFailures.push(...failed.filter(e=>['get_viewer','get_pr_detail','get_reviewing','refresh_now','get_review_gates'].includes(e.name)));
-  result.errors.push(...failed.filter(e=>!result.expectedFailures.some(expected=>expected.name===e.name&&expected.at===e.at)).map(e=>({role:i?'paired':'desktop',command:e.name})));
+  result.errors.push(...failed.filter(e=>!result.expectedFailures.some(expected=>expected.name===e.name&&expected.at===e.at&&(expected.role===undefined||(expected.role===(i?'paired':'desktop')&&expected.callId===e.callId)))).map(e=>({role:i?'paired':'desktop',command:e.name})));
  }
  for(const [i,page] of pages.entries()){const raw=await page.evaluate(()=>({measurement:window.__enterprise.measurement,commits:window.__enterprise.commits,longTasks:window.__enterprise.longTasks,firstUsefulQueue:window.__enterprise.firstUsefulQueue,fullQueue:window.__enterprise.fullQueue,telemetryEntries:window.__enterprise.telemetry.length}));assert.equal(raw.measurement.lost,false,'bounded browser telemetry intact');resourceStartup[i?'paired':'desktop']={...raw,detail:resourceDetail[i]};const metrics=mode==='baseline'?startupMeasurements(resourceStartup[i?'paired':'desktop']):{uiCommits:raw.commits.length,uiCommitMs:raw.commits.reduce((n,c)=>n+c.actual,0),longTaskCount:raw.longTasks?.length??null,longTaskMs:raw.longTasks?.reduce((n,t)=>n+t.duration,0)??null};assert.ok(metrics.uiCommits>0,'profiling renderer must emit actual commits');Object.assign(result.samples[i],metrics);}
  await parentSample();if(browserResources&&!mixedSegment)await browserResources.endPhase('startup',control);
