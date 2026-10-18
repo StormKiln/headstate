@@ -46,6 +46,7 @@ dist-harness
 # The Worktrees harness build (#1582): `make bench-worktrees-browser`.
 dist-harness-worktrees
 target
+.tools/workflow/
 src-tauri/target
 src-tauri/gen
 # The mobile crate's `gen/apple` (and `gen/android`, once generated) ARE

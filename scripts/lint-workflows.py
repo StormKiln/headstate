@@ -11,10 +11,17 @@ top-level queue property is compatible. Once upstream supports it, this
 wrapper continues running all checks without needing an ignored diagnostic.
 """
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+
+ACTIONLINT_REVISION = "fd33e9f582a01a02885c93ae3775e1190cf63653"
+DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_TERM_GRACE_SECONDS = 2.0
 
 UNSUPPORTED = (
     'unexpected key "queue" for "concurrency" section. '
@@ -78,18 +85,73 @@ def decode_diagnostics(output):
     return diagnostics
 
 
+def positive_seconds(name, default):
+    value = float(os.environ.get(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def run_actionlint(command):
+    """Run the complete lint process group within a hard deadline.
+
+    Regular files avoid pipe backpressure and ensure a detached descendant
+    holding inherited descriptors cannot make final output collection hang.
+    """
+    timeout = positive_seconds("WORKFLOW_LINT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+    grace = positive_seconds("WORKFLOW_LINT_TERM_GRACE_SECONDS", DEFAULT_TERM_GRACE_SECONDS)
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+        process = subprocess.Popen(
+            command, text=True, stdout=stdout, stderr=stderr,
+            start_new_session=os.name != "nt",
+        )
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=grace)
+            returncode = 124
+        stdout.seek(0)
+        stderr.seek(0)
+        output = stdout.read()
+        errors = stderr.read()
+    if timed_out:
+        rendered = " ".join(command)
+        errors += (
+            f"Workflow lint failed: actionlint@{ACTIONLINT_REVISION} command "
+            f"'{rendered}' exceeded {timeout:g}s deadline; sent TERM, waited "
+            f"{grace:g}s grace, then KILL if required.\n"
+        )
+    return subprocess.CompletedProcess(command, returncode, output, errors)
+
+
 def main(argv):
     paths = [Path(p) for p in argv] if argv else sorted(Path(".github/workflows").glob("*.y*ml"))
     if not paths:
         raise ValueError("no workflow files found")
     allowed = {str(p.resolve()): supported_queue_line(p.read_text()) for p in paths}
-    result = subprocess.run(
-        ["actionlint", "-no-color", "-format", "{{json .}}", *map(str, paths)],
-        text=True, capture_output=True,
+    result = run_actionlint(
+        ["actionlint", "-no-color", "-format", "{{json .}}", *map(str, paths)]
     )
     if result.stderr:
         print(result.stderr, end="", file=sys.stderr)
-    errors = decode_diagnostics(result.stdout)
+    try:
+        errors = decode_diagnostics(result.stdout)
+    except (json.JSONDecodeError, ValueError) as error:
+        print(f"Workflow lint failed: malformed actionlint diagnostics: {error}", file=sys.stderr)
+        return 1
     rejected = []
     for error in errors:
         expected_line = allowed.get(str(Path(error.get("filepath", "")).resolve()))

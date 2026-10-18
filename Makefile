@@ -1,4 +1,4 @@
-.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
+.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps lint-workflows fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android check-native-ios check-native-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
 	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
@@ -314,6 +314,12 @@ lint: lint-rust lint-ui lint-deps
 # major/minor, and that check lives inside the bundle -- so before this
 # target existed, the mismatch passed lint and both test jobs and failed
 # from the slowest one in CI (#555).
+lint-workflows:
+	python3 scripts/install-workflow-tools.test.py
+	@tool_dir="$$(python3 scripts/install-workflow-tools.py)" && \
+		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.test.py && \
+		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.py
+
 lint-deps:
 	python3 scripts/check-tauri-versions.test.py
 	python3 scripts/check-tauri-versions.py
@@ -427,16 +433,11 @@ lint-deps:
 	# labels, and shellcheck over every `run:` body -- defects that are
 	# invisible until CI runs, which is what #848 and #853 cost.
 	#
-	# Skipped with a note when absent rather than failing: `brew install
-	# actionlint` (shellcheck comes with it) is a real install, and this
-	# target's comment promises answers in a second, not a toolchain. CI
-	# installs it, so the gate is there; this is the local feedback loop.
-	# No GitHub Action and so no new pinned SHA -- it is one binary.
-	@if command -v actionlint >/dev/null 2>&1; then \
-		python3 scripts/lint-workflows.test.py && python3 scripts/lint-workflows.py; \
-	else \
-		echo "actionlint not installed; skipping (brew install actionlint). CI runs it."; \
-	fi
+	# The shared strict target installs the fixed actionlint source revision
+	# and ShellCheck 0.11.0 into the ignored repository cache after verifying
+	# their archives and runtime identities. Local and CI therefore ask the
+	# same tools, and a missing or mismatched tool fails rather than skipping.
+	$(MAKE) lint-workflows
 	# The mobile build high-water mark drifts because nothing reads it
 	# except a Preflight check that only catches a DECREASE -- so a mark
 	# lagging by three still passes, and it went stale before six
@@ -494,6 +495,7 @@ lint-deps:
 	#
 	# Local checks are advisory, CI remains the gate (ci.yml) -- this
 	# closes the feedback gap, it does not move the gate.
+	python3 scripts/check-privacy.test.py
 	./scripts/check-privacy.sh
 
 # The shared step-up crate again: a path dependency is compiled by the
