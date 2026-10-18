@@ -1,6 +1,6 @@
 import { focusManager, type Query, type QueryClient } from "@tanstack/react-query";
 import type { MergeRequest } from "../types/gitlab";
-import type { GitLabDetail } from "../types/gitlabActions";
+import type { GitLabCapabilities, GitLabDetail } from "../types/gitlabActions";
 import type { SourcePollUpdate } from "./tauri";
 import { GitLabQueueState } from "./gitlabQueueState";
 import { prKey } from "../lib/prIdentity";
@@ -71,7 +71,14 @@ function facts(row: MergeRequest): Facts {
 }
 function baseline(client: QueryClient, query: Query): Facts {
   const detail = client.getQueryData<GitLabDetail>(["gitlab-detail", query.queryKey[1], query.queryKey[2]]);
-  return detail ? { title: detail.core.title, head: JSON.stringify(detail.core.head_oid), draft: JSON.stringify(detail.core.is_draft), merge: JSON.stringify(detail.core.detailed_merge_status), base: JSON.stringify(detail.core.base_ref) } : {};
+  const value: Facts = detail ? { title: detail.core.title, head: JSON.stringify(detail.core.head_oid), draft: JSON.stringify(detail.core.is_draft), merge: JSON.stringify(detail.core.detailed_merge_status), base: JSON.stringify(detail.core.base_ref) } : {};
+  // Capabilities are independently cached. Current detail cannot attest that
+  // the permissions were read for the same head.
+  if (query.queryKey[0] === "gitlab-actions") {
+    const capabilities = query.state.data as GitLabCapabilities | undefined;
+    value.head = JSON.stringify(capabilities?.head_oid ?? null);
+  }
+  return value;
 }
 
 /** Called only with a reducer-accepted receipt. Shared acceptance deduplicates

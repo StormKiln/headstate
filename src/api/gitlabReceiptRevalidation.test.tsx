@@ -155,3 +155,20 @@ it("does not issue pending follow-up work after consumers unmount", async () => 
   view.unmount(); await act(async () => finish(detail("Middle"))); expect(reads()).toBe(1);
   expect([...ipc.listeners.values()].every(set => set.size === 0)).toBe(true);
 });
+it("reconciles a stale action head independently of already-current cached detail", async () => {
+  next = detail("Old title", "new-head");
+  client.setQueryData(["gitlab-detail", prKey(identity), "alice"], next);
+  mount(); await screen.findByText(/Action permissions and MR head/);
+  fireEvent.change(screen.getByRole("textbox", { name: "MR comment" }), { target: { value: "Preserved comment" } });
+  const post = screen.getByRole("button", { name: "Post comment" }) as HTMLButtonElement;
+  expect(post.disabled).toBe(true);
+  await receipt([{ ...row, head_oid: "new-head" }]);
+  await waitFor(() => expect(post.disabled).toBe(false));
+  expect(screen.queryByText(/Action permissions and MR head/)).toBeNull();
+  expect(reads()).toBe(0);
+  expect(ipc.invoke.mock.calls.filter(([name]) => name === "gitlab_action_capabilities")).toHaveLength(1);
+  await receipt([{ ...row, head_oid: "new-head" }]);
+  await receipt([{ ...row, head_oid: "new-head" }], { list: "reviewing" });
+  expect(reads()).toBe(0);
+  expect(ipc.invoke.mock.calls.filter(([name]) => name === "gitlab_action_capabilities")).toHaveLength(1);
+});
