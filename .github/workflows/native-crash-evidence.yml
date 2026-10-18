@@ -11,20 +11,32 @@ permissions:
 jobs:
   native-crash-evidence-acceptance:
     runs-on: macos-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - name: Verify pinned Node acceptance contract
+        run: python3 scripts/native-node-acceptance.test.py
       - name: Verify synthetic report selection and privacy bounds
         run: python3 scripts/collect-frontend-crash.test.py
       - name: Require a matching symbolized synthetic native stack
         run: >-
           python3 scripts/collect-frontend-crash.test.py --native-smoke
           "${{ runner.temp }}/native-crash-acceptance/evidence.json"
+      - name: Require matching pinned Node main and worker SIGSEGV evidence
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 scripts/native-node-acceptance.py --node "$(command -v node)"
+          --output "${{ runner.temp }}/native-node-acceptance"
       - name: Retain only sanitized synthetic evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-crash-acceptance
-          path: ${{ runner.temp }}/native-crash-acceptance/evidence.json
+          path: |
+            ${{ runner.temp }}/native-crash-acceptance/evidence.json
+            ${{ runner.temp }}/native-node-acceptance/evidence.json
           if-no-files-found: warn
           retention-days: 7

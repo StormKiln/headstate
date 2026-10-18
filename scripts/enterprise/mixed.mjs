@@ -1,3 +1,4 @@
+import {validateMixedPhasePlan} from './mixed-plan.mjs';
 import {assertMixedCoverageCheckpoints} from './mixed-coverage.mjs';
 import {aggregateMixedParent} from './mixed-parent.mjs';
 import assert from 'node:assert/strict';
@@ -26,7 +27,7 @@ export async function runMixed({out,engine,warm,fixedPlanPath}){
  const profile=resolve(out,'profile'),corpusRoot=resolve(profile,'generated-corpus/projects'),manifestPath=resolve(out,'mixed-fixture-manifest.json');
  await mkdir(corpusRoot,{recursive:true});await writeFile(resolve(profile,'.enterprise-synthetic'),'owned mixed generated profile\n',{flag:'wx'});
  const fixed=fixedPlanPath?JSON.parse(await readFile(fixedPlanPath,'utf8')):undefined;
- if(fixed){assert.equal(fixed.schema,1);assert.deepEqual(Object.keys(fixed.segments).sort(),['initial','resumed']);assert.deepEqual(Object.keys(fixed.segments.initial).sort(),['active_ingestion','churn_restart','idle','unchanged_refresh']);assert.deepEqual(Object.keys(fixed.segments.resumed),['churn_restart']);for(const phase of Object.values(fixed.segments).flatMap(Object.values))assert.ok(Number.isFinite(phase)&&phase>=5000);}
+ if(fixed)validateMixedPhasePlan(fixed);
  const disabled=process.env.ENTERPRISE_RESOURCE_DISABLED==='1',segments=[],result={mode:'mixed',engine,warm,pass:false,calibrationEligible:!!fixed,segments:[],scope:'actual two-process native-connected synthetic mixed integration; no packaged/device claim'};
  let preparation,started;
  const segment=async(kind,sourceDir)=>{

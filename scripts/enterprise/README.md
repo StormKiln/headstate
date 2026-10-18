@@ -461,3 +461,15 @@ sample snapshot and emission are serialized together so periodic/control-boundar
 races cannot emit an older counter snapshot with a later timestamp. The disabled
 observer returns before this lock; unrelated recorder events retain their existing
 concurrent ordering contract.
+
+### 10.9 fixed resource qualification
+
+The approved `mixed-phase-plan-10.9.json` freezes 350 seconds of active phases
+per sample, excluding actual startup, warm preparation and restart downtime.
+Pass its absolute path as `ENTERPRISE_MIXED_PHASE_PLAN` to every
+`make enterprise-resources OUT=<new-directory> RESOURCE_STAGE=calibrate|validate|overhead`
+invocation; validation additionally requires `LIMITS=<calibration/limits.json>`.
+Batch preflight rejects absent or malformed descriptors before launching a child;
+validation also rejects a descriptor differing from the frozen policy. Failed
+samples remain failures with their artifacts; the script never retries or extends
+a phase. These bounded synthetic qualification timings are not a customer SLA.
