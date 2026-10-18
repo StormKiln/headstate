@@ -41,8 +41,20 @@ make enterprise-baseline OUT=/tmp/enterprise-baseline-new
 make enterprise-compare OUT=/tmp/enterprise-regression-new
 ENTERPRISE_BASELINE=scripts/enterprise/baseline.json \
   make enterprise-run OUT=/tmp/enterprise-comparison-new MODE=baseline
+make enterprise-admission-probe OUT=/tmp/enterprise-rejected \
+  BASELINE=/tmp/intentionally-incompatible-schema-2-baseline.json
 make enterprise-run OUT=/tmp/enterprise-soak-new ENGINE=webkit MODE=soak
 ```
+
+New baselines use schema 2 and carry one normalized workload descriptor plus a
+per-engine environment descriptor. Admission requires exact seed, scenario,
+role, population, cadence, schedule, quota, host, browser and build compatibility
+before measured work starts. Source revision is retained as before/after
+provenance and may differ. The historical schema-1 baseline remains immutable
+and is rejected explicitly rather than compared under incomplete semantics. The
+admission probe takes an intentionally incompatible schema-2 baseline and proves
+the real runner rejects it with zero provider receipts while retaining clean
+native shutdown evidence.
 
 The baseline batch captures five cold profiles and five warm copies per engine,
 with both roles in every run. Its checked-in measured data includes actual

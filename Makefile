@@ -613,13 +613,17 @@ test-enterprise-contracts:
 enterprise-run:
 	node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" "$(or $(MODE),gate)" $(if $(PROFILE),"$(PROFILE)")
 
-.PHONY: enterprise-baseline enterprise-compare
+.PHONY: enterprise-baseline enterprise-compare enterprise-admission-probe
 enterprise-baseline:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	node scripts/enterprise-baseline.mjs "$(OUT)"
 enterprise-compare:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	ENTERPRISE_BASELINE=scripts/enterprise/baseline.json node scripts/enterprise-baseline.mjs "$(OUT)"
+enterprise-admission-probe:
+	@test -n "$(OUT)" -a -n "$(BASELINE)" || (echo "Set OUT to a new retained artifact directory and BASELINE to an intentionally incompatible schema-2 baseline"; exit 2)
+	@if ENTERPRISE_BASELINE="$(BASELINE)" node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" baseline; then echo "Expected workload/environment admission rejection"; exit 1; fi
+	node -e 'const r=require(process.argv[1]);if(r.admission?.accepted!==false||r.admission?.stage!=="before-measured-work"||r.providerReceipts!==0||r.shutdown?.telemetryLost!==false||r.exit?.code!==0)process.exit(1)' "$(OUT)/result.json"
 
 .PHONY: analyze-measurements
 analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
