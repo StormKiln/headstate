@@ -68,6 +68,10 @@ export function summarizeResources(evidence,engine){
  assert.ok(Array.isArray(evidence.native)&&evidence.native.length>0,'raw native resource records required');
  for(const row of evidence.native)if(row.resource?.kind==='sample'&&row.resource.boundary!=='interval')assert.ok(required.includes(row.resource.phase),'unexpected phase boundary');
  const sequences=new Set();for(const row of evidence.native){number(row.seq,'sequence');number(row.ns,'monotonic time');assert.ok(!sequences.has(row.seq),'duplicate resource sequence');sequences.add(row.seq);assert.equal(row.stage,'resource');}
+ // Recorder arrival order is not clock order. Cumulative counters must never
+ // decrease anywhere within this process, including unscoped/inter-phase samples.
+ const cumulative=evidence.native.filter(row=>row.resource?.kind==='sample').sort((a,b)=>a.ns-b.ns||a.seq-b.seq);let previous;
+ for(const row of cumulative){for(const lane of ['metadata','usage','index','links']){const value=number(row.resource.readBytes?.[lane],`${lane} cumulative sample`);if(previous)assert.ok(value>=previous.resource.readBytes[lane],`${lane} cumulative counter reset`);}previous=row;}
  const phases={};
  for(const phase of required){
   const boundaries=evidence.native.filter(row=>row.resource?.kind==='sample'&&row.resource.phase===phase&&row.resource.boundary!=='interval');

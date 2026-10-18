@@ -437,3 +437,27 @@ clock. Warm/resumed overlap is reported only when observed; their stored-cache,
 append, recovery and restart obligations still apply. The cold scenario opens its
 PR before the legitimate worker start, then approves during pending population;
 there are no forced ticks or injected delays.
+
+
+Mounted consumer checkpoints validate actual `claude_coverage` and
+`claude_index_coverage` replies plus the rendered production coverage text for
+both roles: initial baseline, permission degradation, durable-pause cancellation,
+and recovery. Cold degradation has130 stored/indexed rows of131; a prepared warm
+corpus retains131 accepted rows while population remains130completed/1remaining.
+Discovery EACCES is proved separately: the index unreadable array stays empty and
+the consumer must state incomplete population. Pause is rendered as the actual
+`Scan cancelled` qualification, with native durable pause separately checked.
+Recovery is131/131 and still shows the one-transcript8MiB truncation caveat. The
+ordinary coverage polls remain unchanged; matching FTS hits cannot substitute for
+these coverage assertions.
+
+Every process must supply measured positive parent RSS and command latency before
+mixed aggregation; missing/null values reject instead of becoming zero or hiding
+behind another process. Every native sample's cumulative lane counter is checked
+in native timestamp order, including unscoped intervals. Missing/malformed values
+and any intra-process decrease reject even if the endpoint recovered above the
+start. Resets between distinct processes remain legitimate. Feature-only native
+sample snapshot and emission are serialized together so periodic/control-boundary
+races cannot emit an older counter snapshot with a later timestamp. The disabled
+observer returns before this lock; unrelated recorder events retain their existing
+concurrent ordering contract.

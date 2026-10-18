@@ -8,3 +8,8 @@ test('mixed resources keep independent process clocks and sum only active phase 
 test('mixed resources reject missing/duplicate/foreign segments and local clock/counter corruption',()=>{
  for(const corrupt of [s=>s.pop(),s=>s.push(s[0]),s=>s[1].kind='initial',s=>s[1].process=s[0].process,s=>s[1].evidence.native[1].seq=1,s=>s[1].evidence.native.at(-1).resource.readBytes.metadata=-1,s=>s[0].evidence.lost=true]){const s=segments();corrupt(s);assert.throws(()=>summarizeMixedResources({schema:2,contract:'mixed',segments:s},'chromium'));}
 });
+
+test('within-process cumulative counter resets reject even with recovered end; plateaus and process reset remain valid',()=>{
+ const good=segments();for(const e of good[0].evidence.native)e.resource.readBytes.metadata=100;for(const e of good[1].evidence.native)e.resource.readBytes.metadata=0;summarizeMixedResources({schema:2,contract:'mixed',segments:good},'chromium');
+ for(const change of [s=>{const r=s[0].evidence.native;[10,100,0,15,20].forEach((v,i)=>r[i].resource.readBytes.metadata=v);},s=>delete s[0].evidence.native[2].resource.readBytes.links,s=>s[0].evidence.native[2].resource.readBytes.usage='3']){const s=segments();change(s);assert.throws(()=>summarizeMixedResources({schema:2,contract:'mixed',segments:s},'chromium'));}
+});

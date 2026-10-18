@@ -254,31 +254,41 @@ pub fn file_size(path: &Path) -> Value {
         Err(_) => json!({"status":"unknown","reason":"metadata_unavailable"}),
     }
 }
+// Periodic and boundary samples can race. Hold snapshot through timestamped
+// emission so cumulative values cannot appear to go backwards within a process.
+static SAMPLE_CAPTURE: Mutex<()> = Mutex::new(());
+fn serialized_sample<T>(capture: impl FnOnce() -> T) -> T {
+    let _capture = SAMPLE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+    capture()
+}
 pub fn sample(profile: &Path, boundary: &'static str, phase: &'static str) {
     if !enabled() {
         return;
     }
-    let mut system = sysinfo::System::new();
-    let pid = sysinfo::get_current_pid().ok();
-    let rss = if let Some(pid) = pid {
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[pid]),
-            true,
-            sysinfo::ProcessRefreshKind::nothing().with_memory(),
-        );
-        system
-            .process(pid)
-            .map(|p| json!({"status":"measured","bytes":p.memory()}))
-            .unwrap_or_else(|| json!({"status":"unknown","reason":"process_unavailable"}))
-    } else {
-        json!({"status":"unknown","reason":"pid_unavailable"})
-    };
-    super::metrics::resource(
-        json!({"kind":"sample","boundary":boundary,"phase":phase,"nativeRssInclusive":rss,
+    serialized_sample(|| {
+        let mut system = sysinfo::System::new();
+        let pid = sysinfo::get_current_pid().ok();
+        let rss = if let Some(pid) = pid {
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing().with_memory(),
+            );
+            system
+                .process(pid)
+                .map(|p| json!({"status":"measured","bytes":p.memory()}))
+                .unwrap_or_else(|| json!({"status":"unknown","reason":"process_unavailable"}))
+        } else {
+            json!({"status":"unknown","reason":"pid_unavailable"})
+        };
+        super::metrics::resource(
+            json!({"kind":"sample","boundary":boundary,"phase":phase,"nativeRssInclusive":rss,
         "db":file_size(&profile.join("headstate.db")),"walRetained":file_size(&profile.join("headstate.db-wal")),
         "readBytes":ObjectReads::get()}),
-    );
+        );
+    });
 }
+
 struct ObjectReads;
 impl ObjectReads {
     fn get() -> Value {
@@ -313,6 +323,48 @@ pub fn stop() {
 mod tests {
     use super::*;
     use rusqlite::{Connection, TransactionBehavior::Immediate};
+    #[test]
+    fn concurrent_sample_snapshot_and_emission_are_serialized() {
+        use std::sync::mpsc;
+        let counter = Arc::new(AtomicU64::new(0));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let a = counter.clone();
+        let output = emitted.clone();
+        let first = std::thread::spawn(move || {
+            serialized_sample(|| {
+                let value = a.load(Ordering::SeqCst);
+                captured_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                output.lock().unwrap().push(value);
+            })
+        });
+        captured_rx.recv().unwrap();
+        counter.store(1, Ordering::SeqCst);
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let output = emitted.clone();
+        let second = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            serialized_sample(|| {
+                output.lock().unwrap().push(counter.load(Ordering::SeqCst));
+                done_tx.send(()).unwrap();
+            });
+        });
+        attempt_rx.recv().unwrap();
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            blocked,
+            "a later sample cannot emit before an earlier snapshot"
+        );
+        assert_eq!(*emitted.lock().unwrap(), vec![0, 1]);
+    }
     #[test]
     fn resource_commits_rollback_connection_isolation_and_privacy() {
         super::super::metrics::take_resource_capture();

@@ -1,3 +1,5 @@
+import {assertMixedCoverageCheckpoints} from './mixed-coverage.mjs';
+import {aggregateMixedParent} from './mixed-parent.mjs';
 import assert from 'node:assert/strict';
 import {mkdir,readdir,readFile,writeFile,stat} from 'node:fs/promises';
 import {createWriteStream} from 'node:fs';
@@ -17,7 +19,7 @@ export function validateMixedPair(initial,resumed){
  let oracle=initialOracle(plan);for(const event of plan.events){oracle=advanceOracle(oracle,event,resumed.mixed.receipts.find(r=>r.revision===event.revision)?.receipt);if(event.revision===plan.checkpointRevision)assert.deepEqual(initial.mixed.oracle,oracle);}
  assert.deepEqual(resumed.mixed.oracle,oracle);assert.deepEqual(initial.mixed.receipts.map(r=>r.revision),[2]);assert.deepEqual(resumed.mixed.receipts.map(r=>r.revision),[2,4]);assert.deepEqual(initial.mixed.receipts,resumed.mixed.receipts.slice(0,1));
  assert.equal(initial.mixed.corpus.stored.paused,true);assert.equal(resumed.mixed.pauseAfterRestart,true);assert.equal(resumed.mixed.cachedCorpus.before,0);assert.equal(resumed.mixed.cachedCorpus.after,0);assert.equal(resumed.mixed.corpus.stored.paused,false);
- for(const run of [initial,resumed]){assert.equal(run.mixed.finalClients.length,2,'both actual clients required');assert.deepEqual(run.mixed.consumerWitnesses.map(w=>w.role).sort(),['desktop','paired'],'both stored consumers required');for(const client of run.mixed.finalClients){assert.equal(client.lost,false);assertChurnFacts(run.mixed.oracle,client.facts);assertChurnReady(run.mixed.oracle,client.ready);}}return plan;
+ for(const run of [initial,resumed]){assert.equal(run.mixed.initialWarm,initial.warm);assertMixedCoverageCheckpoints(run.mixed.coverageWitnesses,{kind:run.mixed.kind,warm:initial.warm});assert.equal(run.mixed.finalClients.length,2,'both actual clients required');assert.deepEqual(run.mixed.consumerWitnesses.map(w=>w.role).sort(),['desktop','paired'],'both stored consumers required');for(const client of run.mixed.finalClients){assert.equal(client.lost,false);assertChurnFacts(run.mixed.oracle,client.facts);assertChurnReady(run.mixed.oracle,client.ready);}}return plan;
 }
 export async function runMixed({out,engine,warm,fixedPlanPath}){
  await mkdir(out,{recursive:true});assert.deepEqual(await readdir(out),[],'refuse existing mixed artifacts');
@@ -43,7 +45,7 @@ export async function runMixed({out,engine,warm,fixedPlanPath}){
   result.resourceIdentity={manifestSha256:manifest.logicalSha256,toolchain:digest(initial.provenance),phasePlan,segmentPhasePlan:fixed?.segments??null,phasePlanStatus:fixed?'fixed':'exploratory-only'};
   if(disabled)result.resources={enabled:false,reason:'runtime_disabled',segments:segments.map(run=>({process:run.process,artifact:result.segments.find(s=>s.kind===run.mixed.kind).artifact}))};
   else{const evidence={schema:2,contract:'mixed',segments:segments.map(run=>({kind:run.mixed.kind,warm:run.warm,process:run.process,evidence:run.resources.evidence}))};result.resources={enabled:true,evidence,summary:summarizeMixedResources(evidence,engine)};validateResourceResult(result);}
-  result.parentObservation={wallMs:performance.now()-started,nativeRssPeak:Math.max(...segments.map(run=>run.parentObservation.nativeRssPeak)),commandLatencyMaxMs:Math.max(...segments.map(run=>run.parentObservation.commandLatencyMaxMs)),lost:segments.some(run=>run.parentObservation.lost),artifactBytes:(await bytes(out))-(warm?await bytes(resolve(out,'preparation')):0),meaning:'independent parent measures; wall includes actual restart downtime; preparation artifacts/cost reported separately'};
+  result.parentObservation={wallMs:performance.now()-started,...aggregateMixedParent(segments.map(run=>run.parentObservation)),artifactBytes:(await bytes(out))-(warm?await bytes(resolve(out,'preparation')):0),meaning:'independent parent measures; wall includes actual restart downtime; preparation artifacts/cost reported separately'};
   result.overlap={requiredForCold:!warm,initial:initial.mixed.overlap,resumed:resumed.mixed.overlap,meaning:'same native clock; completed positive index-work pass excludes cadence sleep; warm overlap only when actually observed'};
   result.restart={actualProcesses:segments.map(run=>run.process),stableProfile:profile,sourceResultSha256:digest(initial),resumedResultSha256:digest(resumed),checkpointSha256:digest(JSON.parse(await readFile(resolve(out,'initial/mixed-checkpoint.json'),'utf8'))),cacheArtifact:resolve(out,'resumed/churn-restart-cache.json'),corpusCacheArtifact:resolve(out,'resumed/mixed-restart-corpus-cache.json')};
   result.pass=true;

@@ -38,7 +38,7 @@ export async function loadMixedCheckpoint({sourceDir,profile,provider,plan,manif
  assert.deepEqual(await profileHashes(resolve(sourceDir,'checkpoint/profile')),record.profileHashes,'retained immutable checkpoint snapshot');
  assert.equal(digest(record.provider),record.hashes.provider);assertProviderMatchesOracle(record.provider,record.oracle);
  const data=structuredClone(record.provider);for(const row of data.rows){row.repository=data.repos.find(repo=>repo.nameWithOwner===row.repository.nameWithOwner);row.headRepository=row.repository;}Object.assign(provider.data,data);
- return record;
+ assert.equal(typeof source.warm,'boolean');return {...record,initialWarm:source.warm};
 }
 
 export async function saveMixedPreparation({out,profile,provider,plan,manifest,source}){
