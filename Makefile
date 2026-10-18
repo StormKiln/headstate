@@ -658,3 +658,10 @@ lint-enterprise-resources:
 measure-enterprise-discovery:
 	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_probe::discovery_scaling_measurement -- --ignored --exact --nocapture
 	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_inventory::tests::discovery_inventory_scaling_measurement -- --ignored --exact --nocapture
+
+.PHONY: measure-enterprise-checkpoints
+# Synthetic sources only; these ignored probes retain their temporary databases.
+# Ordinary debug build isolates codec/publication capacities from recorder costs.
+measure-enterprise-checkpoints:
+	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_staging_matrix -- --ignored --exact --nocapture
+	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_links_and_growth_measurement -- --ignored --exact --nocapture

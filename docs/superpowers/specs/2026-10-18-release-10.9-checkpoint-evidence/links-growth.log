@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/headstate_lib-bd304ff4fe4a7524)
+
+running 1 test
+SOURCE kind=links breakdown=[(21425413, 140546, 8821, 360384, 21054128, 2048, 122167)] elapsed_us=1594366 mutations=4100 retained_wal=1104192 body_bytes=16777200 links_added=1 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmphPEfAR
+SOURCE kind=pending breakdown=[(17506848, 17021897, 16622080, 360448, 0, 524288, 5849542)] elapsed_us=206792 mutations=4100 retained_wal=18086832 body_bytes=16777216 links_added=0 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpceX6wv
+SOURCE kind=growth1024 breakdown=[(10440, 5459, 8200, 160, 0, 2048, 48125)] elapsed_us=2600 mutations=5 retained_wal=16512 body_bytes=12288 links_added=0 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpFCIRAf
+SOURCE kind=growth8192 breakdown=[(10440, 5464, 8200, 160, 0, 2048, 53416)] elapsed_us=2560 mutations=5 retained_wal=16512 body_bytes=12288 links_added=0 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmphnnfoN
+test claude::linkscan::tests::checkpoint_links_and_growth_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3377 filtered out; finished in 19.20s

@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/headstate_lib-bd304ff4fe4a7524)
+
+running 1 test
+STAGING sources=1 history=1024 partial=65536 peak_breakdown=Some((187424, 104225, 69632, 115712, 0, 2048, 119375)) published_sources=1
+COMPACT bytes=104225
+REFERENCE_JSON sources=1 history_blocks=1024 partial=65536 encoded_json=349518 retained_string_capacity=524288 elapsed_us=50984 mutations=1044 retained_wal=379072 body_bytes=4259840 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpq0Ar0k
+STAGING sources=32 history=1024 partial=65536 peak_breakdown=Some((187424, 104237, 69632, 115712, 0, 2048, 45458)) published_sources=32
+COMPACT bytes=3335584
+REFERENCE_JSON sources=32 history_blocks=1024 partial=65536 encoded_json=11184960 retained_string_capacity=16777216 elapsed_us=1620835 mutations=33377 retained_wal=13056312 body_bytes=136314880 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpC6GgaK
+STAGING sources=256 history=1024 partial=65536 peak_breakdown=Some((187424, 104237, 69632, 115712, 0, 2048, 50875)) published_sources=256
+COMPACT bytes=26684288
+REFERENCE_JSON sources=256 history_blocks=1024 partial=65536 encoded_json=89479296 retained_string_capacity=134217728 elapsed_us=13062033 mutations=267009 retained_wal=106448472 body_bytes=1090519040 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpVIKpcq
+STAGING sources=1 history=8192 partial=65536 peak_breakdown=Some((990240, 333618, 69632, 918528, 0, 2048, 62875)) published_sources=1
+COMPACT bytes=333618
+REFERENCE_JSON sources=1 history_blocks=8192 partial=65536 encoded_json=829791 retained_string_capacity=1048576 elapsed_us=395598 mutations=8212 retained_wal=2270152 body_bytes=33619968 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpscjc6w
+STAGING sources=1 history=1024 partial=1048576 peak_breakdown=Some((1185824, 1094957, 1052672, 131072, 0, 2048, 60208)) published_sources=1
+COMPACT bytes=1094957
+REFERENCE_JSON sources=1 history_blocks=1024 partial=1048576 encoded_json=4297770 retained_string_capacity=8388608 elapsed_us=59856 mutations=1284 retained_wal=1429672 body_bytes=5242880 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpPhbwXr
+STAGING sources=1 history=1024 partial=16777215 peak_breakdown=Some((17311710, 16950544, 16785406, 524224, 0, 2048, 63875)) published_sources=1
+COMPACT bytes=16950544
+REFERENCE_JSON sources=1 history_blocks=1024 partial=16777215 encoded_json=67485923 retained_string_capacity=134217728 elapsed_us=230332 mutations=5123 retained_wal=18284592 body_bytes=20971519 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmprHLsiL
+test claude::linkscan::tests::checkpoint_staging_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3377 filtered out; finished in 25.67s

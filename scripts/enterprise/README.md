@@ -182,6 +182,22 @@ Queue transactions retain deferred BEGIN: wait measures BEGIN admission, while h
 includes possible later writer-upgrade contention. Corpus scopes retain immediate
 BEGIN. Records carry the actual transaction mode, and contracts require that mode.
 
+Checkpoint publication emits path-free `checkpoint-staging` records: raw byte
+buffer capacities, dirty digest vector/string capacities, link vector backing
+(`capacity * size_of<PrLink>`) plus owned link strings, metadata string capacity,
+and the 32-byte digest conversion scratch. `checkpointEncodedBytes` covers the
+checkpoint's raw byte/digest delta and metadata, not link SQL parameters. Header
+encoding duration is separate from transaction wait/hold. The 24 MiB measured
+publication envelope is an observation threshold, never an evidence-eviction
+rule or a total-memory guarantee. Fixed stack bookkeeping, corpus/offset scheduling collections, parser-owned trees,
+read-phase clones/buffers, SQLite copies and RSS are outside this payload scope.
+Oversized valid historical metadata remains lossless and may exceed current
+parser bounds. `claude_link_bytes`, `claude_link_hash` and
+`claude_link_continuation` are explicitly classified in transaction observations
+and the profile inspector. Run `make measure-enterprise-checkpoints` for the
+retained synthetic ordinary-build probes; see the release checkpoint measurement
+document for before/after evidence, headroom and initial-WAL tradeoffs.
+
 Application bytes are counted at returned reads for metadata, usage, search index
 and links. They include rereads, not physical I/O. The population inventory additionally emits path-free `discovery` records with
 returned directory entries, cooperative work units, completed directory passes,

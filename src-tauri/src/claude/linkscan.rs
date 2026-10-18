@@ -28,8 +28,9 @@
 //! overflow reports deferred/unreadable without advancing the prior checkpoint.
 //!
 //! A small baseline and per-source rows replace the legacy settings cursor.
-//! Only changed sources serialize and write their evidence. Checksums grow
-//! with accepted bytes (one per4KiB), and each file retains one bounded partial
+//! Only changed sources serialize metadata; byte buffers use raw BLOBs and
+//! historical checksums are loaded lazily and appended (one per4KiB).
+//! Each file retains one bounded partial
 //! record. Complete listings prune missing paths; partial listings retain them.
 //!
 //! Incremental ingestion only ADDS links, preserving existing first-seen
@@ -49,7 +50,7 @@ use crate::store::settings;
 mod storage;
 #[cfg(test)]
 pub(crate) use storage::checkpoint_cursor;
-pub(crate) use storage::migrate_legacy;
+pub(crate) use storage::{migrate_compact, migrate_legacy};
 
 /// How many transcript bytes one pass may read.
 ///
@@ -88,8 +89,8 @@ pub struct Cursor {
 pub struct Refreshed {
     /// No import has set a cursor yet, so nothing was read.
     pub not_started: bool,
-    /// Cancellation/deadline or a newer generation discarded this pass's staged
-    /// work. Previously committed links and parser checkpoints are unchanged.
+    /// Cancellation/deadline or a newer generation discarded the active source.
+    /// Earlier source commits in this pass remain accepted.
     pub stopped: Option<super::transcript::PopulationStatus>,
     /// Files read from, in whole or in part.
     pub files_read: usize,
@@ -128,6 +129,7 @@ pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::Store
     migrate_legacy(conn)?;
     super::transcript::population_generation(conn, "links")?;
     conn.execute("DELETE FROM claude_link_checkpoint", [])?;
+    conn.execute("DELETE FROM claude_link_continuation", [])?;
     conn.execute("INSERT INTO claude_link_baseline VALUES(1, ?1) ON CONFLICT(singleton) DO UPDATE SET since_ms=excluded.since_ms", [since_ms])?;
     Ok(())
 }
@@ -171,9 +173,6 @@ pub(crate) fn refresh_controlled(
         return Ok(out);
     };
     let offsets = storage::offsets(conn)?;
-    // Decode one source at a time. Staged strings still scale with the changed
-    // sources (and one large source remains large), never every warm source.
-    let mut changed = Vec::new();
 
     let mut todo = Vec::new();
     for t in &scan.sessions {
@@ -200,8 +199,13 @@ pub(crate) fn refresh_controlled(
                 .push(format!("{}: could not stat it: {e}", t.path)),
         }
     }
-    todo.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let mut links = Vec::new();
+    todo.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+    if let Some(last) = storage::continuation(conn)? {
+        let next = todo.partition_point(|item| item.1.path <= last);
+        if next < todo.len() {
+            todo.rotate_left(next);
+        }
+    }
     let mut left = budget;
     for (_, t) in todo {
         if let Some(reason) = stopped(conn, control, generation)? {
@@ -214,17 +218,18 @@ pub(crate) fn refresh_controlled(
         }
         // Old offset-only settings replay once: they cannot establish source
         // continuity or reconstruct an unfinished create/result pairing.
-        let original = storage::checkpoint(conn, &t.path)?;
+        let original = storage::load(conn, &t.path)?;
         let checkpoint = original.clone().unwrap_or_default();
-        match read_from_controlled(
+        match read_from_evidence(
             Path::new(&t.path),
             &t.session_id,
             checkpoint,
             left,
             control,
             || {},
+            |block| storage::hash(conn, &t.path, block).map_err(std::io::Error::other),
         ) {
-            Ok(read) => {
+            Ok(mut read) => {
                 left = left.saturating_sub(read.consumed);
                 out.bytes_read += read.consumed;
                 out.files_read += usize::from(read.consumed > 0);
@@ -233,19 +238,62 @@ pub(crate) fn refresh_controlled(
                     out.stopped = Some(reason);
                     return Ok(out);
                 }
-                if let Some(error) = read.error {
+                if let Some(ref error) = read.error {
                     out.unreadable.push(format!("{}: {error}", t.path));
                 }
-                links.extend(read.links);
-                if original.as_ref() != Some(&read.checkpoint)
-                    || offsets.get(&t.path) != Some(&read.checkpoint.to)
-                {
-                    changed.push((
-                        t.path.clone(),
-                        read.checkpoint.to,
-                        serde_json::to_string(&read.checkpoint)?,
-                    ));
+                let changed = original.as_ref() != Some(&read.checkpoint)
+                    || offsets.get(&t.path) != Some(&read.checkpoint.to);
+                drop(original);
+                if !changed && read.links.is_empty() && read.consumed == 0 && read.error.is_none() {
+                    continue;
                 }
+                #[cfg(any(test, feature = "enterprise-harness"))]
+                let encode_started = std::time::Instant::now();
+                let payload = changed
+                    .then(|| storage::encode_header(&mut read.checkpoint))
+                    .transpose()?;
+                #[cfg(any(test, feature = "enterprise-harness"))]
+                if let Some(ref header) = payload {
+                    measure_staging(
+                        &read,
+                        header,
+                        header.capacity(),
+                        encode_started.elapsed().as_nanos() as u64,
+                    );
+                }
+                observe("before_publish");
+                if let Some(reason) = stopped(conn, control, generation)? {
+                    out.stopped = Some(reason);
+                    return Ok(out);
+                }
+                #[cfg(feature = "enterprise-harness")]
+                let tx = crate::enterprise_harness::resources::transaction(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                    "corpus-links",
+                )?;
+                #[cfg(not(feature = "enterprise-harness"))]
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if let Some(reason) = stopped(&tx, control, generation)? {
+                    out.stopped = Some(reason);
+                    return Ok(out);
+                }
+                let mut added = 0;
+                for l in &read.links {
+                    added += tx.execute("INSERT OR IGNORE INTO claude_session_pr (session_id,repo,number,url,first_seen_at) VALUES (?1,?2,?3,?4,?5)", rusqlite::params![l.session_id,l.repo,l.number as i64,l.url,l.first_seen_at])?;
+                }
+                if let Some(payload) = payload {
+                    storage::write(&tx, &t.path, &read.checkpoint, &payload)?;
+                }
+                storage::advance(&tx, &t.path)?;
+                observe("before_commit");
+                if let Some(reason) = stopped(&tx, control, generation)? {
+                    out.stopped = Some(reason);
+                    return Ok(out);
+                }
+                tx.commit()?;
+                out.links_added += added;
             }
             Err(e) => out
                 .unreadable
@@ -259,12 +307,8 @@ pub(crate) fn refresh_controlled(
         removed.extend(offsets.keys().filter(|p| !listed.contains(p.as_str())));
     }
 
-    // The links and the cursor that says they were read, in ONE
-    // transaction: a cursor committed without its links would skip them
-    // for good.
-    observe("before_publish");
-    if let Some(reason) = control.stop_reason() {
-        out.stopped = Some(reason);
+    // Only authoritative discovery may prune, independently of source commits.
+    if removed.is_empty() {
         return Ok(out);
     }
     #[cfg(feature = "enterprise-harness")]
@@ -279,35 +323,76 @@ pub(crate) fn refresh_controlled(
         out.stopped = Some(reason);
         return Ok(out);
     }
-    for l in &links {
-        out.links_added += tx.execute(
-            "INSERT OR IGNORE INTO claude_session_pr
-                 (session_id, repo, number, url, first_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                l.session_id,
-                l.repo,
-                l.number as i64,
-                l.url,
-                l.first_seen_at
-            ],
-        )?;
-    }
-    for (path, offset, payload) in changed {
-        storage::put(&tx, &path, offset, Some(&payload))?;
-    }
     for path in removed {
         tx.execute("DELETE FROM claude_link_checkpoint WHERE path=?1", [path])?;
     }
     observe("before_commit");
     if let Some(reason) = stopped(&tx, control, generation)? {
-        out.links_added = 0;
         out.stopped = Some(reason);
         return Ok(out);
     }
     tx.commit()?;
     Ok(out)
 }
+
+// Calibrated synthetic publication envelope; never an evidence-eviction limit.
+// See release-10.9-checkpoint-measurements.md for fixture and allocation scope.
+#[cfg(any(test, feature = "enterprise-harness"))]
+const MEASURED_STAGING_ENVELOPE: usize = 24 * 1024 * 1024;
+
+/// Selected owned publication buffers; excludes parser/tree allocation overhead,
+/// the already-released original checkpoint, SQLite copies, and process RSS.
+#[cfg(any(test, feature = "enterprise-harness"))]
+fn measure_staging(read: &FileRead, header: &str, header_capacity: usize, encode_ns: u64) {
+    let cp = &read.checkpoint;
+    let buffers = [
+        &cp.line_buffer,
+        &cp.tail,
+        &cp.last_block,
+        &cp.audit_buffer,
+        &cp.provenance.buffer,
+    ];
+    let raw_capacity: usize = buffers.iter().map(|v| v.capacity()).sum();
+    let raw_len: usize = buffers.iter().map(|v| v.len()).sum();
+    let digest_capacity = cp.hashes.capacity() * std::mem::size_of::<String>()
+        + cp.hashes.iter().map(String::capacity).sum::<usize>();
+    let links_capacity = read.links.capacity() * std::mem::size_of::<super::subagent::PrLink>()
+        + read
+            .links
+            .iter()
+            .map(|l| {
+                l.session_id.capacity()
+                    + l.repo.capacity()
+                    + l.url.capacity()
+                    + l.first_seen_at.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>();
+    let codec_scratch = usize::from(!cp.hashes.is_empty()) * 32;
+    let owned = raw_capacity + digest_capacity + links_capacity + header_capacity + codec_scratch;
+    let encoded = raw_len + cp.hashes.len() * 32 + header.len();
+    #[cfg(test)]
+    STAGING.with(|samples| {
+        samples.borrow_mut().push((
+            owned,
+            encoded,
+            raw_capacity,
+            digest_capacity,
+            links_capacity,
+            header_capacity,
+            encode_ns,
+        ))
+    });
+    #[cfg(feature = "enterprise-harness")]
+    if crate::enterprise_harness::resources::enabled() {
+        crate::enterprise_harness::metrics::resource(
+            serde_json::json!({"kind":"checkpoint-staging","ownedPayloadBytes":owned,"measuredEnvelopeBytes":MEASURED_STAGING_ENVELOPE,"aboveMeasuredEnvelope":owned > MEASURED_STAGING_ENVELOPE,"checkpointEncodedBytes":encoded,"codecScratchBytes":codec_scratch,"headerEncodeNs":encode_ns,"rawCapacityBytes":raw_capacity,"dirtyDigestCapacityBytes":digest_capacity,"linksCapacityBytes":links_capacity,"headerBytes":header.len(),"headerCapacityBytes":header_capacity,"coverage":"one source byte/digest/link vector capacities plus encoded metadata; excludes parser/tree nodes, read working memory, SQLite copies and RSS"}),
+        );
+    }
+}
+#[cfg(test)]
+type StagingSample = (usize, usize, usize, usize, usize, usize, u64);
+#[cfg(test)]
+thread_local! { static STAGING: std::cell::RefCell<Vec<StagingSample>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
 fn stopped(
     conn: &Connection,
@@ -456,6 +541,9 @@ struct Checkpoint {
     discarding_line: bool,
     line_buffer: Vec<u8>,
     hashes: Vec<String>,
+    /// Digests before this index live in SQLite; only newly accepted blocks are owned.
+    #[serde(skip)]
+    hash_base: usize,
     tail: Vec<u8>,
     last_block: Vec<u8>,
     // Validation of the trailing anchor may span tiny-budget ticks.
@@ -502,7 +590,8 @@ impl Checkpoint {
             .into_iter()
             .filter_map(|start| {
                 let first = (start.saturating_sub(1) / BLOCK as u64) as usize;
-                (first < self.hashes.len()).then_some((first, self.hashes.len()))
+                (first < (self.hash_base + self.hashes.len()))
+                    .then_some((first, (self.hash_base + self.hashes.len())))
             })
             .collect();
         self.provenance = Provenance {
@@ -558,6 +647,18 @@ struct FileRead {
     error: Option<String>,
 }
 
+/// Test fixtures must seed historical schemas with their actual v1 payload,
+/// rather than invoke current persistence against a previous schema version.
+#[cfg(test)]
+pub(crate) fn historical_checkpoint_payload(path: &Path, session: &str) -> (u64, String) {
+    let read = read_from(path, session, Checkpoint::default(), BYTES_PER_PASS).unwrap();
+    assert!(read.error.is_none());
+    (
+        read.checkpoint.to,
+        serde_json::to_string(&read.checkpoint).unwrap(),
+    )
+}
+
 #[cfg(test)]
 fn read_from(
     path: &Path,
@@ -586,6 +687,7 @@ fn read_from_observed(
     )
 }
 
+#[cfg(test)]
 fn read_from_controlled(
     path: &Path,
     session_id: &str,
@@ -593,6 +695,26 @@ fn read_from_controlled(
     budget: u64,
     control: &super::transcript::PopulationControl,
     after_read: impl FnOnce(),
+) -> std::io::Result<FileRead> {
+    read_from_evidence(
+        path,
+        session_id,
+        original,
+        budget,
+        control,
+        after_read,
+        |_| Err(std::io::Error::other("missing historical digest")),
+    )
+}
+
+fn read_from_evidence(
+    path: &Path,
+    session_id: &str,
+    original: Checkpoint,
+    budget: u64,
+    control: &super::transcript::PopulationControl,
+    after_read: impl FnOnce(),
+    historical: impl Fn(usize) -> std::io::Result<String>,
 ) -> std::io::Result<FileRead> {
     let mut file = std::fs::File::open(path)?;
     let before = Source::read(&file)?;
@@ -618,7 +740,7 @@ fn read_from_controlled(
         }
         if changed && cp.audit_next == cp.audit_end {
             cp.audit_next = 0;
-            cp.audit_end = cp.hashes.len();
+            cp.audit_end = cp.hash_base + cp.hashes.len();
             cp.audit_source = Some(before.clone());
         }
         if cp.anchor_source.as_ref() != Some(&before) {
@@ -655,7 +777,13 @@ fn read_from_controlled(
                 read_exact_counted(&mut file, &mut bytes, &mut out.consumed, control)?;
                 proof.buffer.extend(bytes);
                 if proof.buffer.len() == BLOCK {
-                    if digest(&proof.buffer) != cp.hashes[proof.block] {
+                    if digest(&proof.buffer)
+                        != if proof.block < cp.hash_base {
+                            historical(proof.block)?
+                        } else {
+                            cp.hashes[proof.block - cp.hash_base].clone()
+                        }
+                    {
                         cp = Checkpoint::default();
                         break;
                     }
@@ -680,7 +808,13 @@ fn read_from_controlled(
             read_exact_counted(&mut file, &mut bytes, &mut out.consumed, control)?;
             cp.audit_buffer.extend(bytes);
             if cp.audit_buffer.len() == BLOCK {
-                if digest(&cp.audit_buffer) != cp.hashes[cp.audit_next] {
+                if digest(&cp.audit_buffer)
+                    != if cp.audit_next < cp.hash_base {
+                        historical(cp.audit_next)?
+                    } else {
+                        cp.hashes[cp.audit_next - cp.hash_base].clone()
+                    }
+                {
                     cp = Checkpoint::default();
                 } else {
                     cp.audit_next += 1;
@@ -749,7 +883,7 @@ fn read_from_controlled(
         // restarting it on each append would starve its later blocks.
         if cp.audit_next == cp.audit_end && cp.audit_source.as_ref().is_some_and(|s| s != &before) {
             cp.audit_next = 0;
-            cp.audit_end = cp.hashes.len();
+            cp.audit_end = cp.hash_base + cp.hashes.len();
             cp.audit_source = Some(before.clone());
         }
         out.deferred = !parser_ready || cp.to < before.len || cp.audit_next < cp.audit_end;
@@ -809,6 +943,298 @@ fn read_exact_counted(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(feature = "enterprise-harness")]
+    #[test]
+    fn resource_source_commit_classifies_compact_tables_and_staging() {
+        let (dir, project, mut conn) = fixture();
+        std::fs::write(project.join("s.jsonl"), vec![b'\n'; BLOCK]).unwrap();
+        reset(&conn, 0).unwrap();
+        crate::enterprise_harness::metrics::take_resource_capture();
+        refresh(
+            &mut conn,
+            &crate::claude::corpus(&dir.path().join("projects")),
+            BYTES_PER_PASS,
+        )
+        .unwrap();
+        let captured = crate::enterprise_harness::metrics::take_resource_capture();
+        let commit = captured
+            .iter()
+            .find(|v| {
+                v["kind"] == "transaction"
+                    && v["operation"] == "corpus-links"
+                    && v["outcome"] == "committed"
+            })
+            .unwrap();
+        for table in [
+            "claude_link_checkpoint",
+            "claude_link_bytes",
+            "claude_link_hash",
+            "claude_link_continuation",
+        ] {
+            assert_eq!(
+                commit["mutations"][table],
+                serde_json::json!([1, 0, 0]),
+                "{table}"
+            );
+        }
+        let staging = captured
+            .iter()
+            .find(|v| v["kind"] == "checkpoint-staging")
+            .unwrap();
+        assert_eq!(staging["codecScratchBytes"], 32);
+        assert!(staging["ownedPayloadBytes"].as_u64().unwrap() > BLOCK as u64);
+        assert!(!staging.to_string().contains(project.to_str().unwrap()));
+    }
+
+    #[test]
+    #[ignore]
+    fn checkpoint_links_and_growth_measurement() {
+        for kind in ["links", "pending", "growth1024", "growth8192"] {
+            let (dir, project, mut conn) = fixture();
+            let path = project.join("s.jsonl");
+            let mut data = Vec::new();
+            if kind == "links" {
+                let line = format!("{}\n", link_line("s", "acme/api", 77));
+                while data.len() + line.len() <= BYTES_PER_PASS as usize {
+                    data.extend_from_slice(line.as_bytes());
+                }
+            } else if kind == "pending" {
+                for i in 0..256 {
+                    let id = format!("{i:03}{}", "x".repeat(509));
+                    data.extend_from_slice(format!("{}\n", create_line(&id)).as_bytes());
+                }
+                data.resize(BYTES_PER_PASS as usize, b'x');
+            } else {
+                data.resize(
+                    if kind == "growth1024" { 1024 } else { 8192 } * BLOCK,
+                    b'\n',
+                );
+            }
+            std::fs::write(&path, &data).unwrap();
+            reset(&conn, 0).unwrap();
+            let scan = crate::claude::corpus(&dir.path().join("projects"));
+            if kind.starts_with("growth") {
+                refresh(&mut conn, &scan, u64::MAX / 2).unwrap();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&vec![b'\n'; BLOCK])
+                    .unwrap();
+            }
+            STAGING.with(|samples| samples.borrow_mut().clear());
+            conn.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            let changes = conn.total_changes();
+            let start = std::time::Instant::now();
+            let result = refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+            let elapsed = start.elapsed();
+            let staging = STAGING.with(|samples| samples.borrow().clone());
+            assert!(staging
+                .iter()
+                .all(|sample| sample.0 <= MEASURED_STAGING_ENVELOPE));
+            println!("SOURCE kind={kind} breakdown={staging:?} elapsed_us={} mutations={} retained_wal={} body_bytes={} links_added={} db={}",elapsed.as_micros(),conn.total_changes()-changes,std::fs::metadata(dir.path().join("t.db-wal")).unwrap().len(),result.bytes_read,result.links_added,dir.path().display());
+            assert!(result.unreadable.is_empty(), "{:?}", result.unreadable);
+            let _ = dir.keep();
+        }
+    }
+
+    /// Synthetic production-path baseline; explicit opt-in only.
+    #[test]
+    fn every_body_read_precedes_writer_admission() {
+        let (dir, project, mut conn) = fixture();
+        append(&project.join("s.jsonl"), &[link_line("s", "acme/api", 77)]);
+        reset(&conn, 0).unwrap();
+        let other = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        let guard = observing(move |event| {
+            if event == "read" {
+                let writer = rusqlite::Transaction::new_unchecked(
+                    &other,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .expect("body reads must not hold a writer");
+                writer.rollback().unwrap();
+                observed.set(observed.get() + 1);
+            }
+        });
+        refresh(
+            &mut conn,
+            &crate::claude::corpus(&dir.path().join("projects")),
+            BYTES_PER_PASS,
+        )
+        .unwrap();
+        drop(guard);
+        assert!(count.get() > 0);
+        assert_eq!(linked(&conn, 77), ["s"]);
+    }
+
+    #[test]
+    fn growing_source_only_appends_digest_rows_and_restart_rotates_fairly() {
+        let (dir, project, mut conn) = fixture();
+        for i in 0..3 {
+            std::fs::write(project.join(format!("s{i}.jsonl")), vec![b'\n'; BLOCK * 8]).unwrap();
+        }
+        reset(&conn, 0).unwrap();
+        let scan = crate::claude::corpus(&dir.path().join("projects"));
+        for _ in 0..3 {
+            refresh(&mut conn, &scan, BLOCK as u64).unwrap();
+            drop(conn);
+            conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        }
+        assert_eq!(storage::offsets(&conn).unwrap().len(), 3);
+        for offset in storage::offsets(&conn).unwrap().values() {
+            assert_eq!(*offset, BLOCK as u64);
+        }
+        refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        conn.execute_batch("CREATE TEMP TABLE changes(kind TEXT); CREATE TEMP TRIGGER old_digest_update AFTER UPDATE ON claude_link_hash BEGIN INSERT INTO changes VALUES('update'); END; CREATE TEMP TRIGGER old_digest_delete AFTER DELETE ON claude_link_hash BEGIN INSERT INTO changes VALUES('delete'); END; CREATE TEMP TRIGGER new_digest AFTER INSERT ON claude_link_hash BEGIN INSERT INTO changes VALUES('insert'); END;").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(project.join("s0.jsonl"))
+            .unwrap()
+            .write_all(&vec![b'\n'; BLOCK])
+            .unwrap();
+        refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM changes WHERE kind!='insert'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM changes WHERE kind='insert'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_source_database_failure_preserves_prior_source_and_retries_failed_source() {
+        let (dir, project, mut conn) = fixture();
+        for i in 0..3 {
+            append(
+                &project.join(format!("s{i}.jsonl")),
+                &[link_line(&format!("s{i}"), "acme/api", 77)],
+            );
+        }
+        reset(&conn, 0).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_second BEFORE INSERT ON claude_link_checkpoint WHEN new.path LIKE '%s1.jsonl' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let scan = crate::claude::corpus(&dir.path().join("projects"));
+        assert!(refresh(&mut conn, &scan, BYTES_PER_PASS).is_err());
+        drop(conn);
+        let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        assert_eq!(linked(&conn, 77), ["s0"]);
+        assert_eq!(storage::offsets(&conn).unwrap().len(), 1);
+        conn.execute_batch("DROP TRIGGER fail_second").unwrap();
+        refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+        assert_eq!(linked(&conn, 77).len(), 3);
+    }
+
+    #[test]
+    #[ignore]
+    fn checkpoint_staging_matrix() {
+        for (sources, history, partial) in [
+            (1, 1024, 65536),
+            (32, 1024, 65536),
+            (256, 1024, 65536),
+            (1, 8192, 65536),
+            (1, 1024, 1048576),
+            (1, 1024, 16 * 1024 * 1024 - 1),
+        ] {
+            let (dir, project, mut conn) = fixture();
+            let mut data = vec![b' '; history * BLOCK];
+            for block in data.chunks_mut(BLOCK) {
+                *block.last_mut().unwrap() = b'\n';
+            }
+            data.extend(std::iter::repeat_n(b'x', partial));
+            for i in 0..sources {
+                std::fs::write(project.join(format!("s{i:03}.jsonl")), &data).unwrap();
+            }
+            reset(&conn, 0).unwrap();
+            let scan = crate::claude::corpus(&dir.path().join("projects"));
+            conn.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            STAGING.with(|samples| samples.borrow_mut().clear());
+            let start = std::time::Instant::now();
+            let changes = conn.total_changes();
+            let result = refresh(&mut conn, &scan, u64::MAX / 2).unwrap();
+            let elapsed = start.elapsed();
+            let staging = STAGING.with(|samples| samples.borrow().clone());
+            assert!(staging
+                .iter()
+                .all(|sample| sample.0 <= MEASURED_STAGING_ENVELOPE));
+            println!("STAGING sources={sources} history={history} partial={partial} peak_breakdown={:?} published_sources={}", staging.iter().max_by_key(|s|s.0), staging.len());
+            let compact_bytes: i64 = conn.query_row("SELECT coalesce(sum(length(payload)),0) + (SELECT coalesce(sum(length(line)+length(tail)+length(last_block)+length(audit)+length(provenance)),0) FROM claude_link_bytes) + (SELECT coalesce(sum(length(digest)),0) FROM claude_link_hash) FROM claude_link_checkpoint",[],|r|r.get(0)).unwrap();
+            println!("COMPACT bytes={compact_bytes}");
+            let cursor = checkpoint_cursor(&conn).unwrap().unwrap();
+            let payloads: Vec<_> = cursor
+                .checkpoints
+                .values()
+                .map(|cp| serde_json::to_string(cp).unwrap())
+                .collect();
+            let encoded: usize = payloads.iter().map(String::len).sum();
+            let owned: usize = payloads.iter().map(String::capacity).sum();
+            let wal = std::fs::metadata(dir.path().join("t.db-wal"))
+                .unwrap()
+                .len();
+            println!("REFERENCE_JSON sources={sources} history_blocks={history} partial={partial} encoded_json={encoded} retained_string_capacity={owned} elapsed_us={} mutations={} retained_wal={wal} body_bytes={} db={}", elapsed.as_micros(), conn.total_changes()-changes, result.bytes_read, dir.path().display());
+            assert_eq!(cursor.checkpoints.len(), sources);
+            // Keep synthetic profiles and WAL evidence for inspection.
+            let _ = dir.keep();
+        }
+    }
+
+    #[test]
+    fn cancellation_after_first_source_preserves_atomic_progress_on_reopen() {
+        for cancellation in ["read", "before_publish"] {
+            let (dir, project, mut conn) = fixture();
+            for i in 0..3 {
+                append(
+                    &project.join(format!("s{i}.jsonl")),
+                    &[link_line(&format!("s{i}"), "acme/api", 77)],
+                );
+            }
+            reset(&conn, 0).unwrap();
+            let scan = crate::claude::corpus(&dir.path().join("projects"));
+            let control = super::super::transcript::PopulationControl::discovery();
+            let cancel = control.clone();
+            let mut publications = 0;
+            let guard = observing(move |stage| {
+                if stage == cancellation {
+                    publications += 1;
+                    if publications == if cancellation == "read" { 3 } else { 2 } {
+                        cancel.cancel();
+                    }
+                }
+            });
+            let result = refresh_controlled(&mut conn, &scan, BYTES_PER_PASS, &control).unwrap();
+            assert_eq!(result.links_added, 1);
+            drop(guard);
+            drop(conn);
+            let mut conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+            assert_eq!(linked(&conn, 77).len(), 1);
+            assert_eq!(
+                checkpoint_cursor(&conn).unwrap().unwrap().checkpoints.len(),
+                1
+            );
+            let retried = refresh(&mut conn, &scan, BYTES_PER_PASS).unwrap();
+            assert_eq!(retried.links_added, 2);
+            assert_eq!(
+                retried.bytes_read,
+                2 * std::fs::metadata(project.join("s0.jsonl")).unwrap().len()
+            );
+        }
+    }
 
     #[test]
     fn checkpoint_rows_do_not_rewrite_unchanged_sources() {

@@ -72,17 +72,135 @@ pub(super) fn offsets(conn: &Connection) -> Result<BTreeMap<String, u64>, StoreE
     .collect()
 }
 
-pub(super) fn checkpoint(conn: &Connection, path: &str) -> Result<Option<Checkpoint>, StoreError> {
-    let raw: Option<Option<String>> = conn
+/// Metadata serialization temporarily borrows the five raw byte buffers and
+/// dirty hashes out of the checkpoint; it never clones their payloads.
+pub(super) fn encode_header(cp: &mut Checkpoint) -> Result<String, StoreError> {
+    let line = std::mem::take(&mut cp.line_buffer);
+    let tail = std::mem::take(&mut cp.tail);
+    let last = std::mem::take(&mut cp.last_block);
+    let audit = std::mem::take(&mut cp.audit_buffer);
+    let proof = std::mem::take(&mut cp.provenance.buffer);
+    let hashes = std::mem::take(&mut cp.hashes);
+    let encoded = serde_json::to_string(cp);
+    cp.line_buffer = line;
+    cp.tail = tail;
+    cp.last_block = last;
+    cp.audit_buffer = audit;
+    cp.provenance.buffer = proof;
+    cp.hashes = hashes;
+    Ok(encoded?)
+}
+
+pub(super) fn load(conn: &Connection, path: &str) -> Result<Option<Checkpoint>, StoreError> {
+    let raw: Option<(Option<String>, usize)> = conn
         .query_row(
-            "SELECT payload FROM claude_link_checkpoint WHERE path=?1",
+            "SELECT payload,hash_count FROM claude_link_checkpoint WHERE path=?1",
             [path],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)),
         )
         .optional()?;
-    raw.flatten()
-        .map(|raw| serde_json::from_str(&raw).map_err(StoreError::from))
-        .transpose()
+    let Some((Some(raw), count)) = raw else {
+        return Ok(None);
+    };
+    let mut cp: Checkpoint = serde_json::from_str(&raw)?;
+    cp.hash_base = count;
+    conn.query_row(
+        "SELECT line,tail,last_block,audit,provenance FROM claude_link_bytes WHERE path=?1",
+        [path],
+        |r| {
+            cp.line_buffer = r.get(0)?;
+            cp.tail = r.get(1)?;
+            cp.last_block = r.get(2)?;
+            cp.audit_buffer = r.get(3)?;
+            cp.provenance.buffer = r.get(4)?;
+            Ok(())
+        },
+    )?;
+    Ok(Some(cp))
+}
+
+pub(super) fn hash(conn: &Connection, path: &str, block: usize) -> Result<String, StoreError> {
+    let bytes: Vec<u8> = conn.query_row(
+        "SELECT digest FROM claude_link_hash WHERE path=?1 AND block=?2",
+        rusqlite::params![path, block as i64],
+        |r| r.get(0),
+    )?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn binary_digest(digest: &str) -> Result<Vec<u8>, StoreError> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            rusqlite::Error::InvalidParameterName("malformed checkpoint digest".into()).into(),
+        );
+    }
+    Ok((0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digest[i..i + 2], 16).expect("validated ASCII hex"))
+        .collect())
+}
+
+/// Must run in the source transaction with its link inserts and generation fence.
+pub(super) fn write(
+    conn: &Connection,
+    path: &str,
+    cp: &Checkpoint,
+    payload: &str,
+) -> Result<(), StoreError> {
+    conn.execute("INSERT INTO claude_link_checkpoint(path,offset,payload,hash_count) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET offset=excluded.offset,payload=excluded.payload,hash_count=excluded.hash_count", rusqlite::params![path,cp.to.to_string(),payload,(cp.hash_base+cp.hashes.len()) as i64])?;
+    conn.execute("INSERT INTO claude_link_bytes(path,line,tail,last_block,audit,provenance) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET line=excluded.line,tail=excluded.tail,last_block=excluded.last_block,audit=excluded.audit,provenance=excluded.provenance", rusqlite::params![path,cp.line_buffer,cp.tail,cp.last_block,cp.audit_buffer,cp.provenance.buffer])?;
+    // Existing history is never rewritten on append. A replay has base zero and
+    // atomically replaces all old evidence, including a shorter replacement.
+    conn.execute(
+        "DELETE FROM claude_link_hash WHERE path=?1 AND block>=?2",
+        rusqlite::params![path, cp.hash_base as i64],
+    )?;
+    let mut stmt =
+        conn.prepare("INSERT INTO claude_link_hash(path,block,digest) VALUES(?1,?2,?3)")?;
+    for (i, digest) in cp.hashes.iter().enumerate() {
+        stmt.execute(rusqlite::params![
+            path,
+            (cp.hash_base + i) as i64,
+            binary_digest(digest)?
+        ])?;
+    }
+    Ok(())
+}
+
+pub(super) fn continuation(conn: &Connection) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT path FROM claude_link_continuation WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+pub(super) fn advance(conn: &Connection, path: &str) -> Result<(), StoreError> {
+    conn.execute("INSERT INTO claude_link_continuation VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET path=excluded.path", [path])?;
+    Ok(())
+}
+
+pub(crate) fn migrate_compact(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt =
+        conn.prepare("SELECT path,offset,payload FROM claude_link_checkpoint ORDER BY path")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let offset: String = row.get(1)?;
+        let _: u64 = serde_json::from_str(&offset)?;
+        if let Some(raw) = row.get::<_, Option<String>>(2)? {
+            let mut cp: Checkpoint = serde_json::from_str(&raw)?;
+            let payload = encode_header(&mut cp)?;
+            write(conn, &path, &cp, &payload)?;
+            // Legacy offset and checkpoint can differ: preserve both exactly.
+            conn.execute(
+                "UPDATE claude_link_checkpoint SET offset=?2 WHERE path=?1",
+                rusqlite::params![path, offset],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn put(
@@ -91,8 +209,37 @@ pub(super) fn put(
     offset: u64,
     payload: Option<&str>,
 ) -> Result<(), StoreError> {
-    conn.execute("INSERT INTO claude_link_checkpoint(path, offset, payload) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET offset=excluded.offset,payload=excluded.payload", rusqlite::params![path, offset.to_string(), payload])?;
+    let compact: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='claude_link_bytes')",
+        [],
+        |r| r.get(0),
+    )?;
+    if compact {
+        if let Some(payload) = payload {
+            let mut cp: Checkpoint = serde_json::from_str(payload)?;
+            let header = encode_header(&mut cp)?;
+            write(conn, path, &cp, &header)?;
+            conn.execute(
+                "UPDATE claude_link_checkpoint SET offset=?2 WHERE path=?1",
+                rusqlite::params![path, offset.to_string()],
+            )?;
+            return Ok(());
+        }
+    }
+    conn.execute("INSERT INTO claude_link_checkpoint(path,offset,payload) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET offset=excluded.offset,payload=excluded.payload", rusqlite::params![path,offset.to_string(),payload])?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn checkpoint(conn: &Connection, path: &str) -> Result<Option<Checkpoint>, StoreError> {
+    let Some(mut cp) = load(conn, path)? else {
+        return Ok(None);
+    };
+    for i in 0..cp.hash_base {
+        cp.hashes.push(hash(conn, path, i)?);
+    }
+    cp.hash_base = 0;
+    Ok(Some(cp))
 }
 
 #[cfg(test)]
@@ -117,6 +264,142 @@ pub(crate) fn checkpoint_cursor(conn: &Connection) -> Result<Option<Cursor>, Sto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_migration_preserves_all_fields_and_offset_membership_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration.db");
+        let conn = Connection::open(&path).unwrap();
+        crate::store::historical_schema(&conn, 48);
+        let mut cp = Checkpoint {
+            to: 7,
+            line_buffer: vec![0, 255, 13, 10, 42],
+            tail: vec![255, 0],
+            last_block: vec![7; 4096],
+            audit_buffer: vec![8; 17],
+            hashes: vec![super::super::digest(b"old"); 2048],
+            ..Default::default()
+        };
+        cp.parser.line_links(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"pending","name":"Bash","input":{"command":"gh pr create"}}]}}"#, "s");
+        cp.pending_origins.insert("pending".into(), (2, 5));
+        cp.provenance.buffer = vec![9; 23];
+        cp.provenance.ranges = vec![(3, 10)];
+        cp.provenance.block = 3;
+        cp.audit_next = 9;
+        cp.audit_end = 20;
+        cp.anchor_checked = 2;
+        conn.execute("INSERT INTO claude_link_baseline VALUES(1,44)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO claude_link_checkpoint VALUES('evidence','99',?1)",
+            [serde_json::to_string(&cp).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claude_link_checkpoint VALUES('offset-only','18446744073709551615',NULL)",
+            [],
+        )
+        .unwrap();
+        crate::store::migrate(&conn).unwrap();
+        drop(conn);
+        let conn = crate::store::open_db(&path).unwrap();
+        assert_eq!(checkpoint(&conn, "evidence").unwrap(), Some(cp));
+        assert_eq!(offsets(&conn).unwrap()["evidence"], 99);
+        assert_eq!(offsets(&conn).unwrap()["offset-only"], u64::MAX);
+        assert!(checkpoint(&conn, "offset-only").unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT length(line) FROM claude_link_bytes WHERE path='evidence'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            5
+        );
+        let lazy = load(&conn, "evidence").unwrap().unwrap();
+        assert!(lazy.hashes.is_empty());
+        assert_eq!(lazy.hash_base, 2048);
+    }
+
+    #[test]
+    fn compact_migration_malformed_or_failed_commit_rolls_back_and_reopens() {
+        for failure in ["payload", "digest", "offset", "row", "commit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rollback.db");
+            let conn = Connection::open(&path).unwrap();
+            crate::store::historical_schema(&conn, 48);
+            let cp = Checkpoint {
+                hashes: vec![if failure == "digest" {
+                    "malformed".into()
+                } else {
+                    super::super::digest(b"ok")
+                }],
+                ..Default::default()
+            };
+            let raw = if failure == "payload" {
+                "malformed".into()
+            } else {
+                serde_json::to_string(&cp).unwrap()
+            };
+            conn.execute(
+                "INSERT INTO claude_link_checkpoint VALUES('old','12',?1)",
+                [&raw],
+            )
+            .unwrap();
+            if failure == "offset" {
+                conn.execute("UPDATE claude_link_checkpoint SET offset='invalid'", [])
+                    .unwrap();
+            }
+            if failure == "row" {
+                conn.execute_batch("CREATE TRIGGER fail_conversion BEFORE INSERT ON claude_link_checkpoint BEGIN SELECT RAISE(ABORT,'injected row failure'); END;").unwrap();
+            }
+            if failure == "commit" {
+                conn.commit_hook(Some(|| true)).unwrap();
+            }
+            assert!(crate::store::migrate(&conn).is_err(), "{failure}");
+            drop(conn);
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                48
+            );
+            assert_eq!(
+                conn.query_row("SELECT payload FROM claude_link_checkpoint", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+                raw
+            );
+            assert!(conn.prepare("SELECT * FROM claude_link_bytes").is_err());
+        }
+    }
+
+    #[test]
+    fn oversized_legacy_metadata_is_preserved_without_new_evidence_cap() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::historical_schema(&conn, 48);
+        // Historical JSON was not a bounded schema. This deliberately exceeds
+        // today's parser ID limit; migration is lossless, not a new admission gate.
+        let id = "x".repeat(1024 * 1024);
+        let mut value = serde_json::to_value(Checkpoint::default()).unwrap();
+        value["parser"]["pending"] = serde_json::json!([id]);
+        value["pending_origins"] = serde_json::json!({id: [0,1]});
+        let cp: Checkpoint = serde_json::from_value(value).unwrap();
+        conn.execute(
+            "INSERT INTO claude_link_checkpoint VALUES('historical','0',?1)",
+            [serde_json::to_string(&cp).unwrap()],
+        )
+        .unwrap();
+        let before = std::time::Instant::now();
+        crate::store::migrate(&conn).unwrap();
+        let migrate_us = before.elapsed().as_micros();
+        let before = std::time::Instant::now();
+        let loaded = load(&conn, "historical").unwrap().unwrap();
+        println!("oversized_legacy_metadata migrated_us={migrate_us} load_us={} encoded_header={} decoded_parser_id_bytes={}",before.elapsed().as_micros(),conn.query_row("SELECT length(payload) FROM claude_link_checkpoint",[],|r|r.get::<_,i64>(0)).unwrap(),loaded.parser.pending_ids().map(str::len).sum::<usize>());
+        assert_eq!(loaded, cp);
+    }
 
     fn legacy_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -278,8 +561,11 @@ mod tests {
             let db = dir
                 .path()
                 .join(if per_source { "rows.db" } else { "legacy.db" });
-            let conn = crate::store::open_db(&db).unwrap();
-            conn.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap();
+            // Historical v47 comparison, not the compact production codec.
+            let conn = Connection::open(&db).unwrap();
+            crate::store::historical_schema(&conn, 47);
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+                .unwrap();
             settings::set(&conn, settings::keys::CLAUDE_PR_LINK_CURSOR, &cursor).unwrap();
             if per_source {
                 migrate_legacy(&conn).unwrap();

@@ -1374,6 +1374,20 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX claude_corpus_inventory_directory
         ON claude_corpus_inventory(root,generation,directory);",
 
+    // 49: lossless byte evidence and append-only historical digest authority.
+    "ALTER TABLE claude_link_checkpoint ADD COLUMN hash_count INTEGER NOT NULL DEFAULT 0 CHECK(hash_count>=0);
+     CREATE TABLE claude_link_bytes (
+       path TEXT PRIMARY KEY REFERENCES claude_link_checkpoint(path) ON DELETE CASCADE,
+       line BLOB NOT NULL, tail BLOB NOT NULL, last_block BLOB NOT NULL,
+       audit BLOB NOT NULL, provenance BLOB NOT NULL
+     );
+     CREATE TABLE claude_link_hash (
+       path TEXT NOT NULL REFERENCES claude_link_checkpoint(path) ON DELETE CASCADE,
+       block INTEGER NOT NULL, digest BLOB NOT NULL CHECK(length(digest)=32),
+       PRIMARY KEY(path,block)
+     );
+     CREATE TABLE claude_link_continuation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), path TEXT NOT NULL);",
+
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -1440,6 +1454,9 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
         }
         if i == 46 {
             crate::claude::linkscan::migrate_legacy(&tx)?;
+        }
+        if i == 48 {
+            crate::claude::linkscan::migrate_compact(&tx)?;
         }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
     }
@@ -1541,12 +1558,13 @@ mod tests {
         let scan = transcript::corpus(&root);
         crate::claude::store::metadata_pass(&mut conn, &scan, &control).unwrap();
         crate::claude::search::index_pass_controlled(&mut conn, &scan, &control).unwrap();
-        crate::claude::linkscan::reset(&conn, 0).unwrap();
-        crate::claude::linkscan::refresh_controlled(
-            &mut conn,
-            &scan,
-            crate::claude::linkscan::BYTES_PER_PASS,
-            &control,
+        let (offset, payload) =
+            crate::claude::linkscan::historical_checkpoint_payload(&source, "legacy");
+        conn.execute("INSERT INTO claude_link_baseline VALUES(1,0)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO claude_link_checkpoint(path,offset,payload) VALUES(?1,?2,?3)",
+            rusqlite::params![source.to_string_lossy(), offset.to_string(), payload],
         )
         .unwrap();
         conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES ('legacy','synthetic/repo',1,'https://github.com/synthetic/repo/pull/1','fixture')",[]).unwrap();
