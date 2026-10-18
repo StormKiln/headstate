@@ -2,6 +2,7 @@
 """Tests for fail-closed workflow tool selection."""
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,29 @@ class InstallerTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_ci_source_builds_provision_pinned_go_before_workflow_lint(self):
+        # Runner images need not include Go. Check each real consumer's job and
+        # condition, so an unrelated setup step cannot satisfy the prerequisite.
+        workflow = (SCRIPT.parent.parent / ".github/workflows/ci.yml").read_text()
+        jobs = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
+        consumers = 0
+        for job, body in jobs.items():
+            steps = re.split(r"^      - ", body, flags=re.M)[1:]
+            for index, step in enumerate(steps):
+                if not re.search(r"^        run: make lint-workflows$", step, re.M):
+                    continue
+                consumers += 1
+                with self.subTest(job=job):
+                    prior = [candidate for candidate in steps[:index] if "uses: actions/setup-go@" in candidate]
+                    self.assertTrue(prior, "source-built actionlint requires explicit Go provisioning")
+                    setup = prior[-1]
+                    self.assertIn("uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e", setup)
+                    self.assertRegex(setup, r"(?m)^          go-version: '1\.27\.2'$")
+                    self.assertRegex(setup, r"(?m)^          cache: false$")
+                    condition = re.findall(r"^        if: (.+)$", step, re.M)
+                    self.assertEqual(re.findall(r"^        if: (.+)$", setup, re.M), condition)
+        self.assertEqual(consumers, 2, "both macOS and Linux workflow-lint jobs must be covered")
 
     def test_rejects_actionlint_identity_mismatch(self):
         module = self.load()
