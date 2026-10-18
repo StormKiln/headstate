@@ -1,4 +1,4 @@
-import {expectedRevocationFailures} from './enterprise/revocation-evidence.mjs';
+import {expectedRevocationFailures,revocationReadCommands} from './enterprise/revocation-evidence.mjs';
 import {nodeRuntimeIdentity,waitForProcess} from './enterprise/mixed-runtime.mjs';
 import {assertMixedOverlap} from './enterprise/mixed-overlap.mjs';
 import {runMixed} from './enterprise/mixed.mjs';
@@ -80,7 +80,7 @@ try {
    if(pathname.includes('/call/'))bridgeCommands.push(pathname.split('/').at(-1));
    const up=await fetch(bridge+pathname.slice(7),{method:req.method,headers:{'x-enterprise-secret':secret,'content-type':'application/json'},...(req.method==='POST'?{body}:{})});
    res.writeHead(up.status,{'content-type':up.headers.get('content-type')??'application/json'});
-   if(pathname.includes('/events/')){const stream=Readable.fromWeb(up.body);stream.on('error',()=>{if(!closing&&mode!=='crash')result.errors.push({kind:'unexpected-native-event-stream-close'});res.destroy();});stream.pipe(res);res.on('close',()=>stream.destroy());}else {const text=await up.text();if(revocationWindow&&pathname==='/bridge/call/paired/get_pr_detail'){let value;try{value=JSON.parse(text);}catch{}revocationResponses.push({role:'paired',command:'get_pr_detail',started:requestStarted,completed:performance.now(),status:up.status,error:value?.error,callId:value?.callId});}res.end(text);}return;
+   if(pathname.includes('/events/')){const stream=Readable.fromWeb(up.body);stream.on('error',()=>{if(!closing&&mode!=='crash')result.errors.push({kind:'unexpected-native-event-stream-close'});res.destroy();});stream.pipe(res);res.on('close',()=>stream.destroy());}else {const text=await up.text();if(revocationWindow&&pathname.startsWith('/bridge/call/paired/')&&revocationReadCommands.includes(pathname.split('/').at(-1))){let value;try{value=JSON.parse(text);}catch{}revocationResponses.push({role:'paired',command:pathname.split('/').at(-1),started:requestStarted,completed:performance.now(),status:up.status,error:value?.error,callId:value?.callId});}res.end(text);}return;
   }
   const file=resolve('dist-harness-enterprise','.'+(pathname==='/'?'/harness/enterprise.html':pathname));assert.ok(file.startsWith(resolve('dist-harness-enterprise')+'/'));
   res.writeHead(200,{'content-type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.woff2':'font/woff2'})[extname(file)]??'application/octet-stream'});res.end(await readFile(file));

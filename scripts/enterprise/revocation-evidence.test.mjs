@@ -30,3 +30,14 @@ test('unrelated failed calls remain outside the expected set even with matching 
  const v=valid();v.failures.push({...v.failures[0],role:'desktop'},{...v.failures[0],callId:8},{...v.failures[0],name:'approve_pr'});
  assert.deepEqual(expectedRevocationFailures(v),[v.failures[0]]);
 });
+test('actual Refresh fan-out correlates detail gates and ancestry independently',()=>{
+ const v=valid();
+ for(const [index,name] of ['get_review_gates','get_ready_stacks'].entries()){
+  const callId=8+index;v.responses.push({...v.responses[0],command:name,callId});v.failures.push({...v.failures[0],name,callId});v.native.push(...v.native.slice(0,2).map(row=>({...row,id:callId})));
+ }
+ assert.deepEqual(expectedRevocationFailures(v),v.failures);
+ for(const edit of [r=>r.command='get_pr_detail',r=>r.error='provider timeout',r=>r.role='desktop',r=>r.started=99,r=>r.command='get_viewer',r=>r.command='approve_pr']){
+  const copy=structuredClone(v);edit(copy.responses[1]);assert.deepEqual(expectedRevocationFailures(copy),[copy.failures[0],copy.failures[2]]);
+ }
+ const noDetail=structuredClone(v);noDetail.failures=noDetail.failures.slice(1);assert.throws(()=>expectedRevocationFailures(noDetail),'gate/ancestry refusals cannot replace deliberate detail proof');
+});
