@@ -1,6 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {assertQuotaScenario} from './quota-scenario.mjs';
+import {assertQuotaScenario,runQuotaScenario,completeQuotaInventories} from './quota-scenario.mjs';
+import {mkdtemp} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {weightedQuotaProfile,createQuotaState,documentCost} from './quota.mjs';
 import {parseDocument} from './graphql.mjs';
 function valid(){
@@ -37,4 +40,33 @@ test('rejects duplicate publication rows and corrupted recovered or mounted fact
 });
 test('legitimate approval facts do not invalidate unchanged identity head base and draft',()=>{
  const {e,ledger,p}=valid();for(const witness of [...e.blockedPublications,...e.recovery.publications,...e.recovery.sources])witness.prs[0].review='approved';assert.equal(assertQuotaScenario(e,ledger,p).documents,7);
+});
+
+
+test('quota driver waits for both complete inventories before beginning foreground work',async()=>{
+ const {e}=valid(),snapshots=[0,0];
+ const pages=[0,1].map(role=>({
+  evaluate:async()=>{snapshots[role]++;const inventory=structuredClone(e.retained[role].before);if(snapshots[role]===1)inventory.reviewing=inventory.reviewing.slice(0,100);return inventory;},
+  getByRole:()=>({first:()=>({click:async()=>{throw Error('bounded readiness probe complete');}})})
+ }));
+ const out=await mkdtemp(join(tmpdir(),'headstate-quota-readiness-'));
+ await assert.rejects(runQuotaScenario({pages,provider:{ledger:[{id:1,bucket:'rest',quota:{before:600,after:400}}]},result:{},out,control:async()=>({admission:{}})}),/bounded readiness probe complete/);
+ assert.deepEqual(snapshots,[2,2],'partial first snapshots must not start the foreground/exhaustion phase');
+});
+
+
+test('quota readiness rejects partial duplicate missing foreign and one-role-only populations',()=>{
+ const exact=valid().e.retained.map(row=>row.before);
+ assert.equal(completeQuotaInventories(exact),true);
+ assert.equal(completeQuotaInventories(exact.map(row=>({authored:[...row.authored].reverse(),reviewing:[...row.reviewing].reverse()}))),true);
+ assert.equal(completeQuotaInventories([exact[0]]),false);
+ assert.equal(completeQuotaInventories(undefined),false);
+ for(const role of [0,1])for(const list of ['authored','reviewing'])for(const defect of ['partial','duplicate','missing','foreign']){
+  const inventories=structuredClone(exact),ids=inventories[role][list];
+  if(defect==='partial')inventories[role][list]=ids.slice(0,1);
+  if(defect==='missing')ids.pop();
+  if(defect==='duplicate')ids[0]=ids[1];
+  if(defect==='foreign')ids[0]='synthetic-lab/repo-1/999';
+  assert.equal(completeQuotaInventories(inventories),false,`${role}/${list}/${defect}`);
+ }
 });

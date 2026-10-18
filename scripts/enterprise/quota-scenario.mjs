@@ -12,6 +12,12 @@ const expectedInventory={authored:Array.from({length:population.authored},(_,i)=
 function assertInventory(inventory,label){
  for(const list of ['authored','reviewing']){assert.ok(Array.isArray(inventory?.[list]),`${label} ${list} identities required`);assert.deepEqual([...inventory[list]].sort(),expectedInventory[list],`${label} exact unique ${list} identities`);}
 }
+// The retention oracle needs a complete baseline in both mounted roles, not
+// merely the first incremental page. This predicate never starts provider work.
+export function completeQuotaInventories(inventories){
+ if(!Array.isArray(inventories)||inventories.length!==2)return false;
+ try{for(const [role,inventory]of inventories.entries())assertInventory(inventory,`role ${role} initial`);return true;}catch{return false;}
+}
 function assertReviewingFacts(rows,label){
  assert.ok(Array.isArray(rows),`${label} rows required`);
  assert.deepEqual(rows.map(r=>`${r.repo}/${r.number}`).sort(),expectedInventory.reviewing,`${label} exact unique reviewing identities`);
@@ -54,7 +60,7 @@ export async function runQuotaScenario({pages,provider,result,out,profile,contro
  const until=async(predicate,timeout,label)=>{const end=Date.now()+timeout;while(Date.now()<end){if(await predicate())return;await delay(1000);}throw Error('quota timeout: '+label);};
  try{
   await control('start');
-  await until(async()=>{const values=await inventory();return values.every(i=>i.reviewing.length>0)&&provider.ledger.some(r=>r.bucket==='rest'&&r.quota?.before>500&&r.quota.after<=500);},60000,'initial partial inventory and REST reserve');
+  await until(async()=>{const values=await inventory();return completeQuotaInventories(values)&&provider.ledger.some(r=>r.bucket==='rest'&&r.quota?.before>500&&r.quota.after<=500);},60000,'exact complete inventories in both roles and REST reserve');
   const reserve=provider.ledger.find(r=>r.bucket==='rest'&&r.quota.before>500&&r.quota.after<=500);
   evidence.reserve={receiptId:reserve.id,admission:(await control('status')).admission};await save();
   const p=pages[0];await p.getByRole('button',{name:/Synthetic review 51(?:\D|$)/}).first().click();
@@ -63,7 +69,7 @@ export async function runQuotaScenario({pages,provider,result,out,profile,contro
   await p.getByRole('button',{name:'Approved',exact:true}).first().waitFor();
   const write=provider.ledger.find(r=>r.operation==='review-write'&&r.status===200);
   evidence.foreground={status:write?.status,receiptId:write?.id,role:'desktop',at:Date.now(),admission:(await control('status')).admission};
-  const before=await inventory();await save();
+  const before=await inventory();for(const [role,value]of before.entries())assertInventory(value,`role ${role} before exhaustion`);await save();
   // Each call is an actual foreground detail acquisition, not a provider fetch
   // or scheduler wake. Bound work and stop immediately at the first denial.
   for(let n=0;n<100&&!provider.ledger.some(r=>r.quota?.naturalLimit);n++){
