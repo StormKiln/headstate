@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import {assertCompatibleEnvironment,assertCompatibleWorkload} from './workload.mjs';
+import {assertCompatibleEnvironment,assertCompatibleWorkload,normalizeEnvironment} from './workload.mjs';
 
 export const requiredMetrics=Object.freeze(['firstUsefulQueue','fullQueue','firstUsefulDetail','draftReadyMs','freshActionReadyMs','uiCommits','uiCommitMs']);
 export const chromiumMetrics=Object.freeze([...requiredMetrics,'longTaskCount','longTaskMs']);
+export const canonicalBaselineIdentities=Object.freeze(['chromium','webkit'].flatMap(engine=>[false,true].flatMap(warm=>['desktop','paired'].map(role=>`${engine}/${warm}/${role}`))));
 const finiteNonnegative=(value,label)=>assert.ok(Number.isFinite(value)&&value>=0,`${label} must be finite and nonnegative`);
 
 export function validateSamples(result){
@@ -23,11 +24,18 @@ export function validateSamples(result){
 export function validateBaseline(baseline){
  assert.equal(baseline?.schema,2,'baseline schema 2 required; historical schema is incompatible');
  assert.ok(baseline.environments&&typeof baseline.environments==='object','baseline environments required');
+ assert.deepEqual(Object.keys(baseline.environments).sort(),['chromium','webkit'],'baseline environments must be exactly chromium and webkit');
+ for(const engine of ['chromium','webkit']){
+  const environment=normalizeEnvironment(baseline.environments[engine]);
+  assert.equal(environment.browser.engine,engine,`baseline ${engine} environment browser engine must match`);
+ }
  assert.ok(Array.isArray(baseline.summaries)&&baseline.summaries.length>0,'baseline summaries required');
  const identities=new Set();
  for(const row of baseline.summaries){
   const identity=`${row.engine}/${row.warm}/${row.role}`;
   assert.ok(!identities.has(identity),`duplicate baseline row ${identity}`);identities.add(identity);
+  assert.ok(['chromium','webkit'].includes(row.engine),`unexpected baseline engine ${row.engine}`);
+  assert.equal(typeof row.warm,'boolean',`${identity} warm must be boolean`);
   assert.ok(['desktop','paired'].includes(row.role),`unexpected baseline role ${row.role}`);
   assert.ok(row.budgets&&typeof row.budgets==='object'&&Object.keys(row.budgets).length>0,`${identity} budgets required`);
   const metrics=row.engine==='chromium'?chromiumMetrics:requiredMetrics;
@@ -35,6 +43,7 @@ export function validateBaseline(baseline){
   for(const metric of metrics)finiteNonnegative(row.budgets[metric],`${identity} budget ${metric}`);
   finiteNonnegative(row.documentBudget,`${identity} documentBudget`);
  }
+ assert.deepEqual([...identities].sort(),[...canonicalBaselineIdentities].sort(),'baseline identities must be exactly chromium and webkit, cold and warm, desktop and paired');
  return baseline;
 }
 // Startup-only populations: whole fault/soak request totals are not comparable.

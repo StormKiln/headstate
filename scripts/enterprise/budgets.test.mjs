@@ -1,11 +1,16 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {compareBaseline} from './budgets.mjs';
+import {compareBaseline,validateBaseline} from './budgets.mjs';
 import {defaultWorkload} from './workload.mjs';
 const metrics={firstUsefulQueue:90,fullQueue:90,firstUsefulDetail:90,draftReadyMs:90,freshActionReadyMs:90,uiCommits:2,uiCommitMs:90,longTaskCount:null,longTaskMs:null};
 const environment={platform:'darwin',architecture:'arm64',osRelease:'25.6.0',cpu:'Example CPU',build:'debug profiling',strictMode:false,browser:{engine:'webkit',version:'26.0'},sourceRevision:'after'};
-const row=role=>({engine:'webkit',warm:false,role,budgets:Object.fromEntries(Object.keys(metrics).filter(k=>!k.startsWith('longTask')).map(k=>[k,100])),documentBudget:4});
-const baseline={schema:2,workload:defaultWorkload,environments:{webkit:{...environment,sourceRevision:'before'}},summaries:[row('desktop'),row('paired')]};
+const row=(engine,warm,role)=>({engine,warm,role,budgets:Object.fromEntries(Object.keys(metrics).filter(k=>!k.startsWith('longTask')).map(k=>[k,100])),documentBudget:4});
+const chromiumEnvironment={...environment,browser:{engine:'chromium',version:'140.0'}};
+const summaries=['chromium','webkit'].flatMap(engine=>[false,true].flatMap(warm=>['desktop','paired'].map(role=>{
+ const value=row(engine,warm,role);
+ return engine==='chromium'?{...value,budgets:{...value.budgets,longTaskCount:5,longTaskMs:100}}:value;
+})));
+const baseline={schema:2,workload:defaultWorkload,environments:{chromium:{...chromiumEnvironment,sourceRevision:'before'},webkit:{...environment,sourceRevision:'before'}},summaries};
 const result={engine:'webkit',warm:false,workload:defaultWorkload,environment,samples:[{role:'desktop',...metrics},{role:'paired',...metrics}],providerReceipts:4,longTaskCapability:{supported:false,value:null,reason:'unsupported'}};
 test('measured baseline accepts complete bounded samples with explicit unsupported WebKit long tasks',()=>{
  assert.equal(compareBaseline(result,baseline).length,2);
@@ -27,16 +32,21 @@ test('requires finite nonnegative provider documents and budgets',()=>{
 });
 
 test('rejects missing and duplicate baseline rows and legacy schema explicitly',()=>{
- assert.throws(()=>compareBaseline(result,{...baseline,summaries:baseline.summaries.slice(1)}),/baseline row/);
+ assert.throws(()=>compareBaseline(result,{...baseline,summaries:baseline.summaries.slice(1)}),/baseline identities/);
  assert.throws(()=>compareBaseline(result,{...baseline,summaries:[...baseline.summaries,baseline.summaries[0]]}),/duplicate baseline row/);
  assert.throws(()=>compareBaseline(result,{...baseline,schema:1}),/baseline schema 2/);
 });
 
+test('preflight requires the exact canonical baseline identities and engine environments',()=>{
+ const selectedMissing=baseline.summaries.filter(row=>!(row.engine==='webkit'&&row.warm===false&&row.role==='paired'));
+ assert.throws(()=>validateBaseline({...baseline,summaries:selectedMissing}),/baseline identities/);
+ assert.throws(()=>validateBaseline({...baseline,summaries:[...baseline.summaries,{...baseline.summaries[0],engine:'gecko'}]}),/baseline (?:engine|identities)/);
+ assert.throws(()=>validateBaseline({...baseline,environments:{webkit:baseline.environments.webkit}}),/baseline environments/);
+ assert.throws(()=>validateBaseline({...baseline,environments:{...baseline.environments,gecko:baseline.environments.webkit}}),/baseline environments/);
+});
+
 test('Chromium requires finite long-task measurements',()=>{
- const chromiumEnvironment={...environment,browser:{engine:'chromium',version:'140.0'}};
- const chromiumRows=baseline.summaries.map(r=>({...r,engine:'chromium',budgets:{...r.budgets,longTaskCount:5,longTaskMs:100}}));
  const chromium={...result,engine:'chromium',environment:chromiumEnvironment,longTaskCapability:{supported:true},samples:result.samples.map(s=>({...s,longTaskCount:0,longTaskMs:0}))};
- const chromiumBaseline={...baseline,environments:{chromium:{...chromiumEnvironment,sourceRevision:'before'}},summaries:chromiumRows};
- assert.equal(compareBaseline(chromium,chromiumBaseline).length,2);
- assert.throws(()=>compareBaseline({...chromium,samples:chromium.samples.map(s=>({...s,longTaskCount:null}))},chromiumBaseline),/longTaskCount/);
+ assert.equal(compareBaseline(chromium,baseline).length,2);
+ assert.throws(()=>compareBaseline({...chromium,samples:chromium.samples.map(s=>({...s,longTaskCount:null}))},baseline),/longTaskCount/);
 });

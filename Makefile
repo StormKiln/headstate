@@ -623,7 +623,7 @@ enterprise-compare:
 enterprise-admission-probe:
 	@test -n "$(OUT)" -a -n "$(BASELINE)" || (echo "Set OUT to a new retained artifact directory and BASELINE to an intentionally incompatible schema-2 baseline"; exit 2)
 	@if ENTERPRISE_BASELINE="$(BASELINE)" node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" baseline; then echo "Expected workload/environment admission rejection"; exit 1; fi
-	node -e 'const r=require(process.argv[1]);if(r.admission?.accepted!==false||r.admission?.stage!=="before-measured-work"||r.providerReceipts!==0||r.shutdown?.telemetryLost!==false||r.exit?.code!==0)process.exit(1)' "$(OUT)/result.json"
+	node -e 'const r=require(process.argv[1]);if(r.admission?.accepted!==false||r.admission?.stage!=="before-measured-work"||typeof r.failure!=="string"||!r.failure||r.providerReceipts!==0||r.statsRetirement?.commands!==0||r.shutdown?.clean!==true||r.shutdown?.telemetryLost!==false||r.exit?.code!==0)process.exit(1)' "$(OUT)/result.json"
 
 .PHONY: analyze-measurements
 analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
