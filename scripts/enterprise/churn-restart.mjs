@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {readFile,writeFile,readdir} from 'node:fs/promises';import {resolve,dirname} from 'node:path';import {createHash} from 'node:crypto';
-import {digest,createChurnPlan,initialOracle,advanceOracle} from './churn-plan.mjs';import {assertCompatibleWorkload} from './workload.mjs';
+import {digest,createChurnPlan,initialOracle,advanceOracle,assertChurnSchedule} from './churn-plan.mjs';import {assertCompatibleWorkload} from './workload.mjs';
 export async function profileHashes(path){const result={};async function walk(relative=''){for(const entry of (await readdir(resolve(path,relative),{withFileTypes:true})).sort((a,b)=>a.name.localeCompare(b.name))){const name=relative?`${relative}/${entry.name}`:entry.name;if(entry.isDirectory())await walk(name);else if(entry.isFile())result[name]=createHash('sha256').update(await readFile(resolve(path,name))).digest('hex');else assert.fail('profile cannot contain symlinks');}}await walk();return result;}
 export function validateCheckpoint(record,source,workload){
  assert.equal(record.schema,1);assert.equal(record.segmentPass,true);assert.equal(source.pass,true,'source must pass');assert.equal(source.shutdown.clean,true,'source clean shutdown');assert.equal(source.exit.code,0);
  assert.deepEqual(record.activeSegmentsMs,source.churn?.activeSegmentsMs,'source actual active duration evidence must match');
  assert.ok(Array.isArray(record.activeSegmentsMs)&&record.activeSegmentsMs.length>0,'recorded active segment durations required');for(const value of record.activeSegmentsMs)assert.ok(Number.isFinite(value)&&value>=0);assert.ok(record.activeSegmentsMs.at(-1)<=source.parentObservation.wallMs,'active segment cannot exceed measured process wall time');
  assert.equal(source.churn.segmentPass,true,'source segment obligations must pass');assert.equal(source.churn.endRevision,record.oracle.revision,'checkpoint must match actually executed source revision');assert.equal(source.churn.planHash,digest(record.plan),'source plan hash');assert.deepEqual(source.churn.events.map(event=>event.revision),record.plan.events.slice(source.churn.startRevision,record.oracle.revision).map(event=>event.revision),'source execution obligations cannot be skipped or replayed');
+ assertChurnSchedule(source.churn.events,record.plan.events.slice(source.churn.startRevision,record.oracle.revision).map(event=>event.revision),record.plan.policy);
  assertCompatibleWorkload(record.plan.workload,workload);
  assert.deepEqual(record.plan,createChurnPlan(workload),'plan must regenerate from declared seed, never provider rows');
  for(const [field,key] of [['plan','plan'],['oracle','oracle'],['provider','provider'],['profileHashes','profile']])assert.equal(digest(record[field]),record.hashes[key],`${field} hash`);

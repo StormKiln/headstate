@@ -45,3 +45,17 @@ export function assertSustainedChurn(evidence){
 // is therefore an abstract obligation over the scheduled facts, not derive().
 export function expectedChurnReady(oracle){return oracle.rows.filter(row=>row.terminal==='open'&&row.requested&&!row.draft&&!row.queued&&!row.approved).map(row=>row.identity).sort();}
 export function assertChurnReady(oracle,actual){assert.deepEqual([...actual].sort(),expectedChurnReady(oracle),'actual Ready eligibility must match independent plan');}
+
+// The nominal plan is immutable. Execution serializes obligations with at least
+// spacingMs between issues; slow but bounded convergence is recorded as drift.
+export function assertChurnSchedule(events,revisions,policy){
+ assert.deepEqual(events.map(event=>event.revision),revisions,'schedule obligations cannot be skipped or replayed');
+ let previous;
+ for(const event of events){
+  assert.ok(Number.isFinite(event.actualOffsetMs)&&event.actualOffsetMs>=0,'actual issue timing required');
+  assert.ok(Number.isFinite(event.convergedOffsetMs)&&event.convergedOffsetMs>=event.actualOffsetMs&&event.convergedOffsetMs-event.actualOffsetMs<=policy.convergenceMs,'event convergence deadline');
+  if(previous){assert.ok(event.actualOffsetMs-previous.actualOffsetMs>=policy.spacingMs,'minimum serialized issue spacing');assert.ok(event.actualOffsetMs>=previous.convergedOffsetMs,'prior obligation must converge');}
+  previous=event;
+ }
+ assert.ok(!previous||previous.convergedOffsetMs<=revisions.length*(policy.spacingMs+policy.convergenceMs),'finite segment schedule bound');
+}

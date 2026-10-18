@@ -9,7 +9,7 @@ export async function observeRoles(clients,observe){
  if(errors.length)throw errors.find(fatalObservation)??errors[0];
 }
 import assert from 'node:assert/strict';import {writeFile} from 'node:fs/promises';import {resolve} from 'node:path';
-import {createChurnPlan,initialOracle,advanceOracle,assertChurnFacts,assertAcceptedFacts,assertChurnReady,expectedChurnReady,digest} from './churn-plan.mjs';import {applyChurnEvent} from './provider.mjs';
+import {createChurnPlan,initialOracle,advanceOracle,assertChurnFacts,assertAcceptedFacts,assertChurnReady,expectedChurnReady,assertChurnSchedule,digest} from './churn-plan.mjs';import {applyChurnEvent} from './provider.mjs';
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const snapshot=page=>page.evaluate(()=>({facts:window.__enterprise.rowFacts(),ready:window.__enterprise.readyEligibility(),source:window.__enterprise.sourceEvidence(),lost:window.__enterprise.measurement.lost,accepted:window.__enterprise.telemetry.filter(e=>e.kind==='event'&&e.name==='source-poll-status'&&e.reply?.list==='reviewing'&&e.reply?.prs&&e.reply?.last_received_at===window.__enterprise.sourceEvidence()?.lastReceivedAt).at(-1)?.reply}));
 async function navigate(page,number){const back=page.getByRole('button',{name:'Back to list',exact:true});if(await back.count())await back.click();await page.getByRole('button',{name:'To Review',exact:true}).click();await page.getByRole('button',{name:new RegExp(`Synthetic review ${number}(?:\\D|$)`)}).first().click();await page.getByText(`Synthetic description ${number}`,{exact:false}).waitFor();}
@@ -28,19 +28,20 @@ export async function runChurn({pages,provider,result,out,control,workload,state
   const started=performance.now(),baseOffset=plan.events[oracle.revision]?.nominalOffsetMs??0;
   const stop=state?plan.events.length:plan.checkpointRevision;
   for(const event of plan.events.slice(oracle.revision,stop)){
-   const nominal=event.nominalOffsetMs-baseOffset;await observeUntil({deadline:started+nominal,observe});
-   const before=provider.ledger.length,actualOffsetMs=performance.now()-started;assert.ok(actualOffsetMs-nominal<plan.policy.convergenceMs,'schedule cannot silently skip overdue obligations');
-   const record={revision:event.revision,kind:event.kind,identity:event.identity,nominalOffsetMs:event.nominalOffsetMs,actualOffsetMs,providerBefore:before};evidence.events.push(record);await save();
+   const nominal=event.nominalOffsetMs-baseOffset;const previous=evidence.events.at(-1);const scheduled=Math.max(nominal,previous?previous.actualOffsetMs+plan.policy.spacingMs:0);await observeUntil({deadline:started+scheduled,observe});
+   const before=provider.ledger.length,actualOffsetMs=performance.now()-started;assert.ok(actualOffsetMs<(stop-evidence.startRevision)*(plan.policy.spacingMs+plan.policy.convergenceMs),'finite segment schedule bound');
+   const record={revision:event.revision,kind:event.kind,identity:event.identity,nominalOffsetMs:event.nominalOffsetMs,actualOffsetMs,nominalDriftMs:actualOffsetMs-nominal,providerBefore:before};evidence.events.push(record);await save();
    let receipt;
    if(event.kind==='navigate')await navigate(pages[event.role==='desktop'?0:1],event.next.number);
    else if(event.kind==='approve'){
     const page=pages[event.role==='desktop'?0:1];await page.getByRole('button',{name:'Approve',exact:true}).first().click();await page.getByRole('button',{name:'Approved',exact:true}).first().waitFor({timeout:30000});
     const writes=provider.ledger.slice(before).filter(e=>e.operation==='review-write'&&e.status===200&&e.terminal==='response-sent'&&e.responseDelivered);assert.equal(writes.length,1,'one confirmed real review mutation');receipt=writes[0].mutationReceipt;record.mutation=structuredClone(writes[0]);receipts.push({revision:event.revision,receipt});
    }else record.adapter=applyChurnEvent(provider.data,event);
-   oracle=advanceOracle(oracle,event,receipt);await converge();record.providerAfter=provider.ledger.length;record.documents=record.providerAfter-before;assert.ok(record.documents<=evidence.policy.maxDocumentsPerEvent,'bounded documents per event');record.convergedOffsetMs=performance.now()-started;
+   oracle=advanceOracle(oracle,event,receipt);await converge();record.providerAfter=provider.ledger.length;record.documents=record.providerAfter-before;assert.ok(record.documents<=evidence.policy.maxDocumentsPerEvent,'bounded documents per event');record.convergedOffsetMs=performance.now()-started;assertChurnSchedule(evidence.events,plan.events.slice(evidence.startRevision,oracle.revision).map(event=>event.revision),plan.policy);
    if(event.revision===4||state&&!continuity){for(const page of pages)await mountContinuity(page);continuity=true;record.retentionMounted=true;}
    await save();console.log(JSON.stringify({churnRevision:oracle.revision,kind:event.kind,providerReceipts:provider.ledger.length}));
   }
+  assertChurnSchedule(evidence.events,plan.events.slice(evidence.startRevision,stop).map(event=>event.revision),plan.policy);
   if(state&&!evidence.integrationOnly){while(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)+performance.now()-activeStarted<evidence.requiredActiveMs){await observeUntil({deadline:performance.now()+5000,observe});}}
   assert.ok(provider.ledger.length<=evidence.policy.maxDocumentsPerSegment,'bounded documents per segment');
   evidence.activeSegmentsMs=[...evidence.activeSegmentsMs,performance.now()-activeStarted];

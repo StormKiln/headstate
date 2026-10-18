@@ -317,3 +317,14 @@ after validating and independently replaying the saved oracle;
 recreate expected identities from provider rows or browser-derived eligibility.
 The sustained admission helper is exported from `churn-plan.mjs` for final
 matrix/resource/release consumers.
+
+Churn execution serializes every immutable plan obligation: issue spacing is at
+least 75 seconds and the prior obligation must converge before the next issue.
+Nominal plan offsets remain unchanged; `nominalDriftMs` records cumulative drift.
+Every event must converge within 180 seconds, and the finite segment bound is
+`eventCount * (spacingMs + convergenceMs)`. Restart validates source issue and
+convergence timings against these same rules; incompatible old timings require a
+fresh source, not a tolerance or plan-hash migration. Scheduled quiet intervals
+sample existing UI witnesses at most one second apart, with no provider refresh.
+Both roles are checked independently, and post-convergence regression or retained
+interaction loss fails immediately.

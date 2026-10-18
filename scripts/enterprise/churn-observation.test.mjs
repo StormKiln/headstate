@@ -21,3 +21,10 @@ test('scheduled wait rejects transient mounted draft focus loss',async()=>{
  let now=0;
  await assert.rejects(observeUntil({deadline:5000,now:()=>now,sleep:async ms=>{now+=ms;},observe:async()=>{assert.notEqual(now,1000,'draft focus lost');}}),/focus lost/);
 });
+
+test('serialized schedule accepts multiple valid slow events without cumulative drift rejection',async()=>{
+ const {assertChurnSchedule}=await import('./churn-plan.mjs');const policy={spacingMs:75000,convergenceMs:180000};
+ const events=Array.from({length:8},(_,i)=>({revision:i+1,actualOffsetMs:i*120000,convergedOffsetMs:(i+1)*120000}));
+ assertChurnSchedule(events,events.map(e=>e.revision),policy);
+ for(const bad of [events.slice(1),events.map((e,i)=>i===3?{...e,convergedOffsetMs:e.actualOffsetMs+180001}:e),events.map((e,i)=>i===1?{...e,actualOffsetMs:74999}:e)])assert.throws(()=>assertChurnSchedule(bad,events.map(e=>e.revision),policy));
+});
