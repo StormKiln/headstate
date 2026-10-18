@@ -1667,11 +1667,18 @@ static TABLE: &str = HIT_none_3;
                 continue;
             }
             for (_, first, last) in functions.iter().filter(|(n, _, _)| *n == name) {
-                for (i, line) in lines.iter().enumerate().take(*last).skip(*first + 1) {
+                for (i, line) in lines.iter().enumerate().take(*last).skip(*first) {
                     if is_comment(line) {
                         continue;
                     }
                     let code = line.split("//").next().unwrap_or_default();
+                    // A helper may put its entire body on its declaration line.
+                    // Inspect that body without treating the declaration as a call.
+                    let code = if i == *first {
+                        code.split_once('{').map_or("", |(_, body)| body)
+                    } else {
+                        code
+                    };
                     let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
                     for forbidden in [
                         "corpus_default(",
@@ -1751,6 +1758,22 @@ static TABLE: &str = HIT_none_3;
             let bad = stored_search_offenders("fixture.rs", &unsafe_source, &["readback"]);
             assert_eq!(bad.len(), 1);
             assert!(bad[0].contains("fixture.rs:6: coverage"));
+        }
+    }
+
+    #[test]
+    fn stored_search_guard_checks_one_line_helper_bodies() {
+        let safe = "pub async fn readback() { helper(); }\nfn helper() { db.query_row(); }\nfn background() { db.execute(); }\n";
+        for source in [safe.to_string(), safe.replace('\n', "\r\n")] {
+            assert!(stored_search_offenders("fixture.rs", &source, &["readback"]).is_empty());
+            let unsafe_source = source.replace("db.query_row();", "db.execute();");
+            let bad = stored_search_offenders("fixture.rs", &unsafe_source, &["readback"]);
+            assert_eq!(
+                bad.len(),
+                1,
+                "a reachable one-line helper write must be detected"
+            );
+            assert!(bad[0].contains("fixture.rs:2: helper"));
         }
     }
 
