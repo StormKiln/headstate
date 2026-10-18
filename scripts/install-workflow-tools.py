@@ -84,7 +84,11 @@ def verify_cached(root, actionlint, shellcheck):
         if receipt.get(key) != value:
             raise RuntimeError(f"workflow tool receipt identity mismatch for {key}")
     for name, binary in (("actionlint", actionlint), ("shellcheck", shellcheck)):
-        if receipt.get(f"{name}_sha256") != file_sha256(binary):
+        try:
+            digest = file_sha256(binary)
+        except OSError as error:
+            raise RuntimeError(f"cached {name} unreadable: {error}") from error
+        if receipt.get(f"{name}_sha256") != digest:
             raise RuntimeError(f"cached {name} digest mismatch")
     actionlint_identity = verify_actionlint(actionlint)
     shellcheck_identity = verify_shellcheck(shellcheck)

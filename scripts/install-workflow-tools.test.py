@@ -75,6 +75,29 @@ class InstallerTests(unittest.TestCase):
                 module.verify_cached(root, actionlint, shellcheck)
             self.assertFalse(executed.exists(), "a digest-mismatched cached binary must never execute")
 
+    def test_partial_cache_filesystem_errors_enter_rebuild_contract(self):
+        module = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actionlint = root / "actionlint"
+            shellcheck = root / "shellcheck"
+            actionlint.write_text(f"#!/bin/sh\necho '{module.ACTIONLINT_REVISION}'\necho '{module.ACTIONLINT_PROVENANCE}'\n")
+            shellcheck.write_text(f"#!/bin/sh\necho 'version: {module.SHELLCHECK_VERSION}'\n")
+            actionlint.chmod(0o755)
+            shellcheck.chmod(0o755)
+            module.write_receipt(root, actionlint, shellcheck)
+            for broken in ("missing", "directory"):
+                with self.subTest(broken=broken):
+                    if actionlint.exists():
+                        if actionlint.is_dir():
+                            actionlint.rmdir()
+                        else:
+                            actionlint.unlink()
+                    if broken == "directory":
+                        actionlint.mkdir()
+                    with self.assertRaisesRegex(RuntimeError, "cached actionlint unreadable"):
+                        module.verify_cached(root, actionlint, shellcheck)
+
 
 if __name__ == "__main__":
     unittest.main()
