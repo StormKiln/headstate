@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 export const resourceCoverage=Object.freeze({
  readBytes:'application returned bytes: metadata,usage,index,links; excludes directory/stat/fingerprint, SQLite, network and other reads',
- transactions:['queue:deferred','corpus-metadata:immediate','corpus-usage:immediate','corpus-index:immediate','corpus-links:immediate','corpus-admission:immediate','corpus-pause:immediate'],
+ transactions:['queue:deferred','corpus-metadata:immediate','corpus-usage:immediate','corpus-index:immediate','corpus-discovery:immediate','corpus-links:immediate','corpus-admission:immediate','corpus-pause:immediate'],
  mutationSemantics:'committed SQLite row callbacks only; FTS shadow rows are implementation rows; WITHOUT ROWID and unscoped writes unknown',
  waitSemantics:'BEGIN admission; deferred queue hold includes later writer upgrade contention; immediate corpus wait precedes hold',
  walSemantics:'sampled retained file length, never cumulative writes',

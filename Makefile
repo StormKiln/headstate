@@ -646,7 +646,15 @@ test-enterprise-corpus-resources:
 	cd src-tauri && cargo test --features enterprise-harness --lib claude::search::tests
 	cd src-tauri && cargo test --features enterprise-harness --lib claude::linkscan::tests
 	cd src-tauri && cargo test --features enterprise-harness --lib claude::transcript::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_inventory::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib commands::corpus_cancel_tests
 
 .PHONY: lint-enterprise-resources
 lint-enterprise-resources:
 	cd src-tauri && cargo clippy --features enterprise-harness --lib -- -D warnings
+
+.PHONY: measure-enterprise-discovery
+# Exact synthetic test names: never run ignored real-home corpus probes.
+measure-enterprise-discovery:
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_probe::discovery_scaling_measurement -- --ignored --exact --nocapture
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_inventory::tests::discovery_inventory_scaling_measurement -- --ignored --exact --nocapture

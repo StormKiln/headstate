@@ -36,7 +36,7 @@ pub use schema::{open_db, StoreError};
 
 /// Test-only: the remote pairing tests migrate an in-memory connection.
 #[cfg(test)]
-pub(crate) use schema::migrate;
+pub(crate) use schema::{historical_schema, migrate};
 
 #[cfg(test)]
 mod tests {

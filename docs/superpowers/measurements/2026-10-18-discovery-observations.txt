@@ -1,0 +1,46 @@
+BEFORE POLICY
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=0 entries=2049 elapsed_us=47442 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpLqGYZY
+DISCOVERY_BASELINE dirs=32 files_per_dir=64 delay_us=0 entries=2080 elapsed_us=41271 owned_path_certificate_bytes=354962 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpRqr8aR
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=100 entries=2049 elapsed_us=359659 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmp3ONt7k
+
+UNBATCHED PROTOTYPE
+DISCOVERY_SLICE files=2048 delay_us=0 pass=1 elapsed_us=365586 entries=4098 work=8210 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=0 elapsed_us=365786 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8210 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmppElXMD
+DISCOVERY_SLICE files=2048 delay_us=100 pass=1 elapsed_us=891409 entries=4098 work=8210 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=100 elapsed_us=891575 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8210 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmprj9NnM
+DISCOVERY_SLICE files=8192 delay_us=0 pass=1 elapsed_us=1016300 entries=7247 work=7252 candidate=7246 authoritative=false
+DISCOVERY_SLICE files=8192 delay_us=0 pass=2 elapsed_us=295497 entries=8184 work=16384 candidate=8192 authoritative=false
+DISCOVERY_SLICE files=8192 delay_us=0 pass=3 elapsed_us=32531 entries=955 work=9150 candidate=8192 authoritative=true
+DISCOVERY_AFTER files=8192 delay_us=0 elapsed_us=1356530 passes=3 cadence_wait_seconds=120 entries=16386 units=4 work=32786 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmphPALzs
+
+BATCHED PROTOTYPE 16384 CAP
+DISCOVERY_SLICE files=2048 delay_us=0 pass=1 elapsed_us=99540 entries=4098 work=8210 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=0 elapsed_us=99751 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8210 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmp9t80Z5
+DISCOVERY_SLICE files=2048 delay_us=100 pass=1 elapsed_us=732103 entries=4098 work=8210 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=100 elapsed_us=732275 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8210 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpI2GHzY
+DISCOVERY_SLICE files=8192 delay_us=0 pass=1 elapsed_us=378999 entries=8193 work=16384 candidate=8192 authoritative=false
+DISCOVERY_SLICE files=8192 delay_us=0 pass=2 elapsed_us=46951 entries=8193 work=16384 candidate=8192 authoritative=false
+DISCOVERY_SLICE files=8192 delay_us=0 pass=3 elapsed_us=15997 entries=0 work=18 candidate=8192 authoritative=true
+DISCOVERY_AFTER files=8192 delay_us=0 elapsed_us=443857 passes=3 cadence_wait_seconds=120 entries=16386 units=4 work=32786 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmppaMxVm
+
+FINAL 65536 CAP
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=0 entries=2049 elapsed_us=60963 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpQZ7vQ2
+DISCOVERY_BASELINE dirs=32 files_per_dir=64 delay_us=0 entries=2080 elapsed_us=68010 owned_path_certificate_bytes=354962 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpbogjTJ
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=100 entries=2049 elapsed_us=479344 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmp31M3DV
+DISCOVERY_SLICE files=2048 delay_us=0 pass=1 elapsed_us=104499 entries=4098 work=8213 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=0 elapsed_us=104707 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8213 owned_payload_peak_bytes=522489 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpNTJe5d
+DISCOVERY_SLICE files=2048 delay_us=100 pass=1 elapsed_us=831470 entries=4098 work=8213 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=100 elapsed_us=831673 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8213 owned_payload_peak_bytes=522489 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpfFO6mZ
+DISCOVERY_SLICE files=8192 delay_us=0 pass=1 elapsed_us=629265 entries=16386 work=32789 candidate=8192 authoritative=true
+DISCOVERY_AFTER files=8192 delay_us=0 elapsed_us=629856 passes=1 cadence_wait_seconds=0 entries=16386 units=4 work=32789 owned_payload_peak_bytes=2089209 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpODP2zV
+
+SETTLED POLICY AFTER PERMISSION-PROGRESS FIXES
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=0 entries=2049 elapsed_us=51782 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpwii6Hp
+DISCOVERY_BASELINE dirs=32 files_per_dir=64 delay_us=0 entries=2080 elapsed_us=44621 owned_path_certificate_bytes=354962 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpwv185R
+DISCOVERY_BASELINE dirs=1 files_per_dir=2048 delay_us=100 entries=2049 elapsed_us=362853 owned_path_certificate_bytes=362381 sessions=2048 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmprHHBpb
+DISCOVERY_SLICE files=2048 delay_us=0 pass=1 elapsed_us=102782 entries=4098 work=8213 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=0 elapsed_us=102989 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8213 owned_payload_peak_bytes=522489 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpfEAso7
+DISCOVERY_SLICE files=2048 delay_us=100 pass=1 elapsed_us=741080 entries=4098 work=8213 candidate=2048 authoritative=true
+DISCOVERY_AFTER files=2048 delay_us=100 elapsed_us=741273 passes=1 cadence_wait_seconds=0 entries=4098 units=4 work=8213 owned_payload_peak_bytes=522489 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpg28KjL
+DISCOVERY_SLICE files=8192 delay_us=0 pass=1 elapsed_us=441363 entries=16386 work=32789 candidate=8192 authoritative=true
+DISCOVERY_AFTER files=8192 delay_us=0 elapsed_us=441954 passes=1 cadence_wait_seconds=0 entries=16386 units=4 work=32789 owned_payload_peak_bytes=2089209 fixture=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpX6Diip

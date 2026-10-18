@@ -183,9 +183,13 @@ includes possible later writer-upgrade contention. Corpus scopes retain immediat
 BEGIN. Records carry the actual transaction mode, and contracts require that mode.
 
 Application bytes are counted at returned reads for metadata, usage, search index
-and links. They include rereads, not physical I/O. Directory enumeration,
-stat/fingerprint calls, SQLite reads, network traffic and unscoped writes remain
-unknown. One-second and boundary native samples report inclusive process RSS,
+and links. They include rereads, not physical I/O. The population inventory additionally emits path-free `discovery` records with
+returned directory entries, cooperative work units, completed directory passes,
+authority, elapsed time and selected owned payload bytes. Payload coverage is
+explicit: directory name/certificate and returned-scan session/source strings; diagnostics, tree nodes, SQL,
+transient allocations and RSS are excluded. Ordinary builds have no recorder
+calls. Legacy foreground enumeration, stat/fingerprint calls, SQLite reads,
+network traffic and unscoped writes remain unknown. One-second and boundary native samples report inclusive process RSS,
 DB bytes and retained WAL length; absent WAL stays absent. The marker-gated profile
 inspector separately reads counts and PRAGMAs. Neither path sums WAL lengths as
 writes. Chromium CDP reports telemetry-inclusive renderer JS heap; WebKit,
@@ -241,3 +245,11 @@ Tracing and ordinary product telemetry remain identical. Disabled observation is
 not a valid startup/resource baseline. These commands deliberately reject until the
 real mixed adapter supplies its witnesses; no calibration envelope has been claimed
 by the foundation smoke tests.
+
+`make measure-enterprise-discovery` runs only the two exact synthetic discovery
+probes, retains their generated fixtures, and asserts zero transcript body reads.
+It never selects a home corpus. The inventory's immediate transactions include
+`claude_corpus_epoch`, `claude_corpus_directory` and `claude_corpus_inventory` in
+the fixed-name row-callback allowlist. See
+`docs/superpowers/specs/2026-10-18-discovery-measurements.md` for calibration,
+production-cadence convergence and the portable restart/observation limits.

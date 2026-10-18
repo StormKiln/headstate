@@ -248,6 +248,8 @@ pub(crate) fn discovery_fingerprint(
     for entry in std::fs::read_dir(path)? {
         check_cancelled()?;
         let entry = entry?;
+        #[cfg(test)]
+        super::corpus_probe::entry();
         let kind = entry.file_type()?;
         let kind = if kind.is_dir() {
             1u8

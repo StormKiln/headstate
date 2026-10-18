@@ -4911,6 +4911,7 @@ pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthS
 
 #[derive(Default)]
 struct PopulationRegistry {
+    discovery: std::sync::Arc<std::sync::Mutex<crate::claude::corpus_inventory::DiscoveryRuntime>>,
     paused: bool,
     next_id: u64,
     active: std::collections::HashMap<u64, crate::claude::transcript::PopulationControl>,
@@ -5128,6 +5129,118 @@ mod corpus_cancel_tests {
         assert_eq!(busy.index_health, IndexOutcome::Busy);
         assert!(busy.indexed.is_none());
         drop(permit);
+    }
+
+    #[test]
+    fn accepted_index_progress_precedes_slow_incomplete_discovery() {
+        use crate::claude::{corpus_probe, transcript::PopulationControl};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("accepted.jsonl");
+        let body = |text: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"accepted\",\"message\":{{\"content\":\"{text}\"}}}}\n")
+        };
+        std::fs::write(&source, body("initial")).unwrap();
+        let mut conn = open_db(&dir.path().join("progress.db")).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        populate_live_corpus(
+            &mut conn,
+            Some(&root),
+            &PopulationControl::default(),
+            &registry,
+            &slots,
+        );
+        std::fs::write(&source, body("accepted changed progress")).unwrap();
+        for i in 0..256 {
+            std::fs::write(project.join(format!("extra-{i}.jsonl")), "").unwrap();
+        }
+        settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &3usize).unwrap();
+        let control = PopulationControl::default();
+        corpus_probe::configure(
+            std::time::Duration::from_micros(100),
+            Some((64, control.clone())),
+        );
+        let result = populate_live_corpus(&mut conn, Some(&root), &control, &registry, &slots);
+        corpus_probe::configure(std::time::Duration::ZERO, None);
+        assert_eq!(
+            result.indexed.unwrap().indexed,
+            1,
+            "accepted source must publish before slow discovery exhausts the pass"
+        );
+        let found:i64=conn.query_row("SELECT count(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'changed'",[],|r|r.get(0)).unwrap();
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn stable_inventory_completes_all_lanes_across_rotations_without_body_rereads() {
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("stable.jsonl"), "{\"type\":\"user\",\"sessionId\":\"stable\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/synthetic\",\"message\":{\"content\":\"stable source\"}}\n").unwrap();
+        let path = dir.path().join("stable.db");
+        let mut conn = open_db(&path).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // Finish initial processing and any required continuity audit first.
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        for first in 0..4usize {
+            settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
+            #[cfg(feature = "enterprise-harness")]
+            crate::enterprise_harness::resources::take_read_capture();
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+            for progress in [
+                out.metadata.unwrap(),
+                out.usage.unwrap(),
+                out.indexed.unwrap().population,
+            ] {
+                assert_eq!(
+                    progress.status,
+                    PopulationStatus::Complete,
+                    "first lane {first}"
+                );
+                assert!(progress.total_known);
+                assert_eq!(progress.completed, 1);
+            }
+            let link = crate::claude::linkscan::refresh_controlled(
+                &mut conn,
+                &crate::claude::transcript::corpus(&root),
+                crate::claude::linkscan::BYTES_PER_PASS,
+                &PopulationControl::default(),
+            )
+            .unwrap();
+            assert_eq!(link.deferred, 0);
+            assert!(link.stopped.is_none());
+            assert!(link.unreadable.is_empty());
+            assert!(!link.not_started);
+            #[cfg(feature = "enterprise-harness")]
+            assert_eq!(
+                crate::enterprise_harness::resources::take_read_capture(),
+                [0; 4],
+                "unchanged rotation {first} must not reread transcript bodies"
+            );
+        }
     }
 
     #[test]
@@ -5990,7 +6103,6 @@ fn populate_live_corpus_with_controls(
         out.index_health = IndexOutcome::Failed("No transcript directory is available".into());
         return out;
     };
-    let scan = crate::claude::transcript::corpus_controlled(root, control);
     let order = match processing_order(conn) {
         Ok(order) => order,
         Err(error) => {
@@ -5998,11 +6110,64 @@ fn populate_live_corpus_with_controls(
             return out;
         }
     };
+    let mut scan = match crate::claude::corpus_inventory::load_processing_scan(conn, root) {
+        Ok(scan) => scan,
+        Err(error) => {
+            out.index_health = IndexOutcome::Failed(error.to_string());
+            return out;
+        }
+    };
+    let discovery = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .discovery
+        .clone();
     // Rotation is persisted before work: timeout or interruption cannot pin an
     // expensive usage source ahead of the index forever. Each slice shares the
     // root cancellation and is capped by its remaining deadline.
-    for lane in order {
-        let lane_control = control_for_lane(lane, control);
+    let mut authoritative = false;
+    let mut first_control = None;
+    for (position, lane) in order
+        .into_iter()
+        .chain(std::iter::once(order[0]))
+        .enumerate()
+    {
+        if position == 4 && !authoritative {
+            break;
+        }
+        if position == 1 {
+            let mut runtime = discovery.lock().unwrap_or_else(|e| e.into_inner());
+            match crate::claude::corpus_inventory::reconcile_corpus(
+                conn,
+                root,
+                control,
+                &mut runtime,
+            ) {
+                Ok(slice) => {
+                    authoritative = slice.authoritative;
+                    scan = slice.scan;
+                }
+                Err(error) => {
+                    log::warn!("claude: corpus discovery failed: {error}");
+                    if let Ok(observed) =
+                        crate::claude::corpus_inventory::load_processing_scan(conn, root)
+                    {
+                        scan = observed;
+                    }
+                    scan.unreadable_dirs.push(error.to_string());
+                }
+            }
+        }
+        // Revisit the first lane after completed discovery to finalize truthful
+        // totals/pruning. Its original deadline is retained; no extra budget.
+        let lane_control = if position == 4 {
+            first_control.take().expect("first lane has a control")
+        } else {
+            control_for_lane(lane, control)
+        };
+        if position == 0 {
+            first_control = Some(lane_control.clone());
+        }
         match lane {
             Lane::Links => match crate::claude::linkscan::refresh_controlled(
                 conn,

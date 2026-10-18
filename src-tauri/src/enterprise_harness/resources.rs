@@ -88,6 +88,9 @@ fn table_name(table: &str) -> &'static str {
         "claude_link_checkpoint" => "claude_link_checkpoint",
         "claude_population_generation" => "claude_population_generation",
         "claude_population_state" => "claude_population_state",
+        "claude_corpus_epoch" => "claude_corpus_epoch",
+        "claude_corpus_directory" => "claude_corpus_directory",
+        "claude_corpus_inventory" => "claude_corpus_inventory",
         _ => "unclassified_table",
     }
 }
@@ -129,6 +132,7 @@ fn transaction_observed<'a>(
             | "corpus-metadata"
             | "corpus-usage"
             | "corpus-index"
+            | "corpus-discovery"
             | "corpus-links"
             | "corpus-admission"
             | "corpus-pause"

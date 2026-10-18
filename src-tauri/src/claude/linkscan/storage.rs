@@ -120,8 +120,7 @@ mod tests {
 
     fn legacy_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::store::migrate(&conn).unwrap();
-        conn.execute_batch("DROP TABLE claude_link_checkpoint; DROP TABLE claude_link_baseline; PRAGMA user_version=46;").unwrap();
+        crate::store::historical_schema(&conn, 46);
         conn
     }
 

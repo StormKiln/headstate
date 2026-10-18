@@ -1350,6 +1350,30 @@ const MIGRATIONS: &[&str] = &[
     // legacy offset membership without pretending it proves source continuity.
     "CREATE TABLE claude_link_baseline (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), since_ms INTEGER NOT NULL);
      CREATE TABLE claude_link_checkpoint (path TEXT PRIMARY KEY, offset TEXT NOT NULL, payload TEXT);",
+    // 48: accepted membership and resumable candidate discovery. Directory
+    // completion is durable; a portable ReadDir position deliberately is not.
+    "CREATE TABLE claude_corpus_epoch (
+        root TEXT PRIMARY KEY, accepted INTEGER NOT NULL DEFAULT 0,
+        staging INTEGER NOT NULL DEFAULT 1, phase INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE claude_corpus_directory (
+        root TEXT NOT NULL, generation INTEGER NOT NULL, path TEXT NOT NULL,
+        depth INTEGER NOT NULL, certificate TEXT, entries INTEGER,
+        validated INTEGER NOT NULL DEFAULT 0, issue TEXT, failures INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(root,generation,path)
+    );
+    CREATE INDEX claude_corpus_directory_pending ON claude_corpus_directory(root,generation,depth,path) WHERE certificate IS NULL AND issue IS NULL;
+    CREATE INDEX claude_corpus_directory_validation ON claude_corpus_directory(root,generation,validated,depth,path) WHERE issue IS NULL;
+    CREATE INDEX claude_corpus_directory_retry ON claude_corpus_directory(root,generation,failures,path) WHERE issue IS NOT NULL;
+    CREATE TABLE claude_corpus_inventory (
+        root TEXT NOT NULL, generation INTEGER NOT NULL, path TEXT NOT NULL,
+        directory TEXT NOT NULL, session_id TEXT, size_bytes INTEGER NOT NULL,
+        modified TEXT NOT NULL, issue TEXT,
+        PRIMARY KEY(root,generation,path)
+    );
+    CREATE INDEX claude_corpus_inventory_directory
+        ON claude_corpus_inventory(root,generation,directory);",
+
 ];
 
 /// The only legacy repairs supported here are scripts that were already
@@ -1465,17 +1489,24 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// Construct a real historical schema for migration tests. Downgrading only
+/// user_version on a current database leaves future tables behind.
+#[cfg(test)]
+pub(crate) fn historical_schema(conn: &Connection, version: usize) {
+    for sql in &MIGRATIONS[..version] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", version as i64)
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn historical_db(path: &Path, version: usize) -> Connection {
         let conn = Connection::open(path).unwrap();
-        for sql in &MIGRATIONS[..version] {
-            conn.execute_batch(sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", version as i64)
-            .unwrap();
+        historical_schema(&conn, version);
         if version > 0 {
             conn.execute("INSERT INTO snapshot(id,payload,fetched_at) VALUES(1,'synthetic-saved-data','fixture-time')", []).unwrap();
         }
@@ -1489,6 +1520,84 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn inventory_upgrade_and_partial_first_discovery_preserve_legacy_corpus() {
+        use crate::claude::{
+            corpus_inventory::{reconcile_corpus, DiscoveryRuntime},
+            corpus_probe,
+            transcript::{self, PopulationControl},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("legacy.jsonl");
+        std::fs::write(&source,"{\"type\":\"user\",\"sessionId\":\"legacy\",\"cwd\":\"/synthetic\",\"message\":{\"content\":\"legacy visible content\"}}\n").unwrap();
+        let mut conn = historical_db(&path, 47);
+        let control = PopulationControl::discovery();
+        let scan = transcript::corpus(&root);
+        crate::claude::store::metadata_pass(&mut conn, &scan, &control).unwrap();
+        crate::claude::search::index_pass_controlled(&mut conn, &scan, &control).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        crate::claude::linkscan::refresh_controlled(
+            &mut conn,
+            &scan,
+            crate::claude::linkscan::BYTES_PER_PASS,
+            &control,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES ('legacy','synthetic/repo',1,'https://github.com/synthetic/repo/pull/1','fixture')",[]).unwrap();
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "migration does not invent a root attribution"
+        );
+        std::fs::rename(&source, dir.path().join("retained-legacy.jsonl")).unwrap();
+        for n in 0..100 {
+            std::fs::write(project.join(format!("candidate-{n}.jsonl")), "").unwrap();
+        }
+        let discovery = PopulationControl::discovery();
+        corpus_probe::configure(std::time::Duration::ZERO, Some((64, discovery.clone())));
+        let partial = reconcile_corpus(
+            &mut conn,
+            &root,
+            &discovery,
+            &mut DiscoveryRuntime::default(),
+        )
+        .unwrap();
+        corpus_probe::configure(std::time::Duration::ZERO, None);
+        assert!(!partial.authoritative);
+        assert!(partial.scan.is_partial());
+        crate::claude::store::metadata_pass(&mut conn, &partial.scan, &control).unwrap();
+        crate::claude::search::index_pass_controlled(&mut conn, &partial.scan, &control).unwrap();
+        crate::claude::linkscan::refresh_controlled(
+            &mut conn,
+            &partial.scan,
+            crate::claude::linkscan::BYTES_PER_PASS,
+            &control,
+        )
+        .unwrap();
+        for table in ["claude_session", "claude_index_ledger", "claude_session_pr"] {
+            let sql = format!("SELECT count(*) FROM {table} WHERE session_id='legacy'");
+            assert_eq!(conn.query_row(&sql, [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM claude_link_checkpoint WHERE path=?1",
+                [source.to_string_lossy().as_ref()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'visible'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]
