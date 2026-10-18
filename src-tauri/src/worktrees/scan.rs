@@ -9445,8 +9445,18 @@ prunable gitdir file points to non-existent location
                 1,
             );
             std::fs::write(&script, delayed).unwrap();
-            let mut cmd = Command::new(&script);
-            cmd.arg("-C")
+            // The timeout fixture must not require executable-file admission
+            // for its freshly written script (#1895). Keep a writer open and
+            // remove execute permission so direct execution cannot regress.
+            use std::os::unix::fs::PermissionsExt;
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&script)
+                .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(&script)
+                .arg("-C")
                 .arg(tmp.path())
                 .arg("status")
                 .stdout(std::process::Stdio::piped())
