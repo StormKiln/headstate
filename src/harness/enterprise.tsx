@@ -52,7 +52,7 @@ export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
   // Observe exactly what the production hooks render, including retained startup data.
-  if(convergenceScenario)renderedSource=source;
+  if(convergenceScenario||new URL(location.href).searchParams.get('scenario')==='quota')renderedSource=source;
   renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
   renderedReadyEligibility=(reviewing.data??[]).filter(readyForReview).map(row=>`${row.repo}/${row.number}`).sort();
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;

@@ -112,3 +112,52 @@ documents and zero retired bridge commands; a nonzero count fails acceptance.
 Classification runs before injected provider faults, so failed requests count too.
 Warm replay accepts retained legacy close-day metadata without mounting or calling
 Stats; new runs retain exact external close/merge timestamps.
+
+### Weighted natural quota (`MODE=quota`)
+
+`make enterprise-run OUT=/private/tmp/headstate-quota ENGINE=chromium MODE=quota`
+uses the ordinary native driver, mounted desktop/paired clients and production
+60-second polling cadence. Build with `make enterprise-driver enterprise-ui`
+when needed. Use a new output directory for every attempt; failed artifacts are
+retained. WebKit uses the same mode with `ENGINE=webkit`.
+
+The opt-in `weighted-natural-v1` profile in `quota.mjs` is synthetic accounting,
+not a forecast of GitHub prices. Its complete parameters and canonical SHA-256
+identity are recorded in `result.quotaModel` and `result.workload.quotaProfile`.
+REST and GraphQL have independent capacities (800 and 12000) and 150-second
+windows. Parsed GraphQL field/page/detail/advisory/mutation weights and REST
+endpoint weights determine cost before response materialization or mutation.
+A shared rolling cost burst window can naturally emit secondary 429/cooldown;
+focused provider/model tests exercise this separately from primary recovery.
+
+Each received weighted document has `quotaShape` and an immutable request-time
+`quota` receipt: bucket, window identity, capacity, before, requested cost,
+charged cost, after, reset, and natural/secondary refusal. Accepted requests are
+charged even if a later fixture/transport fault fails. Denied requests charge
+zero and cannot mutate provider rows. A primary over-cost refusal advertises
+zero **admissible** remaining capacity in the protocol header while its receipt
+preserves the actual unspent remainder. Receipt replay checks conservation and
+window/reset/burst behavior; scenario validation independently recomputes cost
+from the recorded parsed request shape. Document counts remain separate from
+`quotaAccounting.charged` totals.
+
+The scenario crosses the real REST `<=500` reserve and proves that a mounted
+GraphQL approval can still succeed. This is independent-bucket foreground
+usability: the production reserve applies to **all REST reads**, and the harness
+does not introduce a REST foreground-read bypass. Bounded alternating desktop
+and paired foreground detail acquisitions then naturally exhaust GraphQL.
+Read-only observers verify blocked background refresh, retained accepted
+identities, native cooldown, bounded traffic, a later real reset receipt, and a
+new accepted source publication consumed by both mounted clients. Previously
+accepted 50/150 inventories are retained through incomplete refresh; this mode
+does not claim an initially partial list subset. Existing partial-page fault
+and convergence modes remain separate.
+
+No quota mode step toggles `fault.mode`, changes admission thresholds, repeatedly
+wakes the scheduler, or advances an artificial clock. The default equal-document
+and convergence fixtures retain their existing policy. `startProvider` accepts
+a normalized workload plus optional quota profile, rejects a mismatched profile
+identity, and rejects unsupported population descriptors rather than advertising
+250 PRs while serving 150. Generalized fixture populations belong to the churn
+extension; the current fixture remains deterministic and seed 9001 is recorded
+as workload provenance.

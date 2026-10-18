@@ -90,3 +90,34 @@ test('conditional hold skips ineligible natural candidate without spending armed
  await query(document);assert.equal(p.heldCount,0);assert.equal(p.fault.holdSearch.remaining,1);assert.equal(p.ledger[0].holdEligibility.eligible,false);
  const pending=query(document);for(let i=0;i<100&&!p.heldCount;i++)await new Promise(r=>setTimeout(r,1));assert.equal(p.heldCount,1);assert.equal(p.fault.holdSearch.remaining,0);assert.equal(p.ledger[1].holdEligibility.eligible,true);p.release();await pending;
 }));
+
+import {weightedQuotaProfile,reconcileQuota,documentCost} from './quota.mjs';
+import {parseDocument} from './graphql.mjs';
+test('weighted provider naturally denies mutation before side effects and preserves request-time costs',async()=>{
+ const quotaProfile=structuredClone(weightedQuotaProfile);quotaProfile.graphql.capacity=90;
+ const p=await startProvider({quotaProfile});const send=query=>fetch(p.url+'/graphql',{method:'POST',body:JSON.stringify({query})});
+ try{
+  p.fault.delays=[80,0];
+  const query='{viewer{login} rateLimit{cost remaining}}';const responses=await Promise.all([send(query),send(query)]);
+  for(const [i,r] of responses.entries()){const body=await r.json();assert.equal(body.data.rateLimit.cost,p.ledger[i].quota.charged);assert.equal(body.data.rateLimit.remaining,p.ledger[i].quota.after);}
+  assert.ok(p.ledger[0].at+p.ledger[0].elapsed>p.ledger[1].at+p.ledger[1].elapsed,'response completion order is reversed');
+  const before=JSON.stringify(p.data.rows[50]);const denied=await send('mutation {closePullRequest(input:{pullRequestId:"PR_51"}){pullRequest{id state updatedAt}}}');
+  assert.equal(denied.status,403);assert.equal(denied.headers.get('x-ratelimit-remaining'),'0','over-cost primary rejection advertises no admissible capacity');assert.equal(JSON.stringify(p.data.rows[50]),before);assert.equal(p.ledger.at(-1).quota.charged,0);assert.ok(p.ledger.at(-1).quota.after>0);assert.equal(p.ledger.at(-1).quota.after,p.ledger.at(-1).quota.before);assert.equal(p.ledger.at(-1).remaining,0);assert.equal(p.ledger.at(-1).quota.naturalLimit,true);
+  assert.equal(reconcileQuota(quotaProfile,p.ledger.map(e=>e.quota)).documents,3);
+  assert.equal(p.ledger[0].quota.cost,documentCost(quotaProfile,{doc:parseDocument(query)}));
+ }finally{await p.close();}
+});
+test('weighted provider naturally emits secondary rejection without charging or mutation',async()=>{
+ const quotaProfile=structuredClone(weightedQuotaProfile);quotaProfile.burst.maxCost=2;
+ const p=await startProvider({quotaProfile});try{const r=await fetch(p.url+'/graphql',{method:'POST',body:JSON.stringify({query:'mutation {closePullRequest(input:{pullRequestId:"PR_51"}){pullRequest{id}}}'})});assert.equal(r.status,429);assert.equal(p.data.rows[50].state,'OPEN');assert.equal(p.ledger[0].quota.charged,0);assert.equal(p.fault.mode,'healthy');}finally{await p.close();}
+});
+
+import {defaultWorkload} from './workload.mjs';
+import {quotaIdentity} from './quota.mjs';
+test('provider rejects unsupported descriptor populations and mismatched quota identity',async()=>{
+ const workload=structuredClone(defaultWorkload);workload.populations.reviewing=250;
+ await assert.rejects(async()=>{const unexpected=await startProvider({workload});await unexpected.close();},/population/);
+ await assert.rejects(startProvider({workload:defaultWorkload,quotaProfile:weightedQuotaProfile}));
+ await assert.rejects(async()=>{const unexpected=await startProvider({workload:{...defaultWorkload,quotaProfile:quotaIdentity(weightedQuotaProfile)}});await unexpected.close();},/quota identity/);
+ const good={...defaultWorkload,quotaProfile:quotaIdentity(weightedQuotaProfile)};const p=await startProvider({workload:good,quotaProfile:weightedQuotaProfile});await p.close();
+});

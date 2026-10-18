@@ -1,3 +1,6 @@
+import {createQuotaState,documentCost,quotaIdentity,validateQuotaProfile} from './quota.mjs';
+import {defaultWorkload,normalizeWorkload} from './workload.mjs';
+import assert from 'node:assert/strict';
 import {statsRequestReasons} from './stats-retirement.mjs';
 import {observeHoldReadiness} from './convergence-action.mjs';
 import {createServer} from 'node:http';import {parseDocument,project} from './graphql.mjs';
@@ -24,7 +27,10 @@ export function fixture({convergence=false}={}) {
  const history=Array.from({length:manifest.historicalMerged},(_,i)=>{const row=structuredClone(rows[i%rows.length]);const number=1001+i;row.commits.nodes[0].commit.oid=`head-${number}`;return {...row,id:`PR_${number}`,number,title:`Synthetic historical review ${number}`,url:`https://github.com/${row.repository.nameWithOwner}/pull/${number}`,state:'MERGED',createdAt:new Date(Date.parse(date)-2*86400000).toISOString(),mergedAt:date,closedAt:date,updatedAt:date,headRefName:`topic-${number}`,headRefOid:`head-${number}`,reviewRequests:connection([])};});
  return {members,repos,rows:[...rows,...history]};
 }
-export async function startProvider({convergence=false}={}) {
+export async function startProvider({convergence=false,workload,quotaProfile}={}) {
+ if(quotaProfile)quotaProfile=validateQuotaProfile(quotaProfile);
+ if(workload){normalizeWorkload(workload);assert.deepEqual(workload.populations,{authored:50,reviewing:convergence?236:150,repositories:50,members:50,history:250},'unsupported fixture population');assert.deepEqual(workload.quotaProfile,quotaProfile?quotaIdentity(quotaProfile):defaultWorkload.quotaProfile,'quota identity must match provider policy');}
+ const weighted=quotaProfile?createQuotaState(quotaProfile):null;
  const held=[];const data=fixture({convergence}),ledger=[],fault={mode:'healthy',delay:0,thread:false,outdated:false,closed:[]};let active=0,next=0,lost=false;const quota=Object.fromEntries(['graphql','rest'].map(bucket=>[bucket,{remaining:5000,reset:Math.floor(Date.now()/1000)+120}]));
  const server=createServer(async(req,res)=>{
   const id=++next,started=performance.now();active++;let entry={id,at:started,operation:'unknown',fault:fault.mode,aliases:0,status:0,active,terminal:null};if(ledger.length<100000)ledger.push(entry);else lost=true;res.once('close',()=>{entry.responseDelivered=res.writableFinished;});
@@ -32,10 +38,9 @@ export async function startProvider({convergence=false}={}) {
   let raw='';for await(const c of req)raw+=c;
   const bucket=req.url==='/graphql'?'graphql':'rest';
   const window=quota[bucket];if(Math.floor(Date.now()/1000)>=window.reset){window.remaining=5000;window.reset=Math.floor(Date.now()/1000)+120;}
-  window.remaining=Math.max(0,window.remaining-1);entry.bucket=bucket;entry.remaining=window.remaining;entry.reset=window.reset;
+  if(!weighted)window.remaining=Math.max(0,window.remaining-1);entry.bucket=bucket;entry.remaining=window.remaining;entry.reset=window.reset;
   res.setHeader('x-ratelimit-remaining',String(entry.remaining));res.setHeader('x-ratelimit-reset',String(entry.reset));
   try {
-   for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    const responseDelay=fault.delays?.shift()??fault.delay;
    const input=req.url==='/graphql'?JSON.parse(raw):null,doc=input?parseDocument(input.query,input.variables):null;
    const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];entry.queryName=queryName;entry.statsRequestReasons=statsRequestReasons(doc,queryName,req.url);
@@ -54,6 +59,20 @@ export async function startProvider({convergence=false}={}) {
    if(doc){entry.aliases=doc.aliases;const names=doc.selection.map(f=>f.name);entry.operation=doc.kind==='mutation'?'review-write':names.includes('search')?'search':names.includes('node')||names.includes('nodes')?'node':names.includes('repository')?'repository':names.includes('viewer')||names.includes('organization')?'viewer':'unknown';}
    else entry.operation=req.method==='GET'?'rest-read':'rest-write';
    const historyRead=doc?.selection.some(f=>f.name==='search'&&String(f.args.query).includes('is:merged')&&f.selection.some(s=>s.name==='nodes'));if(historyRead)entry.operation='history-search';
+   if(weighted){
+    entry.quotaShape={doc,method:req.method,path:req.url};
+    entry.quota=weighted.charge({bucket,cost:documentCost(quotaProfile,entry.quotaShape)});
+    // A primary refusal advertises zero admissible capacity; the receipt
+    // retains the unspent remainder and charges zero for the denied document.
+    entry.remaining=entry.quota.naturalLimit?0:entry.quota.after;entry.reset=entry.quota.reset;
+    res.setHeader('x-ratelimit-remaining',String(entry.remaining));res.setHeader('x-ratelimit-reset',String(entry.reset));
+    if(entry.quota.secondaryLimit||entry.quota.naturalLimit){
+     entry.status=entry.quota.secondaryLimit?429:403;
+     if(entry.quota.secondaryLimit)res.setHeader('retry-after',String(entry.quota.retryAfter));
+     res.writeHead(entry.status,{'content-type':'application/json'}).end(JSON.stringify({message:entry.quota.secondaryLimit?'secondary rate limit':'primary rate limit: synthetic operation cost exceeds remaining capacity'}));return;
+    }
+   }
+   for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    if(failSearch){entry.targetedFailure=true;entry.stage='finite-search-failure';entry.status=503;res.writeHead(503).end();return;}
    if(fault.mode==='offline'){entry.terminal='connection-closed';req.socket.destroy();return;}
    if(fault.mode==='secondary'){res.writeHead(429,{'content-type':'application/json','retry-after':'2'});entry.status=429;res.end(JSON.stringify({message:'secondary rate limit'}));return;}
@@ -75,7 +94,7 @@ export async function startProvider({convergence=false}={}) {
    let pageRefusal=false;
    const resolve=(f,o)=>{
     if(o===root){
-     if(f.name==='rateLimit')return {cost:1,remaining:entry.remaining,resetAt:new Date(entry.reset*1000).toISOString()};
+     if(f.name==='rateLimit')return {cost:entry.quota?.charged??1,remaining:entry.remaining,resetAt:new Date(entry.reset*1000).toISOString()};
      if(f.name==='viewer')return {login:'synthetic-viewer',organizations:connection([{login:'synthetic-lab',name:'Synthetic laboratory',avatarUrl:'',membersWithRole:connection(data.members),repositories:connection(data.repos)}]),repositories:connection(data.repos)};
      if(f.name==='organization')return f.args.login==='synthetic-lab'?{login:'synthetic-lab',name:'Synthetic laboratory',membersWithRole:connection(data.members),repositories:connection(data.repos)}:null;
      if(f.name==='repository')return data.repos.find(r=>r.name===f.args.name&&r.owner.login===f.args.owner)??null;
