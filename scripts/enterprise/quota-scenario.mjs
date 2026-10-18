@@ -2,7 +2,23 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {documentCost,reconcileQuota} from './quota.mjs';
+import {defaultWorkload} from './workload.mjs';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+// Independent expected identities for the fixed quota fixture. The provider
+// rejects other populations; never derive acceptance from observed rows.
+const population=defaultWorkload.populations;
+const identity=number=>`synthetic-lab/repo-${(number-1)%population.repositories+1}/${number}`;
+const expectedInventory={authored:Array.from({length:population.authored},(_,i)=>identity(i+1)).sort(),reviewing:Array.from({length:population.reviewing},(_,i)=>identity(population.authored+i+1)).sort()};
+function assertInventory(inventory,label){
+ for(const list of ['authored','reviewing']){assert.ok(Array.isArray(inventory?.[list]),`${label} ${list} identities required`);assert.deepEqual([...inventory[list]].sort(),expectedInventory[list],`${label} exact unique ${list} identities`);}
+}
+function assertReviewingFacts(rows,label){
+ assert.ok(Array.isArray(rows),`${label} rows required`);
+ assert.deepEqual(rows.map(r=>`${r.repo}/${r.number}`).sort(),expectedInventory.reviewing,`${label} exact unique reviewing identities`);
+ for(const r of rows){assert.equal(r.head_oid,`head-${r.number}`,`${label} head fact`);assert.equal(r.base_ref,'main',`${label} base fact`);assert.equal(r.is_draft,false,`${label} draft fact`);}
+ // Review/approval facts may legitimately change through the measured action.
+}
+
 export function assertQuotaScenario(e,ledger,profile){
  assert.ok(profile.graphql.windowSeconds>120&&profile.rest.capacity>500);
  assert.ok(ledger.length&&ledger.every(r=>r.fault==='healthy'),'natural scenario never injects limits');
@@ -21,13 +37,14 @@ export function assertQuotaScenario(e,ledger,profile){
  assert.ok(e.quiescence?.durationMs>=10000&&e.quiescence.restRequests===0&&e.quiescence.graphqlRequests<=2,'bounded blocked-window traffic');
  const allBlocked=ledger.filter(r=>r.quota.receivedAt>=exhaustion.quota.receivedAt+2000&&r.quota.receivedAt<exhaustion.quota.reset*1000);assert.equal(allBlocked.filter(r=>r.bucket==='rest').length,0,'REST quiescence across full blocked window');assert.ok(allBlocked.filter(r=>r.bucket==='graphql').length<=2,'bounded GraphQL traffic across full blocked window');
  assert.equal(e.retained?.length,2);
- for(const r of e.retained){assert.ok(r.before.authored.length+r.before.reviewing.length>0);for(const kind of ['authored','reviewing'])assert.ok(r.before[kind].every(id=>r.after[kind].includes(id)),'accepted partial inventory retained');}
- for(const [i,blocked] of e.blockedPublications.entries()){assert.deepEqual(blocked.prs.map(r=>`${r.repo}/${r.number}`).sort(),e.retained[i].before.reviewing,'blocked publication retains exact accepted identities');for(const r of blocked.prs){assert.equal(r.head_oid,`head-${r.number}`,'retained head fact');assert.equal(r.base_ref,'main');assert.equal(r.is_draft,false);}}
+ for(const [i,r] of e.retained.entries()){assertInventory(r.before,`role ${i} initial`);assertInventory(r.after,`role ${i} retained`);assertReviewingFacts(e.blockedPublications[i].prs,`role ${i} blocked publication`);}
  const recovery=ledger.find(r=>r.id===e.recovery?.receiptId);
  assert.ok(recovery?.status===200&&recovery.bucket==='graphql'&&recovery.quota.windowId!==exhaustion.quota.windowId&&recovery.quota.receivedAt>=exhaustion.quota.reset*1000,'real reset receipt');
- assert.ok(e.recovery.autonomous&&e.recovery.native.graphql.remaining>0&&e.recovery.inventories.every(i=>i.authored.length===50&&i.reviewing.length===150),'native and mounted recovery');
+ assert.ok(e.recovery.autonomous&&e.recovery.native.graphql.remaining>0,'native and mounted recovery');
+ assert.equal(e.recovery.inventories?.length,2);
+ for(const [i,inventory] of e.recovery.inventories.entries())assertInventory(inventory,`role ${i} recovered`);
  assert.equal(e.recovery.publications?.length,2);assert.equal(e.recovery.sources?.length,2);
- for(const [i,p] of e.recovery.publications.entries()){const blocked=e.blockedPublications[i],source=e.recovery.sources[i];assert.ok(e.recovery.accepted.some(a=>a.operation==='scan-slot'&&a.stage==='accepted-reviewing'&&a.code===p.receipt_revision),'actual native accepted revision required');assert.ok(p.session===blocked.session&&p.receipt_revision>blocked.receipt_revision&&p.phase==='ready'&&p.coverage==='complete'&&Date.parse(p.last_received_at)>=exhaustion.quota.reset*1000,'new accepted source publication after reset');assert.ok(source.phase==='ready'&&source.coverage==='complete'&&source.lastReceivedAt===p.last_received_at,'mounted source consumes recovered publication');}
+ for(const [i,p] of e.recovery.publications.entries()){const blocked=e.blockedPublications[i],source=e.recovery.sources[i];assertReviewingFacts(p.prs,`role ${i} recovered publication`);assertReviewingFacts(source.prs,`role ${i} recovered mounted source`);assert.ok(e.recovery.accepted.some(a=>a.operation==='scan-slot'&&a.stage==='accepted-reviewing'&&a.code===p.receipt_revision),'actual native accepted revision required');assert.ok(p.session===blocked.session&&p.receipt_revision>blocked.receipt_revision&&p.phase==='ready'&&p.coverage==='complete'&&Date.parse(p.last_received_at)>=exhaustion.quota.reset*1000,'new accepted source publication after reset');assert.ok(source.phase==='ready'&&source.coverage==='complete'&&source.lastReceivedAt===p.last_received_at,'mounted source consumes recovered publication');}
  return accounting;
 }
 export async function runQuotaScenario({pages,provider,result,out,profile,control,nativeCall,quotaProfile}){
