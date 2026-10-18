@@ -107,9 +107,9 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
       {caps.data?.actions.filter((c) => !c.allowed).map((c) => <p key={c.action}>{LABEL[c.action]}: {c.reason}</p>)}
       {caps.data && !caps.data.discussions_complete ? <p>Permissions were checked for the first 100 discussions. Later discussions can be acted on in GitLab.</p> : null}
     </details>
-    {permitted(capabilities, "comment") ? <div>
+    {permitted(caps.data, "comment") ? <div>
       <label className="text-sm">Comment<textarea aria-label="MR comment" value={comment} onChange={(e) => setComment(e.target.value)} maxLength={32768} className="mt-1 w-full rounded border border-[#30363d] bg-[#0d1117] p-2" /></label>
-      <button type="button" className={BUTTON} disabled={busy || !comment.trim()} onClick={() => act("comment", comment)}>Post comment</button>
+      <button type="button" className={BUTTON} disabled={busy || !capabilities || detail.isFetching || caps.isFetching || !comment.trim()} onClick={() => act("comment", comment)}>Post comment</button>
     </div> : null}
     <section className="space-y-1 text-sm"><h3 className="font-semibold">Approvals</h3>
       {d.approvals.state === "unavailable" ? <p>Approvals unavailable ({d.approvals.issue}).</p> : <>
@@ -132,7 +132,7 @@ export function GitLabDetail({ identity }: { identity: PrIdentity }) {
     <section className="space-y-3"><h3 className="font-semibold">Discussions</h3>
       {d.discussions.state === "unavailable" ? <p>Discussions unavailable ({d.discussions.issue}).</p> : <>
         <p className="text-sm">Unresolved threads: {d.discussions.value.unresolved_resolvable ?? "unknown"}{d.discussions.value.discussions.coverage !== "complete" ? " · Discussion list is incomplete" : ""}</p>
-        {discussions.map((discussion) => <Discussion key={discussion.id} discussion={discussion} capabilities={capabilities} busy={busy || uncertain || !!paused} act={act} />)}
+        {discussions.map((discussion) => <Discussion key={discussion.id} discussion={discussion} capabilities={caps.data} busy={busy || uncertain || !!paused || !capabilities || detail.isFetching || caps.isFetching} act={act} />)}
       </>}
       {d.comments.state === "unavailable" ? <p>Comments unavailable ({d.comments.issue}).</p> : <>
         {d.comments.value.coverage !== "complete" ? <p>Comment list is incomplete.</p> : null}

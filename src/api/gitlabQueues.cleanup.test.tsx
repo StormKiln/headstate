@@ -1,5 +1,11 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+let client: QueryClient;
+const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+beforeEach(() => { client = new QueryClient(); });
 
 const ipc = vi.hoisted(() => {
   const listeners: Array<{ event: string; handler: (event: { payload: unknown }) => void; resolve: (unlisten: () => void) => void }> = [];
@@ -18,6 +24,7 @@ vi.mock("./tauri", () => ({
 import { useGitLabQueue } from "./gitlabQueues";
 
 afterEach(() => {
+  client.clear();
   ipc.listeners.length = 0;
   ipc.unlisten.mockReset();
   ipc.refresh.mockReset();
@@ -29,7 +36,7 @@ afterEach(() => {
 describe("GitLab queue listeners", () => {
   it("unregisters listeners whose registration finishes after deselection", async () => {
     ipc.snapshot.mockReturnValue(new Promise(() => {}));
-    const { unmount } = renderHook(() => useGitLabQueue("authored", true));
+    const { unmount } = renderHook(() => useGitLabQueue("authored", true), { wrapper });
     expect(ipc.listeners.map(({ event }) => event)).toEqual(["source-poll-status", "refresh-requested"]);
     unmount();
     await act(async () => {
@@ -46,7 +53,7 @@ describe("GitLab queue listeners", () => {
     ipc.snapshot.mockResolvedValue({ data: null });
     ipc.refresh.mockResolvedValue({});
     vi.useFakeTimers();
-    const { unmount } = renderHook(() => useGitLabQueue("authored", true));
+    const { unmount } = renderHook(() => useGitLabQueue("authored", true), { wrapper });
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(ipc.refresh).toHaveBeenCalledTimes(1);
     await act(async () => {
@@ -66,7 +73,7 @@ describe("GitLab queue listeners", () => {
     ipc.refresh.mockResolvedValue({});
     const { result, rerender, unmount } = renderHook(
       ({ host }) => useGitLabQueue("authored", true, host),
-      { initialProps: { host: "gitlab.com" } },
+      { initialProps: { host: "gitlab.com" }, wrapper },
     );
     await waitFor(() => expect(result.current.rows).toEqual([{ title: "Old host" }]));
     rerender({ host: "self.example" });
@@ -77,7 +84,7 @@ describe("GitLab queue listeners", () => {
 
 it("uses a fresh desktop snapshot on mount without requesting the provider again", async () => {
   ipc.snapshot.mockResolvedValue({ data: { state: "git_lab_available", mrs: [], coverage: "complete", fetched_at: new Date().toISOString(), stale_secs: null } });
-  const { result, unmount } = renderHook(() => useGitLabQueue("authored", true));
+  const { result, unmount } = renderHook(() => useGitLabQueue("authored", true), { wrapper });
   await waitFor(() => expect(result.current.rows).toEqual([]));
   expect(result.current.loading).toBe(false);
   expect(ipc.refresh).not.toHaveBeenCalled();

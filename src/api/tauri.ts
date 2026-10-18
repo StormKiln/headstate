@@ -122,6 +122,8 @@ export type SourceRefreshResult = {
   coverage: SourceCoverage;
 };
 export type SourcePollUpdate = {
+  /** Receipt owner; absent on older desktops. */
+  owner?: string | null;
   source: Source;
   list: SourceList;
   phase: "not_requested" | "fetching" | "ready" | "partial" | "unknown" | "retrying" | "failed" | "not_asked";

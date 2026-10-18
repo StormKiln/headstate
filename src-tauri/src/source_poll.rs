@@ -576,12 +576,20 @@ impl SourcePolls {
         let (prs, owner) = receipt
             .map(|(rows, owner)| (Some(rows), owner))
             .unwrap_or_default();
-        let mrs = self
+        let gitlab = self
             .4
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(status.source.clone(), status.list))
-            .map(|(_, receipt)| receipt.mrs.clone());
+            .map(|(_, receipt)| (receipt.mrs.clone(), receipt.viewer.clone()));
+        // Rows and ownership must come from the same provider receipt, even
+        // when the authoritative inventory is empty.
+        let (mrs, owner) = match status.source.provider {
+            crate::identity::Provider::Gitlab => gitlab
+                .map(|(rows, owner)| (Some(rows), owner))
+                .unwrap_or_default(),
+            crate::identity::Provider::Github => (None, owner),
+        };
         let measurement_receipt = self.7.reference(&status);
         Update {
             measurement_receipt,
@@ -2926,6 +2934,58 @@ mod tests {
         );
         assert!(polls.success_publication(&reviewing).await.is_some());
         assert!(polls.success_publication(&other_host).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn gitlab_empty_receipt_publishes_its_owner_without_changing_github_owner() {
+        let polls = SourcePolls::default();
+        let github = Source::default();
+        let (attempt, _) = polls
+            .begin_attempt(github.clone(), CachedList::Authored)
+            .await;
+        let permit = polls.success_publication(&attempt).await.unwrap();
+        polls.complete(
+            permit,
+            Ok(FetchedList {
+                scan: None,
+                viewer: Some("github-owner".into()),
+                prs: vec![],
+                total: Some(0),
+                coverage: Coverage::Complete,
+            }),
+            |_| {},
+        );
+        let gitlab = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let (attempt, _) = polls
+            .begin_attempt(gitlab.clone(), CachedList::Authored)
+            .await;
+        let permit = polls.success_publication(&attempt).await.unwrap();
+        polls.complete_gitlab(
+            permit,
+            Ok(crate::gitlab::queues::FetchedList {
+                session: None,
+                scan: None,
+                viewer: Some("gitlab-owner".into()),
+                mrs: vec![],
+                total: Some(0),
+                coverage: Coverage::Complete,
+            }),
+            |_| {},
+        );
+        let update = polls.snapshot(&gitlab, CachedList::Authored).await;
+        assert_eq!(update.owner.as_deref(), Some("gitlab-owner"));
+        assert_eq!(update.mrs, Some(vec![]));
+        assert_eq!(
+            polls
+                .snapshot(&github, CachedList::Authored)
+                .await
+                .owner
+                .as_deref(),
+            Some("github-owner")
+        );
     }
 
     #[tokio::test]

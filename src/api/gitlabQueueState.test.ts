@@ -123,3 +123,15 @@ it("rejects saved and late live rows from a different GitLab account", () => {
   state.accept(update({ revision: 2, receipt_revision: 2, mrs: [{ ...mr("new row"), viewer: "new-account" }] }));
   expect(state.snapshot().rows?.[0].title).toBe("new row");
 });
+
+it("requires envelope ownership for empty receipts and rejects wrong envelopes even with matching rows", () => {
+  const state = new GitLabQueueState("gitlab.com", "authored", "alice");
+  state.accept(update({ mrs: [], owner: "bob" }));
+  expect(state.snapshot().rows).toBeUndefined();
+  state.accept(update({ mrs: [] }));
+  expect(state.snapshot().rows).toBeUndefined();
+  state.accept(update({ mrs: [{ ...mr("alice row"), viewer: "alice" }], owner: "bob" }));
+  expect(state.snapshot().rows).toBeUndefined();
+  state.accept(update({ mrs: [], owner: "alice" }));
+  expect(state.snapshot().rows).toEqual([]);
+});
