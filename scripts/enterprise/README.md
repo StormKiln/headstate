@@ -66,9 +66,13 @@ SLAs. WebKit unsupported long-task observations are null. Five samples support
 median/range, not a robust p95. Action pending/confirmed samples are separate.
 
 The soak uses real 60-second production cadence for at least 30 minutes. It
-extends up to 45 minutes for external close/merge, Ready pusher/rules/stack observations, then fails explicitly if unfinished. Extend the
-run policy with evidence if more time is required; do not claim convergence from
-inventory alone. It also checks a 125-second unchanged
+uses a finite diagnostic ceiling of `max(30 minutes, 180 seconds +
+120 seconds * max(initially owed pusher/rules identities, initially owed stack identities) + 300 seconds)` for the fixed
+145-row population. This is a diagnostic bound, not a convergence SLA. It fails
+after 10 minutes without useful progress even when that ceiling remains open.
+For example, 141 initially owed identities in the larger family produce a 290-minute ceiling. The outer
+runner must allow that existing bound plus startup, detail, and shutdown margins;
+never extend a failed run or claim convergence from inventory alone. It also checks a 125-second unchanged
 active-detail window. No accelerated clock or repeated wake/refetch loop runs in
 the measured soak. Manual detail invalidation used for thread-movement tests is
 labelled manual; cross-role approval uses automatic production source publication
