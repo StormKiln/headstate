@@ -17,6 +17,49 @@ function measured(v,label,{absent=false}={}){
  if(absent&&v.status==='absent'){assert.equal(v.bytes,undefined);return null;}
  assert.equal(v.status,'measured',`${label}: required measurement unavailable`);return number(v.bytes,label);
 }
+// Native boundary timestamps fall inside these parent request/response brackets.
+// No guessed offset between the Rust and Node monotonic clocks is treated as exact.
+export function bindBrowserClock(clock,native){
+ return {clock:clock.clock,phases:clock.phases.map(mapping=>({...mapping,...Object.fromEntries(['start','end'].map(boundary=>{
+  const matches=native.filter(row=>row.resource?.kind==='sample'&&row.resource.phase===mapping.phase&&row.resource.boundary===boundary);
+  assert.equal(matches.length,1,'unique native phase boundary required for clock mapping');
+  return [boundary,{...mapping[boundary],nativeSeq:matches[0].seq,nativeNs:matches[0].ns}];
+ }))}))};
+}
+function validateBrowserEvidence(evidence,required){
+ const finite=(value,label)=>{assert.ok(Number.isFinite(value)&&value>=0,`${label}: finite nonnegative time required`);};
+ assert.equal(evidence.browserClock?.clock,'node-performance-ms','browser clock domain required');
+ const mappings=evidence.browserClock.phases;
+ assert.ok(Array.isArray(mappings));assert.deepEqual(mappings.map(m=>m.phase).sort(),[...required].sort(),'exact browser phase mappings required');
+ assert.ok(Array.isArray(evidence.browser)&&evidence.browser.length>0,'raw browser samples required');
+ let previous=-1;
+ for(const [index,row] of evidence.browser.entries()){
+  assert.equal(row.seq,index+1,'browser sample sequence must be contiguous and unique');finite(row.at,'browser sample timestamp');
+  assert.ok(row.at>=previous,'browser sample clock must be monotonic');previous=row.at;
+  assert.ok(['desktop','paired'].includes(row.role),'browser sample role');assert.ok(required.includes(row.phase),'browser sample phase');
+  assert.ok(['start','interval','end'].includes(row.boundary),'browser sample boundary');
+ }
+ for(const mapping of mappings){
+  const native={};
+  for(const boundary of ['start','end']){
+   const clock=mapping[boundary];assert.ok(clock,'browser boundary mapping required');finite(clock.beforeMs,'control request');finite(clock.afterMs,'control response');
+   assert.ok(clock.afterMs>=clock.beforeMs&&clock.afterMs-clock.beforeMs<=2500,'bounded control clock bracket required');
+   const rows=evidence.native.filter(row=>row.resource?.kind==='sample'&&row.resource.phase===mapping.phase&&row.resource.boundary===boundary);
+   assert.equal(rows.length,1);native[boundary]=rows[0];assert.equal(clock.nativeSeq,rows[0].seq,'native boundary sequence mapping');assert.equal(clock.nativeNs,rows[0].ns,'native boundary clock mapping');
+  }
+  assert.ok(mapping.end.beforeMs>mapping.start.afterMs,'ordered browser phase brackets');
+  const duration=(native.end.ns-native.start.ns)/1e6;
+  assert.ok(duration>=mapping.end.beforeMs-mapping.start.afterMs-2&&duration<=mapping.end.afterMs-mapping.start.beforeMs+2,'native/browser clock duration must reconcile within request brackets');
+  for(const role of ['desktop','paired']){
+   const rows=evidence.browser.filter(row=>row.phase===mapping.phase&&row.role===role);
+   assert.ok(rows.length>=2,'browser boundary samples required');assert.equal(rows[0].boundary,'start','browser phase start sample required');assert.equal(rows.at(-1).boundary,'end','browser phase end sample required');
+   assert.ok(rows.slice(1,-1).every(row=>row.boundary==='interval'),'exactly one start/end per role and phase');
+   assert.ok(rows[0].at>=mapping.start.afterMs&&rows[0].at-mapping.start.afterMs<=2500,'browser start coverage');
+   assert.ok(rows.at(-1).at<=mapping.end.beforeMs&&mapping.end.beforeMs-rows.at(-1).at<=2500,'browser end coverage');
+   for(let i=1;i<rows.length;i++)assert.ok(rows[i].at-rows[i-1].at<=2500,'browser sampler gap exceeds 2.5 intervals');
+  }
+ }
+}
 export function summarizeResources(evidence,engine){
  assert.equal(evidence?.schema,1,'raw resource evidence required');assert.equal(evidence.lost,false,'resource recorder loss');
  assert.equal(evidence.samplerIntervalMs,1000,'resource sampler interval incompatible');assert.deepEqual(evidence.coverage,resourceCoverage,'resource coverage incompatible');
@@ -52,7 +95,7 @@ export function summarizeResources(evidence,engine){
   const lastWindow=orderedSamples.filter(row=>row.ns>=end.ns-windowNs).map(row=>row.resource.nativeRssInclusive.bytes);
   phases[phase]={nativeRssWindowMedianDelta:median(lastWindow)-median(firstWindow),nativeRssWindowMs:windowNs/1e6,writerWaitMedianNs:transactions.length?median(transactions.map(tx=>tx.waitNs)):null,transactionHoldMedianNs:transactions.some(tx=>tx.holdNs!==null)?median(transactions.filter(tx=>tx.holdNs!==null).map(tx=>tx.holdNs)):null,durationMs:(end.ns-start.ns)/1e6,readBytes,mutations,nativeRssPeak:Math.max(...rss),dbPeak:Math.max(...db),walRetainedPeak:wal.every(v=>v===null)?null:Math.max(...wal.filter(v=>v!==null)),walAbsentSamples:wal.filter(v=>v===null).length,writerWaitMaxNs:waitNs,transactionHoldMaxNs:holdNs,transactions:transactions.length,samples:samples.length};
  }
- assert.ok(Array.isArray(evidence.browser),'raw browser samples required');
+ validateBrowserEvidence(evidence,required);
  for(const phase of required){phases[phase].rendererJsHeapInclusive={};for(const role of ['desktop','paired']){const rows=evidence.browser.filter(row=>row.role===role&&row.phase===phase);assert.ok(rows.length>0,`${phase}/${role}: browser phase samples required`);if(engine==='chromium')phases[phase].rendererJsHeapInclusive[role]={status:'measured',bytes:Math.max(...rows.map(row=>measured(row.heap,'Chromium phase heap')))};else {for(const row of rows){assert.equal(row.heap.status,'unknown');assert.equal(typeof row.heap.reason,'string');}phases[phase].rendererJsHeapInclusive[role]={status:'unknown',reason:'engine_unavailable'};}}}
  const browserHeap={};for(const role of ['desktop','paired']){
   const rows=evidence.browser.filter(row=>row.role===role);assert.ok(rows.length>0,`${role}: browser capability evidence required`);
@@ -82,15 +125,19 @@ export function validateStartupEvidence(result){
  assert.deepEqual(Object.keys(result.resources.startup??{}).sort(),['desktop','paired'],'exact raw startup roles required');
  for(const sample of result.samples){const expected=startupMeasurements(result.resources.startup[sample.role]);for(const [key,value] of Object.entries(expected))assert.equal(sample[key],value,`${sample.role} ${key} must reconcile raw startup phase`);}
 }
-export async function observeBrowserResources(pages,engine,{phase=()=> 'startup'}={}){
- const records=[];let lost=false,pending=Promise.resolve(),timer;
+export async function observeBrowserResources(pages,engine){
+ const records=[],phases=[];let lost=false,pending=Promise.resolve(),timer,active;
  const sessions=engine==='chromium'?await Promise.all(pages.map(async page=>{const session=await page.context().newCDPSession(page);await session.send('Performance.enable');return session;})):[];
- const sample=()=>{pending=pending.then(async()=>{for(const [i] of pages.entries()){
+ const sample=(boundary,phase)=>{pending=pending.then(async()=>{for(const [i] of pages.entries()){
   if(records.length>=100000){lost=true;return;}
   let heap={status:'unknown',reason:'engine_unavailable'};
   if(engine==='chromium'){try{const data=await sessions[i].send('Performance.getMetrics');const bytes=data.metrics.find(m=>m.name==='JSHeapUsedSize')?.value;heap=Number.isSafeInteger(bytes)?{status:'measured',bytes}:{status:'unknown',reason:'metric_unavailable'};}catch{heap={status:'unknown',reason:'probe_failed'};}}
-  records.push({seq:records.length+1,at:performance.now(),role:i?'paired':'desktop',phase:phase(),heap});
+  records.push({seq:records.length+1,at:performance.now(),role:i?'paired':'desktop',phase,boundary,heap});
  }});return pending;};
- await sample();timer=setInterval(()=>void sample(),1000);
- return {async stop(){clearInterval(timer);await sample();for(const session of sessions)await session.detach();return {records,lost};}};
+ const boundary=async(phase,name,control)=>{const beforeMs=performance.now();await control(`resource-${phase}-${name}`);return {beforeMs,afterMs:performance.now()};};
+ return {
+  async startPhase(phase,control){assert.equal(active,undefined,'browser phase already active');assert.ok(!phases.some(p=>p.phase===phase),'duplicate browser phase');active={phase,start:await boundary(phase,'start',control)};phases.push(active);await sample('start',phase);timer=setInterval(()=>void sample('interval',phase),1000);},
+  async endPhase(phase,control){assert.equal(active?.phase,phase,'matching active browser phase required');clearInterval(timer);await pending;await sample('end',phase);active.end=await boundary(phase,'end',control);active=undefined;},
+  async stop(){clearInterval(timer);await pending;for(const session of sessions)await session.detach();return {records,lost,clock:{clock:'node-performance-ms',phases}};},
+ };
 }

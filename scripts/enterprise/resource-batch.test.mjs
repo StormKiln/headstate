@@ -7,12 +7,12 @@ test('resource batches reserve independent cold/warm validation and alternating 
  assert.throws(()=>compareObserverPair({},{}));
 });
 import {fixture} from './resource-fixtures.mjs';
-import {summarizeResources,phaseContracts} from './resources.mjs';
+import {phaseContracts} from './resources.mjs';
 import {defaultWorkload} from './workload.mjs';
 import {validateResourceLimits} from './resource-batch.mjs';
 function mixed(warm=false){
- const run=fixture('chromium');const template=run.resources.evidence.native;run.resources.evidence.contract='mixed';run.resources.evidence.native=phaseContracts.mixed.flatMap((phase,i)=>template.map((row,j)=>({...structuredClone(row),seq:2*i+j+1,ns:(2*i+j+1)*1e9,resource:{...structuredClone(row.resource),phase}})));run.resources.evidence.browser=phaseContracts.mixed.flatMap(phase=>run.resources.evidence.browser.map(row=>({...row,phase})));run.resources.summary=summarizeResources(run.resources.evidence,'chromium');
- return {...run,pass:true,mode:'mixed',warm,workload:{...structuredClone(defaultWorkload),scenario:'mixed'},environment:{platform:'darwin',architecture:'arm64',osRelease:'25.6.0',cpu:'fixture CPU',build:'debug',strictMode:false,browser:{engine:'chromium',version:'140.0'},sourceRevision:'before'},resourceIdentity:{manifestSha256:'fixture',toolchain:'fixture',phasePlan:Object.fromEntries(phaseContracts.mixed.map(p=>[p,1000]))},parentObservation:{lost:false,wallMs:1000,nativeRssPeak:100,artifactBytes:100,commandLatencyMaxMs:3},nativeBinarySha256:'same',mixedOutcome:{rows:150,corpusComplete:true}};
+ const run=fixture('chromium','mixed');
+ return {...run,pass:true,mode:'mixed',warm,workload:{...structuredClone(defaultWorkload),scenario:'mixed'},environment:{platform:'darwin',architecture:'arm64',osRelease:'25.6.0',cpu:'fixture CPU',build:'debug',strictMode:false,browser:{engine:'chromium',version:'140.0'},sourceRevision:'before'},resourceIdentity:{manifestSha256:'fixture',toolchain:'fixture',phasePlan:Object.fromEntries(phaseContracts.mixed.map(p=>[p,4000]))},parentObservation:{lost:false,wallMs:1000,nativeRssPeak:100,artifactBytes:100,commandLatencyMaxMs:3},nativeBinarySha256:'same',mixedOutcome:{rows:150,corpusComplete:true}};
 }
 test('resource calibration freezes comparable observations; independent validation rejects exceeded or incompatible evidence',()=>{
  const runs=resourceBatchPlan('calibrate').map(item=>mixed(item.warm));const policy=deriveResourceLimits(runs);const after=mixed();after.environment.sourceRevision='after';validateResourceLimits(after,policy);

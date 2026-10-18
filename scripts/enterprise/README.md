@@ -206,7 +206,17 @@ gaps over 2.5 intervals reject the result.
 The mixed adapter in Task8 must explicitly bracket `idle`, `unchanged_refresh`,
 `active_ingestion` and `churn_restart` with authenticated controls named
 `resource-<phase>-start` and `resource-<phase>-end`, and collect the existing browser
-resource observer with `{phase: () => activePhase}` so every renderer sample names its phase. It must produce `resources.evidence.contract = "mixed"`, the
+resource observer using `startPhase(phase, control)` and `endPhase(phase, control)`.
+These methods issue the native boundary controls and record explicit browser
+boundary samples for each role. `stop()` returns raw samples plus Node monotonic
+request/response brackets; `bindBrowserClock(clock, nativeRecords)` associates each
+bracket with the exact native boundary sequence/time. The validator requires
+contiguous unique browser sequence numbers, finite monotonic timestamps, one
+start/end sample per role/phase, at most 2.5 intervals between samples, and complete
+boundary coverage. Native and Node phase duration must reconcile inside the
+request/response brackets (2 ms clock rounding allowance); no guessed clock offset
+is treated as exact. WebKit follows the same sampling/coverage protocol while heap
+capability remains unknown. It must produce `resources.evidence.contract = "mixed"`, the
 same schema/coverage/sampler fields and a reconciled summary. Startup is not a
 substitute for mixed load. The batch foundation requires these additional witnesses:
 

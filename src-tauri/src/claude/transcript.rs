@@ -512,10 +512,7 @@ impl<R: Read> Read for ControlledReader<'_, R> {
             )));
         }
         let n = buffer.len().min(64 * 1024);
-        let returned = self.inner.read(&mut buffer[..n])?;
-        #[cfg(feature = "enterprise-harness")]
-        crate::enterprise_harness::resources::read_bytes("metadata", returned);
-        Ok(returned)
+        self.inner.read(&mut buffer[..n])
     }
 }
 
@@ -1129,13 +1126,13 @@ pub(crate) fn extract_controlled(
         // Bound bytes as well as record count: one JSONL record can contain
         // an arbitrarily large attachment. Never checkpoint a truncated head.
         const HEAD_BYTES: u64 = 2 * 1024 * 1024;
-        let mut reader = BufReader::new(
-            ControlledReader {
-                inner: &mut file,
-                control,
-            }
-            .take(HEAD_BYTES + 1),
-        );
+        let reader = ControlledReader {
+            inner: &mut file,
+            control,
+        };
+        #[cfg(feature = "enterprise-harness")]
+        let reader = crate::enterprise_harness::resources::CountedReader::new(reader, "metadata");
+        let mut reader = BufReader::new(reader.take(HEAD_BYTES + 1));
         let mut head_bytes = 0_u64;
         let mut line = String::new();
         for i in 0..HEAD_RECORDS {

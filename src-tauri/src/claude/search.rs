@@ -1135,6 +1135,30 @@ mod tests {
         p
     }
 
+    #[cfg(feature = "enterprise-harness")]
+    #[test]
+    fn resource_production_search_reads_only_index_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session(
+            dir.path(),
+            "synthetic",
+            "read-accounting",
+            "only index bytes",
+        );
+        let length = std::fs::metadata(&path).unwrap().len();
+        crate::enterprise_harness::resources::take_read_capture();
+        let text = readable_text_controlled(
+            &path,
+            length + 100,
+            &super::super::transcript::PopulationControl::default(),
+        );
+        assert!(text.is_ok());
+        assert_eq!(
+            crate::enterprise_harness::resources::take_read_capture(),
+            [0, 0, length, 0]
+        );
+    }
+
     // Synchronize at preparation of the SECOND SELECT: COUNT has already
     // stepped and returned, so a deferred transaction has acquired its snapshot.
     // An authorizer on the first SELECT would only test BEGIN, not a snapshot.

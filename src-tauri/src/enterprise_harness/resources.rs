@@ -31,6 +31,8 @@ pub fn read_bytes(lane: &'static str, bytes: usize) {
         _ => panic!("fixed resource lane required"),
     };
     READS[index].fetch_add(bytes as u64, Ordering::Relaxed);
+    #[cfg(test)]
+    READ_CAPTURE.with(|counts| counts.borrow_mut()[index] += bytes as u64);
 }
 pub struct CountedReader<R> {
     inner: R,
@@ -449,4 +451,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(file_size(&temp.path().join("missing"))["status"], "absent");
     }
+}
+
+#[cfg(test)]
+thread_local! { static READ_CAPTURE: std::cell::RefCell<[u64;4]> = const { std::cell::RefCell::new([0;4]) }; }
+#[cfg(test)]
+pub(crate) fn take_read_capture() -> [u64; 4] {
+    READ_CAPTURE.with(|counts| std::mem::replace(&mut *counts.borrow_mut(), [0; 4]))
 }
