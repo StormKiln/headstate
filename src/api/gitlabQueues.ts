@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { acceptGitLabReceipt } from "./gitlabReceiptRevalidation";
 import { listen, type UnlistenFn } from "./transport";
 import { getSourceSnapshot, refreshSelectedSource, type SourceList, type SourcePollUpdate } from "./tauri";
 import { GitLabQueueState } from "./gitlabQueueState";
@@ -8,6 +10,7 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 
 export function useGitLabQueue(list: SourceList, selected: boolean, host = "gitlab.com") {
   const viewer = useGitLabViewer();
+  const client = useQueryClient();
   const enabled = selected && viewer !== null;
   const source = useMemo(() => ({ provider: "gitlab" as const, host }), [host]);
   const model = useMemo(() => new GitLabQueueState(host, list, viewer), [host, list, viewer]);
@@ -20,12 +23,13 @@ export function useGitLabQueue(list: SourceList, selected: boolean, host = "gitl
     publish();
     try {
       const reply = await refreshSelectedSource(source, list, request.id);
-      model.resolve(request, reply);
+      const accepted = model.resolve(request, reply);
+      if (accepted) acceptGitLabReceipt(client, viewer, accepted);
     } catch (error) {
       model.reject(request, error);
     }
     publish();
-  }, [enabled, list, model, publish, source]);
+  }, [client, enabled, list, model, publish, source, viewer]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -36,7 +40,8 @@ export function useGitLabQueue(list: SourceList, selected: boolean, host = "gitl
     };
     register(listen<SourcePollUpdate>("source-poll-status", ({ payload }) => {
       if (!active || payload.source.provider !== "gitlab" || payload.source.host !== host || payload.list !== list) return;
-      model.accept(payload);
+      const accepted = model.accept(payload);
+      if (accepted) acceptGitLabReceipt(client, viewer, accepted);
       publish();
     }));
     register(listen("refresh-requested", () => { if (active) void refresh(); }));
@@ -63,7 +68,7 @@ export function useGitLabQueue(list: SourceList, selected: boolean, host = "gitl
       window.clearInterval(timer);
       for (const unlisten of unlisteners) safeUnlisten(unlisten);
     };
-  }, [enabled, host, list, model, publish, refresh, source]);
+  }, [client, enabled, host, list, model, publish, refresh, source, viewer]);
 
   if (viewer === null) return { rows: undefined, coverage: null, staleSecs: null, loading: false, refreshing: false, error: "GitLab account has not been verified.", refresh };
   return { ...(state.source === source && state.list === list && state.model === model ? state.snapshot : model.snapshot()), refresh };

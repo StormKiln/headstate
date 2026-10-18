@@ -72,7 +72,11 @@ export class GitLabQueueState {
   }
 
   accept(update: SourcePollUpdate) {
-    if (this.viewer !== undefined && (this.viewer === null || update.mrs?.some(row => row.viewer !== this.viewer))) return;
+    if (this.viewer !== undefined && (this.viewer === null
+      || (update.owner != null && update.owner !== this.viewer)
+      || update.mrs?.some(row => row.viewer !== this.viewer)
+      || (update.mrs?.length === 0 && update.owner !== this.viewer))) return;
+    if (update.mrs?.some(row => row.source.provider !== "gitlab" || row.source.host !== update.source.host)) return;
     if (this.expectedHost !== undefined && (update.source.provider !== "gitlab" || update.source.host !== this.expectedHost || update.list !== this.expectedList)) return;
     if (this.retired.has(update.session)) return;
     if (this.session !== update.session) {
@@ -95,6 +99,7 @@ export class GitLabQueueState {
       this.receiptRevision = update.receipt_revision;
       this.receivedAt = update.last_received_at;
       this.publish({ rows: update.mrs, coverage: update.coverage, staleSecs: receiptAge(this.receivedAt), loading: false });
+      return update;
     } else {
       // A failed/fetching event often repeats the last saved `mrs`. Its
       // presence is not evidence that those rows were fetched again. Recheck
@@ -105,8 +110,9 @@ export class GitLabQueueState {
   }
 
   resolve(request: Request, reply: SourceRefreshReply) {
+    let accepted: SourcePollUpdate | undefined;
     if ("update" in reply && (this.session === undefined || reply.update.session === this.session || request.session === this.session)) {
-      this.accept(reply.update);
+      accepted = this.accept(reply.update);
     }
     // Legacy desktops return rows without a revision. They cannot safely
     // supersede any versioned receipt or terminal status already observed.
@@ -116,6 +122,7 @@ export class GitLabQueueState {
     this.requests.delete(request.id);
     if (request.order === this.order) this.transportError = null;
     this.publish({ loading: false });
+    return accepted;
   }
 
   reject(request: Request, error: unknown) {

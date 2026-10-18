@@ -300,9 +300,8 @@ pub struct Coverage {
     /// denominator, and NOT a guess: it is what
     /// [`super::transcript::scan`] counted.
     ///
-    /// Zero means the corpus size is unknown -- no pass has recorded one
-    /// yet -- which [`Coverage::is_complete`] treats as incomplete. An
-    /// unknown denominator cannot license a "no matches".
+    /// Zero is measured empty only when stored population and state agree
+    /// on a completed pass. Otherwise the denominator remains unknown.
     pub total: u64,
     /// Transcripts the indexer could not read, with why.
     ///
@@ -317,36 +316,26 @@ pub struct Coverage {
     /// against a truncated session is weaker evidence than a miss
     /// against a whole one, and the UI says so.
     pub truncated: u64,
-    /// When the index last ran, RFC 3339, or `None` if it never has.
-    ///
-    /// `None` is not "just now" and not "long ago" -- it is "no pass has
-    /// completed", which is a fourth state and the honest one for a
-    /// fresh install.
+    /// When the last index pass started, RFC 3339, or `None` if absent.
+    /// This timestamp does not prove that the pass completed.
     pub last_indexed_at: Option<String>,
 }
 
 impl Coverage {
-    /// Whether every session on disk is searchable.
-    ///
-    /// This is the single predicate that licenses the words "no
-    /// matches", so each clause is a way the index can be short:
-    ///
-    /// - `total == 0`: no pass has recorded a corpus size, so there is
-    ///   no denominator and nothing to compare against. A search here
-    ///   knows nothing about how much it searched.
-    /// - `indexed < total`: sessions remain unindexed.
-    /// - `!unreadable.is_empty()`: sessions that will never index. A
-    ///   permanently unreadable transcript is a permanent hole, and an
-    ///   index with a hole in it has not searched the corpus.
-    ///
-    /// `truncated` is deliberately NOT a clause. A truncated session is
-    /// searchable -- partly -- and folding it in here would make the
-    /// index permanently incomplete on any machine with one large
-    /// transcript, which would make the partial banner meaningless by
-    /// making it permanent. It is reported on its own instead, and on
-    /// the hits it qualifies.
+    /// Whether the stored observations license a whole-corpus no-match.
+    /// This describes the last observed corpus, never a fresh disk census.
+    /// Truncation is qualified separately, both in coverage and on each hit.
     pub fn is_complete(&self) -> bool {
-        self.total > 0 && self.indexed >= self.total && self.unreadable.is_empty()
+        self.indexed == self.total
+            && self.unreadable.is_empty()
+            && self.population.as_ref().is_some_and(|p| {
+                p.status == super::transcript::PopulationStatus::Complete
+                    && p.total_known
+                    && p.total == self.total
+                    && p.completed == self.total
+                    && p.remaining == 0
+                    && p.failed == 0
+            })
     }
 
     /// Sessions found on disk but not yet in the index.
@@ -867,31 +856,21 @@ fn finalize_index(conn: &Connection, generation: i64, out: &mut Indexed) -> rusq
     super::transcript::persist_progress(conn, "index", generation, &out.population)
 }
 
-/// Refresh foreground coverage without treating a partial listing as the corpus.
-/// A stopped discovery is incomplete coverage, not an operational-health fault.
-pub(crate) fn observe_discovery(
+/// Reuse caller-owned transactions without ending them. Standalone reads own
+/// a deferred transaction so every SELECT, including FTS, sees one commit.
+fn read_snapshot<T>(
     conn: &Connection,
-    scan: &super::Scan,
-) -> rusqlite::Result<Vec<String>> {
-    let progress = scan.population_progress();
-    conn.execute(
-        "INSERT INTO claude_index_state(id, corpus_sessions, last_pass_at, incomplete)
-         VALUES(1, ?1, COALESCE((SELECT last_pass_at FROM claude_index_state WHERE id=1), ?3), 1)
-         ON CONFLICT(id) DO UPDATE SET
-           corpus_sessions = CASE WHEN ?2 THEN ?1 ELSE MAX(corpus_sessions, ?1) END,
-           incomplete = CASE WHEN ?2 THEN incomplete ELSE 1 END",
-        rusqlite::params![
-            progress.total as i64,
-            progress.total_known,
-            chrono::Utc::now().to_rfc3339()
-        ],
-    )?;
-    Ok(scan
-        .unreadable_files
-        .iter()
-        .chain(&scan.unreadable_dirs)
-        .cloned()
-        .collect())
+    read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    if conn.is_autocommit() {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+        let result = read(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    } else {
+        read(conn)
+    }
 }
 
 /// What the index currently covers.
@@ -900,10 +879,11 @@ pub(crate) fn observe_discovery(
 /// search is run -- "1,482 sessions searchable" is worth saying on an
 /// empty search box, and a number that only appears alongside results
 /// cannot be shown then.
-pub fn coverage(
-    conn: &Connection,
-    mut unreadable: Vec<String>,
-) -> Result<Coverage, rusqlite::Error> {
+pub fn coverage(conn: &Connection, unreadable: Vec<String>) -> Result<Coverage, rusqlite::Error> {
+    read_snapshot(conn, |conn| coverage_in_snapshot(conn, unreadable))
+}
+
+fn coverage_in_snapshot(conn: &Connection, unreadable: Vec<String>) -> rusqlite::Result<Coverage> {
     let indexed: i64 =
         conn.query_row("SELECT COUNT(*) FROM claude_index_ledger", [], |r| r.get(0))?;
     let truncated: i64 = conn.query_row(
@@ -919,12 +899,26 @@ pub fn coverage(
         )
         .optional()?;
     let (total, last_indexed_at, incomplete) = state.unwrap_or((0, None, true));
-    if incomplete && unreadable.is_empty() && indexed >= total {
-        unreadable.push("index population has unfinished or failed work".into());
+    let mut population = super::transcript::stored_progress(conn, "index")?;
+    if let Some(p) = &mut population {
+        // A complete progress row can coexist with unfinished state, for
+        // example between commits of a new background pass. Qualify that
+        // readback without inventing file failures or writing a new pass.
+        if p.status == super::transcript::PopulationStatus::Complete
+            && (incomplete
+                || indexed != total
+                || p.total != total as u64
+                || !p.total_known
+                || p.completed != p.total
+                || p.failed > 0
+                || p.remaining > 0)
+        {
+            p.status = super::transcript::PopulationStatus::Deferred;
+        }
     }
 
     Ok(Coverage {
-        population: super::transcript::stored_progress(conn, "index")?,
+        population,
         indexed: indexed as u64,
         total: total as u64,
         unreadable,
@@ -990,7 +984,19 @@ pub fn search(
     unreadable: Vec<String>,
     matching: Matching,
 ) -> Result<SearchAnswer, rusqlite::Error> {
-    let cov = coverage(conn, unreadable)?;
+    read_snapshot(conn, |conn| {
+        search_in_snapshot(conn, query, limit, unreadable, matching)
+    })
+}
+
+fn search_in_snapshot(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    unreadable: Vec<String>,
+    matching: Matching,
+) -> Result<SearchAnswer, rusqlite::Error> {
+    let cov = coverage_in_snapshot(conn, unreadable)?;
 
     let Some(expr) = fts_query(query) else {
         // An empty query is not a search that found nothing. It is not a
@@ -1076,6 +1082,28 @@ mod tests {
         conn
     }
 
+    /// Manually seeded complete-index fixtures need the same persisted
+    /// completion evidence as a real pass, not merely matching row counts.
+    fn completed_progress(conn: &Connection, total: u64) {
+        use super::super::transcript::{
+            persist_progress, population_generation, PopulationPhase, PopulationProgress,
+        };
+        let generation = population_generation(conn, "index").unwrap();
+        persist_progress(
+            conn,
+            "index",
+            generation,
+            &PopulationProgress {
+                phase: PopulationPhase::Index,
+                total,
+                total_known: true,
+                completed: total,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
     /// One indexed session, written through the real index pass.
     fn write_session(dir: &Path, slug: &str, id: &str, body: &str) -> std::path::PathBuf {
         let d = dir.join(slug);
@@ -1091,31 +1119,247 @@ mod tests {
         p
     }
 
+    // Synchronize at preparation of the SECOND SELECT: COUNT has already
+    // stepped and returned, so a deferred transaction has acquired its snapshot.
+    // An authorizer on the first SELECT would only test BEGIN, not a snapshot.
+    fn writer_after_first_read(
+        reader: &Connection,
+        writer: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            start_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            writer();
+            done_tx.send(()).unwrap();
+        });
+        let mut fired = false;
+        reader
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if !fired
+                    && matches!(
+                        ctx.action,
+                        AuthAction::Read {
+                            table_name: "claude_index_ledger",
+                            column_name: "truncated"
+                        }
+                    )
+                {
+                    fired = true;
+                    start_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        handle
+    }
+
     #[test]
-    fn foreground_stopped_discovery_does_not_replace_authoritative_total() {
-        let dir = tempfile::tempdir().unwrap();
-        for id in ["first", "second"] {
-            write_session(dir.path(), "project", id, "accepted");
+    fn stored_readback_uses_one_snapshot_and_next_read_sees_writer() {
+        for mode in ["search", "coverage", "blank", "masked", "caller"] {
+            let dir = tempfile::tempdir().unwrap();
+            let corpus = tempfile::tempdir().unwrap();
+            let path = dir.path().join("index.sqlite");
+            let mut reader = Connection::open(&path).unwrap();
+            crate::store::migrate(&reader).unwrap();
+            reader.pragma_update(None, "journal_mode", "WAL").unwrap();
+            write_session(corpus.path(), "project", "old", "needle oldversion");
+            index_pass(&mut reader, &crate::claude::corpus(corpus.path())).unwrap();
+            let before = coverage(&reader, vec![]).unwrap();
+            reader.pragma_update(None, "query_only", true).unwrap();
+            if mode == "caller" {
+                reader.execute_batch("BEGIN").unwrap();
+            }
+            let writer = writer_after_first_read(&reader, move || {
+                let mut writer = Connection::open(path).unwrap();
+                write_session(corpus.path(), "project", "new", "needle newversion");
+                index_pass(&mut writer, &crate::claude::corpus(corpus.path())).unwrap();
+                writer
+                    .execute("UPDATE claude_index_ledger SET truncated=1", [])
+                    .unwrap();
+                // All readback below must remain independent of these sources.
+                corpus.close().unwrap();
+            });
+            let matching = if mode == "masked" {
+                Matching::Masked
+            } else {
+                Matching::Unmasked
+            };
+            let cov = if mode == "coverage" {
+                coverage(&reader, vec![]).unwrap()
+            } else {
+                let answer = search(
+                    &reader,
+                    if mode == "blank" { "" } else { "needle" },
+                    20,
+                    vec![],
+                    matching,
+                )
+                .unwrap();
+                if mode == "blank" {
+                    assert_eq!(answer.verdict, Verdict::NotAsked);
+                } else {
+                    let Verdict::Matches { hits } = answer.verdict else {
+                        panic!("stored match missing")
+                    };
+                    assert_eq!(
+                        hits.len(),
+                        1,
+                        "{mode}: hits must share the coverage snapshot"
+                    );
+                    assert_eq!(hits[0].session_id, "old");
+                    assert!(!hits[0].truncated);
+                }
+                answer.coverage
+            };
+            writer.join().unwrap();
+            assert_eq!(
+                cov, before,
+                "{mode}: every coverage field must share the first SELECT snapshot"
+            );
+            if mode == "caller" {
+                assert!(!reader.is_autocommit());
+                assert_eq!(coverage(&reader, vec![]).unwrap(), before);
+                reader.execute_batch("ROLLBACK").unwrap();
+            }
+            assert!(reader.is_autocommit());
+            let after = search(&reader, "needle", 20, vec![], matching).unwrap();
+            assert_eq!(after.coverage.indexed, 2);
+            assert_eq!(after.coverage.total, 2);
+            assert_eq!(after.coverage.truncated, 2);
+            assert_eq!(after.coverage.population.unwrap().completed, 2);
+            let Verdict::Matches { hits } = after.verdict else {
+                panic!("new match missing")
+            };
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|h| h.truncated));
         }
+    }
+
+    #[test]
+    fn stored_readback_preserves_caller_transaction_on_success_and_error() {
+        let conn = db();
+        conn.execute_batch("BEGIN; INSERT INTO claude_index_state(id,corpus_sessions,last_pass_at) VALUES(1,7,'caller');").unwrap();
+        assert_eq!(coverage(&conn, vec![]).unwrap().total, 7);
+        search(&conn, "needle", 20, vec![], Matching::Unmasked).unwrap();
+        assert!(!conn.is_autocommit());
+        conn.execute_batch("DROP TABLE claude_transcript_fts")
+            .unwrap();
+        assert!(search(&conn, "needle", 20, vec![], Matching::Unmasked).is_err());
+        assert!(!conn.is_autocommit());
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(coverage(&conn, vec![]).unwrap().total, 0);
+        conn.execute_batch("DROP TABLE claude_transcript_fts")
+            .unwrap();
+        assert!(search(&conn, "needle", 20, vec![], Matching::Unmasked).is_err());
+        assert!(
+            conn.is_autocommit(),
+            "owned failed reads must release their snapshot"
+        );
+    }
+
+    #[test]
+    fn stored_readback_requires_state_and_progress_agreement() {
+        use super::super::transcript::PopulationStatus::*;
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "project", "old", "needle");
         let mut conn = db();
+        let initial = coverage(&conn, vec![]).unwrap();
+        assert!(!initial.is_complete());
+        assert!(
+            initial.unreadable.is_empty(),
+            "unknown coverage is not an unreadable transcript"
+        );
         index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
-        write_session(dir.path(), "project", "new", "unseenneedle");
-        let scan = crate::claude::Scan {
-            stop_reason: Some(super::super::transcript::PopulationStatus::TimedOut),
-            ..Default::default()
+        let complete = coverage(&conn, vec![]).unwrap();
+        assert!(complete.is_complete());
+        let progress = complete.population.unwrap();
+        let set_progress = |p: &super::super::transcript::PopulationProgress| {
+            conn.execute(
+                "UPDATE claude_population_state SET payload=?1 WHERE lane='index'",
+                [serde_json::to_string(p).unwrap()],
+            )
+            .unwrap();
         };
-        let unreadable = observe_discovery(&conn, &scan).unwrap();
-        assert!(unreadable.is_empty(), "a deadline is not an IO failure");
-        let cov = coverage(&conn, unreadable.clone()).unwrap();
-        assert_eq!(cov.total, 2);
-        assert!(!cov.is_complete());
-        let answer = search(&conn, "unseenneedle", 20, unreadable, Matching::Unmasked).unwrap();
-        assert!(!matches!(answer.verdict, Verdict::None));
-        let complete = crate::claude::corpus(dir.path());
-        observe_discovery(&conn, &complete).unwrap();
-        assert_eq!(coverage(&conn, Vec::new()).unwrap().total, 3);
-        index_pass(&mut conn, &complete).unwrap();
-        assert!(coverage(&conn, Vec::new()).unwrap().is_complete());
+        for status in [Running, Deferred, Cancelled, TimedOut, Failed, Invalidated] {
+            let mut p = progress.clone();
+            p.status = status;
+            set_progress(&p);
+            let answer = search(&conn, "absent", 20, vec![], Matching::Masked).unwrap();
+            assert!(
+                matches!(answer.verdict, Verdict::NoneYet { .. }),
+                "{status:?}"
+            );
+            assert!(answer.coverage.unreadable.is_empty());
+        }
+        for case in [
+            "unknown",
+            "failed",
+            "remaining",
+            "mismatched_total",
+            "incomplete_state",
+            "retained_rows",
+            "missing_state",
+            "legacy",
+        ] {
+            set_progress(&progress);
+            conn.execute(
+                "INSERT INTO claude_index_state(id,corpus_sessions,incomplete,last_pass_at) VALUES(1,1,0,'fixture') ON CONFLICT(id) DO UPDATE SET incomplete=0,corpus_sessions=1",
+                [],
+            )
+            .unwrap();
+            let mut p = progress.clone();
+            match case {
+                "unknown" => p.total_known = false,
+                "failed" => p.failed = 1,
+                "remaining" => p.remaining = 1,
+                "mismatched_total" => p.total = 2,
+                "incomplete_state" => {
+                    conn.execute("UPDATE claude_index_state SET incomplete=1", [])
+                        .unwrap();
+                }
+                "retained_rows" => {
+                    conn.execute("UPDATE claude_index_state SET corpus_sessions=0", [])
+                        .unwrap();
+                    p.total = 0;
+                    p.completed = 0;
+                }
+                "missing_state" => {
+                    conn.execute("DELETE FROM claude_index_state", []).unwrap();
+                }
+                "legacy" => {}
+                _ => unreachable!(),
+            }
+            set_progress(&p);
+            if case == "legacy" {
+                conn.execute("DELETE FROM claude_population_state", [])
+                    .unwrap();
+            }
+            let cov = coverage(&conn, vec![]).unwrap();
+            assert!(!cov.is_complete(), "{case}");
+            assert!(
+                cov.unreadable.is_empty(),
+                "{case}: do not fabricate file failures"
+            );
+            assert_eq!(cov.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn stored_readback_distinguishes_measured_empty_from_uninitialized() {
+        let mut conn = db();
+        assert!(!coverage(&conn, vec![]).unwrap().is_complete());
+        let dir = tempfile::tempdir().unwrap();
+        index_pass(&mut conn, &crate::claude::corpus(dir.path())).unwrap();
+        let answer = search(&conn, "absent", 20, vec![], Matching::Unmasked).unwrap();
+        assert!(answer.coverage.is_complete());
+        assert_eq!(answer.verdict, Verdict::None);
     }
 
     #[test]
@@ -1470,6 +1714,8 @@ mod tests {
         )
         .unwrap();
 
+        completed_progress(&conn, 2);
+
         let answer = search(&conn, "kubernetes", 20, vec![], Matching::Unmasked).unwrap();
         assert_eq!(
             answer.verdict,
@@ -1508,6 +1754,7 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE claude_index_state SET corpus_sessions = 1", [])
             .unwrap();
+        completed_progress(&conn, 1);
         let complete = search(&conn, "nothing", 20, vec![], Matching::Unmasked)
             .unwrap()
             .verdict;
@@ -2398,6 +2645,8 @@ mod tests {
             [],
         )
         .unwrap();
+
+        completed_progress(&conn, 1);
 
         // The premise: this index IS complete, so nothing about coverage
         // is holding the settled answer back.

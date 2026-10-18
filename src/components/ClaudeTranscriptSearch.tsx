@@ -63,15 +63,21 @@ function CoverageLine({
   lastIndexedAt: string | null;
   population?: PopulationProgress | null;
 }) {
+  const complete = indexed === total && unreadable.length === 0
+    && population?.status === "complete" && population.total_known
+    && population.total === total && population.completed === total
+    && population.failed === 0 && population.remaining === 0;
   // No pass has run at all. Not "0 of 0 searchable", which would read as
   // a complete index of an empty corpus -- the most reassuring possible
   // way to report that nothing has happened yet.
-  if (total === 0) {
+  if (total === 0 && indexed === 0) {
     return (
       <p className="text-[11px] text-[#8b949e]">
         <CorpusProgress progress={population} />{population ? " " : ""}
-        {population?.total_known && population.status === "complete"
-          ? "No session transcripts were found."
+        {complete
+          ? "No session transcripts were found in the last observed corpus."
+          : population?.total_known && population.total === 0
+          ? "No sessions are stored in the index. Whole-corpus coverage is not confirmed."
           : lastIndexedAt === null
           ? "The transcript index has not run yet, so nothing is searchable so far."
           : "The size of the transcript corpus is not known yet, so how much is searchable cannot be stated."}
@@ -79,23 +85,28 @@ function CoverageLine({
     );
   }
 
-  const complete = indexed >= total && unreadable.length === 0 && (!population || (population.status === "complete" && population.total_known));
   return (
     <p className="text-[11px] text-[#8b949e]">
       <CorpusProgress progress={population} />{population ? " " : ""}
       {complete ? (
-        <>All {total.toLocaleString()} sessions are searchable.</>
+        <>All {total.toLocaleString()} sessions in the last observed corpus are searchable.</>
+      ) : indexed < total ? (
+        <>
+          {indexed.toLocaleString()} of {total.toLocaleString()} sessions indexed so far,
+          based on the last observed corpus. Search covers the stored index; coverage is not confirmed complete.
+        </>
       ) : (
         <>
-          {indexed.toLocaleString()} of {total.toLocaleString()} sessions indexed so far. A
-          search covers those; the rest have not been indexed yet.
+          {indexed.toLocaleString()} sessions in the stored index; coverage is not confirmed complete.
+          {total > 0
+            ? ` The last observed corpus contained ${total.toLocaleString()} sessions.`
+            : " Corpus size is not confirmed."}
         </>
       )}
       {unreadable.length > 0 ? (
         <>
           {" "}
-          {unreadable.length.toLocaleString()} transcript
-          {unreadable.length === 1 ? "" : "s"} could not be read and will not be searched.
+          Some transcript content could not be read and is not searchable.
         </>
       ) : null}
       {truncated > 0 ? (
@@ -127,7 +138,9 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          setQuery(draft);
+          const trimmed = draft.trim();
+          if (trimmed && trimmed === query) void search.refetch({ cancelRefetch: false });
+          else setQuery(trimmed);
         }}
         className="flex gap-2"
       >
@@ -173,8 +186,9 @@ export function ClaudeTranscriptSearch({ enabled = true }: { enabled?: boolean }
           role="status"
           className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
         >
-          The transcript search could not run ({errorMessage(search.error)}). Nothing was
-          searched.
+          {search.data !== undefined
+            ? `Could not refresh the search (${errorMessage(search.error)}). Showing the previous search result.`
+            : `The transcript search could not run (${errorMessage(search.error)}). Nothing was searched.`}
         </p>
       ) : null}
 
@@ -249,10 +263,19 @@ function SearchResult({
         role="status"
         className="rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#c9d1d9]"
       >
-        No matches in the {verdict.indexed.toLocaleString()} of{" "}
-        {verdict.total.toLocaleString()} sessions indexed so far. The remaining{" "}
-        {(verdict.total - verdict.indexed).toLocaleString()} have not been indexed yet and
-        were not searched.
+        {verdict.indexed < verdict.total ? (
+          <>
+            No matches in the {verdict.indexed.toLocaleString()} of{" "}
+            {verdict.total.toLocaleString()} sessions indexed so far. The remaining{" "}
+            {(verdict.total - verdict.indexed).toLocaleString()} have not been indexed yet and
+            were not searched. These counts describe the last observed corpus.
+          </>
+        ) : (
+          <>
+            No matches in the {verdict.indexed.toLocaleString()} stored indexed sessions.
+            Whole-corpus coverage is not confirmed.
+          </>
+        )}
       </p>
     );
   }
@@ -262,7 +285,7 @@ function SearchResult({
       role="status"
       className="rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2 text-xs text-[#c9d1d9]"
     >
-      No matches. All {answer.coverage.total.toLocaleString()} sessions were searched.
+      No matches. All {answer.coverage.total.toLocaleString()} sessions from the last observed corpus were searched.
     </p>
   );
 }

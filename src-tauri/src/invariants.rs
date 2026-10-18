@@ -1641,6 +1641,142 @@ static TABLE: &str = HIT_none_3;
         out
     }
 
+    /// Follow named same-file helpers from the read commands and the search
+    /// module entry points. External library calls and open_db's schema setup
+    /// are outside this guard; the behavioral tests cover the actual DB reads.
+    fn stored_search_offenders(rel: &str, src: &str, roots: &[&str]) -> Vec<String> {
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<_> = src.lines().collect();
+        let functions: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                if is_comment(line) {
+                    return None;
+                }
+                fn_declared(line)?;
+                let (name, first, last) = fn_around(&lines, i)?;
+                (first == i).then_some((name, first, last))
+            })
+            .collect();
+        let mut pending: Vec<_> = roots.iter().map(|s| s.to_string()).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut bad = Vec::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            for (_, first, last) in functions.iter().filter(|(n, _, _)| *n == name) {
+                for (i, line) in lines.iter().enumerate().take(*last).skip(*first) {
+                    if is_comment(line) {
+                        continue;
+                    }
+                    let code = line.split("//").next().unwrap_or_default();
+                    // A helper may put its entire body on its declaration line.
+                    // Inspect that body without treating the declaration as a call.
+                    let code = if i == *first {
+                        code.split_once('{').map_or("", |(_, body)| body)
+                    } else {
+                        code
+                    };
+                    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+                    for forbidden in [
+                        "corpus_default(",
+                        "corpus(",
+                        "corpus_controlled(",
+                        "scan(",
+                        "scan_default(",
+                        "scan_controlled(",
+                        "observe_discovery(",
+                        "index_pass(",
+                        "index_pass_controlled(",
+                        "persist_progress(",
+                        ".execute(",
+                        ".execute_batch(",
+                    ] {
+                        if has_token(&compact, forbidden) {
+                            bad.push(format!(
+                                "{rel}:{}: {name} reaches forbidden foreground discovery/write: {}",
+                                i + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                    for (callee, _, _) in &functions {
+                        // Opening/migrating the DB is allowed, unlike corpus state writes.
+                        if *callee != "open_db" && has_token(&compact, &format!("{callee}(")) {
+                            pending.push(callee.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn stored_search_commands_never_discover_or_write_corpus_state() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad = Vec::new();
+        for (rel, roots) in [
+            (
+                "commands.rs",
+                &["claude_search_transcripts", "claude_index_coverage"][..],
+            ),
+            ("claude/search.rs", &["search", "coverage"][..]),
+        ] {
+            let path = root.join(rel);
+            let src = std::fs::read_to_string(&path).unwrap();
+            // Keep original line numbers while excluding test-only call sites.
+            let src = src
+                .lines()
+                .zip(test_mask(&path, &src))
+                .map(|(line, test)| if test { "" } else { line })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for name in roots {
+                assert!(
+                    fn_bodies(&src).contains_key(*name),
+                    "missing readback entry point {rel}::{name}"
+                );
+            }
+            bad.extend(stored_search_offenders(rel, &src, roots));
+        }
+        assert!(
+            bad.is_empty(),
+            "stored readback must use committed index evidence:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn stored_search_guard_ignores_comments_and_background_but_follows_helpers() {
+        let safe = "pub async fn readback() {\n    // corpus_default(); observe_discovery();\n    coverage(); // scan();\n}\nfn coverage() {\n    db.query_row();\n}\nfn background() {\n    corpus_default();\n    db.execute();\n}\n";
+        for source in [safe.to_string(), safe.replace('\n', "\r\n")] {
+            assert!(stored_search_offenders("fixture.rs", &source, &["readback"]).is_empty());
+            let unsafe_source = source.replace("db.query_row();", "db.execute();");
+            let bad = stored_search_offenders("fixture.rs", &unsafe_source, &["readback"]);
+            assert_eq!(bad.len(), 1);
+            assert!(bad[0].contains("fixture.rs:6: coverage"));
+        }
+    }
+
+    #[test]
+    fn stored_search_guard_checks_one_line_helper_bodies() {
+        let safe = "pub async fn readback() { helper(); }\nfn helper() { db.query_row(); }\nfn background() { db.execute(); }\n";
+        for source in [safe.to_string(), safe.replace('\n', "\r\n")] {
+            assert!(stored_search_offenders("fixture.rs", &source, &["readback"]).is_empty());
+            let unsafe_source = source.replace("db.query_row();", "db.execute();");
+            let bad = stored_search_offenders("fixture.rs", &unsafe_source, &["readback"]);
+            assert_eq!(
+                bad.len(),
+                1,
+                "a reachable one-line helper write must be detected"
+            );
+            assert!(bad[0].contains("fixture.rs:2: helper"));
+        }
+    }
+
     // ---- Invariant 7: the OBSERVED_REMAINING serialisation rule ------------
 
     /// Every test that can reach `OBSERVED_REMAINING` holds

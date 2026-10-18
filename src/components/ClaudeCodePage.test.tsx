@@ -664,6 +664,7 @@ describe("what went wrong in a session", () => {
   it("reports a failed read rather than showing zeros", () => {
     state.list = listOf([session({ name: "Unreadable session" })]);
     state.eventsFailed = true;
+    state.events = undefined;
     renderView();
     open("Unreadable session");
 
