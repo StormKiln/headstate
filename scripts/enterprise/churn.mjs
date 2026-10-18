@@ -1,3 +1,13 @@
+// Read only: callers supply existing UI witnesses; this never refreshes a provider.
+export async function observeUntil({deadline,observe,now=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}){
+ for(;;){await observe();const remaining=deadline-now();if(remaining<=0)return;await sleep(Math.min(1000,remaining));}
+}
+export const fatalObservation=error=>/regress|bounded|lost|continuity/.test(error.message);
+export async function observeRoles(clients,observe){
+ const results=await Promise.allSettled(clients.map(observe));
+ const errors=results.filter(result=>result.status==='rejected').map(result=>result.reason);
+ if(errors.length)throw errors.find(fatalObservation)??errors[0];
+}
 import assert from 'node:assert/strict';import {writeFile} from 'node:fs/promises';import {resolve} from 'node:path';
 import {createChurnPlan,initialOracle,advanceOracle,assertChurnFacts,assertAcceptedFacts,assertChurnReady,expectedChurnReady,digest} from './churn-plan.mjs';import {applyChurnEvent} from './provider.mjs';
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
@@ -11,14 +21,14 @@ export async function runChurn({pages,provider,result,out,control,workload,state
  const evidence={schema:1,readyCoverage:'all-checkpoints-in-this-segment',sourceReadyCoverage:state?.sourceReadyCoverage??null,integrationOnly:process.env.ENTERPRISE_CHURN_INTEGRATION_ONLY==='1',requiredActiveMs:1800000,activeSegmentsMs:state?.activeSegmentsMs??[],sustainedPass:false,planHash:digest(plan),startRevision:oracle.revision,segmentPass:false,planComplete:false,events:[],checkpoints:[],policy:{...plan.policy,maxDocumentsPerEvent:500,maxDocumentsPerSegment:7000}};result.churn=evidence;result.samples.push({role:'desktop'},{role:'paired'});
  const save=()=>writeFile(resolve(out,'churn.json'),JSON.stringify(evidence,null,2));await writeFile(resolve(out,'churn-plan.json'),JSON.stringify({plan,hash:digest(plan)},null,2));
  const acceptedByRole=new Map();let continuity=false;
- const observe=async()=>{const clients=await Promise.all(pages.map(snapshot));for(const [i,client] of clients.entries()){assert.equal(client.lost,false);const r=client.accepted,previous=acceptedByRole.get(i);if(r){let converged=false;try{assertChurnFacts(oracle,client.facts);assertChurnReady(oracle,client.ready);converged=true;}catch{}const accepted={session:r.session,revision:r.receipt_revision,facts:client.facts,oracleRevision:oracle.revision,converged};assertAcceptedFacts(previous,accepted);acceptedByRole.set(i,accepted);}assertChurnFacts(oracle,client.facts);assertChurnReady(oracle,client.ready);if(continuity)await assertContinuity(pages[i]);}return clients;};
- const converge=async()=>{const began=performance.now();let last;while(performance.now()-began<plan.policy.convergenceMs){try{const clients=await observe();evidence.checkpoints.push({revision:oracle.revision,expectedReady:expectedChurnReady(oracle),elapsedMs:performance.now()-began,clients});await save();return;}catch(error){if(/regress|bounded|lost/.test(error.message))throw error;last=error;}await delay(1000);}throw Error(`Churn revision ${oracle.revision} did not converge: ${last?.message}`);};
+ const observe=async()=>{const clients=await Promise.all(pages.map(snapshot));await observeRoles(clients,async(client,i)=>{if(continuity){try{await assertContinuity(pages[i]);}catch(error){throw Error(`continuity lost: ${error.message}`);}}assert.equal(client.lost,false);const r=client.accepted,previous=acceptedByRole.get(i);if(r){let converged=false;try{assertChurnFacts(oracle,client.facts);assertChurnReady(oracle,client.ready);converged=true;}catch{}const accepted={session:r.session,revision:r.receipt_revision,facts:client.facts,oracleRevision:oracle.revision,converged};assertAcceptedFacts(previous,accepted);acceptedByRole.set(i,accepted);}assertChurnFacts(oracle,client.facts);assertChurnReady(oracle,client.ready);});return clients;};
+ const converge=async()=>{const began=performance.now();let last;while(performance.now()-began<plan.policy.convergenceMs){try{const clients=await observe();evidence.checkpoints.push({revision:oracle.revision,expectedReady:expectedChurnReady(oracle),elapsedMs:performance.now()-began,clients});await save();return;}catch(error){if(fatalObservation(error))throw error;last=error;}await delay(1000);}throw Error(`Churn revision ${oracle.revision} did not converge: ${last?.message}`);};
  try{
   if(state)await converge();await control('start');await converge();
   const started=performance.now(),baseOffset=plan.events[oracle.revision]?.nominalOffsetMs??0;
   const stop=state?plan.events.length:plan.checkpointRevision;
   for(const event of plan.events.slice(oracle.revision,stop)){
-   const nominal=event.nominalOffsetMs-baseOffset;await delay(Math.max(0,nominal-(performance.now()-started)));
+   const nominal=event.nominalOffsetMs-baseOffset;await observeUntil({deadline:started+nominal,observe});
    const before=provider.ledger.length,actualOffsetMs=performance.now()-started;assert.ok(actualOffsetMs-nominal<plan.policy.convergenceMs,'schedule cannot silently skip overdue obligations');
    const record={revision:event.revision,kind:event.kind,identity:event.identity,nominalOffsetMs:event.nominalOffsetMs,actualOffsetMs,providerBefore:before};evidence.events.push(record);await save();
    let receipt;
@@ -31,7 +41,7 @@ export async function runChurn({pages,provider,result,out,control,workload,state
    if(event.revision===4||state&&!continuity){for(const page of pages)await mountContinuity(page);continuity=true;record.retentionMounted=true;}
    await save();console.log(JSON.stringify({churnRevision:oracle.revision,kind:event.kind,providerReceipts:provider.ledger.length}));
   }
-  if(state&&!evidence.integrationOnly){while(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)+performance.now()-activeStarted<evidence.requiredActiveMs){await delay(5000);await observe();}}
+  if(state&&!evidence.integrationOnly){while(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)+performance.now()-activeStarted<evidence.requiredActiveMs){await observeUntil({deadline:performance.now()+5000,observe});}}
   assert.ok(provider.ledger.length<=evidence.policy.maxDocumentsPerSegment,'bounded documents per segment');
   evidence.activeSegmentsMs=[...evidence.activeSegmentsMs,performance.now()-activeStarted];
   evidence.segmentPass=true;evidence.planComplete=oracle.revision===plan.events.length;evidence.endRevision=oracle.revision;evidence.remaining=plan.events.slice(oracle.revision).map(e=>e.revision);evidence.sustainedPass=evidence.planComplete&&!evidence.integrationOnly&&evidence.sourceReadyCoverage==='all-checkpoints-in-this-segment'&&evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)>=evidence.requiredActiveMs;return {plan,oracle,receipts,activeSegmentsMs:evidence.activeSegmentsMs};
