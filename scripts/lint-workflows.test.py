@@ -132,6 +132,27 @@ time.sleep(30)
 
 @unittest.skipUnless(shutil.which("actionlint"), "actionlint is installed in CI")
 class WorkflowLintTests(unittest.TestCase):
+    def run_process_group(self, command, *, timeout, **kwargs):
+        process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            if process.poll() is None:
+                process.wait(timeout=0.2)
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
     def make_constrained_shellcheck(self, directory, real_shellcheck, marker):
         shim = Path(directory) / "shellcheck"
         shim.write_text("""#!/usr/bin/env python3
@@ -139,17 +160,37 @@ import fcntl, os, subprocess, sys
 read_fd, write_fd = os.pipe()
 capacity = fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
 open(os.environ['PIPE_CAPACITY_MARKER'], 'w').write(str(capacity))
-process = subprocess.Popen(
-    [os.environ['REAL_SHELLCHECK'], *sys.argv[1:]], stdin=read_fd,
-)
-os.close(read_fd)
+timeout = float(os.environ.get('SHELLCHECK_FIXTURE_TIMEOUT_SECONDS', '20'))
+grace = float(os.environ.get('SHELLCHECK_FIXTURE_TERM_GRACE_SECONDS', '1'))
+if timeout <= 0 or grace <= 0:
+    raise ValueError('ShellCheck fixture deadlines must be positive')
 try:
-    with os.fdopen(write_fd, 'wb') as constrained_stdin:
-        while chunk := sys.stdin.buffer.read(65536):
-            constrained_stdin.write(chunk)
-except BrokenPipeError:
-    pass
-raise SystemExit(process.wait())
+    process = subprocess.Popen(
+        [os.environ['REAL_SHELLCHECK'], *sys.argv[1:]], stdin=read_fd,
+    )
+finally:
+    os.close(read_fd)
+returncode = None
+try:
+    try:
+        with os.fdopen(write_fd, 'wb') as constrained_stdin:
+            while chunk := sys.stdin.buffer.read(65536):
+                constrained_stdin.write(chunk)
+    except BrokenPipeError:
+        pass
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        returncode = 124
+finally:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=grace)
+raise SystemExit(returncode)
 """)
         shim.chmod(0o755)
         env = os.environ.copy()
@@ -248,6 +289,46 @@ jobs:
             self.assertIn("SC2086", result.stderr)
 
     @unittest.skipUnless(fcntl is not None and hasattr(fcntl, "F_SETPIPE_SZ"), "platform cannot constrain pipe capacity with F_SETPIPE_SZ")
+    def test_constrained_shellcheck_bounds_and_reaps_child_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hanging_shellcheck = Path(directory) / "real-shellcheck"
+            hanging_shellcheck.write_text("""#!/usr/bin/env python3
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+""")
+            hanging_shellcheck.chmod(0o755)
+            marker = Path(directory) / "capacity"
+            shim, env = self.make_constrained_shellcheck(directory, hanging_shellcheck, marker)
+            env["SHELLCHECK_FIXTURE_TIMEOUT_SECONDS"] = "0.2"
+            env["SHELLCHECK_FIXTURE_TERM_GRACE_SECONDS"] = "0.1"
+            for copy_failure in (False, True):
+                with self.subTest(copy_failure=copy_failure):
+                    stdin = os.open(directory, os.O_RDONLY) if copy_failure else subprocess.DEVNULL
+                    started = time.monotonic()
+                    process = None
+                    try:
+                        process = subprocess.Popen(
+                            [str(shim), "-"], stdin=stdin, env=env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True,
+                        )
+                        process.communicate(timeout=3)
+                        self.assertLess(time.monotonic() - started, 2)
+                        with self.assertRaises(ProcessLookupError):
+                            os.killpg(process.pid, 0)
+                    finally:
+                        if copy_failure:
+                            os.close(stdin)
+                        if process is not None:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            if process.poll() is None:
+                                process.wait(timeout=1)
+
+    @unittest.skipUnless(fcntl is not None and hasattr(fcntl, "F_SETPIPE_SZ"), "platform cannot constrain pipe capacity with F_SETPIPE_SZ")
     def test_constrained_shellcheck_accepts_prefilled_upstream_pipe(self):
         real_shellcheck = shutil.which("shellcheck")
         self.assertIsNotNone(real_shellcheck)
@@ -262,9 +343,10 @@ jobs:
                 self.assertEqual(os.write(write_fd, script), upstream_capacity)
                 os.close(write_fd)
                 write_fd = None
-                result = subprocess.run(
+                result = self.run_process_group(
                     [str(shim), "-f", "gcc", "-"], stdin=read_fd, env=env,
-                    text=True, capture_output=True, timeout=15,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=15,
                 )
             finally:
                 os.close(read_fd)
