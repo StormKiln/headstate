@@ -1,3 +1,4 @@
+import {churnRowFacts} from './enterpriseFacts';
 import { Profiler, useLayoutEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -15,6 +16,9 @@ import { PrDetailView } from '../components/PrDetailView';
 import type { PullRequest } from '../types/pr';
 import { telemetry, boundedPush, measurement } from './enterpriseTransport';
 import '../index.css';
+const descriptor=await fetch('/workload.json').then(response=>{if(!response.ok)throw Error('Validated workload descriptor unavailable');return response.json();});
+const churnScenario=new URL(location.href).searchParams.get('scenario')==='churn';
+let renderedFacts:unknown[]=[];
 const commits:{phase:string;actual:number;base:number;started:number;at:number}[]=[];
 const longTasks:{at:number;duration:number}[]|null=PerformanceObserver.supportedEntryTypes.includes('longtask')?[]:null;
 if(longTasks)new PerformanceObserver(list=>{for(const e of list.getEntries())boundedPush(longTasks,{at:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});
@@ -23,7 +27,7 @@ let renderedReadyEligibility:string[]=[];
 let renderedSource:SourceRefreshSnapshot|undefined;
 const convergenceScenario=new URL(location.href).searchParams.get("scenario")==="convergence";
 const advisoryPublications:{at:number;wallTime:number;kind:string;identity:unknown;number:number;owner:unknown;generation:unknown;freshPusher:boolean;freshRules:boolean;freshStack:boolean}[]=[];
-const probe={sourceEvidence:()=>renderedSource,advisoryPublications,readyEligibility:()=>renderedReadyEligibility,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
+const probe={workload:descriptor,rowFacts:()=>renderedFacts,sourceEvidence:()=>renderedSource,advisoryPublications,readyEligibility:()=>renderedReadyEligibility,inventory:()=>renderedInventory,querySummary:()=>client.getQueryCache().getAll().map(query=>{
  const value=query.state.data as Record<string,unknown>|undefined;
  const schedule=query.meta?.advisorySchedule as {claims?:Map<string,boolean>;lastAdmittedAt?:number;hasContinuation?:boolean;resumeBoostSpent?:boolean}|undefined;
  const freshness=(field:string,usable:boolean)=>{const evidence=value?.[field] as {expiresAt:number;observedAt:number}|undefined;return evidence?{fresh:usable&&evidence.expiresAt>performance.now(),expiresAt:evidence.expiresAt,observedAt:evidence.observedAt}:null;};
@@ -52,11 +56,12 @@ export function Workload(){
  const authored=usePullRequests();const reviewing=useReviewing();const source=useSourceRefresh('reviewing');
  useLayoutEffect(()=>{
   // Observe exactly what the production hooks render, including retained startup data.
-  if(convergenceScenario||new URL(location.href).searchParams.get('scenario')==='quota')renderedSource=source;
+  if(churnScenario||convergenceScenario||new URL(location.href).searchParams.get('scenario')==='quota')renderedSource=source;
   renderedInventory={authored:(authored.data??[]).map(row=>`${row.repo}/${row.number}`).sort(),reviewing:(reviewing.data??[]).map(row=>`${row.repo}/${row.number}`).sort()};
+  renderedFacts=[...(authored.data??[]).map(row=>({...churnRowFacts(row),list:'authored'})),...(reviewing.data??[]).map(row=>({...churnRowFacts(row),list:'reviewing'}))];
   renderedReadyEligibility=(reviewing.data??[]).filter(readyForReview).map(row=>`${row.repo}/${row.number}`).sort();
   if(reviewing.data?.some(row=>row.number>=51&&row.repo.startsWith('synthetic-lab/'))&&probe.firstUsefulQueue===null)probe.firstUsefulQueue=performance.now()-probe.started;
-  if(authored.data?.length===50&&reviewing.data?.length===(convergenceScenario?236:150)&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
+  if(authored.data?.length===descriptor.populations.authored&&reviewing.data?.length===descriptor.populations.reviewing&&probe.fullQueue===null)probe.fullQueue=performance.now()-probe.started;
  },[authored.data,reviewing.data,source]);
  const completionProbe=new URL(location.href).searchParams.get('scenario')==='ready-completion';
  const first=new URL(location.href).searchParams.get('role')==='paired'?76:51;
@@ -66,7 +71,7 @@ export function Workload(){
   <nav className="mb-4 flex gap-4"><button onClick={()=>setView('reviewing')}>To Review</button><button onClick={()=>setView('authored')}>My PRs</button></nav>
   <output data-testid="counts">Authored {authored.data?.length??'unknown'} / Reviewing {reviewing.data?.length??'unknown'}</output>
   {view==='idle'?null:selected?<PrDetailView repo={selected.repo} number={selected.number} onBack={()=>select(null)} localTools={false}/>:view==='reviewing'?<ReadyStrip prs={readyRows} onOpen={select} localTools={false} availability={{status:reviewing.data===undefined?(reviewing.isError?"failed":"pending"):"available",coverage:source.coverage??null}}/>:<PrList prs={authored.data??[]} onOpen={select}/>}
-  {convergenceScenario&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
+  {(convergenceScenario||churnScenario)&&!selected&&view==="reviewing"?<PrList prs={readyRows} onOpen={select}/>:null}
   {convergenceScenario?<footer data-testid="inventory-footer" className="flex gap-3 text-xs"><GitHubQueueFreshness github={{list:"reviewing",receipt:source}}/></footer>:null}
  </main>;
 }

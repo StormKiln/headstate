@@ -269,3 +269,51 @@ It never selects a home corpus. The inventory's immediate transactions include
 the fixed-name row-callback allowlist. See
 `docs/superpowers/specs/2026-10-18-discovery-measurements.md` for calibration,
 production-cadence convergence and the portable restart/observation limits.
+
+## Seeded sustained churn and checkpoint restart
+
+`ENTERPRISE_REVIEWING=150` or `250` and optional `ENTERPRISE_SEED` select a
+validated descriptor (`churn-v2`, 50 authored PRs, 50 repositories/members).
+Run `make enterprise-run OUT=/tmp/churn-new ENGINE=chromium MODE=churn`.
+This completes revisions 1–7 of the saved plan, including real desktop/paired
+navigation and successful current-head approvals. A successful segment is **not**
+a completed plan. Resume its remaining revisions with the same scale/seed:
+`make enterprise-run OUT=/tmp/churn-resumed ENGINE=chromium MODE=churn-restart PROFILE=/tmp/churn-new/profile`.
+Repeat both phases for WebKit and each scale for the final acceptance matrix.
+
+The plan schedules work 75 seconds apart with a fixed 180-second per-revision
+convergence ceiling, leaving the production 60-second scheduler unchanged.
+There are no wake/refetch loops. Both mounted clients must converge against an
+abstract oracle initialized from the seed, never provider-returned rows or the
+product eligibility selector. External arrivals, heads, requests, drafts, queue
+membership and terminal transitions use a separate provider adapter. Approvals
+advance the oracle only on one successful delivered actual mutation receipt.
+The held PR 53 draft, disclosure, focus and backward selection must survive
+background refresh; deliberate navigation precedes that retention interval.
+
+`churn-plan.json`, `churn.json`, and `churn-checkpoint.json` retain nominal/actual
+times, event and request counts, accepted production row facts/source receipts,
+remaining obligations, and independent plan/oracle/provider/profile hashes.
+Restart rejects failed, unclean, incompatible or tampered sources, replays the
+oracle without provider data, checks byte-identical copied profile evidence,
+and reads authenticated cached authority for both roles before polling starts.
+All failures and profiles remain in their unique output directories. This is a
+finite churn qualification; the existing fixed 145-row fairness soak is separate.
+
+Final sustained admission calls `assertSustainedChurn(result.churn)`: it requires
+all plan revisions, no remaining obligations, and at least 30 measured active
+minutes across validated segments, excluding shutdown/restart downtime. A final
+restart waits autonomously for this duration while continuing observation.
+`ENTERPRISE_CHURN_INTEGRATION_ONLY=1` skips that final duration wait for adapter
+smoke work and is recorded in metadata/result; it can never qualify as sustained
+acceptance even when every event converged. Task 9 must reject this flag.
+
+Mixed workload consumers should reuse `createChurnPlan` / `initialOracle` /
+`advanceOracle` and `assertChurnFacts` for independent `mixedOutcome` evidence,
+`applyChurnEvent` only for external fixture changes, and real successful
+mutation receipts for actions. `loadChurnRestart` restores provider state only
+after validating and independently replaying the saved oracle;
+`captureChurnCache` verifies provider-free native cache authority. Do not
+recreate expected identities from provider rows or browser-derived eligibility.
+The sustained admission helper is exported from `churn-plan.mjs` for final
+matrix/resource/release consumers.
