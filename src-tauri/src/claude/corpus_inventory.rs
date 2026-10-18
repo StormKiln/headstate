@@ -114,7 +114,7 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
     let mut statement=conn.prepare("SELECT i.path,i.session_id,i.size_bytes,i.modified,i.issue FROM claude_corpus_inventory i JOIN claude_corpus_epoch e ON i.root=e.root WHERE i.root=?1 AND i.generation IN (e.accepted,e.staging) AND NOT EXISTS(SELECT 1 FROM claude_corpus_inventory n WHERE n.root=i.root AND n.path=i.path AND n.generation=e.staging AND i.generation=e.accepted AND e.accepted<>e.staging) ORDER BY i.path")?;
     let rows = statement.query_map([key.as_ref()], |r| {
         Ok((
-            r.get::<_, String>(0)?,
+            r.get::<_, rusqlite::types::Value>(0)?,
             r.get::<_, Option<String>>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
@@ -123,6 +123,27 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
     })?;
     for row in rows {
         let (path, session, size, modified, issue) = row?;
+        let path = match path {
+            rusqlite::types::Value::Text(path) => path,
+            // Unsupported native paths are durable diagnostics only. Never
+            // decode them lossily into a candidate that could alias a source.
+            rusqlite::types::Value::Blob(_) => {
+                scan.unreadable_files
+                    .push("unsupported non-UTF-8 transcript path".into());
+                scan.session_bytes = scan.session_bytes.saturating_add(size as u64);
+                if modified.is_empty() {
+                    scan.unsized_files += 1;
+                }
+                continue;
+            }
+            other => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "path".into(),
+                    other.data_type(),
+                ))
+            }
+        };
         if let Some(issue) = issue {
             if session.is_some() {
                 scan.unreadable_files.push(format!("{path}: {issue}"));
@@ -486,7 +507,14 @@ fn reconcile(
                 } else {
                     4
                 };
-                let name = entry.file_name().as_encoded_bytes().to_vec();
+                let path = entry.path();
+                #[cfg(test)]
+                let path = super::corpus_probe::entry_path(path);
+                let name = path
+                    .file_name()
+                    .expect("directory entry has a name")
+                    .as_encoded_bytes()
+                    .to_vec();
                 #[cfg(any(test, feature = "enterprise-harness"))]
                 let bytes = name.len();
                 if dir.names.insert((name, code)) {
@@ -497,7 +525,6 @@ fn reconcile(
                 }
                 dir.count += 1;
                 if !dir.validating {
-                    let path = entry.path();
                     if kind.is_dir() {
                         pending.push(Observation::Directory(path, dir.depth + 1));
                     } else if dir.depth >= 1
@@ -517,12 +544,14 @@ fn reconcile(
                             }
                         }
                         let session = if dir.depth == 1 {
-                            Some(
-                                path.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .ok_or(rusqlite::Error::InvalidQuery)?
-                                    .to_owned(),
-                            )
+                            match path.file_stem().and_then(|s| s.to_str()) {
+                                Some(session) => Some(session.to_owned()),
+                                None => {
+                                    issue =
+                                        Some("unsupported non-UTF-8 transcript filename".into());
+                                    None
+                                }
+                            }
                         } else {
                             None
                         };
@@ -629,7 +658,16 @@ fn flush(
                 modified,
                 issue,
             } => {
-                tx.execute("INSERT INTO claude_corpus_inventory(root,generation,path,directory,session_id,size_bytes,modified,issue) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root,generation,path) DO UPDATE SET session_id=excluded.session_id,size_bytes=excluded.size_bytes,modified=excluded.modified,issue=excluded.issue",params![root,generation,path.to_string_lossy(),directory.to_string_lossy(),session,size,modified,issue])?;
+                // SQLite preserves BLOB/TEXT identity in equality joins and the
+                // primary key. Raw unsupported names cannot collide with a valid
+                // UTF-8 replacement-character filename. They are never sources.
+                let stored_path = match path.to_str() {
+                    Some(path) => rusqlite::types::Value::Text(path.to_owned()),
+                    None => {
+                        rusqlite::types::Value::Blob(path.as_os_str().as_encoded_bytes().to_vec())
+                    }
+                };
+                tx.execute("INSERT INTO claude_corpus_inventory(root,generation,path,directory,session_id,size_bytes,modified,issue) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root,generation,path) DO UPDATE SET session_id=excluded.session_id,size_bytes=excluded.size_bytes,modified=excluded.modified,issue=excluded.issue",params![root,generation,stored_path,directory.to_string_lossy(),session,size,modified,issue])?;
             }
         }
     }

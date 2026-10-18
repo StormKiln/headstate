@@ -67,3 +67,29 @@ fn discovery_scaling_measurement() {
         configure(Duration::ZERO, None);
     }
 }
+
+// Some Unix filesystems (including APFS) reject invalid UTF-8 names. Tests can
+// substitute one synthetic directory entry to exercise the same native-byte path.
+thread_local! { static ENTRY_PATH: RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> = const { RefCell::new(None) }; }
+#[cfg(unix)]
+pub(crate) struct EntryPathGuard;
+#[cfg(unix)]
+impl Drop for EntryPathGuard {
+    fn drop(&mut self) {
+        ENTRY_PATH.with(|p| *p.borrow_mut() = None);
+    }
+}
+#[cfg(unix)]
+pub(crate) fn substitute_entry_path(
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+) -> EntryPathGuard {
+    ENTRY_PATH.with(|p| *p.borrow_mut() = Some((from, to)));
+    EntryPathGuard
+}
+pub(crate) fn entry_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    ENTRY_PATH.with(|p| match p.borrow().as_ref() {
+        Some((from, to)) if from == &path => to.clone(),
+        _ => path,
+    })
+}

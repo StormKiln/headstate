@@ -688,3 +688,84 @@ fn unreadable_projects_do_not_pin_healthy_or_recovered_project_units() {
         5
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn non_utf8_filename_preserves_identity_and_healthy_progress_across_reopen() {
+    use std::os::unix::ffi::OsStringExt;
+    let (dir, root, mut conn) = fixture(1);
+    let mut runtime = DiscoveryRuntime::default();
+    finish(&mut conn, &root, &mut runtime, 64);
+    let invalid = root
+        .join("synthetic")
+        .join(std::ffi::OsString::from_vec(b"\xff.jsonl".to_vec()));
+    let _entry_guard = match std::fs::write(&invalid, "bad") {
+        Ok(()) => None,
+        Err(error) => {
+            // APFS rejects these names before enumeration; inject only this
+            // synthetic entry, preserving the rest of the real filesystem walk.
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+            let placeholder = root.join("synthetic/raw-name-fixture.jsonl");
+            std::fs::write(&placeholder, "bad").unwrap();
+            Some(super::super::corpus_probe::substitute_entry_path(
+                placeholder,
+                invalid.clone(),
+            ))
+        }
+    };
+    // This valid filename has the same lossy display but must remain distinct.
+    std::fs::write(root.join("synthetic/�.jsonl"), "").unwrap();
+    std::fs::create_dir(root.join("z-healthy")).unwrap();
+    std::fs::write(root.join("z-healthy/later.jsonl"), "").unwrap();
+    let mut saw_healthy = false;
+    let mut saw_diagnostic = false;
+    let mut saw_validated_membership = false;
+    for admission in 0..40 {
+        if admission == 10 {
+            drop(conn);
+            conn = crate::store::open_db(&dir.path().join("inventory.db")).unwrap();
+            runtime = DiscoveryRuntime::default();
+        }
+        let slice = reconcile_with_limit(
+            &mut conn,
+            &root,
+            &PopulationControl::discovery(),
+            &mut runtime,
+            8,
+        )
+        .unwrap();
+        assert!(slice.scan.is_partial());
+        assert!(slice.scan.sessions.iter().any(|s| s.session_id == "s-0000"));
+        saw_healthy |= slice.scan.sessions.iter().any(|s| s.session_id == "later");
+        saw_diagnostic |= !slice.scan.unreadable_files.is_empty();
+        saw_validated_membership |= slice.authoritative;
+    }
+    assert!(saw_healthy);
+    assert!(saw_diagnostic);
+    assert!(saw_validated_membership);
+    let scan = load_processing_scan(&conn, &root).unwrap();
+    assert!(scan.sessions.iter().any(|s| s.session_id == "�"));
+    assert!(scan.sessions.iter().any(|s| s.session_id == "later"));
+    assert_eq!(scan.unreadable_files.len(), 1);
+    assert!(scan.is_partial());
+    assert_eq!(scan.sessions.len(), 3);
+    super::super::search::index_pass_controlled(&mut conn, &scan, &PopulationControl::discovery())
+        .unwrap();
+    let indexed: i64 = conn
+        .query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        indexed, 3,
+        "healthy sources actually enter the processing lane"
+    );
+    let certificate: String = conn.query_row("SELECT d.certificate FROM claude_corpus_directory d JOIN claude_corpus_epoch e ON d.root=e.root AND d.generation=e.accepted WHERE d.path=?1", [root.join("synthetic").to_str().unwrap()], |r| r.get(0)).unwrap();
+    assert!(certificate.contains(&serde_json::to_string(&(b"\xff.jsonl".to_vec(), 2)).unwrap()));
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT path FROM claude_corpus_inventory WHERE typeof(path)='blob' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, invalid.as_os_str().as_encoded_bytes());
+}

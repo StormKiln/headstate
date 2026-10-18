@@ -145,3 +145,26 @@ Reproduce with `make test-enterprise-corpus-resources`,
 `make test-enterprise-resources`, `make lint-enterprise-resources`, and
 `make measure-enterprise-discovery`. The last target uses exact synthetic ignored
 test names and retains its fixtures; it never runs ignored real-home probes.
+
+## Review follow-up: unsupported native filenames
+
+Unsupported non-UTF-8 transcript paths persist as SQLite BLOB identities containing
+native encoded bytes; valid paths remain TEXT. SQLite equality/primary-key handling
+keeps these distinct even when their lossy display would match a valid filename.
+BLOB rows only produce unreadable-file diagnostics, never processing candidates or
+reconstructed/opened source paths. The sole processing-scan reader handles BLOB
+explicitly and rejects unexpected stored value types. Directory certificates still
+contain the original native names and types. No schema migration is needed.
+
+The Unix regression attempts a real raw-byte `0xff.jsonl` file, alongside a valid
+replacement-character filename and a healthy later project. APFS rejected creation
+with EILSEQ on the verification host; a guarded, thread-local, test-only entry-path
+substitution supplies that single native name consistently to both enumeration
+passes. The real-filesystem path remains for Linux CI, which was not run locally.
+Repeated admissions and reopen preserve accepted evidence, retain qualified status,
+validate membership, and actually index all three healthy sources.
+
+The all-lane rotation assertion now inspects the production link lane's actual
+returned result through a test-only field. It performs no foreground scan or extra
+link refresh after population. Metadata/usage/index Complete assertions and zero
+unchanged body-read deltas are retained.

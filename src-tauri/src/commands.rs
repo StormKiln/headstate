@@ -5223,13 +5223,9 @@ mod corpus_cancel_tests {
                 assert!(progress.total_known);
                 assert_eq!(progress.completed, 1);
             }
-            let link = crate::claude::linkscan::refresh_controlled(
-                &mut conn,
-                &crate::claude::transcript::corpus(&root),
-                crate::claude::linkscan::BYTES_PER_PASS,
-                &PopulationControl::default(),
-            )
-            .unwrap();
+            let link = out
+                .links
+                .expect("production link lane must return its result");
             assert_eq!(link.deferred, 0);
             assert!(link.stopped.is_none());
             assert!(link.unreadable.is_empty());
@@ -6044,6 +6040,8 @@ fn claude_live_pass_with_population(
 
 #[derive(Default)]
 struct LivePopulation {
+    #[cfg(test)]
+    links: Option<crate::claude::linkscan::Refreshed>,
     indexed: Option<crate::claude::search::Indexed>,
     metadata: Option<crate::claude::transcript::PopulationProgress>,
     usage: Option<crate::claude::transcript::PopulationProgress>,
@@ -6175,11 +6173,18 @@ fn populate_live_corpus_with_controls(
                 crate::claude::linkscan::BYTES_PER_PASS,
                 &lane_control,
             ) {
-                Ok(done) if !done.unreadable.is_empty() => log::warn!(
-                    "claude: link population: {} source failures",
-                    done.unreadable.len()
-                ),
-                Ok(_) => {}
+                Ok(done) => {
+                    if !done.unreadable.is_empty() {
+                        log::warn!(
+                            "claude: link population: {} source failures",
+                            done.unreadable.len()
+                        );
+                    }
+                    #[cfg(test)]
+                    {
+                        out.links = Some(done);
+                    }
+                }
                 Err(error) => log::warn!("claude: link population failed: {error}"),
             },
             Lane::Metadata => match crate::claude::store::metadata_pass(conn, &scan, &lane_control)
