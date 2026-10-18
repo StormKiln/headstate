@@ -85,7 +85,14 @@ export function observeChurnProgress(previous,{event,ledger,clients,now}){
    }
   }else for(const search of entry.searches??[]){if(!search.query.includes('review-requested:@me'))continue;const key=JSON.stringify([search.query,search.after,search.ids]);if(!state.frontiers.includes(key)){state.frontiers.push(key);advanced=true;}}
  }
- for(const [role,client] of clients.entries()){if(!client.accepted)continue;const row=client.facts.find(row=>row.identity===event.identity);const key=JSON.stringify([role,row??null]);if(!state.facts.includes(key)){if(state.facts.some(key=>JSON.parse(key)[0]===role))advanced=true;state.facts.push(key);}}
+ for(const [role,client] of clients.entries()){if(!client.accepted)continue;const row=client.facts.find(row=>row.identity===event.identity);const key=JSON.stringify([role,churnProgressFacts(row)]);if(!state.facts.includes(key)){if(state.facts.some(key=>JSON.parse(key)[0]===role))advanced=true;state.facts.push(key);}}
  if(advanced){state.lastAt=now;state.advances.push({at:now,frontiers:state.frontiers.length,confirmations:state.confirmations.length,facts:state.facts.length});}
  assert.ok(now-state.lastAt<=180000,'meaningful affected-list progress must be bounded by 180s');return state;
+}
+
+// Deliberately omit observation/confirmation clocks and mutation receipt metadata.
+export function churnProgressFacts(row){
+ if(!row)return null;const observation=row.observation,confirmed=observation?.confirmed_review;
+ const fields=value=>value?[...new Set(value)].sort():null;
+ return {identity:row.identity,list:row.list,head:row.head,authored:row.authored,requested:row.requested,draft:row.draft,queued:row.queued,terminal:row.terminal,approved:row.approved,qualification:observation?{state:observation.state,unknown:fields(observation.unknown_fields),retained:fields(observation.retained_fields),detail:fields(observation.detail_fields),readyAtState:observation.ready_at_state,confirmed:confirmed?{head:confirmed.head_oid,review:confirmed.review,unresolved:confirmed.unresolved,confirmedByRead:confirmed.confirmed_by_read}:null}:null};
 }

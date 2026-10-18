@@ -281,8 +281,10 @@ a completed plan. Resume its remaining revisions with the same scale/seed:
 `make enterprise-run OUT=/tmp/churn-resumed ENGINE=chromium MODE=churn-restart PROFILE=/tmp/churn-new/profile`.
 Repeat both phases for WebKit and each scale for the final acceptance matrix.
 
-The plan schedules work 75 seconds apart with a fixed 180-second per-revision
-convergence ceiling, leaving the production 60-second scheduler unchanged.
+The plan issues work at least 75 seconds apart. Foreground actions retain a
+180-second ceiling; background changes use the versioned scale/kind-specific
+healthy envelope below, with a separate 180-second meaningful-progress watchdog.
+The production 60-second scheduler remains unchanged.
 There are no wake/refetch loops. Both mounted clients must converge against an
 abstract oracle initialized from the seed, never provider-returned rows or the
 product eligibility selector. External arrivals, heads, requests, drafts, queue
@@ -339,7 +341,7 @@ production 60-second separation between two negatives (`github/scan.rs:742`).
 Thus the kind-specific limits are `2*S*45s + 120s + 30s/60s/120s`.
 
 A separate 180-second watchdog requires affected-list cursor/frontier change,
-accepted affected-identity fact change, or at most two complete exact-identity
+accepted affected-identity semantic fact/qualification change, or at most two complete exact-identity
 negative confirmation proofs. Repeated requests or changed timestamps alone
 cannot reset it. Correct facts and exact obligations remain mandatory at the
 endpoint. Finite segment bounds sum each obligation's deadline plus spacing.
@@ -359,3 +361,9 @@ Acceptance and final slot drop can arrive in either order; the later native
 boundary defines duration. Final proof rejects missing/duplicate sequences,
 unpaired/unfinished lifetimes and loss. Task 8/9 consumers should preserve this
 recorder concurrency contract and raw trace evidence.
+
+Affected-fact progress uses an explicit projection: identity/list/head/authored,
+request/draft/queue/terminal/approval, and observation state, unknown/retained/detail
+field sets, ready-at qualification and confirmed-review head/review/unresolved/read
+qualification. It excludes every timestamp and receipt metadata. Field sets are
+canonicalized; previously seen semantic values cannot renew progress by alternating.

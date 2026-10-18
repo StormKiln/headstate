@@ -67,3 +67,14 @@ test('longer background envelope never admits wrong facts or missing obligations
  assertChurnSchedule([{revision:1,kind:'request-remove',actualOffsetMs:0,convergedOffsetMs:400000}],[1],churnPolicy(150));
  assert.throws(()=>assertChurnSchedule([],[1],churnPolicy(150)),/skipped/);assert.throws(()=>assertChurnFacts(oracle,[]),/membership/);
 });
+
+for(const timestamps of [false,true])test(`wrong retained facts do not advance with timestamps=${timestamps}`,async()=>{
+ const {observeChurnProgress}=await import('./churn-plan.mjs');const event={identity:'synthetic-lab/repo-5/155',previousHead:'head-155'};let state;
+ const sample=now=>({event,ledger:[],now,clients:[{accepted:{receipt_revision:now,last_received_at:String(now)},facts:[{identity:event.identity,head:event.previousHead,requested:true,draft:false,queued:false,terminal:'open',approved:false,observation:{state:'retained',last_observed_at:timestamps?String(now):'old',unknown_fields:[],retained_fields:[],confirmed_review:{head_oid:event.previousHead,review:'none',confirmed_at:timestamps?String(now):'old',receipt:{id:now}}}}]}]});
+ state=observeChurnProgress(state,sample(0));state=observeChurnProgress(state,sample(120000));assert.throws(()=>observeChurnProgress(state,sample(180001)),/progress.*bounded/);
+});
+test('real semantic and unknown-to-known progression count once, alternating seen values do not',async()=>{
+ const {observeChurnProgress}=await import('./churn-plan.mjs');const event={identity:'synthetic-lab/repo-5/155',previousHead:'old'};let state;
+ const sample=(now,head,unknown)=>({event,ledger:[],now,clients:[{accepted:{receipt_revision:now},facts:[{identity:event.identity,head,requested:true,observation:{state:'retained',unknown_fields:unknown}}]}]});
+ state=observeChurnProgress(state,sample(0,'old',['head']));state=observeChurnProgress(state,sample(120000,'new',['head']));assert.equal(state.lastAt,120000);state=observeChurnProgress(state,sample(240000,'new',[]));assert.equal(state.lastAt,240000);state=observeChurnProgress(state,sample(360000,'old',['head']));assert.equal(state.lastAt,240000);assert.throws(()=>observeChurnProgress(state,sample(420001,'new',[])),/progress.*bounded/);
+});
