@@ -40,3 +40,7 @@ export function assertSustainedChurn(evidence){
  assert.equal(evidence.segmentPass,true);assert.equal(evidence.planComplete,true);assert.equal(evidence.sustainedPass,true);assert.equal(evidence.integrationOnly,false,'integration-only cannot qualify sustained churn');assert.deepEqual(evidence.remaining,[]);
  assert.ok(Array.isArray(evidence.activeSegmentsMs)&&evidence.activeSegmentsMs.length>0);for(const value of evidence.activeSegmentsMs)assert.ok(Number.isFinite(value)&&value>=0,'measured active durations required');assert.ok(evidence.activeSegmentsMs.reduce((a,b)=>a+b,0)>=1800000,'at least 30 active minutes excluding restart downtime');
 }
+// This declared fixture keeps CI successful and mergeability clean. Readiness
+// is therefore an abstract obligation over the scheduled facts, not derive().
+export function expectedChurnReady(oracle){return oracle.rows.filter(row=>row.terminal==='open'&&row.requested&&!row.draft&&!row.queued&&!row.approved).map(row=>row.identity).sort();}
+export function assertChurnReady(oracle,actual){assert.deepEqual([...actual].sort(),expectedChurnReady(oracle),'actual Ready eligibility must match independent plan');}
