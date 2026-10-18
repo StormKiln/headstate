@@ -602,6 +602,13 @@ jobs:
 
       - uses: ./.github/actions/setup
 
+      # The constrained ShellCheck transport is Linux-specific: Darwin does
+      # not expose F_SETPIPE_SZ, so the lint job cannot exercise this branch.
+      # Keep the shared target here as the continuous real-tool regression.
+      - name: Workflow lint (Linux transport)
+        if: matrix.os == 'ubuntu-latest'
+        run: make lint-workflows
+
       - name: Rust tests
         shell: bash
         run: |

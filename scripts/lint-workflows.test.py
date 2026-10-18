@@ -132,6 +132,32 @@ time.sleep(30)
 
 @unittest.skipUnless(shutil.which("actionlint"), "actionlint is installed in CI")
 class WorkflowLintTests(unittest.TestCase):
+    def make_constrained_shellcheck(self, directory, real_shellcheck, marker):
+        shim = Path(directory) / "shellcheck"
+        shim.write_text("""#!/usr/bin/env python3
+import fcntl, os, subprocess, sys
+read_fd, write_fd = os.pipe()
+capacity = fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+open(os.environ['PIPE_CAPACITY_MARKER'], 'w').write(str(capacity))
+process = subprocess.Popen(
+    [os.environ['REAL_SHELLCHECK'], *sys.argv[1:]], stdin=read_fd,
+)
+os.close(read_fd)
+try:
+    with os.fdopen(write_fd, 'wb') as constrained_stdin:
+        while chunk := sys.stdin.buffer.read(65536):
+            constrained_stdin.write(chunk)
+except BrokenPipeError:
+    pass
+raise SystemExit(process.wait())
+""")
+        shim.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{directory}:{env['PATH']}"
+        env["REAL_SHELLCHECK"] = real_shellcheck
+        env["PIPE_CAPACITY_MARKER"] = str(marker)
+        return shim, env
+
     def lint(self, text, env=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "workflow.yml"
@@ -203,18 +229,7 @@ jobs:
         self.assertIsNotNone(real_shellcheck)
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "capacity"
-            shim = Path(directory) / "shellcheck"
-            shim.write_text("""#!/usr/bin/env python3
-import fcntl, os
-capacity = fcntl.fcntl(0, fcntl.F_SETPIPE_SZ, 4096)
-open(os.environ['PIPE_CAPACITY_MARKER'], 'w').write(str(capacity))
-os.execv(os.environ['REAL_SHELLCHECK'], [os.environ['REAL_SHELLCHECK'], *os.sys.argv[1:]])
-""")
-            shim.chmod(0o755)
-            env = os.environ.copy()
-            env["PATH"] = f"{directory}:{env['PATH']}"
-            env["REAL_SHELLCHECK"] = real_shellcheck
-            env["PIPE_CAPACITY_MARKER"] = str(marker)
+            _, env = self.make_constrained_shellcheck(directory, real_shellcheck, marker)
             large_body = "\n".join(f"          echo safe-{number}" for number in range(6000))
             workflow = f"""name: constrained-shell
 on: push
@@ -231,6 +246,33 @@ jobs:
             self.assertLessEqual(int(marker.read_text()), 4096)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("SC2086", result.stderr)
+
+    @unittest.skipUnless(fcntl is not None and hasattr(fcntl, "F_SETPIPE_SZ"), "platform cannot constrain pipe capacity with F_SETPIPE_SZ")
+    def test_constrained_shellcheck_accepts_prefilled_upstream_pipe(self):
+        real_shellcheck = shutil.which("shellcheck")
+        self.assertIsNotNone(real_shellcheck)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "capacity"
+            shim, env = self.make_constrained_shellcheck(directory, real_shellcheck, marker)
+            read_fd, write_fd = os.pipe()
+            try:
+                upstream_capacity = fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 8192)
+                suffix = b"\necho $UNQUOTED_AT_THE_END\n"
+                script = b"#" + b"x" * (upstream_capacity - len(suffix) - 1) + suffix
+                self.assertEqual(os.write(write_fd, script), upstream_capacity)
+                os.close(write_fd)
+                write_fd = None
+                result = subprocess.run(
+                    [str(shim), "-f", "gcc", "-"], stdin=read_fd, env=env,
+                    text=True, capture_output=True, timeout=15,
+                )
+            finally:
+                os.close(read_fd)
+                if write_fd is not None:
+                    os.close(write_fd)
+            self.assertLessEqual(int(marker.read_text()), 4096)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SC2086", result.stdout)
 
 
 if __name__ == "__main__":
