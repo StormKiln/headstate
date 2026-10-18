@@ -43,6 +43,7 @@ function coverage(over: Partial<ClaudeIndexCoverage> = {}): ClaudeIndexCoverage 
     indexed: 1482,
     total: 1482,
     unreadable: [],
+    population: { status: "complete", total: 1482, total_known: true, completed: 1482, unchanged: 1482, failed: 0, remaining: 0 },
     truncated: 0,
     last_indexed_at: "2026-09-20T00:00:00Z",
     ...over,
@@ -90,7 +91,7 @@ describe("an unfinished index never says 'no matches'", () => {
 
     // The settled sentence must be absent. `All N sessions were
     // searched` is the phrase that would be the lie here.
-    expect(screen.queryByText(/all 1,482 sessions were searched/i)).toBeNull();
+    expect(screen.queryByText(/all 1,482 sessions.*were searched/i)).toBeNull();
   });
 
   /// The other half: a complete index says the settled thing.
@@ -100,7 +101,7 @@ describe("an unfinished index never says 'no matches'", () => {
     state.answer = { verdict: { kind: "none" }, coverage: cov };
     searchFor("fsevents");
 
-    expect(screen.getByText(/no matches\. all 1,482 sessions were searched/i)).toBeTruthy();
+    expect(screen.getByText(/no matches\. all 1,482 sessions.*were searched/i)).toBeTruthy();
     expect(screen.queryByText(/indexed so far/i)).toBeNull();
     expect(screen.queryByText(/have not been indexed yet/i)).toBeNull();
   });
@@ -118,14 +119,14 @@ describe("an unfinished index never says 'no matches'", () => {
       coverage: partialCov,
     };
     searchFor("fsevents");
-    const partial = screen.getByRole("status").textContent ?? "";
+    const partial = screen.getByText(/^No matches/i).textContent ?? "";
     cleanup();
 
     const wholeCov = coverage();
     state.coverage = wholeCov;
     state.answer = { verdict: { kind: "none" }, coverage: wholeCov };
     searchFor("fsevents");
-    const complete = screen.getByRole("status").textContent ?? "";
+    const complete = screen.getByText(/^No matches/i).textContent ?? "";
 
     expect(partial).not.toEqual(complete);
     expect(partial).toMatch(/indexed so far/i);
@@ -147,7 +148,7 @@ describe("an unfinished index never says 'no matches'", () => {
     expect(screen.queryByText(/were searched/i)).toBeNull();
     // The coverage line still shows: how much is searchable is worth
     // saying before anyone types.
-    expect(screen.getByText(/all 1,482 sessions are searchable/i)).toBeTruthy();
+    expect(screen.getByText(/all 1,482 sessions.*are searchable/i)).toBeTruthy();
   });
 
   /// A search that FAILED is neither empty state. #846's exact shape.
@@ -174,13 +175,13 @@ describe("coverage is stated before anything is typed", () => {
   it("says so when everything is searchable", () => {
     state.coverage = coverage();
     render(<ClaudeTranscriptSearch />);
-    expect(screen.getByText(/all 1,482 sessions are searchable/i)).toBeTruthy();
+    expect(screen.getByText(/all 1,482 sessions.*are searchable/i)).toBeTruthy();
   });
 
   /// No pass has run. NOT "0 of 0 searchable", which would read as a
   /// complete index of an empty corpus.
   it("says the index has not run rather than reporting 0 of 0", () => {
-    state.coverage = coverage({ indexed: 0, total: 0, last_indexed_at: null });
+    state.coverage = coverage({ indexed: 0, total: 0, last_indexed_at: null, population: undefined });
     render(<ClaudeTranscriptSearch />);
     expect(screen.getByText(/index has not run yet/i)).toBeTruthy();
     expect(screen.queryByText(/0 of 0/)).toBeNull();
@@ -188,14 +189,14 @@ describe("coverage is stated before anything is typed", () => {
   });
 
   /// An unreadable transcript is a gap the user is told about.
-  it("states how many transcripts could not be read", () => {
+  it("states when transcript content could not be read", () => {
     state.coverage = coverage({
       indexed: 1481,
       total: 1482,
       unreadable: ["/Users/acme/.claude/projects/x/y.jsonl: Permission denied"],
     });
     render(<ClaudeTranscriptSearch />);
-    expect(screen.getByText(/1 transcript could not be read/i)).toBeTruthy();
+    expect(screen.getByText(/Some transcript content could not be read/i)).toBeTruthy();
   });
 
   /// A truncated transcript is stated too: a miss in one is not proof of
@@ -247,7 +248,7 @@ describe("hits", () => {
 it("does not claim complete coverage when the population pass was cancelled", () => {
   state.coverage = coverage({ population: { status: "cancelled", total: 1482, total_known: true, completed: 1482, unchanged: 1482, failed: 0, remaining: 0 } });
   render(<ClaudeTranscriptSearch />);
-  expect(screen.queryByText(/All 1,482 sessions are searchable/)).toBeNull();
+  expect(screen.queryByText(/All 1,482 sessions.*are searchable/)).toBeNull();
   expect(screen.getByText(/Scan cancelled/)).toBeTruthy();
 });
 
@@ -256,4 +257,43 @@ it("distinguishes a known empty corpus from an unknown denominator", () => {
   render(<ClaudeTranscriptSearch />);
   expect(screen.getByText(/No session transcripts were found/)).toBeTruthy();
   expect(screen.queryByText(/size of the transcript corpus is not known/)).toBeNull();
+});
+
+
+it("qualifies legacy coverage without inventing unreadable files", () => {
+  state.coverage = coverage({ population: undefined });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.queryByText(/All 1,482 sessions.*are searchable/)).toBeNull();
+  expect(screen.getByText(/stored index.*coverage is not confirmed/i)).toBeTruthy();
+  expect(screen.queryByText(/transcript.*could not be read/)).toBeNull();
+});
+
+it("qualifies retained indexed rows without a negative or invented remaining count", () => {
+  state.answer = { coverage: coverage({ indexed: 10, total: 4 }), verdict: { kind: "none_yet", indexed: 10, total: 4 } };
+  searchFor("needle");
+  expect(screen.getByText(/No matches in the 10 stored indexed sessions/i)).toBeTruthy();
+  expect(screen.queryByText(/remaining -6|remaining 0|rest have not been indexed/i)).toBeNull();
+  expect(screen.getByText(/last observed corpus contained 4/i)).toBeTruthy();
+});
+
+it("does not relabel a stopped known-empty observation as an unknown census", () => {
+  state.coverage = coverage({ indexed: 0, total: 0, population: { status: "cancelled", total: 0, total_known: true, completed: 0, unchanged: 0, failed: 0, remaining: 0 } });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.getByText(/No sessions are stored in the index.*coverage is not confirmed/i)).toBeTruthy();
+  expect(screen.queryByText(/corpus is not known/i)).toBeNull();
+});
+
+it("does not count unreadable directory diagnostics as unreadable transcripts", () => {
+  state.coverage = coverage({ unreadable: ["project directory: permission denied"] });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.getByText(/Some transcript content could not be read/i)).toBeTruthy();
+  expect(screen.queryByText(/1 transcript could not be read/)).toBeNull();
+});
+
+it("keeps an unknown denominator unknown when indexed sessions are retained", () => {
+  state.coverage = coverage({ indexed: 10, total: 0, population: undefined, last_indexed_at: null });
+  render(<ClaudeTranscriptSearch />);
+  expect(screen.getByText(/10 sessions in the stored index/i)).toBeTruthy();
+  expect(screen.getByText(/Corpus size is not confirmed/i)).toBeTruthy();
+  expect(screen.queryByText(/last observed corpus contained 0/i)).toBeNull();
 });

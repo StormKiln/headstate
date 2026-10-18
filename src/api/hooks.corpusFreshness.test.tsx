@@ -17,7 +17,7 @@ vi.mock("./transport", async (original) => ({ ...await original<object>(), liste
 vi.mock("./tauri", async (original) => ({ ...await original<object>(), claudeSearchTranscripts: ipc.search, claudeIndexCoverage: ipc.coverage, claudeSessionEvents: ipc.session, claudeEventProfile: ipc.profile }));
 const cov = { indexed: 1, total: 2, unreadable: [], truncated: 0, last_indexed_at: "2026-10-17" };
 const partial = { coverage: cov, verdict: { kind: "none_yet", indexed: 1, total: 2 } };
-const hit = { coverage: { ...cov, indexed: 2 }, verdict: { kind: "matches", hits: [{ session_id: "synthetic", snippet: "new committed hit", truncated: false }] } };
+const hit = { coverage: { ...cov, indexed: 2, population: { phase: "index", status: "complete", total: 2, total_known: true, completed: 2, unchanged: 0, failed: 0, remaining: 0 } }, verdict: { kind: "matches", hits: [{ session_id: "synthetic", snippet: "new committed hit", truncated: false }] } };
 function setup() {
   focusManager.setFocused(true);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
@@ -34,7 +34,7 @@ it("refreshes mounted search hits and coherent coverage, resubmits trimmed text,
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
   await screen.findByText(/No matches in the 1 of 2/);
   ipc.search.mockResolvedValue(hit); await receipt();
-  await screen.findByText("new committed hit"); expect(screen.getByText("All 2 sessions are searchable.")).toBeTruthy();
+  await screen.findByText("new committed hit"); expect(screen.getByText("All 2 sessions in the last observed corpus are searchable.")).toBeTruthy();
   expect(ipc.search).toHaveBeenCalledTimes(2);
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "needle" } });
   fireEvent.click(screen.getByRole("button", { name: "Search" })); await waitFor(() => expect(ipc.search).toHaveBeenCalledTimes(3));

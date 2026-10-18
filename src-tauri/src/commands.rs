@@ -5424,21 +5424,9 @@ pub async fn claude_import_transcripts(
 /// other surfaces (#846, #1042, #1044, #1152), and a search box is the
 /// place a user is least likely to question an empty result.
 ///
-/// # Why this rescans rather than trusting the stored denominator
-///
-/// The coverage denominator must describe the corpus as it is NOW, not
-/// as the last pass found it. A user who started a session ninety
-/// seconds ago is exactly the user most likely to search for it, and a
-/// denominator from before it existed would report the index as
-/// complete while the session they want is not in it. The scan is the
-/// same bounded-seek walk the session list already does -- measured
-/// sub-second -- and it is what lets the answer distinguish "not in
-/// your history" from "the index has not reached it yet".
-///
-/// `async` and `spawn_blocking`: this walks the corpus directory and
-/// reads a database, which is exactly the shape
-/// `no_sync_command_reaches_a_subprocess_or_a_whole_file` forbids on
-/// the async runtime.
+/// Coverage describes the last observed/indexed corpus. Background population
+/// owns discovery and writes; search reads coverage, progress and hits from one
+/// committed SQLite snapshot. `spawn_blocking` keeps DB work off the async runtime.
 ///
 /// [`SearchAnswer`]: crate::claude::search::SearchAnswer
 /// [`Verdict`]: crate::claude::search::Verdict
@@ -5458,37 +5446,15 @@ pub async fn claude_search_transcripts(
     let matching = matching.unwrap_or(crate::remote::privacy::Matching::Unmasked);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
-        // A fresh scan for the denominator and the unreadable set, so
-        // the coverage sentence describes the corpus the user has right
-        // now. A failure to scan is NOT fatal: the index is still
-        // searchable and the stored denominator is still the last thing
-        // we knew, so the search proceeds with an empty unreadable list
-        // rather than refusing -- but it can then only report the
-        // coverage it has, which `is_complete` handles.
-        // `corpus_default`, for the reason `claude_live_pass` gives
-        // (#1246): this needs the denominator and the unreadable set
-        // and nothing else, and the full scan would read 0.84 GB to
-        // produce titles and timestamps that are discarded three lines
-        // down. Warm, that is ~51 ms instead of ~880 -- and this one is
-        // on the path of somebody waiting for a search result, not on
-        // a background timer.
-        let unreadable = match crate::claude::corpus_default() {
-            Ok(scan) => {
-                crate::claude::search::observe_discovery(&conn, &scan).map_err(|e| e.to_string())?
-            }
-            Err(e) => {
-                log::warn!("claude: could not re-scan the corpus for search coverage: {e}");
-                vec![format!("corpus discovery failed: {e}")]
-            }
-        };
-        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), unreadable, matching)
+        // Stored readback: discovery and its state writes belong to population.
+        crate::claude::search::search(&conn, &query, limit.unwrap_or(50), Vec::new(), matching)
             .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// How much of the transcript corpus is searchable right now (#1203).
+/// Searchable coverage of the last observed transcript corpus (#1203).
 ///
 /// Separate from the search itself so a UI can state coverage on an
 /// EMPTY search box -- "1,482 sessions searchable", or "340 of 1,482
@@ -5503,16 +5469,7 @@ pub async fn claude_index_coverage(
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
-        // `corpus_default` (#1246): only `unreadable_files` is read
-        // here, and the listing computes it from the same `fs::metadata`
-        // failure `extract` reports, without opening a transcript.
-        let unreadable = match crate::claude::corpus_default() {
-            Ok(scan) => {
-                crate::claude::search::observe_discovery(&conn, &scan).map_err(|e| e.to_string())?
-            }
-            Err(e) => vec![format!("corpus discovery failed: {e}")],
-        };
-        crate::claude::search::coverage(&conn, unreadable).map_err(|e| e.to_string())
+        crate::claude::search::coverage(&conn, Vec::new()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
