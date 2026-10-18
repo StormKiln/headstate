@@ -135,6 +135,7 @@ export async function startProvider({convergence=false,workload,quotaProfile}={}
     return o[f.name]??null;
    };
    const root={};const response=project(doc.selection,root,resolve);
+   if(queryName==='QueueConfirmation')entry.confirmations=doc.selection.filter(f=>f.name==='search').map((field,i)=>({direct:response[`p${i}`]?.pullRequest,bucket:response[field.alias??field.name]}));
    if(pageRefusal){entry.status=503;res.writeHead(503).end();return;}
    entry.materializedAt=performance.now();
    if(holdSearch&&holdRule.observeReady){entry.holdEligibility=await observeHoldReadiness(holdRule.observeReady);holdSearch=entry.holdEligibility.eligible===true;}

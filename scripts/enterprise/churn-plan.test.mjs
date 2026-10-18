@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as churn from './churn-plan.mjs';
 import {defaultWorkload} from './workload.mjs';
-const workload=(reviewing=150,seed=9001)=>({...defaultWorkload,seed,scenario:'churn',scheduleVersion:'churn-v2',populations:{...defaultWorkload.populations,reviewing}});
+const workload=(reviewing=150,seed=9001)=>({...defaultWorkload,seed,scenario:'churn',scheduleVersion:'churn-v3',populations:{...defaultWorkload.populations,reviewing}});
 test('seeded plan is deterministic, changes with seed and covers exact disjoint populations and all events',()=>{
  assert.equal(typeof churn.createChurnPlan,'function');
  for(const scale of [150,250]){const p=churn.createChurnPlan(workload(scale));assert.deepEqual(p,churn.createChurnPlan(workload(scale)));assert.notDeepEqual(p.events,churn.createChurnPlan(workload(scale,17)).events);assert.equal(p.initial.filter(r=>r.authored).length,50);assert.equal(p.initial.filter(r=>r.requested).length,scale);assert.ok(p.initial.every(r=>!(r.authored&&r.requested)));assert.equal(new Set(p.initial.map(r=>r.identity.split('/').slice(0,2).join('/'))).size,50);assert.deepEqual(new Set(p.events.map(e=>e.kind)),new Set(['arrival','head','request-remove','request-add','draft','ready','queue','dequeue','close','merge','approve','navigate']));}

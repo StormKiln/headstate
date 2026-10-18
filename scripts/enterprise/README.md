@@ -273,7 +273,7 @@ production-cadence convergence and the portable restart/observation limits.
 ## Seeded sustained churn and checkpoint restart
 
 `ENTERPRISE_REVIEWING=150` or `250` and optional `ENTERPRISE_SEED` select a
-validated descriptor (`churn-v2`, 50 authored PRs, 50 repositories/members).
+validated descriptor (`churn-v3`, 50 authored PRs, 50 repositories/members).
 Run `make enterprise-run OUT=/tmp/churn-new ENGINE=chromium MODE=churn`.
 This completes revisions 1–7 of the saved plan, including real desktop/paired
 navigation and successful current-head approvals. A successful segment is **not**
@@ -318,13 +318,44 @@ recreate expected identities from provider rows or browser-derived eligibility.
 The sustained admission helper is exported from `churn-plan.mjs` for final
 matrix/resource/release consumers.
 
-Churn execution serializes every immutable plan obligation: issue spacing is at
-least 75 seconds and the prior obligation must converge before the next issue.
-Nominal plan offsets remain unchanged; `nominalDriftMs` records cumulative drift.
-Every event must converge within 180 seconds, and the finite segment bound is
-`eventCount * (spacingMs + convergenceMs)`. Restart validates source issue and
-convergence timings against these same rules; incompatible old timings require a
-fresh source, not a tolerance or plan-hash migration. Scheduled quiet intervals
-sample existing UI witnesses at most one second apart, with no provider refresh.
-Both roles are checked independently, and post-convergence regression or retained
-interaction loss fails immediately.
+Churn v3 execution serializes every immutable plan obligation: issue spacing is
+at least 75 seconds and the prior obligation must converge before the next issue.
+Nominal offsets remain unchanged; `nominalDriftMs` records actual drift. The
+versioned healthy-fixture policy is a conservative finite envelope, not expected
+latency or a production SLA. Foreground navigation/approval keeps 180 seconds.
+At 150/250 requested rows, background positive changes allow 510/690 seconds,
+terminal disappearance 540/720 seconds, and request removal 600/780 seconds.
+Actual timings and progress remain in `churn.json`; these limits never add sleep.
+
+The derivation uses `S = ceil(ceil((reviewing + 1) / 25) / 2)`: 25 rows/page
+(`github/client.rs`), two pages/step (`github/scan.rs:389`), and the one scheduled
+arrival. Two traversals cover finishing the in-flight pass and a fresh pass.
+Each continuation cycle allows two independently measured <=15-second list
+steps plus the production 15-second sleep (`poll.rs:1166–1189`), hence 45 seconds.
+A further 120 seconds covers completed-pass cooldown (`queue_scan.rs:317`) and
+ordinary 60-second cadence. Positive publication allows 30 seconds; terminal
+identity confirmation allows another 30 seconds. Request removal adds the
+production 60-second separation between two negatives (`github/scan.rs:742`).
+Thus the kind-specific limits are `2*S*45s + 120s + 30s/60s/120s`.
+
+A separate 180-second watchdog requires affected-list cursor/frontier change,
+accepted affected-identity fact change, or at most two complete exact-identity
+negative confirmation proofs. Repeated requests or changed timestamps alone
+cannot reset it. Correct facts and exact obligations remain mandatory at the
+endpoint. Finite segment bounds sum each obligation's deadline plus spacing.
+Restart checks exact version/hash and source timings; incompatible old sources
+require a fresh run, never a tolerance or migration.
+
+Scheduled quiet intervals sample existing UI witnesses at most one second apart,
+with no provider refresh. Both roles are checked independently; any observed
+post-convergence regression or retained interaction loss is fatal. Native step
+work includes scan-slot creation through scope drop and associated accepted
+publication. Unfinished/unaccepted slots are included. The native file reader
+consumes only new complete lines with bounded carry/backlog. Recorder producers
+allocate sequence IDs before sending, so line arrival order can differ from
+sequence order; records are reordered with bounded buffering. Timestamps are
+checked against same-slot starts, not globally across concurrent producers.
+Acceptance and final slot drop can arrive in either order; the later native
+boundary defines duration. Final proof rejects missing/duplicate sequences,
+unpaired/unfinished lifetimes and loss. Task 8/9 consumers should preserve this
+recorder concurrency contract and raw trace evidence.

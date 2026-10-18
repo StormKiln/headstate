@@ -4,7 +4,7 @@ import {normalizeWorkload} from './workload.mjs';
 export const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function createChurnPlan(input){
  const workload=normalizeWorkload(input),p=workload.populations;
- assert.ok([150,250].includes(p.reviewing));assert.deepEqual({...p,reviewing:150},{authored:50,reviewing:150,repositories:50,members:50,history:250});assert.equal(workload.cadenceSeconds,60);assert.equal(workload.scheduleVersion,'churn-v2','explicit sustained schedule version required');assert.ok(Number.isSafeInteger(workload.seed),'integer seed required');
+ assert.ok([150,250].includes(p.reviewing));assert.deepEqual({...p,reviewing:150},{authored:50,reviewing:150,repositories:50,members:50,history:250});assert.equal(workload.cadenceSeconds,60);assert.equal(workload.scheduleVersion,'churn-v3','explicit sustained schedule version required');assert.ok(Number.isSafeInteger(workload.seed),'integer seed required');
  let seed=workload.seed>>>0;const random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
  const row=n=>({identity:`synthetic-lab/repo-${(n-1)%50+1}/${n}`,number:n,head:`head-${n}`,authored:n<=50,requested:n>50,draft:false,queued:false,terminal:'open',approved:false});
  const initial=Array.from({length:p.authored+p.reviewing},(_,i)=>row(i+1));
@@ -15,7 +15,7 @@ export function createChurnPlan(input){
  // A second cycle keeps external mutation obligations live throughout the
  // thirty-minute qualification, including the deliberately held detail.
  add('head',53,{head:`head-53-seed-${workload.seed}`});add('request-remove',numbers[5],{requested:false});add('request-add',numbers[5],{requested:true});add('draft',numbers[6],{draft:true});add('ready',numbers[6],{draft:false});add('queue',numbers[7],{queued:true});add('dequeue',numbers[7],{queued:false});add('head',51,{head:`head-51-seed-${workload.seed}-second`,approved:false});add('request-remove',numbers[8],{requested:false});add('request-add',numbers[8],{requested:true});add('draft',numbers[9],{draft:true});add('ready',numbers[9],{draft:false});
- return {schema:1,workload,initial,events,checkpointRevision:7,policy:{cadenceMs:60000,convergenceMs:180000,spacingMs:75000}};
+ return {schema:1,workload,initial,events,checkpointRevision:7,policy:churnPolicy(p.reviewing)};
 }
 export function initialOracle(plan){return {planHash:digest(plan),revision:0,rows:structuredClone(plan.initial),events:structuredClone(plan.events)};}
 export function advanceOracle(state,event,receipt){
@@ -53,9 +53,39 @@ export function assertChurnSchedule(events,revisions,policy){
  let previous;
  for(const event of events){
   assert.ok(Number.isFinite(event.actualOffsetMs)&&event.actualOffsetMs>=0,'actual issue timing required');
-  assert.ok(Number.isFinite(event.convergedOffsetMs)&&event.convergedOffsetMs>=event.actualOffsetMs&&event.convergedOffsetMs-event.actualOffsetMs<=policy.convergenceMs,'event convergence deadline');
+  assert.ok(Number.isFinite(event.convergedOffsetMs)&&event.convergedOffsetMs>=event.actualOffsetMs&&event.convergedOffsetMs-event.actualOffsetMs<=(policy.absenceMs?churnDeadline(event.kind,policy):policy.convergenceMs),'event convergence deadline');
   if(previous){assert.ok(event.actualOffsetMs-previous.actualOffsetMs>=policy.spacingMs,'minimum serialized issue spacing');assert.ok(event.actualOffsetMs>=previous.convergedOffsetMs,'prior obligation must converge');}
   previous=event;
  }
- assert.ok(!previous||previous.convergedOffsetMs<=revisions.length*(policy.spacingMs+policy.convergenceMs),'finite segment schedule bound');
+ assert.ok(!previous||previous.convergedOffsetMs<=events.reduce((sum,event)=>sum+policy.spacingMs+(policy.absenceMs?churnDeadline(event.kind,policy):policy.convergenceMs),0),'finite segment schedule bound');
+}
+
+export function churnPolicy(reviewing){
+ const scanSteps=Math.ceil(Math.ceil((reviewing+1)/25)/2);
+ return {cadenceMs:60000,spacingMs:75000,convergenceMs:180000,progressMs:180000,healthyStepMs:15000,continuationMs:15000,scanSteps,backgroundMs:2*scanSteps*45000+120000+30000,terminalMs:2*scanSteps*45000+120000+60000,absenceMs:2*scanSteps*45000+120000+90000+30000};
+}
+export function churnDeadline(kind,policy){return kind==='request-remove'?policy.absenceMs:['close','merge'].includes(kind)?policy.terminalMs:['approve','navigate'].includes(kind)?policy.convergenceMs:policy.backgroundMs;}
+export function assertHealthyChurnPhases(events,state={slots:new Map(),lastNs:-1,lastSeq:0}){
+ const slots=state.slots;let previousNs=state.lastNs,previousSeq=state.lastSeq;
+ for(const event of events){assert.ok(Number.isFinite(event.ns)&&event.ns>=0,'native phase timestamp required');if(event.seq!==undefined){assert.ok(event.seq===previousSeq+1,'native phase sequence must be contiguous (no loss)');previousSeq=event.seq;}previousNs=Math.max(previousNs,event.ns);
+  if(event.operation!=='scan-slot')continue;
+  if(event.stage==='begin'){assert.ok(!slots.has(event.id),'native phase duplicate start');slots.set(event.id,{id:event.id,startNs:event.ns,endNs:null,acceptedNs:null});}
+  if(['cancelled','complete','failed','accepted-reviewing'].includes(event.stage)){const slot=slots.get(event.id);assert.ok(slot,'native phase paired start required');assert.ok(event.ns>=slot.startNs,'native phase timestamps must be monotonic within slot');if(event.stage==='accepted-reviewing')slot.acceptedNs=event.ns;else{assert.equal(slot.endNs,null,'native phase duplicate end');slot.endNs=event.ns;}}
+ }
+ const phases=[...slots.values()].map(slot=>({...slot,durationMs:(Math.max(slot.acceptedNs??slot.startNs,slot.endNs??previousNs)-slot.startNs)/1e6}));
+ for(const phase of phases)assert.ok(phase.durationMs<=15000,'healthy native phase work must be bounded by 15s');
+ state.lastNs=previousNs;state.lastSeq=previousSeq;assert.ok(slots.size<=10000,'bounded native phase evidence');return {maxMs:Math.max(0,...phases.map(p=>p.durationMs)),phases,state};
+}
+export function observeChurnProgress(previous,{event,ledger,clients,now}){
+ const state=previous??{lastAt:now,frontiers:[],facts:[],confirmations:[],advances:[]};let advanced=false;
+ for(const entry of ledger){if(entry.status!==200||!entry.responseDelivered)continue;
+  if(entry.queryName==='QueueConfirmation'){
+   for(const proof of entry.confirmations??[]){const row=proof.direct,bucket=proof.bucket;const identity=row?.repository?.nameWithOwner+'/'+row?.number;if(identity!==event.identity||row.headRefOid!==event.previousHead||!Array.isArray(bucket?.nodes)||bucket.pageInfo?.hasNextPage!==false||bucket.issueCount!==bucket.nodes.length||bucket.nodes.some(n=>n.id===row.id))continue;
+    const last=state.confirmations.at(-1);if(state.confirmations.length<2&&(!last||entry.at-last.at>=60000)){state.confirmations.push({id:entry.id,at:entry.at});advanced=true;}
+   }
+  }else for(const search of entry.searches??[]){if(!search.query.includes('review-requested:@me'))continue;const key=JSON.stringify([search.query,search.after,search.ids]);if(!state.frontiers.includes(key)){state.frontiers.push(key);advanced=true;}}
+ }
+ for(const [role,client] of clients.entries()){if(!client.accepted)continue;const row=client.facts.find(row=>row.identity===event.identity);const key=JSON.stringify([role,row??null]);if(!state.facts.includes(key)){if(state.facts.some(key=>JSON.parse(key)[0]===role))advanced=true;state.facts.push(key);}}
+ if(advanced){state.lastAt=now;state.advances.push({at:now,frontiers:state.frontiers.length,confirmations:state.confirmations.length,facts:state.facts.length});}
+ assert.ok(now-state.lastAt<=180000,'meaningful affected-list progress must be bounded by 180s');return state;
 }
