@@ -9526,6 +9526,30 @@ pub(crate) mod enterprise_corpus {
             );
         }
     }
+    #[cfg(unix)]
+    fn make_unreadable(
+        path: &std::path::Path,
+    ) -> Result<(std::fs::Permissions, std::io::Error), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::metadata(path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0))
+            .map_err(|e| e.to_string())?;
+        match std::fs::File::open(path) {
+            Ok(_) => {
+                std::fs::set_permissions(path, permissions).map_err(|e| e.to_string())?;
+                Err("permission failure unavailable: actual open succeeded".into())
+            }
+            Err(error) => Ok((permissions, error)),
+        }
+    }
+    #[cfg(not(unix))]
+    fn make_unreadable(
+        _path: &std::path::Path,
+    ) -> Result<(std::fs::Permissions, std::io::Error), String> {
+        Err("permission fault requires Unix capability".into())
+    }
     impl Runtime {
         fn connection(
             &self,
@@ -9631,25 +9655,9 @@ pub(crate) mod enterprise_corpus {
                 if original.is_some() {
                     return Err("permission fault already enabled".into());
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let permissions = std::fs::metadata(&path)
-                        .map_err(|e| e.to_string())?
-                        .permissions();
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0))
-                        .map_err(|e| e.to_string())?;
-                    let probe = std::fs::File::open(&path);
-                    if probe.is_ok() {
-                        std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
-                        return Err("permission failure unavailable: actual open succeeded".into());
-                    }
-                    let error = probe.unwrap_err();
-                    *original = Some(permissions);
-                    self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).push(serde_json::json!({"kind":"permission-on","source":"synthetic/unreadable.jsonl","actualOpenError":error.to_string(),"osCode":error.raw_os_error()}));
-                }
-                #[cfg(not(unix))]
-                return Err("permission fault requires Unix capability".into());
+                let (permissions, error) = make_unreadable(&path)?;
+                *original = Some(permissions);
+                self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).push(serde_json::json!({"kind":"permission-on","source":"synthetic/unreadable.jsonl","actualOpenError":error.to_string(),"osCode":error.raw_os_error()}));
             } else if let Some(permissions) = original.take() {
                 std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
                 self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).push(serde_json::json!({"kind":"permission-off","source":"synthetic/unreadable.jsonl"}));

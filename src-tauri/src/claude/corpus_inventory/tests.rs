@@ -769,3 +769,104 @@ fn non_utf8_filename_preserves_identity_and_healthy_progress_across_reopen() {
         .unwrap();
     assert_eq!(raw, invalid.as_os_str().as_encoded_bytes());
 }
+
+#[test]
+fn unsupported_blob_sizes_follow_durable_directory_scope_across_reopen() {
+    let (dir, root, mut conn) = fixture(1);
+    finish(&mut conn, &root, &mut DiscoveryRuntime::default(), 64);
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT accepted FROM claude_corpus_epoch WHERE root=?1",
+            [root.to_string_lossy()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let project = root.join("synthetic");
+    let nested = project.join("subagents");
+    conn.execute(
+        "INSERT INTO claude_corpus_directory(root,generation,path,depth) VALUES(?1,?2,?3,2)",
+        params![root.to_string_lossy(), epoch, nested.to_string_lossy()],
+    )
+    .unwrap();
+    for (raw, directory, size) in [
+        (vec![255u8], &project, 23i64),
+        (vec![254u8], &nested, 47i64),
+    ] {
+        conn.execute("INSERT INTO claude_corpus_inventory(root,generation,path,directory,session_id,size_bytes,modified,issue) VALUES(?1,?2,?3,?4,NULL,?5,'recorded','unsupported native path')",params![root.to_string_lossy(),epoch,raw,directory.to_string_lossy(),size]).unwrap();
+    }
+    drop(conn);
+    let conn = crate::store::open_db(&dir.path().join("inventory.db")).unwrap();
+    let scan = load_processing_scan(&conn, &root).unwrap();
+    assert_eq!(scan.session_bytes, 23);
+    assert_eq!(scan.subagent_bytes, 47);
+    assert_eq!(scan.subagent_files_skipped, 1);
+    assert_eq!(scan.unsized_files, 0);
+    assert_eq!(scan.unreadable_files.len(), 2);
+    assert_eq!(scan.sessions.len(), 1);
+    assert!(scan.is_partial());
+    assert_eq!(
+        conn.query_row(
+            "SELECT accepted FROM claude_corpus_epoch WHERE root=?1",
+            [root.to_string_lossy()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        epoch
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM claude_corpus_inventory WHERE typeof(path)='blob'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn nested_non_utf8_filename_remains_skipped_subagent_across_reopen() {
+    use std::os::unix::ffi::OsStringExt;
+    let (dir, root, mut conn) = fixture(1);
+    let nested = root.join("synthetic/subagents");
+    std::fs::create_dir(&nested).unwrap();
+    let invalid = nested.join(std::ffi::OsString::from_vec(b"\xff.jsonl".to_vec()));
+    let body = b"unsupported nested synthetic transcript";
+    let (guard, expected_bytes, expected_unsized) = match std::fs::write(&invalid, body) {
+        Ok(()) => (None, body.len() as u64, 0),
+        Err(error) => {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+            let placeholder = nested.join("raw-name-fixture.jsonl");
+            std::fs::write(&placeholder, body).unwrap();
+            (
+                Some(super::super::corpus_probe::substitute_entry_path(
+                    placeholder,
+                    invalid.clone(),
+                )),
+                0,
+                1,
+            )
+        }
+    };
+    finish(&mut conn, &root, &mut DiscoveryRuntime::default(), 64);
+    drop(guard);
+    drop(conn);
+    let conn = crate::store::open_db(&dir.path().join("inventory.db")).unwrap();
+    let scan = load_processing_scan(&conn, &root).unwrap();
+    assert_eq!(scan.sessions.len(), 1);
+    assert_eq!(scan.session_bytes, 0);
+    assert_eq!(scan.subagent_bytes, expected_bytes);
+    assert_eq!(scan.subagent_files_skipped, 1);
+    assert_eq!(scan.unsized_files, expected_unsized);
+    assert_eq!(scan.unreadable_files.len(), 1);
+    assert!(scan.is_partial());
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT path FROM claude_corpus_inventory WHERE typeof(path)='blob'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, invalid.as_os_str().as_encoded_bytes());
+}

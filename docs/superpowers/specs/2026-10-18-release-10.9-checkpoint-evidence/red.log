@@ -1,4 +1,4 @@
-   Compiling headstate v0.1.0 (/Users/sthirlwall/code/ghstat/src-tauri)
+   Compiling headstate v0.1.0 (<checkout>/src-tauri)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 31.67s
      Running unittests src/lib.rs (src-tauri/target/debug/deps/headstate_lib-bd304ff4fe4a7524)
 

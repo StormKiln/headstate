@@ -1567,7 +1567,7 @@ mod tests {
             rusqlite::params![source.to_string_lossy(), offset.to_string(), payload],
         )
         .unwrap();
-        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES ('legacy','synthetic/repo',1,'https://github.com/synthetic/repo/pull/1','fixture')",[]).unwrap();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES ('legacy','synthetic-lab/repo',1,'https://github.com/synthetic-lab/repo/pull/1','fixture')",[]).unwrap();
         drop(conn);
         let mut conn = open_db(&path).unwrap();
         assert_eq!(

@@ -111,7 +111,7 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
         stop_reason: Some(PopulationStatus::Deferred),
         ..Default::default()
     };
-    let mut statement=conn.prepare("SELECT i.path,i.session_id,i.size_bytes,i.modified,i.issue FROM claude_corpus_inventory i JOIN claude_corpus_epoch e ON i.root=e.root WHERE i.root=?1 AND i.generation IN (e.accepted,e.staging) AND NOT EXISTS(SELECT 1 FROM claude_corpus_inventory n WHERE n.root=i.root AND n.path=i.path AND n.generation=e.staging AND i.generation=e.accepted AND e.accepted<>e.staging) ORDER BY i.path")?;
+    let mut statement=conn.prepare("SELECT i.path,i.session_id,i.size_bytes,i.modified,i.issue,CASE WHEN typeof(i.path)='blob' THEN (SELECT d.depth FROM claude_corpus_directory d WHERE d.root=i.root AND d.generation=i.generation AND d.path=i.directory) END FROM claude_corpus_inventory i JOIN claude_corpus_epoch e ON i.root=e.root WHERE i.root=?1 AND i.generation IN (e.accepted,e.staging) AND NOT EXISTS(SELECT 1 FROM claude_corpus_inventory n WHERE n.root=i.root AND n.path=i.path AND n.generation=e.staging AND i.generation=e.accepted AND e.accepted<>e.staging) ORDER BY i.path")?;
     let rows = statement.query_map([key.as_ref()], |r| {
         Ok((
             r.get::<_, rusqlite::types::Value>(0)?,
@@ -119,10 +119,11 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
         ))
     })?;
     for row in rows {
-        let (path, session, size, modified, issue) = row?;
+        let (path, session, size, modified, issue, diagnostic_depth) = row?;
         let path = match path {
             rusqlite::types::Value::Text(path) => path,
             // Unsupported native paths are durable diagnostics only. Never
@@ -130,7 +131,17 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
             rusqlite::types::Value::Blob(_) => {
                 scan.unreadable_files
                     .push("unsupported non-UTF-8 transcript path".into());
-                scan.session_bytes = scan.session_bytes.saturating_add(size as u64);
+                // Raw paths deliberately have no session ID. Their persisted
+                // directory scope, not lossy decoding, distinguishes sessions
+                // from excluded nested/subagent transcripts across restart.
+                match diagnostic_depth {
+                    Some(1) => scan.session_bytes = scan.session_bytes.saturating_add(size as u64),
+                    Some(depth) if depth > 1 => {
+                        scan.subagent_files_skipped += 1;
+                        scan.subagent_bytes = scan.subagent_bytes.saturating_add(size as u64);
+                    }
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                }
                 if modified.is_empty() {
                     scan.unsized_files += 1;
                 }
