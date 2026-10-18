@@ -1,3 +1,4 @@
+import {validateStartupEvidence} from './resources.mjs';
 import assert from 'node:assert/strict';
 import {assertCompatibleEnvironment,assertCompatibleWorkload,normalizeEnvironment} from './workload.mjs';
 
@@ -48,7 +49,7 @@ export function validateBaseline(baseline){
 }
 // Startup-only populations: whole fault/soak request totals are not comparable.
 export function compareBaseline(result,baseline){
- validateBaseline(baseline);assertCompatibleWorkload(result.workload,baseline.workload);assertCompatibleEnvironment(result.environment,baseline.environments[result.engine]);validateSamples(result);
+ validateBaseline(baseline);assertCompatibleWorkload(result.workload,baseline.workload);assertCompatibleEnvironment(result.environment,baseline.environments[result.engine]);validateSamples(result);validateStartupEvidence(result);
  const matching=baseline.summaries.filter(r=>r.engine===result.engine&&r.warm===result.warm);
  assert.deepEqual(matching.map(row=>row.role).sort(),['desktop','paired'],'matching baseline rows must contain exact roles');
  return result.samples.map(sample=>{

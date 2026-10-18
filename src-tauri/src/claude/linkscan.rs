@@ -112,6 +112,13 @@ pub struct Refreshed {
 /// Standalone callers receive the same atomicity through an owned transaction.
 pub fn reset(conn: &Connection, since_ms: i64) -> Result<(), crate::store::StoreError> {
     if conn.is_autocommit() {
+        #[cfg(feature = "enterprise-harness")]
+        let tx = crate::enterprise_harness::resources::transaction(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+            "corpus-links",
+        )?;
+        #[cfg(not(feature = "enterprise-harness"))]
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         reset(&tx, since_ms)?;
@@ -260,6 +267,13 @@ pub(crate) fn refresh_controlled(
         out.stopped = Some(reason);
         return Ok(out);
     }
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-links",
+    )?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if let Some(reason) = stopped(&tx, control, generation)? {
         out.stopped = Some(reason);
@@ -769,6 +783,8 @@ impl<R: Read> Read for CountedRead<'_, R> {
         }
         let limit = buffer.len().min(64 * 1024);
         let n = self.inner.read(&mut buffer[..limit])?;
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::resources::read_bytes("links", n);
         self.consumed += n as u64;
         Ok(n)
     }

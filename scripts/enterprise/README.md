@@ -161,3 +161,73 @@ identity, and rejects unsupported population descriptors rather than advertising
 250 PRs while serving 150. Generalized fixture populations belong to the churn
 extension; the current fixture remains deterministic and seed 9001 is recorded
 as workload provenance.
+
+### Resource observations (10.9 foundation)
+
+`make test-enterprise-resources` checks bounded raw-phase contracts and scoped native
+accounting; `make test-enterprise-corpus-resources` checks the actual instrumented
+production corpus call sites. `make lint-enterprise-resources` checks the opt-in
+feature, which ordinary builds do not compile. `make enterprise-run OUT=<new path>
+ENGINE=chromium MODE=baseline` retains the startup resource smoke; WebKit uses the
+same command with `ENGINE=webkit` and an explicitly unknown renderer heap.
+
+Native resource records share `native.ndjson`'s bounded recorder, sequence, monotonic
+clock and loss bit. Hooks are installed only for the exact observed Connection and
+removed on scope exit. Nested acquisition fails without replacing an outer hook;
+other connections cannot contribute. Only successful COMMIT publishes callbacks.
+Rollback, failed BEGIN/COMMIT and rollback failure are separate outcomes. Counts
+are SQLite callbacks, including named FTS shadow rows; WITHOUT ROWID, truncate
+DELETE and implicit REPLACE deletions are coverage holes, not logical row counts.
+Queue transactions retain deferred BEGIN: wait measures BEGIN admission, while hold
+includes possible later writer-upgrade contention. Corpus scopes retain immediate
+BEGIN. Records carry the actual transaction mode, and contracts require that mode.
+
+Application bytes are counted at returned reads for metadata, usage, search index
+and links. They include rereads, not physical I/O. Directory enumeration,
+stat/fingerprint calls, SQLite reads, network traffic and unscoped writes remain
+unknown. One-second and boundary native samples report inclusive process RSS,
+DB bytes and retained WAL length; absent WAL stays absent. The marker-gated profile
+inspector separately reads counts and PRAGMAs. Neither path sums WAL lengths as
+writes. Chromium CDP reports telemetry-inclusive renderer JS heap; WebKit,
+application-only and browser-process memory remain unknown. Result artifacts
+separately report recorder capacity/output bytes, renderer telemetry/commit entry
+counts, trace sizes, and parent Node RSS. No memory subtraction is performed.
+
+Startup comparisons now require raw resource boundaries and raw renderer
+observations: queue milestones, absolute detail milestones, actual commit arrays
+and long-task arrays. Detached `samples` are rejected even when under budget.
+`result.resources.evidence` holds raw resource records, `summary` must reconcile
+those records, and `startup` holds the browser observations used to derive startup
+metrics. `resources.json`, the original native recorder, renderer artifacts and
+parent sampling file remain retained. Recorder loss, required unknown probes,
+missing boundaries, incompatible coverage, duplicate sequences and native sampler
+gaps over 2.5 intervals reject the result.
+
+The mixed adapter in Task8 must explicitly bracket `idle`, `unchanged_refresh`,
+`active_ingestion` and `churn_restart` with authenticated controls named
+`resource-<phase>-start` and `resource-<phase>-end`, and collect the existing browser
+resource observer with `{phase: () => activePhase}` so every renderer sample names its phase. It must produce `resources.evidence.contract = "mixed"`, the
+same schema/coverage/sampler fields and a reconciled summary. Startup is not a
+substitute for mixed load. The batch foundation requires these additional witnesses:
+
+- `resourceIdentity`: generated `manifestSha256`, exact `toolchain`, and `phasePlan`
+  mapping the four phase names to fixed requested durations in milliseconds.
+- `mixedOutcome`: independent product/provider/corpus outcome facts, equal across
+  observer A/B arms. This must come from actual mixed-workload assertions.
+- Existing normalized workload/environment fields, `warm`, the exact native binary
+  SHA-256, and independent `parentObservation` fields. Source revision may change as
+  provenance; host, browser, build class, workload, phase plan and capability must match. Actual mixed phase duration must be within the requested duration and 2.5 seconds above it; larger scheduling overruns reject comparability.
+
+`make enterprise-resources OUT=<new batch> RESOURCE_STAGE=calibrate` reserves five
+cold and five warm Chromium fixed150 mixed observations on macOS arm64. It derives
+separate cold/warm limits and freezes them to `limits.json`, with explicit headroom.
+`RESOURCE_STAGE=validate LIMITS=<frozen limits.json>` makes five independent cold and
+five independent warm runs and never rewrites those limits. `RESOURCE_STAGE=overhead`
+makes five A/B pairs, alternating order. A uses `ENTERPRISE_RESOURCE_DISABLED=1` with
+the same compiled binary; it skips resource hooks, counters, sampler, timing and CDP
+measurement. The independent parent samples native RSS, Node RSS and DB/WAL in both
+arms and reports wall time, artifact size and existing native command durations.
+Tracing and ordinary product telemetry remain identical. Disabled observation is
+not a valid startup/resource baseline. These commands deliberately reject until the
+real mixed adapter supplies its witnesses; no calibration envelope has been claimed
+by the foundation smoke tests.

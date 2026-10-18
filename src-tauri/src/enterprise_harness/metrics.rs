@@ -18,6 +18,8 @@ struct Event {
     stage: &'static str,
     operation: &'static str,
     code: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<serde_json::Value>,
 }
 static TX: OnceLock<SyncSender<Event>> = OnceLock::new();
 static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -67,6 +69,7 @@ pub fn record(id: u64, stage: &'static str, operation: &'static str, code: u64) 
             stage,
             operation,
             code,
+            resource: None,
         };
         if tx.try_send(event).is_err() {
             LOST.store(true, Ordering::SeqCst);
@@ -279,4 +282,40 @@ pub fn accepted_revisions(slot: u64) -> Vec<u64> {
         .iter()
         .filter_map(|(id, revision)| (*id == slot).then_some(*revision))
         .collect()
+}
+
+/// Resource records share bounded recorder loss detection and its monotonic clock.
+pub fn resource(value: serde_json::Value) {
+    #[cfg(test)]
+    RESOURCE_CAPTURE.with(|events| events.borrow_mut().push(value.clone()));
+    if let Some(tx) = TX.get() {
+        let event = Event {
+            seq: SEQ.fetch_add(1, Ordering::Relaxed),
+            ns: START
+                .get()
+                .unwrap()
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            id: 0,
+            stage: "resource",
+            operation: "resource",
+            code: 0,
+            resource: Some(value),
+        };
+        if tx.try_send(event).is_err() {
+            LOST.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+pub fn mark_lost() {
+    LOST.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+thread_local! { static RESOURCE_CAPTURE: std::cell::RefCell<Vec<serde_json::Value>> = const { std::cell::RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+pub fn take_resource_capture() -> Vec<serde_json::Value> {
+    RESOURCE_CAPTURE.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }

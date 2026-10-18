@@ -629,3 +629,24 @@ enterprise-admission-probe:
 analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
 analyze-measurements:
 	@python3 scripts/measurement-report.py "$$MEASUREMENT_INPUT"
+
+.PHONY: test-enterprise-resources
+test-enterprise-resources:
+	cd src-tauri && cargo test --features enterprise-harness --lib resource_ -- --nocapture
+	node --test scripts/enterprise/resources.test.mjs scripts/enterprise/resource-batch.test.mjs scripts/enterprise/budgets.test.mjs scripts/enterprise/inspect-profile.test.mjs
+
+.PHONY: enterprise-resources
+enterprise-resources:
+	@test -n "$(OUT)" || (echo "OUT must be a new retained batch directory"; exit 1)
+	node scripts/enterprise-resources.mjs "$(OUT)" "$(or $(RESOURCE_STAGE),calibrate)" $(if $(LIMITS),"$(LIMITS)")
+
+.PHONY: test-enterprise-corpus-resources
+test-enterprise-corpus-resources:
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::store::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::search::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::linkscan::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::transcript::tests
+
+.PHONY: lint-enterprise-resources
+lint-enterprise-resources:
+	cd src-tauri && cargo clippy --features enterprise-harness --lib -- -D warnings

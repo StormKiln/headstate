@@ -1,3 +1,4 @@
+import {validateStartupEvidence} from './enterprise/resources.mjs';
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,cp} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
@@ -12,7 +13,7 @@ for(const engine of ['chromium','webkit'])for(let sample=1;sample<=5;sample++){
   const out=warm?resolve(root,`${engine}-warm-${sample}`):cold;
   const args=['scripts/enterprise-run.mjs',out,engine,'baseline',...(warm?[resolve(cold,'profile')]:[])];
   const code=await new Promise(r=>{const p=spawn(process.execPath,args,{stdio:'inherit'});p.on('exit',r);});
-  const result=JSON.parse(await readFile(resolve(out,'result.json'),'utf8'));validateSamples(result);if(results.length){assertCompatibleWorkload(result.workload,results[0].workload);const sameEngine=results.find(previous=>previous.engine===result.engine);if(sameEngine)assertCompatibleEnvironment(result.environment,sameEngine.environment);}results.push({...result,artifact:out});
+  const result=JSON.parse(await readFile(resolve(out,'result.json'),'utf8'));validateSamples(result);validateStartupEvidence(result);if(results.length){assertCompatibleWorkload(result.workload,results[0].workload);const sameEngine=results.find(previous=>previous.engine===result.engine);if(sameEngine)assertCompatibleEnvironment(result.environment,sameEngine.environment);}results.push({...result,artifact:out});
   await writeFile(resolve(root,'samples.json'),JSON.stringify(results,null,2));assert.equal(code,0);assert.equal(result.pass,true);
   if(!warm)await cp(resolve(cold,'profile'),resolve(cold,'profile-at-cold-shutdown'),{recursive:true});
  }

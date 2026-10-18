@@ -4939,6 +4939,14 @@ fn admit_population_state(
 ) -> Result<u64, String> {
     // All durable admission/cancellation operations take the database write
     // lock before the registry lock. No stale pause read can race a resume.
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-admission",
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -4962,6 +4970,14 @@ fn persist_population_pause(
     conn: &mut rusqlite::Connection,
     registry: &std::sync::Mutex<PopulationRegistry>,
 ) -> Result<(), String> {
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-pause",
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;

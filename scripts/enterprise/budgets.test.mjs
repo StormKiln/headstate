@@ -1,3 +1,4 @@
+import {fixture} from './resource-fixtures.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {compareBaseline,validateBaseline} from './budgets.mjs';
@@ -12,6 +13,8 @@ const summaries=['chromium','webkit'].flatMap(engine=>[false,true].flatMap(warm=
 })));
 const baseline={schema:2,workload:defaultWorkload,environments:{chromium:{...chromiumEnvironment,sourceRevision:'before'},webkit:{...environment,sourceRevision:'before'}},summaries};
 const result={engine:'webkit',warm:false,workload:defaultWorkload,environment,samples:[{role:'desktop',...metrics},{role:'paired',...metrics}],providerReceipts:4,longTaskCapability:{supported:false,value:null,reason:'unsupported'}};
+const rawStartup=engine=>Object.fromEntries(['desktop','paired'].map(role=>[role,{measurement:{lost:false},firstUsefulQueue:90,fullQueue:90,detail:{start:10,visible:100,draft:100,action:100},commits:[{actual:40},{actual:50}],longTasks:engine==='chromium'?[]:null}]));
+result.resources={...fixture().resources,startup:rawStartup('webkit')};
 test('measured baseline accepts complete bounded samples with explicit unsupported WebKit long tasks',()=>{
  assert.equal(compareBaseline(result,baseline).length,2);
 });
@@ -46,7 +49,12 @@ test('preflight requires the exact canonical baseline identities and engine envi
 });
 
 test('Chromium requires finite long-task measurements',()=>{
- const chromium={...result,engine:'chromium',environment:chromiumEnvironment,longTaskCapability:{supported:true},samples:result.samples.map(s=>({...s,longTaskCount:0,longTaskMs:0}))};
+ const chromium={...result,resources:{...fixture('chromium').resources,startup:rawStartup('chromium')},engine:'chromium',environment:chromiumEnvironment,longTaskCapability:{supported:true},samples:result.samples.map(s=>({...s,longTaskCount:0,longTaskMs:0}))};
  assert.equal(compareBaseline(chromium,baseline).length,2);
  assert.throws(()=>compareBaseline({...chromium,samples:chromium.samples.map(s=>({...s,longTaskCount:null}))},baseline),/longTaskCount/);
+});
+
+test('baseline rejects detached numeric summaries without raw phase evidence',()=>{
+ const missing={...result};delete missing.resources;assert.throws(()=>compareBaseline(missing,baseline),/raw phase/);
+ const forged=structuredClone(result);forged.samples[0].firstUsefulDetail=80;assert.throws(()=>compareBaseline(forged,baseline),/reconcile raw/);
 });

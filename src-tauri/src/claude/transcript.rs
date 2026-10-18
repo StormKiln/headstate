@@ -512,7 +512,10 @@ impl<R: Read> Read for ControlledReader<'_, R> {
             )));
         }
         let n = buffer.len().min(64 * 1024);
-        self.inner.read(&mut buffer[..n])
+        let returned = self.inner.read(&mut buffer[..n])?;
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::resources::read_bytes("metadata", returned);
+        Ok(returned)
     }
 }
 

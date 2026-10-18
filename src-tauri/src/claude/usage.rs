@@ -578,6 +578,8 @@ pub(crate) fn read_and_sum_cancellable(
         let n = file
             .read(&mut chunk[..count])
             .map_err(|e| format!("{}: could not read it: {e}", path.display()))?;
+        #[cfg(feature = "enterprise-harness")]
+        crate::enterprise_harness::resources::read_bytes("usage", n);
         if n == 0 {
             break;
         }

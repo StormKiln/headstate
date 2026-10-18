@@ -549,6 +549,13 @@ pub(crate) fn metadata_pass(
             progress.failed += 1;
             continue;
         }
+        #[cfg(feature = "enterprise-harness")]
+        let tx = crate::enterprise_harness::resources::transaction(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+            "corpus-metadata",
+        )?;
+        #[cfg(not(feature = "enterprise-harness"))]
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if control.stopped() || !generation_current(&tx, "metadata", generation)? {
             progress.status = control
@@ -688,6 +695,13 @@ fn populate_usage(
                 .push(format!("{}: changed while measuring usage", t.path));
             continue;
         }
+        #[cfg(feature = "enterprise-harness")]
+        let tx = crate::enterprise_harness::resources::transaction(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+            "corpus-usage",
+        )?;
+        #[cfg(not(feature = "enterprise-harness"))]
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if control.stopped() || !super::transcript::generation_current(&tx, "usage", generation)? {
             out.population.status = control
@@ -802,6 +816,13 @@ fn import_generation(
                 continue;
             }
         }
+        #[cfg(feature = "enterprise-harness")]
+        let tx = crate::enterprise_harness::resources::transaction(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+            "corpus-metadata",
+        )?;
+        #[cfg(not(feature = "enterprise-harness"))]
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if control.stopped() || !super::transcript::generation_current(&tx, "import", generation)? {
             out.population.status = control
@@ -866,6 +887,13 @@ fn import_generation(
         return Ok(out);
     }
 
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-metadata",
+    )?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if control.stopped() || !super::transcript::generation_current(&tx, "import", generation)? {
         out.population.status = control

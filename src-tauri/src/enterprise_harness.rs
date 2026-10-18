@@ -2,6 +2,7 @@
 //! Product calls use real handlers; paired calls traverse the real pinned mTLS listener.
 pub(crate) mod metrics;
 mod phone;
+pub(crate) mod resources;
 use crate::{commands, github::client::GitHubClient, poll, remote, store};
 use axum::{
     extract::{Path, State},
@@ -39,6 +40,8 @@ struct Config {
     provider: String,
     bridge_secret: String,
     ready: PathBuf,
+    #[serde(default)]
+    resource_disabled: bool,
 }
 struct Empty;
 impl Assets<Wry> for Empty {
@@ -324,6 +327,52 @@ async fn control(
                     .unwrap();
             }
         }
+        "resource-startup-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "startup",
+        ),
+        "resource-startup-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "startup",
+        ),
+        "resource-idle-start" => {
+            resources::sample(commands::db_path(&d.app).parent().unwrap(), "start", "idle")
+        }
+        "resource-idle-end" => {
+            resources::sample(commands::db_path(&d.app).parent().unwrap(), "end", "idle")
+        }
+        "resource-unchanged_refresh-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "unchanged_refresh",
+        ),
+        "resource-unchanged_refresh-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "unchanged_refresh",
+        ),
+        "resource-active_ingestion-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "active_ingestion",
+        ),
+        "resource-active_ingestion-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "active_ingestion",
+        ),
+        "resource-churn_restart-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "churn_restart",
+        ),
+        "resource-churn_restart-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "churn_restart",
+        ),
         "status" => {}
         _ => {
             return (
@@ -522,6 +571,7 @@ async fn setup(app: tauri::AppHandle, config: Config) -> Result<(), String> {
     for worker in workers {
         let _ = worker.await;
     }
+    resources::stop();
     metrics::finish();
     std::fs::write(
         config.profile.join("shutdown.json"),
@@ -550,6 +600,8 @@ pub fn run() {
     std::fs::write(marker, b"synthetic profile v1").unwrap();
     metrics::set_profile(&config.profile);
     metrics::start(&config.profile.join("native.ndjson")).expect("metrics recorder");
+    resources::configure(!config.resource_disabled);
+    resources::start(&config.profile);
     let db = config.profile.join("headstate.db");
     let conn = store::open_db(&db).unwrap();
     let prefs = poll::NotifyPrefs {
