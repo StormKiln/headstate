@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 try:
     import fcntl
@@ -68,6 +68,22 @@ class ToolFailureTests(unittest.TestCase):
                 with self.subTest(result=result), patch.object(module, "run_actionlint", return_value=result), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(module.main([str(path)]), 1)
 
+    @unittest.skipIf(os.name == "nt", "POSIX process groups are required")
+    def test_cleanup_errors_preserve_timeout_failure(self):
+        spec = importlib.util.spec_from_file_location("workflow_lint", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        process = Mock(pid=123)
+        process.wait.side_effect = [subprocess.TimeoutExpired("actionlint", .1), 0]
+        process.poll.return_value = 0
+        with patch.object(module.subprocess, "Popen", return_value=process), patch.object(module.os, "killpg", side_effect=PermissionError(1, "private detail")):
+            result = module.run_actionlint(["actionlint"])
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("deadline", result.stderr)
+        self.assertIn("cleanup failed: errno 1", result.stderr)
+        self.assertIn("expected actionlint pin", result.stderr)
+        self.assertNotIn("private detail", result.stderr)
+
 
 class BoundedProcessTests(unittest.TestCase):
     def make_tool(self, directory, body):
@@ -112,6 +128,41 @@ time.sleep(30)
             child = int(pid_file.read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(child, 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups are required")
+    def test_timeout_kills_ignoring_same_group_child_after_leader_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "ignoring.pid"
+            ready = Path(directory) / "ready"
+            self.make_tool(directory, f"""
+import json, os, signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', "import os,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);open({str(ready)!r},'w').write('ready');time.sleep(30)"])
+open({str(pid_file)!r}, 'w').write(str(child.pid))
+while not os.path.exists({str(ready)!r}): time.sleep(.01)
+print(json.dumps([{{'kind':'syntax-check','message':'before ignoring child','filepath':sys.argv[-1],'line':1,'column':1}}]), flush=True)
+time.sleep(30)
+""")
+            child = None
+            try:
+                started = time.monotonic()
+                result = self.run_lint(directory, timeout="0.5", grace="0.2")
+                child = int(pid_file.read_text())
+                self.assertTrue(ready.exists())
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("before ignoring child", result.stderr)
+                self.assertIn("deadline", result.stderr)
+                # Allow asynchronous OS reaping, but never silently leave it.
+                for _ in range(50):
+                    try: os.kill(child, 0)
+                    except ProcessLookupError: break
+                    time.sleep(.01)
+                with self.assertRaises(ProcessLookupError): os.kill(child, 0)
+            finally:
+                if child is None and pid_file.exists(): child = int(pid_file.read_text())
+                if child is not None:
+                    try: os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError: pass
 
     @unittest.skipIf(os.name == "nt", "POSIX process groups are required")
     def test_sigterm_ignoring_orphan_pipe_holder_cannot_hang_cleanup(self):

@@ -301,7 +301,7 @@ pub(crate) fn refresh_controlled(
         }
     }
     let mut removed = Vec::new();
-    if !scan.is_partial() {
+    if !scan.is_partial() && scan.absent_root.is_none() {
         let listed: std::collections::HashSet<&str> =
             scan.sessions.iter().map(|t| t.path.as_str()).collect();
         removed.extend(offsets.keys().filter(|p| !listed.contains(p.as_str())));
@@ -2148,6 +2148,35 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    #[test]
+    fn explicit_absent_root_never_prunes_a_legacy_checkpoint() {
+        let (dir, project, mut conn) = fixture();
+        let source = project.join("legacy.jsonl");
+        append(&source, &[link_line("legacy", "octocat/hello-world", 1)]);
+        reset(&conn, 0).unwrap();
+        refresh(
+            &mut conn,
+            &crate::claude::corpus(&dir.path().join("projects")),
+            BYTES_PER_PASS,
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_cursor(&conn).unwrap().unwrap().checkpoints.len(),
+            1
+        );
+        let missing = crate::claude::transcript::Scan {
+            absent_root: Some("synthetic missing root".into()),
+            ..Default::default()
+        };
+        assert!(!missing.is_partial());
+        refresh(&mut conn, &missing, BYTES_PER_PASS).unwrap();
+        assert_eq!(
+            checkpoint_cursor(&conn).unwrap().unwrap().checkpoints.len(),
+            1
+        );
+        assert_eq!(linked(&conn, 1), ["legacy"]);
     }
 
     /// A corpus root with one project directory, and a database.

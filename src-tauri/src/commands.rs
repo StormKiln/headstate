@@ -5043,6 +5043,216 @@ async fn admit_population(
 mod corpus_cancel_tests {
     use super::*;
     #[test]
+    fn missing_corpus_root_is_stable_absence_across_rotations_and_reopen() {
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("never-created");
+        let db = dir.path().join("absent.db");
+        let mut conn = open_db(&db).unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for first in 0..8usize {
+            if first == 4 {
+                drop(conn);
+                conn = open_db(&db).unwrap();
+            }
+            settings::set(
+                &conn,
+                settings::keys::CLAUDE_POPULATION_NEXT_LANE,
+                &(first % 4),
+            )
+            .unwrap();
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &std::sync::Mutex::new(PopulationRegistry::default()),
+                &slots,
+            );
+            for progress in [
+                out.metadata.unwrap(),
+                out.usage.unwrap(),
+                out.indexed.unwrap().population,
+            ] {
+                assert_eq!(
+                    progress.status,
+                    PopulationStatus::Complete,
+                    "fresh missing root is not failed discovery; first lane {first}"
+                );
+            }
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "stable absence must not churn epochs"
+            );
+        }
+        std::fs::create_dir_all(root.join("synthetic")).unwrap();
+        std::fs::write(
+            root.join("synthetic/new.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"new\",\"message\":{\"content\":\"new history\"}}\n",
+        )
+        .unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_root_with_legacy_facts_without_inventory_stays_qualified() {
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("missing");
+        let mut conn = open_db(&dir.path().join("legacy.db")).unwrap();
+        conn.execute("INSERT INTO claude_session(session_id,first_seen_at) VALUES('legacy','2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES('legacy','octocat/hello-world',1,'https://github.com/octocat/hello-world/pull/1','fixture')", []).unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for first in 0..4usize {
+            settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &std::sync::Mutex::new(PopulationRegistry::default()),
+                &slots,
+            );
+            for progress in [
+                out.metadata.unwrap(),
+                out.usage.unwrap(),
+                out.indexed.unwrap().population,
+            ] {
+                assert_eq!(progress.status, PopulationStatus::Deferred);
+                assert!(!progress.total_known);
+            }
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_session", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_session_pr", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn disappeared_corpus_root_preserves_accepted_index_and_links() {
+        use crate::claude::transcript::PopulationControl;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        std::fs::create_dir_all(root.join("synthetic")).unwrap();
+        std::fs::write(root.join("synthetic/stable.jsonl"), "{\"type\":\"user\",\"sessionId\":\"stable\",\"message\":{\"content\":\"https://github.com/octocat/hello-world/pull/1\"}}\n").unwrap();
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(root.join("synthetic/stable.jsonl")).unwrap(), "{}", serde_json::json!({"type":"pr-link","sessionId":"stable","prNumber":1,"prUrl":"https://github.com/octocat/hello-world/pull/1","prRepository":"octocat/hello-world","timestamp":"2026-09-11T12:00:00.000Z"})).unwrap();
+        let db = dir.path().join("retained.db");
+        let mut conn = open_db(&db).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        let epoch: (i64, i64) = conn
+            .query_row(
+                "SELECT accepted,staging FROM claude_corpus_epoch",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        for table in [
+            "claude_index_ledger",
+            "claude_link_checkpoint",
+            "claude_session_pr",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        std::fs::rename(&root, dir.path().join("retained-projects")).unwrap();
+        drop(conn);
+        let mut conn = open_db(&db).unwrap();
+        for _ in 0..8 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT accepted,staging FROM claude_corpus_epoch",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            epoch
+        );
+        for table in [
+            "claude_index_ledger",
+            "claude_link_checkpoint",
+            "claude_session_pr",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "missing root must preserve {table}"
+            );
+        }
+        std::fs::rename(dir.path().join("retained-projects"), &root).unwrap();
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn durable_pause_survives_reopen_and_automatic_admission_until_explicit_resume() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pause.db");
@@ -6110,7 +6320,8 @@ fn populate_live_corpus_with_controls(
             return out;
         }
     };
-    let mut scan = match crate::claude::corpus_inventory::load_processing_scan(conn, root) {
+    let mut scan = match crate::claude::corpus_inventory::load_population_scan(conn, root, control)
+    {
         Ok(scan) => scan,
         Err(error) => {
             out.index_health = IndexOutcome::Failed(error.to_string());
@@ -6150,7 +6361,7 @@ fn populate_live_corpus_with_controls(
                 Err(error) => {
                     log::warn!("claude: corpus discovery failed: {error}");
                     if let Ok(observed) =
-                        crate::claude::corpus_inventory::load_processing_scan(conn, root)
+                        crate::claude::corpus_inventory::load_population_scan(conn, root, control)
                     {
                         scan = observed;
                     }
@@ -9534,7 +9745,7 @@ pub(crate) mod enterprise_corpus {
         let permissions = std::fs::metadata(path)
             .map_err(|e| e.to_string())?
             .permissions();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
             .map_err(|e| e.to_string())?;
         match std::fs::File::open(path) {
             Ok(_) => {

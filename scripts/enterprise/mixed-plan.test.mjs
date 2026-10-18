@@ -18,3 +18,10 @@ test('validation rejects a mismatched frozen descriptor before output or child l
  const root=await mkdtemp(resolve(tmpdir(),'r109-batch-policy-'));const guard=await spawnGuard(root);const policy=resolve(root,'limits.json');await writeFile(policy,JSON.stringify({schema:1,stage:'frozen',resourceIdentity:{segmentPhasePlan:{}}}));const out=resolve(root,'out');
  const run=spawnSync(process.execPath,[...guard.args,'scripts/enterprise-resources.mjs',out,'validate',policy],{env:{...process.env,ENTERPRISE_MIXED_PHASE_PLAN:resolve('scripts/enterprise/mixed-phase-plan-10.9.json')},encoding:'utf8',timeout:5000});assert.equal(run.status,1);assert.match(run.stderr,/frozen phase descriptor/);await assert.rejects(access(out));await assert.rejects(access(guard.marker));
 });
+
+test('matching phase plan with malformed frozen coverage rejects without launching a sample',async()=>{
+ const root=await mkdtemp(resolve(tmpdir(),'r109-batch-malformed-policy-')),guard=await spawnGuard(root),out=resolve(root,'out'),policy=resolve(root,'limits.json');
+ await writeFile(policy,JSON.stringify({schema:1,stage:'frozen',resourceIdentity:{segmentPhasePlan:fixed.segments},coverage:{}}));
+ const run=spawnSync(process.execPath,[...guard.args,'scripts/enterprise-resources.mjs',out,'validate',policy],{env:{...process.env,ENTERPRISE_MIXED_PHASE_PLAN:resolve('scripts/enterprise/mixed-phase-plan-10.9.json')},encoding:'utf8',timeout:5000});
+ assert.equal(run.status,1);assert.doesNotMatch(run.stderr,/unexpected child launch/);await assert.rejects(access(out));await assert.rejects(access(guard.marker));
+});

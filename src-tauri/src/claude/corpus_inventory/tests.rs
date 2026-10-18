@@ -870,3 +870,176 @@ fn nested_non_utf8_filename_remains_skipped_subagent_across_reopen() {
         .unwrap();
     assert_eq!(raw, invalid.as_os_str().as_encoded_bytes());
 }
+
+#[test]
+#[cfg(unix)]
+fn unsupported_raw_directories_do_not_alias_or_starve_healthy_sources() {
+    use std::os::unix::ffi::OsStringExt;
+    for nested in [false, true] {
+        let (dir, root, mut conn) = fixture(1);
+        let mut runtime = DiscoveryRuntime::default();
+        finish(&mut conn, &root, &mut runtime, 64);
+        let parent = if nested {
+            root.join("synthetic")
+        } else {
+            root.clone()
+        };
+        let invalid = parent.join(std::ffi::OsString::from_vec(vec![255]));
+        let (physical, guard) = match std::fs::create_dir(&invalid) {
+            Ok(()) => (invalid.clone(), None),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+                let placeholder = parent.join("raw-directory-fixture");
+                std::fs::create_dir(&placeholder).unwrap();
+                (
+                    placeholder.clone(),
+                    Some(super::super::corpus_probe::substitute_entry_path(
+                        placeholder,
+                        invalid.clone(),
+                    )),
+                )
+            }
+        };
+        std::fs::write(physical.join("hidden.jsonl"), "hidden bytes are unknown").unwrap();
+        let replacement = parent.join("�");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("valid-replacement.jsonl"), "").unwrap();
+        std::fs::create_dir(root.join("z-healthy")).unwrap();
+        std::fs::write(root.join("z-healthy/later.jsonl"), "").unwrap();
+        let mut saw_healthy = false;
+        for tick in 0..24 {
+            if tick == 8 {
+                drop(conn);
+                conn = crate::store::open_db(&dir.path().join("inventory.db")).unwrap();
+                runtime = DiscoveryRuntime::default();
+            }
+            let slice = reconcile_with_limit(
+                &mut conn,
+                &root,
+                &PopulationControl::discovery(),
+                &mut runtime,
+                16,
+            )
+            .unwrap();
+            assert!(
+                slice.scan.sessions.iter().any(|s| s.session_id == "s-0000"),
+                "accepted sibling retained"
+            );
+            if slice.scan.sessions.iter().any(|s| s.session_id == "later") {
+                saw_healthy = true;
+                assert!(
+                    slice.scan.is_partial(),
+                    "unsupported subtree stays qualified"
+                );
+                super::super::search::index_pass_controlled(
+                    &mut conn,
+                    &slice.scan,
+                    &PopulationControl::discovery(),
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            saw_healthy,
+            "healthy new sibling must publish despite raw directory"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM claude_index_ledger WHERE session_id='later'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "healthy candidate reached actual stored index"
+        );
+        let scan = load_processing_scan(&conn, &root).unwrap();
+        assert!(scan
+            .unreadable_dirs
+            .iter()
+            .any(|d| d.contains("unsupported non-UTF-8 directory")));
+        assert!(!scan.sessions.iter().any(|s| s.session_id == "hidden"));
+        if !nested {
+            assert!(scan
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "valid-replacement"));
+        }
+        let raw_count: i64 = conn.query_row("SELECT count(*) FROM claude_corpus_directory d JOIN claude_corpus_epoch e ON d.root=e.root AND d.generation=e.accepted WHERE typeof(d.path)='blob'", [], |r| r.get(0)).unwrap();
+        assert_eq!(raw_count, 1);
+        let valid_count: i64 = conn.query_row("SELECT count(*) FROM claude_corpus_directory d JOIN claude_corpus_epoch e ON d.root=e.root AND d.generation=e.accepted WHERE d.path=?1", [replacement.to_str().unwrap()], |r| r.get(0)).unwrap();
+        assert_eq!(
+            valid_count, 1,
+            "replacement character directory has independent identity"
+        );
+        drop(guard);
+        std::fs::rename(&physical, dir.path().join("retained-raw-directory")).unwrap();
+        let recovered = finish(&mut conn, &root, &mut runtime, 128);
+        assert!(!recovered.scan.is_partial());
+        assert!(recovered
+            .scan
+            .sessions
+            .iter()
+            .any(|s| s.session_id == "later"));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn unreadable_root_is_partial_and_never_reported_as_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, root, mut conn) = fixture(1);
+    let permissions = std::fs::metadata(&root).unwrap().permissions();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let probe = std::fs::read_dir(&root);
+    let result = reconcile_corpus(
+        &mut conn,
+        &root,
+        &PopulationControl::discovery(),
+        &mut DiscoveryRuntime::default(),
+    );
+    std::fs::set_permissions(&root, permissions).unwrap();
+    assert_eq!(
+        probe.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let scan = result.unwrap().scan;
+    assert!(scan.absent_root.is_none());
+    assert!(scan.is_partial());
+    assert!(!scan.unreadable_dirs.is_empty());
+}
+
+#[test]
+fn cancelled_missing_root_probe_retains_cancellation_without_absence_authority() {
+    let (dir, _, conn) = fixture(0);
+    let root = dir.path().join("missing");
+    let control = PopulationControl::discovery();
+    control.cancel();
+    let scan = load_population_scan(&conn, &root, &control).unwrap();
+    assert!(scan.absent_root.is_none());
+    assert!(scan.is_partial());
+    assert_eq!(scan.stop_reason, control.stop_reason());
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn non_directory_root_is_partial_instead_of_absent() {
+    let (dir, _, mut conn) = fixture(0);
+    let root = dir.path().join("file-not-directory");
+    std::fs::write(&root, "synthetic").unwrap();
+    let result = reconcile_corpus(
+        &mut conn,
+        &root,
+        &PopulationControl::discovery(),
+        &mut DiscoveryRuntime::default(),
+    )
+    .unwrap();
+    assert!(result.scan.absent_root.is_none());
+    assert!(result.scan.is_partial());
+    assert!(!result.authoritative);
+}

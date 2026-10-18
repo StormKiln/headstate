@@ -51,3 +51,9 @@ test('write budget table keys exactly cover the native scoped callback allowlist
  const source=readFileSync(new URL('../../src-tauri/src/enterprise_harness/resources.rs',import.meta.url),'utf8').split('fn table_name')[1].split('type Mutations')[0];
  assert.deepEqual(mutationBudgetTables,[...source.matchAll(/"([a-z_]+)" =>/g)].map(match=>match[1]));
 });
+
+import {validateFrozenResourcePolicy} from './resource-batch.mjs';
+test('static frozen policy admission rejects malformed descriptors, unknown keys and absent/non-numeric limits',()=>{
+ const policy=deriveResourceLimits(resourceBatchPlan('calibrate').map(item=>mixed(item.warm)));validateFrozenResourcePolicy(policy);
+ for(const mutate of [p=>delete p.sourceRevisions,p=>p.headroom=null,p=>p.coverage={},p=>p.workload.populations.reviewing=250,p=>p.environment.browser.version=null,p=>p.resourceIdentity.toolchain='',p=>delete p.limits.warm,p=>delete p.limits.cold['idle.transactions'],p=>p.limits.cold.commandLatencyMaxMs=NaN,p=>p.limits.cold.commandLatencyMaxMs=-1,p=>p.limits.cold.extra=2,p=>p.limits.warm={}]){const bad=structuredClone(policy);mutate(bad);assert.throws(()=>validateFrozenResourcePolicy(bad));}
+});

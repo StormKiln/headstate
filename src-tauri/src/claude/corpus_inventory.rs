@@ -102,6 +102,52 @@ fn io(error: std::io::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(error))
 }
 
+fn path_identity(path: &Path) -> rusqlite::types::Value {
+    match path.to_str() {
+        Some(path) => rusqlite::types::Value::Text(path.to_owned()),
+        None => rusqlite::types::Value::Blob(path.as_os_str().as_encoded_bytes().to_vec()),
+    }
+}
+fn root_is_missing(root: &Path) -> bool {
+    matches!(std::fs::metadata(root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+/// Materialized source evidence only: progress/control generations and an empty
+/// import baseline are not history. EXISTS remains bounded and avoids counting
+/// or loading rows. Legacy facts can precede inventory migration.
+pub(crate) fn has_materialized_source_authority(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM claude_session) OR EXISTS(SELECT 1 FROM claude_subagent) OR EXISTS(SELECT 1 FROM claude_session_usage) OR EXISTS(SELECT 1 FROM claude_session_model) OR EXISTS(SELECT 1 FROM claude_session_pr) OR EXISTS(SELECT 1 FROM claude_index_ledger) OR EXISTS(SELECT 1 FROM claude_usage_ledger) OR EXISTS(SELECT 1 FROM claude_fts_identity) OR EXISTS(SELECT 1 FROM claude_link_checkpoint)", [], |r| r.get(0))
+}
+fn mark_absent_root(conn: &Connection, scan: &mut Scan, root: &Path) -> rusqlite::Result<()> {
+    scan.absent_root = Some(root.display().to_string());
+    // A missing root is distinct from an unreadable directory. Previously
+    // accepted sources remain qualified and cannot authorize pruning.
+    scan.unreadable_dirs.clear();
+    scan.stop_reason = if scan.sessions.is_empty()
+        && scan.unreadable_files.is_empty()
+        && !has_materialized_source_authority(conn)?
+    {
+        None
+    } else {
+        Some(PopulationStatus::Deferred)
+    };
+    Ok(())
+}
+/// Admit the root's current existence before the first processing lane without
+/// enumerating it or modifying inventory. Cancellation retains its own status.
+pub(crate) fn load_population_scan(
+    conn: &Connection,
+    root: &Path,
+    control: &PopulationControl,
+) -> rusqlite::Result<Scan> {
+    let mut scan = load_processing_scan(conn, root)?;
+    if let Some(reason) = control.stop_reason() {
+        scan.stop_reason = Some(reason);
+    } else if root_is_missing(root) {
+        mark_absent_root(conn, &mut scan, root)?;
+    }
+    Ok(scan)
+}
+
 /// Loading does no filesystem traversal or body reads. Cached membership stays
 /// qualified until this admission completes a fresh revalidated epoch. Each
 /// processing lane still certifies the actual source it reads before commit.
@@ -184,11 +230,18 @@ pub(crate) fn load_processing_scan(conn: &Connection, root: &Path) -> rusqlite::
     }
     let mut failures=conn.prepare("SELECT d.path,d.issue FROM claude_corpus_directory d JOIN claude_corpus_epoch e ON d.root=e.root AND d.generation=e.staging WHERE d.root=?1 AND d.issue IS NOT NULL")?;
     for row in failures.query_map([key.as_ref()], |r| {
-        Ok(format!(
-            "{}: {}",
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?
-        ))
+        let path = match r.get::<_, rusqlite::types::Value>(0)? {
+            rusqlite::types::Value::Text(path) => path,
+            rusqlite::types::Value::Blob(_) => "unsupported non-UTF-8 directory".into(),
+            other => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "path".into(),
+                    other.data_type(),
+                ))
+            }
+        };
+        Ok(format!("{path}: {}", r.get::<_, String>(1)?))
     })? {
         scan.unreadable_dirs.push(row?);
     }
@@ -249,6 +302,17 @@ fn reconcile_with_limit(
     runtime: &mut DiscoveryRuntime,
     limit: usize,
 ) -> rusqlite::Result<DiscoverySlice> {
+    if !control.stopped() && root_is_missing(root) {
+        let scan = load_population_scan(conn, root, control)?;
+        runtime.current = None;
+        runtime.attempting = None;
+        runtime.key = None;
+        return Ok(DiscoverySlice {
+            authoritative: !scan.is_partial(),
+            scan,
+            ..Default::default()
+        });
+    }
     let mut result = DiscoverySlice::default();
     let bounded = control.with_slice_budget(SLICE);
     let answer = reconcile(conn, root, control, &bounded, runtime, &mut result, limit);
@@ -305,7 +369,7 @@ fn reconcile_with_limit(
     }
     if result.authoritative {
         result.scan.stop_reason = None;
-        let mut q=conn.prepare("SELECT path,entries,certificate FROM claude_corpus_directory WHERE root=?1 AND generation=?2 ORDER BY path")?;
+        let mut q=conn.prepare("SELECT path,entries,certificate FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' ORDER BY path")?;
         for row in q.query_map(params![root.to_string_lossy(), result.epoch], |r| {
             Ok((PathBuf::from(r.get::<_, String>(0)?), r.get(1)?, r.get(2)?))
         })? {
@@ -387,9 +451,9 @@ fn reconcile(
         if runtime.current.is_none() {
             flush(conn, &key, generation, control, &mut pending)?;
             let query = match phase {
-                0 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND certificate IS NULL AND issue IS NULL ORDER BY depth,path LIMIT 1",
-                1 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND validated=0 AND issue IS NULL ORDER BY depth,path LIMIT 1",
-                2 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND validated=1 AND issue IS NULL ORDER BY depth,path LIMIT 1",
+                0 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND certificate IS NULL AND issue IS NULL ORDER BY depth,path LIMIT 1",
+                1 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND validated=0 AND issue IS NULL ORDER BY depth,path LIMIT 1",
+                2 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND validated=1 AND issue IS NULL ORDER BY depth,path LIMIT 1",
                 _ => return Err(rusqlite::Error::InvalidQuery),
             };
             let mut next: Option<(String, i64)> = conn
@@ -402,9 +466,9 @@ fn reconcile(
                 // A permanently unreadable project cannot pin healthy siblings
                 // or another failed project that has since become readable.
                 let failed_query=match phase {
-                    0 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND certificate IS NULL AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
-                    1 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND validated=0 AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
-                    _ => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND validated=1 AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
+                    0 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND certificate IS NULL AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
+                    1 => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND validated=0 AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
+                    _ => "SELECT path,depth FROM claude_corpus_directory WHERE root=?1 AND generation=?2 AND typeof(path)='text' AND validated=1 AND issue IS NOT NULL ORDER BY failures,path LIMIT 1",
                 };
                 next = conn
                     .query_row(failed_query, params![key, generation], |r| {
@@ -659,7 +723,11 @@ fn flush(
     for observation in pending.iter() {
         match observation {
             Observation::Directory(path, depth) => {
-                tx.execute("INSERT OR IGNORE INTO claude_corpus_directory(root,generation,path,depth) VALUES (?1,?2,?3,?4)",params![root,generation,path.to_string_lossy(),depth])?;
+                let unsupported = path.to_str().is_none();
+                // Unsupported directory bodies are never opened through a lossy
+                // alias. Keep exact identity and a durable partial diagnostic;
+                // the parent's byte-exact certificate detects removal/rename.
+                tx.execute("INSERT OR IGNORE INTO claude_corpus_directory(root,generation,path,depth,issue) VALUES (?1,?2,?3,?4,?5)",params![root,generation,path_identity(path),depth,unsupported.then_some("unsupported directory path; subtree not scanned")])?;
             }
             Observation::File {
                 path,
@@ -672,13 +740,8 @@ fn flush(
                 // SQLite preserves BLOB/TEXT identity in equality joins and the
                 // primary key. Raw unsupported names cannot collide with a valid
                 // UTF-8 replacement-character filename. They are never sources.
-                let stored_path = match path.to_str() {
-                    Some(path) => rusqlite::types::Value::Text(path.to_owned()),
-                    None => {
-                        rusqlite::types::Value::Blob(path.as_os_str().as_encoded_bytes().to_vec())
-                    }
-                };
-                tx.execute("INSERT INTO claude_corpus_inventory(root,generation,path,directory,session_id,size_bytes,modified,issue) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root,generation,path) DO UPDATE SET session_id=excluded.session_id,size_bytes=excluded.size_bytes,modified=excluded.modified,issue=excluded.issue",params![root,generation,stored_path,directory.to_string_lossy(),session,size,modified,issue])?;
+                let stored_path = path_identity(path);
+                tx.execute("INSERT INTO claude_corpus_inventory(root,generation,path,directory,session_id,size_bytes,modified,issue) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root,generation,path) DO UPDATE SET session_id=excluded.session_id,size_bytes=excluded.size_bytes,modified=excluded.modified,issue=excluded.issue",params![root,generation,stored_path,path_identity(directory),session,size,modified,issue])?;
             }
         }
     }

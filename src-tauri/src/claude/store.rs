@@ -477,9 +477,14 @@ pub(crate) fn metadata_pass(
     let generation = super::transcript::population_generation(conn, "metadata")?;
     let _activity = PopulationActivity::new(conn, "metadata", generation);
     let mut progress = scan.population_progress();
-    // Metadata coverage keeps the existing absent-root qualification; an
-    // import on a machine with no history is still a complete empty list.
-    progress.total_known &= scan.absent_root.is_none();
+    // Confirmed absence with no source history is an honest empty population.
+    // Legacy materialized facts may exist before an inventory was established;
+    // their unavailable root must remain qualified rather than certify zero.
+    if scan.absent_root.is_some()
+        && super::corpus_inventory::has_materialized_source_authority(conn)?
+    {
+        progress.total_known = false;
+    }
     progress.phase = PopulationPhase::Metadata;
     progress.failed = scan.unreadable_files.len() as u64;
     persist_progress(conn, "metadata", generation, &progress)?;

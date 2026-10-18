@@ -4,13 +4,13 @@ import {validateMixedPhasePlan} from './enterprise/mixed-plan.mjs';
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,readdir} from 'node:fs/promises';
 import {spawn} from 'node:child_process';import {resolve} from 'node:path';
-import {resourceBatchPlan,resourceBatchInvocation,deriveResourceLimits,validateResourceLimits,compareObserverPair} from './enterprise/resource-batch.mjs';
+import {resourceBatchPlan,resourceBatchInvocation,deriveResourceLimits,validateResourceLimits,compareObserverPair,validateFrozenResourcePolicy} from './enterprise/resource-batch.mjs';
 const root=resolve(process.argv[2]),stage=process.argv[3]??'calibrate';
 const plan=resourceBatchPlan(stage);
 assert.ok(process.env.ENTERPRISE_MIXED_PHASE_PLAN,'ENTERPRISE_MIXED_PHASE_PLAN required before any batch launch');
 const phasePlan=validateMixedPhasePlan(JSON.parse(await readFile(process.env.ENTERPRISE_MIXED_PHASE_PLAN,'utf8')));
 const policy=stage==='validate'?JSON.parse(await readFile(process.argv[4],'utf8')):undefined;
-if(policy){assert.equal(policy.schema,1);assert.equal(policy.stage,'frozen');assert.deepEqual(policy.resourceIdentity.segmentPhasePlan,phasePlan.segments,'validation must use frozen phase descriptor');}
+if(policy){assert.equal(policy.schema,1);assert.equal(policy.stage,'frozen');assert.deepEqual(policy.resourceIdentity.segmentPhasePlan,phasePlan.segments,'validation must use frozen phase descriptor');validateFrozenResourcePolicy(policy);}
 await mkdir(root,{recursive:true});assert.equal((await readdir(root)).length,0,'retain previous batches; use a new output path');
 await writeFile(resolve(root,'plan.json'),JSON.stringify({stage,plan,phasePlan,policy},null,2));
 const runs=[];

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {assertCompatibleEnvironment,assertCompatibleWorkload} from './workload.mjs';
+import {assertCompatibleEnvironment,assertCompatibleWorkload,normalizeWorkload,normalizeEnvironment} from './workload.mjs';
 import {validateResourceResult,resourceCoverage} from './resources.mjs';
 
 export function resourceBatchPlan(stage){
@@ -53,8 +53,37 @@ export function deriveResourceLimits(runs){
  const limits={cold:{},warm:{}};for(const run of runs)for(const [key,value] of Object.entries(metricVector(run))){const arm=limits[run.warm?'warm':'cold'];assert.ok(Number.isFinite(value)&&value>=0,`${key} measured calibration value required`);const count=key.endsWith('.transactions')||key.includes('.mutations.');const limit=count?(value===0?0:Math.ceil(value*2+1)):Math.ceil(value*2+(key.endsWith('Ns')?1_000_000:key.endsWith('Ms')?500:1024*1024));arm[key]=Math.max(arm[key]??0,limit);}
  return {schema:1,stage:'frozen',workload:reference.workload,environment:reference.environment,resourceIdentity:reference.resourceIdentity,coverage:resourceCoverage,sourceRevisions:[...new Set(runs.map(r=>r.environment.sourceRevision))],sampleDesign:'5 cold + 5 warm; maximum with engineering headroom, no p95 claim',headroom:'2 * observed maximum + 1 MiB for sizes, + 1 ms for transaction timing, + 500 ms command latency; scoped transaction/callback counts: 2 * observed maximum + 1 occurrence, but observed-zero remains zero; unknown tables reject',mutationBudgetTables,limits};
 }
+export function validateFrozenResourcePolicy(policy){
+ assert.equal(policy?.schema,1);assert.equal(policy.stage,'frozen');
+ assert.ok(Array.isArray(policy.sourceRevisions)&&policy.sourceRevisions.length>0&&policy.sourceRevisions.every(s=>typeof s==='string'&&s.length>0),'source revision provenance required');
+ for(const key of ['sampleDesign','headroom'])assert.ok(typeof policy[key]==='string'&&policy[key].length>0,`${key} required`);
+ assert.deepEqual(policy.coverage,resourceCoverage);assert.deepEqual(policy.mutationBudgetTables,mutationBudgetTables);
+ const workload=normalizeWorkload(policy.workload),environment=normalizeEnvironment(policy.environment);
+ assert.equal(workload.scenario,'mixed');assert.equal(workload.populations.reviewing,150);
+ assert.equal(environment.platform,'darwin');assert.equal(environment.architecture,'arm64');assert.equal(environment.browser.engine,'chromium');
+ const identity=policy.resourceIdentity;assert.equal(identity?.phasePlanStatus,'fixed');
+ for(const key of ['manifestSha256','toolchain'])assert.ok(typeof identity[key]==='string'&&identity[key].length>0);
+ const segments=identity.segmentPhasePlan;assert.deepEqual(Object.keys(segments??{}).sort(),['initial','resumed']);
+ assert.deepEqual(Object.keys(segments.initial??{}).sort(),['active_ingestion','churn_restart','idle','unchanged_refresh']);assert.deepEqual(Object.keys(segments.resumed??{}),['churn_restart']);
+ for(const n of Object.values(segments).flatMap(Object.values))assert.ok(Number.isSafeInteger(n)&&n>0);
+ const phases=['idle','unchanged_refresh','active_ingestion','churn_restart'];assert.deepEqual(Object.keys(identity.phasePlan??{}).sort(),[...phases].sort());
+ for(const phase of phases)assert.equal(identity.phasePlan[phase],(segments.initial[phase]??0)+(segments.resumed[phase]??0));
+ assert.deepEqual(Object.keys(policy.limits??{}).sort(),['cold','warm']);
+ const required=new Set(['commandLatencyMaxMs']),optional=new Set();
+ for(const phase of phases){
+  for(const key of ['transactions','nativeRssPeak','dbPeak','writerWaitMaxNs','transactionHoldMaxNs','rendererJsHeapInclusive.desktop','rendererJsHeapInclusive.paired',...['metadata','usage','index','links'].map(lane=>`readBytes.${lane}`),...(phase==='churn_restart'?['initial','resumed']:['initial']).map(segment=>`${segment}.nativeRssGrowth`)])required.add(`${phase}.${key}`);
+  for(const table of mutationBudgetTables)for(const action of ['insert','update','delete'])required.add(`${phase}.mutations.${table}.${action}`);
+  optional.add(`${phase}.walRetainedPeak`);
+ }
+ for(const limits of Object.values(policy.limits)){
+  assert.ok(limits&&typeof limits==='object'&&!Array.isArray(limits),'numeric frozen limits required');
+  for(const key of required)assert.ok(Object.hasOwn(limits,key),`${key} missing from frozen limits`);
+  for(const [key,value] of Object.entries(limits)){assert.ok(required.has(key)||optional.has(key),`${key} unknown frozen metric`);assert.ok(Number.isSafeInteger(value)&&value>=0,`${key} must be a finite nonnegative integer`);}
+ }
+ return policy;
+}
 export function validateResourceLimits(run,policy){
- assert.equal(policy.schema,1);assert.equal(policy.stage,'frozen');assert.deepEqual(policy.coverage,resourceCoverage);assert.deepEqual(policy.mutationBudgetTables,mutationBudgetTables);
+ validateFrozenResourcePolicy(policy);
  assertResourceComparable(run,policy);
  assert.deepEqual(Object.keys(policy.limits).sort(),['cold','warm']);const limits=policy.limits[run.warm?'warm':'cold'];const vector=metricVector(run);for(const [key,limit] of Object.entries(limits)){assert.ok(Number.isFinite(limit)&&limit>=0);assert.ok(Number.isFinite(vector[key]),`${key} required`);assert.ok(vector[key]<=limit,`${key} exceeds calibrated limit`);}
  for(const key of Object.keys(vector))assert.ok(Object.hasOwn(limits,key),`${key} absent from frozen calibration`);

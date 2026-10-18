@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ACTIONLINT_REVISION = "fd33e9f582a01a02885c93ae3775e1190cf63653"
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -110,27 +111,50 @@ def run_actionlint(command):
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
+            cleanup_errors = []
+            def signal_owned(sig):
+                try:
+                    if os.name == "nt":
+                        process.terminate() if sig == signal.SIGTERM else process.kill()
+                    else:
+                        os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    cleanup_errors.append(f"owned-group cleanup failed: errno {error.errno}")
+            signal_owned(signal.SIGTERM)
+            grace_deadline = time.monotonic() + grace
             try:
                 process.wait(timeout=grace)
             except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=grace)
+                pass
+            # The group can outlive its leader. Give surviving children their
+            # grace period, then KILL the owned group independently of wait().
+            if os.name != "nt":
+                while time.monotonic() < grace_deadline:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        break
+                    except OSError:
+                        break
+                    time.sleep(min(0.01, max(0, grace_deadline - time.monotonic())))
+            signal_owned(getattr(signal, "SIGKILL", None))
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("direct child did not exit after KILL")
             returncode = 124
         stdout.seek(0)
         stderr.seek(0)
         output = stdout.read()
         errors = stderr.read()
     if timed_out:
+        errors += "".join(message + "\n" for message in cleanup_errors)
         rendered = " ".join(command)
         errors += (
-            f"Workflow lint failed: actionlint@{ACTIONLINT_REVISION} command "
+            f"Workflow lint failed: expected actionlint pin {ACTIONLINT_REVISION}; command "
             f"'{rendered}' exceeded {timeout:g}s deadline; sent TERM, waited "
             f"{grace:g}s grace, then KILL if required.\n"
         )
