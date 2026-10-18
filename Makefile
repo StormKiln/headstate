@@ -316,7 +316,7 @@ lint: lint-rust lint-ui lint-deps
 # from the slowest one in CI (#555).
 lint-workflows:
 	python3 scripts/install-workflow-tools.test.py
-	@tool_dir="$$(python3 scripts/install-workflow-tools.py)" && \
+	@tool_dir="$$(python3 scripts/install-workflow-tools.py --bin-dir)" && \
 		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.test.py && \
 		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.py
 

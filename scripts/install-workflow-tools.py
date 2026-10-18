@@ -13,6 +13,7 @@ import tempfile
 import urllib.request
 
 ACTIONLINT_REVISION = "fd33e9f582a01a02885c93ae3775e1190cf63653"
+ACTIONLINT_PROVENANCE = "Headstate-verified-source"
 ACTIONLINT_SHA256 = "475da14da4ed169c493d4f988f2cd6e4f15434752635ad809e5613cc3cde6fcc"
 SHELLCHECK_VERSION = "0.11.0"
 SHELLCHECK_SHA256 = {
@@ -34,6 +35,8 @@ def verify_actionlint(binary):
     identity = output(binary, "-version")
     if ACTIONLINT_REVISION not in identity:
         raise RuntimeError(f"actionlint identity mismatch: expected {ACTIONLINT_REVISION}, got {identity.strip()!r}")
+    if ACTIONLINT_PROVENANCE not in identity:
+        raise RuntimeError(f"actionlint provenance mismatch: expected {ACTIONLINT_PROVENANCE}, got {identity.strip()!r}")
     return identity.strip()
 
 
@@ -46,15 +49,48 @@ def verify_shellcheck(binary):
     return identity.strip()
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_receipt(root, actionlint, shellcheck):
     receipt = root / "receipt.json"
     receipt.write_text(json.dumps({
         "actionlint_revision": ACTIONLINT_REVISION,
         "actionlint_identity": verify_actionlint(actionlint),
+        "actionlint_sha256": file_sha256(actionlint),
         "shellcheck_version": SHELLCHECK_VERSION,
         "shellcheck_identity": verify_shellcheck(shellcheck),
+        "shellcheck_sha256": file_sha256(shellcheck),
     }, indent=2, sort_keys=True) + "\n")
     return receipt
+
+
+def verify_cached(root, actionlint, shellcheck):
+    receipt_path = root / "receipt.json"
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid workflow tool receipt: {error}") from error
+    expected = {
+        "actionlint_revision": ACTIONLINT_REVISION,
+        "shellcheck_version": SHELLCHECK_VERSION,
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            raise RuntimeError(f"workflow tool receipt identity mismatch for {key}")
+    for name, binary in (("actionlint", actionlint), ("shellcheck", shellcheck)):
+        if receipt.get(f"{name}_sha256") != file_sha256(binary):
+            raise RuntimeError(f"cached {name} digest mismatch")
+    actionlint_identity = verify_actionlint(actionlint)
+    shellcheck_identity = verify_shellcheck(shellcheck)
+    if receipt.get("actionlint_identity") != actionlint_identity or receipt.get("shellcheck_identity") != shellcheck_identity:
+        raise RuntimeError("workflow tool receipt runtime identity mismatch")
+    return receipt_path
 
 
 def download(url, destination, expected):
@@ -79,7 +115,7 @@ def install(root):
     actionlint = bindir / "actionlint"
     shellcheck = bindir / "shellcheck"
     try:
-        write_receipt(root, actionlint, shellcheck)
+        verify_cached(root, actionlint, shellcheck)
         return bindir
     except RuntimeError:
         pass
@@ -100,7 +136,7 @@ def install(root):
         env["GOMODCACHE"] = str(root / "gomodcache")
         subprocess.run([
             "go", "build", "-trimpath",
-            "-ldflags", f"-s -w -X github.com/rhysd/actionlint.version={ACTIONLINT_REVISION} -X github.com/rhysd/actionlint.installedFrom=Headstate-verified-source",
+            "-ldflags", f"-s -w -X github.com/rhysd/actionlint.version={ACTIONLINT_REVISION} -X github.com/rhysd/actionlint.installedFrom={ACTIONLINT_PROVENANCE}",
             "-o", str(actionlint), "./cmd/actionlint",
         ], cwd=source_root, env=env, check=True)
         shell_archive = temporary / "shellcheck.tar.gz"
@@ -118,7 +154,17 @@ def install(root):
 def main():
     repository = Path(__file__).resolve().parent.parent
     root = Path(os.environ.get("WORKFLOW_TOOLS_DIR", repository / ".tools" / "workflow"))
-    print(install(root))
+    bindir = install(root)
+    if sys.argv[1:] == ["--bin-dir"]:
+        print(bindir)
+    elif not sys.argv[1:]:
+        print(json.dumps({
+            "actionlint": str(bindir / "actionlint"),
+            "shellcheck": str(bindir / "shellcheck"),
+            "receipt": str(root / "receipt.json"),
+        }, sort_keys=True))
+    else:
+        raise RuntimeError("usage: install-workflow-tools.py [--bin-dir]")
 
 
 if __name__ == "__main__":

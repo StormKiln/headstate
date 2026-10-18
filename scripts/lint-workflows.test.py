@@ -14,6 +14,11 @@ import time
 import unittest
 from unittest.mock import patch
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 SCRIPT = Path(__file__).with_name("lint-workflows.py")
 WORKFLOW = """name: test
 on: push
@@ -127,13 +132,13 @@ time.sleep(30)
 
 @unittest.skipUnless(shutil.which("actionlint"), "actionlint is installed in CI")
 class WorkflowLintTests(unittest.TestCase):
-    def lint(self, text):
+    def lint(self, text, env=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "workflow.yml"
             path.write_text(text)
             return subprocess.run(
                 ["python3", str(SCRIPT), str(path)], text=True, capture_output=True,
-                timeout=15,
+                timeout=15, env=env,
             )
 
     def test_documented_queue_passes_real_actionlint(self):
@@ -191,6 +196,41 @@ jobs:
         result = self.lint(workflow)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("SC2086", result.stderr)
+
+    @unittest.skipUnless(fcntl is not None and hasattr(fcntl, "F_SETPIPE_SZ"), "platform cannot constrain pipe capacity with F_SETPIPE_SZ")
+    def test_real_fixed_tool_with_constrained_shellcheck_pipe_reaches_end(self):
+        real_shellcheck = shutil.which("shellcheck")
+        self.assertIsNotNone(real_shellcheck)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "capacity"
+            shim = Path(directory) / "shellcheck"
+            shim.write_text("""#!/usr/bin/env python3
+import fcntl, os
+capacity = fcntl.fcntl(0, fcntl.F_SETPIPE_SZ, 4096)
+open(os.environ['PIPE_CAPACITY_MARKER'], 'w').write(str(capacity))
+os.execv(os.environ['REAL_SHELLCHECK'], [os.environ['REAL_SHELLCHECK'], *os.sys.argv[1:]])
+""")
+            shim.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{directory}:{env['PATH']}"
+            env["REAL_SHELLCHECK"] = real_shellcheck
+            env["PIPE_CAPACITY_MARKER"] = str(marker)
+            large_body = "\n".join(f"          echo safe-{number}" for number in range(6000))
+            workflow = f"""name: constrained-shell
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+{large_body}
+          echo $UNQUOTED_AT_THE_END
+"""
+            result = self.lint(workflow, env)
+            self.assertLessEqual(int(marker.read_text()), 4096)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SC2086", result.stderr)
 
 
 if __name__ == "__main__":
