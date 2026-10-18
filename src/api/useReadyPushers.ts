@@ -27,7 +27,10 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   const schedule = (key: string) => readSchedule(qc, queryKey(key));
   const demand = new Set(rows.filter(pr => {
     const key = queryKey(keyOf(pr));
-    return preferred.has(keyOf(pr)) || !hasUsablePublication(qc, key, "pusher") || !hasUsablePublication(qc, key, "rules") || schedule(keyOf(pr))?.hasContinuation;
+    // Pusher partials mean one family was declined, not pending pagination.
+    // Once both families have been usable, offscreen refresh continuations must
+    // not displace never-served rows. Preferred rows still revalidate normally.
+    return preferred.has(keyOf(pr)) || !hasUsablePublication(qc, key, "pusher") || !hasUsablePublication(qc, key, "rules");
   }).map(keyOf));
   const window = useAdvisoryWindow(rows.map(keyOf), preferred, !!owner, demand, schedule);
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));

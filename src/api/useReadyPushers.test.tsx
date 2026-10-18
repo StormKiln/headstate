@@ -183,3 +183,43 @@ it("keeps offscreen initial pusher and rules demand until usable publication ins
   expect(calls).toBe(4);
   unsubscribe();
 });
+
+it("retires served cached-partial offscreen rows so never-served families get their turns", async () => {
+  const population = Array.from({ length: 12 }, (_, i) => ({ ...pr, number: 100 + i }));
+  const identity = (row: typeof pr) => JSON.stringify(["github", "github.com", row.repo, row.number]);
+  const calls = new Map<number, number>();
+  const usable = new Set<number>();
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type !== "updated" || event.action.type !== "success" || event.query.queryKey[0] !== "ready-pushers") return;
+    const value = event.query.state.data as { row: { number: number; last_pusher: { state: string } }; pusher?: { expiresAt: number } };
+    if (value.row.last_pusher.state === "known" && (value.pusher?.expiresAt ?? 0) > performance.now()) usable.add(value.row.number);
+  });
+  invoke.mockImplementation(async (_command, args) => (args?.rows as PusherAsk[]).map(ask => {
+    const count = (calls.get(ask.number) ?? 0) + 1;
+    calls.set(ask.number, count);
+    const served = ask.number === 106 || ask.number === 107;
+    const partial = served ? count > 1 : count === 1;
+    return { ...success(ask),
+      pusher_valid_for_ms: served ? 1_000 : 60_000,
+      ...(partial ? { last_pusher: { state: "declined", reason: "advisory consumer share is spent for this cycle" } } : {}),
+      advisory_progress: { outcome: partial ? "partial" : "offered", admitted: !served || count === 1 } };
+  }));
+  const initialPriority = new Set([...population.slice(0, 4), ...population.slice(6, 8)].map(identity));
+  const view = renderHook(({ priority }) => useReadyPushers(population, priority), { wrapper, initialProps: { priority: initialPriority } });
+  await advance();
+  expect(usable.has(106) && usable.has(107)).toBe(true);
+  await advance(30_000); await advance();
+  expect(calls.get(106)).toBe(2);
+  expect(calls.get(107)).toBe(2);
+  view.rerender({ priority: new Set(population.slice(0, 6).map(identity)) });
+  for (let cycle = 0; cycle < 12; cycle++) { await advance(30_000); await advance(); }
+  for (const row of population.slice(8)) {
+    expect(usable.has(row.number), `initial family debt for ${row.number}`).toBe(true);
+    expect(calls.get(row.number)).toBe(2);
+  }
+  expect(calls.get(106)).toBe(2);
+  expect(calls.get(107)).toBe(2);
+  expect(calls.get(100)).toBeGreaterThan(3); // Preferred rows continue refresh.
+  expect(view.result.current.displayOf(population[6])?.freshness).toBe("retained");
+  unsubscribe();
+});
