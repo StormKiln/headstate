@@ -477,3 +477,13 @@ Batch preflight rejects absent or malformed descriptors before launching a child
 validation also rejects a descriptor differing from the frozen policy. Failed
 samples remain failures with their artifacts; the script never retries or extends
 a phase. These bounded synthetic qualification timings are not a customer SLA.
+
+
+Frozen resource budget policies use schema2. Every phase has a sampled retained-WAL
+upper bound. Explicit native `NotFound` observations contribute zero retained file
+bytes to that comparison; raw summaries still report a null peak when every sample
+was absent and retain the absence count. Unknown, unreadable, missing or lost samples
+remain invalid. This does not measure cumulative writes or peaks between samples.
+Schema1 policies with optional WAL dimensions are rejected. Re-derivation from
+retained calibration evidence must record the policy-generator revision separately
+from the collector/native/UI revisions and preserve the old policy and outcomes.

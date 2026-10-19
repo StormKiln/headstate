@@ -57,3 +57,29 @@ test('static frozen policy admission rejects malformed descriptors, unknown keys
  const policy=deriveResourceLimits(resourceBatchPlan('calibrate').map(item=>mixed(item.warm)));validateFrozenResourcePolicy(policy);
  for(const mutate of [p=>delete p.sourceRevisions,p=>p.headroom=null,p=>p.coverage={},p=>p.workload.populations.reviewing=250,p=>p.environment.browser.version=null,p=>p.resourceIdentity.toolchain='',p=>delete p.limits.warm,p=>delete p.limits.cold['idle.transactions'],p=>p.limits.cold.commandLatencyMaxMs=NaN,p=>p.limits.cold.commandLatencyMaxMs=-1,p=>p.limits.cold.extra=2,p=>p.limits.warm={}]){const bad=structuredClone(policy);mutate(bad);assert.throws(()=>validateFrozenResourcePolicy(bad));}
 });
+function withWal(run,status,bytes){
+ for(const segment of run.resources.evidence.segments)for(const row of segment.evidence.native)if(row.resource?.kind==='sample'&&row.resource.phase==='churn_restart')row.resource.walRetained=status==='measured'?{status,bytes}:{status};
+ run.resources.summary=summarizeMixedResources(run.resources.evidence,'chromium');return run;
+}
+test('sampled WAL absence and measured zero remain equivalent upper-bound evidence with distinct summaries',()=>{
+ const runs=resourceBatchPlan('calibrate').map(item=>withWal(mixed(item.warm),'measured',0));const policy=deriveResourceLimits(runs),absent=mixed();
+ assert.equal(absent.resources.summary.phases.churn_restart.walRetainedPeak,null);
+ validateResourceLimits(absent,policy);
+ const absentPolicy=deriveResourceLimits(resourceBatchPlan('calibrate').map(item=>mixed(item.warm)));
+ assert.equal(absentPolicy.schema,2);assert.equal(absentPolicy.limits.cold['churn_restart.walRetainedPeak'],1024*1024);
+ validateResourceLimits(withWal(mixed(),'measured',0),absentPolicy);
+ validateResourceLimits(withWal(mixed(),'measured',100),absentPolicy);
+ assert.throws(()=>validateResourceLimits(withWal(mixed(),'measured',1024*1024+1),absentPolicy),/exceeds calibrated limit/);
+});
+test('WAL budget rejects unknown missing lost evidence and missing or legacy policy dimensions',()=>{
+ const policy=deriveResourceLimits(resourceBatchPlan('calibrate').map(item=>mixed(item.warm)));
+ for(const edit of [r=>r.resources.evidence.segments[0].evidence.native.find(n=>n.resource?.kind==='sample').resource.walRetained={status:'unknown'},r=>delete r.resources.evidence.segments[0].evidence.native.find(n=>n.resource?.kind==='sample').resource.walRetained,r=>r.resources.evidence.segments[0].evidence.lost=true]){
+  const run=mixed();edit(run);assert.throws(()=>validateResourceLimits(run,policy));
+ }
+ for(const edit of [p=>delete p.limits.cold['churn_restart.walRetainedPeak'],p=>p.schema=1]){const bad=structuredClone(policy);edit(bad);assert.throws(()=>validateFrozenResourcePolicy(bad));}
+});
+test('mixed measured and absent WAL samples retain actual observed peak',()=>{
+ const run=mixed(),sample=run.resources.evidence.segments[0].evidence.native.find(n=>n.resource?.kind==='sample'&&n.resource.phase==='churn_restart');sample.resource.walRetained={status:'measured',bytes:42};run.resources.summary=summarizeMixedResources(run.resources.evidence,'chromium');
+ assert.equal(run.resources.summary.phases.churn_restart.walRetainedPeak,42);assert.ok(run.resources.summary.phases.churn_restart.walAbsentSamples>0);
+ const policy=deriveResourceLimits(resourceBatchPlan('calibrate').map(item=>mixed(item.warm)));validateResourceLimits(run,policy);
+});

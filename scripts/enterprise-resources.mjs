@@ -10,7 +10,7 @@ const plan=resourceBatchPlan(stage);
 assert.ok(process.env.ENTERPRISE_MIXED_PHASE_PLAN,'ENTERPRISE_MIXED_PHASE_PLAN required before any batch launch');
 const phasePlan=validateMixedPhasePlan(JSON.parse(await readFile(process.env.ENTERPRISE_MIXED_PHASE_PLAN,'utf8')));
 const policy=stage==='validate'?JSON.parse(await readFile(process.argv[4],'utf8')):undefined;
-if(policy){assert.equal(policy.schema,1);assert.equal(policy.stage,'frozen');assert.deepEqual(policy.resourceIdentity.segmentPhasePlan,phasePlan.segments,'validation must use frozen phase descriptor');validateFrozenResourcePolicy(policy);}
+if(policy){assert.equal(policy.schema,2);assert.equal(policy.stage,'frozen');assert.deepEqual(policy.resourceIdentity.segmentPhasePlan,phasePlan.segments,'validation must use frozen phase descriptor');validateFrozenResourcePolicy(policy);}
 await mkdir(root,{recursive:true});assert.equal((await readdir(root)).length,0,'retain previous batches; use a new output path');
 await writeFile(resolve(root,'plan.json'),JSON.stringify({stage,plan,phasePlan,policy},null,2));
 const runs=[];
