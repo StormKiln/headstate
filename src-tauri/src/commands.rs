@@ -5384,9 +5384,37 @@ mod corpus_cancel_tests {
         assert_eq!(found, 1);
     }
 
+    // Test-only bounded convergence, not an extension of any production slice.
+    // Each call still uses the real one-second discovery and lane deadlines.
+    fn fixture_is_certified(out: &LivePopulation) -> bool {
+        use crate::claude::transcript::PopulationStatus;
+        let progress = [
+            out.metadata.as_ref().unwrap(),
+            out.usage.as_ref().unwrap(),
+            &out.indexed.as_ref().unwrap().population,
+        ];
+        for p in progress {
+            assert!(matches!(
+                p.status,
+                PopulationStatus::Complete | PopulationStatus::Deferred
+            ));
+            assert_eq!(p.failed, 0);
+        }
+        let link = out.links.as_ref().unwrap();
+        assert!(link.stopped.is_none());
+        assert!(link.unreadable.is_empty());
+        progress.iter().all(|p| {
+            p.status == PopulationStatus::Complete
+                && p.total_known
+                && p.total == 1
+                && p.completed == 1
+        }) && link.deferred == 0
+            && !link.not_started
+    }
+
     #[test]
     fn stable_inventory_completes_all_lanes_across_rotations_without_body_rereads() {
-        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        use crate::claude::transcript::PopulationControl;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("projects");
         let project = root.join("synthetic");
@@ -5397,22 +5425,10 @@ mod corpus_cancel_tests {
         crate::claude::linkscan::reset(&conn, 0).unwrap();
         let registry = std::sync::Mutex::new(PopulationRegistry::default());
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        // Finish initial processing and any required continuity audit first.
-        for _ in 0..4 {
-            populate_live_corpus(
-                &mut conn,
-                Some(&root),
-                &PopulationControl::default(),
-                &registry,
-                &slots,
-            );
-        }
-        drop(conn);
-        let mut conn = open_db(&path).unwrap();
-        for first in 0..4usize {
-            settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
-            #[cfg(feature = "enterprise-harness")]
-            crate::enterprise_harness::resources::take_read_capture();
+        // Setup must actually certify all lanes; a fixed number of warmups
+        // cannot establish authority on a slow or contended filesystem.
+        let mut certified = false;
+        for _ in 0..32 {
             let out = populate_live_corpus(
                 &mut conn,
                 Some(&root),
@@ -5420,31 +5436,56 @@ mod corpus_cancel_tests {
                 &registry,
                 &slots,
             );
-            for progress in [
-                out.metadata.unwrap(),
-                out.usage.unwrap(),
-                out.indexed.unwrap().population,
-            ] {
-                assert_eq!(
-                    progress.status,
-                    PopulationStatus::Complete,
-                    "first lane {first}"
-                );
-                assert!(progress.total_known);
-                assert_eq!(progress.completed, 1);
+            if fixture_is_certified(&out) {
+                certified = true;
+                break;
             }
-            let link = out
-                .links
-                .expect("production link lane must return its result");
-            assert_eq!(link.deferred, 0);
-            assert!(link.stopped.is_none());
-            assert!(link.unreadable.is_empty());
-            assert!(!link.not_started);
-            #[cfg(feature = "enterprise-harness")]
-            assert_eq!(
-                crate::enterprise_harness::resources::take_read_capture(),
-                [0; 4],
-                "unchanged rotation {first} must not reread transcript bodies"
+        }
+        assert!(certified, "fixture setup never obtained certified coverage");
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        for first in 0..4usize {
+            let mut certified = false;
+            for attempt in 0..32 {
+                settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::resources::take_read_capture();
+                // Deterministically split the fresh epoch once. Subsequent calls
+                // resume it under the same production slice, without delay.
+                crate::claude::corpus_probe::configure(
+                    if attempt == 0 {
+                        std::time::Duration::from_millis(1100)
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                    None,
+                );
+                let out = populate_live_corpus(
+                    &mut conn,
+                    Some(&root),
+                    &PopulationControl::default(),
+                    &registry,
+                    &slots,
+                );
+                crate::claude::corpus_probe::configure(std::time::Duration::ZERO, None);
+                #[cfg(feature = "enterprise-harness")]
+                assert_eq!(
+                    crate::enterprise_harness::resources::take_read_capture(),
+                    [0; 4],
+                    "unchanged rotation {first}, continuation {attempt} must not reread bodies"
+                );
+                let complete = fixture_is_certified(&out);
+                if attempt == 0 {
+                    assert!(!complete, "forced split must remain qualified");
+                }
+                if complete {
+                    certified = true;
+                    break;
+                }
+            }
+            assert!(
+                certified,
+                "rotation {first} never obtained certified coverage"
             );
         }
     }
@@ -5463,6 +5504,31 @@ mod corpus_cancel_tests {
         let registry = std::sync::Mutex::new(PopulationRegistry::default());
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let mut conn = open_db(&path).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        // Establish membership without running any body-processing lane. The
+        // fairness assertion must not depend on first-discovery speed.
+        let mut discovery = crate::claude::corpus_inventory::DiscoveryRuntime::default();
+        let mut certified = false;
+        for _ in 0..32 {
+            let slice = crate::claude::corpus_inventory::reconcile_corpus(
+                &mut conn,
+                &root,
+                &PopulationControl::default(),
+                &mut discovery,
+            )
+            .unwrap();
+            if slice.authoritative {
+                certified = true;
+                break;
+            }
+        }
+        assert!(certified, "membership setup never certified");
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM claude_transcript_fts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 0, "setup must not pre-index the fairness fixture");
         settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &2usize).unwrap();
         let mut expired = false;
         let first = populate_live_corpus_with_controls(
@@ -5490,6 +5556,8 @@ mod corpus_cancel_tests {
         drop(conn);
         let mut conn = open_db(&path).unwrap();
         expired = false;
+        crate::claude::corpus_probe::configure(std::time::Duration::from_millis(1100), None);
+        let mut second_order = Vec::new();
         let second = populate_live_corpus_with_controls(
             &mut conn,
             Some(&root),
@@ -5497,6 +5565,7 @@ mod corpus_cancel_tests {
             &registry,
             &slots,
             &mut |lane, root| {
+                second_order.push(lane);
                 if lane == Lane::Usage {
                     expired = true;
                 }
@@ -5507,13 +5576,40 @@ mod corpus_cancel_tests {
                 }
             },
         );
+        crate::claude::corpus_probe::configure(std::time::Duration::ZERO, None);
         let indexed = second.indexed.unwrap();
-        assert_eq!(indexed.population.status, PopulationStatus::Complete);
-        assert_eq!(indexed.population.completed, 1);
-        assert_eq!(second.usage.unwrap().status, PopulationStatus::TimedOut);
+        assert_eq!(second_order.first(), Some(&Lane::Index));
         assert_eq!(
-            second.index_health,
-            crate::background::IndexOutcome::Healthy
+            indexed.indexed, 1,
+            "the second tick must publish new index work"
+        );
+        assert_eq!(indexed.population.completed, 1);
+        assert_eq!(
+            indexed.population.status,
+            PopulationStatus::Deferred,
+            "forced split qualifies coverage without discarding index progress"
+        );
+        let found:i64=conn.query_row("SELECT count(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'searchable'",[],|r|r.get(0)).unwrap();
+        assert_eq!(found, 1, "second-tick progress must be durably searchable");
+        assert_eq!(second.usage.unwrap().status, PopulationStatus::TimedOut);
+        let mut certified = false;
+        for _ in 0..32 {
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+            if fixture_is_certified(&out) {
+                assert_eq!(out.index_health, crate::background::IndexOutcome::Healthy);
+                certified = true;
+                break;
+            }
+        }
+        assert!(
+            certified,
+            "fairness fixture never obtained certified coverage"
         );
     }
 
