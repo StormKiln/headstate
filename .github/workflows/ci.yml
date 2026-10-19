@@ -62,6 +62,8 @@ jobs:
       - name: Install signature verifier for release contract tests
         timeout-minutes: 5
         run: brew install minisign
+      - name: Native transcript evidence qualification
+        run: python3 scripts/transcript-native-bench.test.py
       - name: Release artifact selection
         run: |
           python3 scripts/check-release-artifacts.test.py
