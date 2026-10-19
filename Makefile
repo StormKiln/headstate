@@ -403,6 +403,7 @@ lint-deps:
 	# worse than the bug.
 	python3 scripts/install-dependencies.test.py
 	python3 scripts/measurement-report.test.py
+	python3 scripts/transcript-native-bench.test.py
 	node --test scripts/measurement-evidence.test.mjs
 	python3 scripts/ci-command.test.py
 	python3 scripts/install-linux-dependencies.test.py
