@@ -17,16 +17,23 @@ MEMORY = ['hostResidentBytes', 'hostPhysicalFootprintBytes',
 
 
 def qualified(result):
-    samples = result.get('samples', [])
+    # #1912: JSON numbers must match the native PID/UInt64 domains. Python
+    # bool is an int subclass, and NaN evades a simple <= 0 check.
+    if not isinstance(result, dict):
+        return False
+    samples = result.get('samples')
+    if (not isinstance(samples, list) or not all(isinstance(s, dict) for s in samples)):
+        return False
     if result.get('status') != 'measured-proxies' or [s.get('phase') for s in samples] != PHASES:
         return False
     identities = set()
     for sample in samples:
         host, renderer = sample.get('hostPID'), sample.get('webContentPID')
-        if not isinstance(host, int) or not isinstance(renderer, int) or min(host, renderer) <= 0 or host == renderer:
+        if (type(host) is not int or type(renderer) is not int
+                or not 0 < host < 2**31 or not 0 < renderer < 2**31 or host == renderer):
             return False
         identities.add((host, renderer))
-        if sample.get('visible') is not True or any(not isinstance(sample.get(k), (int, float)) or sample[k] <= 0 for k in MEMORY):
+        if sample.get('visible') is not True or any(type(sample.get(k)) is not int or not 0 < sample[k] < 2**64 for k in MEMORY):
             return False
     return len(identities) == 1
 

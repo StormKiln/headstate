@@ -43,3 +43,8 @@ Exit 0 means only the four visible proxy/memory phases completed with stable
 own-PID attribution. Exit 3 means unavailable/incomplete, not a passing zero.
 `python3 scripts/transcript-native-bench.test.py` tests that qualification
 rejects hidden, incomplete, misattributed and missing-memory evidence.
+
+Qualification requires object samples for exactly the four ordered phases, stable
+distinct positive signed-32-bit PIDs, and positive UInt64 integer byte counts.
+Booleans, fractional/non-finite values and out-of-range values are rejected;
+these adversarial tests also run in the regular CI script gate (#1912).
