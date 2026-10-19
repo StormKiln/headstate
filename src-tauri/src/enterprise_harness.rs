@@ -1,7 +1,9 @@
 //! Opt-in synthetic native acceptance driver. Never called by ordinary app setup.
 //! Product calls use real handlers; paired calls traverse the real pinned mTLS listener.
+pub(crate) mod corpus;
 pub(crate) mod metrics;
 mod phone;
+pub(crate) mod resources;
 use crate::{commands, github::client::GitHubClient, poll, remote, store};
 use axum::{
     extract::{Path, State},
@@ -39,6 +41,10 @@ struct Config {
     provider: String,
     bridge_secret: String,
     ready: PathBuf,
+    #[serde(default)]
+    resource_disabled: bool,
+    #[serde(default)]
+    corpus_root: Option<PathBuf>,
 }
 struct Empty;
 impl Assets<Wry> for Empty {
@@ -70,6 +76,7 @@ struct Driver {
     lost: AtomicBool,
     started: AtomicBool,
     stop: Notify,
+    corpus: Option<Arc<corpus::Worker>>,
     pairing_requests: tokio::sync::Mutex<
         tokio::sync::mpsc::UnboundedReceiver<remote::pairing::PairingRequestEvent>,
     >,
@@ -111,6 +118,9 @@ fn supported(command: &str) -> bool {
             | "get_pr_files"
             | "get_pr_advisory"
             | "get_poll_interval"
+            | "claude_coverage"
+            | "claude_index_coverage"
+            | "claude_search_transcripts"
     )
 }
 async fn call(
@@ -266,6 +276,36 @@ async fn control(
             Json(json!({"error":"unauthorized"})),
         );
     }
+    if action.starts_with("corpus-") {
+        let Some(worker) = &d.corpus else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"no generated corpus configured"})),
+            );
+        };
+        let result = match action.as_str() {
+            "corpus-initialize" => worker.initialize().await,
+            "corpus-start" => worker.start().await,
+            "corpus-pause" => worker.pause().await,
+            "corpus-resume" => worker.resume().await,
+            "corpus-status" => Ok(()),
+            "corpus-fault-on" => worker.fault(true).await,
+            "corpus-fault-off" => worker.fault(false).await,
+            "corpus-unreadable-on" => worker.permission_fault(true).await,
+            "corpus-unreadable-off" => worker.permission_fault(false).await,
+            _ => Err("unknown corpus control".into()),
+        };
+        return match result {
+            Ok(()) => match worker.status().await {
+                Ok(status) => (StatusCode::OK, Json(status)),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":error})),
+                ),
+            },
+            Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))),
+        };
+    }
     match action.as_str() {
         "start" => {
             if !d.started.swap(true, Ordering::SeqCst) {
@@ -324,6 +364,52 @@ async fn control(
                     .unwrap();
             }
         }
+        "resource-startup-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "startup",
+        ),
+        "resource-startup-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "startup",
+        ),
+        "resource-idle-start" => {
+            resources::sample(commands::db_path(&d.app).parent().unwrap(), "start", "idle")
+        }
+        "resource-idle-end" => {
+            resources::sample(commands::db_path(&d.app).parent().unwrap(), "end", "idle")
+        }
+        "resource-unchanged_refresh-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "unchanged_refresh",
+        ),
+        "resource-unchanged_refresh-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "unchanged_refresh",
+        ),
+        "resource-active_ingestion-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "active_ingestion",
+        ),
+        "resource-active_ingestion-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "active_ingestion",
+        ),
+        "resource-churn_restart-start" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "start",
+            "churn_restart",
+        ),
+        "resource-churn_restart-end" => resources::sample(
+            commands::db_path(&d.app).parent().unwrap(),
+            "end",
+            "churn_restart",
+        ),
         "status" => {}
         _ => {
             return (
@@ -390,6 +476,14 @@ async fn repair(d: &Arc<Driver>) -> Result<(), String> {
     Ok(())
 }
 async fn setup(app: tauri::AppHandle, config: Config) -> Result<(), String> {
+    let corpus = config
+        .corpus_root
+        .as_ref()
+        .map(|root| {
+            corpus::ValidatedCorpus::new(&config.profile, root)
+                .map(|validated| corpus::Worker::new(validated, commands::db_path(&app)))
+        })
+        .transpose()?;
     let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
     let pairing = Arc::new(remote::pairing::PairingState::new(move |event| {
         let _ = tx.send(event);
@@ -470,6 +564,7 @@ async fn setup(app: tauri::AppHandle, config: Config) -> Result<(), String> {
         lost: AtomicBool::new(false),
         started: AtomicBool::new(false),
         stop: Notify::new(),
+        corpus,
         pairing_requests: tokio::sync::Mutex::new(requests),
     });
     for name in remote::events::EVENT_NAMES {
@@ -504,7 +599,7 @@ async fn setup(app: tauri::AppHandle, config: Config) -> Result<(), String> {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;
-    std::fs::write(&config.ready,json!({"bridge":format!("http://{}",tcp.local_addr().unwrap()),"paired":true,"native":true}).to_string()).map_err(|e|e.to_string())?;
+    std::fs::write(&config.ready,json!({"bridge":format!("http://{}",tcp.local_addr().unwrap()),"paired":true,"native":true,"process":{"pid":std::process::id(),"nonce":format!("{:032x}",rand::random::<u128>())}}).to_string()).map_err(|e|e.to_string())?;
     let server = tokio::spawn(async move { axum::serve(tcp, router).await });
     d.stop.notified().await;
     server.abort();
@@ -522,15 +617,20 @@ async fn setup(app: tauri::AppHandle, config: Config) -> Result<(), String> {
     for worker in workers {
         let _ = worker.await;
     }
+    let corpus_shutdown = match &d.corpus {
+        Some(worker) => worker.shutdown().await,
+        None => Ok(()),
+    };
+    resources::stop();
     metrics::finish();
     std::fs::write(
         config.profile.join("shutdown.json"),
-        json!({"clean":true,"telemetryLost":d.lost.load(Ordering::SeqCst) || metrics::lost()})
+        json!({"clean":corpus_shutdown.is_ok(),"corpusError":corpus_shutdown.as_ref().err(),"telemetryLost":d.lost.load(Ordering::SeqCst) || metrics::lost()})
             .to_string(),
     )
     .map_err(|e| e.to_string())?;
-    app.exit(0);
-    Ok(())
+    app.exit(if corpus_shutdown.is_ok() { 0 } else { 2 });
+    corpus_shutdown
 }
 pub fn run() {
     remote::gate::install_crypto_provider();
@@ -542,6 +642,10 @@ pub fn run() {
     let url = reqwest::Url::parse(&config.provider).expect("provider URL");
     assert_eq!(url.scheme(), "http");
     assert_eq!(url.host_str(), Some("127.0.0.1"));
+    if let Some(root) = &config.corpus_root {
+        corpus::ValidatedCorpus::new(&config.profile, root)
+            .expect("preexisting marked contained corpus");
+    }
     std::fs::create_dir_all(&config.profile).unwrap();
     let marker = config.profile.join(".enterprise-synthetic");
     if config.profile.join("headstate.db").exists() {
@@ -550,6 +654,8 @@ pub fn run() {
     std::fs::write(marker, b"synthetic profile v1").unwrap();
     metrics::set_profile(&config.profile);
     metrics::start(&config.profile.join("native.ndjson")).expect("metrics recorder");
+    resources::configure(!config.resource_disabled);
+    resources::start(&config.profile);
     let db = config.profile.join("headstate.db");
     let conn = store::open_db(&db).unwrap();
     let prefs = poll::NotifyPrefs {
@@ -619,4 +725,33 @@ pub fn run() {
         .build(context)
         .expect("build Wry driver");
     app.run(|_, _| {});
+}
+
+#[cfg(test)]
+mod corpus_surface_tests {
+    #[test]
+    fn corpus_controls_are_never_product_or_paired_calls() {
+        for command in [
+            "corpus-initialize",
+            "corpus-start",
+            "corpus-pause",
+            "corpus-resume",
+            "corpus-status",
+            "corpus-fault-on",
+            "corpus-fault-off",
+            "corpus-unreadable-on",
+            "corpus-unreadable-off",
+        ] {
+            assert!(!super::supported(command));
+        }
+        for command in [
+            "claude_coverage",
+            "claude_index_coverage",
+            "claude_search_transcripts",
+        ] {
+            assert!(super::supported(command));
+        }
+        assert!(!super::supported("claude_import_transcripts"));
+        assert!(!super::supported("claude_live_pass"));
+    }
 }

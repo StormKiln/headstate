@@ -354,3 +354,8 @@ mod tests {
 }
 
 pub(crate) mod population_schedule;
+
+#[cfg(test)]
+pub(crate) mod corpus_probe;
+
+pub(crate) mod corpus_inventory;

@@ -149,3 +149,77 @@ it("keeps queue-capacity refusal not checked without dispatching a command", asy
   expect(invoke).not.toHaveBeenCalled();
   await act(async () => { controller.abort(); finish(); await Promise.all([active, ...waiting]); });
 });
+
+it("keeps offscreen initial pusher and rules demand until usable publication instead of retained presence", async () => {
+  const population = Array.from({ length: 12 }, (_, i) => ({ ...pr, number: 100 + i }));
+  const target = population[6];
+  let calls = 0;
+  const useful: boolean[] = [];
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type !== "updated" || event.action.type !== "success" || event.query.queryKey[0] !== "ready-pushers") return;
+    if (JSON.parse(JSON.parse(String(event.query.queryKey[3]))[0])[3] !== target.number) return;
+    const value = event.query.state.data as { row: { last_pusher: { state: string }; rules: { state: string } }; pusher?: { expiresAt: number }; rules?: { expiresAt: number } };
+    useful.push(value.row.last_pusher.state === "known" && value.row.rules.state === "read" && (value.pusher?.expiresAt ?? 0) > performance.now() && (value.rules?.expiresAt ?? 0) > performance.now());
+  });
+  invoke.mockImplementation(async (_command, args) => {
+    const ask = (args?.rows as PusherAsk[])[0];
+    const count = ask.number === target.number ? ++calls : 4;
+    if (count === 1) await new Promise(resolve => setTimeout(resolve, 7));
+    const answer = { ...success(ask), rules: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false } };
+    return [{ ...answer,
+      ...(count === 2 || count === 3 ? { last_pusher: { state: "declined", reason: "budget" }, rules: { state: "declined", reason: "budget" } } : {}),
+      pusher_valid_for_ms: count === 1 ? 1 : 60_000, rules_valid_for_ms: count === 1 ? 1 : 600_000,
+      last_known_pusher: { value: answer.last_pusher, age_ms: 60_000 }, last_known_rules: { value: answer.rules, age_ms: 600_000 },
+      advisory_progress: { outcome: count === 2 ? "partial" : count === 3 ? "deferred" : "offered", admitted: count !== 3 } }];
+  });
+  const view = renderHook(() => useReadyPushers(population, new Set(population.slice(0, 6).map(row => JSON.stringify(["github", "github.com", row.repo, row.number])))), { wrapper });
+  await advance(20);
+  expect(useful).toEqual([false]);
+  expect(view.result.current.displayOf(target)?.freshness).toBe("retained");
+  for (let cycle = 0; cycle < 6; cycle++) { await advance(30_000); await advance(10); }
+  expect(useful).toContain(true);
+  expect(calls).toBe(4);
+  await advance(120_000);
+  expect(calls).toBe(4);
+  unsubscribe();
+});
+
+it("retires served cached-partial offscreen rows so never-served families get their turns", async () => {
+  const population = Array.from({ length: 12 }, (_, i) => ({ ...pr, number: 100 + i }));
+  const identity = (row: typeof pr) => JSON.stringify(["github", "github.com", row.repo, row.number]);
+  const calls = new Map<number, number>();
+  const usable = new Set<number>();
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type !== "updated" || event.action.type !== "success" || event.query.queryKey[0] !== "ready-pushers") return;
+    const value = event.query.state.data as { row: { number: number; last_pusher: { state: string } }; pusher?: { expiresAt: number } };
+    if (value.row.last_pusher.state === "known" && (value.pusher?.expiresAt ?? 0) > performance.now()) usable.add(value.row.number);
+  });
+  invoke.mockImplementation(async (_command, args) => (args?.rows as PusherAsk[]).map(ask => {
+    const count = (calls.get(ask.number) ?? 0) + 1;
+    calls.set(ask.number, count);
+    const served = ask.number === 106 || ask.number === 107;
+    const partial = served ? count > 1 : count === 1;
+    return { ...success(ask),
+      pusher_valid_for_ms: served ? 1_000 : 60_000,
+      ...(partial ? { last_pusher: { state: "declined", reason: "advisory consumer share is spent for this cycle" } } : {}),
+      advisory_progress: { outcome: partial ? "partial" : "offered", admitted: !served || count === 1 } };
+  }));
+  const initialPriority = new Set([...population.slice(0, 4), ...population.slice(6, 8)].map(identity));
+  const view = renderHook(({ priority }) => useReadyPushers(population, priority), { wrapper, initialProps: { priority: initialPriority } });
+  await advance();
+  expect(usable.has(106) && usable.has(107)).toBe(true);
+  await advance(30_000); await advance();
+  expect(calls.get(106)).toBe(2);
+  expect(calls.get(107)).toBe(2);
+  view.rerender({ priority: new Set(population.slice(0, 6).map(identity)) });
+  for (let cycle = 0; cycle < 12; cycle++) { await advance(30_000); await advance(); }
+  for (const row of population.slice(8)) {
+    expect(usable.has(row.number), `initial family debt for ${row.number}`).toBe(true);
+    expect(calls.get(row.number)).toBe(2);
+  }
+  expect(calls.get(106)).toBe(2);
+  expect(calls.get(107)).toBe(2);
+  expect(calls.get(100)).toBeGreaterThan(3); // Preferred rows continue refresh.
+  expect(view.result.current.displayOf(population[6])?.freshness).toBe("retained");
+  unsubscribe();
+});

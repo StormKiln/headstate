@@ -1,0 +1,21 @@
+   Compiling headstate v0.1.0 (<checkout>/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.67s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/headstate_lib-bd304ff4fe4a7524)
+
+running 1 test
+
+thread 'claude::linkscan::tests::cancellation_after_first_source_preserves_atomic_progress_on_reopen' (323088785) panicked at src/claude/linkscan.rs:856:9:
+assertion `left == right` failed
+  left: 3
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test claude::linkscan::tests::cancellation_after_first_source_preserves_atomic_progress_on_reopen ... FAILED
+
+failures:
+
+failures:
+    claude::linkscan::tests::cancellation_after_first_source_preserves_atomic_progress_on_reopen
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3370 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`

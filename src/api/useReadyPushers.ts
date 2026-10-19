@@ -5,7 +5,7 @@ import { getReadyPushers } from "./tauri";
 import { useViewer } from "./hooks";
 import { useAdvisoryWindow } from "./useAdvisoryWindow";
 import { acknowledgeSchedule, isPreferred, readSchedule, scheduleMeta, useScheduleClaims } from "./advisorySchedule";
-import { advisoryGcTime, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
+import { advisoryGcTime, hasUsablePublication, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { commandError } from "@/lib/errorKind";
 import { prKey } from "@/lib/prIdentity";
 import { readyPusher, type ReadyPusher } from "@/lib/readyPusher";
@@ -26,8 +26,11 @@ export function useReadyPushers(prs: PullRequest[], priority: ReadonlySet<string
   const queryKey = (key: string) => ["ready-pushers", owner, session.generation, key];
   const schedule = (key: string) => readSchedule(qc, queryKey(key));
   const demand = new Set(rows.filter(pr => {
-    const value = qc.getQueryData<Receipt>(queryKey(keyOf(pr)));
-    return preferred.has(keyOf(pr)) || !value?.pusher || !value.rules || schedule(keyOf(pr))?.hasContinuation;
+    const key = queryKey(keyOf(pr));
+    // Pusher partials mean one family was declined, not pending pagination.
+    // Once both families have been usable, offscreen refresh continuations must
+    // not displace never-served rows. Preferred rows still revalidate normally.
+    return preferred.has(keyOf(pr)) || !hasUsablePublication(qc, key, "pusher") || !hasUsablePublication(qc, key, "rules");
   }).map(keyOf));
   const window = useAdvisoryWindow(rows.map(keyOf), preferred, !!owner, demand, schedule);
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));

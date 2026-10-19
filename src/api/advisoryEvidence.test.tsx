@@ -8,6 +8,7 @@ import { partitionReady } from "@/lib/readyPusher";
 import type { PullRequest } from "@/types/pr";
 const invoke = vi.hoisted(() => vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+import { hasUsablePublication, useAdvisorySession } from "./advisoryEvidence";
 import { useReadyStacks } from "./useReadyStacks";
 import { useReadyPushers } from "./useReadyPushers";
 let qc: QueryClient;
@@ -402,4 +403,67 @@ it("a failed selected request does not schedule another automatic selected attem
   renderHook(() => useReadyStacks([rows[0]], new Set(), true, "detail"), { wrapper });
   await advance(5);
   expect(invoke.mock.calls.filter(call => call[1]?.selected)).toHaveLength(1);
+});
+
+it("bootstraps only currently usable cache data and preserves served history across consumer remounts", async () => {
+  const population = rows.slice(0, 12);
+  const target = population[6];
+  const key = ["ready-stack", "octocat", 0, JSON.stringify([prKey(target), target.head_oid, target.base_ref])];
+  const now = performance.now();
+  qc.setQueryData(key, { stack: { kind: "none" }, expiresAt: now + 60_000, staleFor: 60_000,
+    lastKnown: { value: { kind: "none" }, expiresAt: now + 60_000, observedAt: Date.now() } });
+  const priority = new Set(population.slice(0, 6).map(prKey));
+  const view = renderHook(() => useReadyStacks(population, priority), { wrapper });
+  await advance(5);
+  expect(invoke.mock.calls.some(call => (call[1]?.rows as PullRequest[])?.some(pr => pr.number === target.number))).toBe(false);
+  view.unmount();
+  await advance(60_001);
+  const remounted = renderHook(() => useReadyStacks(population, priority), { wrapper });
+  await advance(5);
+  expect(remounted.result.current.displayOf(target)?.freshness).toBe("retained");
+  expect(invoke.mock.calls.some(call => (call[1]?.rows as PullRequest[])?.some(pr => pr.number === target.number))).toBe(false);
+});
+
+it("does not bootstrap expired cached history as a completed initial observation", async () => {
+  const population = rows.slice(0, 12);
+  const target = population[6];
+  const key = ["ready-stack", "octocat", 0, JSON.stringify([prKey(target), target.head_oid, target.base_ref])];
+  qc.setQueryData(key, { stack: { kind: "none" }, expiresAt: performance.now() - 1, staleFor: 0,
+    lastKnown: { value: { kind: "none" }, expiresAt: performance.now() - 1, observedAt: Date.now() } });
+  renderHook(() => useReadyStacks(population, new Set(population.slice(0, 6).map(prKey))), { wrapper });
+  for (let cycle = 0; cycle < 3; cycle++) { await advance(30_000); await advance(5); }
+  expect(invoke.mock.calls.some(call => (call[1]?.rows as PullRequest[])?.some(pr => pr.number === target.number))).toBe(true);
+});
+
+
+it("records families independently at publication without recursive writes and retires reset/removed identities", async () => {
+  renderHook(() => useAdvisorySession(qc), { wrapper });
+  const key = ["ready-pushers", "octocat", 0, "synthetic-publication"];
+  let successes = 0;
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type === "updated" && event.action.type === "success") successes++;
+  });
+  const now = performance.now();
+  const pusher = { value: { state: "known", login: "octocat" }, expiresAt: now + 10, observedAt: Date.now() };
+  const rules = { value: { state: "read", require_last_push_approval: false, required_review_thread_resolution: false }, expiresAt: now + 100, observedAt: Date.now() };
+  qc.setQueryData(key, { row: { last_pusher: pusher.value, rules: { state: "declined" } }, pusher });
+  expect(hasUsablePublication(qc, key, "pusher")).toBe(true);
+  expect(hasUsablePublication(qc, key, "rules")).toBe(false);
+  await advance(20);
+  qc.setQueryData(key, { row: { last_pusher: { state: "declined" }, rules: rules.value }, pusher, rules });
+  expect(hasUsablePublication(qc, key, "pusher")).toBe(true);
+  expect(hasUsablePublication(qc, key, "rules")).toBe(true);
+  expect(successes).toBe(2);
+  await qc.resetQueries({ queryKey: key, exact: true });
+  expect(hasUsablePublication(qc, key, "pusher")).toBe(false);
+  expect(hasUsablePublication(qc, key, "rules")).toBe(false);
+  qc.setQueryData(key, { row: { last_pusher: { state: "declined" }, rules: rules.value }, rules });
+  expect(hasUsablePublication(qc, key, "rules")).toBe(true);
+  qc.removeQueries({ queryKey: key, exact: true });
+  qc.setQueryData(key, { row: { last_pusher: { state: "declined" }, rules: { state: "declined" } }, rules });
+  expect(hasUsablePublication(qc, key, "rules")).toBe(false);
+  expect(hasUsablePublication(qc, [...key.slice(0, 3), "replacement-head"], "rules")).toBe(false);
+  await act(async () => { qc.setQueryData(["viewer"], "replacement-account"); });
+  expect(hasUsablePublication(qc, key, "rules")).toBe(false);
+  unsubscribe();
 });

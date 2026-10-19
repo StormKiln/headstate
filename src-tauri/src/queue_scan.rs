@@ -439,6 +439,13 @@ pub fn commit(
 ) -> Result<bool, StoreError> {
     #[cfg(feature = "enterprise-harness")]
     let mut metric = crate::enterprise_harness::metrics::Scope::new("queue-transaction", 0);
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Deferred,
+        "queue",
+    )?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn.unchecked_transaction()?;
     #[cfg(feature = "enterprise-harness")]
     metric.mark("acquired", 0);

@@ -4911,6 +4911,7 @@ pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthS
 
 #[derive(Default)]
 struct PopulationRegistry {
+    discovery: std::sync::Arc<std::sync::Mutex<crate::claude::corpus_inventory::DiscoveryRuntime>>,
     paused: bool,
     next_id: u64,
     active: std::collections::HashMap<u64, crate::claude::transcript::PopulationControl>,
@@ -4939,6 +4940,14 @@ fn admit_population_state(
 ) -> Result<u64, String> {
     // All durable admission/cancellation operations take the database write
     // lock before the registry lock. No stale pause read can race a resume.
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-admission",
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -4962,6 +4971,14 @@ fn persist_population_pause(
     conn: &mut rusqlite::Connection,
     registry: &std::sync::Mutex<PopulationRegistry>,
 ) -> Result<(), String> {
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-pause",
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -5025,6 +5042,216 @@ async fn admit_population(
 #[cfg(test)]
 mod corpus_cancel_tests {
     use super::*;
+    #[test]
+    fn missing_corpus_root_is_stable_absence_across_rotations_and_reopen() {
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("never-created");
+        let db = dir.path().join("absent.db");
+        let mut conn = open_db(&db).unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for first in 0..8usize {
+            if first == 4 {
+                drop(conn);
+                conn = open_db(&db).unwrap();
+            }
+            settings::set(
+                &conn,
+                settings::keys::CLAUDE_POPULATION_NEXT_LANE,
+                &(first % 4),
+            )
+            .unwrap();
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &std::sync::Mutex::new(PopulationRegistry::default()),
+                &slots,
+            );
+            for progress in [
+                out.metadata.unwrap(),
+                out.usage.unwrap(),
+                out.indexed.unwrap().population,
+            ] {
+                assert_eq!(
+                    progress.status,
+                    PopulationStatus::Complete,
+                    "fresh missing root is not failed discovery; first lane {first}"
+                );
+            }
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "stable absence must not churn epochs"
+            );
+        }
+        std::fs::create_dir_all(root.join("synthetic")).unwrap();
+        std::fs::write(
+            root.join("synthetic/new.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"new\",\"message\":{\"content\":\"new history\"}}\n",
+        )
+        .unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_root_with_legacy_facts_without_inventory_stays_qualified() {
+        use crate::claude::transcript::{PopulationControl, PopulationStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("missing");
+        let mut conn = open_db(&dir.path().join("legacy.db")).unwrap();
+        conn.execute("INSERT INTO claude_session(session_id,first_seen_at) VALUES('legacy','2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute("INSERT INTO claude_session_pr(session_id,repo,number,url,first_seen_at) VALUES('legacy','octocat/hello-world',1,'https://github.com/octocat/hello-world/pull/1','fixture')", []).unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for first in 0..4usize {
+            settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &std::sync::Mutex::new(PopulationRegistry::default()),
+                &slots,
+            );
+            for progress in [
+                out.metadata.unwrap(),
+                out.usage.unwrap(),
+                out.indexed.unwrap().population,
+            ] {
+                assert_eq!(progress.status, PopulationStatus::Deferred);
+                assert!(!progress.total_known);
+            }
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_session", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_session_pr", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_corpus_epoch", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn disappeared_corpus_root_preserves_accepted_index_and_links() {
+        use crate::claude::transcript::PopulationControl;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        std::fs::create_dir_all(root.join("synthetic")).unwrap();
+        std::fs::write(root.join("synthetic/stable.jsonl"), "{\"type\":\"user\",\"sessionId\":\"stable\",\"message\":{\"content\":\"https://github.com/octocat/hello-world/pull/1\"}}\n").unwrap();
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(root.join("synthetic/stable.jsonl")).unwrap(), "{}", serde_json::json!({"type":"pr-link","sessionId":"stable","prNumber":1,"prUrl":"https://github.com/octocat/hello-world/pull/1","prRepository":"octocat/hello-world","timestamp":"2026-09-11T12:00:00.000Z"})).unwrap();
+        let db = dir.path().join("retained.db");
+        let mut conn = open_db(&db).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        let epoch: (i64, i64) = conn
+            .query_row(
+                "SELECT accepted,staging FROM claude_corpus_epoch",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        for table in [
+            "claude_index_ledger",
+            "claude_link_checkpoint",
+            "claude_session_pr",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        std::fs::rename(&root, dir.path().join("retained-projects")).unwrap();
+        drop(conn);
+        let mut conn = open_db(&db).unwrap();
+        for _ in 0..8 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT accepted,staging FROM claude_corpus_epoch",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            epoch
+        );
+        for table in [
+            "claude_index_ledger",
+            "claude_link_checkpoint",
+            "claude_session_pr",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "missing root must preserve {table}"
+            );
+        }
+        std::fs::rename(dir.path().join("retained-projects"), &root).unwrap();
+        for _ in 0..4 {
+            populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn durable_pause_survives_reopen_and_automatic_admission_until_explicit_resume() {
         let dir = tempfile::tempdir().unwrap();
@@ -5115,6 +5342,155 @@ mod corpus_cancel_tests {
     }
 
     #[test]
+    fn accepted_index_progress_precedes_slow_incomplete_discovery() {
+        use crate::claude::{corpus_probe, transcript::PopulationControl};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("accepted.jsonl");
+        let body = |text: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"accepted\",\"message\":{{\"content\":\"{text}\"}}}}\n")
+        };
+        std::fs::write(&source, body("initial")).unwrap();
+        let mut conn = open_db(&dir.path().join("progress.db")).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        populate_live_corpus(
+            &mut conn,
+            Some(&root),
+            &PopulationControl::default(),
+            &registry,
+            &slots,
+        );
+        std::fs::write(&source, body("accepted changed progress")).unwrap();
+        for i in 0..256 {
+            std::fs::write(project.join(format!("extra-{i}.jsonl")), "").unwrap();
+        }
+        settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &3usize).unwrap();
+        let control = PopulationControl::default();
+        corpus_probe::configure(
+            std::time::Duration::from_micros(100),
+            Some((64, control.clone())),
+        );
+        let result = populate_live_corpus(&mut conn, Some(&root), &control, &registry, &slots);
+        corpus_probe::configure(std::time::Duration::ZERO, None);
+        assert_eq!(
+            result.indexed.unwrap().indexed,
+            1,
+            "accepted source must publish before slow discovery exhausts the pass"
+        );
+        let found:i64=conn.query_row("SELECT count(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'changed'",[],|r|r.get(0)).unwrap();
+        assert_eq!(found, 1);
+    }
+
+    // Test-only bounded convergence, not an extension of any production slice.
+    // Each call still uses the real one-second discovery and lane deadlines.
+    fn fixture_is_certified(out: &LivePopulation) -> bool {
+        use crate::claude::transcript::PopulationStatus;
+        let progress = [
+            out.metadata.as_ref().unwrap(),
+            out.usage.as_ref().unwrap(),
+            &out.indexed.as_ref().unwrap().population,
+        ];
+        for p in progress {
+            assert!(matches!(
+                p.status,
+                PopulationStatus::Complete | PopulationStatus::Deferred
+            ));
+            assert_eq!(p.failed, 0);
+        }
+        let link = out.links.as_ref().unwrap();
+        assert!(link.stopped.is_none());
+        assert!(link.unreadable.is_empty());
+        progress.iter().all(|p| {
+            p.status == PopulationStatus::Complete
+                && p.total_known
+                && p.total == 1
+                && p.completed == 1
+        }) && link.deferred == 0
+            && !link.not_started
+    }
+
+    #[test]
+    fn stable_inventory_completes_all_lanes_across_rotations_without_body_rereads() {
+        use crate::claude::transcript::PopulationControl;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let project = root.join("synthetic");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("stable.jsonl"), "{\"type\":\"user\",\"sessionId\":\"stable\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/synthetic\",\"message\":{\"content\":\"stable source\"}}\n").unwrap();
+        let path = dir.path().join("stable.db");
+        let mut conn = open_db(&path).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        let registry = std::sync::Mutex::new(PopulationRegistry::default());
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // Setup must actually certify all lanes; a fixed number of warmups
+        // cannot establish authority on a slow or contended filesystem.
+        let mut certified = false;
+        for _ in 0..32 {
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+            if fixture_is_certified(&out) {
+                certified = true;
+                break;
+            }
+        }
+        assert!(certified, "fixture setup never obtained certified coverage");
+        drop(conn);
+        let mut conn = open_db(&path).unwrap();
+        for first in 0..4usize {
+            let mut certified = false;
+            for attempt in 0..32 {
+                settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &first).unwrap();
+                #[cfg(feature = "enterprise-harness")]
+                crate::enterprise_harness::resources::take_read_capture();
+                // Deterministically split the fresh epoch once. Subsequent calls
+                // resume it under the same production slice, without delay.
+                crate::claude::corpus_probe::configure(
+                    if attempt == 0 {
+                        std::time::Duration::from_millis(1100)
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                    None,
+                );
+                let out = populate_live_corpus(
+                    &mut conn,
+                    Some(&root),
+                    &PopulationControl::default(),
+                    &registry,
+                    &slots,
+                );
+                crate::claude::corpus_probe::configure(std::time::Duration::ZERO, None);
+                #[cfg(feature = "enterprise-harness")]
+                assert_eq!(
+                    crate::enterprise_harness::resources::take_read_capture(),
+                    [0; 4],
+                    "unchanged rotation {first}, continuation {attempt} must not reread bodies"
+                );
+                let complete = fixture_is_certified(&out);
+                if attempt == 0 {
+                    assert!(!complete, "forced split must remain qualified");
+                }
+                if complete {
+                    certified = true;
+                    break;
+                }
+            }
+            assert!(
+                certified,
+                "rotation {first} never obtained certified coverage"
+            );
+        }
+    }
+
+    #[test]
     fn expensive_usage_cannot_keep_index_behind_it_across_ticks_and_restart() {
         use crate::claude::population_schedule::Lane;
         use crate::claude::transcript::{PopulationControl, PopulationStatus};
@@ -5128,6 +5504,31 @@ mod corpus_cancel_tests {
         let registry = std::sync::Mutex::new(PopulationRegistry::default());
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let mut conn = open_db(&path).unwrap();
+        crate::claude::linkscan::reset(&conn, 0).unwrap();
+        // Establish membership without running any body-processing lane. The
+        // fairness assertion must not depend on first-discovery speed.
+        let mut discovery = crate::claude::corpus_inventory::DiscoveryRuntime::default();
+        let mut certified = false;
+        for _ in 0..32 {
+            let slice = crate::claude::corpus_inventory::reconcile_corpus(
+                &mut conn,
+                &root,
+                &PopulationControl::default(),
+                &mut discovery,
+            )
+            .unwrap();
+            if slice.authoritative {
+                certified = true;
+                break;
+            }
+        }
+        assert!(certified, "membership setup never certified");
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM claude_transcript_fts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 0, "setup must not pre-index the fairness fixture");
         settings::set(&conn, settings::keys::CLAUDE_POPULATION_NEXT_LANE, &2usize).unwrap();
         let mut expired = false;
         let first = populate_live_corpus_with_controls(
@@ -5155,6 +5556,8 @@ mod corpus_cancel_tests {
         drop(conn);
         let mut conn = open_db(&path).unwrap();
         expired = false;
+        crate::claude::corpus_probe::configure(std::time::Duration::from_millis(1100), None);
+        let mut second_order = Vec::new();
         let second = populate_live_corpus_with_controls(
             &mut conn,
             Some(&root),
@@ -5162,6 +5565,7 @@ mod corpus_cancel_tests {
             &registry,
             &slots,
             &mut |lane, root| {
+                second_order.push(lane);
                 if lane == Lane::Usage {
                     expired = true;
                 }
@@ -5172,13 +5576,40 @@ mod corpus_cancel_tests {
                 }
             },
         );
+        crate::claude::corpus_probe::configure(std::time::Duration::ZERO, None);
         let indexed = second.indexed.unwrap();
-        assert_eq!(indexed.population.status, PopulationStatus::Complete);
-        assert_eq!(indexed.population.completed, 1);
-        assert_eq!(second.usage.unwrap().status, PopulationStatus::TimedOut);
+        assert_eq!(second_order.first(), Some(&Lane::Index));
         assert_eq!(
-            second.index_health,
-            crate::background::IndexOutcome::Healthy
+            indexed.indexed, 1,
+            "the second tick must publish new index work"
+        );
+        assert_eq!(indexed.population.completed, 1);
+        assert_eq!(
+            indexed.population.status,
+            PopulationStatus::Deferred,
+            "forced split qualifies coverage without discarding index progress"
+        );
+        let found:i64=conn.query_row("SELECT count(*) FROM claude_transcript_fts WHERE claude_transcript_fts MATCH 'searchable'",[],|r|r.get(0)).unwrap();
+        assert_eq!(found, 1, "second-tick progress must be durably searchable");
+        assert_eq!(second.usage.unwrap().status, PopulationStatus::TimedOut);
+        let mut certified = false;
+        for _ in 0..32 {
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+            if fixture_is_certified(&out) {
+                assert_eq!(out.index_health, crate::background::IndexOutcome::Healthy);
+                certified = true;
+                break;
+            }
+        }
+        assert!(
+            certified,
+            "fairness fixture never obtained certified coverage"
         );
     }
 
@@ -5915,6 +6346,10 @@ fn claude_live_pass_with_population(
 
 #[derive(Default)]
 struct LivePopulation {
+    #[cfg(any(test, feature = "enterprise-harness"))]
+    links: Option<crate::claude::linkscan::Refreshed>,
+    #[cfg(feature = "enterprise-harness")]
+    link_errors: Vec<String>,
     indexed: Option<crate::claude::search::Indexed>,
     metadata: Option<crate::claude::transcript::PopulationProgress>,
     usage: Option<crate::claude::transcript::PopulationProgress>,
@@ -5974,7 +6409,6 @@ fn populate_live_corpus_with_controls(
         out.index_health = IndexOutcome::Failed("No transcript directory is available".into());
         return out;
     };
-    let scan = crate::claude::transcript::corpus_controlled(root, control);
     let order = match processing_order(conn) {
         Ok(order) => order,
         Err(error) => {
@@ -5982,11 +6416,65 @@ fn populate_live_corpus_with_controls(
             return out;
         }
     };
+    let mut scan = match crate::claude::corpus_inventory::load_population_scan(conn, root, control)
+    {
+        Ok(scan) => scan,
+        Err(error) => {
+            out.index_health = IndexOutcome::Failed(error.to_string());
+            return out;
+        }
+    };
+    let discovery = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .discovery
+        .clone();
     // Rotation is persisted before work: timeout or interruption cannot pin an
     // expensive usage source ahead of the index forever. Each slice shares the
     // root cancellation and is capped by its remaining deadline.
-    for lane in order {
-        let lane_control = control_for_lane(lane, control);
+    let mut authoritative = false;
+    let mut first_control = None;
+    for (position, lane) in order
+        .into_iter()
+        .chain(std::iter::once(order[0]))
+        .enumerate()
+    {
+        if position == 4 && !authoritative {
+            break;
+        }
+        if position == 1 {
+            let mut runtime = discovery.lock().unwrap_or_else(|e| e.into_inner());
+            match crate::claude::corpus_inventory::reconcile_corpus(
+                conn,
+                root,
+                control,
+                &mut runtime,
+            ) {
+                Ok(slice) => {
+                    authoritative = slice.authoritative;
+                    scan = slice.scan;
+                }
+                Err(error) => {
+                    log::warn!("claude: corpus discovery failed: {error}");
+                    if let Ok(observed) =
+                        crate::claude::corpus_inventory::load_population_scan(conn, root, control)
+                    {
+                        scan = observed;
+                    }
+                    scan.unreadable_dirs.push(error.to_string());
+                }
+            }
+        }
+        // Revisit the first lane after completed discovery to finalize truthful
+        // totals/pruning. Its original deadline is retained; no extra budget.
+        let lane_control = if position == 4 {
+            first_control.take().expect("first lane has a control")
+        } else {
+            control_for_lane(lane, control)
+        };
+        if position == 0 {
+            first_control = Some(lane_control.clone());
+        }
         match lane {
             Lane::Links => match crate::claude::linkscan::refresh_controlled(
                 conn,
@@ -5994,12 +6482,23 @@ fn populate_live_corpus_with_controls(
                 crate::claude::linkscan::BYTES_PER_PASS,
                 &lane_control,
             ) {
-                Ok(done) if !done.unreadable.is_empty() => log::warn!(
-                    "claude: link population: {} source failures",
-                    done.unreadable.len()
-                ),
-                Ok(_) => {}
-                Err(error) => log::warn!("claude: link population failed: {error}"),
+                Ok(done) => {
+                    if !done.unreadable.is_empty() {
+                        log::warn!(
+                            "claude: link population: {} source failures",
+                            done.unreadable.len()
+                        );
+                    }
+                    #[cfg(any(test, feature = "enterprise-harness"))]
+                    {
+                        out.links = Some(done);
+                    }
+                }
+                Err(error) => {
+                    log::warn!("claude: link population failed: {error}");
+                    #[cfg(feature = "enterprise-harness")]
+                    out.link_errors.push(error.to_string());
+                }
             },
             Lane::Metadata => match crate::claude::store::metadata_pass(conn, &scan, &lane_control)
             {
@@ -9163,5 +9662,439 @@ mod artifact_wire_compatibility_tests {
             None
         );
         assert!(size_artifacts(vec![missing]).await.is_err());
+    }
+}
+
+/// Synthetic-root adapter only; all lane execution remains in production code.
+#[cfg(feature = "enterprise-harness")]
+pub(crate) mod enterprise_corpus {
+    use super::*;
+    use crate::enterprise_harness::corpus::ValidatedCorpus;
+    pub(crate) struct Runtime {
+        registry: std::sync::Mutex<PopulationRegistry>,
+        slots: std::sync::Arc<tokio::sync::Semaphore>,
+        permission: std::sync::Mutex<Option<std::fs::Permissions>>,
+        fault_receipts: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+    impl Default for Runtime {
+        fn default() -> Self {
+            Self {
+                registry: Default::default(),
+                slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                permission: Default::default(),
+                fault_receipts: Default::default(),
+            }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn real_population_preserves_rollback_authority_and_durable_pause_across_reopen() {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".enterprise-synthetic"), "unit-only").unwrap();
+            let root = dir.path().join("generated-corpus/projects");
+            std::fs::create_dir_all(&root).unwrap();
+            let validated = ValidatedCorpus::new(dir.path(), &root).unwrap();
+            let db = dir.path().join("headstate.db");
+            let conn = open_db(&db).unwrap();
+            let runtime = Runtime::default();
+            runtime.initialize(&db, &validated).unwrap();
+            let project = root.join("synthetic");
+            std::fs::create_dir(&project).unwrap();
+            for n in 0..128 {
+                let mut file =
+                    std::fs::File::create(project.join(format!("session-{n:03}.jsonl"))).unwrap();
+                writeln!(file, "{}", serde_json::json!({"type":"user","timestamp":"2026-10-18T12:00:00Z","cwd":project,"message":{"role":"user","content":format!("mixedneedle{n:03}")}})).unwrap();
+                writeln!(file, "{}", serde_json::json!({"type":"assistant","timestamp":"2026-10-18T12:00:01Z","message":{"role":"assistant","model":"claude-sonnet-4-20250514","usage":{"input_tokens":11,"output_tokens":7},"content":[{"type":"tool_use","id":format!("t{n}"),"name":"Bash","input":{"command":"gh pr create"}}]}})).unwrap();
+            }
+            std::fs::write(project.join("malformed.jsonl"), "{invalid json\n").unwrap();
+            // Isolated adapter test calls are not the native benchmark cadence.
+            for _ in 0..8 {
+                runtime.pass(&db, &validated).unwrap();
+            }
+            let before = runtime.status(&db, &validated).unwrap();
+            assert!(runtime.initialize(&db, &validated).is_err());
+            assert_eq!(
+                runtime.status(&db, &validated).unwrap(),
+                before,
+                "reinitialization cannot wipe accepted corpus data"
+            );
+            assert!(before["counts"]["sessions"].as_i64().unwrap() >= 128);
+            assert!(before["counts"]["indexed"].as_i64().unwrap() >= 128);
+            assert!(
+                before["counts"]["checkpoints"].as_i64().unwrap() >= 128,
+                "actual links lane checkpoint authority"
+            );
+            let answer = crate::claude::search::search(
+                &conn,
+                "mixedneedle001",
+                50,
+                Vec::new(),
+                crate::remote::privacy::Matching::Unmasked,
+            )
+            .unwrap();
+            assert!(matches!(
+                answer.verdict,
+                crate::claude::search::Verdict::Matches { .. }
+            ));
+            runtime.fault(&db, &validated, true).unwrap();
+            let mut append = std::fs::OpenOptions::new()
+                .append(true)
+                .open(project.join("session-001.jsonl"))
+                .unwrap();
+            writeln!(append, "{}", serde_json::json!({"type":"user","timestamp":"2026-10-18T12:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"https://github.com/synthetic-lab/repo-1/pull/52","is_error":false}]}})).unwrap();
+            let failed = runtime.pass(&db, &validated).unwrap();
+            assert!(
+                failed["linkErrors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|error| error
+                        .as_str()
+                        .unwrap()
+                        .contains("enterprise_mixed_declared_link_rollback")),
+                "actual production link failure receipt required"
+            );
+            let after = runtime.status(&db, &validated).unwrap();
+            for index in [1, 2, 4] {
+                assert_ne!(
+                    before["healthyAuthority"][0][index], after["healthyAuthority"][0][index],
+                    "metadata activity/index bytes/usage bytes must independently advance"
+                );
+            }
+            assert_eq!(
+                before["linkAuthority"], after["linkAuthority"],
+                "FAIL must not publish partial link/checkpoint/digest authority"
+            );
+            runtime.pause(&db, &validated).unwrap();
+            runtime.fault(&db, &validated, false).unwrap();
+            let reopened = Runtime::default();
+            assert_eq!(reopened.status(&db, &validated).unwrap()["paused"], true);
+            assert_eq!(
+                reopened.pass(&db, &validated).unwrap()["indexOutcome"],
+                "Paused"
+            );
+            assert_eq!(
+                reopened.status(&db, &validated).unwrap()["linkAuthority"],
+                before["linkAuthority"]
+            );
+            reopened.resume(&db, &validated).unwrap();
+            for _ in 0..4 {
+                reopened.pass(&db, &validated).unwrap();
+            }
+            let recovered = reopened.status(&db, &validated).unwrap();
+            assert_eq!(recovered["counts"]["links"], 1);
+            assert_ne!(
+                recovered["linkAuthority"]["checkpoint"],
+                before["linkAuthority"]["checkpoint"]
+            );
+        }
+        #[test]
+        fn empty_initialization_is_durable_and_cannot_reset_existing_authority() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".enterprise-synthetic"), "unit-only").unwrap();
+            let root = dir.path().join("generated-corpus/projects");
+            std::fs::create_dir_all(&root).unwrap();
+            let validated = ValidatedCorpus::new(dir.path(), &root).unwrap();
+            let db = dir.path().join("headstate.db");
+            let conn = open_db(&db).unwrap();
+            let runtime = Runtime::default();
+            std::fs::write(root.join("pending.jsonl"), "must not read or import").unwrap();
+            assert!(runtime.initialize(&db, &validated).is_err());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM claude_link_baseline", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            std::fs::remove_file(root.join("pending.jsonl")).unwrap();
+            runtime.initialize(&db, &validated).unwrap();
+            let before: i64 = conn
+                .query_row("SELECT since_ms FROM claude_link_baseline", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            // A new runtime models reopen: durable authority, not a local bool,
+            // refuses initialization even with the root still empty.
+            assert!(Runtime::default().initialize(&db, &validated).is_err());
+            assert_eq!(
+                conn.query_row("SELECT since_ms FROM claude_link_baseline", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                before
+            );
+            std::fs::write(root.join("accepted.jsonl"), "retained source").unwrap();
+            assert!(runtime.initialize(&db, &validated).is_err());
+            assert_eq!(
+                std::fs::read_to_string(root.join("accepted.jsonl")).unwrap(),
+                "retained source"
+            );
+        }
+    }
+    #[cfg(unix)]
+    fn make_unreadable(
+        path: &std::path::Path,
+    ) -> Result<(std::fs::Permissions, std::io::Error), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::metadata(path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+            .map_err(|e| e.to_string())?;
+        match std::fs::File::open(path) {
+            Ok(_) => {
+                std::fs::set_permissions(path, permissions).map_err(|e| e.to_string())?;
+                Err("permission failure unavailable: actual open succeeded".into())
+            }
+            Err(error) => Ok((permissions, error)),
+        }
+    }
+    #[cfg(not(unix))]
+    fn make_unreadable(
+        _path: &std::path::Path,
+    ) -> Result<(std::fs::Permissions, std::io::Error), String> {
+        Err("permission fault requires Unix capability".into())
+    }
+    impl Runtime {
+        fn connection(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<rusqlite::Connection, String> {
+            root.check_tree()?;
+            if !db
+                .canonicalize()
+                .map_err(|e| e.to_string())?
+                .starts_with(root.profile())
+            {
+                return Err("synthetic database escaped marked profile".into());
+            }
+            open_db(db).map_err(|e| e.to_string())
+        }
+        pub(crate) fn initialize(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<(), String> {
+            // Exclusive with all production population work. This is setup of a
+            // genuine empty import, never a cursor reset for an existing corpus.
+            let _permit = self
+                .slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "corpus initialization requires idle worker".to_string())?;
+            let mut conn = self.connection(db, root)?;
+            if std::fs::read_dir(root.root())
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_some()
+            {
+                return Err("corpus initialization requires an empty generated root".into());
+            }
+            for table in [
+                "claude_session",
+                "claude_link_baseline",
+                "claude_population_state",
+                "claude_population_generation",
+                "claude_corpus_inventory",
+                "claude_corpus_epoch",
+                "claude_index_ledger",
+                "claude_usage_ledger",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
+                if count != 0 {
+                    return Err("corpus initialization refuses existing durable authority".into());
+                }
+            }
+            let control = crate::claude::transcript::PopulationControl::discovery();
+            let id = admit_population_state(&mut conn, &self.registry, &control, false)?;
+            let _registration = PopulationRegistration {
+                id,
+                registry: &self.registry,
+            };
+            let since_ms = chrono::Utc::now().timestamp_millis();
+            let scan = crate::claude::transcript::scan_controlled(root.root(), &control);
+            if scan.is_partial() || scan.absent_root.is_some() || !scan.sessions.is_empty() {
+                return Err("empty corpus changed during initialization".into());
+            }
+            let imported =
+                crate::claude::store::import_controlled_since(&mut conn, scan, &control, since_ms)
+                    .map_err(|e| e.to_string())?;
+            if !imported.write_failures.is_empty()
+                || imported.population.status
+                    != crate::claude::transcript::PopulationStatus::Complete
+            {
+                return Err("empty production import did not complete".into());
+            }
+            Ok(())
+        }
+        pub(crate) fn pass(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<serde_json::Value, String> {
+            let mut conn = self.connection(db, root)?;
+            let control = crate::claude::transcript::PopulationControl::default();
+            let result = populate_live_corpus(
+                &mut conn,
+                Some(root.root()),
+                &control,
+                &self.registry,
+                &self.slots,
+            );
+            Ok(
+                serde_json::json!({"indexOutcome":format!("{:?}",result.index_health),"links":format!("{:?}",result.links),"linkErrors":result.link_errors,"indexed":result.indexed,"metadata":result.metadata,"usage":result.usage,"stored":self.status(db,root)?}),
+            )
+        }
+        pub(crate) fn permission_fault(
+            &self,
+            root: &ValidatedCorpus,
+            enabled: bool,
+        ) -> Result<(), String> {
+            root.check_tree()?;
+            let path = root.root().join("synthetic/unreadable.jsonl");
+            let mut original = self.permission.lock().unwrap_or_else(|e| e.into_inner());
+            if enabled {
+                if original.is_some() {
+                    return Err("permission fault already enabled".into());
+                }
+                let (permissions, error) = make_unreadable(&path)?;
+                *original = Some(permissions);
+                self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).push(serde_json::json!({"kind":"permission-on","source":"synthetic/unreadable.jsonl","actualOpenError":error.to_string(),"osCode":error.raw_os_error()}));
+            } else if let Some(permissions) = original.take() {
+                std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
+                self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).push(serde_json::json!({"kind":"permission-off","source":"synthetic/unreadable.jsonl"}));
+            }
+            Ok(())
+        }
+        pub(crate) fn fault(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+            enabled: bool,
+        ) -> Result<(), String> {
+            let conn = self.connection(db, root)?;
+            if enabled {
+                let target = root.root().join("synthetic/session-001.jsonl");
+                if !target.is_file() {
+                    return Err("declared append source required for fault".into());
+                }
+                let quoted = target.to_string_lossy().replace('\'', "''");
+                conn.execute_batch(&format!("CREATE TRIGGER enterprise_mixed_link_rollback BEFORE INSERT ON claude_link_checkpoint WHEN NEW.path='{quoted}' BEGIN SELECT RAISE(FAIL,'enterprise_mixed_declared_link_rollback'); END;")).map_err(|e|e.to_string())?;
+            } else {
+                conn.execute_batch("DROP TRIGGER IF EXISTS enterprise_mixed_link_rollback;")
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        pub(crate) fn pause(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<(), String> {
+            self.registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel();
+            let mut conn = self.connection(db, root)?;
+            persist_population_pause(&mut conn, &self.registry)
+        }
+        pub(crate) fn resume(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<(), String> {
+            let mut conn = self.connection(db, root)?;
+            let control = crate::claude::transcript::PopulationControl::default();
+            let id = admit_population_state(&mut conn, &self.registry, &control, true)?;
+            drop(PopulationRegistration {
+                id,
+                registry: &self.registry,
+            });
+            Ok(())
+        }
+        pub(crate) fn cancel_active(&self) {
+            for control in self
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active
+                .values()
+            {
+                control.cancel();
+            }
+        }
+        pub(crate) fn status(
+            &self,
+            db: &std::path::Path,
+            root: &ValidatedCorpus,
+        ) -> Result<serde_json::Value, String> {
+            let conn = self.connection(db, root)?;
+            let paused =
+                settings::get_strict::<bool>(&conn, settings::keys::CLAUDE_POPULATION_PAUSED)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+            let mut progress = serde_json::Map::new();
+            for lane in ["metadata", "usage", "index", "links"] {
+                progress.insert(
+                    lane.into(),
+                    serde_json::to_value(
+                        crate::claude::transcript::stored_progress(&conn, lane)
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+            }
+            let mut counts = serde_json::Map::new();
+            for (label, sql) in [
+                ("sessions", "SELECT COUNT(*) FROM claude_session"),
+                ("indexed", "SELECT COUNT(*) FROM claude_index_ledger"),
+                ("usage", "SELECT COUNT(*) FROM claude_usage_ledger"),
+                ("links", "SELECT COUNT(*) FROM claude_session_pr"),
+                ("checkpoints", "SELECT COUNT(*) FROM claude_link_checkpoint"),
+            ] {
+                let count: i64 = conn
+                    .query_row(sql, [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                counts.insert(label.into(), serde_json::json!(count));
+            }
+            fn rows(
+                conn: &rusqlite::Connection,
+                sql: &str,
+                target: &str,
+            ) -> Result<Vec<serde_json::Value>, String> {
+                let mut statement = conn.prepare(sql).map_err(|e| e.to_string())?;
+                let result = statement
+                    .query_map([target], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                result
+                    .map(|row| {
+                        serde_json::from_str(&row.map_err(|e| e.to_string())?)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect()
+            }
+            let target = root
+                .root()
+                .join("synthetic/session-001.jsonl")
+                .to_string_lossy()
+                .into_owned();
+            let links = rows(&conn, "SELECT json_array(session_id,repo,number,url,first_seen_at) FROM claude_session_pr WHERE ?1 IS NOT NULL ORDER BY session_id,repo,number", &target)?;
+            let checkpoint = rows(&conn, "SELECT json_array(path,offset,payload,hash_count) FROM claude_link_checkpoint WHERE path=?1", &target)?;
+            let bytes = rows(&conn, "SELECT json_array(hex(line),hex(tail),hex(last_block),hex(audit),hex(provenance)) FROM claude_link_bytes WHERE path=?1", &target)?;
+            let hashes = rows(&conn, "SELECT json_array(block,hex(digest)) FROM claude_link_hash WHERE path=?1 ORDER BY block", &target)?;
+            let usage = rows(&conn, "SELECT json_array(session_id,messages,input_tokens,output_tokens,cache_read,cache_creation,truncated) FROM claude_session_usage WHERE ?1 IS NOT NULL ORDER BY session_id", &target)?;
+            let sessions = rows(&conn, "SELECT json_array(session_id,cwd,opening_prompt) FROM claude_session WHERE ?1 IS NOT NULL ORDER BY session_id", &target)?;
+            let indexed_sources = rows(&conn, "SELECT json_array(session_id,size_bytes,truncated) FROM claude_index_ledger WHERE ?1 IS NOT NULL ORDER BY session_id", &target)?;
+            let healthy = rows(&conn, "SELECT json_array(s.session_id,s.last_activity_at,i.size_bytes,i.mtime_ns,u.size_bytes,u.mtime_ns) FROM claude_session s LEFT JOIN claude_index_ledger i ON i.session_id=s.session_id LEFT JOIN claude_usage_ledger u ON u.session_id=s.session_id WHERE s.session_id='session-001' AND ?1 IS NOT NULL", &target)?;
+            let coverage = crate::claude::coverage::report(&conn).map_err(|e| e.to_string())?;
+            Ok(
+                serde_json::json!({"paused":paused,"progress":progress,"counts":counts,"coverage":coverage,"sessions":sessions,"usage":usage,"healthyAuthority":healthy,"indexedSources":indexed_sources,"fixtureFaultReceipts":self.fault_receipts.lock().unwrap_or_else(|e|e.into_inner()).clone(),"linkAuthority":{"links":links,"checkpoint":checkpoint,"bytes":bytes,"hashes":hashes}}),
+            )
+        }
     }
 }

@@ -5,7 +5,7 @@ import { getReadyStacks } from "./tauri";
 import { useViewer } from "./hooks";
 import { useAdvisoryWindow } from "./useAdvisoryWindow";
 import { acknowledgeSchedule, isPreferred, isSelected, readSchedule, scheduleMeta, useScheduleClaims } from "./advisorySchedule";
-import { advisoryGcTime, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
+import { advisoryGcTime, hasUsablePublication, assertCurrent, display, receipt, retainedReceipt, useAdvisorySession, useEvidenceExpiry, type Evidence } from "./advisoryEvidence";
 import { prIdentity, prKey } from "@/lib/prIdentity";
 import type { PrStack, PullRequest } from "@/types/pr";
 
@@ -22,7 +22,7 @@ export function useReadyStacks(prs: StackSubject[], priority: ReadonlySet<string
   const preferred = new Set(rows.filter(pr => priority.has(prKey(pr)) || rows.length <= 8).map(keyOf));
   const queryKey = (key: string) => ["ready-stack", owner, session.generation, key];
   const schedule = (key: string) => readSchedule(qc, queryKey(key));
-  const demand = new Set(rows.filter(pr => preferred.has(keyOf(pr)) || !qc.getQueryData<Receipt>(queryKey(keyOf(pr)))?.lastKnown || schedule(keyOf(pr))?.hasContinuation).map(keyOf));
+  const demand = new Set(rows.filter(pr => preferred.has(keyOf(pr)) || !hasUsablePublication(qc, queryKey(keyOf(pr)), "stack") || schedule(keyOf(pr))?.hasContinuation).map(keyOf));
   const window = useAdvisoryWindow(rows.map(keyOf), preferred, enabled && !!owner, demand, schedule);
   const byKey = new Map(rows.map(pr => [keyOf(pr), pr]));
   const selected = window.selected.flatMap(key => { const pr = byKey.get(key); return pr ? [pr] : []; });

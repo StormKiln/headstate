@@ -102,18 +102,16 @@ jobs:
       # in the same commit. The lowest false-positive rate of anything
       # #892's audit evaluated.
       #
-      # Installed via brew rather than added as an action: it is a single
-      # static Go binary, so there is no new third-party action and no new
-      # pinned SHA to audit. shellcheck arrives as its dependency and is
-      # what makes the `run:` bodies checkable. Runs in about 0.2s; the
-      # install is the only cost, and it is paid in `lint` (~2m) rather
-      # than anywhere near the 10m Windows critical path.
-      - name: Install actionlint
-        run: brew install actionlint
+      # The shared target verifies and builds the fixed actionlint source
+      # revision in the ignored repository cache, and installs the explicitly
+      # pinned ShellCheck artifact that makes `run:` bodies checkable.
+      - name: Install Go for workflow lint
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.2'
+          cache: false
       - name: Workflow lint
-        run: |
-          python3 scripts/lint-workflows.test.py
-          python3 scripts/lint-workflows.py
+        run: make lint-workflows
       # Asked BEFORE the heavy jobs, and asked at all because the ignore
       # rule alone cannot enforce this. A committed symlink whose target
       # is absolute or climbs out of the tree resolves only on the
@@ -608,6 +606,19 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/setup
+
+      # The constrained ShellCheck transport is Linux-specific: Darwin does
+      # not expose F_SETPIPE_SZ, so the lint job cannot exercise this branch.
+      # Keep the shared target here as the continuous real-tool regression.
+      - name: Install Go for workflow lint
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - name: Workflow lint (Linux transport)
+        if: matrix.os == 'ubuntu-latest'
+        run: make lint-workflows
 
       - name: Rust tests
         shell: bash

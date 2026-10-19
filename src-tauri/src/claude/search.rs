@@ -447,6 +447,8 @@ fn readable_text_controlled(
         inner: file,
         control,
     };
+    #[cfg(feature = "enterprise-harness")]
+    let reader = crate::enterprise_harness::resources::CountedReader::new(reader, "index");
     let mut reader = BufReader::new(std::io::Read::take(reader, budget));
 
     let mut out = Readable::default();
@@ -707,6 +709,13 @@ pub(crate) fn index_pass_controlled(
                 continue;
             }
         }
+        #[cfg(feature = "enterprise-harness")]
+        let tx = crate::enterprise_harness::resources::transaction(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+            "corpus-index",
+        )?;
+        #[cfg(not(feature = "enterprise-harness"))]
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
             out.population.status = control
@@ -803,6 +812,13 @@ pub(crate) fn index_pass_controlled(
     {
         out.population.status = super::transcript::PopulationStatus::Invalidated;
     }
+    #[cfg(feature = "enterprise-harness")]
+    let tx = crate::enterprise_harness::resources::transaction(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+        "corpus-index",
+    )?;
+    #[cfg(not(feature = "enterprise-harness"))]
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if control.stopped() || !super::transcript::generation_current(&tx, "index", generation)? {
         out.population.status = control
@@ -1117,6 +1133,30 @@ mod tests {
         ));
         std::fs::write(&p, lines).unwrap();
         p
+    }
+
+    #[cfg(feature = "enterprise-harness")]
+    #[test]
+    fn resource_production_search_reads_only_index_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session(
+            dir.path(),
+            "synthetic",
+            "read-accounting",
+            "only index bytes",
+        );
+        let length = std::fs::metadata(&path).unwrap().len();
+        crate::enterprise_harness::resources::take_read_capture();
+        let text = readable_text_controlled(
+            &path,
+            length + 100,
+            &super::super::transcript::PopulationControl::default(),
+        );
+        assert!(text.is_ok());
+        assert_eq!(
+            crate::enterprise_harness::resources::take_read_capture(),
+            [0, 0, length, 0]
+        );
     }
 
     // Synchronize at preparation of the SECOND SELECT: COUNT has already

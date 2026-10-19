@@ -17,7 +17,7 @@ p.execute('CREATE TABLE pr_history(retained TEXT)')
 p.execute("INSERT INTO pr_history VALUES('keep synthetic history')")
 p.commit()`,join(profile,'headstate.db')]);
   const result=JSON.parse(execFileSync('python3',[new URL('./inspect-profile.py',import.meta.url).pathname,profile],{encoding:'utf8'}));
-  assert.equal(result.integrity,'ok');assert.deepEqual(result.counts,{queue_scan:1});
+  assert.equal(result.files.db.status,'measured');assert.equal(result.files.walRetained.status,'absent');assert.equal(result.corpusCounts.claude_session.status,'absent');assert.ok(result.sqlite.page_count>0);assert.ok(result.sqlite.page_size>0);assert.equal(result.integrity,'ok');assert.deepEqual(result.counts,{queue_scan:1});
   assert.equal(result.queues[0].revision,7);assert.equal(result.queues[0].seen,1);
   const retained=execFileSync('python3',['-c','import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute("SELECT retained FROM pr_history").fetchone()[0])',join(profile,'headstate.db')],{encoding:'utf8'}).trim();
   assert.equal(retained,'keep synthetic history');

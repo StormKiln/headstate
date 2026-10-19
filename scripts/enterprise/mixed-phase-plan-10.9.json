@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "segments": {
+    "initial": {
+      "idle": 10000,
+      "unchanged_refresh": 75000,
+      "active_ingestion": 180000,
+      "churn_restart": 10000
+    },
+    "resumed": {
+      "churn_restart": 75000
+    }
+  }
+}

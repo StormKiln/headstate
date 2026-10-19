@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useSyncExternalStore } from "react";
-import type { QueryClient } from "@tanstack/react-query";
+import type { Query, QueryClient } from "@tanstack/react-query";
 import { retireAdvisoryDispatch } from "./advisoryDispatch";
 
 export interface Evidence<T> { value: T; expiresAt: number; observedAt: number }
@@ -8,14 +8,46 @@ export interface DisplayEvidence<T> { value: T; freshness: "fresh" | "retained";
 export const advisoryGcTime = Infinity;
 const isAdvisory = (key: readonly unknown[]) => key[0] === "ready-stack" || key[0] === "ready-pushers" || key[0] === "review-gates";
 
-// Only session control lives outside query state. Query reset/removal owns all
-// evidence, including last successes. A login round trip is a new generation.
+// Publication history belongs to the actual query lifetime, never a parallel
+// string-identity cache. Reset/removal retires it with query-owned display data.
+// Session control separately fences login round trips with a new generation.
+type Family = "stack" | "pusher" | "rules";
+const publications = new WeakMap<Query, Set<Family>>();
+function recordPublication(query: Query) {
+  if (query.queryKey[0] !== "ready-stack" && query.queryKey[0] !== "ready-pushers") return;
+  const data = query.state.data as {
+    stack?: { kind: string }; lastKnown?: Evidence<unknown>; expiresAt?: number;
+    row?: { last_pusher: { state: string }; rules: { state: string } };
+    pusher?: Evidence<unknown>; rules?: Evidence<unknown>;
+  } | undefined;
+  if (!data) return;
+  const now = performance.now();
+  const served = publications.get(query) ?? new Set<Family>();
+  if (query.queryKey[0] === "ready-stack" && data.stack && data.stack.kind !== "unknown"
+    && data.lastKnown && data.lastKnown.expiresAt > now && (data.expiresAt ?? 0) > now) served.add("stack");
+  if (query.queryKey[0] === "ready-pushers") {
+    if (data.row?.last_pusher.state === "known" && data.pusher && data.pusher.expiresAt > now) served.add("pusher");
+    if (data.row?.rules.state === "read" && data.rules && data.rules.expiresAt > now) served.add("rules");
+  }
+  publications.set(query, served);
+}
+/** Initial debt ends only after usable publication; later expiry is display-only
+ * for offscreen rows, whose current authority remains independently qualified. */
+export function hasUsablePublication(qc: QueryClient, key: readonly unknown[], family: Family) {
+  const query = qc.getQueryCache().get(qc.defaultQueryOptions({ queryKey: key }).queryHash);
+  return !!query && publications.get(query)?.has(family) === true;
+}
 const sessions = new WeakMap<QueryClient, ReturnType<typeof createSession>>();
 function createSession(qc: QueryClient) {
   let generation = 0;
   let owner = qc.getQueryData(["viewer"]);
   const listeners = new Set<() => void>();
+  // A consumer can mount after valid data was cached. Bootstrap only authority
+  // that is still usable now, never infer past usability from retained history.
+  for (const query of qc.getQueryCache().getAll()) recordPublication(query);
   qc.getQueryCache().subscribe(event => {
+    if (event.type === "removed" || (event.type === "updated" && event.action.type === "setState")) publications.delete(event.query);
+    if (event.type === "updated" && event.action.type === "success") recordPublication(event.query);
     if (event.query.queryKey[0] === "viewer" && (event.type === "removed" || event.type === "updated")) {
       const next = event.type === "removed" ? undefined : event.query.state.data;
       const reset = event.type === "updated" && event.action.type === "setState";

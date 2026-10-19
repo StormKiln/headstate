@@ -7,7 +7,7 @@ export const telemetry:{kind:string;at:number;name:string;duration?:number;compl
 export const measurement={lost:false};
 export function boundedPush<T>(items:T[],value:T){if(items.length>=100000){measurement.lost=true;return;}items.push(value);}
 export const call:Transport['call']=async<T,>(name:string,args?:Record<string,unknown>):Promise<T>=>{
- const observed=new URL(location.href).searchParams.get('scenario')==='convergence'&&['get_pr_detail','act_on_pr','refresh_source','get_reviewing','refresh_now'].includes(name);
+ const observed=['convergence','quota','churn','mixed'].includes(new URL(location.href).searchParams.get('scenario')??'')&&['get_pr_detail','act_on_pr','refresh_source','get_reviewing','refresh_now','claude_coverage','claude_index_coverage','claude_search_transcripts'].includes(name);
  const at=performance.now();if(observed)boundedPush(telemetry,{kind:'call-start',at,name,args});let envelope:unknown;let callId:number|undefined;
  try{
   const response=await fetch(`/bridge/call/${role}/${name}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(args??{})});
@@ -18,6 +18,6 @@ export const call:Transport['call']=async<T,>(name:string,args?:Record<string,un
  }catch(error){boundedPush(telemetry,{kind:'call',at,name,duration:performance.now()-at,completedWallTime:Date.now(),callId,ok:false,...(observed?{args,envelope,error:String(error)}:{})});throw error;}
 };
 export const listen:Transport['listen']=async<T,>(name:string,cb:(e:{payload:T})=>void)=>{
- const handler=(event:MessageEvent<string>)=>{const payload=JSON.parse(event.data) as T;const error=remoteEventError(name,payload);if(error)throw new Error(error);boundedPush(telemetry,{kind:'event',at:performance.now(),name,...(new URL(location.href).searchParams.get('scenario')==='convergence'&&name==='source-poll-status'?{reply:payload}:{})});cb({payload});};
+ const handler=(event:MessageEvent<string>)=>{const payload=JSON.parse(event.data) as T;const error=remoteEventError(name,payload);if(error)throw new Error(error);boundedPush(telemetry,{kind:'event',at:performance.now(),name,...(['convergence','quota','churn','mixed'].includes(new URL(location.href).searchParams.get('scenario')??'')&&name==='source-poll-status'?{reply:payload}:{})});cb({payload});};
  source.addEventListener(name,handler as EventListener);return()=>source.removeEventListener(name,handler as EventListener);
 };

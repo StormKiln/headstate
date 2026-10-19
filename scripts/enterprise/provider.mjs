@@ -1,3 +1,6 @@
+import {createQuotaState,documentCost,quotaIdentity,validateQuotaProfile} from './quota.mjs';
+import {defaultWorkload,normalizeWorkload} from './workload.mjs';
+import assert from 'node:assert/strict';
 import {statsRequestReasons} from './stats-retirement.mjs';
 import {observeHoldReadiness} from './convergence-action.mjs';
 import {createServer} from 'node:http';import {parseDocument,project} from './graphql.mjs';
@@ -6,10 +9,10 @@ const date=new Date(Date.now()-86400000).toISOString().slice(0,10)+'T12:00:00Z';
 manifest.historyClosedDay=date.slice(0,10);
 export const convergenceManifest={...manifest,openPrs:286,reviewing:236,ready:130,readyNumbers:{from:51,through:180},scenario:'convergence'};
 const connection=nodes=>({nodes,totalCount:nodes.length,issueCount:nodes.length,pageInfo:{hasNextPage:false,endCursor:null}});
-export function fixture({convergence=false}={}) {
+export function fixture({convergence=false,workload}={}) {
  const members=Array.from({length:50},(_,i)=>({login:i===0?"synthetic-viewer":`synthetic-member-${i+1}`,name:`Synthetic member ${i+1}`,avatarUrl:''}));
  const repos=Array.from({length:50},(_,i)=>({name:`repo-${i+1}`,nameWithOwner:`synthetic-lab/repo-${i+1}`,owner:{login:'synthetic-lab'},defaultBranchRef:{name:'main'},url:`https://github.com/synthetic-lab/repo-${i+1}`,isArchived:false,isPrivate:true,pushedAt:date}));
- const rows=Array.from({length:convergence?286:200},(_,i)=>{const number=i+1,repo=repos[i%50];return {
+ const rows=Array.from({length:convergence?286:workload?50+workload.populations.reviewing:200},(_,i)=>{const number=i+1,repo=repos[i%50];return {
   id:`PR_${number}`,number,title:`Synthetic review ${number}`,url:`https://github.com/${repo.nameWithOwner}/pull/${number}`,state:'OPEN',isDraft:convergence&&number>=181,createdAt:date,updatedAt:date,readyAt:date,
   body:`Synthetic description ${number}\n<details><summary>Open report</summary>Retained disclosure</details>`,author:i<50?members[0]:members[1+(i-50)%49],repository:repo,
   headRefName:`topic-${number}`,headRefOid:`head-${number}`,headRef:{id:`REF_${number}`},headRepository:repo,baseRefName:'main',
@@ -24,18 +27,21 @@ export function fixture({convergence=false}={}) {
  const history=Array.from({length:manifest.historicalMerged},(_,i)=>{const row=structuredClone(rows[i%rows.length]);const number=1001+i;row.commits.nodes[0].commit.oid=`head-${number}`;return {...row,id:`PR_${number}`,number,title:`Synthetic historical review ${number}`,url:`https://github.com/${row.repository.nameWithOwner}/pull/${number}`,state:'MERGED',createdAt:new Date(Date.parse(date)-2*86400000).toISOString(),mergedAt:date,closedAt:date,updatedAt:date,headRefName:`topic-${number}`,headRefOid:`head-${number}`,reviewRequests:connection([])};});
  return {members,repos,rows:[...rows,...history]};
 }
-export async function startProvider({convergence=false}={}) {
- const held=[];const data=fixture({convergence}),ledger=[],fault={mode:'healthy',delay:0,thread:false,outdated:false,closed:[]};let active=0,next=0,lost=false;const quota=Object.fromEntries(['graphql','rest'].map(bucket=>[bucket,{remaining:5000,reset:Math.floor(Date.now()/1000)+120}]));
+export async function startProvider({convergence=false,workload,quotaProfile}={}) {
+ if(quotaProfile)quotaProfile=validateQuotaProfile(quotaProfile);
+ if(workload){normalizeWorkload(workload);assert.deepEqual(workload.populations,{authored:50,reviewing:convergence?236:workload.scenario.startsWith('churn')?workload.populations.reviewing:150,repositories:50,members:50,history:250},'unsupported fixture population');assert.deepEqual(workload.quotaProfile,quotaProfile?quotaIdentity(quotaProfile):defaultWorkload.quotaProfile,'quota identity must match provider policy');}
+ const weighted=quotaProfile?createQuotaState(quotaProfile):null;
+ if(workload?.scenario.startsWith('churn'))assert.ok([150,250].includes(workload.populations.reviewing),'churn scale must be 150 or 250');
+ const held=[];const data=fixture({convergence,workload}),ledger=[],fault={mode:'healthy',delay:0,thread:false,outdated:false,closed:[]};let active=0,next=0,lost=false;const quota=Object.fromEntries(['graphql','rest'].map(bucket=>[bucket,{remaining:5000,reset:Math.floor(Date.now()/1000)+120}]));
  const server=createServer(async(req,res)=>{
   const id=++next,started=performance.now();active++;let entry={id,at:started,operation:'unknown',fault:fault.mode,aliases:0,status:0,active,terminal:null};if(ledger.length<100000)ledger.push(entry);else lost=true;res.once('close',()=>{entry.responseDelivered=res.writableFinished;});
   if(convergence)res.setHeader('x-headstate-synthetic-ledger',String(id));
   let raw='';for await(const c of req)raw+=c;
   const bucket=req.url==='/graphql'?'graphql':'rest';
   const window=quota[bucket];if(Math.floor(Date.now()/1000)>=window.reset){window.remaining=5000;window.reset=Math.floor(Date.now()/1000)+120;}
-  window.remaining=Math.max(0,window.remaining-1);entry.bucket=bucket;entry.remaining=window.remaining;entry.reset=window.reset;
+  if(!weighted)window.remaining=Math.max(0,window.remaining-1);entry.bucket=bucket;entry.remaining=window.remaining;entry.reset=window.reset;
   res.setHeader('x-ratelimit-remaining',String(entry.remaining));res.setHeader('x-ratelimit-reset',String(entry.reset));
   try {
-   for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    const responseDelay=fault.delays?.shift()??fault.delay;
    const input=req.url==='/graphql'?JSON.parse(raw):null,doc=input?parseDocument(input.query,input.variables):null;
    const queryName=input?.query.match(/\bquery\s+(\w+)/)?.[1];entry.queryName=queryName;entry.statsRequestReasons=statsRequestReasons(doc,queryName,req.url);
@@ -54,6 +60,20 @@ export async function startProvider({convergence=false}={}) {
    if(doc){entry.aliases=doc.aliases;const names=doc.selection.map(f=>f.name);entry.operation=doc.kind==='mutation'?'review-write':names.includes('search')?'search':names.includes('node')||names.includes('nodes')?'node':names.includes('repository')?'repository':names.includes('viewer')||names.includes('organization')?'viewer':'unknown';}
    else entry.operation=req.method==='GET'?'rest-read':'rest-write';
    const historyRead=doc?.selection.some(f=>f.name==='search'&&String(f.args.query).includes('is:merged')&&f.selection.some(s=>s.name==='nodes'));if(historyRead)entry.operation='history-search';
+   if(weighted){
+    entry.quotaShape={doc,method:req.method,path:req.url};
+    entry.quota=weighted.charge({bucket,cost:documentCost(quotaProfile,entry.quotaShape)});
+    // A primary refusal advertises zero admissible capacity; the receipt
+    // retains the unspent remainder and charges zero for the denied document.
+    entry.remaining=entry.quota.naturalLimit?0:entry.quota.after;entry.reset=entry.quota.reset;
+    res.setHeader('x-ratelimit-remaining',String(entry.remaining));res.setHeader('x-ratelimit-reset',String(entry.reset));
+    if(entry.quota.secondaryLimit||entry.quota.naturalLimit){
+     entry.status=entry.quota.secondaryLimit?429:403;
+     if(entry.quota.secondaryLimit)res.setHeader('retry-after',String(entry.quota.retryAfter));
+     res.writeHead(entry.status,{'content-type':'application/json'}).end(JSON.stringify({message:entry.quota.secondaryLimit?'secondary rate limit':'primary rate limit: synthetic operation cost exceeds remaining capacity'}));return;
+    }
+   }
+   for(const row of data.rows){const state=fault.merged?.includes(row.number)?'MERGED':fault.closed.includes(row.number)?'CLOSED':null;if(state&&row.state!==state){row.state=state;row.closedAt=new Date().toISOString();row.updatedAt=row.closedAt;if(state==='MERGED')row.mergedAt=row.closedAt;}}
    if(failSearch){entry.targetedFailure=true;entry.stage='finite-search-failure';entry.status=503;res.writeHead(503).end();return;}
    if(fault.mode==='offline'){entry.terminal='connection-closed';req.socket.destroy();return;}
    if(fault.mode==='secondary'){res.writeHead(429,{'content-type':'application/json','retry-after':'2'});entry.status=429;res.end(JSON.stringify({message:'secondary rate limit'}));return;}
@@ -75,7 +95,7 @@ export async function startProvider({convergence=false}={}) {
    let pageRefusal=false;
    const resolve=(f,o)=>{
     if(o===root){
-     if(f.name==='rateLimit')return {cost:1,remaining:entry.remaining,resetAt:new Date(entry.reset*1000).toISOString()};
+     if(f.name==='rateLimit')return {cost:entry.quota?.charged??1,remaining:entry.remaining,resetAt:new Date(entry.reset*1000).toISOString()};
      if(f.name==='viewer')return {login:'synthetic-viewer',organizations:connection([{login:'synthetic-lab',name:'Synthetic laboratory',avatarUrl:'',membersWithRole:connection(data.members),repositories:connection(data.repos)}]),repositories:connection(data.repos)};
      if(f.name==='organization')return f.args.login==='synthetic-lab'?{login:'synthetic-lab',name:'Synthetic laboratory',membersWithRole:connection(data.members),repositories:connection(data.repos)}:null;
      if(f.name==='repository')return data.repos.find(r=>r.name===f.args.name&&r.owner.login===f.args.owner)??null;
@@ -103,6 +123,7 @@ export async function startProvider({convergence=false}={}) {
      if(f.name==='addPullRequestReview'){
       const input=f.args.input,pr=data.rows.find(r=>r.id===input.pullRequestId);if(!pr)throw Error('unknown mutation identity');
       const review={id:`REVIEW_${pr.number}`,state:({APPROVE:"APPROVED",REQUEST_CHANGES:"CHANGES_REQUESTED",COMMENT:"COMMENTED"})[input.event],submittedAt:date,author:{login:'synthetic-viewer'},commit:{oid:input.commitOID??pr.headRefOid},pullRequest:pr};
+      entry.mutationReceipt={ok:true,identity:`${pr.repository.nameWithOwner}/${pr.number}`,head:review.commit.oid};
       pr.latestReviews=connection([review]);pr.reviews=connection([review]);return {pullRequestReview:review};
      }
      throw Error('unsupported root');
@@ -114,6 +135,7 @@ export async function startProvider({convergence=false}={}) {
     return o[f.name]??null;
    };
    const root={};const response=project(doc.selection,root,resolve);
+   if(queryName==='QueueConfirmation')entry.confirmations=doc.selection.filter(f=>f.name==='search').map((field,i)=>({direct:response[`p${i}`]?.pullRequest,bucket:response[field.alias??field.name]}));
    if(pageRefusal){entry.status=503;res.writeHead(503).end();return;}
    entry.materializedAt=performance.now();
    if(holdSearch&&holdRule.observeReady){entry.holdEligibility=await observeHoldReadiness(holdRule.observeReady);holdSearch=entry.holdEligibility.eligible===true;}
@@ -125,7 +147,7 @@ export async function startProvider({convergence=false}={}) {
   finally {active--;entry.elapsed=performance.now()-started;entry.terminal??='response-sent';}
  });
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
- return {url:`http://127.0.0.1:${server.address().port}`,ledger,fault,data,manifest:convergence?convergenceManifest:manifest,get lost(){return lost;},get heldCount(){return held.length;},release(){fault.hold=false;fault.holdSearch=undefined;for(const release of held.splice(0))release();},close:()=>new Promise(r=>server.close(r))};
+ return {url:`http://127.0.0.1:${server.address().port}`,ledger,fault,data,manifest:convergence?convergenceManifest:workload?.scenario.startsWith('churn')?{...manifest,reviewing:workload.populations.reviewing,openPrs:50+workload.populations.reviewing}:manifest,get lost(){return lost;},get heldCount(){return held.length;},release(){fault.hold=false;fault.holdSearch=undefined;for(const release of held.splice(0))release();},close:()=>new Promise(r=>server.close(r))};
 }
 
 export function searchRows(rows,q){
@@ -141,9 +163,34 @@ export function searchRows(rows,q){
   else if(key==='org'||key==='user')match=row.repository.owner.login===value;
   else if(key==='reviewed-by')match=row.reviews.nodes.some(r=>r.author.login===who);
   else if(key==='involves')match=row.author.login===who||row.reviewRequests.nodes.some(r=>r.requestedReviewer.login===who)||row.reviews.nodes.some(r=>r.author.login===who);
-  else if(['created','updated','merged','closed'].includes(key)) {const at=row[`${key}At`];if(!at)match=false;else if(value.includes('..')){const [a,b]=value.split('..');match=at.slice(0,10)>=a&&at.slice(0,10)<=b;}else if(value.startsWith('>='))match=at.slice(0,10)>=value.slice(2);else match=at.slice(0,10)===value;}
+  else if(['created','updated','merged','closed'].includes(key)) {const at=row[`${key}At`];if(!at)match=false;else if(value.includes('..')){const [a,b]=value.split('..');match=at.slice(0,10)>=a&&at.slice(0,10)<=b;}else if(value.startsWith('>='))match=at.slice(0,10)>=value.slice(2);else match=value.includes('T')?Date.parse(at)===Date.parse(value):at.slice(0,10)===value;}
   else if(key==='sort')match=true;
   else throw Error('unsupported search filter');
   return negate?!match:match;
  }));
+}
+
+// External scheduled provider changes are deliberately separate from the abstract oracle.
+export function applyChurnEvent(data,event){
+ assert.ok(!['approve','navigate'].includes(event.kind),'user actions require real UI receipts');
+ let row=data.rows.find(r=>`${r.repository.nameWithOwner}/${r.number}`===event.identity);
+ if(event.kind==='arrival'){
+  assert.ok(!row,'arrival identity must be new');row=structuredClone(data.rows.find(r=>r.number===53));
+  const n=event.next.number,repo=data.repos[(n-1)%50];Object.assign(row,{id:`PR_${n}`,number:n,title:`Synthetic review ${n}`,body:`Synthetic description ${n}`,repository:repo,headRepository:repo,url:`https://github.com/${repo.nameWithOwner}/pull/${n}`,headRefName:`topic-${n}`,headRef:{id:`REF_${n}`},headRefOid:event.previousHead});data.rows.push(row);
+ }
+ assert.ok(row,'scheduled identity exists');assert.equal(row.headRefOid,event.previousHead,'provider previous head');
+ row.updatedAt=new Date(Math.max(Date.now(),Date.parse(row.updatedAt)+1)).toISOString();
+ if(event.kind==='arrival'){row.createdAt=row.updatedAt;row.timelineItems=connection([{__typename:'ReadyForReviewEvent',createdAt:row.updatedAt}]);row.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[0].id=`CHECK_${row.number}`;}
+ switch(event.kind){
+ case 'head':row.headRefOid=event.next.head;row.commits.nodes[0].commit.oid=event.next.head;row.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[0].id=`CHECK_${row.number}_${event.revision}`;break;
+ case 'request-remove':row.reviewRequests=connection([]);break;
+ case 'request-add':case 'arrival':row.reviewRequests=connection([{requestedReviewer:{login:'synthetic-viewer',__typename:'User'}}]);row.headRefOid=event.next.head;row.commits.nodes[0].commit.oid=event.next.head;break;
+ case 'draft':row.isDraft=true;break;case 'ready':row.isDraft=false;row.timelineItems=connection([{__typename:'ReadyForReviewEvent',createdAt:row.updatedAt}]);break;
+ case 'queue':row.isMergeQueueEnabled=true;row.isInMergeQueue=true;row.mergeQueueEntry={state:'QUEUED'};break;
+ case 'dequeue':row.isInMergeQueue=false;row.mergeQueueEntry=null;break;
+ case 'close':row.state='CLOSED';row.closedAt=row.updatedAt;break;
+ case 'merge':row.state='MERGED';row.closedAt=row.updatedAt;row.mergedAt=row.updatedAt;break;
+ default:assert.fail('unknown churn event');
+ }
+ return {revision:event.revision,identity:event.identity,head:row.headRefOid};
 }

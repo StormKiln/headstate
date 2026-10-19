@@ -1,0 +1,14 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.98s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/headstate_lib-bd304ff4fe4a7524)
+
+running 1 test
+BASELINE sources=1 history_blocks=1024 partial=65536 encoded_json=349530 retained_string_capacity=524288 elapsed_us=63513 mutations=2 retained_wal=366712 body_bytes=4259840 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpyZPxcg
+BASELINE sources=32 history_blocks=1024 partial=65536 encoded_json=11184960 retained_string_capacity=16777216 elapsed_us=1717788 mutations=33 retained_wal=11288832 body_bytes=136314880 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmp0Wl1Eg
+BASELINE sources=256 history_blocks=1024 partial=65536 encoded_json=89479680 retained_string_capacity=134217728 elapsed_us=13852824 mutations=257 retained_wal=90236272 body_bytes=1090519040 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpNOHJes
+BASELINE sources=1 history_blocks=8192 partial=65536 encoded_json=829791 retained_string_capacity=1048576 elapsed_us=364571 mutations=2 retained_wal=848752 body_bytes=33619968 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpBr0bJ1
+BASELINE sources=1 history_blocks=1024 partial=1048576 encoded_json=4297770 retained_string_capacity=8388608 elapsed_us=186786 mutations=2 retained_wal=4342512 body_bytes=5242880 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpGeahXs
+BASELINE sources=1 history_blocks=1024 partial=16777215 encoded_json=67485923 retained_string_capacity=134217728 elapsed_us=2264452 mutations=2 retained_wal=67963552 body_bytes=20971519 db=/var/folders/xk/hrswss797vq1gkkf3hld5k5c0000gn/T/.tmpcbuo7u
+test claude::linkscan::tests::checkpoint_staging_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3370 filtered out; finished in 28.62s

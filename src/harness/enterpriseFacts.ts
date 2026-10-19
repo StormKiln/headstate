@@ -1,0 +1,3 @@
+import type {PullRequest} from '../types/pr';
+// Read only actual hook rows; no product derive or provider fixture state.
+export function churnRowFacts(row:PullRequest){return {identity:`${row.repo}/${row.number}`,number:row.number,head:row.head_oid,authored:row.author==='synthetic-viewer',requested:row.requested_reviewers.includes('synthetic-viewer'),draft:row.is_draft,queued:row.in_merge_queue,terminal:'open',approved:row.latest_reviews.some(review=>review.author==='synthetic-viewer'&&review.state==='APPROVED'&&review.commit_oid===row.head_oid),aggregateReview:row.review,observation:row.observation};}

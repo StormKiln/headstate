@@ -1,4 +1,4 @@
-.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
+.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps lint-workflows fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android check-native-ios check-native-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
 	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
@@ -314,6 +314,12 @@ lint: lint-rust lint-ui lint-deps
 # major/minor, and that check lives inside the bundle -- so before this
 # target existed, the mismatch passed lint and both test jobs and failed
 # from the slowest one in CI (#555).
+lint-workflows:
+	python3 scripts/install-workflow-tools.test.py
+	@tool_dir="$$(python3 scripts/install-workflow-tools.py --bin-dir)" && \
+		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.test.py && \
+		PATH="$$tool_dir:$$PATH" python3 scripts/lint-workflows.py
+
 lint-deps:
 	python3 scripts/check-tauri-versions.test.py
 	python3 scripts/check-tauri-versions.py
@@ -403,6 +409,7 @@ lint-deps:
 	python3 scripts/test-rust-ci.test.py
 	python3 scripts/check-frontend-report.test.py
 	python3 scripts/collect-frontend-crash.test.py
+	python3 scripts/native-node-acceptance.test.py
 	python3 scripts/test-frontend-ci.test.py
 	python3 scripts/check-release-artifacts.test.py
 	python3 scripts/wait-release-ci.test.py
@@ -427,16 +434,11 @@ lint-deps:
 	# labels, and shellcheck over every `run:` body -- defects that are
 	# invisible until CI runs, which is what #848 and #853 cost.
 	#
-	# Skipped with a note when absent rather than failing: `brew install
-	# actionlint` (shellcheck comes with it) is a real install, and this
-	# target's comment promises answers in a second, not a toolchain. CI
-	# installs it, so the gate is there; this is the local feedback loop.
-	# No GitHub Action and so no new pinned SHA -- it is one binary.
-	@if command -v actionlint >/dev/null 2>&1; then \
-		python3 scripts/lint-workflows.test.py && python3 scripts/lint-workflows.py; \
-	else \
-		echo "actionlint not installed; skipping (brew install actionlint). CI runs it."; \
-	fi
+	# The shared strict target installs the fixed actionlint source revision
+	# and ShellCheck 0.11.0 into the ignored repository cache after verifying
+	# their archives and runtime identities. Local and CI therefore ask the
+	# same tools, and a missing or mismatched tool fails rather than skipping.
+	$(MAKE) lint-workflows
 	# The mobile build high-water mark drifts because nothing reads it
 	# except a Preflight check that only catches a DECREASE -- so a mark
 	# lagging by three still passes, and it went stale before six
@@ -494,6 +496,7 @@ lint-deps:
 	#
 	# Local checks are advisory, CI remains the gate (ci.yml) -- this
 	# closes the feedback gap, it does not move the gate.
+	python3 scripts/check-privacy.test.py
 	./scripts/check-privacy.sh
 
 # The shared step-up crate again: a path dependency is compiled by the
@@ -611,15 +614,61 @@ test-enterprise-contracts:
 enterprise-run:
 	node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" "$(or $(MODE),gate)" $(if $(PROFILE),"$(PROFILE)")
 
-.PHONY: enterprise-baseline enterprise-compare
+.PHONY: enterprise-baseline enterprise-compare enterprise-admission-probe
 enterprise-baseline:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	node scripts/enterprise-baseline.mjs "$(OUT)"
 enterprise-compare:
 	@test -n "$(OUT)" || (echo "Set OUT to a new retained artifact directory"; exit 2)
 	ENTERPRISE_BASELINE=scripts/enterprise/baseline.json node scripts/enterprise-baseline.mjs "$(OUT)"
+enterprise-admission-probe:
+	@test -n "$(OUT)" -a -n "$(BASELINE)" || (echo "Set OUT to a new retained artifact directory and BASELINE to an intentionally incompatible schema-2 baseline"; exit 2)
+	@if ENTERPRISE_BASELINE="$(BASELINE)" node scripts/enterprise-run.mjs "$(OUT)" "$(or $(ENGINE),chromium)" baseline; then echo "Expected workload/environment admission rejection"; exit 1; fi
+	node -e 'const r=require(process.argv[1]);if(r.admission?.accepted!==false||r.admission?.stage!=="before-measured-work"||typeof r.failure!=="string"||!r.failure||r.providerReceipts!==0||r.statsRetirement?.commands!==0||r.shutdown?.clean!==true||r.shutdown?.telemetryLost!==false||r.exit?.code!==0)process.exit(1)' "$(OUT)/result.json"
 
 .PHONY: analyze-measurements
 analyze-measurements: export MEASUREMENT_INPUT = $(INPUT)
 analyze-measurements:
 	@python3 scripts/measurement-report.py "$$MEASUREMENT_INPUT"
+
+.PHONY: test-enterprise-resources
+test-enterprise-resources:
+	cd src-tauri && cargo test --features enterprise-harness --lib resource_ -- --nocapture
+	node --test scripts/enterprise/resources.test.mjs scripts/enterprise/resource-batch.test.mjs scripts/enterprise/budgets.test.mjs scripts/enterprise/inspect-profile.test.mjs
+
+.PHONY: enterprise-resources
+enterprise-resources:
+	@test -n "$(OUT)" || (echo "OUT must be a new retained batch directory"; exit 1)
+	node scripts/enterprise-resources.mjs "$(OUT)" "$(or $(RESOURCE_STAGE),calibrate)" $(if $(LIMITS),"$(LIMITS)")
+
+.PHONY: test-enterprise-corpus-resources
+test-enterprise-corpus-resources:
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::store::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::search::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::linkscan::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::transcript::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_inventory::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib commands::corpus_cancel_tests
+
+.PHONY: lint-enterprise-resources
+lint-enterprise-resources:
+	cd src-tauri && cargo clippy --features enterprise-harness --lib -- -D warnings
+
+.PHONY: measure-enterprise-discovery
+# Exact synthetic test names: never run ignored real-home corpus probes.
+measure-enterprise-discovery:
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_probe::discovery_scaling_measurement -- --ignored --exact --nocapture
+	cd src-tauri && cargo test --features enterprise-harness --lib claude::corpus_inventory::tests::discovery_inventory_scaling_measurement -- --ignored --exact --nocapture
+
+.PHONY: measure-enterprise-checkpoints
+# Synthetic sources only; these ignored probes retain their temporary databases.
+# Ordinary debug build isolates codec/publication capacities from recorder costs.
+measure-enterprise-checkpoints:
+	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_staging_matrix -- --ignored --exact --nocapture
+	cd src-tauri && cargo test --lib claude::linkscan::tests::checkpoint_links_and_growth_measurement -- --ignored --exact --nocapture
+
+.PHONY: test-enterprise-mixed
+test-enterprise-mixed:
+	node --test scripts/enterprise/mixed*.test.mjs
+	cd src-tauri && cargo test --features enterprise-harness --lib commands::enterprise_corpus::tests
+	cd src-tauri && cargo test --features enterprise-harness --lib enterprise_harness::corpus

@@ -79,3 +79,8 @@ test('live merged-head matching and GitLab open queues remain allowed',()=>{
  assert.deepEqual(statsRequestReasons(null,undefined,'/api/v4/merge_requests?state=opened&scope=assigned_to_me'),[]);
  assert.equal(statsRequestCounts([],['get_pr_detail','get_reviewing','get_ready_stacks']).commands,0);
 });
+test('bounded current-open identity membership confirmation is not historical Stats',()=>{
+ const make=(query='is:pr is:open review-requested:@me repo:synthetic-lab/repo-5 created:2026-10-17T12:00:00Z',first=25,identity=true,name='QueueConfirmation')=>({name,doc:parseDocument(`query ${name} { ${identity?'p0:repository(owner:"synthetic-lab",name:"repo-5"){pullRequest(number:55){id number state headRefOid createdAt repository{nameWithOwner}}}':''} m0:search(query:${JSON.stringify(query)},type:ISSUE,first:${first}){issueCount pageInfo{hasNextPage endCursor} nodes{id number repository{nameWithOwner}}}}`)});
+ const allowed=make();assert.deepEqual(statsRequestReasons(allowed.doc,allowed.name),[]);
+ for(const input of [make(undefined,100),make(undefined,25,false),make('is:pr is:open review-requested:@me repo:synthetic-lab/repo-5 created:2026-01-01..2026-12-31'),make('is:pr is:closed review-requested:@me repo:synthetic-lab/repo-5 created:2026-10-17T12:00:00Z'),make('is:pr is:open review-requested:@me repo:synthetic-lab/repo-6 created:2026-10-17T12:00:00Z'),make(undefined,25,true,'StatsViewer')])assert.ok(statsRequestReasons(input.doc,input.name).length,'historical/forged/broad document remains classified');
+});

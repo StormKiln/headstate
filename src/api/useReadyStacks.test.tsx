@@ -228,3 +228,35 @@ it.each([8, 9])("retains an8ms conclusive receipt after %ims transport without g
   expect(view.result.current.displayOf(pr)?.freshness).toBe("fresh");
   unsubscribe();
 });
+
+it("keeps offscreen initial stack demand after an expired offer and retained partial/deferred replies", async () => {
+  const population = Array.from({ length: 12 }, (_, i) => ({ ...rows[0], number: 100 + i }));
+  const target = population[6];
+  let calls = 0;
+  const useful: boolean[] = [];
+  const unsubscribe = qc.getQueryCache().subscribe(event => {
+    if (event.type !== "updated" || event.action.type !== "success" || event.query.queryKey[0] !== "ready-stack") return;
+    if (JSON.parse(JSON.parse(String(event.query.queryKey[3]))[0])[3] !== target.number) return;
+    const value = event.query.state.data as { stack: PrStack; expiresAt: number };
+    useful.push(value.stack.kind !== "unknown" && value.expiresAt > performance.now());
+  });
+  invoke.mockImplementation(async (_command, args) => {
+    const pr = (args?.rows as typeof population)[0];
+    const count = pr.number === target.number ? ++calls : 4;
+    if (count === 1) await new Promise(resolve => setTimeout(resolve, 7));
+    return [{ ...pr, stack: count === 2 || count === 3 ? { kind: "unknown" } : { kind: "none" },
+      valid_for_ms: count === 1 ? 1 : count >= 4 ? 60_000 : undefined,
+      last_known_stack: { value: { kind: "none" }, age_ms: count >= 4 ? 0 : 60_000 },
+      advisory_progress: { outcome: count === 2 ? "partial" : count === 3 ? "deferred" : "offered", admitted: count !== 3 } }];
+  });
+  const view = renderHook(() => useReadyStacks(population, new Set(population.slice(0, 6).map(prKey))), { wrapper });
+  await advance(20);
+  expect(useful).toEqual([false]);
+  expect(view.result.current.displayOf(target)?.freshness).toBe("retained");
+  for (let cycle = 0; cycle < 6; cycle++) { await advance(30_000); await advance(10); }
+  expect(useful).toContain(true);
+  expect(calls).toBe(4);
+  await advance(120_000);
+  expect(calls).toBe(4); // Serving initial debt must not create an expiry-driven offscreen loop.
+  unsubscribe();
+});

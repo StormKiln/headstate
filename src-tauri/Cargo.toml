@@ -405,7 +405,7 @@ float_cmp = "deny"
 
 [features]
 default = []
-enterprise-harness = []
+enterprise-harness = ["rusqlite/hooks"]
 
 [[bin]]
 name = "enterprise-driver"
