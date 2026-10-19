@@ -394,10 +394,21 @@ jobs:
           # the runner's own architecture, so --target is omitted there
           # rather than passed empty.
           if [ -n "${{ matrix.target }}" ]; then
-            yarn tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+            # #1915: classify hidden DMG errors; collector discards all raw text.
+            RUST_LOG=tauri_bundler::utils=debug python3 scripts/ci-command.py run release-bundle --release -- \
+              yarn tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
           else
             yarn tauri build --bundles "${{ matrix.bundles }}"
           fi
+
+      - name: Retain fixed macOS packaging classifications
+        if: always() && matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packaging-diagnostics-macos
+          path: ${{ runner.temp }}/ci-diagnostics/release-bundle*
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Verify Linux media runtime
         if: matrix.os == 'ubuntu-latest'

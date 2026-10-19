@@ -407,6 +407,24 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: yarn tauri build --bundles app
 
+      # #1915: reuse the built native app to exercise real DMG creation before
+      # tagging. Raw subprocess text is discarded; only fixed classifications
+      # and counts are emitted. Release still verifies universal notarized apps.
+      - name: Package the built app as a DMG
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ steps.signing.outputs.key }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          RUST_LOG: tauri_bundler::utils=debug
+        run: python3 scripts/ci-command.py run dmg-smoke --release -- yarn tauri bundle --bundles dmg --no-sign
+      - name: Retain fixed DMG smoke classifications
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dmg-smoke-diagnostics
+          path: ${{ runner.temp }}/ci-diagnostics/dmg-smoke*
+          if-no-files-found: warn
+          retention-days: 14
+
       # Asserted against the BUILT css, because this failure exists only
       # in a production bundle: `yarn dev` does not extract Sonner's
       # inlined styles and jsdom applies them, so every other gate passes

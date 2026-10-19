@@ -1,10 +1,10 @@
-# 10.9.1 closeout field testing
+# 10.9.2 closeout field testing
 
 This is the current checklist for #1737 (enterprise review reliability) and #1487 (native/phone transcript performance), tracked by [epic #1911](https://github.com/StormKiln/headstate/issues/1911). It replaces the operational instructions in the historical 9.2 guide. PR Stats was removed; there is no Stats step here.
 
 ## Versions and what is still unverified
 
-Use [desktop 10.9.1](https://github.com/StormKiln/headstate/releases/tag/v10.9.1) once the release is published. Until then, 10.9.0 is the delivered baseline. The matching companion remains **10.9.0, build 53**: this patch changes developer verification and documentation, not shared frontend, mobile code or the pairing protocol. Its [published IPA](https://github.com/StormKiln/headstate/releases/tag/mobile-v10.9.0) and Apple upload are verified; record whether TestFlight actually offers build 53. Upload acceptance does not prove tester availability. Do not label an older companion's results as build 53.
+The 10.9.1 delivery failed during DMG packaging and was not published. Use [desktop 10.9.2](https://github.com/StormKiln/headstate/releases/tag/v10.9.2) once the release is published. Until then, 10.9.0 is the delivered baseline. The matching companion remains **10.9.0, build 53**: this patch changes developer verification and documentation, not shared frontend, mobile code or the pairing protocol. Its [published IPA](https://github.com/StormKiln/headstate/releases/tag/mobile-v10.9.0) and Apple upload are verified; record whether TestFlight actually offers build 53. Upload acceptance does not prove tester availability. Do not label an older companion's results as build 53.
 
 Record the actual desktop version, companion version/build, macOS/iOS versions and phone model for every session. Use the owner's iPhone 17 Pro; its results do not establish an older iPhone's performance floor. Native/WebKit proxies, synthetic enterprise tests and successful exports do not complete field acceptance.
 
