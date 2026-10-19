@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Retain CI stage/output/exit evidence when hosted job logs disappear (#1361/#1614).
 
-No command arguments or environment are recorded. Output is the same output the
-command already sends to CI. Existing job budgets and retry policy are unchanged.
+No command arguments or environment are recorded. Default output is the same
+output the command already sends to CI. Opt-in --release discards raw output and
+retains only fixed DMG classifications plus counts, bounded to two 2 MiB logs. Existing job budgets and retry policy are unchanged.
 A lost runner can still lose its local artifacts; stage notices are a separate
 breadcrumb in the check annotations, not a guarantee against runner loss.
 """
@@ -102,9 +103,105 @@ class RustProgress:
                 'activeTestVisibilityComplete': False, 'truncated': self.truncated}
 
 
-def run(folder, label, command, rust=False, heartbeat_seconds=30):
+class ReleaseOutput:
+    """#1915: classify debug-only DMG output without retaining raw signing logs.
+
+    Every emitted value is a fixed literal. Unknown lines/causes remain counts
+    or `unknown`, never arbitrary subprocess text, paths, arguments or secrets.
+    """
+    LINE_LIMIT = 64 * 1024
+    PHASES = {
+        'Running bundle_dmg.sh': 'dmg-script',
+        'Creating disk image...': 'create-image',
+        'Mounting disk image...': 'mount-image',
+        'Making link to Applications dir...': 'applications-link',
+        'Fixing permissions...': 'permissions',
+        'Deleting .fseventsd': 'remove-fsevents',
+        'Compressing disk image...': 'compress-image',
+        'Disk image done': 'dmg-complete',
+        'Failed running AppleScript': 'applescript-failed',
+        'Failed to add the EULA license': 'eula-failed',
+        'The signature seems invalid': 'signature-invalid',
+        'Stapling app...': 'staple-app',
+        'Will skip running AppleScript to configure DMG aesthetics because of --skip-jenkins option.': 'skip-finder-layout',
+    }
+    REASONS = {
+        'Resource busy': 'resource-busy',
+        'Permission denied': 'permission-denied',
+        'Operation not permitted': 'operation-not-permitted',
+        'No space left on device': 'no-space',
+        'File exists': 'file-exists',
+        'No such file or directory': 'not-found',
+        'Invalid argument': 'invalid-argument',
+        'Device not configured': 'device-not-configured',
+        'no mountable file systems': 'no-mountable-filesystems',
+        'image not recognized': 'image-not-recognized',
+        'Input/output error': 'io-error',
+    }
+
+    def __init__(self):
+        self.pending = b''
+        self.discarding = False
+        self.unknown = 0
+        self.oversized = 0
+        self.last_phase = None
+
+    def classify(self, value):
+        line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value.decode('utf-8', errors='replace')).strip()
+        phase = self.PHASES.get(line)
+        if re.fullmatch(r'Notarizing Finished with status Accepted for id [0-9a-f-]+ \(Processing complete\)', line):
+            phase = 'app-notarization-accepted'
+        if 'error running bundle_dmg.sh' in line:
+            phase = 'dmg-script-failed'
+        if phase:
+            if self.last_phase == phase:
+                return b''
+            self.last_phase = phase
+            return f'DMG phase: {phase}\n'.encode()
+        match = re.fullmatch(r'hdiutil: (create|attach|detach|resize|convert|makehybrid|udifrez)(?: failed)? - (.+)', line)
+        if match:
+            # Both fields are fixed allowlisted literals; never echo match[2].
+            reason = self.REASONS.get(match[2], 'unknown')
+            return f'DMG error: operation={match[1]} reason={reason}\n'.encode()
+        self.unknown += 1
+        return b''
+
+    def feed(self, chunk, final=False):
+        output = []
+        for part in chunk.splitlines(keepends=True):
+            complete = part.endswith(b'\n')
+            if not self.discarding:
+                if len(self.pending) + len(part) > self.LINE_LIMIT:
+                    self.pending = b''
+                    self.discarding = True
+                    self.oversized += 1
+                else:
+                    self.pending += part
+            if complete:
+                if not self.discarding:
+                    output.append(self.classify(self.pending))
+                self.pending = b''
+                self.discarding = False
+        if final and not self.discarding and self.pending:
+            output.append(self.classify(self.pending))
+            self.pending = b''
+        return b''.join(output)
+
+    def snapshot(self):
+        return {'lastPhase': self.last_phase, 'unclassifiedLines': self.unknown,
+                'oversizedLines': self.oversized, 'rawOutputRetained': False}
+
+
+# Two rotating files retain at most 4 MiB, including the most recent failure.
+RELEASE_LOG_BYTES = 2 * 1024 * 1024
+
+
+def run(folder, label, command, rust=False, heartbeat_seconds=30, release=False):
     started = time.monotonic()
     data = {'stage': label, 'startedAt': now(), 'state': 'running', 'outputBytes': 0}
+    if release:
+        data.update(outputPolicy="fixed-dmg-classifications", retainedLimitBytes=2 * RELEASE_LOG_BYTES)
+    sanitizer = ReleaseOutput() if release else None
     try:
         record(folder, label, data)
     except OSError as error:
@@ -147,21 +244,38 @@ def run(folder, label, command, rust=False, heartbeat_seconds=30):
     pump_errors = []
 
     def pump():
+        path = folder / f'{label}.log'
+        log = None
+
+        def emit(chunk):
+            nonlocal log
+            if not chunk:
+                return
+            if release and log.tell() + len(chunk) > RELEASE_LOG_BYTES:
+                log.close()
+                path.replace(folder / f'{label}.previous.log')
+                log = path.open('wb')
+            log.write(chunk)
+            log.flush()
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+
         try:
-            with (folder / f'{label}.log').open('wb') as log:
-                while chunk := child.stdout.read1(8192):
-                    log.write(chunk)
-                    log.flush()
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-                    with capture_lock:
-                        captured_bytes[0] += len(chunk)
-                        last_output[0] = time.monotonic()
-                        if progress:
-                            progress.feed(chunk, last_output[0] - started)
+            log = path.open('wb')
+            while chunk := child.stdout.read1(8192):
+                emit(sanitizer.feed(chunk) if sanitizer else chunk)
+                with capture_lock:
+                    captured_bytes[0] += len(chunk)
+                    last_output[0] = time.monotonic()
+                    if progress:
+                        progress.feed(chunk, last_output[0] - started)
+            if sanitizer:
+                emit(sanitizer.feed(b'', final=True))
         except OSError as error:
             pump_errors.append(type(error).__name__)
         finally:
+            if log is not None:
+                log.close()
             child.stdout.close()
 
     reader = threading.Thread(target=pump, daemon=True)
@@ -199,6 +313,8 @@ def run(folder, label, command, rust=False, heartbeat_seconds=30):
                             secondsSinceOutput=round(current - last_output[0], 3))
                 if progress:
                     data['rustProgress'] = progress.snapshot()
+                if sanitizer:
+                    data['releaseProgress'] = sanitizer.snapshot()
             data.update(elapsedSeconds=round(current - started, 3), checkpointAt=now())
             checkpoint()
         if current - heartbeat >= heartbeat_seconds:
@@ -221,6 +337,8 @@ def run(folder, label, command, rust=False, heartbeat_seconds=30):
         data['outputBytes'] = captured_bytes[0]
         if progress:
             data['rustProgress'] = progress.snapshot()
+        if sanitizer:
+            data['releaseProgress'] = sanitizer.snapshot()
     data.update(state='cancelled' if cancelled else 'completed', exitCode=status,
                 finishedAt=now(), elapsedSeconds=round(time.monotonic() - started, 1))
     data['checkpointAt'] = now()
@@ -234,7 +352,7 @@ def run(folder, label, command, rust=False, heartbeat_seconds=30):
 
 def main():
     if len(sys.argv) < 3 or sys.argv[1] not in ('mark', 'run') or not re.fullmatch(r'[a-z0-9-]+', sys.argv[2]):
-        raise SystemExit('usage: ci-command.py mark LABEL | run LABEL [--rust] -- COMMAND [ARG ...]')
+        raise SystemExit('usage: ci-command.py mark LABEL | run LABEL [--rust|--release] -- COMMAND [ARG ...]')
     folder = Path(os.environ['RUNNER_TEMP']) / 'ci-diagnostics'
     folder.mkdir(parents=True, exist_ok=True)
     label = sys.argv[2]
@@ -244,10 +362,11 @@ def main():
         print(f'::notice title=CI setup::{label} at {data["time"]}', flush=True)
         return 0
     rust = sys.argv[3:4] == ['--rust']
-    offset = 4 if rust else 3
+    release = sys.argv[3:4] == ['--release']
+    offset = 4 if rust or release else 3
     if len(sys.argv) < offset + 2 or sys.argv[offset] != '--':
         raise SystemExit('run requires -- COMMAND')
-    return run(folder, label, sys.argv[offset + 1:], rust=rust)
+    return run(folder, label, sys.argv[offset + 1:], rust=rust, release=release)
 
 
 if __name__ == '__main__':

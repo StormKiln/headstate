@@ -194,5 +194,52 @@ class DiagnosticLifecycle(unittest.TestCase):
             self.assertIn('CI evidence unavailable', result.stderr)
 
 
+class ReleaseEvidence(unittest.TestCase):
+    def test_failed_bundler_output_is_allowlisted_bounded_and_keeps_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'RUNNER_TEMP': tmp,
+                   'APPLE_PASSWORD': 'synthetic-password-xyz',
+                   'TAURI_SIGNING_PRIVATE_KEY': 'synthetic-key-line-one\nsynthetic-key-line-two'}
+            code = r"""import os,sys,time
+secret=os.environ['APPLE_PASSWORD'].encode()
+os.write(1, secret[:10]); time.sleep(.05); os.write(1, secret[10:]+b'\n')
+print(os.environ['TAURI_SIGNING_PRIVATE_KEY'],flush=True)
+print('x'*70000 + os.environ['APPLE_PASSWORD'],flush=True)
+for _ in range(1200): print('compiler progress '+ 'x'*4096)
+for _ in range(100000): print('hdiutil: create failed - Resource busy')
+print('hdiutil: create failed - synthetic-password-xyz',file=sys.stderr,flush=True)
+sys.exit(17)
+"""
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', 'probe', '--release', '--',
+                                     sys.executable, '-u', '-c', code], env=env, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 17, result.stderr)
+            folder = Path(tmp)/'ci-diagnostics'
+            files = list(folder.glob('probe*.log'))
+            self.assertEqual(len(files), 2)
+            self.assertLessEqual(sum(f.stat().st_size for f in files), 4*1024*1024)
+            captured = b''.join(f.read_bytes() for f in files)
+            self.assertIn(b'DMG error: operation=create reason=unknown', captured)
+            self.assertIn(b'DMG error: operation=create reason=resource-busy', result.stdout)
+            for value in (b'synthetic-password-xyz',b'synthetic-key-line-one',b'synthetic-key-line-two'):
+                self.assertNotIn(value, result.stdout + result.stderr + captured)
+            data = json.loads((folder/'probe.json').read_text())
+            self.assertEqual(data['exitCode'], 17)
+            self.assertEqual(data['outputPolicy'], 'fixed-dmg-classifications')
+            self.assertGreater(data['releaseProgress']['unclassifiedLines'], 0)
+            self.assertEqual(data['releaseProgress']['oversizedLines'], 1)
+            self.assertFalse(data['releaseProgress']['rawOutputRetained'])
+            self.assertGreater(data['outputBytes'], 4*1024*1024)
+
+    def test_unterminated_split_secret_and_success_are_preserved_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env={**os.environ,'RUNNER_TEMP':tmp,'APPLE_PASSWORD':'synthetic-tail-secret'}
+            code="import os,time;os.write(1,b'synthetic-tail-');time.sleep(.05);os.write(1,b'secret')"
+            result=subprocess.run([sys.executable,str(SCRIPT),'run','probe','--release','--',
+                                   sys.executable,'-c',code],env=env,capture_output=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertNotIn(b'synthetic-tail-secret',result.stdout)
+            self.assertEqual(b'',(Path(tmp)/'ci-diagnostics/probe.log').read_bytes())
+
+
 if __name__ == '__main__':
     unittest.main()
