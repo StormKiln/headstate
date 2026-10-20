@@ -151,6 +151,7 @@ describe("the remote surface's frontend half", () => {
       "revealLog",
       "revokePairedDevice",
       "setAutostart",
+      "setDiscoveryExclusions",
       "setGitLabHost",
       "setPairedDeviceAccess",
       "setNotifyPrefs",

@@ -439,6 +439,8 @@ pub fn run() {
             commands::get_poll_interval,
             commands::set_poll_interval,
             commands::get_worktree_dirs,
+            commands::get_discovery_exclusions,
+            commands::set_discovery_exclusions,
             commands::set_worktree_dirs,
             commands::list_worktrees,
             commands::repo_tree,

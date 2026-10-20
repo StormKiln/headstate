@@ -1445,6 +1445,11 @@ pub async fn read_cached_scan(
     kind: crate::store::scans::ScanKind,
 ) -> Result<Option<crate::store::scans::CachedScan>, String> {
     let dirs = get_worktree_dirs(app.clone());
+    let dirs = if kind == crate::store::scans::ScanKind::Worktrees {
+        discovery_cache_scope(&dirs, &get_discovery_exclusions(app.clone())?)
+    } else {
+        dirs
+    };
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
@@ -1520,9 +1525,11 @@ pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan
     let dirs = get_worktree_dirs(app.clone());
     // Blocking filesystem and subprocess work: keep it off the async
     // runtime's worker threads.
+    let excluded = get_discovery_exclusions(app.clone())?;
+    let cache_scope = discovery_cache_scope(&dirs, &excluded);
     let scanned = dirs.clone();
     let out = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting(&scanned)
+        crate::worktrees::scan_dirs_fast_reporting_excluding(&scanned, &excluded)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1530,7 +1537,12 @@ pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan
     // (#1152). Paths and sizes only -- `Safety` rides along in the
     // payload but `read_cached_scan` is never the source of a removal
     // decision, and every destructive path re-verifies live.
-    remember_scan(&app, crate::store::scans::ScanKind::Worktrees, &dirs, &out);
+    remember_scan(
+        &app,
+        crate::store::scans::ScanKind::Worktrees,
+        &cache_scope,
+        &out,
+    );
     Ok(out)
 }
 
@@ -3018,6 +3030,68 @@ pub fn get_worktree_dirs(app: AppHandle) -> Vec<String> {
         .unwrap_or_else(default_worktree_dirs)
 }
 
+/// Capture policy in the cache identity so an old in-flight scan cannot
+/// overwrite the snapshot used after exclusions change.
+fn discovery_cache_scope(dirs: &[String], exclusions: &[String]) -> Vec<String> {
+    let mut scope = dirs.to_vec();
+    if !exclusions.is_empty() {
+        let mut sorted = exclusions.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        scope.push(format!(
+            "discovery-exclusions:{}",
+            serde_json::to_string(&sorted).expect("string list")
+        ));
+    }
+    scope
+}
+
+#[tauri::command]
+pub fn get_discovery_exclusions(app: AppHandle) -> Result<Vec<String>, String> {
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    settings::get_strict(&conn, settings::keys::DISCOVERY_EXCLUSIONS)
+        .map(|value| value.unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
+fn validate_discovery_exclusions(paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for path in paths {
+        let path = expand_tilde(path.trim());
+        if path.is_empty() {
+            continue;
+        }
+        let path = std::path::Path::new(&path);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("Use an absolute folder path without '..' for discovery exclusions".into());
+        }
+        // Keep the user's spelling (including missing paths). Alias matching
+        // is resolved by the scanner, so recreation remains excluded.
+        result.push(
+            path.components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn set_discovery_exclusions(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let paths = validate_discovery_exclusions(paths)?;
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &paths)
+        .map_err(|e| e.to_string())?;
+    Ok(paths)
+}
+
 /// `~/code` if it exists, else nothing.
 ///
 /// Returning a path that does not exist would make the worktrees view
@@ -4463,6 +4537,7 @@ pub struct ClaudifyCommand {
 #[tauri::command]
 pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
     let ok = validate_dirs(dirs)?;
+    let worktree_scope = discovery_cache_scope(&ok, &get_discovery_exclusions(app.clone())?);
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     settings::set(&conn, settings::keys::WORKTREE_DIRS, &ok).map_err(|e| e.to_string())?;
     // Drop scan caches keyed on the OLD set (#1152). Nothing stale is
@@ -4473,7 +4548,9 @@ pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String
     //
     // Best-effort: failing to tidy a cache must not fail the setting
     // the user actually asked to change.
-    if let Err(e) = crate::store::scans::retain_only(&conn, &scan_key(&ok)) {
+    if let Err(e) =
+        crate::store::scans::retain_only(&conn, &scan_key(&ok), &scan_key(&worktree_scope))
+    {
         log::warn!("scan cache: could not drop entries for the previous roots: {e}");
     }
     log::info!("worktree directories set to {} path(s)", ok.len());
@@ -7334,11 +7411,12 @@ pub async fn update_all_repositories(
     expected_paths: Option<Vec<String>>,
 ) -> Result<crate::worktrees::UpdateAllReport, String> {
     let dirs = get_worktree_dirs(app.clone());
+    let excluded = get_discovery_exclusions(app.clone())?;
 
     // The scan first, and on the blocking pool: it walks the scan roots
     // and spawns a `git worktree list` per repository.
     let scan = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting(&dirs)
+        crate::worktrees::scan_dirs_fast_reporting_excluding(&dirs, &excluded)
     })
     .await
     .map_err(|e| format!("could not scan for repositories: {e}"))?;
@@ -8606,6 +8684,60 @@ mod tests {
         // Every pull request is issued exactly once -- a chunking bug
         // that dropped or duplicated one would report the wrong outcomes.
         assert_eq!(chunks.concat(), batch);
+    }
+
+    #[test]
+    fn discovery_exclusion_settings_and_cache_scope_survive_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp
+            .path()
+            .join("future-backup")
+            .to_string_lossy()
+            .into_owned();
+        let paths =
+            validate_discovery_exclusions(vec![format!("  {absent}  "), absent.clone(), "".into()])
+                .unwrap();
+        assert_eq!(paths, vec![absent]);
+        assert!(validate_discovery_exclusions(vec!["relative/backup".into()]).is_err());
+        assert!(validate_discovery_exclusions(vec![tmp
+            .path()
+            .join("../backup")
+            .to_string_lossy()
+            .into_owned()])
+        .is_err());
+        let db = tmp.path().join("settings.sqlite");
+        let conn = open_db(&db).unwrap();
+        settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &paths).unwrap();
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            settings::get_strict::<Vec<String>>(&conn, settings::keys::DISCOVERY_EXCLUSIONS)
+                .unwrap(),
+            Some(paths.clone())
+        );
+        let roots = vec![tmp.path().to_string_lossy().into_owned()];
+        let old_key = scan_key(&discovery_cache_scope(&roots, &[]));
+        let new_key = scan_key(&discovery_cache_scope(&roots, &paths));
+        assert_ne!(old_key, new_key);
+        crate::store::scans::save(
+            &conn,
+            crate::store::scans::ScanKind::Worktrees,
+            &old_key,
+            "old late response",
+        )
+        .unwrap();
+        assert!(crate::store::scans::load(
+            &conn,
+            crate::store::scans::ScanKind::Worktrees,
+            &new_key
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(discovery_cache_scope(&roots, &[]), roots);
+        let mut reversed = vec!["b".into(), "a".into()];
+        let scope = discovery_cache_scope(&roots, &reversed);
+        reversed.reverse();
+        assert_eq!(scope, discovery_cache_scope(&roots, &reversed));
     }
 
     #[test]

@@ -372,6 +372,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
+    ("get_discovery_exclusions", Class::Read),
+    ("set_discovery_exclusions", Class::Local),
     ("get_ui_prefs", Class::Read),
     // How a run is going, or how it ended. The resume path: a
     // suspended phone holds no event stream, so it asks instead.

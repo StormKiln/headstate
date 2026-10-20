@@ -266,6 +266,8 @@ const ROWS: Row[] = [
   row(api.removeOrphan, [path], "remove_orphan", { path }),
   row(api.removeWorktree, [repoPath, worktreePath], "remove_worktree", { repoPath, worktreePath }),
   row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs, reviewing: false }),
+  row(api.getDiscoveryExclusions, [], "get_discovery_exclusions"),
+  row(api.setDiscoveryExclusions, [dirs], "set_discovery_exclusions", { paths: dirs }),
   row(api.getWorktreeDirs, [], "get_worktree_dirs"),
   row(api.setWorktreeDirs, [dirs], "set_worktree_dirs", { dirs }),
   row(api.getPollInterval, [], "get_poll_interval"),

@@ -1,8 +1,10 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+const setExclusions = vi.hoisted(() => vi.fn((d: string[]) => Promise.resolve(d)));
 const setDirs = vi.hoisted(() => vi.fn((d: string[]) => Promise.resolve(d)));
 const setInterval_ = vi.hoisted(() => vi.fn((s: number) => Promise.resolve(s)));
+const exclusionsState = vi.hoisted(() => ({ ready: true, error: null as Error | null, retry: vi.fn() }));
 const dirs = vi.hoisted(() => ({ current: ["/Users/x/code"] as string[] }));
 
 const setCleanup = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -72,7 +74,7 @@ vi.mock("../api/hooks", () => ({
   usePairedDevices: () => ({ data: [], isLoading: false, error: null }),
   useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
-  useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs }),
+  useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs, exclusions: [], setExclusions, exclusionsReady: exclusionsState.ready, exclusionsError: exclusionsState.error, retryExclusions: exclusionsState.retry }),
   // #915's panel. "Not installed" is the state a fresh machine is in, and
   // deliberately not `undefined`: an unresolved status renders a "checking"
   // line rather than any of the four answers, which would make the
@@ -551,4 +553,27 @@ describe("the settings sections", () => {
     // ...and a Repositories one.
     expect(screen.getByLabelText(/directories to scan/i)).toBeTruthy();
   });
+});
+
+it("saves explicit discovery exclusions without changing scan roots", async () => {
+  open();
+  fireEvent.change(screen.getByLabelText("Exclude folders from repository discovery"), {
+    target: { value: "  /code/backup  \n\n /code/archive " },
+  });
+  fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+  await waitFor(() => expect(setExclusions).toHaveBeenCalledWith(["/code/backup", "/code/archive"]));
+});
+
+it("does not allow an unloaded exclusion list to overwrite saved exclusions and offers retry", () => {
+  exclusionsState.ready = false;
+  exclusionsState.error = new Error("database unavailable");
+  try {
+    open();
+    expect(screen.getByLabelText("Exclude folders from repository discovery")).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading exclusions" }));
+    expect(exclusionsState.retry).toHaveBeenCalled();
+  } finally {
+    exclusionsState.ready = true;
+    exclusionsState.error = null;
+  }
 });

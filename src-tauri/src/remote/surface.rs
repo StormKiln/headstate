@@ -587,6 +587,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("claude_hooks_status", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
+    ("get_discovery_exclusions", Class::Read),
+    ("set_discovery_exclusions", Class::Local),
     ("get_ui_prefs", Class::Read),
     // How a run is going, or how it ended. The resume path: a
     // suspended phone holds no event stream, so it asks instead.
@@ -1294,6 +1296,7 @@ async fn call(
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
+        "get_discovery_exclusions" => res(commands::get_discovery_exclusions(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
         "update_run_state" => ok(commands::update_run_state(app.state(), a.get("repoPath")?)),
         "update_all_state" => ok(commands::update_all_state(app.state())),
