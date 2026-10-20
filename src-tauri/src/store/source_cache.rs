@@ -102,7 +102,8 @@ pub(crate) fn load_qualified_snapshot(
 ) -> Result<OwnedSourceSnapshot, StoreError> {
     // A read transaction keeps the binding, owner and decoded payload on the
     // same SQLite snapshot even when another connection publishes a receipt.
-    let tx = conn.unchecked_transaction()?;
+    // It never writes, so DEFERRED cannot hit the read-to-write upgrade (#1958).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
     let owner: Option<(Option<String>, Option<String>)> = tx.query_row(
         "SELECT s.owner,c.owner FROM snapshot s LEFT JOIN snapshot_credentials c ON c.binding=?4
          WHERE s.provider=?1 AND s.host=?2 AND s.id=?3",

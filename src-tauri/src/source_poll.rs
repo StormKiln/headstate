@@ -828,7 +828,8 @@ fn apply_checking_snapshot(
     rows: Vec<crate::github::model::PullRequest>,
 ) -> Result<Option<FetchedList>, Failure> {
     let save = || -> Result<Option<FetchedList>, crate::store::StoreError> {
-        let tx = conn.unchecked_transaction()?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let source = &capture.attempt.source;
         let list = capture.attempt.list;
         if previous.viewer.as_deref() != Some(&capture.owner)
@@ -994,7 +995,13 @@ pub(crate) async fn fetch_github_step_at(
     let (mut loaded, rows) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, crate::store::StoreError> {
             let conn = crate::store::open_db(&path)?;
-            let conn = conn.unchecked_transaction()?;
+            // Read-only snapshot, never written or committed: DEFERRED cannot
+            // hit the read-to-write upgrade (#1958), and IMMEDIATE would queue
+            // every checkpoint load behind the write lock.
+            let conn = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Deferred,
+            )?;
             let source = Source::default();
             let checkpoint = crate::queue_scan::load(&conn, &source, list, &owner)?;
             let rows = if crate::store::source_cache::snapshot_owner(&conn, &source, list)?
@@ -1262,7 +1269,10 @@ fn reconcile_github_snapshot_observed(
         }
     } else {
         let mut save = || -> Result<(), crate::store::StoreError> {
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             crate::store::github_facts::apply(&tx, list, owner, &mut result.prs)?;
             crate::store::source_cache::save_owned_source_snapshot(
                 &tx,
@@ -1584,7 +1594,7 @@ fn persist_github_effect(
     receipt: &FetchedList,
     taint: bool,
 ) -> Result<(), crate::store::StoreError> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     if crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
         == receipt.viewer.as_deref()
         && receipt.viewer.is_some()
@@ -1764,7 +1774,10 @@ async fn record_github_effect_at(
             let saved = tauri::async_runtime::spawn_blocking(
                 move || -> Result<_, crate::store::StoreError> {
                     let conn = crate::store::open_db(&path)?;
-                    let tx = conn.unchecked_transaction()?;
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        &conn,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
                     // If membership is absent, accept only an identity already
                     // journaled by this owner, never invent a new open row.
                     if !matches
@@ -2026,7 +2039,10 @@ pub async fn record_gitlab_action(
         let persisted = tauri::async_runtime::spawn_blocking(move || {
             saved_session.with_current(|| {
                 let conn = crate::store::open_db(&path)?;
-                let tx = conn.unchecked_transaction()?;
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
                 crate::store::source_cache::save_owned_gitlab_snapshot(
                     &tx,
                     &saved_source,

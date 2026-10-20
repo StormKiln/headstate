@@ -1574,7 +1574,7 @@ fn store_rows(
     ledger: &Ledger,
     now: &str,
 ) -> Result<(), rusqlite::Error> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
         "DELETE FROM claude_advice_signal WHERE session_id = ?1",
         rusqlite::params![session_id],
