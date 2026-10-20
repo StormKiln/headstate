@@ -5,6 +5,44 @@ import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
 import { NarrowQueryError } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
+import { SavedScanNotice } from "./SavedScanNotice";
+import type { WorktreeRepo } from "../types/pr";
+
+/// The previous scan's repositories, while the live scan runs (#1950).
+///
+/// Plain text, not buttons: selecting a repository from a dated list
+/// would open a page the live scan has not confirmed. The counts are the
+/// saved scan's, under the label that says so; the "All repositories"
+/// total below stays a dash, because it is the LIVE scan's number and
+/// that has not answered.
+function SavedScanRows({
+  repos,
+  ageSecs,
+  stale,
+}: {
+  repos: WorktreeRepo[];
+  ageSecs: number;
+  stale: boolean;
+}) {
+  // The live list's filter, so a saved row and its live replacement are
+  // the same set of repositories.
+  const withWorktrees = repos.filter(
+    (r) => r.worktrees.some((w) => !w.is_main) && !r.worktrees.some((w) => isOrphaned(w.safety)),
+  );
+  return (
+    <div className="px-1 py-2">
+      <SavedScanNotice ageSecs={ageSecs} stale={stale} compact />
+      <ul className="mt-2" aria-label="Repositories from the last scan">
+        {withWorktrees.map((r) => (
+          <li key={r.path} className="flex justify-between px-2 py-1 text-xs text-[#8b949e]">
+            <span className="truncate">{r.name}</span>
+            <span className="ml-2 shrink-0">{r.worktrees.filter((w) => !w.is_main).length}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 /// Repos that have worktrees.
 ///
@@ -42,7 +80,10 @@ export function WorktreeSidebar({
     // means the same as empty -- no shortfall reported.
     unreadable = [],
     diagnostics,
+    // The previous scan, while this one is pending (#1950).
+    cached,
   } = useWorktrees();
+  const saved = isLoading && !isError && cached ? cached : undefined;
   const partial = unreadable.length > 0;
   // The scan's INPUT (#952), so the empty arm below can tell "nowhere to
   // look" from "nothing there". One cache hit: `staleTime: Infinity`.
@@ -135,6 +176,8 @@ export function WorktreeSidebar({
             message="Could not scan for worktrees."
             onRetry={() => void refetch()}
           />
+        ) : saved && saved.data.repos.length > 0 ? (
+          <SavedScanRows repos={saved.data.repos} ageSecs={saved.ageSecs} stale={saved.stale} />
         ) : isLoading ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
         ) : null}

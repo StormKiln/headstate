@@ -25,6 +25,7 @@ import { HelpButton } from "./HelpButton";
 import { QueryError, errorMessage } from "./QueryError";
 import { VenvSection } from "./VenvSection";
 import { CleanupLog } from "./CleanupLog";
+import { SavedScanNotice } from "./SavedScanNotice";
 
 /// A placeholder holding the same footprint as the number it stands in
 /// for, so rows do not jump as each measurement lands. Matches the one
@@ -136,17 +137,7 @@ function ArtifactsFromCache({
   const total = artifacts.reduce((n, a) => n + (a.size_bytes ?? 0), 0);
   return (
     <div className="p-4">
-      <div
-        className={`rounded-md border px-3 py-2 text-xs ${
-          stale
-            ? "border-[#d29922]/40 bg-[#d29922]/5 text-[#d29922]"
-            : "border-[#30363d] bg-[#161b22] text-[#8b949e]"
-        }`}
-        role="status"
-      >
-        Showing the last scan, from {describeAge(ageSecs)}. Rescanning now
-        {stale ? " — this result is old enough that it may have changed." : "."}
-      </div>
+      <SavedScanNotice ageSecs={ageSecs} stale={stale} />
       <ul className="mt-3 space-y-1">
         {artifacts.slice(0, 50).map((a) => (
           <li key={a.path} className="flex justify-between text-xs text-[#8b949e]">
@@ -166,17 +157,6 @@ function ArtifactsFromCache({
       </p>
     </div>
   );
-}
-
-/// How long ago, in words a sentence can use.
-function describeAge(secs: number): string {
-  if (secs < 60) return "moments ago";
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
-  const days = Math.floor(hours / 24);
-  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
 export function ArtifactsPage() {

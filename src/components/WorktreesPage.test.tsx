@@ -9,6 +9,8 @@ const state = vi.hoisted(() => ({
   /// The configured terminal template, empty for none (#1126).
   terminal: "",
   repos: undefined as WorktreeRepo[] | undefined,
+  /// The saved scan `useWorktrees` exposes while pending (#1950).
+  cached: undefined as { data: { repos: WorktreeRepo[] }; ageSecs: number; stale: boolean } | undefined,
   isLoading: false,
   isError: false,
   /// What the walk could not read (#951). A FOURTH state beside loading,
@@ -205,6 +207,8 @@ vi.mock("../api/hooks", () => ({
     refetch: vi.fn(),
     dataUpdatedAt: state.dataUpdatedAt,
     unreadable: state.unreadable,
+    // Mirrors the real hook: only while the live scan is pending.
+    cached: state.isLoading ? state.cached : undefined,
   }),
   // Mirrors the real hook (#830): verdicts stream in per worktree, so
   // `partial` is what the page renders from and the settled `data` wins
@@ -252,6 +256,9 @@ vi.mock("../api/hooks", () => ({
   useWorktreeSizes: () => ({
     data: state.sizes,
     partial: state.partialSizes ?? new Map<string, number | null>(),
+    // The real hook's merged view (#1942): the settled answer once there
+    // is one, the stream until then.
+    sizes: state.sizes ?? state.partialSizes ?? new Map<string, number | null>(),
     isLoading: state.sizing,
     isFetching: state.sizing,
     // #769: the page must read this. A mock that omitted it would let
@@ -379,6 +386,7 @@ describe("WorktreesPage on a phone", () => {
       // assertions in this file assume (#1126).
       terminal: "",
       repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
+      cached: undefined,
       isLoading: false,
       isError: false,
       // Reset like every other field, so a test that pins the scan
@@ -539,6 +547,7 @@ describe("WorktreesPage", () => {
     removeOrphanFn.mockClear();
     Object.assign(state, {
       repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
+      cached: undefined,
       isLoading: false,
       isError: false,
       // Reset like every other field, so a test that pins the scan
@@ -588,6 +597,31 @@ describe("WorktreesPage", () => {
     state.isLoading = true;
     render(<WorktreesPage />);
     expect(screen.getByText(/scanning for worktrees/i)).toBeTruthy();
+  });
+
+  // #1950: a cold start paints the saved scan, dated and read-only,
+  // rather than a blank "Scanning…" -- and the live page replaces it.
+  it("paints the saved scan with its age while scanning, then the live rows", () => {
+    state.isLoading = true;
+    state.repos = undefined;
+    state.cached = {
+      data: { repos: [{ identity: null, name: "saved-proj", path: "/code/saved-proj", worktrees: [wt({ path: "/code/saved-proj/wt" })] }] },
+      ageSecs: 45 * 60,
+      stale: false,
+    };
+    const { rerender } = render(<WorktreesPage />);
+    expect(screen.getByText(/Showing the last scan, from 45 minutes ago/)).toBeTruthy();
+    expect(screen.getByText("saved-proj")).toBeTruthy();
+    expect(screen.queryByText(/scanning for worktrees/i)).toBeNull();
+    // Dated rows authorise nothing.
+    expect(screen.queryByRole("button", { name: /remove/i })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+
+    state.isLoading = false;
+    state.repos = [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }];
+    rerender(<WorktreesPage />);
+    expect(screen.queryByText(/Showing the last scan/)).toBeNull();
+    expect(screen.queryByText("saved-proj")).toBeNull();
   });
 
   it("surfaces a scan failure rather than showing an empty list", () => {
