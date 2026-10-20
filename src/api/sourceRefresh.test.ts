@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { PullRequest } from "../types/pr";
 import { receiptAdvisory, SourceRefreshState, type SourceStatus } from "./sourceRefresh";
+import type { SourceSnapshot } from "./tauri";
 
 const rows = (number: number) => [{ number }] as PullRequest[];
 const update = (revision: number, error: string | null = null, extra: Partial<SourceStatus> = {}): SourceStatus => ({
@@ -210,4 +211,40 @@ it("publishes once for duplicate/stale event and command receipts, but retains n
   expect(publications).toBe(3);
   expect(state.snapshot().prs).toBe(first.prs);
   expect(state.snapshot().error).toBe("rate limited");
+});
+
+/// #1925: with no saved list there is nothing to verify. The first load is
+/// pending (a skeleton), not "checked, and the account could not be verified".
+describe("seeding from the saved snapshot", () => {
+  const saved = (data: SourceSnapshot["data"], ownership: SourceSnapshot["ownership"]): SourceSnapshot => ({
+    source: { provider: "github", host: "github.com" }, list: "reviewing", ownership, data,
+  });
+
+  it.each([{ state: "unverified" as const }, { state: "different_account" as const }, undefined])(
+    "keeps a missing snapshot pending whatever its ownership (%o)", (ownership) => {
+      const state = new SourceRefreshState();
+      state.seed(saved({ state: "missing" }, ownership));
+      expect(state.snapshot()).toMatchObject({ prs: undefined, error: null });
+    });
+
+  it("says an unreadable snapshot could not be read, not that its account could not be verified", () => {
+    const state = new SourceRefreshState();
+    state.seed(saved({ state: "unreadable" }, { state: "unverified" }));
+    expect(state.snapshot().prs).toBeUndefined();
+    expect(state.snapshot().error).toBe("The saved list could not be read. Refresh to load it again.");
+  });
+
+  it("still withholds a present snapshot whose account could not be verified", () => {
+    const state = new SourceRefreshState();
+    const reason = "The saved snapshot's account could not be verified. Connect once to verify this credential.";
+    state.seed(saved({ state: "withheld", reason }, { state: "unverified" }));
+    expect(state.snapshot()).toMatchObject({ prs: undefined, error: reason });
+  });
+
+  it("lets a later live receipt replace the pending first load", () => {
+    const state = new SourceRefreshState();
+    state.seed(saved({ state: "missing" }, { state: "unverified" }));
+    state.accept(update(1));
+    expect(state.snapshot()).toMatchObject({ prs: rows(1), error: null });
+  });
 });

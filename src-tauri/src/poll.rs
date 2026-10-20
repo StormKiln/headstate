@@ -763,6 +763,10 @@ async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
     let prs = &result.prs;
     let coverage = result.coverage.clone();
     let owner = result.viewer.clone();
+    if owner.is_none() {
+        // The store keeps an attributed review list over this write (#1926).
+        log::info!("review list fetched with the viewer unknown; it will not replace an attributed saved list");
+    }
     let Ok(dir) = crate::commands::profile_dir(app) else {
         return;
     };

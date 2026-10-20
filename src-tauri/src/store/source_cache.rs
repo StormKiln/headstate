@@ -251,6 +251,17 @@ pub fn snapshot_owner(
         .flatten())
 }
 
+/// An unattributed write never replaces an attributed row (#1926).
+///
+/// A fetch whose viewer is unknown (a cold start before the client has
+/// learned its login) produces rows nobody can be verified to own, and
+/// `load_qualified_snapshot` withholds them on every read. Letting that write
+/// replace a row with a known owner swapped readable data for data that can
+/// never be read back. Keeping only the owner (`COALESCE`) would be worse: it
+/// would label rows of unknown provenance as the old account's, and the
+/// owner-gated inventory readers in `source_poll` would adopt them. So the
+/// attributed row is kept whole, receipt time included; its age still says
+/// how old it is.
 fn save_payload<T: Serialize>(
     conn: &Connection,
     source: &Source,
@@ -260,12 +271,16 @@ fn save_payload<T: Serialize>(
     owner: Option<&str>,
 ) -> Result<(), StoreError> {
     let provider = serde_json::to_value(source.provider)?;
+    // An empty owner verifies nothing on read; store it as the absence it is.
+    let owner = owner.filter(|owner| !owner.is_empty());
     conn.execute(
         "INSERT INTO snapshot (provider, host, id, payload, fetched_at, coverage, owner)
          VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6)
          ON CONFLICT(provider, host, id) DO UPDATE SET
             payload = excluded.payload, fetched_at = excluded.fetched_at,
-            coverage = excluded.coverage, owner = excluded.owner",
+            coverage = excluded.coverage, owner = excluded.owner
+         WHERE excluded.owner IS NOT NULL
+            OR snapshot.owner IS NULL OR snapshot.owner = ''",
         params![
             provider.as_str(),
             source.host,
@@ -662,6 +677,7 @@ mod tests {
                 .as_deref(),
             Some("second-account")
         );
+        // An unattributed write does not erase a known owner (#1926).
         save_source_snapshot(
             &conn,
             &source,
@@ -671,8 +687,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            snapshot_owner(&conn, &source, CachedList::Reviewing).unwrap(),
-            None
+            snapshot_owner(&conn, &source, CachedList::Reviewing)
+                .unwrap()
+                .as_deref(),
+            Some("second-account")
+        );
+    }
+
+    /// #1926: a cold-start write whose viewer is unknown must not replace an
+    /// attributed snapshot with one that every read withholds.
+    #[test]
+    fn unattributed_write_keeps_the_attributed_snapshot_readable() {
+        let conn = db();
+        let source = Source::default();
+        let mut alice_row = sample(source.clone());
+        alice_row.number = 11;
+        save_owned_source_snapshot(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            &[alice_row],
+            &Coverage::Complete,
+            Some("alice"),
+        )
+        .unwrap();
+        save_verified_binding(&conn, "fixture-binding", "alice").unwrap();
+        let mut unknown_row = sample(source.clone());
+        unknown_row.number = 12;
+        for owner in [None, Some("")] {
+            save_owned_source_snapshot(
+                &conn,
+                &source,
+                CachedList::Reviewing,
+                &[unknown_row.clone()],
+                &Coverage::Partial { total: None },
+                owner,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            snapshot_owner(&conn, &source, CachedList::Reviewing)
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+        let live =
+            load_qualified_snapshot(&conn, &source, CachedList::Reviewing, Some("alice"), None)
+                .unwrap();
+        assert!(
+            matches!(live.ownership, Ownership::LiveVerified { ref owner } if owner == "alice")
+        );
+        let SnapshotData::Available { prs, coverage, .. } = live.snapshot.data else {
+            panic!("alice's snapshot was withheld: {:?}", live.snapshot.data)
+        };
+        // The attributed rows are kept whole; rows of unknown provenance are
+        // never relabelled as alice's.
+        assert_eq!(prs.iter().map(|pr| pr.number).collect::<Vec<_>>(), [11]);
+        assert_eq!(coverage, Coverage::Complete);
+        let bound = load_qualified_snapshot(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            None,
+            Some("fixture-binding"),
+        )
+        .unwrap();
+        assert!(
+            matches!(bound.ownership, Ownership::CredentialBound { ref owner } if owner == "alice")
+        );
+        assert!(matches!(
+            bound.snapshot.data,
+            SnapshotData::Available { .. }
+        ));
+        // A known owner still replaces the row, and an unowned row can still
+        // be replaced by an unowned write.
+        save_owned_source_snapshot(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            &[],
+            &Coverage::Complete,
+            Some("bob"),
+        )
+        .unwrap();
+        for rows in [vec![sample(source.clone())], vec![]] {
+            save_source_snapshot(
+                &conn,
+                &source,
+                CachedList::Authored,
+                &rows,
+                &Coverage::Unknown,
+            )
+            .unwrap();
+        }
+        let SnapshotData::Available { prs, .. } =
+            load_source_snapshot(&conn, &source, CachedList::Authored)
+                .unwrap()
+                .data
+        else {
+            panic!("unowned row")
+        };
+        assert!(prs.is_empty());
+        assert_eq!(
+            snapshot_owner(&conn, &source, CachedList::Reviewing)
+                .unwrap()
+                .as_deref(),
+            Some("bob")
         );
     }
 

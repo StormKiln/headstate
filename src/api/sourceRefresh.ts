@@ -201,6 +201,17 @@ export class SourceRefreshState {
   }
   seed(receipt: SourceSnapshot) {
     if (this.retired || this.providerReceipt) return;
+    // Data state first: a missing snapshot has no account to verify, so it is
+    // pending (not checked yet), never a verification failure (#1925).
+    if (receipt.data.state === "missing") {
+      this.publish();
+      return;
+    }
+    if (receipt.data.state === "unreadable") {
+      this.backendError = "The saved list could not be read. Refresh to load it again.";
+      this.publish();
+      return;
+    }
     const ownership = receipt.ownership;
     if (!ownership || !["live_verified", "credential_bound", "saved_desktop"].includes(ownership.state)) {
       this.backendError = receipt.data.state === "withheld" ? receipt.data.reason : "The saved snapshot's account could not be verified. Refresh to verify it.";
