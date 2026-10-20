@@ -28,6 +28,9 @@ pub(crate) enum ScanMode {
 }
 
 type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
+/// How long a waiter outlasts its own deadline so the producer, bounded by
+/// that same deadline, can publish the partial receipt it already holds.
+const RECEIPT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[derive(Default)]
 pub(super) struct Reads(Mutex<HashMap<(bool, i64), Weak<ScanSlot>>>);
 struct ScanSlot {
@@ -143,6 +146,11 @@ impl GitHubClient {
     ) -> Result<FetchedList, ClientError> {
         let _active = self.active_queue_read();
         let context = self.read_context();
+        // Report the budget this caller actually had, rounded up.
+        let budget = context
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let budget_secs = budget.as_secs() + u64::from(budget.subsec_nanos() > 0);
         let (slot, caller) = {
             let mut reads = self.scans.0.lock().unwrap_or_else(|e| e.into_inner());
             reads.retain(|_, weak| weak.strong_count() > 0);
@@ -329,9 +337,14 @@ impl GitHubClient {
                 notified.await;
             }
         };
-        let result = tokio::time::timeout_at(context.deadline, wait)
+        // The producer's request deadline is this caller's deadline, and on
+        // reaching it the scan returns the pages it already received with a
+        // step failure (#1044). Timing out here at the same instant would drop
+        // the last caller and abort that producer first, discarding them
+        // (#1931), so the waiter outlasts the producer's deadline by a grace.
+        let result = tokio::time::timeout_at(context.deadline + RECEIPT_GRACE, wait)
             .await
-            .map_err(|_| ClientError::Timeout(30))?;
+            .map_err(|_| ClientError::Timeout(budget_secs))?;
         drop(caller);
         result
     }
@@ -1905,6 +1918,77 @@ mod tests {
         assert_eq!(finished.prs.len(), 25);
         assert!(finished.prs.iter().all(|r| r.number >= 50));
         assert!(finished.scan.unwrap().state.done);
+    }
+    /// #1931 (#1044 again): the waiter and the producer share one deadline.
+    /// Page 1 arrives, page 2 hangs past the deadline. The producer's own
+    /// deadline path keeps page 1 and its cursor; the waiter must not time out
+    /// first and abort the producer, which would discard both.
+    ///
+    /// Real time, not a paused clock: the transport is a real socket, and a
+    /// paused runtime auto-advances to the deadline while page 1 is in flight.
+    /// The waiter is this test's own future, which a current-thread runtime
+    /// polls before spawned tasks when both timers fire in one tick, so the
+    /// unfixed code loses this race every run rather than sometimes.
+    #[tokio::test]
+    async fn waiter_deadline_keeps_pages_received_before_a_hung_page() {
+        use crate::github::admission::{ReadClass, ReadContext};
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let after = body["variables"]["after"].as_str().unwrap_or("");
+            let start = after.strip_prefix("cursor-").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+            let end = (start + 25).min(75);
+            let response = ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"fixture"},"authored":{"issueCount":75,"nodes":(start..end).map(node).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":end<75,"endCursor":format!("cursor-{end}")}}}}));
+            if after == "cursor-25" {
+                response.set_delay(Duration::from_secs(10))
+            } else {
+                response
+            }
+        }).mount(&server).await;
+        let base = client(&server);
+        base.fetch_viewer().await.unwrap();
+        let scoped = base.with_read_context(ReadContext::new(
+            ReadClass::Background,
+            Duration::from_millis(1500),
+        ));
+        let started = tokio::time::Instant::now();
+        let receipt = scoped
+            .advance_scan(
+                CachedList::Authored,
+                Loaded {
+                    revision: 0,
+                    state: State::default(),
+                },
+                &[],
+                1000,
+            )
+            .await
+            .expect("pages received before the deadline are an answer, not a timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hung page is bounded by the step's deadline"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "viewer, page 1, and the hung page 2"
+        );
+        assert_eq!(receipt.prs.len(), 25, "page 1 is retained");
+        assert!(receipt.prs.iter().all(|r| r.number < 25));
+        let state = receipt.scan.unwrap().state;
+        assert_eq!(
+            state.after.as_deref(),
+            Some("cursor-25"),
+            "the checkpoint advances past page 1"
+        );
+        assert_eq!(state.pages, 1);
+        assert!(!state.done);
+        assert!(state.received);
+        assert!(
+            state.step_failure.is_some(),
+            "the hung page is reported as this step's failure"
+        );
     }
     #[tokio::test]
     async fn search_ceiling_stays_partial_and_bad_cursor_never_claims_a_terminal_pass() {
