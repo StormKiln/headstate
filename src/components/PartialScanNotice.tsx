@@ -1,4 +1,5 @@
 import type { DiscoveryDiagnostic } from "../types/pr";
+import { rootBoundaries } from "../lib/rootBoundaries";
 import { useId, useState } from "react";
 
 /// The banner for a worktree scan that could not read everything (#951).
@@ -38,7 +39,50 @@ import { useId, useState } from "react";
 /// a repository owned by another uid, a permission wall, and git missing
 /// from a GUI-launched app's PATH send the user to three different places,
 /// and only the message distinguishes them.
-export function PartialScanNotice({
+///
+/// # A scan root that is itself a repository (#1948)
+///
+/// Discovery stops at a checkout (#1919), so a scan root that is a
+/// repository lists one row and nothing nested inside it. The scan read
+/// everything it looked at, so this is not a shortfall and not an alert:
+/// it renders as a note BESIDE the banner, and only qualifies the numbers.
+export function PartialScanNotice(props: Parameters<typeof ShortfallNotice>[0]) {
+  const roots = rootBoundaries(props.diagnostics);
+  return (
+    <>
+      <ShortfallNotice
+        {...props}
+        diagnostics={props.diagnostics?.filter((d) => d.kind !== "repositoryBoundary")}
+      />
+      {roots.length > 0 && (
+        <RootBoundaryNote roots={roots} consequence={props.consequence} compact={props.compact} />
+      )}
+    </>
+  );
+}
+
+function RootBoundaryNote({
+  roots,
+  consequence,
+  compact,
+}: {
+  roots: readonly string[];
+  consequence: string;
+  compact?: boolean;
+}) {
+  const one = roots.length === 1;
+  const name = (root: string) => (compact ? root.split(/[\\/]/).filter(Boolean).pop() ?? root : root);
+  const subject = one ? `The scan root ${name(roots[0])} is itself a repository` : `${roots.length} scan roots are themselves repositories`;
+  const nested = `repositories nested inside ${one ? "it" : "them"} are not listed`;
+  return (
+    <div role="note" className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
+      <p>{compact ? `${subject}; ${nested}.` : `${subject}, and ${nested}, so ${consequence}`}</p>
+      <p className="mt-1">To include one, add its folder as a scan root in Settings &gt; Repositories.</p>
+    </div>
+  );
+}
+
+function ShortfallNotice({
   unreadable,
   /// What the numbers on this surface are, given the shortfall. Each
   /// surface says its own, because "at least N repositories" and "at
