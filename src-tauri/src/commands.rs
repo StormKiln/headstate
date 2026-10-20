@@ -7346,7 +7346,7 @@ pub async fn update_all_repositories(
     // The MAIN CHECKOUT of each repository, which is what the button is
     // about. A repository's other worktrees are branches the user is
     // working on, and pulling them is a different promise entirely.
-    let paths: Vec<String> = scan.repos.iter().map(|r| r.path.clone()).collect();
+    let paths = crate::worktrees::repository_update_paths(&scan.repos);
     if let Some(expected) = expected_paths {
         crate::worktrees::validate_update_scope(&expected, &paths)?;
     }
