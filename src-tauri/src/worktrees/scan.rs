@@ -3709,6 +3709,9 @@ fn collect_bounded(
                     prunable: None,
                 }],
             });
+            // An orphan marker is still a checkout boundary. Its source tree
+            // is not another discovery root merely because its owner is gone.
+            return;
         }
     }
     if dir.join(".git").is_dir() || (dir.join(".git").is_file() && orphan_gitdir(dir).is_none()) {
@@ -3820,6 +3823,10 @@ fn collect_bounded(
                 Err(e) => out.discovery_error(root, dir, DiscoveryDiagnosticKind::GitError, e),
             }
         }
+        // Repository discovery ends here, including failed inspection and
+        // already-seen common directories. Git enumerates registered worktrees;
+        // finding unrelated nested repositories requires an explicit scan root.
+        return;
     }
     // A BARE repository -- a clone or mirror with no working tree
     // (#1142).
@@ -12612,6 +12619,76 @@ mod nested_discovery_tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn repository_discovery_stops_at_checkout_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for kind in ["normal", "unborn", "broken", "orphan"] {
+            let outer = tmp.path().join(kind);
+            let inner = outer.join("src/a/b/c/d/e/f/nested");
+            std::fs::create_dir_all(&inner).unwrap();
+            run(&inner, &["init", "-q"]);
+            match kind {
+                "orphan" => std::fs::write(
+                    outer.join(".git"),
+                    "gitdir: /missing-headstate-fixture/.git/worktrees/gone\n",
+                )
+                .unwrap(),
+                "broken" => std::fs::create_dir(outer.join(".git")).unwrap(),
+                _ => {
+                    run(&outer, &["init", "-q"]);
+                    if kind == "normal" {
+                        run(&outer, &["commit", "--allow-empty", "-qm", "initial"]);
+                    }
+                }
+            }
+            let mut scan = RepoScan::default();
+            let mut remaining = 100;
+            collect_bounded(
+                &outer,
+                0,
+                &mut scan,
+                false,
+                &mut Default::default(),
+                &mut remaining,
+            );
+            assert_eq!(remaining, 99, "must not visit children of {kind}");
+            assert!(!scan.repos.iter().any(|r| r.path == inner.to_string_lossy()));
+        }
+    }
+
+    #[test]
+    fn linked_and_already_seen_repositories_are_discovery_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        run(&main, &["init", "-q"]);
+        run(&main, &["commit", "--allow-empty", "-qm", "initial"]);
+        let linked = tmp.path().join("linked");
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        for dir in [&main, &linked] {
+            std::fs::create_dir_all(dir.join("src/a/b/c/d/e/f")).unwrap();
+        }
+        let mut scan = RepoScan::default();
+        let mut common = Default::default();
+        let mut remaining = 100;
+        for dir in [&linked, &main, &linked] {
+            let before = remaining;
+            collect_bounded(dir, 0, &mut scan, false, &mut common, &mut remaining);
+            assert_eq!(remaining, before - 1);
+        }
+        assert_eq!(scan.repos.len(), 1);
+        assert_eq!(scan.repos[0].worktrees.len(), 2);
     }
 
     #[test]

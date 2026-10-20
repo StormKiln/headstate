@@ -3262,6 +3262,16 @@ function worktreeSizeOptions(
       const queries = qc.getQueryCache().findAll({ queryKey: ["worktree-sizes", repoPath] });
       return Math.min(...(paths ?? []).map((path) => Math.max(0, ...queries.filter((q) => (q.state.data as Map<string, number | null> | undefined)?.has(path)).map((q) => q.state.dataUpdatedAt))));
     },
+    // Maps are not structurally shared by TanStack's default JSON comparator.
+    // An equivalent placeholder must not notify every observer on each parent
+    // render, including disabled observers retained by the all-repository hook.
+    structuralSharing: (previous: unknown, next: unknown) => {
+      if (previous instanceof Map && next instanceof Map && previous.size === next.size
+        && [...next].every(([path, bytes]) => previous.has(path) && previous.get(path) === bytes)) {
+        return previous;
+      }
+      return next;
+    },
     placeholderData: warm,
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
       const measured = await measureSizes(repoPath as string);
