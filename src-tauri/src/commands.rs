@@ -3089,6 +3089,18 @@ pub fn set_discovery_exclusions(app: AppHandle, paths: Vec<String>) -> Result<Ve
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &paths)
         .map_err(|e| e.to_string())?;
+    // The worktrees scan cache is keyed on roots AND exclusions, so a
+    // changed exclusion set already misses; this drops the rows keyed on
+    // the old policy, exactly as `set_worktree_dirs` does for the roots
+    // (#1950). Best-effort for the same reason as there.
+    let dirs = get_worktree_dirs(app.clone());
+    if let Err(e) = crate::store::scans::retain_only(
+        &conn,
+        &scan_key(&dirs),
+        &scan_key(&discovery_cache_scope(&dirs, &paths)),
+    ) {
+        log::warn!("scan cache: could not drop entries for the previous exclusions: {e}");
+    }
     Ok(paths)
 }
 

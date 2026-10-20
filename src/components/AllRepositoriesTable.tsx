@@ -6,6 +6,8 @@ import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
 import type { RepoOverviewRow } from "@/lib/repoOverview";
 import { upstreamReasonAged, upstreamToneAged } from "@/lib/worktrees";
 import { UpdateAllButton } from "@/components/UpdateAllButton";
+import { SavedScanNotice } from "@/components/SavedScanNotice";
+import type { WorktreeRepo } from "@/types/pr";
 
 /// The All Repositories overview: one row per repository, each saying how
 /// its main checkout stands against the ref it tracks (#1011).
@@ -78,7 +80,7 @@ export function AllRepositoriesTable() {
   // `isError` and `refetch` as well as the data (#846) -- and
   // `unreadable`, which is the whole of #1028's requirement now that the
   // reporting form exists.
-  const { data, unreadable, diagnostics, isLoading, isError, error, refetch } = useWorktrees();
+  const { data, unreadable, diagnostics, isLoading, isError, error, refetch, cached } = useWorktrees();
 
   const scanned = useMemo(() => repoOverviewRows(data ?? []), [data]);
 
@@ -147,6 +149,14 @@ export function AllRepositoriesTable() {
   }
 
   if (isLoading) {
+    // The previous scan's repositories on a cold start (#1950). Names
+    // and branches only: the Status column is a verdict, and a saved
+    // scan carries none worth showing -- `upstream` is never set by the
+    // walk (#1042) -- so the column is left out rather than skeletoned
+    // under a label that says nothing is being checked for these rows.
+    if (cached && cached.data.repos.length > 0) {
+      return <SavedRepositories repos={cached.data.repos} ageSecs={cached.ageSecs} stale={cached.stale} />;
+    }
     return (
       <p className="px-4 py-8 text-center text-sm text-[#8b949e]">Scanning for repositories…</p>
     );
@@ -219,6 +229,49 @@ export function AllRepositoriesTable() {
         <tbody>
           {rows.map((row) => (
             <RepoRow key={row.path} row={row} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/// The previous scan's repositories, labelled with their age (#1950).
+///
+/// Read-only and verdict-free, `ArtifactsFromCache`'s rule: no Update
+/// all, no status. The live table replaces it whole when discovery
+/// answers.
+function SavedRepositories({
+  repos,
+  ageSecs,
+  stale,
+}: {
+  repos: WorktreeRepo[];
+  ageSecs: number;
+  stale: boolean;
+}) {
+  const rows = repoOverviewRows(repos);
+  return (
+    <div className="p-4">
+      <SavedScanNotice ageSecs={ageSecs} stale={stale} />
+      <table className="mt-3 w-full border-collapse text-sm">
+        <caption className="sr-only">Repositories from the last scan.</caption>
+        <thead>
+          <tr className="border-b border-[#30363d] text-left text-xs text-[#8b949e]">
+            <th scope="col" className="px-4 py-2 font-normal">
+              Repository
+            </th>
+            <th scope="col" className="px-4 py-2 font-normal">
+              Branch
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.path} className="border-b border-[#21262d] text-[#8b949e]">
+              <td className="px-4 py-2 font-mono">{row.name}</td>
+              <td className="px-4 py-2 text-xs">{row.branch ?? <span className="italic">detached</span>}</td>
+            </tr>
           ))}
         </tbody>
       </table>

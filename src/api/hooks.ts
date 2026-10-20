@@ -2868,10 +2868,26 @@ export function useWorktrees(enabled = true) {
   const qc = useQueryClient();
   const q = useQuery({
     queryKey: ["worktrees"],
-    queryFn: async ({ signal }) => { const result = await listWorktrees(); signal.throwIfAborted(); return result; },
+    // `signal` is deliberately NOT read (#1944). In TanStack v5, reading
+    // it opts the query into cancellation when its last observer
+    // unmounts, and the query then reverts -- but the walk behind this
+    // `invoke` cannot be aborted, so it ran to completion anyway and its
+    // finished answer was thrown away. A user moving between views
+    // mid-scan never saw the list fill. Explicit cancellation still
+    // works without it: `cancelQueries` rejects the in-flight fetch
+    // whether or not the function looked at its signal, which is what
+    // `refreshDiskMeasurements` and `setExclusions` rely on.
+    queryFn: () => listWorktrees(),
     enabled,
     staleTime: 30_000,
   });
+  // The previous scan, for the cold start (#1950, the #1152 goal). Read
+  // only while discovery has never answered: once it has, the live
+  // result is strictly better. Kept BESIDE `data`, never in it -- the
+  // reason `useCachedScan` gives for not being `initialData` -- so a
+  // caller can label which one it is showing, and the consumers that
+  // tell pending from empty by `data === undefined` keep that meaning.
+  const cached = useCachedScan<WorktreeScan>("worktrees", q.isLoading);
   return {
     ...q,
     refetch: (...args: Parameters<typeof q.refetch>) => refreshDiskMeasurements(qc, "worktrees", "worktree-sizes", () => q.refetch(...args)),
@@ -2883,6 +2899,12 @@ export function useWorktrees(enabled = true) {
     /// carried by `isLoading`.
     unreadable: q.data?.unreadable ?? EMPTY_UNREADABLE,
     diagnostics: q.data?.diagnostics,
+    /// The last stored scan and its age, while the live one is pending
+    /// and only then; `undefined` once discovery has answered, when there
+    /// is no stored scan, or when it could not be parsed. Read-only by
+    /// contract: nothing may act on a row from it (`ArtifactsFromCache`
+    /// states the rule), so it is for painting, never for removal.
+    cached: q.isLoading ? cached : undefined,
   };
 }
 
@@ -3275,9 +3297,10 @@ function worktreeSizeOptions(
       return next;
     },
     placeholderData: warm,
-    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+    // No `signal`, for `useWorktrees`' reason (#1944): the walk cannot
+    // be aborted, so cancelling on unmount only discarded its answer.
+    queryFn: async () => {
       const measured = await measureSizes(repoPath as string);
-      signal.throwIfAborted();
       return paths
         ? new Map([...measured].filter(([path]) => paths.includes(path)))
         : measured;
@@ -3304,11 +3327,28 @@ export function useWorktreeSizes(
   useEffect(() => {
     if (repoPath) sizeCalls.promote(repoPath);
   }, [repoPath]);
+  const streamed = members
+    ? new Map([...partial].filter(([path]) => members.includes(path)))
+    : partial;
   return {
     ...query,
-    partial: members
-      ? new Map([...partial].filter(([path]) => members.includes(path)))
-      : partial,
+    partial: streamed,
+    /// What a row should show: the settled walk once it has answered,
+    /// and until then whatever is retained with the stream merged OVER
+    /// it (#1942).
+    ///
+    /// Merged, not picked. The page used to read `data ?? partial`, but
+    /// with `members` passed `placeholderData` always yields a Map --
+    /// empty when nothing is retained -- so `data` was never undefined
+    /// and the stream was never reached: every row waited for the
+    /// slowest tree in the repository, which is #754 back again. The
+    /// stream wins over the placeholder because it is the newer
+    /// measurement; the settled answer wins over both because it is the
+    /// whole walk.
+    sizes:
+      query.data !== undefined && !query.isPlaceholderData
+        ? query.data
+        : new Map<string, number | null>([...(query.data ?? []), ...streamed]),
   };
 }
 
@@ -3358,6 +3398,12 @@ export function useAllWorktreeSizes(
   // pieces. Streamed values go in FIRST so a settled query's answer
   // wins on any key it has -- the settled set is the authoritative one,
   // and the stream is only ever an early view of the same walk.
+  //
+  // A PLACEHOLDER is not a settled answer (#1942). It is what was
+  // retained from an earlier walk, so it fills only the paths the
+  // stream has not measured yet: overwriting a fresh streamed size with
+  // an older retained one would show a number the current walk has
+  // already superseded.
   const currentPaths = repos
     ? new Set(repos.flatMap((repo) => repo.worktrees.map((w) => w.path)))
     : undefined;
@@ -3365,7 +3411,11 @@ export function useAllWorktreeSizes(
     [...streamed].filter(([path]) => !currentPaths || currentPaths.has(path)),
   );
   for (const r of results) {
-    if (r.data) for (const [k, v] of r.data) sizes.set(k, v);
+    if (!r.data) continue;
+    for (const [k, v] of r.data) {
+      if (r.isPlaceholderData && streamed.has(k)) continue;
+      sizes.set(k, v);
+    }
   }
   return {
     sizes,
@@ -4176,17 +4226,25 @@ export function useWorktreeDirs() {
     ]);
     qc.setQueryData(["discovery-exclusions"], applied);
     qc.setQueryData(["cached-scan", "worktrees"], null);
+    // And marked stale, so the next cold paint asks the backend again
+    // under the NEW scope rather than trusting this session's answer for
+    // the old one (#1962's frontend half; the key still omits the scope).
+    await qc.invalidateQueries({ queryKey: ["cached-scan"], refetchType: "none" });
     await qc.resetQueries({ queryKey: ["worktrees"] });
     return applied;
   };
   const set = (dirs: string[]) =>
     setWorktreeDirs(dirs).then(async (applied) => {
       diskRefreshes.get(qc)?.clear();
-      const keys = ["worktrees", "artifacts", "worktree-sizes", "artifact-sizes", "venvs", "venv-sizes", "disk-inventory"];
+      // `cached-scan` too (#1962's frontend half): its key does not carry
+      // the roots and it is `staleTime: Infinity`, so without this a
+      // changed root set would go on painting the previous set's saved
+      // scan, labelled with an age, for the rest of the session.
+      const keys = ["worktrees", "artifacts", "worktree-sizes", "artifact-sizes", "venvs", "venv-sizes", "disk-inventory", "cached-scan"];
       await Promise.all(keys.map((key) => qc.cancelQueries({ queryKey: [key] })));
       await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key], refetchType: "none" })));
       qc.setQueryData(["worktree-dirs"], applied);
-      await Promise.all(["worktrees", "artifacts", "venvs", "disk-inventory"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
+      await Promise.all(["worktrees", "artifacts", "venvs", "disk-inventory", "cached-scan"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
       await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
       return applied;
     });

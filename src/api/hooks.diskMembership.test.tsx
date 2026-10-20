@@ -92,8 +92,15 @@ describe("disk measurement membership", () => {
     qc.setQueryData(["artifact-sizes", "/repo"], [["/repo/target", 10, 60]]);
     qc.setQueryData(["worktree-sizes", "/repo"], new Map([["/repo", 10]]));
     qc.setQueryData(["artifacts"], [artifact("/repo/target")]);
+    // The saved scans are keyed by kind alone on this side, so a changed
+    // root set must mark them stale or the old roots' scan keeps painting
+    // (#1962's frontend half).
+    qc.setQueryData(["cached-scan", "artifacts"], { payload: "[]", age_secs: 60, stale: false });
+    qc.setQueryData(["cached-scan", "worktrees"], { payload: "{}", age_secs: 60, stale: false });
     const { result } = renderHook(() => useWorktreeDirs(), { wrapper });
     await act(() => result.current.set(["/new/root"]));
+    expect(qc.getQueryState(["cached-scan", "artifacts"])?.isInvalidated).toBe(true);
+    expect(qc.getQueryState(["cached-scan", "worktrees"])?.isInvalidated).toBe(true);
     expect(qc.getQueryState(["artifact-sizes", "/repo"])?.isInvalidated).toBe(true);
     expect(qc.getQueryState(["worktree-sizes", "/repo"])?.isInvalidated).toBe(true);
     expect(qc.getQueryState(["artifacts"])?.isInvalidated).toBe(true);
@@ -184,6 +191,10 @@ it("exclusion changes discard an old discovery response and cached scope without
   let scans = 0;
   bridge.invoke.mockImplementation((cmd, args) => {
     if (cmd === "set_discovery_exclusions") return Promise.resolve(args.paths);
+    // `useWorktrees` now reads the saved scan while discovery is pending
+    // (#1950). The backend's answer for a scope with no saved scan is
+    // `null`; the generic `[]` below is not a shape that command returns.
+    if (cmd === "read_cached_scan") return Promise.resolve(null);
     if (cmd === "list_worktrees") {
       scans++;
       if (scans === 1) return new Promise(resolve => { finishOld = resolve; });
@@ -201,6 +212,7 @@ it("exclusion changes discard an old discovery response and cached scope without
   await act(async () => finishOld({ repos: [{ path: "/old" }], unreadable: ["old warning"] }));
   expect(result.current.scan.data).toEqual([]);
   expect(qc.getQueryData(["cached-scan", "worktrees"])).toBeNull();
+  expect(qc.getQueryState(["cached-scan", "worktrees"])?.isInvalidated).toBe(true);
   expect(qc.getQueryData(["artifacts"])).toEqual([artifact("/repo/target")]);
   expect(calls("list_artifacts")).toHaveLength(0);
 });

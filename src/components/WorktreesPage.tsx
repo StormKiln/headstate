@@ -81,7 +81,8 @@ import { assessmentSummary } from "../lib/assessment";
 import { rollupRepos } from "../lib/rollup";
 import { useActiveFilters, useFilters } from "../store/filters";
 import type {
-  ClaudeSession, PullRequest, Worktree } from "../types/pr";
+  ClaudeSession, PullRequest, Worktree, WorktreeRepo } from "../types/pr";
+import { SavedScanNotice } from "./SavedScanNotice";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { QueryError, errorMessage } from "./QueryError";
@@ -1173,6 +1174,42 @@ function useFirstSizingSettled(repoPath: string | undefined, sizing: boolean): n
   return next.ticks;
 }
 
+/// The previous scan, painted while the live one runs (#1950).
+///
+/// `ArtifactsFromCache`'s shape and its rule: the rows are real but
+/// dated, so this renders no selection, no remove and no safety verdict
+/// -- a stale "safe to delete" is the one thing a cache must not
+/// authorise -- and the age sits above them every time. The live page
+/// replaces it whole the moment discovery answers.
+function WorktreesFromCache({
+  repos,
+  ageSecs,
+  stale,
+}: {
+  repos: WorktreeRepo[];
+  ageSecs: number;
+  stale: boolean;
+}) {
+  return (
+    <div className="p-4">
+      <SavedScanNotice ageSecs={ageSecs} stale={stale} />
+      <ul className="mt-3 space-y-1" aria-label="Repositories from the last scan">
+        {repos.map((r) => {
+          const count = r.worktrees.filter((w) => !w.is_main).length;
+          return (
+            <li key={r.path} className="flex justify-between text-xs text-[#8b949e]">
+              <span className="truncate">{r.name}</span>
+              <span className="ml-3 shrink-0">
+                {count} worktree{count === 1 ? "" : "s"}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function WorktreesPage() {
   const {
     data: repos,
@@ -1191,6 +1228,8 @@ export function WorktreesPage() {
     // empty mean the same thing here: no shortfall was reported.
     unreadable = [],
     diagnostics,
+    // The previous scan, while this one is pending (#1950).
+    cached,
   } = useWorktrees();
   const partial = unreadable.length > 0;
   // The scan's INPUT (#952): whether there were any folders to walk at
@@ -1286,7 +1325,11 @@ export function WorktreesPage() {
   // walked -- MEASURED at 21.40s for one 200 GB checkout, and minutes
   // across a repository with 100 worktrees. A row's own size is known
   // long before that and there was no reason to withhold it.
-  const sizes = sizesQuery.data ?? sizesQuery.partial;
+  //
+  // Read from the hook's merged `sizes`, not `data ?? partial` (#1942):
+  // with members passed, `data` is a placeholder Map while pending --
+  // never undefined -- so that fallback never reached the stream.
+  const sizes = sizesQuery.sizes;
   // `isFetching`, NOT `isLoading`. A DISABLED query reports `isLoading:
   // true` forever in TanStack v5 -- it has no data and never will --
   // so on "All repositories", where no repo is selected and the sizing
@@ -1972,6 +2015,12 @@ export function WorktreesPage() {
   const refreshControls = <div className="px-4 py-2 text-xs text-muted-foreground"><button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button>{isError && repos?.length ? <p role="status">Could not scan for worktrees: {errorMessage(error)}. Previously discovered worktrees remain visible; measurements may be out of date.</p> : null}</div>;
 
   if (isLoading) {
+    // The last scan rather than a blank page on a cold start (#1950,
+    // the #1152 goal Artifacts already meets). Only when it found
+    // something: an empty saved scan says nothing a spinner does not.
+    if (cached && cached.data.repos.length > 0) {
+      return <WorktreesFromCache repos={cached.data.repos} ageSecs={cached.ageSecs} stale={cached.stale} />;
+    }
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
         Scanning for worktrees…
