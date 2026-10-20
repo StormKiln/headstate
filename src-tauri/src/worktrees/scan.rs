@@ -13006,6 +13006,7 @@ mod nested_discovery_tests {
             ],
         );
         run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut spellings = vec![root.clone()];
         // The root reached through a symlink, as macOS's /var -> /private/var
         // temp dir is: Git records the worktree's gitdir under the RESOLVED
