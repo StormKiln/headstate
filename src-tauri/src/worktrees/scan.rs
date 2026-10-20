@@ -2396,7 +2396,7 @@ impl RepoScan {
                 unreachable!("errors are not traversal stops")
             }
         };
-        diagnostic.message = format!("{}: discovery {reason} reached at {} traversal boundaries (for example {}); add a narrower scan root", diagnostic.root, diagnostic.count, diagnostic.path);
+        diagnostic.message = format!("{}: discovery {reason}: skipped {} subtrees (for example {}); choose a narrower scan root or exclude an unwanted folder in Settings > Repositories", diagnostic.root, diagnostic.count, diagnostic.path);
         // Retained for older clients and existing partial-scan safety gates.
         self.unreadable.push(diagnostic.message.clone());
     }
@@ -2444,18 +2444,60 @@ pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
     scan_dirs_fast_reporting(dirs).repos
 }
 
+pub fn scan_dirs_fast_reporting_excluding(dirs: &[String], excluded: &[String]) -> RepoScan {
+    scan_reporting_excluding(dirs, false, excluded)
+}
+
 fn scan_reporting(dirs: &[String], with_safety: bool) -> RepoScan {
+    scan_reporting_excluding(dirs, with_safety, &[])
+}
+
+// Resolve the existing prefix even when a saved root or exclusion has been
+// removed. No directory is traversed through an alias by this comparison.
+fn discovery_path_identity(path: &Path) -> std::path::PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(resolved) = std::fs::canonicalize(ancestor) {
+            if let Ok(suffix) = path.strip_prefix(ancestor) {
+                return resolved.join(suffix);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+fn scan_reporting_excluding(dirs: &[String], with_safety: bool, excluded: &[String]) -> RepoScan {
     let mut scan = RepoScan::default();
     let mut common_dirs = std::collections::HashSet::new();
     for base in dirs {
         let mut remaining = 10_000;
-        collect_bounded(
+        // Map canonical exclusions into this root's spelling once, not once
+        // per visited directory. The walker still refuses directory symlinks.
+        let base_path = Path::new(base);
+        let canonical_base = discovery_path_identity(base_path);
+        let exclusions: Vec<_> = excluded
+            .iter()
+            .filter_map(|excluded| {
+                let excluded = Path::new(excluded);
+                let resolved = discovery_path_identity(excluded);
+                if canonical_base.starts_with(&resolved) || base_path.starts_with(excluded) {
+                    Some(base_path.to_path_buf())
+                } else if let Ok(rest) = resolved.strip_prefix(&canonical_base) {
+                    Some(base_path.join(rest))
+                } else if excluded.starts_with(base_path) {
+                    Some(excluded.to_path_buf())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        collect_bounded_excluding(
             Path::new(base),
             0,
             &mut scan,
             with_safety,
             &mut common_dirs,
             &mut remaining,
+            &exclusions,
         );
     }
     scan.repos.sort_by(|a, b| a.path.cmp(&b.path));
@@ -3589,6 +3631,7 @@ fn generated_runtime_boundary(dir: &Path) -> bool {
         && !(dir.join("HEAD").is_file() && dir.join("objects").is_dir())
 }
 
+#[cfg(test)]
 fn collect_bounded(
     dir: &Path,
     depth: usize,
@@ -3597,6 +3640,21 @@ fn collect_bounded(
     common_dirs: &mut std::collections::HashSet<std::path::PathBuf>,
     remaining: &mut usize,
 ) {
+    collect_bounded_excluding(dir, depth, out, with_safety, common_dirs, remaining, &[]);
+}
+
+fn collect_bounded_excluding(
+    dir: &Path,
+    depth: usize,
+    out: &mut RepoScan,
+    with_safety: bool,
+    common_dirs: &mut std::collections::HashSet<std::path::PathBuf>,
+    remaining: &mut usize,
+    excluded: &[std::path::PathBuf],
+) {
+    if excluded.iter().any(|path| dir.starts_with(path)) {
+        return;
+    }
     if depth > 0 && (installed_discovery_bundle(dir) || generated_runtime_boundary(dir)) {
         return;
     }
@@ -3975,9 +4033,15 @@ fn collect_bounded(
         // which keeps the existing behaviour of not descending into a
         // linked tree: it is reachable by its real path.
         match e.file_type() {
-            Ok(ft) if ft.is_dir() => {
-                collect_bounded(&p, depth + 1, out, with_safety, common_dirs, remaining)
-            }
+            Ok(ft) if ft.is_dir() => collect_bounded_excluding(
+                &p,
+                depth + 1,
+                out,
+                with_safety,
+                common_dirs,
+                remaining,
+                excluded,
+            ),
             Ok(_) => {}
             Err(err) => out.discovery_error(root, &p, DiscoveryDiagnosticKind::ReadError, err),
         }
@@ -12618,6 +12682,97 @@ mod nested_discovery_tests {
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn discovery_exclusions_skip_backups_but_preserve_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir_all(backup.join("a/b/c/d/e/f/g/h")).unwrap();
+        let sibling = tmp.path().join("backup-real");
+        std::fs::create_dir(&sibling).unwrap();
+        run(&sibling, &["init", "-q"]);
+        let roots = vec![tmp.path().to_string_lossy().into_owned()];
+        assert!(scan_dirs_fast_reporting(&roots).is_partial());
+        let excluded = vec![backup.to_string_lossy().into_owned()];
+        let scan = scan_dirs_fast_reporting_excluding(&roots, &excluded);
+        assert!(!scan.is_partial(), "{:?}", scan.unreadable);
+        assert_eq!(scan.repos.len(), 1);
+        assert_eq!(scan.repos[0].path, sibling.to_string_lossy());
+        let explicit = scan_dirs_fast_reporting_excluding(&excluded, &excluded);
+        assert!(explicit.repos.is_empty());
+        assert!(!explicit.is_partial());
+        let nested_root = vec![backup.join("a").to_string_lossy().into_owned()];
+        assert!(!scan_dirs_fast_reporting_excluding(&nested_root, &excluded).is_partial());
+    }
+
+    #[test]
+    fn discovery_exclusions_preserve_registered_worktrees_and_real_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let backup = tmp.path().join("backup");
+        let linked = backup.join("linked");
+        std::fs::create_dir(&main).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        run(&main, &["init", "-q"]);
+        run(&main, &["commit", "--allow-empty", "-qm", "initial"]);
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(broken.join(".git")).unwrap();
+        let scan = scan_dirs_fast_reporting_excluding(
+            &[tmp.path().to_string_lossy().into_owned()],
+            &[backup.to_string_lossy().into_owned()],
+        );
+        assert!(scan
+            .repos
+            .iter()
+            .any(|repo| repo
+                .worktrees
+                .iter()
+                .any(|w| canonical_key(Path::new(&w.path)) == canonical_key(&linked))));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiscoveryDiagnosticKind::GitError));
+        assert!(!scan
+            .diagnostics
+            .iter()
+            .any(|d| Path::new(&d.path).starts_with(&backup)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_exclusions_match_canonical_and_alias_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let alias = tmp.path().join("alias");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(backup.join("a/b/c/d/e/f/g")).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let scan = scan_dirs_fast_reporting_excluding(
+            &[root.to_string_lossy().into_owned()],
+            &[alias.join("backup").to_string_lossy().into_owned()],
+        );
+        assert!(!scan.is_partial());
+        let missing_root = alias.join("backup/removed");
+        let missing = scan_dirs_fast_reporting_excluding(
+            &[missing_root.to_string_lossy().into_owned()],
+            &[backup.to_string_lossy().into_owned()],
+        );
+        assert!(
+            !missing.is_partial(),
+            "excluded missing aliases must not produce read errors: {:?}",
+            missing.unreadable
         );
     }
 

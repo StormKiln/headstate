@@ -7,7 +7,7 @@ import type { Artifact } from "@/types/pr";
 const bridge = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: bridge.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
-import { useArtifacts, useArtifactSizes, useAllWorktreeSizes, useWorktreeDirs, useArtifactScanFailures } from "./hooks";
+import { useArtifacts, useArtifactSizes, useAllWorktreeSizes, useWorktreeDirs, useArtifactScanFailures, useWorktrees } from "./hooks";
 
 function harness() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -177,4 +177,30 @@ describe("disk measurement membership", () => {
     expect(calls("size_artifacts_report")).toHaveLength(2);
   });
 
+});
+
+it("exclusion changes discard an old discovery response and cached scope without rescanning artifacts", async () => {
+  let finishOld!: (value: unknown) => void;
+  let scans = 0;
+  bridge.invoke.mockImplementation((cmd, args) => {
+    if (cmd === "set_discovery_exclusions") return Promise.resolve(args.paths);
+    if (cmd === "list_worktrees") {
+      scans++;
+      if (scans === 1) return new Promise(resolve => { finishOld = resolve; });
+      return Promise.resolve({ repos: [], unreadable: [], diagnostics: [] });
+    }
+    return Promise.resolve([]);
+  });
+  const { qc, wrapper } = harness();
+  qc.setQueryData(["cached-scan", "worktrees"], { payload: "old scope" });
+  qc.setQueryData(["artifacts"], [artifact("/repo/target")]);
+  const { result } = renderHook(() => ({ dirs: useWorktreeDirs(), scan: useWorktrees() }), { wrapper });
+  await waitFor(() => expect(scans).toBe(1));
+  await act(() => result.current.dirs.setExclusions(["/repo/backup"]));
+  await waitFor(() => expect(result.current.scan.data).toEqual([]));
+  await act(async () => finishOld({ repos: [{ path: "/old" }], unreadable: ["old warning"] }));
+  expect(result.current.scan.data).toEqual([]);
+  expect(qc.getQueryData(["cached-scan", "worktrees"])).toBeNull();
+  expect(qc.getQueryData(["artifacts"])).toEqual([artifact("/repo/target")]);
+  expect(calls("list_artifacts")).toHaveLength(0);
 });

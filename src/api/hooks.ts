@@ -105,6 +105,8 @@ import {
   getPrDetail,
   getReviewGates,
   getWorktreeDirs,
+  getDiscoveryExclusions,
+  setDiscoveryExclusions,
   classifyRepoUpstream,
   classifyWorktrees,
   listBranches,
@@ -911,7 +913,7 @@ export function useVenvWalkProgress(enabled: boolean) {
 export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   const query = useQuery({
     queryKey: ["cached-scan", kind],
-    queryFn: () => readCachedScan(kind),
+    queryFn: async ({ signal }) => { const result = await readCachedScan(kind); signal.throwIfAborted(); return result; },
     enabled,
     staleTime: Infinity,
     // A cache miss is the answer, not a failure to retry three times.
@@ -4160,6 +4162,23 @@ export function useWorktreeDirs() {
     queryFn: getWorktreeDirs,
     staleTime: Infinity,
   });
+  const exclusionsQuery = useQuery({
+    queryKey: ["discovery-exclusions"],
+    queryFn: getDiscoveryExclusions,
+    staleTime: Infinity,
+  });
+  const setExclusions = async (paths: string[]) => {
+    const applied = await setDiscoveryExclusions(paths);
+    diskRefreshes.get(qc)?.delete("worktrees");
+    await Promise.all([
+      qc.cancelQueries({ queryKey: ["worktrees"] }),
+      qc.cancelQueries({ queryKey: ["cached-scan", "worktrees"] }),
+    ]);
+    qc.setQueryData(["discovery-exclusions"], applied);
+    qc.setQueryData(["cached-scan", "worktrees"], null);
+    await qc.resetQueries({ queryKey: ["worktrees"] });
+    return applied;
+  };
   const set = (dirs: string[]) =>
     setWorktreeDirs(dirs).then(async (applied) => {
       diskRefreshes.get(qc)?.clear();
@@ -4171,7 +4190,7 @@ export function useWorktreeDirs() {
       await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
       return applied;
     });
-  return { dirs: query.data ?? [], set, isLoading: query.isLoading, isError: query.isError };
+  return { dirs: query.data ?? [], set, exclusions: exclusionsQuery.data ?? [], setExclusions, exclusionsError: exclusionsQuery.error, exclusionsReady: exclusionsQuery.isSuccess, retryExclusions: exclusionsQuery.refetch, isLoading: query.isLoading, isError: query.isError };
 }
 
 /// The poll interval setting, and a way to change it.

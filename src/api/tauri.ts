@@ -878,6 +878,8 @@ export const setViewNeedsGithub = (needs: boolean, reviewing = false) =>
   call<void>("set_view_needs_github", { needs, reviewing });
 
 /// Directories scanned for git checkouts. Defaults to `~/code`.
+export const getDiscoveryExclusions = () => call<string[]>("get_discovery_exclusions");
+export const setDiscoveryExclusions = (paths: string[]) => call<string[]>("set_discovery_exclusions", { paths });
 export const getWorktreeDirs = () => call<string[]>("get_worktree_dirs");
 
 /// Replace the scanned directories. Rejects paths that are not

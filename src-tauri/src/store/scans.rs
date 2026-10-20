@@ -186,7 +186,7 @@ fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
     age.max(0)
 }
 
-/// Drop every entry whose key is not `keep`.
+/// Retain the current roots key and the worktree-specific policy key.
 ///
 /// Called when the configured directories change. The key is the whole
 /// ROOT SET, so a changed set already misses -- nothing stale is ever
@@ -198,10 +198,10 @@ fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
 /// a set-shaped key there is no single root to forget, and a function
 /// whose argument does not match the key is one that silently deletes
 /// nothing.
-pub fn retain_only(conn: &Connection, keep: &str) -> Result<(), StoreError> {
+pub fn retain_only(conn: &Connection, keep: &str, worktrees: &str) -> Result<(), StoreError> {
     conn.execute(
-        "DELETE FROM scan_cache WHERE root <> ?1",
-        rusqlite::params![keep],
+        "DELETE FROM scan_cache WHERE (kind = 'worktrees' AND root <> ?2) OR (kind <> 'worktrees' AND root <> ?1)",
+        rusqlite::params![keep, worktrees],
     )?;
     Ok(())
 }
@@ -379,8 +379,16 @@ mod tests {
         save(&c, ScanKind::Venvs, "/old-set", "V").unwrap();
         save(&c, ScanKind::Artifacts, "/new-set", "K").unwrap();
 
-        retain_only(&c, "/new-set").unwrap();
+        save(&c, ScanKind::Worktrees, "/new-worktree-policy", "W").unwrap();
+        save(&c, ScanKind::Worktrees, "/old-policy", "old").unwrap();
+        retain_only(&c, "/new-set", "/new-worktree-policy").unwrap();
 
+        assert!(load(&c, ScanKind::Worktrees, "/new-worktree-policy")
+            .unwrap()
+            .is_some());
+        assert!(load(&c, ScanKind::Worktrees, "/old-policy")
+            .unwrap()
+            .is_none());
         assert_eq!(load(&c, ScanKind::Artifacts, "/old-set").unwrap(), None);
         assert_eq!(load(&c, ScanKind::Venvs, "/old-set").unwrap(), None);
         // And the CURRENT set survives, or the next cold start pays the

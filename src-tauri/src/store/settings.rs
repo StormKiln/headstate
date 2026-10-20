@@ -57,6 +57,7 @@ pub mod keys {
     /// Explicit GitLab API hostname. Never a URL or credential.
     pub const GITLAB_HOST: &str = "gitlab_host";
     /// Directories scanned for git checkouts, as a JSON array of paths.
+    pub const DISCOVERY_EXCLUSIONS: &str = "discovery_exclusions";
     pub const WORKTREE_DIRS: &str = "worktree_dirs";
     /// Worktrees handed to Claude Code, as a JSON map of path -> head
     /// OID. The OID is what makes the mark expire: a branch that has

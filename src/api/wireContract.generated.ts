@@ -79,6 +79,7 @@ export const wireGraph: WireGraph = {
   "get_cached": 1,
   "get_cached_reviewing": 746,
   "get_cleanup_prefs": 747,
+  "get_discovery_exclusions": 60,
   "get_gitlab_auth_state": 751,
   "get_gitlab_detail": 755,
   "get_gitlab_host": 10,

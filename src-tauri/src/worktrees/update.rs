@@ -56,6 +56,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Match `repoOverviewRows`: records without a main checkout are absent
+/// from the table and must be absent from both preflight and execution.
+pub fn repository_update_paths(repos: &[super::model::Repo]) -> Vec<String> {
+    repos
+        .iter()
+        .filter(|repo| repo.worktrees.iter().any(|worktree| worktree.is_main))
+        .map(|repo| repo.path.clone())
+        .collect()
+}
+
 /// Refuse a changed repository set before a bulk action touches any checkout.
 /// Canonical paths admit aliases and overlapping roots without widening scope.
 pub fn validate_update_scope(expected: &[String], actual: &[String]) -> Result<(), String> {
@@ -644,6 +654,56 @@ mod tests {
     fn only(report: &UpdateAllReport) -> &UpdateResult {
         assert_eq!(report.outcomes.len(), 1, "one input, one outcome");
         &report.outcomes[0].result
+    }
+
+    #[test]
+    fn update_scope_matches_visible_main_checkouts() {
+        use super::super::model::{Repo, Worktree};
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let main_path = main.to_string_lossy().into_owned();
+        let worktree = |is_main| Worktree {
+            is_main,
+            ..Default::default()
+        };
+        let repos = vec![
+            Repo {
+                path: main_path.clone(),
+                worktrees: vec![worktree(false), worktree(true)],
+                ..Default::default()
+            },
+            Repo {
+                path: tmp.path().join("orphan").to_string_lossy().into_owned(),
+                worktrees: vec![worktree(false)],
+                ..Default::default()
+            },
+            Repo {
+                path: "empty".into(),
+                ..Default::default()
+            },
+            Repo {
+                path: "bare".into(),
+                bare: true,
+                worktrees: vec![worktree(false)],
+                ..Default::default()
+            },
+        ];
+        let paths = repository_update_paths(&repos);
+        assert_eq!(
+            paths,
+            vec![main_path.clone()],
+            "hidden scan records cannot enter the bulk action scope"
+        );
+        assert!(validate_update_scope(std::slice::from_ref(&main_path), &paths).is_ok());
+        assert!(
+            validate_update_scope(&[], &paths).is_err(),
+            "a newly visible checkout still changes scope"
+        );
+        assert!(
+            validate_update_scope(&paths, &[]).is_err(),
+            "a removed visible checkout still changes scope"
+        );
     }
 
     #[test]

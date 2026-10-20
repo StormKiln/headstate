@@ -92,7 +92,7 @@ export function SettingsDialog({
   // the stacked layout too, and it is still a desktop with `gh`.
   const isMobile = useIsMobile();
   const { seconds, set: setInterval } = usePollInterval();
-  const { dirs, set: setDirs } = useWorktreeDirs();
+  const { dirs, set: setDirs, exclusions = [], setExclusions, exclusionsError, exclusionsReady = false, retryExclusions } = useWorktreeDirs();
   const { prefs, set: setPrefs } = useNotifyPrefs();
   const { prefs: ui, set: setUi } = useUiPrefs();
   const { prefs: cleanup, set: setCleanup } = useCleanupPrefs();
@@ -108,6 +108,8 @@ export function SettingsDialog({
   // which is where a user who arrived that way would expect to find
   // the rest of Settings.
   const [section, setSection] = useState<SectionId | null>(initialSection);
+  const [exclusionDraft, setExclusionDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -120,6 +122,7 @@ export function SettingsDialog({
 
   const close = () => {
     setDraft(null);
+    setExclusionDraft(null);
     setError(null);
     onOpenChange(false);
   };
@@ -129,10 +132,17 @@ export function SettingsDialog({
       .split("\n")
       .map((d) => d.trim())
       .filter(Boolean);
-    setDirs(next).then(
+    setSaving(true);
+    const saveChanges = async () => {
+      if (exclusionDraft !== null) {
+        await setExclusions(exclusionDraft.split("\n").map((p) => p.trim()).filter(Boolean));
+      }
+      if (draft !== null || exclusionDraft === null) await setDirs(next);
+    };
+    void saveChanges().then(
       () => close(),
       (e: unknown) => setError(typeof e === "string" ? e : "Could not save"),
-    );
+    ).finally(() => setSaving(false));
   };
 
   return (
@@ -481,6 +491,31 @@ export function SettingsDialog({
             One path per line. Used to find git worktrees. <code>~</code> is expanded and
             saved as the full path.
           </p>
+          {!IS_MOBILE_BUILD && <>
+            <label htmlFor="discovery-exclusions" className="mt-3 text-sm font-medium">
+              Exclude folders from repository discovery
+            </label>
+            <textarea
+              id="discovery-exclusions"
+              disabled={!exclusionsReady || saving}
+              value={exclusionDraft ?? exclusions.join("\n")}
+              onChange={(e) => setExclusionDraft(e.target.value)}
+              rows={3}
+              spellCheck={false}
+              placeholder="~/code/project-backup"
+              className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-sm"
+            />
+            <p className="text-xs text-[#8b949e]">
+              One folder per line; ~ is supported. These folders and their descendants are skipped,
+              even when listed as scan roots. Git-registered worktrees still appear. This does not
+              exclude disk usage or artifacts, and deletes nothing. Copy an unwanted folder from
+              scan details and add it here.
+            </p>
+            {exclusionsError ? <div role="alert" className="text-xs text-[#f85149]">
+              Could not load discovery exclusions.
+              <button type="button" className="ml-2 underline" onClick={() => void retryExclusions()}>Retry loading exclusions</button>
+            </div> : !exclusionsReady && <p className="text-xs text-[#8b949e]">Loading discovery exclusions…</p>}
+          </>}
           {error ? (
             <p role="alert" className="text-xs text-[#f85149]">
               {error}
@@ -999,7 +1034,7 @@ export function SettingsDialog({
           {section !== "gitlab" ? (
             <button
               type="button"
-              onClick={save}
+              onClick={save} disabled={saving || (exclusionDraft !== null && !exclusionsReady)}
               className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
             >
               Save
