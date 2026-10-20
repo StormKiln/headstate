@@ -2403,7 +2403,11 @@ fn has_nested_checkout(dir: &Path) -> bool {
                 other => target.push(other),
             }
         }
-        !target.starts_with(&own)
+        // Git records the gitdir under the RESOLVED path, so a root spelled
+        // through a symlink (macOS's /var -> /private/var) must be resolved
+        // too before comparing. Lexical when a side does not resolve.
+        let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        !resolve(&target).starts_with(resolve(&own))
     })
 }
 
@@ -13002,15 +13006,28 @@ mod nested_discovery_tests {
             ],
         );
         run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
-        let scan = scan_dirs_fast_reporting(&[root.to_string_lossy().into_owned()]);
-        assert!(
-            !scan
-                .diagnostics
-                .iter()
-                .any(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary),
-            "{:?}",
-            scan.diagnostics
-        );
+        let mut spellings = vec![root.clone()];
+        // The root reached through a symlink, as macOS's /var -> /private/var
+        // temp dir is: Git records the worktree's gitdir under the RESOLVED
+        // path, so a lexical comparison against the spelled root misses it.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("via-link");
+            std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+            spellings.push(link.join("product"));
+        }
+        for spelled in spellings {
+            let scan = scan_dirs_fast_reporting(&[spelled.to_string_lossy().into_owned()]);
+            assert!(
+                !scan
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary),
+                "{}: {:?}",
+                spelled.display(),
+                scan.diagnostics
+            );
+        }
     }
 
     #[test]
