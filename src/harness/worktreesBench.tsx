@@ -183,6 +183,15 @@ async function main() {
     fetched_at: new Date(Date.now() - 3_600_000).toISOString(),
     default_ref: "main",
   };
+  // A selected repository still mounts disabled observers for its siblings.
+  // Exercise that population as well as the selected rows (#1917).
+  const repoCount = Math.max(1, Number(params.get("repos") ?? 1));
+  const repos = [repo, ...Array.from({ length: repoCount - 1 }, (_, i) => ({
+    ...repo,
+    path: `${ROOT}/sibling-${i}`,
+    name: `sibling-${i}`,
+    worktrees: [{ ...worktreeAt(0), path: `${ROOT}/sibling-${i}` }],
+  }))];
   const prs = pullRequests(prCount, n);
   const verdicts = listed.map((w, i) => verdictFor(w, i));
   let settleClassify: (v: Worktree[]) => void = () => {};
@@ -246,7 +255,7 @@ async function main() {
       probe.asked[cmd] = (probe.asked[cmd] ?? 0) + 1;
       switch (cmd) {
         case "list_worktrees":
-          return { repos: [repo], unreadable: [] };
+          return { repos, unreadable: [] };
         case "get_worktree_dirs":
           return [ROOT];
         case "classify_worktrees":

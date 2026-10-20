@@ -5356,12 +5356,41 @@ mod corpus_cancel_tests {
         let mut conn = open_db(&dir.path().join("progress.db")).unwrap();
         let registry = std::sync::Mutex::new(PopulationRegistry::default());
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        corpus_probe::configure(std::time::Duration::from_millis(1100), None);
         populate_live_corpus(
             &mut conn,
             Some(&root),
             &PopulationControl::default(),
             &registry,
             &slots,
+        );
+        corpus_probe::configure(std::time::Duration::ZERO, None);
+        // One bounded pass is not a fixture certificate on a contended runner.
+        // Force that setup split above, then continue until the real index has
+        // accepted the source before testing index-before-discovery ordering.
+        let mut certified = false;
+        for _ in 0..32 {
+            let out = populate_live_corpus(
+                &mut conn,
+                Some(&root),
+                &PopulationControl::default(),
+                &registry,
+                &slots,
+            );
+            let progress = &out.indexed.as_ref().unwrap().population;
+            if progress.status == crate::claude::transcript::PopulationStatus::Complete
+                && progress.total_known
+                && progress.total == 1
+                && progress.completed == 1
+                && progress.failed == 0
+            {
+                certified = true;
+                break;
+            }
+        }
+        assert!(
+            certified,
+            "fixture setup never obtained certified index coverage"
         );
         std::fs::write(&source, body("accepted changed progress")).unwrap();
         for i in 0..256 {

@@ -47,6 +47,7 @@ import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
 
 const N = Number(process.env.N || 141);
+const REPOS = Number(process.env.REPOS || 1);
 const PRS = Number(process.env.PRS || 300);
 const RATES = (process.env.RATES || "60,6.5").split(",").map(Number);
 const SIZES = process.env.SIZES === "1";
@@ -170,7 +171,7 @@ async function run(rate) {
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e)));
-  await page.goto(`http://127.0.0.1:${port}/harness/worktrees.html?n=${N}&prs=${PRS}`);
+  await page.goto(`http://127.0.0.1:${port}/harness/worktrees.html?n=${N}&prs=${PRS}&repos=${REPOS}`);
   await page.waitForFunction(() => document.body.dataset.harness === "ready");
   // The listing is on screen and the countdown is up: the pass has begun.
   await page.getByText(/checking what is safe to remove/).waitFor({ timeout: 30_000 });
