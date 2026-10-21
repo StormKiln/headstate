@@ -2,8 +2,9 @@
 //!
 //! Only a completed second names/types enumeration authorizes replacement of
 //! the accepted generation. A partial scan is a useful lower bound, never a
-//! deletion certificate. ReadDir lives only in this process: after restart an
-//! incomplete directory is replayed from its beginning, not from an ordinal.
+//! deletion certificate. Progress through an incomplete directory lives only
+//! in this process: after restart it is replayed from its beginning, not from
+//! an ordinal. No ReadDir outlives the slice that opened it (#1977).
 use super::transcript::{PopulationControl, PopulationStatus, Scan, Transcript};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{
@@ -32,7 +33,10 @@ struct Directory {
     depth: i64,
     validating: bool,
     modified: String,
+    /// Open only while a slice is running; see `release_handles`.
     reader: Option<ReadDir>,
+    /// Every entry has been observed; what remains is sealing the certificate.
+    listed: bool,
     names: BTreeSet<(Vec<u8>, u8)>,
     #[cfg(any(test, feature = "enterprise-harness"))]
     name_bytes: usize,
@@ -295,6 +299,27 @@ pub(crate) fn reconcile_corpus(
     result
 }
 
+/// The runtime outlives every slice (it sits in the process-wide population
+/// registry), so an open directory handle in it would be held between passes
+/// for as long as the next one takes to come, indefinitely while population
+/// is paused. Windows refuses to rename or delete a directory while any handle
+/// inside it is open: a user could not rename or remove their own transcript
+/// folder, and #1977's test could not rename its fixture. Every return path of
+/// a slice goes through here; the next slice reopens and skips what it saw.
+fn release_handles(runtime: &mut DiscoveryRuntime) {
+    if let Some(directory) = runtime.current.as_mut() {
+        directory.reader = None;
+    }
+}
+
+fn slice_budget() -> Option<Duration> {
+    #[cfg(test)]
+    if let Some(budget) = super::corpus_probe::slice_budget_override() {
+        return budget;
+    }
+    Some(SLICE)
+}
+
 fn reconcile_with_limit(
     conn: &mut Connection,
     root: &Path,
@@ -314,8 +339,12 @@ fn reconcile_with_limit(
         });
     }
     let mut result = DiscoverySlice::default();
-    let bounded = control.with_slice_budget(SLICE);
+    let bounded = match slice_budget() {
+        Some(budget) => control.with_slice_budget(budget),
+        None => control.clone(),
+    };
     let answer = reconcile(conn, root, control, &bounded, runtime, &mut result, limit);
+    release_handles(runtime);
     let failed_unit = runtime
         .current
         .as_ref()
@@ -443,7 +472,14 @@ fn reconcile(
         }
     }
     let mut pending = Vec::new();
-    while result.work < limit && !budget.stopped() {
+    // The slice deadline is a soft cap on wall-clock, so it never prevents the
+    // first unit: a machine slow enough that setup alone outlasts the slice
+    // would otherwise make no progress on any pass (#1977). Cancellation and
+    // the caller's own deadline still stop the slice before any unit.
+    'unit: while result.work < limit
+        && !control.stopped()
+        && (result.work == 0 || !budget.stopped())
+    {
         if pending.len() >= 64 {
             flush(conn, &key, generation, control, &mut pending)?;
         }
@@ -550,6 +586,7 @@ fn reconcile(
                 validating: phase == 1,
                 modified,
                 reader: Some(reader),
+                listed: false,
                 names: BTreeSet::new(),
                 #[cfg(any(test, feature = "enterprise-harness"))]
                 name_bytes: 0,
@@ -566,8 +603,17 @@ fn reconcile(
                 .peak_owned_payload_bytes
                 .max(dir.name_bytes + dir.signature.capacity() + dir.path.as_os_str().len());
         }
-        if let Some(reader) = dir.reader.as_mut() {
-            if let Some(entry) = reader.next() {
+        if !dir.listed {
+            // An earlier slice released this handle (`release_handles`). The
+            // reopened listing skips every name already observed inside this
+            // one unit, so each unit still adds a new entry and a directory too
+            // large for one slice cannot livelock. Changes between slices are
+            // caught by the stamp comparison below, as with one handle.
+            let reader = match &mut dir.reader {
+                Some(reader) => reader,
+                none => none.insert(std::fs::read_dir(&dir.path).map_err(io)?),
+            };
+            for entry in reader.by_ref() {
                 let entry = entry.map_err(io)?;
                 #[cfg(test)]
                 super::corpus_probe::entry();
@@ -592,11 +638,12 @@ fn reconcile(
                     .to_vec();
                 #[cfg(any(test, feature = "enterprise-harness"))]
                 let bytes = name.len();
-                if dir.names.insert((name, code)) {
-                    #[cfg(any(test, feature = "enterprise-harness"))]
-                    {
-                        dir.name_bytes += bytes;
-                    }
+                if !dir.names.insert((name, code)) {
+                    continue; // Observed by an earlier slice.
+                }
+                #[cfg(any(test, feature = "enterprise-harness"))]
+                {
+                    dir.name_bytes += bytes;
                 }
                 dir.count += 1;
                 if !dir.validating {
@@ -640,9 +687,10 @@ fn reconcile(
                         });
                     }
                 }
-                continue;
+                continue 'unit;
             }
             dir.reader = None;
+            dir.listed = true;
             if stamp(&dir.path).map_err(io)? != dir.modified {
                 return invalidate(conn, &key, generation, control, runtime);
             }
