@@ -324,13 +324,19 @@ async fn late_joiner_keeps_zero_dispatch_opportunity_beyond_first_callers_thirty
     // The original caller and four bounded HTTP blockers have expired. The
     // late caller still owns 28 seconds; no zero-dispatch receipt may end it.
     tokio::time::resume();
-    assert!(leader.await.unwrap().is_err());
+    // The leader's waiter outlasts its deadline by RECEIPT_GRACE (#1931), so
+    // it may time out or may receive the joiner's dispatched receipt. It must
+    // never receive a separate zero-dispatch receipt.
+    let leader = leader.await.unwrap();
     stop(held).await;
     let result = tokio::time::timeout(Duration::from_secs(1), joiner)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    if let Ok(leader) = leader {
+        assert_eq!(leader.scan, result.scan, "one shared dispatched receipt");
+    }
     assert!(result.scan.unwrap().state.done);
     assert_eq!(server.received_requests().await.unwrap().len(), 5);
 }
