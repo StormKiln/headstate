@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { currencyRank, repoCurrency, repoOverviewRows, sortByCurrency } from "./repoOverview";
+import {
+  currencyRank,
+  notBrowsableReason,
+  repoCurrency,
+  repoOverviewRows,
+  sortByCurrency,
+} from "./repoOverview";
 import type { RepoOverviewRow } from "./repoOverview";
 import type { Upstream, Worktree, WorktreeRepo } from "@/types/pr";
 
@@ -29,9 +35,6 @@ const repo = (over: Partial<WorktreeRepo> = {}): WorktreeRepo => ({
 const row = (upstream: Upstream | null): RepoOverviewRow => ({
   name: "a",
   path: "/code/a",
-  // These fixtures exercise upstream sorting and labelling, where
-  // bareness plays no part. An ordinary checkout is the case they mean.
-  bare: false,
   branch: "main",
   defaultRef: "origin/main",
   upstream,
@@ -115,7 +118,7 @@ describe("repoCurrency", () => {
       row({ kind: "untracked" }),
       row({ kind: "untracked" }),
     ]);
-    expect(c).toEqual({ current: 1, compared: 1, total: 3 });
+    expect(c).toEqual({ current: 1, compared: 1, pending: 0, unknown: 0, none: 2, total: 3 });
   });
 
   /// The states where a remote ref WAS read are all in the denominator,
@@ -127,21 +130,37 @@ describe("repoCurrency", () => {
       row({ kind: "behind", n: 1 }),
       row({ kind: "diverged", n: [1, 1] }),
     ]);
-    expect(c).toEqual({ current: 1, compared: 4, total: 4 });
+    expect(c).toEqual({ current: 1, compared: 4, pending: 0, unknown: 0, none: 0, total: 4 });
   });
 
   /// `null` is pending, not current. A table that counted it would
   /// claim every repository was up to date before anything was measured.
   it("counts a pending row as neither current nor compared", () => {
     const c = repoCurrency([row(null), row(null)]);
-    expect(c).toEqual({ current: 0, compared: 0, total: 2 });
+    expect(c).toEqual({ current: 0, compared: 0, pending: 2, unknown: 0, none: 0, total: 2 });
   });
 
   /// #967's shape: git was asked and could not answer. That is not
   /// evidence of currency in either direction.
   it("counts an unknown verdict as neither current nor compared", () => {
     const c = repoCurrency([row({ kind: "unknown", n: "git failed" }), row({ kind: "detached" })]);
-    expect(c).toEqual({ current: 0, compared: 0, total: 2 });
+    expect(c).toEqual({ current: 0, compared: 0, pending: 0, unknown: 1, none: 1, total: 2 });
+  });
+
+  /// #1951: Pending, Unknown and "no upstream" are three different
+  /// answers. The summary used to derive "no upstream" as `total -
+  /// compared`, so a row still loading and a row whose check failed were
+  /// both reported as having no upstream.
+  it("counts pending, could-not-check and no-upstream separately", () => {
+    const c = repoCurrency([
+      row(null),
+      row({ kind: "unknown", n: "could not list worktrees" }),
+      row({ kind: "untracked" }),
+    ]);
+    expect(c.pending).toBe(1);
+    expect(c.unknown).toBe(1);
+    expect(c.none).toBe(1);
+    expect(c.total).toBe(3);
   });
 
   /// Paired with the shortfall tests above: when every repository IS
@@ -149,12 +168,19 @@ describe("repoCurrency", () => {
   /// caveat.
   it("reports a clean set with no shortfall", () => {
     const c = repoCurrency([row({ kind: "current" }), row({ kind: "current" })]);
-    expect(c).toEqual({ current: 2, compared: 2, total: 2 });
+    expect(c).toEqual({ current: 2, compared: 2, pending: 0, unknown: 0, none: 0, total: 2 });
     expect(c.total - c.compared).toBe(0);
   });
 
   it("reports zeroes for an empty set rather than throwing", () => {
-    expect(repoCurrency([])).toEqual({ current: 0, compared: 0, total: 0 });
+    expect(repoCurrency([])).toEqual({
+      current: 0,
+      compared: 0,
+      pending: 0,
+      unknown: 0,
+      none: 0,
+      total: 0,
+    });
   });
 });
 
@@ -213,29 +239,32 @@ describe("sortByCurrency", () => {
 });
 
 
-/// #1142: a bare repository is carried through as such.
-///
-/// `AllRepositoriesTable` filters on this before asking for an upstream
-/// verdict, because `classify_main_checkout` would otherwise be asked to
-/// judge a checkout that is not there -- and `Safety::MainCheckout`
-/// means "this is the main checkout, protect it", a claim about
-/// something a mirror does not have.
+/// #1142, #1953: a bare repository is not a row. It has no working tree,
+/// so `classify_main_checkout` would be asked to judge a checkout that is
+/// not there, and the file browser has nothing to list.
 describe("a bare repository", () => {
-  it("is marked bare on its row", () => {
-    const rows = repoOverviewRows([repo({ bare: true })]);
-    expect(rows[0]?.bare).toBe(true);
+  it("is not a row, even when it lists a main entry", () => {
+    expect(repoOverviewRows([repo({ bare: true })])).toEqual([]);
+    expect(notBrowsableReason(repo({ bare: true }))).toMatch(/bare repository/);
   });
 
-  it("is not marked bare when it has a working tree", () => {
-    const rows = repoOverviewRows([repo({ bare: false })]);
-    expect(rows[0]?.bare).toBe(false);
+  it("is a row when it has a working tree", () => {
+    expect(repoOverviewRows([repo({ bare: false })])).toHaveLength(1);
+    expect(notBrowsableReason(repo({ bare: false }))).toBeNull();
   });
 
   /// A scan cached before this field existed has no `bare` key. An
   /// absent flag must read as an ordinary checkout, which is what every
   /// such scan held -- not as `undefined` leaking into a filter.
   it("reads an absent flag as an ordinary checkout", () => {
-    const rows = repoOverviewRows([repo({})]);
-    expect(rows[0]?.bare).toBe(false);
+    expect(repoOverviewRows([repo({})])).toHaveLength(1);
+    expect(notBrowsableReason(repo({}))).toBeNull();
+  });
+
+  /// An orphan has no main checkout: not a row, and not browsable.
+  it("treats an orphan as not browsable", () => {
+    const orphan = repo({ worktrees: [wt({ is_main: false })] });
+    expect(repoOverviewRows([orphan])).toEqual([]);
+    expect(notBrowsableReason(orphan)).toMatch(/orphaned/);
   });
 });

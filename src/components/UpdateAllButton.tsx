@@ -31,24 +31,28 @@ import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
 /// scope, never cached verdicts. The desktop rescans and refuses a changed
 /// scope before checking each repository and acting.
 ///
-/// # Over a partial scan it does not say "All" (#1025)
+/// # It never says "All" (#1025, #1957)
 ///
-/// The label names the number it can actually see, because "Update All
+/// The label always names the number of repositories the table shows
+/// (`updateAllLabel`), complete scan or not, because "Update All
 /// Repositories" over a census that could not read three directories is a
-/// lie about scope. It stays ENABLED -- disabling it would let one
-/// unreadable directory block updating 42 perfectly good repositories,
-/// trading a lie for a broken feature -- and the completion summary
-/// repeats the shortfall, so a user who dismissed `PartialScanNotice`
-/// before clicking still learns the set was short.
+/// lie about scope, and that number is exactly the scope the run is
+/// refused outside of. It stays ENABLED over a partial scan -- disabling
+/// it would let one unreadable directory block updating 42 perfectly good
+/// repositories -- and the completion summary repeats the shortfall, so a
+/// user who dismissed `PartialScanNotice` before clicking still learns
+/// the set was short.
+///
+/// There is no `unreadable` prop: the label does not depend on the
+/// shortfall, and a prop documented as qualifying the label while being
+/// ignored was the defect #1957 reported.
 export function UpdateAllButton({
   count,
   expectedPaths,
 }: {
   /// How many repositories the table can see. The button names this
-  /// number when the scan fell short.
+  /// number.
   count: number;
-  /// What the scan could not read, carried from `RepoScan.unreadable`.
-  unreadable: readonly string[];
   expectedPaths?: readonly string[];
 }) {
   const update = useUpdateAllRepositories();

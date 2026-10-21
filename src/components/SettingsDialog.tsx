@@ -135,7 +135,11 @@ export function SettingsDialog({
     setSaving(true);
     const saveChanges = async () => {
       if (exclusionDraft !== null) {
-        await setExclusions(exclusionDraft.split("\n").map((p) => p.trim()).filter(Boolean));
+        const paths = exclusionDraft.split("\n").map((p) => p.trim()).filter(Boolean);
+        // When the roots change too, saving them rescans; rescanning
+        // here as well walked every root twice for one Save (#1957).
+        if (draft !== null) await setExclusions(paths, { rescan: false });
+        else await setExclusions(paths);
       }
       if (draft !== null || exclusionDraft === null) await setDirs(next);
     };

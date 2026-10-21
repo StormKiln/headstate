@@ -1543,6 +1543,9 @@ pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan
         &cache_scope,
         &out,
     );
+    // And in memory, so the file browser can validate a click against
+    // this scan instead of walking again (#1952).
+    remember_scanned_repos(&cache_scope, &out);
     Ok(out)
 }
 
@@ -1583,10 +1586,55 @@ pub async fn classify_worktrees(
     // refetch, or an invalidation after a removal, started a whole second
     // pass on a 141-worktree repository while the first was still
     // running: twice the workers, twice the git, on the same disk.
-    let key = repo_path.clone();
+    //
+    // But only a pass started SINCE the last mutation (#1943). A Pull,
+    // Fetch or Update All moves refs, and the hook that ran it then
+    // invalidates this query; joining a pass that began before the pull
+    // handed the refetch the pre-pull verdicts ("N behind"), which the
+    // page then cached for five minutes -- #346 again. The epoch is part
+    // of the key, so a request after a mutation starts its own pass while
+    // the older one finishes for whoever was already waiting on it.
+    join_classify_pass(&repo_path.clone(), move |epoch| {
+        classify_pass(app, repo_path, epoch)
+    })
+    .await?
+}
+
+/// Bumped by every command that can move a checkout's refs (pull, fetch,
+/// Update All). A classification pass belongs to the epoch it started in
+/// (#1943). Process-wide rather than per repository: `pull_checkout` and
+/// `fetch_refs` are given a checkout path, not the repository key the
+/// passes are filed under, and an extra pass for the one repository the
+/// user is looking at is the whole cost of being coarse.
+static CLASSIFY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn classify_epoch() -> u64 {
+    CLASSIFY_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A checkout's refs may have moved: no pass already running may answer
+/// a request made from now on (#1943).
+fn invalidate_classify_passes() {
+    CLASSIFY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Join the current epoch's pass for `repo_path`, or start one with
+/// `start`, which is told the epoch it belongs to (#1943).
+async fn join_classify_pass<F, Fut>(
+    repo_path: &str,
+    start: F,
+) -> Result<Result<Vec<crate::worktrees::Worktree>, String>, String>
+where
+    F: FnOnce(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<crate::worktrees::Worktree>, String>>
+        + Send
+        + 'static,
+{
+    let epoch = classify_epoch();
+    let key = format!("{epoch}\0{repo_path}");
     classify_passes()
-        .join_or_start(&key, move || classify_pass(app, repo_path))
-        .await?
+        .join_or_start(&key, move || start(epoch))
+        .await
 }
 
 /// The passes running now, one per repository path.
@@ -1602,6 +1650,7 @@ fn classify_passes() -> &'static SingleFlight<Result<Vec<crate::worktrees::Workt
 async fn classify_pass(
     app: AppHandle,
     repo_path: String,
+    epoch: u64,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
     // Under CLASSIFICATION's permits, not the scan permits the size walks
     // hold (#1582) -- see `classify_permits`. Held by the walk itself
@@ -1618,7 +1667,13 @@ async fn classify_pass(
             // Emitted per worktree rather than batched, for the reason
             // `size_worktrees` gives: batching would reintroduce exactly
             // the wait this exists to remove.
-            let _ = emitter.emit("worktree-safety", w);
+            //
+            // Not once a mutation has superseded this pass (#1943): the
+            // newer pass is streaming the post-pull verdicts, and a late
+            // pre-pull one would overwrite them on screen.
+            if classify_epoch() == epoch {
+                let _ = emitter.emit("worktree-safety", w);
+            }
             out.push(w.clone());
         })?;
         Ok::<_, String>(out)
@@ -1634,8 +1689,10 @@ async fn classify_pass(
     // so the streamed view agrees with the returned set.
     let client = app.state::<GhClient>().0.clone();
     let (rows, changed) = crate::worktrees::github::enrich(client, &repo_path, rows).await;
-    for i in changed {
-        let _ = app.emit("worktree-safety", &rows[i]);
+    if classify_epoch() == epoch {
+        for i in changed {
+            let _ = app.emit("worktree-safety", &rows[i]);
+        }
     }
     Ok(rows)
 }
@@ -2938,6 +2995,8 @@ pub async fn pull_checkout(path: String) -> Result<String, String> {
     let result = tauri::async_runtime::spawn_blocking(move || crate::worktrees::pull_checkout(&p))
         .await
         .map_err(|e| e.to_string())?;
+    // Whatever the outcome: a refused pull may still have fetched.
+    invalidate_classify_passes();
 
     match &result {
         Ok(_) => log::info!("updated checkout {}", crate::redact::redact(&path)),
@@ -2970,6 +3029,9 @@ pub async fn fetch_refs(path: String) -> Result<String, String> {
     let result = tauri::async_runtime::spawn_blocking(move || crate::worktrees::fetch_refs(&p))
         .await
         .map_err(|e| e.to_string())?;
+    // Whatever the outcome: a fetch that failed part-way may still have
+    // moved some refs.
+    invalidate_classify_passes();
 
     match &result {
         Ok(_) => log::info!("fetched refs for {}", crate::redact::redact(&path)),
@@ -7287,8 +7349,66 @@ pub async fn claude_transcript_find(
 /// Its own message, distinct from every path refusal below, because the
 /// remedy is different: this one means the SELECTION is stale and the
 /// sidebar should clear it, not that the path was wrong.
+///
+/// # Not a full walk per click (#1952)
+///
+/// This used to call `list_worktrees` on every `repo_tree` and `repo_file`
+/// -- a walk of every root, four git calls per repository and a SQLite
+/// write, once per click in the file browser. It now checks the
+/// repositories of the last COMPLETED scan over the same roots and
+/// exclusions, if that scan is younger than [`SCANNED_REPOS_TTL`], and
+/// walks again only on a miss. A hit still requires the directory to
+/// canonicalise, so a repository deleted since that scan is refused; a
+/// repository removed from the roots changes the scope and misses.
 async fn scanned_repo_root(app: AppHandle, repo_path: &str) -> Result<std::path::PathBuf, String> {
-    let scan = list_worktrees(app).await?;
+    let scope = discovery_cache_scope(
+        &get_worktree_dirs(app.clone()),
+        &get_discovery_exclusions(app.clone())?,
+    );
+    scanned_repo_root_with(scanned_repos(), &scope, repo_path, || async move {
+        // `list_worktrees` records its result in `scanned_repos()`.
+        let scan = list_worktrees(app).await?;
+        Ok(scan.repos.into_iter().map(|r| r.path).collect())
+    })
+    .await
+}
+
+/// How long a completed scan may answer `scanned_repo_root` (#1952).
+const SCANNED_REPOS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The repositories of the last completed `list_worktrees`, and what it
+/// covered.
+struct ScannedRepos {
+    scope: Vec<String>,
+    at: std::time::Instant,
+    paths: Vec<String>,
+}
+
+fn scanned_repos() -> &'static std::sync::Mutex<Option<ScannedRepos>> {
+    static LAST: std::sync::Mutex<Option<ScannedRepos>> = std::sync::Mutex::new(None);
+    &LAST
+}
+
+fn remember_scanned_repos(scope: &[String], scan: &crate::worktrees::RepoScan) {
+    *scanned_repos().lock().unwrap_or_else(|p| p.into_inner()) = Some(ScannedRepos {
+        scope: scope.to_vec(),
+        at: std::time::Instant::now(),
+        paths: scan.repos.iter().map(|r| r.path.clone()).collect(),
+    });
+}
+
+/// `scanned_repo_root`, with the memo and the walk passed in so a test can
+/// count walks (#1952).
+async fn scanned_repo_root_with<F, Fut>(
+    memo: &std::sync::Mutex<Option<ScannedRepos>>,
+    scope: &[String],
+    repo_path: &str,
+    rescan: F,
+) -> Result<std::path::PathBuf, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+{
     // Compared on the CANONICAL path, not on the string. The scan reports
     // `/Users/...` and a caller may send the same directory through
     // `/System/Volumes/Data/Users/...` on macOS; two spellings of one
@@ -7296,13 +7416,26 @@ async fn scanned_repo_root(app: AppHandle, repo_path: &str) -> Result<std::path:
     let want = std::path::Path::new(repo_path)
         .canonicalize()
         .map_err(|e| format!("{repo_path}: could not be read: {e}"))?;
-    for repo in &scan.repos {
-        if std::path::Path::new(&repo.path)
-            .canonicalize()
-            .is_ok_and(|p| p == want)
-        {
-            return Ok(want);
-        }
+    let listed = |paths: &[String]| {
+        paths.iter().any(|p| {
+            std::path::Path::new(p)
+                .canonicalize()
+                .is_ok_and(|p| p == want)
+        })
+    };
+    let hit = memo
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|m| {
+            m.scope == scope && m.at.elapsed() < SCANNED_REPOS_TTL && listed(&m.paths)
+        });
+    if hit {
+        return Ok(want);
+    }
+    let paths = rescan().await?;
+    if listed(&paths) {
+        return Ok(want);
     }
     Err(format!(
         "{repo_path} is no longer one of the scanned repositories"
@@ -7456,7 +7589,7 @@ pub async fn update_all_repositories(
     let _ = app.emit("update-all-progress", (0usize, paths.len()));
 
     let progress_app = app.clone();
-    let mut report = tauri::async_runtime::spawn_blocking(move || {
+    let report = tauri::async_runtime::spawn_blocking(move || {
         crate::worktrees::update_all_with(&paths, unreadable, &stop, |done, total| {
             // Counts only -- never paths. The same rule the two progress
             // emitters beside this one state in identical terms: a
@@ -7471,8 +7604,10 @@ pub async fn update_all_repositories(
                 .progress(done, total);
         })
     })
-    .await
-    .map_err(|e| format!("the update run failed to finish: {e}"))?;
+    .await;
+    // Before the `?`: a run that died part-way may still have moved refs.
+    invalidate_classify_passes();
+    let mut report = report.map_err(|e| format!("the update run failed to finish: {e}"))?;
     report.diagnostics = diagnostics;
 
     let updated = report
@@ -8231,6 +8366,133 @@ mod tests {
             .await;
         assert_eq!(again, Ok(Ok(9)));
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A request made after a pull does NOT join the classification pass
+    /// that started before it (#1943). Joining it handed the refetch the
+    /// pre-pull verdicts ("N behind"), which the page cached for five
+    /// minutes. A request in the same epoch still joins (#1582).
+    #[tokio::test]
+    async fn a_request_after_a_mutation_starts_a_new_pass_rather_than_joining() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let repo = "/code/acme/epoch-1943";
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // The pre-pull pass, held open as a slow repository would hold it.
+        let s = starts.clone();
+        let before = tokio::spawn(super::join_classify_pass(repo, move |_| async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.await;
+            Err("pre-pull verdicts".to_string())
+        }));
+        while starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // A same-epoch request still joins the running pass.
+        let s = starts.clone();
+        let joined = tokio::spawn(super::join_classify_pass(repo, move |_| async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            Err("must not run".to_string())
+        }));
+        // Let it reach the flight before the pull lands (the test runtime
+        // is single-threaded, so one yield runs it to its first await).
+        tokio::task::yield_now().await;
+
+        // The pull lands; the hook's refetch arrives.
+        super::invalidate_classify_passes();
+        let s = starts.clone();
+        let after = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::join_classify_pass(repo, move |_| async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                Err("post-pull verdicts".to_string())
+            }),
+        )
+        .await
+        .expect("the post-pull request does not wait on the pre-pull pass");
+        assert_eq!(
+            after,
+            Ok(Err("post-pull verdicts".to_string())),
+            "the request after the pull must get a pass started after it"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "a second pass was started"
+        );
+
+        release_tx
+            .send(())
+            .expect("the pre-pull pass is still waiting");
+        let pre = Ok(Err("pre-pull verdicts".to_string()));
+        assert_eq!(before.await.expect("ran"), pre);
+        assert_eq!(
+            joined.await.expect("ran"),
+            pre,
+            "same-epoch callers still join"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The file browser validates a click against the last completed scan
+    /// instead of walking every root again (#1952), and walks only on a
+    /// miss: a stale memo, another scope, or a path the memo lacks.
+    #[tokio::test]
+    async fn the_file_browser_does_not_rescan_per_click() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("widget");
+        std::fs::create_dir(&repo).expect("repo dir");
+        let repo = repo.to_string_lossy().into_owned();
+        let other = dir.path().join("gadget");
+        std::fs::create_dir(&other).expect("other dir");
+        let other = other.to_string_lossy().into_owned();
+        let scope = vec!["/code".to_string()];
+        let memo = std::sync::Mutex::new(Some(super::ScannedRepos {
+            scope: scope.clone(),
+            at: std::time::Instant::now(),
+            paths: vec![repo.clone()],
+        }));
+        let walks = AtomicUsize::new(0);
+        let walk = |found: Vec<String>| {
+            let walks = &walks;
+            move || async move {
+                walks.fetch_add(1, Ordering::SeqCst);
+                Ok(found)
+            }
+        };
+
+        for _ in 0..3 {
+            super::scanned_repo_root_with(&memo, &scope, &repo, walk(vec![]))
+                .await
+                .expect("a scanned repository is browsable");
+        }
+        assert_eq!(walks.load(Ordering::SeqCst), 0, "three clicks, no walk");
+
+        // A path the memo lacks walks once, and is refused if the walk
+        // does not find it either.
+        let got = super::scanned_repo_root_with(&memo, &scope, &other, walk(vec![])).await;
+        assert!(got.is_err(), "{got:?}");
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+
+        // Another set of roots is a miss, and so is an old memo.
+        let elsewhere = vec!["/elsewhere".to_string()];
+        super::scanned_repo_root_with(&memo, &elsewhere, &repo, walk(vec![repo.clone()]))
+            .await
+            .expect("found by the walk");
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+        if let Some(m) = memo.lock().expect("memo").as_mut() {
+            m.at = std::time::Instant::now()
+                .checked_sub(super::SCANNED_REPOS_TTL * 2)
+                .expect("an instant two TTLs ago");
+        }
+        let got = super::scanned_repo_root_with(&memo, &scope, &repo, walk(vec![])).await;
+        assert!(got.is_err(), "a stale memo does not authorise: {got:?}");
+        assert_eq!(walks.load(Ordering::SeqCst), 3);
     }
 
     /// A run that ends without a result (a panic) says it stopped, and

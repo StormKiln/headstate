@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useWorktreeDirs, useWorktrees } from "@/api/hooks";
 import { current } from "@/lib/ariaCurrent";
+import { notBrowsableReason } from "@/lib/repoOverview";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { NarrowQueryError } from "./QueryError";
 import { PartialScanNotice } from "./PartialScanNotice";
@@ -35,11 +36,15 @@ import { ViewSwitcher } from "./ViewSwitcher";
 export function RepoPickerSidebar({
   reviewingCount,
   allLabel,
+  browsing = false,
 }: {
   reviewingCount: number;
   /// The label for a pinned row above the repository list that clears
   /// the selection, or `undefined` for no such row. See above.
   allLabel?: string;
+  /// The rows open the FILE BROWSER (#1953): a repository it cannot
+  /// open -- bare, or orphaned -- is listed disabled, with the reason.
+  browsing?: boolean;
 }) {
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
@@ -263,17 +268,38 @@ export function RepoPickerSidebar({
             <span className="truncate">{allLabel}</span>
           </button>
         ) : null}
-        {repos.map((r) => (
-          <button
-            type="button"
-            key={r.path}
-            onClick={() => setFilter("repo", r.path)}
-            aria-current={current(filters.repo === r.path)}
-            className={rowClass(filters.repo === r.path)}
-          >
-            <span className="truncate">{r.name}</span>
-          </button>
-        ))}
+        {repos.map((r) => {
+          // On the Repositories view a bare repository or an orphan has
+          // nothing for the file browser to open, and the table beside
+          // this list leaves it out (#1953). Listed, so the sidebar does
+          // not hide what the scan found, but disabled with the reason.
+          const why = browsing ? notBrowsableReason(r) : null;
+          if (why !== null) {
+            return (
+              <button
+                type="button"
+                key={r.path}
+                disabled
+                title={why}
+                className="flex w-full cursor-default flex-col items-start rounded px-3 py-2 text-left text-sm text-[#8b949e]"
+              >
+                <span className="max-w-full truncate">{r.name}</span>
+                <span className="text-[11px]">{why}</span>
+              </button>
+            );
+          }
+          return (
+            <button
+              type="button"
+              key={r.path}
+              onClick={() => setFilter("repo", r.path)}
+              aria-current={current(filters.repo === r.path)}
+              className={rowClass(filters.repo === r.path)}
+            >
+              <span className="truncate">{r.name}</span>
+            </button>
+          );
+        })}
       </div>
       {/* Mounted only while open, `ConnectionBanner`'s shape: the dialog
           subscribes to every settings query, and a permanently mounted

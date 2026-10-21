@@ -3,7 +3,7 @@ import { useRepoUpstreams, useWorktrees } from "@/api/hooks";
 import { PartialScanNotice } from "@/components/PartialScanNotice";
 import { QueryError, errorMessage } from "@/components/QueryError";
 import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
-import type { RepoOverviewRow } from "@/lib/repoOverview";
+import type { RepoCurrency, RepoOverviewRow } from "@/lib/repoOverview";
 import { upstreamReasonAged, upstreamToneAged } from "@/lib/worktrees";
 import { UpdateAllButton } from "@/components/UpdateAllButton";
 import { SavedScanNotice } from "@/components/SavedScanNotice";
@@ -104,13 +104,12 @@ export function AllRepositoriesTable() {
   // Keyed by repository PATH, which is the row's identity and unique
   // across scan roots where `name` is not.
   //
-  // A BARE repository is excluded (#1142): it has no working tree, so
-  // `classify_main_checkout` would be asked to judge a checkout that is
-  // not there. `Safety::MainCheckout` means "this is the main checkout,
-  // protect it", which is a claim about something a mirror does not
-  // have -- and an answer computed about nothing is exactly the
-  // confident wrong verdict this table's other guards exist to prevent.
-  const paths = useMemo(() => scanned.filter((r) => !r.bare).map((r) => r.path), [scanned]);
+  // A BARE repository is never asked about (#1142): it has no working
+  // tree, so `classify_main_checkout` would judge a checkout that is not
+  // there. `repoOverviewRows` already leaves it out, through the
+  // definition the sidebar shares (#1953), so there is nothing to filter
+  // here.
+  const paths = useMemo(() => scanned.map((r) => r.path), [scanned]);
   const { upstreams } = useRepoUpstreams(paths);
 
   // The resolved verdict laid over the row, and `?? row.upstream`
@@ -192,10 +191,10 @@ export function AllRepositoriesTable() {
           name rather than by its first row. */}
       <h2 className="text-sm font-semibold text-[#e6edf3]">All Repositories</h2>
       <RepoCurrencySummary currency={currency} />
-      {/* The button belongs HERE, above the rows it acts on, and it is
-          handed the same `unreadable` the notice above renders (#1025).
+      {/* The button belongs HERE, above the rows it acts on, with the
+          notice above saying when the scan fell short (#1025).
           `rows.length` rather than a literal: the label names the number
-          it can actually see when the scan fell short, and a measured
+          it can actually see, never "All" (#1957), and a measured
           figure rendered as a string is correct on the day it is written
           and describes someone else's machine from then on (#969).
 
@@ -204,7 +203,7 @@ export function AllRepositoriesTable() {
           repository -- this table's currency column is minutes old by the
           time the button is pressed, and it is a reason to OFFER the
           action, never the basis for performing it. */}
-      <UpdateAllButton count={rows.length} unreadable={unreadable} expectedPaths={rows.map((row) => row.path)} />
+      <UpdateAllButton count={rows.length} expectedPaths={rows.map((row) => row.path)} />
       <table className="w-full border-collapse text-sm">
         <caption className="sr-only">
           Every repository found in the scanned folders, and how its main checkout stands against
@@ -289,21 +288,37 @@ function SavedRepositories({
 /// Every number is computed from live data. None is a literal -- a
 /// measured figure rendered as a string is correct on the day it is
 /// written and describes someone else's machine from then on (#969).
-function RepoCurrencySummary({
-  currency,
-}: {
-  currency: { current: number; compared: number; total: number };
-}) {
-  const uncompared = currency.total - currency.compared;
+function RepoCurrencySummary({ currency }: { currency: RepoCurrency }) {
+  // Pending and Unknown are different states (#1951). While any verdict
+  // is still arriving the ratio is over a population still being
+  // measured, so it is withheld and the count of what is outstanding is
+  // shown instead. "No upstream" is said only of rows measured as having
+  // none; a check that failed is "could not check", never "no upstream".
+  if (currency.pending > 0) {
+    return (
+      <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
+        Checking {currency.pending} of {currency.total} repositor
+        {currency.total === 1 ? "y" : "ies"} against {currency.total === 1 ? "its" : "their"}{" "}
+        upstream…
+      </p>
+    );
+  }
   return (
     <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
       {currency.current} of {currency.compared} repositories with an upstream are up to date with
       it, as of each one&rsquo;s last fetch.
-      {uncompared > 0 ? (
+      {currency.none > 0 ? (
         <>
           {" "}
-          {uncompared} {uncompared === 1 ? "repository has" : "repositories have"} no upstream to
-          compare against and {uncompared === 1 ? "is" : "are"} not counted here.
+          {currency.none} {currency.none === 1 ? "repository has" : "repositories have"} no
+          upstream to compare against and {currency.none === 1 ? "is" : "are"} not counted here.
+        </>
+      ) : null}
+      {currency.unknown > 0 ? (
+        <>
+          {" "}
+          Could not check {currency.unknown} repositor{currency.unknown === 1 ? "y" : "ies"};{" "}
+          {currency.unknown === 1 ? "it is" : "they are"} not counted here.
         </>
       ) : null}
     </p>
