@@ -93,3 +93,34 @@ pub(crate) fn entry_path(path: std::path::PathBuf) -> std::path::PathBuf {
         _ => path,
     })
 }
+
+// Discovery's slice deadline is wall-clock. A test that asserts what one slice
+// reaches must not depend on runner speed (#1977), so it can pin the budget on
+// its own thread: `None` removes the time cap and leaves only the work limit;
+// `Some(Duration::ZERO)` makes every slice's deadline already expired.
+thread_local! { static SLICE_BUDGET: std::cell::Cell<Option<Option<Duration>>> = const { std::cell::Cell::new(None) }; }
+pub(crate) struct SliceBudgetGuard(Option<Option<Duration>>);
+impl Drop for SliceBudgetGuard {
+    fn drop(&mut self) {
+        SLICE_BUDGET.with(|b| b.set(self.0));
+    }
+}
+pub(crate) fn slice_budget(budget: Option<Duration>) -> SliceBudgetGuard {
+    SliceBudgetGuard(SLICE_BUDGET.with(|b| b.replace(Some(budget))))
+}
+pub(crate) fn slice_budget_override() -> Option<Option<Duration>> {
+    SLICE_BUDGET.with(std::cell::Cell::get)
+}
+
+/// Every open file descriptor of this process that resolves inside `dir`.
+/// Other tests' fixtures live in their own temporary directories, so the
+/// answer for a test's own fixture does not depend on what runs beside it.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_handles_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = dir.canonicalize().expect("fixture directory exists");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("procfs is mounted")
+        .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&dir))
+        .collect()
+}
