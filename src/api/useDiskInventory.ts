@@ -12,6 +12,9 @@ export function useDiskInventory(enabled: boolean) {
   const [status, setStatus] = useState<DiskStatus | null>(null);
   const [settings, setSettings] = useState<DiskSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Saved measurements that could not be read and were left out (#1963):
+  // what remains is not the whole history, and must not read as if it were.
+  const [historyUnreadable, setHistoryUnreadable] = useState(0);
   const [busy, setBusy] = useState(false);
   const generation = useRef(0);
   const [refresh, setRefresh] = useState(0);
@@ -37,7 +40,8 @@ export function useDiskInventory(enabled: boolean) {
     ]).then(([history, config]) => {
       if (!live || generation.current !== epoch) return;
       const newest = new Map<string, DiskObservation>();
-      for (const observation of history) {
+      setHistoryUnreadable(history.unreadable);
+      for (const observation of history.observations) {
         if (!newest.has(observation.volume.id)) newest.set(observation.volume.id, observation);
       }
       setStatus(previous => previous?.observations.length ? previous : {
@@ -63,7 +67,7 @@ export function useDiskInventory(enabled: boolean) {
   }, []);
 
   return {
-    status, settings, error, busy,
+    status, settings, error, busy, historyUnreadable,
     save: (next: DiskSettings) => perform(async () => {
       await api.saveDiskSettings(next);
       setSettings(next);

@@ -49,7 +49,7 @@ function Measurement({ observation: o, unit, onReveal }: {
 export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean }) {
     const [open, setOpen] = useState(defaultOpen);
     const { dirs, isLoading: scopeLoading, isError: scopeError } = useWorktreeDirs();
-    const { status, settings, error, busy, save, start, cancel } = useDiskInventory(open);
+    const { status, settings, error, busy, historyUnreadable, save, start, cancel } = useDiskInventory(open);
     const [selected, setSelected] = useState<string | null>(null);
     const [unit, setUnit] = useState<"GiB" | "GB">("GiB");
     const [draft, setDraft] = useState<string | null>(null);
@@ -60,6 +60,7 @@ export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean 
   <p>Measure selected locations and see what remains unexplained. Scans do not remove files.</p>
   <div className="break-all"><h3>Scan scope</h3><p>Repository folders: {scopeError ? "Unavailable" : scopeLoading ? "Loading…" : dirs.length ? dirs.join(", ") : "None configured"}. Change these in Settings.</p><p>External folders are included only when saved below. Additional locations include developer caches, toolchains, archives and temporary build folders when available; ownership may be unknown.</p><p>This inventory covers all selected folders, regardless of the sidebar filter. Worktree and artifact lists show logical sizes and overlap; do not add their totals to this inventory.</p></div>
   {error && <p role="alert">Disk measurement unavailable: {error}</p>}{status?.error && <p role="alert">{status.error}</p>}{revealError && <p role="alert">{revealError}</p>}
+  {historyUnreadable > 0 && <p role="status">{historyUnreadable === 1 ? "1 saved measurement could not be read and is not shown." : `${historyUnreadable} saved measurements could not be read and are not shown.`}</p>}
   {!IS_MOBILE_BUILD && <><label className="block">External build and cache folders (one absolute path per line)<textarea value={draft ?? settings?.external_roots.join("\n") ?? ""} onChange={e => setDraft(e.target.value)} disabled={busy || status?.running} className="block w-full rounded border p-2"/></label>
    <button type="button" disabled={busy || status?.running || !settings} onClick={() => void save({ external_roots: (draft ?? settings?.external_roots.join("\n") ?? "").split("\n").map(p => p.trim()).filter(Boolean), additional_locations: settings?.additional_locations ?? false })}>Save locations</button>{" "}
    <button type="button" disabled={busy || status?.running} onClick={() => void start()}>{status?.resumable ? "Continue disk measurement" : "Measure disk usage"}</button>{" "}<button type="button" disabled={busy || status?.running || !settings} onClick={() => void start(true)}>Scan additional build locations</button>{" "}
@@ -69,6 +70,6 @@ export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean 
   {status?.running && <p role="status">Scanning {status.phase ?? "locations"}: {status.visited} entries checked. {status.remaining ?? 0} queued. {status.current_path}</p>}
   <label>Units <select value={unit} onChange={e => setUnit(e.target.value as "GiB" | "GB")}><option>GiB</option><option>GB</option></select></label>
   {observations.length > 1 && <label>Storage scope <select value={observation?.volume.id} onChange={e => setSelected(e.target.value)}>{observations.map(o => <option key={o.volume.id} value={o.volume.id}>{o.volume.label} {o.volume.mount}</option>)}</select></label>}
-  {observation ? <Measurement observation={observation} unit={unit} onReveal={path => { setRevealError(null); void claudeRevealPath(path).catch(e => setRevealError(String(e))); }}/> : !status?.running && !error ? <p>No disk measurement yet. Choose locations, then measure disk usage.</p> : null}
+  {observation ? <Measurement observation={observation} unit={unit} onReveal={path => { setRevealError(null); void claudeRevealPath(path).catch(e => setRevealError(String(e))); }}/> : !status?.running && !error && historyUnreadable === 0 ? <p>No disk measurement yet. Choose locations, then measure disk usage.</p> : null}
  </div>}</section>;
 }

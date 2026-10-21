@@ -85,3 +85,8 @@ export interface DiskSettings {
     external_roots: string[];
     additional_locations: boolean;
 }
+/** Saved history, with how many saved rows could not be read (#1963). */
+export interface DiskHistory {
+    observations: DiskObservation[];
+    unreadable: number;
+}

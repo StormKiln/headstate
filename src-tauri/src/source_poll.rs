@@ -842,8 +842,10 @@ fn apply_checking_snapshot(
         let source = &capture.attempt.source;
         let list = capture.attempt.list;
         if previous.viewer.as_deref() != Some(&capture.owner)
-            || crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
-                != Some(&capture.owner)
+            || !crate::store::source_cache::same_owner(
+                crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref(),
+                &capture.owner,
+            )
             || capture.scan_revision.is_some_and(|revision| {
                 crate::queue_scan::load(&tx, source, list, &capture.owner)
                     .map_or(true, |s| s.revision != revision)
@@ -1013,10 +1015,10 @@ pub(crate) async fn fetch_github_step_at(
             )?;
             let source = Source::default();
             let checkpoint = crate::queue_scan::load(&conn, &source, list, &owner)?;
-            let rows = if crate::store::source_cache::snapshot_owner(&conn, &source, list)?
-                .as_deref()
-                == Some(&owner)
-            {
+            let rows = if crate::store::source_cache::same_owner(
+                crate::store::source_cache::snapshot_owner(&conn, &source, list)?.as_deref(),
+                &owner,
+            ) {
                 match crate::store::source_cache::load_source_snapshot(&conn, &source, list)?.data {
                     crate::store::source_cache::SnapshotData::Available { prs, .. } => prs,
                     _ => vec![],
@@ -1195,11 +1197,12 @@ fn reconcile_github_snapshot_observed(
         previous.filter(|receipt| receipt.viewer.as_deref() == Some(owner))
     {
         receipt.prs
-    } else if crate::store::source_cache::snapshot_owner(conn, source, list)
-        .map_err(|_| inventory_failure("The saved inventory owner could not be read."))?
-        .as_deref()
-        == Some(owner)
-    {
+    } else if crate::store::source_cache::same_owner(
+        crate::store::source_cache::snapshot_owner(conn, source, list)
+            .map_err(|_| inventory_failure("The saved inventory owner could not be read."))?
+            .as_deref(),
+        owner,
+    ) {
         match crate::store::source_cache::load_source_snapshot(conn, source, list)
             .map_err(|_| inventory_failure("The saved inventory could not be read."))?
             .data
@@ -1611,9 +1614,11 @@ fn persist_github_effect(
     taint: bool,
 ) -> Result<(), crate::store::StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if crate::store::source_cache::snapshot_owner(&tx, source, list)?.as_deref()
-        == receipt.viewer.as_deref()
-        && receipt.viewer.is_some()
+    let stored = crate::store::source_cache::snapshot_owner(&tx, source, list)?;
+    if receipt
+        .viewer
+        .as_deref()
+        .is_some_and(|viewer| crate::store::source_cache::same_owner(stored.as_deref(), viewer))
     {
         crate::store::source_cache::save_owned_source_failure(
             &tx,
@@ -1671,6 +1676,65 @@ async fn record_github_effect(
     .await;
 }
 
+/// What a confirmed effect found to replay onto.
+#[derive(Debug)]
+enum ReplayTarget {
+    Rows(
+        Vec<crate::github::model::PullRequest>,
+        crate::store::source_cache::Coverage,
+    ),
+    /// Legitimately nothing to replay onto: none saved, another
+    /// account's, or not a list of pull requests.
+    Skip(&'static str),
+}
+
+/// The saved rows a confirmed effect can be replayed onto.
+///
+/// `Err` is a read that failed, including saved rows that could not be
+/// decoded. That used to share `None` with "nothing saved", so a locked
+/// or corrupt database skipped replay exactly as a first run did and
+/// said nothing (#1961).
+fn saved_rows_for_replay(
+    path: &std::path::Path,
+    source: &Source,
+    list: CachedList,
+    owner: &str,
+) -> Result<ReplayTarget, String> {
+    use crate::store::source_cache::{
+        load_source_snapshot, same_owner, snapshot_owner, SnapshotData,
+    };
+    let read = || -> Result<Result<ReplayTarget, String>, crate::store::StoreError> {
+        let conn = crate::store::open_db(path)?;
+        // One read snapshot for the owner and the rows it vouches for.
+        // Never writes, so DEFERRED cannot hit the upgrade race (#1958).
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)?;
+        let stored = snapshot_owner(&tx, source, list)?;
+        let target = if stored.is_none() {
+            Ok(ReplayTarget::Skip("no attributed snapshot is saved"))
+        } else if !same_owner(stored.as_deref(), owner) {
+            Ok(ReplayTarget::Skip(
+                "the saved snapshot belongs to another account",
+            ))
+        } else {
+            match load_source_snapshot(&tx, source, list)?.data {
+                SnapshotData::Available { prs, coverage, .. } => {
+                    Ok(ReplayTarget::Rows(prs, coverage))
+                }
+                SnapshotData::Unreadable => {
+                    Err("the saved snapshot could not be decoded".to_string())
+                }
+                _ => Ok(ReplayTarget::Skip(
+                    "the saved snapshot holds no pull request rows",
+                )),
+            }
+        };
+        tx.commit()?;
+        Ok(target)
+    };
+    read().map_err(|e| e.to_string())?
+}
+
 // Shared receipt transaction; the platform shell only delivers its events.
 async fn record_github_effect_at(
     path: std::path::PathBuf,
@@ -1689,7 +1753,7 @@ async fn record_github_effect_at(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(source.clone(), list))
-            .filter(|(_, r)| r.viewer.as_deref() == Some(viewer))
+            .filter(|(_, r)| crate::store::source_cache::same_owner(r.viewer.as_deref(), viewer))
             .map(|(_, r)| r.clone());
         let mut receipt = if let Some(receipt) = existing {
             receipt
@@ -1697,30 +1761,26 @@ async fn record_github_effect_at(
             let path = path.clone();
             let source = source.clone();
             let owner = viewer.to_string();
+            // A read that failed is not "nothing saved" (#1961): it is
+            // reported, where a missing or foreign snapshot is a reason
+            // to skip that is logged.
             let rows = tauri::async_runtime::spawn_blocking(move || {
-                let conn = crate::store::open_db(&path).ok()?;
-                if crate::store::source_cache::snapshot_owner(&conn, &source, list)
-                    .ok()?
-                    .as_deref()
-                    != Some(&owner)
-                {
-                    return None;
-                }
-                match crate::store::source_cache::load_source_snapshot(&conn, &source, list)
-                    .ok()?
-                    .data
-                {
-                    crate::store::source_cache::SnapshotData::Available {
-                        prs, coverage, ..
-                    } => Some((prs, coverage)),
-                    _ => None,
-                }
+                saved_rows_for_replay(&path, &source, list, &owner)
             })
             .await
-            .ok()
-            .flatten();
-            let Some((prs, coverage)) = rows else {
-                continue;
+            .map_err(|e| e.to_string())
+            .and_then(|read| read);
+            let (prs, coverage) = match rows {
+                Ok(ReplayTarget::Rows(prs, coverage)) => (prs, coverage),
+                Ok(ReplayTarget::Skip(reason)) => {
+                    log::debug!("not replaying pull request facts onto {list:?}: {reason}");
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("could not read saved {list:?} rows to replay facts onto: {e}");
+                    emit(Err("Saved pull requests could not be read, so new pull request facts were not applied to them."));
+                    continue;
+                }
             };
             FetchedList {
                 scan: None,
@@ -3731,6 +3791,93 @@ printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
                 .as_deref(),
             Some("fixture")
         );
+    }
+
+    fn replay_fixture() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/search.json")).unwrap();
+        let mut node = data["authored"]["nodes"][0].clone();
+        node["id"] = serde_json::json!("PR_replay");
+        node["state"] = serde_json::json!("OPEN");
+        node["headRefOid"] = serde_json::json!("head-a");
+        node["updatedAt"] = serde_json::json!("2026-10-01T10:00:00Z");
+        node["isDraft"] = serde_json::json!(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        (dir, path, node)
+    }
+
+    /// #1961: a stored owner that differs from the viewer only in case is
+    /// the same account, so its confirmed facts are replayed, not skipped.
+    #[tokio::test]
+    async fn facts_replay_onto_rows_owned_by_a_differently_cased_login() {
+        let (_dir, path, node) = replay_fixture();
+        let rows = crate::github::map::map_list(
+            &serde_json::json!({"authored": {"nodes": [node.clone()]}}),
+            "authored",
+        );
+        assert_eq!(rows.len(), 1);
+        let (repo, number) = (rows[0].repo.clone(), rows[0].number);
+        {
+            let conn = crate::store::open_db(&path).unwrap();
+            crate::store::source_cache::save_owned_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+                &rows,
+                &crate::store::source_cache::Coverage::Complete,
+                Some("alice"),
+            )
+            .unwrap();
+        }
+        let mut newer = node.clone();
+        newer["isDraft"] = serde_json::json!(true);
+        newer["updatedAt"] = serde_json::json!("2026-10-01T11:00:00Z");
+        let observation =
+            crate::store::github_facts::Observation::from_node(&newer, chrono::Utc::now()).unwrap();
+        let polls = SourcePolls::default();
+        let mut errors = Vec::new();
+        record_github_effect_at(
+            path.clone(),
+            &polls,
+            &repo,
+            number,
+            "Alice",
+            GithubEffect::Facts(observation),
+            |event| {
+                if let Err(message) = event {
+                    errors.push(message);
+                }
+            },
+        )
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let conn = crate::store::open_db(&path).unwrap();
+        let crate::store::source_cache::SnapshotData::Available { prs, .. } =
+            crate::store::source_cache::load_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+            )
+            .unwrap()
+            .data
+        else {
+            panic!("the saved rows must remain available");
+        };
+        assert!(prs[0].is_draft, "the confirmed fact must be applied");
+    }
+
+    /// #1961: a failed read of the saved rows is reported, not treated as
+    /// "nothing saved" and skipped in silence.
+    #[test]
+    fn a_failed_read_of_replay_rows_is_an_error_not_a_skip() {
+        let (_dir, path, _) = replay_fixture();
+        let conn = crate::store::open_db(&path).unwrap();
+        let skip = saved_rows_for_replay(&path, &Source::default(), CachedList::Authored, "a");
+        assert!(matches!(skip, Ok(ReplayTarget::Skip(_))), "{skip:?}");
+        conn.execute("DROP TABLE snapshot", []).unwrap();
+        let failed = saved_rows_for_replay(&path, &Source::default(), CachedList::Authored, "a");
+        assert!(failed.is_err(), "{failed:?}");
     }
 }
 
