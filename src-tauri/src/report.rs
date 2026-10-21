@@ -69,7 +69,8 @@ pub struct PollTickRecord {
     /// Consecutive failures including this one. Zero on success.
     pub attempt: u32,
     /// What the review-queue fetch in the same tick did: `ok`, `failed`,
-    /// `timed out` or `skipped`.
+    /// `timed out`, `skipped` or `not asked` (declined, or no time left in
+    /// the tick to send it).
     pub reviewing: String,
 }
 
