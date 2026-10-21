@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Lock, Worktree, WorktreeRepo } from "@/types/pr";
 import { useFilters } from "@/store/filters";
@@ -4172,6 +4172,9 @@ describe("WorktreesPage filtering", () => {
   });
 
   afterEach(() => {
+    // Unmount first (#1965): this hook runs before Testing Library's own
+    // cleanup, so the reset below re-rendered a mounted page outside act().
+    cleanup();
     // `setState` is a partial merge, so a filter set here survives into
     // the next test and silently narrows a list it was never about.
     useFilters.setState({

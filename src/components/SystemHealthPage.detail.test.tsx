@@ -308,6 +308,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Unmount FIRST (#1965). Testing Library's own cleanup runs after this
+  // hook, so resetting `healthPage` here re-rendered the still-mounted
+  // page outside act() -- one warning per test, 88 per run.
+  cleanup();
   stubViewport(null);
   useFilters.setState({ healthPage: "overview" });
 });

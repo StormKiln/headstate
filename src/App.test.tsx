@@ -1,6 +1,6 @@
 import { preserveMeasurement } from "../scripts/measurement-evidence.mjs";
 import { GitLabViewerProvider } from "./api/authAvailability";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest } from "./types/pr";
@@ -15,6 +15,10 @@ import { AuthGate } from "./components/AuthGate";
 const measurements = vi.hoisted(() => vi.fn<(_batch: readonly unknown[]) => Promise<void>>(() => Promise.resolve()));
 vi.mock("./api/tauri", async importOriginal => ({
   ...await importOriginal<typeof import("./api/tauri")>(), recordClientMeasurements: measurements,
+  // Accepted, as the desktop accepts it. Unstubbed, it rejected for want
+  // of IPC after each test's assertions had run, and App's error state
+  // updated outside act() (#1965). No test here is about that error.
+  setSourceSelection: () => Promise.resolve(),
 }));
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[] | undefined>(() => []);
@@ -69,6 +73,32 @@ vi.mock("./api/hooks", () => ({
     rescan: () => Promise.resolve(),
   }),
   useWorktrees: () => ({ data: [], unreadable: [], isLoading: false, isError: false, error: null, refetch: () => {} }),
+  // The rest of WorktreesPage's hooks (#1965). Without them the
+  // Worktrees view threw on render and ViewErrorBoundary hid it, so the
+  // notification test that starts on Worktrees passed over an error
+  // panel. Idle shapes, matching an empty listing.
+  useWorktreeSafety: () => ({
+    data: undefined, isLoading: false, isError: false, error: null, refetch: () => {},
+    partial: new Map(), pending: 0, total: 0, failed: 0,
+  }),
+  useWorktreeSizes: () => ({
+    data: undefined, partial: new Map(), sizes: new Map(), isLoading: false, isFetching: false, isError: false, error: null,
+  }),
+  useAllWorktreeSizes: () => ({ sizes: new Map(), pending: 0, total: 0, failed: 0 }),
+  useAssessed: () => ({ data: undefined }),
+  useAssessment: () => ({ data: undefined, isLoading: false }),
+  useMarkAssessed: () => () => Promise.resolve(),
+  useClearAssessed: () => () => Promise.resolve(),
+  useRemoveWorktree: () => () => Promise.resolve(),
+  useRemoveWorktrees: () => () => Promise.resolve([]),
+  useRemoveWorktreeForced: () => () => Promise.resolve(),
+  useUnlockWorktree: () => () => Promise.resolve(),
+  useUnlockWorktrees: () => () => Promise.resolve([]),
+  usePruneWorktrees: () => () => Promise.resolve(),
+  usePullCheckout: () => () => Promise.resolve(),
+  useFetchRefs: () => () => Promise.resolve(),
+  useRemoveOrphan: () => () => Promise.resolve(),
+  useOrphanSize: () => ({ bytes: undefined, measuring: false, failed: false }),
   // A `Scan`, not a bare array (#972).
   useClaudeMdEffective: () => ({
     data: {
@@ -193,6 +223,18 @@ await Promise.all([
   import("./components/SystemHealthPage"),
 ]);
 
+/// Unmount the shell BEFORE an `afterEach` resets the stores it reads (#1965).
+///
+/// Testing Library's own cleanup is a file-level `afterEach`, and vitest
+/// runs a `describe`'s `afterEach` first. Resetting `useFilters` there
+/// re-rendered the still-mounted App -- every row, the filter bar, the
+/// status bar -- outside `act()`, and that one ordering was most of the
+/// suite's ~1,000 act() warnings. `cleanup` is idempotent, so the later
+/// file-level call finds nothing to do.
+function unmountBeforeReset() {
+  cleanup();
+}
+
 function renderApp() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   qc.setQueryData(["gitlab-host"], "gitlab.com");
@@ -241,6 +283,7 @@ describe("assembled auth and PR status", () => {
 
 describe("App — priorities strip scoping", () => {
   afterEach(() => {
+    unmountBeforeReset();
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
     vi.clearAllMocks();
@@ -612,6 +655,7 @@ describe("an incomplete refresh", () => {
 /// Found by review rather than by a test, which is why these exist.
 describe("the Claude Code route is gated on the capability", () => {
   afterEach(() => {
+    unmountBeforeReset();
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
@@ -663,6 +707,7 @@ describe("the Claude Code route is gated on the capability", () => {
 
 describe("review request source scope", () => {
   afterEach(() => {
+    unmountBeforeReset();
     mockPrs.mockReturnValue([]);
     useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
     useFilters.setState({ view: "my-prs", selectedPr: null });
@@ -685,6 +730,7 @@ describe("review request source scope", () => {
 
 describe("notification click in the assembled shell", () => {
   afterEach(() => {
+    unmountBeforeReset();
     clearMocks();
     useSourceSelection.getState().setSelection("github");
     useFilters.getState().setView("my-prs");
@@ -789,6 +835,7 @@ describe("active inventory footer wiring", () => {
     useFilters.setState({ view: "to-review", selectedPr: null });
   });
   afterEach(() => {
+    unmountBeforeReset();
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
     measurements.mockClear();
     mockReviewPhase.mockReturnValue(undefined); mockReviewReceivedAt.mockReturnValue(undefined);

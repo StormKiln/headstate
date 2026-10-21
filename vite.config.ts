@@ -126,6 +126,10 @@ export default defineConfig(({ mode }) => ({
     // anyway.
     pool: "vmThreads",
     globals: true,
+    // Suite-wide: an inert `listen` when no Tauri IPC is installed, and
+    // a test fails if a ViewErrorBoundary caught a render error in it.
+    // Both are argued in the file (#1965).
+    setupFiles: ["src/test/setup.ts"],
     // 15s, not vitest's default 5s.
     //
     // Not because any test is slow: 58% of this suite's wall-clock is
