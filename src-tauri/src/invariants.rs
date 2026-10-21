@@ -5646,4 +5646,119 @@ let f = std::env::temp_dir;
             "worktree and disk metadata spawn boundaries must be checked"
         );
     }
+
+    /// Lines of production code in `src` that open a DEFERRED transaction
+    /// through `unchecked_transaction(`, as `file:line: text`.
+    ///
+    /// Comments are skipped (this rule is documented above the code it
+    /// governs, so the name appears in prose) and so is every
+    /// `#[cfg(test)]` item: tests deliberately hold a DEFERRED lock to
+    /// stage contention, and that is what they are for.
+    fn deferred_transaction_offenders(file: &Path, rel: &str, src: &str) -> Vec<String> {
+        let src = src.replace("\r\n", "\n");
+        src.lines()
+            .zip(test_mask(file, &src))
+            .enumerate()
+            .filter(|(_, (line, test))| {
+                !test && !is_comment(line) && line.contains("unchecked_transaction(")
+            })
+            .map(|(i, (line, _))| format!("{rel}:{}: {}", i + 1, line.trim()))
+            .collect()
+    }
+
+    /// **No production transaction is opened DEFERRED by default (#1958).**
+    ///
+    /// `Connection::unchecked_transaction()` begins DEFERRED. Under WAL, a
+    /// DEFERRED transaction that reads and then writes holds only a read
+    /// snapshot until its first write; if another connection commits in
+    /// between, the upgrade fails with SQLITE_BUSY immediately and
+    /// `busy_timeout` does not retry it. Many writers share
+    /// `headstate.db`, so a PR action or a Checking-row update was done
+    /// and then not saved.
+    ///
+    /// The method's name hides the mode, which is why it is banned rather
+    /// than reviewed: every production transaction must say which mode it
+    /// takes. A read-then-write one uses
+    /// `Transaction::new_unchecked(conn, TransactionBehavior::Immediate)`
+    /// (or `transaction_with_behavior` given `&mut`); a read-only snapshot
+    /// that never writes cannot hit the upgrade and states `Deferred`
+    /// explicitly, as `claude::search::read_snapshot` does.
+    ///
+    /// # What it cannot see
+    ///
+    /// Text, not semantics. An explicit `new_unchecked(.., Deferred)` that
+    /// later writes is the same defect and passes this; the explicit
+    /// spelling is what makes it visible in review.
+    #[test]
+    fn no_production_transaction_is_opened_deferred_by_default() {
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+        let mut immediate = 0usize;
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                // By PATH: this guard's own prose names the call.
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                checked += 1;
+                immediate += production(&file, &src.replace("\r\n", "\n"))
+                    .matches("TransactionBehavior::Immediate")
+                    .count();
+                let rel = format!(
+                    "{crate_name}/{}",
+                    file.strip_prefix(&root).unwrap_or(&file).display()
+                );
+                offenders.extend(deferred_transaction_offenders(&file, &rel, &src));
+            }
+        }
+        assert!(
+            checked > 100 && immediate >= 10,
+            "the walk saw {checked} files and {immediate} IMMEDIATE transactions in \
+             production code; it is not reading the tree it claims to guard"
+        );
+        assert!(
+            offenders.is_empty(),
+            "production code opens a DEFERRED transaction with `unchecked_transaction()` \
+             (#1958). A transaction that reads then writes fails with SQLITE_BUSY under WAL \
+             when another connection commits between the two, and busy_timeout does not \
+             retry it. Use `rusqlite::Transaction::new_unchecked(conn, \
+             rusqlite::TransactionBehavior::Immediate)`; a read-only snapshot that never \
+             writes may state `TransactionBehavior::Deferred` explicitly:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The other direction: the guard stays silent on comments, on test
+    /// code and on an explicit mode, and still fires on a production call
+    /// that follows a test module, in a CRLF checkout.
+    #[test]
+    fn the_deferred_transaction_guard_ignores_tests_and_prose_but_not_code() {
+        let file = Path::new("fixture/does_not_exist.rs");
+        let safe = "/// Never call `conn.unchecked_transaction()` here.\n\
+                    fn write(conn: &Connection) {\n    \
+                    // unchecked_transaction() is DEFERRED\n    \
+                    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;\n\
+                    }\n\
+                    #[cfg(test)]\n\
+                    mod tests {\n    \
+                    fn holds_a_lock() {\n        \
+                    let tx = conn.unchecked_transaction().unwrap();\n    \
+                    }\n\
+                    }\n";
+        assert_eq!(
+            deferred_transaction_offenders(file, "fixture.rs", safe),
+            Vec::<String>::new()
+        );
+        let unsafe_ = format!(
+            "{safe}fn late(conn: &Connection) {{\n    let tx = conn.unchecked_transaction()?;\n}}\n"
+        )
+        .replace('\n', "\r\n");
+        assert_eq!(
+            deferred_transaction_offenders(file, "fixture.rs", &unsafe_),
+            vec!["fixture.rs:13: let tx = conn.unchecked_transaction()?;".to_string()]
+        );
+    }
 }

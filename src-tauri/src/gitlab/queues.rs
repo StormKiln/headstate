@@ -192,7 +192,12 @@ pub async fn fetch<F: std::future::Future<Output = bool>>(
                 let (loaded, previous) = tauri::async_runtime::spawn_blocking(
                     move || -> Result<_, crate::store::StoreError> {
                         let conn = crate::store::open_db(&path)?;
-                        let conn = conn.unchecked_transaction()?;
+                        // Read-only snapshot, never written or committed:
+                        // DEFERRED cannot hit the read-to-write upgrade (#1958).
+                        let conn = rusqlite::Transaction::new_unchecked(
+                            &conn,
+                            rusqlite::TransactionBehavior::Deferred,
+                        )?;
                         let loaded = crate::queue_scan::load(&conn, &owned_source, list, &owner)?;
                         let rows = if crate::store::source_cache::snapshot_owner(
                             &conn,

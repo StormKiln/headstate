@@ -429,6 +429,8 @@ pub fn accepted(
 }
 
 /// CAS and rows are one transaction. The caller still holds its publication gate.
+/// IMMEDIATE: the CAS reads and then writes, and a DEFERRED upgrade fails at
+/// once with SQLITE_BUSY when another connection commits in between (#1958).
 pub fn commit(
     conn: &Connection,
     source: &Source,
@@ -442,11 +444,11 @@ pub fn commit(
     #[cfg(feature = "enterprise-harness")]
     let tx = crate::enterprise_harness::resources::transaction(
         conn,
-        rusqlite::TransactionBehavior::Deferred,
+        rusqlite::TransactionBehavior::Immediate,
         "queue",
     )?;
     #[cfg(not(feature = "enterprise-harness"))]
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     #[cfg(feature = "enterprise-harness")]
     metric.mark("acquired", 0);
     let provider = serde_json::to_value(source.provider)?;
@@ -807,6 +809,74 @@ mod tests {
         let other = load(&conn, &source, list, "different").unwrap();
         assert_eq!(other.revision, 2);
         assert!(other.state.after.is_none());
+    }
+    /// #1958: `commit` reads the revision, then writes. Under WAL a DEFERRED
+    /// transaction holds only a read snapshot after the SELECT; if another
+    /// connection commits before the INSERT, upgrading that snapshot fails
+    /// with SQLITE_BUSY at once and `busy_timeout` never retries it.
+    ///
+    /// The interleaving is made deterministic with an authorizer hook: it
+    /// runs while A PREPARES its INSERT, which is after A's SELECT has fixed
+    /// its snapshot and before A writes. B commits from inside that hook.
+    /// IMMEDIATE takes the write lock at BEGIN, so B waits out its busy
+    /// timeout instead and A's progress is saved.
+    #[test]
+    fn a_write_committed_between_the_cas_read_and_its_write_does_not_lose_the_step() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let a = crate::store::open_db(&path).unwrap();
+        let b = crate::store::open_db(&path).unwrap();
+        b.busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        let source = Source::default();
+        let list = CachedList::Reviewing;
+        let interleaved: Arc<Mutex<Option<rusqlite::Result<usize>>>> = Arc::default();
+        let outcome = interleaved.clone();
+        let mut b = Some(b);
+        a.authorizer(Some(move |ctx: AuthContext<'_>| {
+            if let AuthAction::Insert {
+                table_name: "queue_scan",
+            } = ctx.action
+            {
+                if let Some(b) = b.take() {
+                    *outcome.lock().unwrap() = Some(b.execute(
+                        "INSERT INTO queue_scan(provider,host,list,owner,revision,payload)
+                         VALUES('github','other.example','other','b',1,'{}')",
+                        [],
+                    ));
+                }
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+        let next = Commit {
+            expected_revision: 0,
+            state: State {
+                receipt_id: Some(new_receipt_id()),
+                ..State::default()
+            },
+            removals: vec![],
+        };
+        let saved = commit(&a, &source, list, "fixture", &next, |_| Ok(()));
+        a.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        let b_result = interleaved
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the hook must have run B's write between A's read and A's write");
+        assert!(
+            matches!(saved, Ok(true)),
+            "A's step must be saved when B commits mid-transaction; got {saved:?} \
+             (B's write: {b_result:?})"
+        );
+        assert!(
+            b_result.is_err(),
+            "with the write lock held from BEGIN, B must wait out its busy timeout"
+        );
+        assert_eq!(load(&a, &source, list, "fixture").unwrap().revision, 1);
     }
     #[test]
     fn restart_preserves_only_matching_owned_query_progress_and_recovers_bad_metadata() {
