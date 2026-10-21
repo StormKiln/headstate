@@ -645,7 +645,9 @@ pub fn map_list(v: &Value, alias: &str) -> Vec<PullRequest> {
             //
             // Counts only, never titles or repository names.
             if mapped.len() < a.len() {
-                log::warn!(
+                crate::log_dedup::log_while!(
+                    warn,
+                    "github.map_dropped",
                     "dropped {} of {} pull requests: GitHub returned them without \
                      the fields needed to render one",
                     a.len() - mapped.len(),

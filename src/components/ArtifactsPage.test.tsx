@@ -43,6 +43,19 @@ const refetchVenvsFn = vi.hoisted(() => vi.fn());
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
+// The page mounts `DiskUsagePanel` above the inventory, and its hook
+// loads over IPC on mount. Unmocked, every test here ended with that
+// load rejecting AFTER the assertions -- a state update outside act(),
+// 110 warnings per run (#1965). The panel has its own tests
+// (`DiskUsagePanel.test.tsx`); here it sits in its "not measured yet"
+// state and stays there.
+vi.mock("../api/useDiskInventory", () => ({
+  useDiskInventory: () => ({
+    status: null, settings: null, error: null, busy: false,
+    save: async () => {}, start: async () => {}, cancel: async () => {},
+  }),
+}));
+
 vi.mock("../api/hooks", () => ({
   useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }),
   // Undefined by default: the first-run state, which every other

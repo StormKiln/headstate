@@ -817,13 +817,31 @@ async fn persist_and_emit(
                 })
                 .await;
                 match written {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        crate::log_dedup::log_cleared!("poll.db_open", "database opened again");
+                        crate::log_dedup::log_cleared!(
+                            "poll.snapshot_save",
+                            "snapshot saved again"
+                        );
+                        crate::log_dedup::log_cleared!(
+                            "poll.snapshot_task",
+                            "snapshot saved again"
+                        );
+                    }
                     Ok(Err((opening, e))) if opening => {
-                        log::error!("failed to open db: {e}");
+                        crate::log_dedup::log_while!(
+                            error,
+                            "poll.db_open",
+                            "failed to open db: {e}"
+                        );
                         emit_store_error(app, format!("could not open the local database: {e}"));
                     }
                     Ok(Err((_, e))) => {
-                        log::error!("failed to save snapshot: {e}");
+                        crate::log_dedup::log_while!(
+                            error,
+                            "poll.snapshot_save",
+                            "failed to save snapshot: {e}"
+                        );
                         emit_store_error(app, format!("could not save local snapshot: {e}"));
                     }
                     // A panic in the closure. Reported rather than swallowed:
@@ -832,7 +850,11 @@ async fn persist_and_emit(
                     // readability is gone and nothing told you" failure the
                     // banner was added for.
                     Err(e) => {
-                        log::error!("the snapshot write task failed: {e}");
+                        crate::log_dedup::log_while!(
+                            error,
+                            "poll.snapshot_task",
+                            "the snapshot write task failed: {e}"
+                        );
                         emit_store_error(app, format!("could not save local snapshot: {e}"));
                     }
                 }
@@ -1488,6 +1510,7 @@ pub fn spawn(
                                 log::warn!("failed to emit prs-incomplete: {e}");
                             }
 
+                            crate::log_dedup::log_cleared!("poll.failed", "poll succeeded again");
                             persist_and_emit(&app, &prs, coverage.clone(), viewer, scan.is_some())
                                 .await;
                             let capture =
@@ -1499,7 +1522,7 @@ pub fn spawn(
                         // A failed poll leaves the last snapshot in place rather
                         // than blanking the UI; the next tick retries.
                         Err(e) => {
-                            log::warn!("poll failed: {e}");
+                            crate::log_dedup::log_while!(warn, "poll.failed", "poll failed: {e}");
                             // `complete` settles the status, and `emit_status`
                             // decides from it whether this surfaces as a
                             // banner or stays "retrying" (#1104, #1934).
