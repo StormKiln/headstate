@@ -171,6 +171,13 @@ pub const EVENT_NAMES: &[&str] = &[
     "claude-transcript-activity",
     // Payload-free receipt for already-allowlisted local population summaries.
     "claude-population-updated",
+    // Update All's progress (#1946): `(done, total)`, counts only -- no
+    // paths, the `worktree-removal-progress` rule. `update_all_repositories`
+    // is an allowlisted Write whose worst case is ~22 minutes, so without
+    // this a phone sat on "Checking repository scope…" for the whole run.
+    // `update_all_state`, an allowlisted Read, already returns these same
+    // counts, so the event opens nothing the command has not.
+    "update-all-progress",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

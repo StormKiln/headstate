@@ -122,6 +122,8 @@ import {
   fetchRefs,
   updateAllRepositories,
   cancelUpdateAll,
+  updateAllState,
+  type UpdateAllState,
   removeOrphan,
   assessedWorktrees,
   dockerBuilds,
@@ -3636,17 +3638,70 @@ export function useFetchRefs() {
 export function useUpdateAllRepositories() {
   const qc = useQueryClient();
   return (expectedPaths?: readonly string[]) =>
-    updateAllRepositories(expectedPaths).then((report) => {
-      void qc.invalidateQueries({ queryKey: ["worktrees"] });
-      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
-      // And the overview's verdicts (#1042). This button lives ON the
-      // All Repositories table, so its own rows are the ones that would
-      // otherwise sit stale for five minutes -- a run that moved 30
-      // repositories, reporting so, above a table still saying they are
-      // behind.
-      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
-      return report;
+    updateAllRepositories(expectedPaths).finally(() => {
+      // On a rejection too (#1947, #1954): a run that died part-way, or a
+      // phone whose call timed out while the desktop carried on, may still
+      // have moved repositories, and a scope the desktop found changed is
+      // only fixed by a fresh list.
+      invalidateUpdatedRepositories(qc);
+      // The registry is the record of how the run went (#1946).
+      void qc.invalidateQueries({ queryKey: UPDATE_ALL_STATE_KEY });
     });
+}
+
+function invalidateUpdatedRepositories(qc: QueryClient) {
+  void qc.invalidateQueries({ queryKey: ["worktrees"] });
+  void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+  // And the overview's verdicts (#1042). This button lives ON the
+  // All Repositories table, so its own rows are the ones that would
+  // otherwise sit stale for five minutes -- a run that moved 30
+  // repositories, reporting so, above a table still saying they are
+  // behind.
+  void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
+}
+
+const UPDATE_ALL_STATE_KEY = ["update-all-state"] as const;
+
+/// How often a running Update All is re-read from the desktop's registry.
+const UPDATE_ALL_POLL_MS = 2_000;
+
+/// The desktop's record of the Update All run: going, or how the last one
+/// ended (#1946).
+///
+/// The run outlives whoever started it. On the desktop the button unmounts
+/// when the user leaves the page and the run carries on for up to ~22
+/// minutes; on the phone the call itself gives up after 120 s while the
+/// desktop carries on. Component state and the command's return value both
+/// die with them, so this registry read is what the button shows from.
+///
+/// Polls while the run is going, and stops once it has ended. Refetched on
+/// mount, so returning to the page shows the run as it is now. When a run
+/// this hook watched ends, the repository views are invalidated, because
+/// the caller that would have done it may be long gone.
+export function useUpdateAllState(): { data: UpdateAllState | null | undefined; refetch: () => Promise<UpdateAllState | null | undefined> } {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: UPDATE_ALL_STATE_KEY,
+    queryFn: updateAllState,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchInterval: (q) => (q.state.data?.state === "running" ? UPDATE_ALL_POLL_MS : false),
+  });
+  const data = query.data;
+  const watched = useRef<number | null>(null);
+  useEffect(() => {
+    if (data?.state === "running") {
+      watched.current = data.run;
+    } else if (data && watched.current === data.run) {
+      watched.current = null;
+      invalidateUpdatedRepositories(qc);
+    }
+  }, [data, qc]);
+  const { refetch } = query;
+  return {
+    data,
+    refetch: useCallback(() => refetch().then((r) => r.data), [refetch]),
+  };
 }
 
 /// Ask the Update All run to stop.

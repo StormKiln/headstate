@@ -1738,6 +1738,12 @@ mod tests {
                 admit("update_all_state").is_ok(),
                 "a run whose end a phone cannot read must not be exposed to a phone"
             );
+            // #1946: the command emits its progress on this event, and a
+            // name missing here never reaches the phone at all.
+            assert!(
+                crate::remote::events::EVENT_NAMES.contains(&"update-all-progress"),
+                "a run whose progress a phone cannot hear leaves it on its first frame"
+            );
         }
     }
 

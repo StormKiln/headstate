@@ -25,6 +25,7 @@ vi.mock("@/api/hooks", () => ({
   useUpdateAllRepositories: () => vi.fn(),
   useCancelUpdateAll: () => vi.fn(),
   useUpdateAllProgress: () => null,
+  useUpdateAllState: () => ({ data: null, refetch: () => Promise.resolve(null) }),
 }));
 
 import { AllRepositoriesTable } from "./AllRepositoriesTable";

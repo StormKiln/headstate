@@ -39,7 +39,7 @@
 //! per-repository claim would let two runs interleave across 45
 //! repositories and make both reports wrong. There is one slot.
 
-use crate::worktrees::UpdateAllReport;
+use crate::worktrees::{RepoUpdateOutcome, UpdateAllReport, UpdateResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -48,14 +48,35 @@ use std::sync::{Arc, Mutex};
 /// Both live in the same slot, on `RunState`'s reasoning: a client asking
 /// "what happened to my run" gets one answer whether it is still going or
 /// ended while the client was away, and does not have to ask twice.
+///
+/// `run` numbers the runs this process has started, so a client can tell
+/// the report of the run it just started from the one that was already on
+/// record when it clicked (#1946).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum UpdateAllState {
     /// Still going. `done` counts finished repositories.
-    Running { done: usize, total: usize },
+    Running { run: u64, done: usize, total: usize },
     /// Ended, with the same report the command returns. A client that
     /// missed the event reads it here instead.
-    Done { report: Box<UpdateAllReport> },
+    Done {
+        run: u64,
+        report: Box<UpdateAllReport>,
+    },
+    /// Ended WITHOUT the run reporting how it finished: the blocking task
+    /// failed to join, or the command was dropped mid-run (#1947).
+    ///
+    /// Not collapsed into `Done`, because the report here was assembled by
+    /// the registry from the outcomes the run recorded before it died, and
+    /// not collapsed into an error string either, because those outcomes
+    /// are real: repositories that were fast-forwarded stay
+    /// fast-forwarded, and a user must be told which. The rest of the run's
+    /// repositories are `NotAttempted`.
+    Failed {
+        run: u64,
+        reason: String,
+        report: Box<UpdateAllReport>,
+    },
 }
 
 /// The one Update All run this process may have going.
@@ -63,56 +84,174 @@ pub enum UpdateAllState {
 /// `Option` rather than a map: see the module doc. One slot, and it holds
 /// the last outcome after the run ends so a returning client can read it.
 #[derive(Default)]
-pub struct UpdateAllRuns(Mutex<Option<Entry>>);
+pub struct UpdateAllRuns {
+    slot: Mutex<Option<Entry>>,
+    /// The last run number handed out.
+    runs: std::sync::atomic::AtomicU64,
+}
 
-pub struct Entry {
+struct Entry {
     /// Set by [`UpdateAllRuns::cancel`], read between repositories by the
     /// run itself.
     stop: Arc<AtomicBool>,
+    /// The repositories the run was started over, in its order.
+    paths: Vec<String>,
+    /// What the run has done so far, one entry per finished repository, in
+    /// `paths`' order. Kept HERE rather than only inside the run, so that
+    /// a run which dies still leaves what it applied behind (#1947).
+    applied: Vec<RepoUpdateOutcome>,
     state: UpdateAllState,
 }
 
+/// The claim on the slot for one run.
+///
+/// Its `Drop` is what guarantees the slot never stays `Running` after the
+/// run is gone (#1947). Before it, the command's `?` on a failed join
+/// returned before `finished` was ever called, and every later Update All
+/// was refused as "already going" until the app restarted.
+#[must_use = "dropping the claim ends the run as failed"]
+pub struct RunClaim<'a> {
+    runs: &'a UpdateAllRuns,
+    stop: Arc<AtomicBool>,
+    settled: bool,
+}
+
+impl RunClaim<'_> {
+    /// The flag the run reads between repositories.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    /// Record how the run ended.
+    pub fn finished(mut self, report: UpdateAllReport) {
+        self.settled = true;
+        self.runs.finished(report);
+    }
+
+    /// Record that the run ended without a report, keeping what it had
+    /// already applied. `scope` carries what the run did not produce
+    /// itself -- the scan's shortfall and the scope's own outcomes -- and
+    /// its outcomes are appended after the run's. Returns the report that
+    /// was recorded.
+    pub fn failed(mut self, reason: String, scope: UpdateAllReport) -> UpdateAllReport {
+        self.settled = true;
+        self.runs.fail(reason, scope)
+    }
+}
+
+impl Drop for RunClaim<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.runs.fail(
+                "the update run stopped without reporting how it ended".into(),
+                UpdateAllReport {
+                    diagnostics: Vec::new(),
+                    outcomes: Vec::new(),
+                    cancelled: false,
+                    timed_out: false,
+                    unreadable: Vec::new(),
+                },
+            );
+        }
+    }
+}
+
 impl UpdateAllRuns {
-    /// Claim the slot for a new run.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Entry>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claim the slot for a new run over `paths`.
     ///
     /// `Err` when one is already going: two runs pulling the same 45
     /// repositories is not something to discover afterwards. The message
     /// is user-facing, since this is what the command returns.
-    pub fn start(&self, total: usize) -> Result<Arc<AtomicBool>, String> {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn start(&self, paths: &[String]) -> Result<RunClaim<'_>, String> {
+        let mut slot = self.lock();
         if let Some(e) = slot.as_ref() {
             if matches!(e.state, UpdateAllState::Running { .. }) {
                 return Err("an update run is already going".into());
             }
         }
+        let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
         let stop = Arc::new(AtomicBool::new(false));
         *slot = Some(Entry {
             stop: stop.clone(),
-            state: UpdateAllState::Running { done: 0, total },
+            paths: paths.to_vec(),
+            applied: Vec::with_capacity(paths.len()),
+            state: UpdateAllState::Running {
+                run,
+                done: 0,
+                total: paths.len(),
+            },
         });
-        Ok(stop)
+        Ok(RunClaim {
+            runs: self,
+            stop,
+            settled: false,
+        })
     }
 
-    /// Record progress. Ignored once the run has ended, so a late frame
-    /// cannot resurrect a finished run as `Running`.
-    pub fn progress(&self, done: usize, total: usize) {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    /// Record one finished repository. Ignored once the run has ended, so
+    /// a late frame cannot resurrect a finished run as `Running`.
+    pub fn outcome_landed(&self, outcome: RepoUpdateOutcome) {
+        let mut slot = self.lock();
         if let Some(e) = slot.as_mut() {
-            if matches!(e.state, UpdateAllState::Running { .. }) {
-                e.state = UpdateAllState::Running { done, total };
+            if let UpdateAllState::Running { run, total, .. } = e.state {
+                e.applied.push(outcome);
+                e.state = UpdateAllState::Running {
+                    run,
+                    done: e.applied.len(),
+                    total,
+                };
             }
         }
     }
 
     /// Record how a run ended. The entry stays, so a client that was away
     /// can still read it.
-    pub fn finished(&self, report: UpdateAllReport) {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    fn finished(&self, report: UpdateAllReport) {
+        let mut slot = self.lock();
         if let Some(e) = slot.as_mut() {
-            e.state = UpdateAllState::Done {
-                report: Box::new(report),
-            };
+            if let UpdateAllState::Running { run, .. } = e.state {
+                e.state = UpdateAllState::Done {
+                    run,
+                    report: Box::new(report),
+                };
+            }
         }
+    }
+
+    /// End the run as failed, from what it recorded. Partial is not
+    /// nothing: every outcome already applied is kept, and every
+    /// repository the run never reached is `NotAttempted` rather than
+    /// absent.
+    fn fail(&self, reason: String, scope: UpdateAllReport) -> UpdateAllReport {
+        let mut slot = self.lock();
+        let Some(e) = slot.as_mut() else {
+            return scope;
+        };
+        let UpdateAllState::Running { run, .. } = e.state else {
+            return scope;
+        };
+        let mut outcomes = std::mem::take(&mut e.applied);
+        outcomes.extend(
+            e.paths
+                .iter()
+                .skip(outcomes.len())
+                .map(|path| RepoUpdateOutcome {
+                    path: path.clone(),
+                    result: UpdateResult::NotAttempted,
+                }),
+        );
+        outcomes.extend(scope.outcomes);
+        let report = UpdateAllReport { outcomes, ..scope };
+        e.state = UpdateAllState::Failed {
+            run,
+            reason,
+            report: Box::new(report.clone()),
+        };
+        report
     }
 
     /// Ask the run to stop after the repository it is on.
@@ -121,7 +260,7 @@ impl UpdateAllRuns {
     /// silently: a Cancel that appears to work on a run that already
     /// finished would be its own small lie.
     pub fn cancel(&self) -> Result<(), String> {
-        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.lock();
         match slot.as_ref() {
             Some(e) if matches!(e.state, UpdateAllState::Running { .. }) => {
                 e.stop.store(true, Ordering::SeqCst);
@@ -134,7 +273,7 @@ impl UpdateAllRuns {
     /// What happened to the run, or `None` if this process has never had
     /// one.
     pub fn state(&self) -> Option<UpdateAllState> {
-        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.lock();
         slot.as_ref().map(|e| e.state.clone())
     }
 }
@@ -142,7 +281,6 @@ impl UpdateAllRuns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktrees::{RepoUpdateOutcome, UpdateResult};
 
     fn report() -> UpdateAllReport {
         UpdateAllReport {
@@ -157,12 +295,25 @@ mod tests {
         }
     }
 
+    fn paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("repo-{i}")).collect()
+    }
+
+    fn outcome(path: &str, result: UpdateResult) -> RepoUpdateOutcome {
+        RepoUpdateOutcome {
+            path: path.into(),
+            result,
+        }
+    }
+
     #[test]
     fn a_second_run_is_refused_while_one_is_going() {
         let runs = UpdateAllRuns::default();
-        runs.start(45).expect("the first run claims the slot");
+        let _claim = runs
+            .start(&paths(45))
+            .expect("the first run claims the slot");
         assert!(
-            runs.start(45).is_err(),
+            runs.start(&paths(45)).is_err(),
             "two runs would put two git pulls in the same repository"
         );
     }
@@ -170,29 +321,29 @@ mod tests {
     #[test]
     fn a_new_run_may_start_once_the_last_one_finished() {
         let runs = UpdateAllRuns::default();
-        runs.start(2).expect("first");
-        runs.finished(report());
-        runs.start(2).expect("the slot is free again");
+        runs.start(&paths(2)).expect("first").finished(report());
+        let _claim = runs.start(&paths(2)).expect("the slot is free again");
     }
 
     #[test]
     fn cancel_sets_the_flag_the_run_reads() {
         let runs = UpdateAllRuns::default();
-        let stop = runs.start(3).expect("start");
+        let claim = runs.start(&paths(3)).expect("start");
+        let stop = claim.stop_flag();
         assert!(!stop.load(Ordering::SeqCst));
         runs.cancel().expect("cancel");
         assert!(
             stop.load(Ordering::SeqCst),
             "cancel must set the flag the loop checks between repositories"
         );
+        claim.finished(report());
     }
 
     #[test]
     fn cancelling_nothing_is_an_error_rather_than_a_quiet_success() {
         let runs = UpdateAllRuns::default();
         assert!(runs.cancel().is_err(), "there is no run to stop");
-        runs.start(1).expect("start");
-        runs.finished(report());
+        runs.start(&paths(1)).expect("start").finished(report());
         assert!(
             runs.cancel().is_err(),
             "a Cancel that appears to work on a finished run is its own small lie"
@@ -204,11 +355,19 @@ mod tests {
     #[test]
     fn the_outcome_can_be_read_back_after_the_run_ends() {
         let runs = UpdateAllRuns::default();
-        runs.start(1).expect("start");
-        runs.progress(1, 1);
-        runs.finished(report());
+        let claim = runs.start(&paths(1)).expect("start");
+        runs.outcome_landed(outcome("repo-0", UpdateResult::AlreadyLevel));
+        assert!(matches!(
+            runs.state(),
+            Some(UpdateAllState::Running {
+                done: 1,
+                total: 1,
+                ..
+            })
+        ));
+        claim.finished(report());
         match runs.state() {
-            Some(UpdateAllState::Done { report }) => {
+            Some(UpdateAllState::Done { report, .. }) => {
                 assert_eq!(report.outcomes.len(), 1);
             }
             other => {
@@ -220,9 +379,8 @@ mod tests {
     #[test]
     fn a_late_progress_frame_cannot_resurrect_a_finished_run() {
         let runs = UpdateAllRuns::default();
-        runs.start(2).expect("start");
-        runs.finished(report());
-        runs.progress(1, 2);
+        runs.start(&paths(2)).expect("start").finished(report());
+        runs.outcome_landed(outcome("repo-1", UpdateResult::AlreadyLevel));
         assert!(
             matches!(runs.state(), Some(UpdateAllState::Done { .. })),
             "a finished run stays finished"
@@ -232,5 +390,95 @@ mod tests {
     #[test]
     fn a_process_that_has_run_nothing_says_so() {
         assert!(UpdateAllRuns::default().state().is_none());
+    }
+
+    /// #1946: a client compares run numbers to tell the report of the run
+    /// it started from the one already on record when it clicked.
+    #[test]
+    fn each_run_gets_its_own_number() {
+        let runs = UpdateAllRuns::default();
+        runs.start(&paths(1)).expect("first").finished(report());
+        let first = match runs.state() {
+            Some(UpdateAllState::Done { run, .. }) => run,
+            other => panic!("{other:?}"),
+        };
+        let _claim = runs.start(&paths(1)).expect("second");
+        match runs.state() {
+            Some(UpdateAllState::Running { run, .. }) => assert!(run > first),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// #1947: the run panics after one repository. The registry must not
+    /// stay `Running` (which refused every later run until a restart), and
+    /// the repository it already updated must still be reported.
+    #[test]
+    fn a_run_that_dies_frees_the_slot_and_keeps_what_it_applied() {
+        let runs = UpdateAllRuns::default();
+        let claim = runs.start(&paths(3)).expect("start");
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runs.outcome_landed(outcome(
+                "repo-0",
+                UpdateResult::Updated {
+                    message: "Fast-forward".into(),
+                },
+            ));
+            panic!("the blocking task panicked");
+        }));
+        assert!(died.is_err());
+        let mut scope = report();
+        scope.outcomes = vec![outcome(
+            "gone",
+            UpdateResult::Skipped {
+                reason: "no longer found".into(),
+            },
+        )];
+        scope.unreadable = vec!["/locked".into()];
+        let recorded = claim.failed("the update run failed to finish".into(), scope);
+        assert_eq!(recorded.unreadable, vec!["/locked".to_string()]);
+
+        match runs.state() {
+            Some(UpdateAllState::Failed { reason, report, .. }) => {
+                assert!(reason.contains("failed to finish"), "{reason}");
+                let results: Vec<_> = report
+                    .outcomes
+                    .iter()
+                    .map(|o| (o.path.as_str(), &o.result))
+                    .collect();
+                assert!(
+                    matches!(results[0], ("repo-0", UpdateResult::Updated { .. })),
+                    "the applied update is not discarded: {results:?}"
+                );
+                assert_eq!(results[1], ("repo-1", &UpdateResult::NotAttempted));
+                assert_eq!(results[2], ("repo-2", &UpdateResult::NotAttempted));
+                assert!(matches!(results[3], ("gone", UpdateResult::Skipped { .. })));
+                assert_eq!(results.len(), 4);
+            }
+            other => panic!("a dead run must not read as running: {other:?}"),
+        }
+        let _next = runs
+            .start(&paths(1))
+            .expect("a dead run must not refuse every later one");
+    }
+
+    /// #1947, the guard itself: a claim dropped without being settled --
+    /// the command's future dropped, or an early return nobody wrote a
+    /// `failed` for -- still ends the run.
+    #[test]
+    fn a_claim_dropped_unsettled_ends_the_run() {
+        let runs = UpdateAllRuns::default();
+        {
+            let _claim = runs.start(&paths(2)).expect("start");
+            runs.outcome_landed(outcome("repo-0", UpdateResult::AlreadyLevel));
+        }
+        match runs.state() {
+            Some(UpdateAllState::Failed { report, .. }) => {
+                assert_eq!(report.outcomes.len(), 2);
+                assert_eq!(report.outcomes[0].result, UpdateResult::AlreadyLevel);
+                assert_eq!(report.outcomes[1].result, UpdateResult::NotAttempted);
+            }
+            other => panic!("an abandoned run must not stay running: {other:?}"),
+        }
+        let _next = runs.start(&paths(1)).expect("the slot is free");
     }
 }

@@ -38,6 +38,8 @@ export interface RemoteEvents {
   "worktree-safety": Worktree;
   "claude-session-activity": SessionActivity;
   "claude-transcript-activity": TranscriptActivity;
+  /// `(done, total)`, counts only (#1946).
+  "update-all-progress": [number, number];
 }
 
 /// Existing remote command without a frontend wrapper. Mirrors ClaudeLiveState

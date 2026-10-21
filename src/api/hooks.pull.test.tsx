@@ -7,7 +7,7 @@ const invoke = vi.hoisted(() => vi.fn(() => Promise.resolve("Already up to date.
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
-import { useFetchRefs, usePullCheckout, useUpdateAllRepositories } from "./hooks";
+import { useFetchRefs, usePullCheckout, useUpdateAllRepositories, useUpdateAllState } from "./hooks";
 
 /// #346: "Update to latest" appeared to do nothing — the row stayed
 /// yellow saying "N commits behind" for ~10 seconds after a SUCCESSFUL
@@ -101,5 +101,53 @@ describe("the overview's verdicts are refreshed by everything that moves a ref",
       await result.current();
     });
     await waitFor(() => expect(invalidated).toContain("repo-upstream"));
+  });
+
+  /// #1947, #1954: a rejected run may still have moved repositories (one
+  /// that died part-way), and the phone's call gives up while the desktop
+  /// carries on -- so the views are refreshed on a rejection too.
+  it("is invalidated by an Update All that rejected", async () => {
+    invoke.mockImplementationOnce(() => Promise.reject(new Error("the update run failed to finish")));
+    const invalidated = await invalidationsOf(async (qc) => {
+      const { result } = renderHook(() => useUpdateAllRepositories(), {
+        wrapper: wrapperFor(qc),
+      });
+      await result.current().catch(() => {});
+    });
+    await waitFor(() => expect(invalidated).toContain("repo-upstream"));
+    expect(invalidated).toContain("worktrees");
+    expect(invalidated).toContain("update-all-state");
+  });
+});
+
+/// #1946: the run outlives whoever started it, so the registry is read --
+/// polled while the run is going -- and when a run it watched ends, the
+/// repository views are refreshed, since the caller that would have done
+/// it may be long gone.
+describe("useUpdateAllState", () => {
+  beforeEach(() => invoke.mockReset());
+
+  it("reads the registry, and refreshes the repository views when a watched run ends", async () => {
+    const states: unknown[] = [
+      { state: "running", run: 3, done: 1, total: 2 },
+      { state: "done", run: 3, report: { outcomes: [], cancelled: false, timedOut: false, unreadable: [] } },
+    ];
+    invoke.mockImplementation((() => Promise.resolve(states.length > 1 ? states.shift() : states[0])) as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidated: unknown[] = [];
+    const original = qc.invalidateQueries.bind(qc);
+    vi.spyOn(qc, "invalidateQueries").mockImplementation((filters) => {
+      invalidated.push((filters as { queryKey?: unknown[] })?.queryKey?.[0]);
+      return original(filters);
+    });
+    const { result } = renderHook(() => useUpdateAllState(), { wrapper: wrapperFor(qc) });
+    await waitFor(() => expect(result.current.data).toMatchObject({ state: "running", done: 1 }));
+    expect((invoke.mock.calls as unknown[][])[0]?.[0]).toBe("update_all_state");
+    expect(invalidated).not.toContain("worktrees");
+    // The poll, without waiting out its interval.
+    await result.current.refetch();
+    await waitFor(() => expect(result.current.data).toMatchObject({ state: "done", run: 3 }));
+    await waitFor(() => expect(invalidated).toContain("worktrees"));
+    expect(invalidated).toContain("repo-upstream");
   });
 });

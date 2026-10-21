@@ -146,7 +146,7 @@ export const wireGraph: WireGraph = {
   "update_all_repositories": 995,
   "update_all_state": 1008,
   "update_pr_branch": 201,
-  "update_run_state": 1012
+  "update_run_state": 1013
 },
 "events": {
   "claude-population-updated": 0,
@@ -168,7 +168,8 @@ export const wireGraph: WireGraph = {
   "worktree-size": 142,
   "worktree-safety": 143,
   "claude-session-activity": 198,
-  "claude-transcript-activity": 199
+  "claude-transcript-activity": 199,
+  "update-all-progress": 108
 },
 "nodes": [
   {"t":"literal","v":null},
@@ -1179,11 +1180,12 @@ export const wireGraph: WireGraph = {
   {"t":"object","props":[["state",81,false],["error",10,false]]},
   {"t":"object","props":[["state",1007,false]]},
   {"t":"literal","v":"notAttempted"},
-  {"t":"union","of":[0,1009,1010]},
-  {"t":"object","props":[["state",331,false],["done",37,false],["total",37,false]]},
-  {"t":"object","props":[["state",1011,false],["report",995,false]]},
+  {"t":"union","of":[0,1009,1010,1012]},
+  {"t":"object","props":[["state",331,false],["run",37,false],["done",37,false],["total",37,false]]},
+  {"t":"object","props":[["state",1011,false],["run",37,false],["report",995,false]]},
   {"t":"literal","v":"done"},
-  {"t":"union","of":[0,1013,1014]},
+  {"t":"object","props":[["state",81,false],["run",37,false],["reason",10,false],["report",995,false]]},
+  {"t":"union","of":[0,1014,1015]},
   {"t":"object","props":[["state",331,false],["done",37,false],["total",37,false]]},
   {"t":"object","props":[["state",1011,false],["outcome",109,false]]}
 ]

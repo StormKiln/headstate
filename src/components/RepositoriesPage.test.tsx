@@ -134,6 +134,7 @@ vi.mock("../api/hooks", () => ({
   useUpdateAllRepositories: () => vi.fn(),
   useCancelUpdateAll: () => vi.fn(),
   useUpdateAllProgress: () => null,
+  useUpdateAllState: () => ({ data: null, refetch: () => Promise.resolve(null) }),
 }));
 
 vi.mock("@/store/filters", async (orig) => ({
