@@ -1149,8 +1149,24 @@ pub(crate) fn tick_state(phase: &source_poll::Phase) -> &'static str {
     }
 }
 
-/// A separate timer advances existing visible queue traversals only. Hidden
-/// windows use the ordinary configured cadence; no second hidden poll exists.
+/// A separate 15 s timer advances queue traversals between full ticks.
+///
+/// An INCOMPLETE traversal advances whether or not anyone is looking
+/// (#1935). Each step reads at most two pages, and gating the next step
+/// on visibility left it waiting for the full tick -- 600 s hidden -- so
+/// a 200-PR queue left in the background took about half an hour to
+/// fill. A traversal that has started is work already committed to, and
+/// idling halfway through it is the one thing this clock exists to stop.
+///
+/// It is not a second hidden poll. Nothing here STARTS a traversal --
+/// `started_at` must already be set, which only the full tick does -- and
+/// the reads go through the same `ReadClass::Background` admission and
+/// rate-limit budget as the tick, so a foreground read still goes first
+/// and an exhausted budget still refuses. A failed step backs off through
+/// `eligible_at` exactly as it does when visible.
+///
+/// Repairs and candidate confirmations are refinements of a list that is
+/// already populated, not population, so they stay on the visible clock.
 pub(crate) fn queue_continuation_due(
     state: &crate::queue_scan::State,
     now: i64,
@@ -1158,13 +1174,21 @@ pub(crate) fn queue_continuation_due(
     view_needs_github: bool,
     enabled: bool,
 ) -> bool {
-    focused
-        && view_needs_github
-        && enabled
-        && ((!state.done && state.started_at.is_some() && now >= state.eligible_at)
-            || state.repair_due(now)
-            || state.candidates.iter().any(|c| c.eligible_at <= now))
+    let visible = focused && view_needs_github;
+    let incomplete = !state.done && state.started_at.is_some() && now >= state.eligible_at;
+    enabled
+        && (incomplete
+            || (visible
+                && (state.repair_due(now)
+                    || state.candidates.iter().any(|c| c.eligible_at <= now))))
 }
+
+/// How often the continuation clock looks for a due traversal step.
+///
+/// Matches the `eligible_at = now + 15` a successful step sets in
+/// `github/scan.rs`, so a traversal advances once per step delay rather
+/// than once per full tick.
+pub(crate) const CONTINUATION_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The production continuation clock and visibility dispatch boundary. The
 /// adapter owns checkpoint/provider/publication work; sleeping happens after
@@ -1175,7 +1199,7 @@ pub(crate) async fn run_queue_continuations<F, Fut>(
     enabled: Arc<AtomicBool>,
     dispatch: F,
 ) where
-    F: FnMut(CachedList) -> Fut,
+    F: FnMut(CachedList, bool) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     run_queue_continuations_observed(
@@ -1194,29 +1218,40 @@ async fn run_queue_continuations_observed<F, Fut>(
     mut dispatch: F,
     recorder: Option<&crate::measurement::Recorder>,
 ) where
-    F: FnMut(CachedList) -> Fut,
+    F: FnMut(CachedList, bool) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Before the wait, so a clock stuck in a dispatch is overdue
+        // (#1937).
+        crate::background::GITHUB_CONTINUATION.tick(CONTINUATION_INTERVAL);
+        tokio::time::sleep(CONTINUATION_INTERVAL).await;
         crate::queue_measurement::aggregate(
             recorder,
             crate::measurement::AggregateKind::Tick,
             crate::measurement::WorkClass::Background,
         );
+        let mut hidden_counted = false;
         for list in [CachedList::Authored, CachedList::Reviewing] {
-            if !focused.load(Ordering::Relaxed)
-                || !view_needs_github.load(Ordering::Relaxed)
-                || !enabled.load(Ordering::Relaxed)
-            {
+            if !enabled.load(Ordering::Relaxed) {
+                break;
+            }
+            // Visibility no longer stops the clock (#1935): it is handed
+            // to the dispatcher, whose `queue_continuation_due` decides
+            // which work a hidden window still owes. Still counted once
+            // per tick, as before, so the journal's hidden-tick figure
+            // keeps its meaning.
+            let visible =
+                focused.load(Ordering::Relaxed) && view_needs_github.load(Ordering::Relaxed);
+            if !visible && !hidden_counted {
+                hidden_counted = true;
                 crate::queue_measurement::aggregate(
                     recorder,
                     crate::measurement::AggregateKind::Hidden,
                     crate::measurement::WorkClass::Background,
                 );
-                break;
             }
-            dispatch(list).await;
+            dispatch(list, visible).await;
         }
     }
 }
@@ -1228,7 +1263,7 @@ async fn continue_queues(
     view_needs_github: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
 ) {
-    run_queue_continuations(focused, view_needs_github, enabled, move |list| {
+    run_queue_continuations(focused, view_needs_github, enabled, move |list, visible| {
         let app = app.clone();
         let client = client.clone();
         async move {
@@ -1248,8 +1283,8 @@ async fn continue_queues(
                 Some(queue_continuation_due(
                     &loaded.state,
                     chrono::Utc::now().timestamp(),
-                    true,
-                    true,
+                    visible,
+                    visible,
                     true,
                 ))
             })
@@ -1276,6 +1311,20 @@ async fn continue_queues(
             ));
             let fetched =
                 source_poll::fetch_github_continuation(&app, &scoped, list, FETCH_TIMEOUT).await;
+            let health = match &fetched {
+                Ok(_) => crate::background::Cycle::Ok,
+                Err(e) if source_poll::Failure::from(e).not_asked => {
+                    crate::background::Cycle::NotAsked
+                }
+                Err(e) => crate::background::Cycle::Failed(crate::redact::redact(&format!(
+                    "{list:?} continuation: {e}"
+                ))),
+            };
+            crate::background::announce_degraded(
+                &app,
+                &crate::background::GITHUB_CONTINUATION,
+                crate::background::GITHUB_CONTINUATION.record_cycle(&[health]),
+            );
             let publication = if fetched.is_ok() {
                 source_poll::success_publication(&app, &attempt).await
             } else {
@@ -1347,6 +1396,8 @@ pub fn spawn(
             if !github_source_enabled.load(Ordering::Relaxed) {
                 // Source selection pauses GitHub network work, including the
                 // initial tick after a relaunch. Switching back wakes us.
+                // Waiting on purpose, with no deadline: not a stall (#1937).
+                crate::background::GITHUB_POLL.park();
                 waker.notified().await;
                 continue;
             }
@@ -1390,6 +1441,15 @@ pub fn spawn(
                         },
                     )),
                 };
+                // The loop's own health (#1937). A declined request was
+                // not sent, so it neither failed nor succeeded (#1928).
+                let health = match (&fetched, &tick_failure) {
+                    (Err(e), _) if source_poll::Failure::from(e).not_asked => {
+                        crate::background::Cycle::NotAsked
+                    }
+                    (_, Some((message, _))) => crate::background::Cycle::Failed(message.clone()),
+                    _ => crate::background::Cycle::Ok,
+                };
                 let authored_publication = if fetched.is_ok() {
                     source_poll::success_publication(&app, &authored_attempt).await
                 } else {
@@ -1406,7 +1466,10 @@ pub fn spawn(
                                     Err(failure) => {
                                         let message = failure.message.clone();
                                         source_poll::complete(&app, publication, Err(failure));
-                                        return (fetch_ms, Some((message, None)));
+                                        let health = crate::background::Cycle::Failed(
+                                            crate::redact::redact(&message),
+                                        );
+                                        return (fetch_ms, Some((message, None)), health);
                                     }
                                 };
                             let receipt = result.clone();
@@ -1511,7 +1574,7 @@ pub fn spawn(
                         }
                     }
                 }
-                (fetch_ms, tick_failure)
+                (fetch_ms, tick_failure, health)
             };
             let reviewing_work = async |budget| {
                 let reviewing_attempt =
@@ -1530,6 +1593,13 @@ pub fn spawn(
                     Err(failure) if failure.not_asked => "not asked",
                     Err(_) => "failed",
                 };
+                let health = match &reviewing_now {
+                    Ok(_) => crate::background::Cycle::Ok,
+                    Err(failure) if failure.not_asked => crate::background::Cycle::NotAsked,
+                    Err(failure) => crate::background::Cycle::Failed(crate::redact::redact(
+                        &format!("review queue: {}", failure.message),
+                    )),
+                };
                 // Each successful queue survives a failure from the other queue.
                 let review_publication = if reviewing_now.is_ok() {
                     source_poll::success_publication(&app, &reviewing_attempt).await
@@ -1544,8 +1614,12 @@ pub fn spawn(
                             {
                                 Ok(now) => now,
                                 Err(failure) => {
+                                    let health =
+                                        crate::background::Cycle::Failed(crate::redact::redact(
+                                            &format!("review queue: {}", failure.message),
+                                        ));
                                     source_poll::complete(&app, publication, Err(failure));
-                                    return "failed";
+                                    return ("failed", health);
                                 }
                             };
                             let prefs = read_notify_prefs(&app).await;
@@ -1565,26 +1639,35 @@ pub fn spawn(
                         Err(error) => source_poll::complete(&app, publication, Err(error)),
                     }
                 }
-                reviewing_outcome
+                (reviewing_outcome, health)
             };
             let (authored_outcome, reviewing_outcome) =
                 prioritized_pair(client.reviewing_first(), authored_work, reviewing_work).await;
             // A list left unasked keeps its last status and receipt: it was
             // not sent, so nothing failed (#1932).
-            let reviewing_outcome = reviewing_outcome.unwrap_or("not asked");
+            let (reviewing_outcome, reviewing_health) =
+                reviewing_outcome.unwrap_or(("not asked", crate::background::Cycle::NotAsked));
+            let authored_health = authored_outcome
+                .as_ref()
+                .map_or(crate::background::Cycle::NotAsked, |(_, _, h)| h.clone());
+            crate::background::announce_degraded(
+                &app,
+                &crate::background::GITHUB_POLL,
+                crate::background::GITHUB_POLL.record_cycle(&[authored_health, reviewing_health]),
+            );
             crate::diag!(
                 "[diag] poll tick fetch done {}ms authored={} reviewing={}",
                 tick_started.elapsed().as_millis(),
                 match &authored_outcome {
                     None => "not asked",
-                    Some((_, None)) => "ok",
-                    Some((_, Some(_))) => "failed",
+                    Some((_, None, _)) => "ok",
+                    Some((_, Some(_), _)) => "failed",
                 },
                 reviewing_outcome
             );
             // The report describes the open-pull-request search; a tick that
             // did not send it has no outcome to record for it.
-            if let Some((fetch_ms, tick_failure)) = authored_outcome {
+            if let Some((fetch_ms, tick_failure, _)) = authored_outcome {
                 let ok = tick_failure.is_none();
                 let (error, timed_out_after_secs) = tick_failure.unzip();
                 crate::report::record_tick(crate::report::PollTickRecord {
@@ -1613,6 +1696,7 @@ pub fn spawn(
                 interval_secs.load(Ordering::Relaxed),
             );
             crate::diag!("[diag] poll tick sleeping {}s", sleep_for.as_secs());
+            crate::background::GITHUB_POLL.tick(sleep_for);
             crate::report::note_wait(sleep_for.as_secs());
             tokio::select! {
                 _ = tokio::time::sleep(interval_for_secs(
@@ -1688,7 +1772,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn measurement_continuation_clock_observes_hidden_ticks_without_new_dispatch() {
+    async fn measurement_continuation_clock_records_hidden_ticks_and_says_so_to_dispatch() {
         use crate::measurement::{Config, Platform, Recorder, Role};
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(Config {
@@ -1701,13 +1785,19 @@ mod tests {
         .unwrap();
         recorder.set_enabled(true);
         let focused = Arc::new(AtomicBool::new(false));
-        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let visible_calls = std::sync::atomic::AtomicUsize::new(0);
+        let hidden_calls = std::sync::atomic::AtomicUsize::new(0);
         let run = run_queue_continuations_observed(
             focused,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
+            |_, visible| {
+                if visible {
+                    &visible_calls
+                } else {
+                    &hidden_calls
+                }
+                .fetch_add(1, Ordering::Relaxed);
                 async {}
             },
             Some(&recorder),
@@ -1715,7 +1805,10 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_secs(31), run)
             .await
             .is_err());
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        // Two 15 s ticks, both lists each time, every one marked hidden:
+        // the dispatcher decides what a hidden window is still owed.
+        assert_eq!(visible_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(hidden_calls.load(Ordering::Relaxed), 4);
         tokio::time::resume();
         let path = dir.path().canonicalize().unwrap().join("report.jsonl");
         recorder.export_to(path.clone()).await.unwrap();
@@ -1725,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_continuations_only_advance_due_visible_existing_passes() {
+    fn queue_continuations_only_advance_due_existing_passes() {
         let mut state = crate::queue_scan::State {
             started_at: Some(1000),
             eligible_at: 1015,
@@ -1733,15 +1826,13 @@ mod tests {
         };
         assert!(!queue_continuation_due(&state, 1014, true, true, true));
         assert!(queue_continuation_due(&state, 1015, true, true, true));
-        for flags in [
-            (false, true, true),
-            (true, false, true),
-            (true, true, false),
-        ] {
-            assert!(!queue_continuation_due(
-                &state, 2000, flags.0, flags.1, flags.2
-            ));
-        }
+        // An incomplete traversal is owed its next step whether or not
+        // the window is focused or the view shows PRs (#1935)...
+        assert!(queue_continuation_due(&state, 2000, false, true, true));
+        assert!(queue_continuation_due(&state, 2000, true, false, true));
+        assert!(queue_continuation_due(&state, 2000, false, false, true));
+        // ...but never while the GitHub source is switched off.
+        assert!(!queue_continuation_due(&state, 2000, true, true, false));
         state.done = true;
         assert!(!queue_continuation_due(&state, 2000, true, true, true));
         state.done = false;
@@ -1750,6 +1841,86 @@ mod tests {
         // Configured full-poll cadence stays independent of queue progress.
         assert_eq!(interval_for_secs(true, 300), Duration::from_secs(300));
         assert_eq!(interval_for_secs(false, 300), Duration::from_secs(1500));
+    }
+
+    /// A finished list's refinements are not population: a hidden window
+    /// leaves repairs and candidate confirmations to the visible clock.
+    #[test]
+    fn hidden_windows_owe_no_repair_or_confirmation() {
+        let mut state = crate::queue_scan::State {
+            started_at: Some(1000),
+            done: true,
+            eligible_at: 1015,
+            ..Default::default()
+        };
+        state.candidates.push_back(crate::queue_scan::Candidate {
+            isolated: false,
+            identity: crate::identity::PrIdentity {
+                source: Source::default(),
+                repo: "o/r".into(),
+                number: 1,
+            },
+            id: "id".into(),
+            head: "h".into(),
+            created_at: chrono::Utc::now(),
+            negative_at: None,
+            eligible_at: 1015,
+            failures: 0,
+        });
+        assert!(queue_continuation_due(&state, 2000, true, true, true));
+        assert!(!queue_continuation_due(&state, 2000, false, true, true));
+        assert!(!queue_continuation_due(&state, 2000, true, false, true));
+    }
+
+    /// #1935: an incomplete traversal left in a hidden window advances on
+    /// the continuation clock, not on the 600 s tick. Before the fix the
+    /// clock skipped dispatch entirely while hidden, so a 200-PR queue
+    /// moved two pages per full tick -- about half an hour.
+    #[tokio::test(start_paused = true)]
+    async fn a_hidden_incomplete_traversal_steps_at_the_continuation_interval() {
+        let hidden = Arc::new(AtomicBool::new(false));
+        let state = std::sync::Mutex::new(crate::queue_scan::State {
+            started_at: Some(0),
+            eligible_at: 0,
+            ..Default::default()
+        });
+        let started = tokio::time::Instant::now();
+        let steps = std::sync::Mutex::new(Vec::<Duration>::new());
+        let run = run_queue_continuations_observed(
+            hidden.clone(),
+            hidden,
+            Arc::new(AtomicBool::new(true)),
+            |list, visible| {
+                let elapsed = started.elapsed();
+                let now = elapsed.as_secs() as i64;
+                let mut s = state.lock().unwrap();
+                // The production adapter's decision, with the flags the
+                // clock handed over.
+                if list == CachedList::Authored
+                    && queue_continuation_due(&s, now, visible, visible, true)
+                {
+                    steps.lock().unwrap().push(elapsed);
+                    // What `github/scan.rs` does after a clean step.
+                    s.eligible_at = now + 15;
+                }
+                async {}
+            },
+            None,
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(61), run)
+            .await
+            .is_err());
+        let steps = steps.into_inner().unwrap();
+        assert_eq!(
+            steps,
+            (1..=4)
+                .map(|n| CONTINUATION_INTERVAL * n)
+                .collect::<Vec<_>>(),
+            "a hidden incomplete traversal must step every {CONTINUATION_INTERVAL:?}, \
+             not wait for the {:?} hidden tick",
+            interval_for(false)
+        );
+        assert!(CONTINUATION_INTERVAL < interval_for(false));
     }
 
     /// The worst case in the six-day log: 8 fetched of 29 open (#745).

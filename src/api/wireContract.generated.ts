@@ -379,7 +379,7 @@ export const wireGraph: WireGraph = {
   {"t":"object","props":[["path",10,false],["branch",10,false],["commits_ahead",92,false],["files_changed",92,false],["insertions",92,false],["deletions",92,false],["last_activity",9,false],["has_upstream",176,false],["subjects",206,false],["subjects_elided",37,false],["uncommitted",92,false],["base",10,false],["fetched_at",9,false]]},
   {"t":"union","of":[0,60]},
   {"t":"array","item":208},
-  {"t":"object","props":[["task",10,false],["consecutive_failures",37,false],["total_failures",37,false],["last_error",9,false],["last_success_ms",92,false],["degraded",41,false]]},
+  {"t":"object","props":[["task",10,false],["consecutive_failures",37,false],["total_failures",37,false],["last_error",9,false],["last_success_ms",92,false],["last_tick_ms",84,true],["stalled",38,true],["degraded",41,false]]},
   {"t":"tuple","items":[10,10],"min":2},
   {"t":"array","item":211},
   {"t":"object","props":[["path",10,false],["label",10,false],["reports",212,false]]},

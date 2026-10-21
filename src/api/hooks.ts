@@ -350,20 +350,45 @@ export function usePollState(): "idle" | "fetching" | "retrying" {
   return state;
 }
 
+/// Which views render polled GitHub pull-request data (#1936).
+///
+/// An ALLOWLIST, total over `View`: a view added to `ALL_VIEWS` does not
+/// typecheck until someone decides which way it goes. The previous
+/// `view !== "worktrees"` was a one-entry denylist, so Repositories,
+/// Branches, System Health, Claude Code and every later view kept the
+/// focused GitHub cadence and competed for scan permits while showing no
+/// pull request at all.
+const VIEW_NEEDS_GITHUB: Record<View, boolean> = {
+  "my-prs": true,
+  "to-review": true,
+  worktrees: false,
+  branches: false,
+  docker: false,
+  artifacts: false,
+  packages: false,
+  "claude-md": false,
+  "claude-code": false,
+  repositories: false,
+  "system-health": false,
+};
+
 /// Keep the poll cadence in step with the active view.
 ///
-/// The worktrees view needs no GitHub data, so the loop drops to the
-/// background rate while it is open. It does NOT stop: the tray badge
-/// would silently go stale, and the badge staying honest while the window
-/// is not being watched is the reason polling lives in Rust.
-export function useViewCadence(view: string): void {
+/// Only views in `VIEW_NEEDS_GITHUB` ask for the focused rate; every other
+/// view drops the loop to the background rate. It does NOT stop: the tray
+/// badge would silently go stale, and the badge staying honest while the
+/// window is not being watched is the reason polling lives in Rust.
+export function useViewCadence(view: View): void {
   useEffect(() => {
     // Phone demand uses explicit minute/resume refreshes; cadence belongs to the desktop.
     if (IS_MOBILE_BUILD) return;
-    // Tolerate a host without the command, as the other listeners do:
-    // cadence is an optimisation, and failing to set it must not break
-    // the page.
-    void setViewNeedsGithub(view !== "worktrees", view === "to-review").catch(() => {});
+    // Cadence is an optimisation, so a host without the command must not
+    // break the page -- but the failure is logged rather than swallowed,
+    // because a cadence the backend never heard about is otherwise
+    // invisible.
+    void setViewNeedsGithub(VIEW_NEEDS_GITHUB[view], view === "to-review").catch((e: unknown) => {
+      console.warn("set_view_needs_github failed", e);
+    });
   }, [view]);
 }
 
@@ -4295,7 +4320,31 @@ export function usePollInterval() {
 /// Returns the raw list rather than a boolean, unlike the panic hook:
 /// the notice names WHICH loop failed and why, and a boolean would make
 /// that impossible.
+///
+/// `background-degraded` re-reads it at once (#1937). The backend emits it
+/// the moment a loop crosses the failure threshold, and for a long time
+/// nothing listened, so the notice waited up to 30 s for news already
+/// sent. The poll stays: a STALLED loop cannot announce itself -- it is
+/// the thing that is stuck -- so only the poll ever sees a stall.
 export function useBackgroundHealth() {
+  const qc = useQueryClient();
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen("background-degraded", () => {
+      void qc.invalidateQueries({ queryKey: ["background-health"] });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [qc]);
   return useQuery<TaskHealth[]>({
     queryKey: ["background-health"],
     queryFn: backgroundHealth,
