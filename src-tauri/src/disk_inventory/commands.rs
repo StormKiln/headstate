@@ -344,7 +344,7 @@ pub async fn start_disk_inventory(app: AppHandle) -> Result<Status, String> {
     controller()
         .start(
             crate::commands::db_path(&app),
-            crate::commands::get_worktree_dirs(app),
+            crate::commands::get_worktree_dirs(app).await,
         )
         .await
 }

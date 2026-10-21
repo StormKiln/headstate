@@ -284,9 +284,10 @@ fn snapshot_source(app: &AppHandle) -> SnapshotSource {
     Arc::new(move || {
         let app = app.clone();
         Box::pin(async move {
-            let loaded =
-                tauri::async_runtime::spawn_blocking(move || crate::commands::get_cached(app))
-                    .await;
+            let loaded = tauri::async_runtime::spawn_blocking(move || {
+                crate::commands::get_cached_blocking(app)
+            })
+            .await;
             match loaded {
                 Ok(Ok(prs)) => serde_json::to_string(&prs).ok(),
                 Ok(Err(e)) => {

@@ -5761,4 +5761,315 @@ let f = std::env::temp_dir;
             vec!["fixture.rs:13: let tx = conn.unchecked_transaction()?;".to_string()]
         );
     }
+
+    /// What [`sync_command_db_offenders`] saw: how many commands it read,
+    /// which functions it found to open the database, and the sync
+    /// commands that reach one.
+    struct SyncDbScan {
+        commands: usize,
+        openers: std::collections::BTreeSet<String>,
+        offenders: Vec<String>,
+    }
+
+    /// How a body calls a function named `name`: `None` for a bare
+    /// `name(`, `Some(segment)` for `segment::name(`. Method calls
+    /// (`.name(`) and identifiers that merely END in `name` are not calls
+    /// of it, and are left out.
+    fn calls_of<'a>(body: &'a str, name: &str) -> Vec<Option<&'a str>> {
+        let pat = format!("{name}(");
+        body.match_indices(&pat)
+            .filter_map(|(at, _)| {
+                if let Some(before) = body[..at].strip_suffix("::") {
+                    let seg = before
+                        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .map_or(before, |i| &before[i + 1..]);
+                    return Some(Some(seg));
+                }
+                let prev = body[..at].chars().next_back();
+                (!prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')).then_some(None)
+            })
+            .collect()
+    }
+
+    /// The sync `#[tauri::command]`s in one crate that open the database,
+    /// directly or through any chain of sync functions in that crate.
+    ///
+    /// # Resolving a call without a compiler
+    ///
+    /// By name alone, this tree's `new`, `get`, `load` and `status` would
+    /// each make hundreds of functions look like database openers: the
+    /// first draft of this guard did exactly that. So a call reaches a
+    /// helper only when it plausibly names THAT helper:
+    ///
+    /// - `name(`, bare: a helper of that name in the same file, or the only
+    ///   function of that name in the crate (an import).
+    /// - `module::name(`: a helper of that name in `module.rs` or
+    ///   `module/mod.rs`; for `crate::`, `self::` and `super::`, the
+    ///   bare rule.
+    /// - `Type::name(` and `.name(`: never. Those are associated functions
+    ///   and methods, which a free helper is not.
+    ///
+    /// `open_db` itself counts in every spelling. Async functions are never
+    /// followed: what an async fn does is not done on its caller's thread.
+    /// A body naming `spawn_blocking` is already on the pool and is read as
+    /// empty, as `no_sync_command_reaches_a_subprocess_or_a_whole_file`
+    /// reads it.
+    ///
+    /// Comment lines, trailing ` //` comments and every `#[cfg(test)]` item
+    /// are blanked first, so the line numbers in a failure are real ones.
+    fn sync_command_db_offenders(files: &[(PathBuf, String, String)]) -> SyncDbScan {
+        struct Item {
+            file: usize,
+            module: String,
+            at: String,
+            name: String,
+            command: bool,
+            sync: bool,
+            body: String,
+        }
+        let mut items: Vec<Item> = Vec::new();
+        for (index, (file, rel, src)) in files.iter().enumerate() {
+            let module = match file.file_stem().and_then(|s| s.to_str()) {
+                Some("mod") => file
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default(),
+                stem => stem.unwrap_or_default(),
+            }
+            .to_string();
+            let src = src.replace("\r\n", "\n");
+            let code: Vec<&str> = src
+                .lines()
+                .zip(test_mask(file, &src))
+                .map(|(line, test)| {
+                    if test || is_comment(line) {
+                        ""
+                    } else {
+                        line.split_once(" //").map_or(line, |(code, _)| code)
+                    }
+                })
+                .collect();
+            let mut commands = std::collections::BTreeSet::new();
+            for (i, line) in code.iter().enumerate() {
+                if line.trim().starts_with("#[tauri::command") {
+                    if let Some(f) =
+                        (i + 1..code.len().min(i + 12)).find(|j| fn_declared(code[*j]).is_some())
+                    {
+                        commands.insert(f);
+                    }
+                }
+            }
+            for (i, line) in code.iter().enumerate() {
+                if fn_declared(line).is_none() {
+                    continue;
+                }
+                let Some((name, first, end)) = fn_around(&code, i) else {
+                    continue;
+                };
+                if first != i {
+                    continue;
+                }
+                // The declaration itself is not a call: keep only what
+                // follows its opening brace on that line.
+                let head = line.split_once('{').map_or("", |(_, rest)| rest);
+                let body = std::iter::once(head)
+                    .chain(code[i + 1..end].iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                items.push(Item {
+                    file: index,
+                    module: module.clone(),
+                    at: format!("{rel}:{}", i + 1),
+                    name: name.to_string(),
+                    command: commands.contains(&i),
+                    sync: !line.contains("async fn "),
+                    body: if body.contains("spawn_blocking") {
+                        String::new()
+                    } else {
+                        body
+                    },
+                });
+            }
+        }
+
+        let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
+        for it in &items {
+            *declared.entry(it.name.as_str()).or_default() += 1;
+        }
+        // Whether `caller` reaches the function `target` names.
+        let reaches = |caller: &Item, target: &Item| {
+            let unique = declared.get(target.name.as_str()) == Some(&1);
+            calls_of(&caller.body, &target.name)
+                .into_iter()
+                .any(|call| match call {
+                    None | Some("crate" | "self" | "super") => caller.file == target.file || unique,
+                    Some(seg) => seg == target.module,
+                })
+        };
+
+        let mut opener: Vec<bool> = items
+            .iter()
+            .map(|it| it.sync && !calls_of(&it.body, "open_db").is_empty())
+            .collect();
+        loop {
+            let more: Vec<usize> = (0..items.len())
+                .filter(|&i| items[i].sync && !opener[i])
+                .filter(|&i| (0..items.len()).any(|t| opener[t] && reaches(&items[i], &items[t])))
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for i in more {
+                opener[i] = true;
+            }
+        }
+
+        let mut offenders = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            if !(it.command && it.sync) {
+                continue;
+            }
+            let mut via: Vec<&str> = (0..items.len())
+                .filter(|&t| t != i && opener[t] && reaches(it, &items[t]))
+                .map(|t| items[t].name.as_str())
+                .collect();
+            if !calls_of(&it.body, "open_db").is_empty() {
+                via.insert(0, "open_db");
+            }
+            via.dedup();
+            if !via.is_empty() {
+                offenders.push(format!("{}: {} reaches {}", it.at, it.name, via.join(", ")));
+            }
+        }
+        SyncDbScan {
+            commands: items.iter().filter(|it| it.command).count(),
+            openers: (0..items.len())
+                .filter(|&i| opener[i])
+                .map(|i| items[i].name.clone())
+                .collect(),
+            offenders,
+        }
+    }
+
+    /// **No sync `#[tauri::command]` opens the database (#1959).**
+    ///
+    /// Tauri runs a plain `fn` command on the main thread. `open_db` sets a
+    /// five-second `busy_timeout`, so a command that opens `headstate.db`
+    /// while a background writer holds it froze the whole window for up to
+    /// five seconds -- at mount of both PR pages, and on every settings
+    /// change. A sync command that does this inline on the remote surface
+    /// also stalls the phone's listener.
+    ///
+    /// Such a command is `async` and passes its body, kept as
+    /// `<name>_blocking`, to `commands::off_main_thread`.
+    ///
+    /// Reaching it through a helper counts: `get_gitlab_host` opened the
+    /// database only through `configured_gitlab_host`, and `get_ui_prefs`
+    /// only through `read_ui_prefs`. The scan follows sync helpers across
+    /// the crate, and asserts it still finds those two, so a change that
+    /// stopped it following helpers fails here instead of passing.
+    #[test]
+    fn no_sync_command_opens_the_database() {
+        let mut commands = 0usize;
+        let mut openers = std::collections::BTreeSet::new();
+        let mut offenders = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            let files: Vec<(PathBuf, String, String)> = rust_files(&root)
+                .into_iter()
+                // By PATH: this guard's own prose names `open_db`.
+                .filter(|file| !file.ends_with("invariants.rs"))
+                .filter_map(|file| {
+                    let src = std::fs::read_to_string(&file).ok()?;
+                    let rel = format!(
+                        "{crate_name}/{}",
+                        file.strip_prefix(&root).unwrap_or(&file).display()
+                    );
+                    Some((file, rel, src))
+                })
+                .collect();
+            let scan = sync_command_db_offenders(&files);
+            commands += scan.commands;
+            openers.extend(scan.openers);
+            offenders.extend(scan.offenders);
+        }
+        assert!(
+            commands >= 90,
+            "found only {commands} `#[tauri::command]` functions; the scan no longer \
+             matches the source and this guard is reading nothing"
+        );
+        for helper in ["read_ui_prefs", "configured_gitlab_host"] {
+            assert!(
+                openers.contains(helper),
+                "`{helper}` opens the database but the scan did not see it, so it is no \
+                 longer following helpers; openers seen: {openers:?}"
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "these `#[tauri::command]`s are a plain `fn` and open the database, directly or \
+             through a sync helper. Tauri runs a sync command on the main thread, and \
+             `open_db`'s five-second busy_timeout then freezes the window whenever a \
+             background writer holds the file (#1959). Make the command `async` and run \
+             the body, kept as `<name>_blocking`, through `commands::off_main_thread`:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The other direction: silent on prose, on test code, on async and
+    /// `spawn_blocking` commands and on a same-named METHOD; firing on a
+    /// direct open and on one reached through a helper, in a CRLF checkout.
+    #[test]
+    fn the_sync_command_db_guard_ignores_tests_prose_and_async_but_not_helpers() {
+        let file = PathBuf::from("fixture/does_not_exist.rs");
+        let safe = "/// A sync command must never call `open_db(&path)`.\n\
+                    #[tauri::command]\n\
+                    pub fn prose() -> u8 {\n    \
+                    // open_db(&path) would freeze the window\n    \
+                    store.read_prefs(); // read_prefs() is a method here\n    \
+                    1\n\
+                    }\n\
+                    #[tauri::command]\n\
+                    pub async fn reads(app: AppHandle) -> u8 {\n    \
+                    off_main_thread(move || read_prefs(&app)).await\n\
+                    }\n\
+                    #[tauri::command]\n\
+                    pub fn pooled() -> u8 {\n    \
+                    tauri::async_runtime::spawn_blocking(|| open_db(&path));\n    \
+                    2\n\
+                    }\n\
+                    fn read_prefs(app: &AppHandle) -> u8 {\n    \
+                    open_db(&db_path(app)).ok();\n    \
+                    3\n\
+                    }\n\
+                    #[cfg(test)]\n\
+                    mod tests {\n    \
+                    #[tauri::command]\n    \
+                    fn fixture() {\n        \
+                    open_db(&path).unwrap();\n    \
+                    }\n\
+                    }\n";
+        let scan = |src: &str| {
+            sync_command_db_offenders(&[(file.clone(), "fixture.rs".into(), src.into())])
+        };
+        let quiet = scan(safe);
+        assert_eq!(quiet.offenders, Vec::<String>::new());
+        assert_eq!(quiet.commands, 3, "the test-module command is not counted");
+        assert!(quiet.openers.contains("read_prefs"));
+
+        let unsafe_ = format!(
+            "{safe}#[tauri::command]\n\
+             pub fn direct() -> bool {{\n    open_db(&path).is_ok()\n}}\n\
+             #[tauri::command]\n\
+             pub fn helped(app: AppHandle) -> u8 {{\n    read_prefs(&app)\n}}\n"
+        )
+        .replace('\n', "\r\n");
+        assert_eq!(
+            scan(&unsafe_).offenders,
+            vec![
+                "fixture.rs:29: direct reaches open_db".to_string(),
+                "fixture.rs:33: helped reaches read_prefs".to_string(),
+            ]
+        );
+    }
 }
