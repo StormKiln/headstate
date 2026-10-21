@@ -23,6 +23,7 @@ pub mod identity;
 #[cfg(test)]
 mod invariants;
 pub mod inventory;
+mod log_dedup;
 mod markdown_export;
 pub mod measurement;
 mod measurement_desktop;

@@ -996,7 +996,11 @@ impl GitHubClient {
                 // answer -- the mistake v3.2.5 made.
                 Err(e) => {
                     failed_pages += 1;
-                    log::warn!("a page of the search failed ({e}); the list will be short");
+                    crate::log_dedup::log_while!(
+                        warn,
+                        "github.search_page_failed",
+                        "a page of the search failed ({e}); the list will be short"
+                    );
                 }
             }
         }
@@ -1242,10 +1246,17 @@ impl GitHubClient {
         let boundaries = v["headstate_paging"]["boundaries"].as_u64().unwrap_or(0);
         let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0);
         if short > expected_drift(boundaries, failed) {
-            log::warn!(
+            crate::log_dedup::log_while!(
+                warn,
+                "github.review_list_short",
                 "the review list is short: {} of {total} pull requests \
                  (GitHub could not answer the full query)",
                 mapped.len()
+            );
+        } else {
+            crate::log_dedup::log_cleared!(
+                "github.review_list_short",
+                "the review list is whole again"
             );
         }
         let refused = refused_fields(&v);
@@ -1994,13 +2005,32 @@ impl GitHubClient {
         // never repository names or titles.
         let elapsed = started.elapsed();
         if elapsed > std::time::Duration::from_secs(5) {
-            log::warn!("the pull request query took {:.1}s", elapsed.as_secs_f32());
+            crate::log_dedup::log_while!(
+                warn,
+                "github.slow_query",
+                "the pull request query took {:.1}s",
+                elapsed.as_secs_f32()
+            );
+        } else {
+            crate::log_dedup::log_cleared!(
+                "github.slow_query",
+                "the pull request query is fast again"
+            );
         }
         // Warn before the budget is actually gone, so the user learns
         // about it from a message rather than from a wall of failures.
         if let Some((remaining, reset)) = map_rate_limit(&v) {
             if remaining < 500 {
-                log::warn!("GitHub rate limit low: {remaining} remaining, resets at {reset}");
+                crate::log_dedup::log_while!(
+                    warn,
+                    "github.rate_limit_low",
+                    "GitHub rate limit low: {remaining} remaining, resets at {reset}"
+                );
+            } else {
+                crate::log_dedup::log_cleared!(
+                    "github.rate_limit_low",
+                    "GitHub rate limit recovered"
+                );
             }
             // And FEED the stats gate, which had no source of truth at all
             // (#843). This is the poll loop's own read -- it runs every
@@ -2124,7 +2154,9 @@ async fn graphql_with_transport(
                 .chars()
                 .take(200)
                 .collect();
-            log::warn!(
+            crate::log_dedup::log_while!(
+                warn,
+                "github.graphql_partial_errors",
                 "GraphQL returned {} error(s) alongside usable data; \
                  some results may be missing. Types: {:?}. Example: {}",
                 errs.len(),

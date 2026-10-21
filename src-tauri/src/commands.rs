@@ -1491,13 +1491,26 @@ fn remember_scan<T: serde::Serialize>(
         log::warn!("scan cache: could not serialise a {kind:?} result");
         return;
     };
+    // Logged on change (#1966): this runs after every scan, so a broken
+    // database repeated the same line for as long as it stayed broken.
     match open_db(&db_path(app)) {
         Ok(conn) => {
             if let Err(e) = crate::store::scans::save(&conn, kind, &scan_key(dirs), &payload) {
-                log::warn!("scan cache: could not store a {kind:?} result: {e}");
+                crate::log_dedup::log_while!(
+                    warn,
+                    "scan_cache.store",
+                    "scan cache: could not store a {kind:?} result: {e}"
+                );
+            } else {
+                crate::log_dedup::log_cleared!("scan_cache.store", "scan cache: storing again");
             }
+            crate::log_dedup::log_cleared!("scan_cache.open", "scan cache: database open again");
         }
-        Err(e) => log::warn!("scan cache: no database to store a {kind:?} result: {e}"),
+        Err(e) => crate::log_dedup::log_while!(
+            warn,
+            "scan_cache.open",
+            "scan cache: no database to store a {kind:?} result: {e}"
+        ),
     }
 }
 
