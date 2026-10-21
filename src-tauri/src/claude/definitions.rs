@@ -603,19 +603,30 @@ pub fn user_root() -> Option<PathBuf> {
 /// permission wall would be indistinguishable from a file -- and this
 /// module's whole contract is that such a directory gets REPORTED. The
 /// refusals come back beside the roots for exactly that.
-pub fn project_roots(dirs: &[String]) -> (Vec<PathBuf>, Vec<String>) {
+///
+/// Takes the discovery scope rather than bare roots (#1949): a folder the
+/// user excluded from discovery is not a project either, and walking it
+/// here is how this sweep came to disagree with the repository pages.
+pub fn project_roots(scope: &crate::worktrees::DiscoveryScope) -> (Vec<PathBuf>, Vec<String>) {
     let mut found = Vec::new();
     let mut unreadable = Vec::new();
-    for d in dirs {
-        walk_projects(Path::new(d), 0, &mut found, &mut unreadable);
+    for d in &scope.roots {
+        let excluded = scope.excluded_under(d);
+        walk_projects(Path::new(d), 0, &mut found, &mut unreadable, &excluded);
     }
     found.sort();
     found.dedup();
     (found, unreadable)
 }
 
-fn walk_projects(dir: &Path, depth: usize, found: &mut Vec<PathBuf>, unreadable: &mut Vec<String>) {
-    if depth > 2 {
+fn walk_projects(
+    dir: &Path,
+    depth: usize,
+    found: &mut Vec<PathBuf>,
+    unreadable: &mut Vec<String>,
+    excluded: &[PathBuf],
+) {
+    if depth > 2 || excluded.iter().any(|path| dir.starts_with(path)) {
         return;
     }
     match std::fs::symlink_metadata(dir) {
@@ -653,7 +664,7 @@ fn walk_projects(dir: &Path, depth: usize, found: &mut Vec<PathBuf>, unreadable:
         {
             continue;
         }
-        walk_projects(&p, depth + 1, found, unreadable);
+        walk_projects(&p, depth + 1, found, unreadable, excluded);
     }
 }
 
@@ -1097,8 +1108,35 @@ mod tests {
         std::fs::create_dir_all(a.join(".claude").join("agents")).unwrap();
         std::fs::create_dir_all(b.join("src")).unwrap();
 
-        let (found, unreadable) = project_roots(&[tmp.path().to_string_lossy().to_string()]);
+        let (found, unreadable) = project_roots(&crate::worktrees::DiscoveryScope {
+            roots: vec![tmp.path().to_string_lossy().to_string()],
+            ..Default::default()
+        });
         assert_eq!(found, vec![a], "beta has no .claude and is not a scope");
+        assert!(unreadable.is_empty());
+    }
+
+    /// #1949: a folder excluded from discovery is not a project scope
+    /// either. A backup copy of a project carries its `.claude/`, and
+    /// listing it made this sweep disagree with the repository pages.
+    #[test]
+    fn project_roots_skip_discovery_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("alpha");
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir_all(live.join(".claude")).unwrap();
+        std::fs::create_dir_all(backup.join("alpha").join(".claude")).unwrap();
+
+        let (found, unreadable) = project_roots(&crate::worktrees::DiscoveryScope {
+            roots: vec![tmp.path().to_string_lossy().to_string()],
+            exclusions: vec![backup.to_string_lossy().to_string()],
+            exclusions_unread: None,
+        });
+        assert_eq!(
+            found,
+            vec![live],
+            "the excluded backup's .claude is not a scope"
+        );
         assert!(unreadable.is_empty());
     }
 

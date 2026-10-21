@@ -5731,6 +5731,113 @@ let f = std::env::temp_dir;
         );
     }
 
+    /// Production lines outside `worktrees/scan.rs` that reach the
+    /// discovery walk without the exclusions (#1949).
+    fn unexcluded_discovery_offenders(file: &Path, rel: &str, src: &str) -> Vec<String> {
+        if file.ends_with(Path::new("worktrees").join("scan.rs")) {
+            return Vec::new();
+        }
+        let src = src.replace("\r\n", "\n");
+        src.lines()
+            .zip(test_mask(file, &src))
+            .enumerate()
+            .filter(|(_, (line, test))| {
+                !test && !is_comment(line) && line.contains("scan_dirs_fast_reporting")
+            })
+            .map(|(i, (line, _))| format!("{rel}:{}: {}", i + 1, line.trim()))
+            .collect()
+    }
+
+    /// **Every production discovery walk honours the exclusions (#1949).**
+    ///
+    /// #1923 added `scan_dirs_fast_reporting_excluding` BESIDE
+    /// `scan_dirs_fast_reporting` and moved two callers; Docker
+    /// provenance, config health and cleanup kept walking folders the user
+    /// had excluded. Both are now test-only inside `scan.rs`, and
+    /// production reaches the walk through `DiscoveryScope::scan`, which
+    /// cannot be built without saying what the exclusions are.
+    ///
+    /// The `#[cfg(test)]` on those functions is one deleted line away from
+    /// undoing that, and the compiler would then accept a new caller
+    /// without complaint. This is what notices.
+    #[test]
+    fn no_production_discovery_walk_skips_the_exclusions() {
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+        let mut scoped = 0usize;
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                // By PATH: this guard's own prose names the call.
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                checked += 1;
+                scoped += production(&file, &src.replace("\r\n", "\n"))
+                    .matches("discovery_scope(")
+                    .count();
+                let rel = format!(
+                    "{crate_name}/{}",
+                    file.strip_prefix(&root).unwrap_or(&file).display()
+                );
+                offenders.extend(unexcluded_discovery_offenders(&file, &rel, &src));
+            }
+        }
+        assert!(
+            checked > 100 && scoped >= 8,
+            "the walk saw {checked} files and {scoped} production `discovery_scope(` calls; \
+             it is not reading the tree it claims to guard"
+        );
+        assert!(
+            offenders.is_empty(),
+            "production code calls the discovery walk without the exclusions (#1949). \
+             Build a `worktrees::DiscoveryScope` (in a command: `discovery_scope(&app)?`) \
+             and call `.scan()` on it:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The other direction: silent on prose, on test code and on
+    /// `scan.rs` itself, and still firing on a production call after a
+    /// test module, in a CRLF checkout.
+    #[test]
+    fn the_unexcluded_discovery_guard_ignores_tests_and_prose_but_not_code() {
+        let file = Path::new("fixture/does_not_exist.rs");
+        let safe = "/// Not `scan_dirs_fast_reporting(&dirs)`: it ignores exclusions.\n\
+                    fn census(scope: &DiscoveryScope) {\n    \
+                    let scan = scope.scan();\n\
+                    }\n\
+                    #[cfg(test)]\n\
+                    mod tests {\n    \
+                    fn walks() {\n        \
+                    let scan = scan_dirs_fast_reporting(&roots);\n    \
+                    }\n\
+                    }\n";
+        assert_eq!(
+            unexcluded_discovery_offenders(file, "fixture.rs", safe),
+            Vec::<String>::new()
+        );
+        let unsafe_ = format!(
+            "{safe}fn late(dirs: &[String]) {{\n    let scan = crate::worktrees::scan_dirs_fast_reporting(dirs);\n}}\n"
+        )
+        .replace('\n', "\r\n");
+        assert_eq!(
+            unexcluded_discovery_offenders(file, "fixture.rs", &unsafe_),
+            vec![
+                "fixture.rs:12: let scan = crate::worktrees::scan_dirs_fast_reporting(dirs);"
+                    .to_string()
+            ]
+        );
+        let home = Path::new("src").join("worktrees").join("scan.rs");
+        assert_eq!(
+            unexcluded_discovery_offenders(&home, "scan.rs", &unsafe_),
+            Vec::<String>::new(),
+            "scan.rs defines the walk"
+        );
+    }
+
     /// The other direction: the guard stays silent on comments, on test
     /// code and on an explicit mode, and still fires on a production call
     /// that follows a test module, in a CRLF checkout.

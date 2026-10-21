@@ -1444,11 +1444,14 @@ pub async fn read_cached_scan(
     app: AppHandle,
     kind: crate::store::scans::ScanKind,
 ) -> Result<Option<crate::store::scans::CachedScan>, String> {
-    let dirs = get_worktree_dirs(app.clone());
-    let dirs = if kind == crate::store::scans::ScanKind::Worktrees {
-        discovery_cache_scope(&dirs, &get_discovery_exclusions(app.clone())?)
-    } else {
-        dirs
+    let scope = discovery_scope(&app)?;
+    // The walks that honour exclusions key on them; venvs deliberately do
+    // not honour them (see `scan_venvs`), so they key on the roots.
+    let dirs = match kind {
+        crate::store::scans::ScanKind::Worktrees | crate::store::scans::ScanKind::Artifacts => {
+            discovery_cache_scope(&scope)
+        }
+        _ => scope.roots,
     };
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
@@ -1522,17 +1525,13 @@ fn remember_scan<T: serde::Serialize>(
 /// unreadable directory labels the list partial rather than blanking it.
 #[tauri::command]
 pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan, String> {
-    let dirs = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app)?;
+    let cache_scope = discovery_cache_scope(&scope);
     // Blocking filesystem and subprocess work: keep it off the async
     // runtime's worker threads.
-    let excluded = get_discovery_exclusions(app.clone())?;
-    let cache_scope = discovery_cache_scope(&dirs, &excluded);
-    let scanned = dirs.clone();
-    let out = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting_excluding(&scanned, &excluded)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let out = tauri::async_runtime::spawn_blocking(move || scope.scan())
+        .await
+        .map_err(|e| e.to_string())?;
     // Stored so the next cold start paints rows instead of a blank page
     // (#1152). Paths and sizes only -- `Safety` rides along in the
     // payload but `read_cached_scan` is never the source of a removal
@@ -1774,16 +1773,19 @@ pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, Strin
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
-    let dirs = get_worktree_dirs(app.clone());
+    //
+    // And the same exclusions (#1949): this walk's depth and budget
+    // notices inside an excluded backup are what the exclusion is for.
+    let scope = discovery_scope(&app)?;
+    let dirs = discovery_cache_scope(&scope);
     // Progress, so the page can say "3 of 4 roots, 142 found" rather
     // than showing an unqualified spinner for a walk it cannot see the
     // end of (#1151). One event per ROOT: per-directory would be 178
     // for a 1.5 s walk, and the number that answers "is it stuck" is
     // how many roots are left.
     let emitter = app.clone();
-    let scanned = dirs.clone();
     let (out, failed) = scan_blocking(move || {
-        crate::artifacts::scan::scan_streaming(&scanned, &mut |p| {
+        crate::artifacts::scan::scan_streaming_excluding(&scope, &mut |p| {
             use tauri::Emitter;
             let _ = emitter.emit("artifact-scan-progress", p);
         })
@@ -2114,7 +2116,9 @@ pub async fn remove_artifacts(
     app: AppHandle,
     paths: Vec<String>,
 ) -> Result<Vec<crate::artifacts::ArtifactRemoval>, String> {
-    let roots = get_worktree_dirs(app.clone());
+    // Containment roots: the configured roots, never narrowed by the
+    // exclusions, and never a guessed default when they cannot be read.
+    let roots = get_worktree_dirs(app.clone())?;
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). This is the
     // BACKEND half of the freeze report: paired with the frontend's
     // `ui remove_artifacts` marks, it separates a slow `remove_dir_all`
@@ -2151,7 +2155,13 @@ pub async fn remove_artifacts(
 pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
     // One budget across every filesystem scan (#1149), held by the
     // walk itself rather than by this future -- see `scan_blocking`.
-    let roots = get_worktree_dirs(app.clone());
+    //
+    // The bare roots, NOT the discovery scope: a deliberate opt-out of the
+    // exclusions (#1949). A venv is orphaned when no project directory
+    // hashes to it, so leaving an excluded folder out of the set would
+    // mark every venv whose project lives there as removable. Exclusions
+    // narrow what is listed; they must never make something look orphaned.
+    let roots = get_worktree_dirs(app.clone())?;
     let emitter = app.clone();
     let scanned = roots.clone();
     let out = scan_blocking(move || {
@@ -2264,7 +2274,9 @@ pub async fn remove_venvs(
         allow_stale: true,
         stale_days: crate::poll::stale_venv_days(&prefs),
     };
-    let roots = get_worktree_dirs(app);
+    // The bare roots, for `scan_venvs`' reason: the orphan verdict needs
+    // every project directory, excluded or not (#1949).
+    let roots = get_worktree_dirs(app)?;
     let out = tauri::async_runtime::spawn_blocking(move || {
         let dirs = crate::caches::project_dirs(&roots);
         crate::caches::remove_venvs(&paths, &dirs, policy)
@@ -2339,13 +2351,13 @@ pub fn clear_assessed(app: AppHandle, worktree_path: String) -> Result<(), Strin
 /// runs.
 #[tauri::command]
 pub async fn preview_cleanup(app: AppHandle) -> Result<Vec<crate::cleanup::LedgerEntry>, String> {
-    let roots = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app)?;
     let db = db_path(&app);
     let now = chrono::Utc::now().to_rfc3339();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         let prefs = crate::cleanup::prefs(&conn);
-        let entries = crate::cleanup::propose(&prefs, &roots, &now);
+        let entries = crate::cleanup::propose(&prefs, &scope, &now);
         crate::cleanup::record(&conn, &entries);
         log::info!("cleanup preview: {} entries", entries.len());
         Ok(entries)
@@ -2998,7 +3010,9 @@ pub async fn fetch_refs(path: String) -> Result<String, String> {
 /// check nor a containment check, reachable from a paired peer.
 #[tauri::command]
 pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
-    let roots = get_worktree_dirs(app);
+    // An unreadable setting refuses the removal: containment against a
+    // guessed `~/code` is not containment against what the user chose.
+    let roots = get_worktree_dirs(app)?;
     let p = path.clone();
     let result =
         tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_orphan(&p, &roots))
@@ -3020,19 +3034,80 @@ pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
 /// Defaults to `~/code` when unset, so the app works with no
 /// configuration on a machine that follows that convention -- and says
 /// what it scanned rather than silently finding nothing.
+///
+/// An `Err` when the setting could not be read (#1956). This used to fold
+/// a database that would not open, a query that failed and a value that
+/// would not decode into "the user configured `~/code`", so a busy
+/// database silently scanned -- and cached, and offered for deletion
+/// containment -- a folder nobody chose. Only an UNSET (or emptied)
+/// setting means the default.
 #[tauri::command]
-pub fn get_worktree_dirs(app: AppHandle) -> Vec<String> {
-    open_db(&db_path(&app))
-        .ok()
-        .and_then(|c| settings::get::<Vec<String>>(&c, settings::keys::WORKTREE_DIRS).ok())
-        .flatten()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(default_worktree_dirs)
+pub fn get_worktree_dirs(app: AppHandle) -> Result<Vec<String>, String> {
+    worktree_dirs_at(&db_path(&app))
+}
+
+fn worktree_dirs_at(db: &std::path::Path) -> Result<Vec<String>, String> {
+    let conn = open_db(db).map_err(settings_database_error)?;
+    read_worktree_dirs(&conn)
+}
+
+fn settings_database_error(e: impl std::fmt::Display) -> String {
+    format!("could not open the settings database: {e}")
+}
+
+fn read_worktree_dirs(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    match settings::get_strict::<Vec<String>>(conn, settings::keys::WORKTREE_DIRS) {
+        Ok(Some(dirs)) if !dirs.is_empty() => Ok(dirs),
+        Ok(_) => Ok(default_worktree_dirs()),
+        Err(e) => Err(format!("could not read the scan folders setting: {e}")),
+    }
+}
+
+fn read_discovery_exclusions(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    settings::get_strict(conn, settings::keys::DISCOVERY_EXCLUSIONS)
+        .map(|value| value.unwrap_or_default())
+        .map_err(|e| format!("could not read the discovery exclusions setting: {e}"))
+}
+
+/// The roots and exclusions every discovery walker scans (#1949, #1956).
+///
+/// The two settings fail differently on purpose. Roots that could not be
+/// read are an `Err`: there is no honest set to scan. Exclusions that
+/// could not be read are NOT -- the roots are real, and scanning them
+/// without exclusions can only visit more -- so the scan runs and says so
+/// (`DiscoveryScope::exclusions_unread`), rather than the page failing
+/// over a filter.
+fn discovery_scope(app: &AppHandle) -> Result<crate::worktrees::DiscoveryScope, String> {
+    discovery_scope_at(&db_path(app))
+}
+
+fn discovery_scope_at(db: &std::path::Path) -> Result<crate::worktrees::DiscoveryScope, String> {
+    let conn = open_db(db).map_err(settings_database_error)?;
+    let roots = read_worktree_dirs(&conn)?;
+    let (exclusions, exclusions_unread) = match read_discovery_exclusions(&conn) {
+        Ok(exclusions) => (exclusions, None),
+        Err(e) => {
+            log::warn!("discovery: {e}; scanning without exclusions");
+            (Vec::new(), Some(e))
+        }
+    };
+    Ok(crate::worktrees::DiscoveryScope {
+        roots,
+        exclusions,
+        exclusions_unread,
+    })
 }
 
 /// Capture policy in the cache identity so an old in-flight scan cannot
 /// overwrite the snapshot used after exclusions change.
-fn discovery_cache_scope(dirs: &[String], exclusions: &[String]) -> Vec<String> {
+///
+/// A scope whose exclusions could not be read keys on the roots alone,
+/// which is exactly what its scan covered.
+fn discovery_cache_scope(scope: &crate::worktrees::DiscoveryScope) -> Vec<String> {
+    discovery_cache_key(&scope.roots, &scope.exclusions)
+}
+
+fn discovery_cache_key(dirs: &[String], exclusions: &[String]) -> Vec<String> {
     let mut scope = dirs.to_vec();
     if !exclusions.is_empty() {
         let mut sorted = exclusions.to_vec();
@@ -3048,10 +3123,8 @@ fn discovery_cache_scope(dirs: &[String], exclusions: &[String]) -> Vec<String> 
 
 #[tauri::command]
 pub fn get_discovery_exclusions(app: AppHandle) -> Result<Vec<String>, String> {
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    settings::get_strict(&conn, settings::keys::DISCOVERY_EXCLUSIONS)
-        .map(|value| value.unwrap_or_default())
-        .map_err(|e| e.to_string())
+    let conn = open_db(&db_path(&app)).map_err(settings_database_error)?;
+    read_discovery_exclusions(&conn)
 }
 
 fn validate_discovery_exclusions(paths: Vec<String>) -> Result<Vec<String>, String> {
@@ -3092,14 +3165,20 @@ pub fn set_discovery_exclusions(app: AppHandle, paths: Vec<String>) -> Result<Ve
     // The worktrees scan cache is keyed on roots AND exclusions, so a
     // changed exclusion set already misses; this drops the rows keyed on
     // the old policy, exactly as `set_worktree_dirs` does for the roots
-    // (#1950). Best-effort for the same reason as there.
-    let dirs = get_worktree_dirs(app.clone());
-    if let Err(e) = crate::store::scans::retain_only(
-        &conn,
-        &scan_key(&dirs),
-        &scan_key(&discovery_cache_scope(&dirs, &paths)),
-    ) {
-        log::warn!("scan cache: could not drop entries for the previous exclusions: {e}");
+    // (#1950). Best-effort for the same reason as there -- including when
+    // the roots cannot be read: the setting the user changed is saved,
+    // and an unknown root set is a reason not to tidy, not to fail.
+    match read_worktree_dirs(&conn) {
+        Ok(dirs) => {
+            if let Err(e) = crate::store::scans::retain_only(
+                &conn,
+                &scan_key(&dirs),
+                &scan_key(&discovery_cache_key(&dirs, &paths)),
+            ) {
+                log::warn!("scan cache: could not drop entries for the previous exclusions: {e}");
+            }
+        }
+        Err(e) => log::warn!("scan cache: not tidied after an exclusions change: {e}"),
     }
     Ok(paths)
 }
@@ -3196,17 +3275,19 @@ pub async fn docker_state() -> crate::docker::DockerState {
 /// Resolved against the same directories the worktrees view scans, so a
 /// machine configured once works for both.
 pub async fn docker_images(app: AppHandle) -> Result<Vec<crate::docker::Image>, String> {
-    let dirs = get_worktree_dirs(app);
+    let scope = discovery_scope(&app)?;
     // The heaviest of these: `scan_dirs_fast` is the same full worktree
     // expansion the Worktrees view pays ~2.6s for, and `classify` then
     // runs git per repository on top of it. Blocking the runtime on
     // that is what froze the app on every switch to this view.
-    tauri::async_runtime::spawn_blocking(move || docker_images_blocking(dirs))
+    tauri::async_runtime::spawn_blocking(move || docker_images_blocking(scope))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>, String> {
+fn docker_images_blocking(
+    scope: crate::worktrees::DiscoveryScope,
+) -> Result<Vec<crate::docker::Image>, String> {
     // EXPANDED into repositories, not passed as scan roots.
     //
     // `classify` resolves a SHA-shaped image tag by running git in each
@@ -3236,7 +3317,7 @@ fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>
     // Not escalated to an `Err`: the images that DID resolve are real,
     // and blanking the Docker page because one directory in `~/code` was
     // unreadable is the trade `ArtifactsPage` explicitly refuses.
-    let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+    let scan = scope.scan();
     if scan.is_partial() {
         log::warn!(
             "docker: {} scan {} could not be read, so image provenance may be \
@@ -4549,8 +4630,15 @@ pub struct ClaudifyCommand {
 #[tauri::command]
 pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
     let ok = validate_dirs(dirs)?;
-    let worktree_scope = discovery_cache_scope(&ok, &get_discovery_exclusions(app.clone())?);
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    // Unreadable exclusions must not refuse a change to the ROOTS (#1956):
+    // a scan then runs without them and stores under the roots-only key,
+    // which is the key kept here.
+    let exclusions = read_discovery_exclusions(&conn).unwrap_or_else(|e| {
+        log::warn!("discovery: {e}; keeping the roots-only scan cache");
+        Vec::new()
+    });
+    let worktree_scope = discovery_cache_key(&ok, &exclusions);
     settings::set(&conn, settings::keys::WORKTREE_DIRS, &ok).map_err(|e| e.to_string())?;
     // Drop scan caches keyed on the OLD set (#1152). Nothing stale is
     // painted without this -- the key is the whole set, so a changed
@@ -6825,13 +6913,13 @@ pub async fn claude_definitions(
 
     let user = defs::user_root()
         .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
-    let dirs = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app)?;
     // The plugin inventory, read on the blocking pool with everything
     // else. A plugin list we could not read is NOT an error: the user
     // and project scopes are real answers and worth showing, the trade
     // `list_worktrees` states. It surfaces as a `ScopeRefusal` below.
     tauri::async_runtime::spawn_blocking(move || {
-        let (repos, repo_refusals) = defs::project_roots(&dirs);
+        let (repos, repo_refusals) = defs::project_roots(&scope);
         let (installed, plugin_refusal) = installed_plugins();
         let plugins = plugin_roots(installed);
         let roots = defs::roots(Some(user), &repos, &plugins);
@@ -7422,16 +7510,13 @@ pub async fn update_all_repositories(
     app: AppHandle,
     expected_paths: Option<Vec<String>>,
 ) -> Result<crate::worktrees::UpdateAllReport, String> {
-    let dirs = get_worktree_dirs(app.clone());
-    let excluded = get_discovery_exclusions(app.clone())?;
+    let scope = discovery_scope(&app)?;
 
     // The scan first, and on the blocking pool: it walks the scan roots
     // and spawns a `git worktree list` per repository.
-    let scan = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting_excluding(&dirs, &excluded)
-    })
-    .await
-    .map_err(|e| format!("could not scan for repositories: {e}"))?;
+    let scan = tauri::async_runtime::spawn_blocking(move || scope.scan())
+        .await
+        .map_err(|e| format!("could not scan for repositories: {e}"))?;
 
     // The MAIN CHECKOUT of each repository, which is what the button is
     // about. A repository's other worktrees are branches the user is
@@ -7635,14 +7720,14 @@ pub async fn claude_config_health(
 ) -> Result<crate::claude::confighealth::Sweep, String> {
     let home = crate::auth::home_dir()
         .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
-    let dirs = get_worktree_dirs(app);
+    let scope = discovery_scope(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        // The census first. `scan_dirs_fast_reporting` returns what it
-        // could not read alongside what it found, and that shortfall is
-        // carried into the sweep rather than dropped (#1025): it is what
-        // makes "38 repositories are clean" honest or not.
-        let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+        // The census first. `DiscoveryScope::scan` returns what it could
+        // not read alongside what it found, and that shortfall is carried
+        // into the sweep rather than dropped (#1025): it is what makes
+        // "38 repositories are clean" honest or not.
+        let scan = scope.scan();
         let repos: Vec<(String, String)> = scan
             .repos
             .iter()
@@ -8728,8 +8813,8 @@ mod tests {
             Some(paths.clone())
         );
         let roots = vec![tmp.path().to_string_lossy().into_owned()];
-        let old_key = scan_key(&discovery_cache_scope(&roots, &[]));
-        let new_key = scan_key(&discovery_cache_scope(&roots, &paths));
+        let old_key = scan_key(&discovery_cache_key(&roots, &[]));
+        let new_key = scan_key(&discovery_cache_key(&roots, &paths));
         assert_ne!(old_key, new_key);
         crate::store::scans::save(
             &conn,
@@ -8745,11 +8830,101 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert_eq!(discovery_cache_scope(&roots, &[]), roots);
+        assert_eq!(discovery_cache_key(&roots, &[]), roots);
         let mut reversed = vec!["b".into(), "a".into()];
-        let scope = discovery_cache_scope(&roots, &reversed);
+        let scope = discovery_cache_key(&roots, &reversed);
         reversed.reverse();
-        assert_eq!(scope, discovery_cache_scope(&roots, &reversed));
+        assert_eq!(scope, discovery_cache_key(&roots, &reversed));
+    }
+
+    /// #1956: a scan-folders setting that could not be read is an error,
+    /// never "the user configured `~/code`". Before, a value written by a
+    /// newer build, a failed query and an unopenable database all became
+    /// the default -- which was then scanned, cached, and used as the
+    /// containment boundary for deletes.
+    #[test]
+    fn an_unreadable_scan_folders_setting_is_an_error_not_the_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("settings.sqlite");
+        let conn = open_db(&db).unwrap();
+        // Unset and emptied are the two states that DO mean the default.
+        assert!(worktree_dirs_at(&db).is_ok());
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &Vec::<String>::new()).unwrap();
+        assert!(worktree_dirs_at(&db).is_ok());
+        let configured = vec![tmp.path().to_string_lossy().into_owned()];
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &configured).unwrap();
+        assert_eq!(worktree_dirs_at(&db).unwrap(), configured);
+
+        // A shape this build cannot decode, as a newer build might write.
+        conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = ?2",
+            [r#"{"roots":["/elsewhere"]}"#, settings::keys::WORKTREE_DIRS],
+        )
+        .unwrap();
+        let err = worktree_dirs_at(&db).expect_err("an undecodable setting is not the default");
+        assert!(err.contains("scan folders"), "{err}");
+        assert!(
+            discovery_scope_at(&db).is_err(),
+            "no honest set of roots to scan"
+        );
+
+        // The settings table itself unreadable.
+        conn.execute("DROP TABLE settings", []).unwrap();
+        assert!(worktree_dirs_at(&db).is_err());
+
+        // A database that cannot be opened at all: its path is a folder.
+        assert!(worktree_dirs_at(tmp.path()).is_err());
+    }
+
+    /// #1956: exclusions that could not be read do not fail discovery.
+    /// The roots were read, and scanning without exclusions can only visit
+    /// more, so the scan runs -- and says it ran without them, as a
+    /// settings failure rather than an unreadable path.
+    #[test]
+    fn unreadable_exclusions_scan_without_them_and_say_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("settings.sqlite");
+        let root = tmp.path().join("code");
+        std::fs::create_dir(&root).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let conn = open_db(&db).unwrap();
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &roots).unwrap();
+        let excluded = vec![root.join("backup").to_string_lossy().into_owned()];
+        settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &excluded).unwrap();
+
+        let readable = discovery_scope_at(&db).unwrap();
+        assert_eq!(readable.exclusions, excluded);
+        assert_eq!(readable.exclusions_unread, None);
+        assert!(readable
+            .scan()
+            .diagnostics
+            .iter()
+            .all(|d| d.kind != crate::worktrees::scan::DiscoveryDiagnosticKind::SettingsError));
+
+        conn.execute(
+            "UPDATE settings SET value = 'not json' WHERE key = ?1",
+            [settings::keys::DISCOVERY_EXCLUSIONS],
+        )
+        .unwrap();
+        let scope = discovery_scope_at(&db).expect("unreadable exclusions must not fail the scan");
+        assert_eq!(scope.roots, roots, "the roots that WERE read are kept");
+        assert!(scope.exclusions.is_empty());
+        assert!(scope.exclusions_unread.is_some());
+        // Keyed on exactly what the scan covered: the roots, unexcluded.
+        assert_eq!(discovery_cache_scope(&scope), roots);
+
+        let scan = scope.scan();
+        let said: Vec<_> = scan
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == crate::worktrees::scan::DiscoveryDiagnosticKind::SettingsError)
+            .collect();
+        assert_eq!(said.len(), 1, "{:?}", scan.diagnostics);
+        assert_eq!(said[0].root, roots[0]);
+        assert!(said[0].message.contains("exclusions could not be read"));
+        // A settings failure, not an unreadable path: the safety gates
+        // keyed on `is_partial()` are unchanged.
+        assert!(!scan.is_partial(), "{:?}", scan.unreadable);
     }
 
     #[test]

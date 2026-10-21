@@ -92,7 +92,7 @@ export function SettingsDialog({
   // the stacked layout too, and it is still a desktop with `gh`.
   const isMobile = useIsMobile();
   const { seconds, set: setInterval } = usePollInterval();
-  const { dirs, set: setDirs, exclusions = [], setExclusions, exclusionsError, exclusionsReady = false, retryExclusions } = useWorktreeDirs();
+  const { dirs, set: setDirs, exclusions = [], setExclusions, exclusionsError, exclusionsReady = false, retryExclusions, isError: dirsUnread } = useWorktreeDirs();
   const { prefs, set: setPrefs } = useNotifyPrefs();
   const { prefs: ui, set: setUi } = useUiPrefs();
   const { prefs: cleanup, set: setCleanup } = useCleanupPrefs();
@@ -491,6 +491,14 @@ export function SettingsDialog({
             One path per line. Used to find git worktrees. <code>~</code> is expanded and
             saved as the full path.
           </p>
+          {/* #1956: the setting is no longer read as `~/code` when it
+              cannot be read, so an empty box here would otherwise look
+              like "nothing configured". */}
+          {dirsUnread && (
+            <p role="alert" className="text-xs text-[#f85149]">
+              The saved folders could not be read. Folders saved here replace them.
+            </p>
+          )}
           {!IS_MOBILE_BUILD && <>
             <label htmlFor="discovery-exclusions" className="mt-3 text-sm font-medium">
               Exclude folders from repository discovery

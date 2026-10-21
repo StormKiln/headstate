@@ -101,6 +101,22 @@ describe("a scan root that is itself a repository (#1948)", () => {
     expect(screen.getByRole("note")).toBeTruthy();
   });
 
+  it("says the exclusions were not applied as a note, not a shortfall (#1956)", () => {
+    const unread = {
+      root: "/home/me/code",
+      path: "/home/me/code",
+      kind: "settingsError" as const,
+      count: 1,
+      message: "/home/me/code: discovery exclusions could not be read",
+    };
+    render(<PartialScanNotice unreadable={[]} diagnostics={[unread]} consequence="counts may be incomplete." />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    const note = screen.getByRole("note");
+    expect(note.textContent).toContain("Discovery exclusions could not be read, so excluded folders were scanned too.");
+    expect(note.textContent).toContain("Settings > Repositories");
+    expect(note.textContent).not.toContain("floors");
+  });
+
   it("renders nothing when there is neither a shortfall nor a boundary", () => {
     const { container } = render(<PartialScanNotice unreadable={[]} diagnostics={[]} consequence="x" />);
     expect(container.textContent).toBe("");

@@ -1295,7 +1295,7 @@ async fn call(
         }
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
-        "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
+        "get_worktree_dirs" => res(commands::get_worktree_dirs(app.clone())),
         "get_discovery_exclusions" => res(commands::get_discovery_exclusions(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
         "update_run_state" => ok(commands::update_run_state(app.state(), a.get("repoPath")?)),
