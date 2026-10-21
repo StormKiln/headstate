@@ -2295,15 +2295,31 @@ pub async fn remove_venvs(
 #[tauri::command]
 pub fn mark_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    let mut seen: std::collections::BTreeMap<String, String> =
-        settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
     let head = crate::worktrees::head_oid(&worktree_path)
         .map_err(|e| format!("could not read the worktree's head: {e}"))?;
-    seen.insert(worktree_path, head);
-    settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen).map_err(|e| e.to_string())
+    set_assessed(&conn, &worktree_path, Some(head))
+        .map_err(|e| format!("could not record the assessment: {e}"))
+}
+
+/// Add (`Some(head)`) or drop (`None`) one worktree's assessment mark.
+///
+/// Strict and atomic (#1960): the marks used to be read with a fallback
+/// to an empty map and written back whole, so a busy database or an
+/// unreadable value wiped every other mark. A read failure now refuses
+/// the write and leaves the stored marks as they were.
+fn set_assessed(
+    conn: &rusqlite::Connection,
+    worktree_path: &str,
+    head: Option<String>,
+) -> Result<(), crate::store::StoreError> {
+    settings::update_strict(
+        conn,
+        settings::keys::ASSESSED_WORKTREES,
+        |seen: &mut std::collections::BTreeMap<String, String>| match head {
+            Some(head) => seen.insert(worktree_path.to_owned(), head.clone()) != Some(head),
+            None => seen.remove(worktree_path).is_some(),
+        },
+    )
 }
 
 /// Forget that a worktree was assessed.
@@ -2319,13 +2335,8 @@ pub fn mark_assessed(app: AppHandle, worktree_path: String) -> Result<(), String
 #[tauri::command]
 pub fn clear_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    let mut seen: std::collections::BTreeMap<String, String> =
-        settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-    seen.remove(&worktree_path);
-    settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen).map_err(|e| e.to_string())
+    set_assessed(&conn, &worktree_path, None)
+        .map_err(|e| format!("could not clear the assessment: {e}"))
 }
 
 /// What automatic cleanup would remove, run now.
@@ -3475,13 +3486,10 @@ pub async fn remove_worktree_forced(
         }
         Err(_) => {}
         Ok(conn) => {
-            let mut seen: std::collections::BTreeMap<String, String> =
-                settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-            if seen.remove(&worktree_path).is_some() {
-                let _ = settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen);
+            // Strict (#1960): an unreadable map is left alone, not
+            // replaced by an empty one.
+            if let Err(e) = set_assessed(&conn, &worktree_path, None) {
+                log::warn!("not dropping the assessment mark: {e}");
             }
         }
     }
@@ -5125,6 +5133,64 @@ async fn admit_population(
             let permit = permit.map_err(|e| e.to_string())?;
             if control.stopped() { Ok(None) } else { Ok(Some(permit)) }
         }
+    }
+}
+
+#[cfg(test)]
+mod assessed_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn stored(conn: &rusqlite::Connection) -> String {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [settings::keys::ASSESSED_WORKTREES],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #1960: an unreadable map must refuse the mark, not be replaced
+    /// by a map holding only the new one.
+    #[test]
+    fn a_mark_over_an_unreadable_map_is_refused_and_the_marks_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("t.db")).unwrap();
+        set_assessed(&conn, "/w/a", Some("a1".into())).unwrap();
+        set_assessed(&conn, "/w/b", Some("b1".into())).unwrap();
+        let marks: BTreeMap<String, String> =
+            settings::get_strict(&conn, settings::keys::ASSESSED_WORKTREES)
+                .unwrap()
+                .unwrap();
+        assert_eq!(marks.len(), 2);
+
+        // A value this build cannot decode (corrupt, or a newer shape).
+        let corrupt = r#"{"/w/a":{"head":"a1"},"/w/b":{"head":"b1"}}"#;
+        conn.execute(
+            "UPDATE settings SET value=?1 WHERE key=?2",
+            rusqlite::params![corrupt, settings::keys::ASSESSED_WORKTREES],
+        )
+        .unwrap();
+        assert!(set_assessed(&conn, "/w/c", Some("c1".into())).is_err());
+        assert!(set_assessed(&conn, "/w/a", None).is_err());
+        assert_eq!(stored(&conn), corrupt);
+    }
+
+    #[test]
+    fn marks_are_added_and_cleared_individually() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("t.db")).unwrap();
+        set_assessed(&conn, "/w/a", Some("a1".into())).unwrap();
+        set_assessed(&conn, "/w/b", Some("b1".into())).unwrap();
+        set_assessed(&conn, "/w/a", None).unwrap();
+        let marks: BTreeMap<String, String> =
+            settings::get_strict(&conn, settings::keys::ASSESSED_WORKTREES)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            marks,
+            BTreeMap::from([("/w/b".to_string(), "b1".to_string())])
+        );
     }
 }
 

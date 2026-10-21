@@ -256,6 +256,7 @@ impl Controller {
                                 previous.filter(|p| p.id != observation.id).or_else(|| {
                                     disk_observations::history(&conn)
                                         .ok()?
+                                        .observations
                                         .into_iter()
                                         .find(|p| {
                                             p.volume.id == observation.volume.id
@@ -322,7 +323,7 @@ pub async fn set_disk_inventory_settings(app: AppHandle, settings: Settings) -> 
         .await
 }
 #[tauri::command]
-pub async fn disk_inventory_history(app: AppHandle) -> Result<Vec<Observation>, String> {
+pub async fn disk_inventory_history(app: AppHandle) -> Result<disk_observations::History, String> {
     let db = crate::commands::db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;

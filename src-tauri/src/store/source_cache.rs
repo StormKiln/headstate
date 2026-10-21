@@ -202,7 +202,7 @@ pub fn save_owned_source_failure(
     let provider = serde_json::to_value(source.provider)?;
     let old_time: Option<String> = conn
         .query_row(
-            "SELECT fetched_at FROM snapshot WHERE provider=?1 AND host=?2 AND id=?3 AND owner=?4",
+            "SELECT fetched_at FROM snapshot WHERE provider=?1 AND host=?2 AND id=?3 AND owner=?4 COLLATE NOCASE",
             params![provider.as_str(), source.host, list.id(), owner],
             |r| r.get(0),
         )
@@ -212,7 +212,7 @@ pub fn save_owned_source_failure(
     };
     save_owned_source_snapshot(conn, source, list, prs, coverage, Some(owner))?;
     conn.execute(
-        "UPDATE snapshot SET fetched_at=?1 WHERE provider=?2 AND host=?3 AND id=?4 AND owner=?5",
+        "UPDATE snapshot SET fetched_at=?1 WHERE provider=?2 AND host=?3 AND id=?4 AND owner=?5 COLLATE NOCASE",
         params![old_time, provider.as_str(), source.host, list.id(), owner],
     )?;
     Ok(())
@@ -235,6 +235,16 @@ pub fn save_owned_gitlab_snapshot(
     }
     save_payload(conn, source, list, mrs, coverage, owner)
 }
+/// Whether a stored snapshot owner is this login (#1961).
+///
+/// Logins compare without regard to ASCII case, as
+/// [`load_qualified_snapshot`] and `github_facts` (which lowercases its
+/// key) already do. A raw `==` here skipped fact replay silently for a
+/// login whose case differed from the one stored.
+pub fn same_owner(stored: Option<&str>, owner: &str) -> bool {
+    stored.is_some_and(|stored| stored.eq_ignore_ascii_case(owner))
+}
+
 /// Internal ownership; deliberately excluded from remote snapshot payloads.
 pub fn snapshot_owner(
     conn: &Connection,

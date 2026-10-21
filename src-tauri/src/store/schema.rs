@@ -1503,6 +1503,15 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
         }
         return Err(e);
     }
+    // The `ON DELETE CASCADE` clauses (migration 49) act only while
+    // `foreign_keys` is on. The bundled SQLite is compiled with
+    // SQLITE_DEFAULT_FOREIGN_KEYS=1, so it always has been (#1963 checked
+    // this); saying so explicitly keeps the cascade from depending on a
+    // build flag nobody reads. A no-op today, so it cannot change how an
+    // existing database opens; non-fatal for the same reason WAL is.
+    if let Err(e) = conn.pragma_update(None, "foreign_keys", true) {
+        log::warn!("could not enable foreign keys: {e}");
+    }
     Ok(conn)
 }
 
@@ -1528,6 +1537,46 @@ mod tests {
             conn.execute("INSERT INTO snapshot(id,payload,fetched_at) VALUES(1,'synthetic-saved-data','fixture-time')", []).unwrap();
         }
         conn
+    }
+
+    /// #1963 suspected the cascade was a no-op. It is not -- the bundled
+    /// SQLite enables foreign keys by default -- and this pins that, so a
+    /// switch to a system SQLite (where the default is off) cannot quietly
+    /// start leaving orphan byte and digest rows behind.
+    #[test]
+    fn deleting_a_checkpoint_leaves_no_orphan_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("t.db")).unwrap();
+        let enabled: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert!(enabled);
+        let counts = || -> (i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM claude_link_checkpoint),
+                        (SELECT count(*) FROM claude_link_bytes),
+                        (SELECT count(*) FROM claude_link_hash)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        conn.execute_batch(
+            "INSERT INTO claude_link_checkpoint(path,offset,payload,hash_count) VALUES('/s','0',NULL,1);
+             INSERT INTO claude_link_bytes(path,line,tail,last_block,audit,provenance) VALUES('/s',x'',x'',x'',x'',x'');
+             INSERT INTO claude_link_hash(path,block,digest) VALUES('/s',0,zeroblob(32));",
+        )
+        .unwrap();
+        assert_eq!(counts(), (1, 1, 1));
+        conn.execute("DELETE FROM claude_link_checkpoint WHERE path='/s'", [])
+            .unwrap();
+        assert_eq!(counts(), (0, 0, 0));
+        let violations: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     fn schema_signature(conn: &Connection) -> Vec<(String, Option<String>)> {
