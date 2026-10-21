@@ -398,6 +398,13 @@ async fn refresh_source_request(
     request_id: Option<String>,
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
+    // No receipt yet in this process: typically the first Refresh after a
+    // restart, which the pass cadence must not swallow (#1938).
+    let cold = app
+        .state::<source_poll::SourcePolls>()
+        .get(&source, list)
+        .receipt_revision
+        .is_none();
     let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
     let gitlab_source = source.provider == crate::identity::Provider::Gitlab
         && crate::gitlab::host::validate(&source.host).is_ok();
@@ -416,6 +423,7 @@ async fn refresh_source_request(
                 message: message.clone(),
                 transient: false,
                 not_asked: true,
+                superseded: false,
             },
         )
         .await;
@@ -426,9 +434,9 @@ async fn refresh_source_request(
     }
     // The loader owns its deadline so completed pages survive a timeout.
     let client = client.0.as_ref().expect("checked above");
-    let result =
-        source_poll::fetch_github_step(&app, client, list, crate::poll::FETCH_TIMEOUT).await;
-    let fetched = result.map_err(|error| Failure::from(&error));
+    let fetched =
+        source_poll::fetch_github_refresh(&app, client, list, crate::poll::FETCH_TIMEOUT, cold)
+            .await;
     match fetched {
         Ok(result) => {
             let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
@@ -445,7 +453,22 @@ async fn refresh_source_request(
                 Ok(result) => result,
                 Err(failure) => {
                     let message = failure.message.clone();
+                    let superseded = failure.superseded;
                     source_poll::complete(&app, publication, Err(failure));
+                    // A lost write race answers with the winner's receipt,
+                    // which is already published (#1933).
+                    if let Some(winner) = superseded
+                        .then(|| source_poll::latest(&app, &source, list))
+                        .flatten()
+                    {
+                        return Ok(SourceRefresh {
+                            source,
+                            list,
+                            prs: Some(winner.prs),
+                            mrs: None,
+                            coverage: winner.coverage,
+                        });
+                    }
                     return Err(message);
                 }
             };
@@ -608,6 +631,7 @@ async fn refresh_gitlab_request(
                 message: message.clone(),
                 transient: error.transient(),
                 not_asked: matches!(error, crate::gitlab::queues::QueueError::MissingCli),
+                superseded: false,
             };
             if let Some(publication) = source_poll::publication(&app, &attempt).await {
                 source_poll::complete_gitlab(&app, publication, Err(failure));

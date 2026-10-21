@@ -666,6 +666,43 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
         .collect()
 }
 
+/// Whether a receipt can be the baseline that "new" is measured against
+/// (#1939).
+///
+/// A Complete receipt can. So can a Partial one once this list has had a
+/// validated traversal (`completed_at`, which a fresh or tainted pass
+/// keeps): every page has then been read, and the rows a later partial
+/// pass did not reach are retained rather than dropped, so an identity
+/// absent from the baseline was absent from every page observed before.
+/// Before the first validated traversal, absence may only mean a page not
+/// fetched yet, and announcing it would be a confident claim that might be
+/// wrong -- so nothing is announced until then.
+pub(crate) fn notification_baseline(receipt: &FetchedList) -> bool {
+    matches!(receipt.coverage, Coverage::Complete)
+        || receipt
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.state.completed_at.is_some())
+}
+
+/// Compare an accepted receipt against the last baseline, then keep the
+/// receipt as the next baseline only if it can be one (#789, #1939).
+///
+/// `None` means "no usable baseline": the first tick after launch, or a
+/// list never validated end to end. It announces nothing.
+pub(crate) fn announce_against(
+    baseline: &mut Option<Vec<PullRequest>>,
+    receipt: &FetchedList,
+    diff: fn(&[PullRequest], &[PullRequest]) -> Vec<Breakage>,
+) -> Vec<Breakage> {
+    let announced = baseline
+        .as_deref()
+        .map(|before| diff(before, &receipt.prs))
+        .unwrap_or_default();
+    *baseline = notification_baseline(receipt).then(|| receipt.prs.clone());
+    announced
+}
+
 /// Persists a snapshot and emits `prs-updated`, matching every fallible
 /// step rather than unwrapping -- shared by both the regular poll tick and
 /// the #22 one-shot recheck so the "never panic, never blank the UI on
@@ -1326,14 +1363,14 @@ pub fn spawn(
     ));
     spawn_worker(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
-        // Whether a tick has ever completed, so `newly_appeared` has
-        // something real to compare against (#789).
+        // The baseline `newly_appeared` compares against, and whether
+        // there IS one (#789, #1939).
         //
-        // Not `!previous.is_empty()`: a user whose last pull request
-        // merged has a genuinely empty list, and the next one they open
-        // is news. "Empty" and "never looked" are different answers, and
-        // only this flag distinguishes them.
-        let mut had_a_tick = false;
+        // Not `previous` with an emptiness check: a user whose last pull
+        // request merged has a genuinely empty list, and the next one they
+        // open is news. "Empty" and "never looked" are different answers,
+        // and only `None` says the second.
+        let mut appeared_baseline: Option<Vec<PullRequest>> = None;
         // The review queue as of the last tick, and whether there HAS
         // been one.
         //
@@ -1405,10 +1442,15 @@ pub fn spawn(
                                     Ok(result) => result,
                                     Err(failure) => {
                                         let message = failure.message.clone();
+                                        // A lost write race is not a failed
+                                        // poll: the winner's data stands (#1933).
+                                        let failed = !failure.superseded;
                                         source_poll::complete(&app, publication, Err(failure));
-                                        return (fetch_ms, Some((message, None)));
+                                        return (fetch_ms, failed.then_some((message, None)));
                                     }
                                 };
+                            let appeared =
+                                announce_against(&mut appeared_baseline, &result, newly_appeared);
                             let receipt = result.clone();
                             let FetchedList {
                                 scan,
@@ -1432,32 +1474,25 @@ pub fn spawn(
                                     notify_breakage(&app, &b);
                                 }
                             }
-                            // Newly APPEARED pull requests (#789).
-                            //
-                            // Gated on `had_a_tick` rather than on `previous`
-                            // being non-empty, and that distinction is the whole
-                            // of the first-tick suppression. `previous` starts
-                            // EMPTY, so `!previous.is_empty()` would be false on
-                            // the first tick and also false on the first tick of
-                            // a user whose last pull request merged -- and the
-                            // second of those is a real empty list whose next
-                            // arrival IS news. A separate flag says "we have
-                            // compared at least once", which is the actual
-                            // question.
+                            // Newly APPEARED pull requests (#789), measured
+                            // against `appeared_baseline` above rather than
+                            // `previous`: `None` until a receipt that can be a
+                            // baseline has been seen, which is the whole of the
+                            // first-tick suppression. A Partial receipt counts
+                            // once the list has been validated end to end
+                            // (#1939), so a long or tainted traversal no longer
+                            // silences every arrival.
                             //
                             // `newly_broken` above needs no such guard: it never
                             // fires for a pull request absent from `previous`, so
                             // an empty previous list announces nothing by
                             // construction. This rule is the opposite shape --
-                            // absent means new -- so it needs the flag.
-                            if had_a_tick {
-                                for b in newly_appeared(&previous, &prs) {
-                                    if prefs.wants(b.kind) {
-                                        notify_breakage(&app, &b);
-                                    }
+                            // absent means new -- so it needs the baseline.
+                            for b in appeared {
+                                if prefs.wants(b.kind) {
+                                    notify_breakage(&app, &b);
                                 }
                             }
-                            had_a_tick = matches!(coverage, Coverage::Complete);
 
                             previous = prs.clone();
                             // Null replaces stale numeric advice with unknown completeness.
@@ -1544,22 +1579,26 @@ pub fn spawn(
                             {
                                 Ok(now) => now,
                                 Err(failure) => {
+                                    // A lost write race is not a failure (#1933).
+                                    let outcome = if failure.superseded {
+                                        "superseded"
+                                    } else {
+                                        "failed"
+                                    };
                                     source_poll::complete(&app, publication, Err(failure));
-                                    return "failed";
+                                    return outcome;
                                 }
                             };
                             let prefs = read_notify_prefs(&app).await;
-                            if let Some(before) = &previous_reviewing {
-                                for b in newly_ready(before, &now.prs) {
-                                    if prefs.wants(b.kind) {
-                                        notify_breakage(&app, &b);
-                                    }
+                            // Partial receipts count once the queue has been
+                            // validated end to end (#1939).
+                            for b in announce_against(&mut previous_reviewing, &now, newly_ready) {
+                                if prefs.wants(b.kind) {
+                                    notify_breakage(&app, &b);
                                 }
                             }
                             persist_reviewing(&app, &now).await;
                             emit_reviewing(&app, &now);
-                            let complete = matches!(now.coverage, Coverage::Complete);
-                            previous_reviewing = complete.then(|| now.prs.clone());
                             source_poll::complete(&app, publication, Ok(now));
                         }
                         Err(error) => source_poll::complete(&app, publication, Err(error)),
@@ -2725,8 +2764,96 @@ mod tests {
             assert_eq!(
                 out.len(),
                 3,
-                "the suppression lives in the poll loop's `had_a_tick`, not here"
+                "the suppression lives in `announce_against`'s baseline, not here"
             );
+        }
+
+        /// A receipt as the poll loop accepts it: rows, coverage, and the
+        /// checkpoint state that says whether the list was ever validated.
+        fn receipt(rows: Vec<PullRequest>, complete: bool, validated: bool) -> FetchedList {
+            FetchedList {
+                viewer: Some("me".into()),
+                total: Some(rows.len() as u64 + 10),
+                prs: rows,
+                coverage: if complete {
+                    Coverage::Complete
+                } else {
+                    Coverage::Partial { total: None }
+                },
+                scan: Some(crate::queue_scan::Commit {
+                    expected_revision: 0,
+                    state: crate::queue_scan::State {
+                        completed_at: validated.then_some(1000),
+                        ..Default::default()
+                    },
+                    removals: vec![],
+                }),
+            }
+        }
+
+        /// #1939: two Partial receipts of a list already validated end to
+        /// end. The second carries a pull request the first did not, in
+        /// the head page both fetched. Partial is not nothing: it is news.
+        #[test]
+        fn a_partial_receipt_announces_what_it_actually_received() {
+            let mut baseline = None;
+            let first = receipt(vec![open(1), open(2)], false, true);
+            assert!(
+                announce_against(&mut baseline, &first, newly_appeared).is_empty(),
+                "the first tick stays silent"
+            );
+            let second = receipt(vec![open(3), open(1), open(2)], false, true);
+            let out = announce_against(&mut baseline, &second, newly_appeared);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].number, 3);
+            // The same rows again announce nothing: no duplicates.
+            let third = receipt(vec![open(3), open(1), open(2)], false, true);
+            assert!(announce_against(&mut baseline, &third, newly_appeared).is_empty());
+        }
+
+        /// The ready-to-review notification follows the same baseline.
+        #[test]
+        fn a_partial_review_receipt_announces_a_newly_ready_pull_request() {
+            let ready = |n| pr_full("o/r", n, CiState::Success, MergeState::Mergeable);
+            let mut baseline = None;
+            announce_against(
+                &mut baseline,
+                &receipt(vec![ready(1)], false, true),
+                newly_ready,
+            );
+            let out = announce_against(
+                &mut baseline,
+                &receipt(vec![ready(2), ready(1)], false, true),
+                newly_ready,
+            );
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].kind, BreakageKind::ReadyToReview);
+            assert_eq!(out[0].number, 2);
+        }
+
+        /// Before the first validated traversal, a pull request missing
+        /// from the last receipt may sit on a page not fetched yet. That
+        /// is possibly wrong, so it is suppressed -- and a Complete receipt
+        /// then becomes the baseline.
+        #[test]
+        fn an_unvalidated_partial_list_is_no_baseline() {
+            let mut baseline = None;
+            announce_against(
+                &mut baseline,
+                &receipt(vec![open(1)], false, false),
+                newly_appeared,
+            );
+            let page_two = receipt(vec![open(1), open(26)], false, false);
+            assert!(
+                announce_against(&mut baseline, &page_two, newly_appeared).is_empty(),
+                "a page fetched for the first time is not news"
+            );
+            let complete = receipt(vec![open(1), open(26), open(51)], true, false);
+            assert!(announce_against(&mut baseline, &complete, newly_appeared).is_empty());
+            let next = receipt(vec![open(60), open(1), open(26), open(51)], false, true);
+            let out = announce_against(&mut baseline, &next, newly_appeared);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].number, 60);
         }
 
         /// And the `NotifyPrefs` category gates it.

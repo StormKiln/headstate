@@ -938,6 +938,7 @@ async fn coalesced_outcome_is_adopted_once(recovery: bool) {
                 message: "Synthetic earlier failure".into(),
                 transient: false,
                 not_asked: false,
+                superseded: false,
             }),
         )
         .await;
@@ -1166,6 +1167,7 @@ async fn coalesced_adoption_cannot_settle_an_independent_newer_failure() {
                 message: "Independent newer failure".into(),
                 transient: false,
                 not_asked: false,
+                superseded: false,
             }),
             |_| {},
         );
@@ -2141,6 +2143,7 @@ async fn settle_independent_readback_failure(polls: &SourcePolls) -> Status {
             message: "Independent newer failure".into(),
             transient: false,
             not_asked: false,
+            superseded: false,
         }),
         |_| {},
     );
@@ -4169,4 +4172,194 @@ async fn a_local_checkpoint_failure_is_not_reported_as_a_github_error() {
         failure.message
     );
     assert!(!failure.not_asked);
+}
+
+/// #1933: two attempts step from the same checkpoint revision. The winner
+/// commits; the loser's compare-and-swap fails. That is a lost race, not a
+/// provider failure: the winner's data stands, nothing is counted, and the
+/// winner's receipt is not re-stamped -- however many times it happens.
+#[tokio::test]
+async fn a_lost_write_race_leaves_the_winners_outcome_unchanged() {
+    let (_server, client) = stable_queue(75).await;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let polls = SourcePolls::default();
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    scan_and_publish(&polls, &conn, &client, 1000).await;
+    // Both schedulers read the same checkpoint revision.
+    let loaded = queue_scan::load(&conn, &source, list, "synthetic-viewer").unwrap();
+    let rows = saved(&conn);
+    scan_and_publish(&polls, &conn, &client, 1015).await;
+    let winner = polls.get(&source, list);
+    let winner_rows = saved(&conn);
+    for _ in 0..2 {
+        let (loser, _) = polls.begin_attempt(source.clone(), list).await;
+        let late = client
+            .advance_scan(
+                list,
+                queue_scan::Loaded {
+                    revision: loaded.revision,
+                    state: loaded.state.clone(),
+                },
+                &rows,
+                1015,
+            )
+            .await
+            .unwrap();
+        let permit = polls.success_publication(&loser).await.unwrap();
+        let prepared = reconcile_github_snapshot(&conn, &source, list, late, None);
+        assert!(prepared.is_err(), "the loser's commit must be refused");
+        let mut settled = None;
+        polls.complete(permit, prepared, |status| settled = Some(status));
+        let after = settled.expect("the newest attempt still settles; it cannot stay pending");
+        assert_eq!(after.phase, winner.phase);
+        assert_eq!(after.consecutive_failures, winner.consecutive_failures);
+        assert_eq!(after.error, winner.error);
+        assert_eq!(after.receipt_revision, winner.receipt_revision);
+        assert_eq!(after.last_received_at, winner.last_received_at);
+        assert_eq!(after.coverage, winner.coverage);
+    }
+    assert_eq!(saved(&conn), winner_rows, "the winner's rows stand");
+}
+
+/// #1933: a receipt published behind other work carries the time its data
+/// arrived, not the time it was finally published.
+#[tokio::test]
+async fn an_older_receipt_is_stamped_when_it_arrived_not_when_it_was_published() {
+    let polls = SourcePolls::default();
+    let source = Source::default();
+    let list = CachedList::Authored;
+    let (older, _) = polls.begin_attempt(source.clone(), list).await;
+    let (_newer, _) = polls.begin_attempt(source.clone(), list).await;
+    let permit = polls.success_publication(&older).await.unwrap();
+    let arrived_by = chrono::Utc::now();
+    // Publication work (reconcile, persistence) happens after arrival.
+    std::thread::sleep(Duration::from_millis(20));
+    polls.complete(
+        permit,
+        Ok(FetchedList {
+            scan: None,
+            viewer: Some("synthetic-viewer".into()),
+            prs: vec![],
+            total: Some(0),
+            coverage: Coverage::Complete,
+        }),
+        |_| {},
+    );
+    let status = polls.get(&source, list);
+    assert!(status.receipt_revision.is_some());
+    let stamped = chrono::DateTime::parse_from_rfc3339(&status.last_received_at.unwrap()).unwrap();
+    assert!(
+        stamped <= arrived_by,
+        "stamped {stamped}, but the data had arrived by {arrived_by}"
+    );
+}
+
+/// The previous process finished a pass at 1000, so its cadence holds the
+/// next pass until after 1060. Returns the database path.
+async fn finished_pass_before_restart(
+    client: &GitHubClient,
+    temp: &tempfile::TempDir,
+) -> std::path::PathBuf {
+    let path = temp.path().join("headstate.db");
+    let conn = crate::store::open_db(&path).unwrap();
+    scan_and_publish(&SourcePolls::default(), &conn, client, 1000).await;
+    let loaded = queue_scan::load(
+        &conn,
+        &Source::default(),
+        CachedList::Reviewing,
+        "synthetic-viewer",
+    )
+    .unwrap();
+    assert!(loaded.state.done && loaded.state.eligible_at > 1010);
+    path
+}
+
+/// #1938: after a restart inside one pass delay, Refresh fetched nothing
+/// and published no receipt, so the frontend could only say "No refreshed
+/// snapshot is available yet" until the next tick. Refresh now fetches.
+#[tokio::test]
+async fn refresh_right_after_a_restart_fetches_instead_of_waiting_for_the_cadence() {
+    let (server, client) = stable_queue(20).await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = finished_pass_before_restart(&client, &temp).await;
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    // A new process: nothing received yet.
+    let polls = SourcePolls::default();
+    let cold = polls.get(&source, list).receipt_revision.is_none();
+    let before = server.received_requests().await.unwrap().len();
+    let (attempt, _) = polls.begin_attempt(source.clone(), list).await;
+    let fetched = fetch_github_refresh_at(
+        path.clone(),
+        &client,
+        list,
+        Duration::from_secs(30),
+        cold,
+        || (60, 1010),
+    )
+    .await
+    .unwrap_or_else(|failure| panic!("{}", failure.message));
+    assert!(
+        server.received_requests().await.unwrap().len() > before,
+        "the refresh must reach GitHub"
+    );
+    let permit = polls.success_publication(&attempt).await.unwrap();
+    let conn = crate::store::open_db(&path).unwrap();
+    let prepared = reconcile_github_snapshot(&conn, &source, list, fetched, None);
+    polls.complete(permit, prepared, |_| {});
+    let status = polls.get(&source, list);
+    assert!(status.receipt_revision.is_some(), "a receipt to accept");
+    assert_eq!(status.phase, Phase::Ready);
+    assert!(status.last_received_at.is_some());
+}
+
+/// #1938: when Refresh still cannot ask GitHub (here a provider cooldown),
+/// it says so: not asked, never a provider failure and never absence.
+#[tokio::test]
+async fn refresh_right_after_a_restart_that_cannot_ask_says_not_asked() {
+    let (server, client) = stable_queue(20).await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = finished_pass_before_restart(&client, &temp).await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "60")
+                .set_body_json(json!({"message":"Synthetic provider cooldown"})),
+        )
+        .mount(&server)
+        .await;
+    assert!(client
+        .fetch_viewer_metered(&client.request_budget())
+        .await
+        .is_err());
+    let before = server.received_requests().await.unwrap().len();
+    let source = Source::default();
+    let list = CachedList::Reviewing;
+    let polls = SourcePolls::default();
+    let (attempt, _) = polls.begin_attempt(source.clone(), list).await;
+    let failure = fetch_github_refresh_at(
+        path,
+        &client,
+        list,
+        Duration::from_secs(30),
+        polls.get(&source, list).receipt_revision.is_none(),
+        || (60, 1010),
+    )
+    .await
+    .err()
+    .expect("nothing was asked, so nothing was answered");
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert!(failure.not_asked, "{}", failure.message);
+    let permit = polls.publication(&attempt).await.unwrap();
+    polls.complete(permit, Err(failure), |_| {});
+    let status = polls.get(&source, list);
+    assert_eq!(status.phase, Phase::NotAsked);
+    assert_eq!(status.consecutive_failures, 0);
+    assert!(status
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with(crate::commands::NOT_ASKED)));
 }

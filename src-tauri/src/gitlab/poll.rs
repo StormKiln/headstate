@@ -323,6 +323,7 @@ async fn fetch_and_persist(
                         error,
                         queues::QueueError::MissingCli | queues::QueueError::UnsupportedHost
                     ),
+                    superseded: false,
                 };
                 source_poll::complete_gitlab(app, publication, Err(failure));
             }
