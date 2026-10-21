@@ -5761,4 +5761,105 @@ let f = std::env::temp_dir;
             vec!["fixture.rs:13: let tx = conn.unchecked_transaction()?;".to_string()]
         );
     }
+
+    /// Lines of production code in `src` that emit the legacy authored
+    /// `poll-state` or `poll-error` event, as `file:line: text`.
+    fn poll_event_emitters(file: &Path, rel: &str, src: &str) -> Vec<String> {
+        let src = src.replace("\r\n", "\n");
+        src.lines()
+            .zip(test_mask(file, &src))
+            .enumerate()
+            .filter(|(_, (line, test))| {
+                !test
+                    && !is_comment(line)
+                    && line.contains("emit(")
+                    && (line.contains("\"poll-error\"") || line.contains("\"poll-state\""))
+            })
+            .map(|(i, (line, _))| format!("{rel}:{}: {}", i + 1, line.trim()))
+            .collect()
+    }
+
+    /// **`poll-state` and `poll-error` have one emitter (#1934).**
+    ///
+    /// The poll loop used to emit both itself, from its own failure counter
+    /// and its own copy of `should_surface`, while `source_poll::emit_status`
+    /// emitted them again from `Status.consecutive_failures` -- a counter that
+    /// also counts foreground failures. Every surfaced error reached the
+    /// banner twice, and the two copies could disagree about whether it
+    /// should surface at all. The authored status is the one source.
+    #[test]
+    fn poll_state_and_poll_error_are_emitted_only_from_the_source_status() {
+        let mut emitters = Vec::new();
+        let mut checked = 0usize;
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                // By PATH: this guard's own prose and fixtures name the events.
+                if file.ends_with("invariants.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                checked += 1;
+                let rel = format!(
+                    "{crate_name}/{}",
+                    file.strip_prefix(&root).unwrap_or(&file).display()
+                )
+                .replace('\\', "/");
+                emitters.extend(poll_event_emitters(&file, &rel, &src));
+            }
+        }
+        assert!(
+            checked > 100,
+            "the walk saw {checked} files; it is not reading the tree it claims to guard"
+        );
+        let (allowed, others): (Vec<_>, Vec<_>) = emitters
+            .into_iter()
+            .partition(|line| line.contains("/source_poll.rs:"));
+        assert_eq!(
+            allowed.len(),
+            2,
+            "`source_poll::emit_status` should emit exactly `poll-state` and `poll-error`; \
+             the guard is not seeing them: {allowed:?}"
+        );
+        assert!(
+            others.is_empty(),
+            "`poll-state`/`poll-error` emitted outside `source_poll::emit_status` (#1934). \
+             A second emitter applies a second failure rule to a second counter, and the \
+             banner fires twice. Settle the source status and let `emit_status` emit:\n  {}",
+            others.join("\n  ")
+        );
+    }
+
+    /// The other direction: silent on prose, on test code and on the event
+    /// name used as a relay key; fires on a production emit after a test
+    /// module in a CRLF checkout.
+    #[test]
+    fn the_poll_event_guard_ignores_tests_and_prose_but_not_code() {
+        let file = Path::new("fixture/does_not_exist.rs");
+        let safe = "/// Never `app.emit(\"poll-error\", e)` from the loop.\n\
+                    const RELAYED: &[&str] = &[\"poll-state\", \"poll-error\"];\n\
+                    fn tick(app: &AppHandle) {\n    \
+                    // app.emit(\"poll-state\", \"idle\")\n    \
+                    let _ = app.emit(\"prs-updated\", ());\n\
+                    }\n\
+                    #[cfg(test)]\n\
+                    mod tests {\n    \
+                    fn relays() {\n        \
+                    hub.emit(\"poll-state\", \"idle\");\n    \
+                    }\n\
+                    }\n";
+        assert_eq!(
+            poll_event_emitters(file, "fixture.rs", safe),
+            Vec::<String>::new()
+        );
+        let unsafe_ = format!(
+            "{safe}fn late(app: &AppHandle) {{\n    let _ = app.emit(\"poll-error\", e.to_string());\n}}\n"
+        )
+        .replace('\n', "\r\n");
+        assert_eq!(
+            poll_event_emitters(file, "fixture.rs", &unsafe_),
+            vec!["fixture.rs:14: let _ = app.emit(\"poll-error\", e.to_string());".to_string()]
+        );
+    }
 }

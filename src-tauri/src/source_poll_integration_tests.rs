@@ -4132,3 +4132,41 @@ async fn identical_targeted_reads_preserve_repair_progress_and_completed_proof()
         );
     }
 }
+
+/// #1928: a local database failure while loading the checkpoint is a fault
+/// on this machine. It must not reach the user as "GitHub GraphQL error",
+/// and it must keep the underlying error text.
+#[tokio::test]
+async fn a_local_checkpoint_failure_is_not_reported_as_a_github_error() {
+    let (_server, client) = stable_queue(1).await;
+    let temp = tempfile::tempdir().unwrap();
+    // A directory is not a database file: opening it fails locally.
+    let error = fetch_github_step_at(
+        temp.path().to_path_buf(),
+        &client,
+        CachedList::Reviewing,
+        Duration::from_secs(30),
+        false,
+        || (120, 1000),
+    )
+    .await
+    .err()
+    .expect("a directory cannot be opened as the database");
+    assert!(
+        matches!(error, crate::github::client::ClientError::Local(_)),
+        "a local failure must be classified as local, got {error:?}"
+    );
+    let failure = Failure::from(&error);
+    assert!(
+        !failure.message.contains("GitHub"),
+        "a local failure must not blame GitHub: {}",
+        failure.message
+    );
+    let prefix = "Headstate could not read its saved refresh progress on this computer: ";
+    assert!(
+        failure.message.len() > prefix.len() && failure.message.starts_with(prefix),
+        "the underlying error text is kept: {}",
+        failure.message
+    );
+    assert!(!failure.not_asked);
+}
