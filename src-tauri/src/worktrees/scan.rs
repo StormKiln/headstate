@@ -2311,6 +2311,16 @@ pub enum DiscoveryDiagnosticKind {
     /// `RepoScan::unreadable` and does not trip `is_partial()` or the
     /// safety gates keyed on it.
     RepositoryBoundary,
+    /// The discovery exclusions setting could not be read, so the scan
+    /// ran without exclusions (#1956).
+    ///
+    /// Neither a shortfall nor a floor: scanning without exclusions can
+    /// only visit MORE, so nothing configured was missed and the count is
+    /// not qualified. It is kept out of `RepoScan::unreadable` for the
+    /// same reason as `RepositoryBoundary` -- nothing on disk was
+    /// unreadable -- and it is reported as a settings failure rather than
+    /// a scan failure, because the remedy is in Settings, not on disk.
+    SettingsError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2362,53 +2372,155 @@ pub struct RepoScan {
     pub unreadable: Vec<String>,
 }
 
-/// Whether the checkout at `dir` holds another checkout one level down
-/// that discovery will not visit (#1948).
+/// What a bounded look inside a root checkout found (#1948, #1976).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedCheckouts {
+    /// Nothing nested within the probe's reach, and everything in reach
+    /// was read: the root's count is exact.
+    None,
+    /// Another checkout is nested inside and discovery will not visit it:
+    /// the root's count is a floor.
+    Found,
+    /// The probe could not decide -- it ran out of budget, or a folder
+    /// inside could not be read -- so the root MAY hide repositories.
+    /// Qualified like `Found` rather than suppressed: "at least" stays
+    /// true either way, while a clean answer here might be wrong.
+    Possible,
+}
+
+/// How far below a root checkout the nested-checkout probe looks.
 ///
-/// A child counts when its `.git` is a directory (an independent clone)
+/// Three levels reaches `vendor/x`, `src/tool` and `third_party/lib/x`,
+/// which is where repositories kept inside another repository live in
+/// practice (#1976). Deeper is a walk, which is what #1919 removed.
+const NESTED_PROBE_DEPTH: usize = 3;
+
+/// Filesystem operations (directory reads plus `.git` checks) the probe
+/// may spend on one root before it answers `Possible`.
+///
+/// The probe exists to SAY something, never to discover, so it must stay
+/// far cheaper than the walk it is not doing: #1919 stopped walking
+/// checkouts because their source and build trees ate the 10,000-directory
+/// budget. A source tree has a few hundred folders within three levels.
+const NESTED_PROBE_BUDGET: usize = 2_000;
+
+/// Whether the checkout at `dir` holds another checkout that discovery
+/// will not visit (#1948, #1976).
+///
+/// A folder counts when its `.git` is a directory (an independent clone)
 /// or a `gitdir:` file pointing anywhere but `dir`'s own `.git` -- a
-/// linked worktree of the root repository is enumerated by Git, so it is
-/// not hidden. One level only: that is where `~/code`-under-VCS keeps its
-/// repositories, and it costs one directory read rather than a walk.
-/// Unreadable means `false`: the read failure, if real, is reported by
-/// the walk itself.
-fn has_nested_checkout(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    let own = dir.join(".git");
-    entries.flatten().any(|entry| {
-        if entry.file_name() == ".git" || !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            return false;
+/// linked worktree or submodule of the root repository is enumerated by
+/// Git, so it is not hidden, and it is not looked inside either.
+///
+/// Bounded descent rather than asking Git: `git ls-files --others
+/// --exclude-standard` hides IGNORED folders, and an ignored `vendor/` or
+/// `src/` is exactly where a dotfiles or monorepo root keeps its clones;
+/// adding `--ignored` collapses each ignored folder into one entry that
+/// would need walking anyway. It also costs a subprocess per root with
+/// Git's own failure modes. A capped `read_dir` breadth-first search
+/// answers the same question with no subprocess and a fixed cost.
+///
+/// Breadth-first, so the common case (`~/code` under version control,
+/// whose clones sit one level down) is decided by the first read. Skips
+/// the folders discovery prunes as build or dependency output (hidden
+/// folders, `node_modules`, `target`, `build`, `dist`) but NOT `vendor`:
+/// inside a checkout, `vendor/` is where clones are kept.
+///
+/// An unreadable ROOT means `None`: that read failure, if real, is
+/// reported by the walk itself. An unreadable folder inside it is
+/// `Possible`, because the probe could not look there.
+fn nested_checkouts(dir: &Path) -> NestedCheckouts {
+    nested_checkouts_within(dir, NESTED_PROBE_BUDGET)
+}
+
+fn nested_checkouts_within(dir: &Path, mut budget: usize) -> NestedCheckouts {
+    // Git records gitdirs under the RESOLVED path, so a root spelled
+    // through a symlink (macOS's /var -> /private/var) must be resolved
+    // before comparing. Lexical when it does not resolve.
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own = resolve(&dir.join(".git"));
+    let mut uncertain = false;
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0usize)]);
+    while let Some((folder, depth)) = queue.pop_front() {
+        if budget == 0 {
+            return NestedCheckouts::Possible;
         }
-        let marker = entry.path().join(".git");
-        if marker.is_dir() {
-            return true;
-        }
-        let Ok(contents) = std::fs::read_to_string(&marker) else {
-            return false;
+        budget -= 1;
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(_) if depth == 0 => return NestedCheckouts::None,
+            Err(_) => {
+                uncertain = true;
+                continue;
+            }
         };
-        let Some(admin) = contents.strip_prefix("gitdir:").map(str::trim) else {
-            return false;
-        };
-        // Lexically, so a relative `../.git/worktrees/x` (git worktree
-        // --relative-paths) resolves without touching the filesystem.
-        let mut target = std::path::PathBuf::new();
-        for part in entry.path().join(admin).components() {
-            match part {
-                std::path::Component::ParentDir => {
-                    target.pop();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                uncertain = true;
+                continue;
+            };
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.')
+                || matches!(
+                    name.to_str(),
+                    Some("node_modules" | "target" | "build" | "dist")
+                )
+            {
+                continue;
+            }
+            // `file_type()` does not follow symlinks: a linked folder is
+            // reachable by its real path, as in the walk itself.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    uncertain = true;
+                    continue;
                 }
-                std::path::Component::CurDir => {}
-                other => target.push(other),
+            }
+            if budget == 0 {
+                return NestedCheckouts::Possible;
+            }
+            budget -= 1;
+            let child = entry.path();
+            let marker = child.join(".git");
+            if marker.is_dir() {
+                return NestedCheckouts::Found;
+            }
+            match std::fs::read_to_string(&marker) {
+                Ok(contents) => {
+                    if let Some(admin) = contents.strip_prefix("gitdir:").map(str::trim) {
+                        // Lexically, so a relative `../.git/worktrees/x`
+                        // (git worktree --relative-paths) resolves without
+                        // touching the filesystem.
+                        let mut target = std::path::PathBuf::new();
+                        for part in child.join(admin).components() {
+                            match part {
+                                std::path::Component::ParentDir => {
+                                    target.pop();
+                                }
+                                std::path::Component::CurDir => {}
+                                other => target.push(other),
+                            }
+                        }
+                        if !resolve(&target).starts_with(&own) {
+                            return NestedCheckouts::Found;
+                        }
+                    }
+                    // The root's own worktree or submodule, or a `.git`
+                    // file that is not a pointer: a checkout either way,
+                    // and not looked inside.
+                }
+                Err(_) if depth + 1 < NESTED_PROBE_DEPTH => queue.push_back((child, depth + 1)),
+                Err(_) => {}
             }
         }
-        // Git records the gitdir under the RESOLVED path, so a root spelled
-        // through a symlink (macOS's /var -> /private/var) must be resolved
-        // too before comparing. Lexical when a side does not resolve.
-        let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        !resolve(&target).starts_with(resolve(&own))
-    })
+    }
+    if uncertain {
+        NestedCheckouts::Possible
+    } else {
+        NestedCheckouts::None
+    }
 }
 
 impl RepoScan {
@@ -2444,10 +2556,32 @@ impl RepoScan {
     /// Only when something is actually hidden: a repository added as its
     /// own scan root -- the very advice the note gives -- holds nothing
     /// nested, and reporting it would put "at least" on a count that is
-    /// exact. One directory read decides it; see `has_nested_checkout`.
+    /// exact. A bounded probe decides it; see `nested_checkouts`. When the
+    /// probe cannot decide, the boundary is still reported, worded as
+    /// possibly hiding rather than certainly hiding (#1976).
     fn repository_root_boundary(&mut self, root: &Path, dir: &Path, depth: usize) {
-        if depth == 0 && has_nested_checkout(dir) {
-            self.discovery_stop(root, dir, DiscoveryDiagnosticKind::RepositoryBoundary);
+        if depth == 0 {
+            self.report_root_boundary(root, dir, nested_checkouts(dir));
+        }
+    }
+
+    fn report_root_boundary(&mut self, root: &Path, dir: &Path, nested: NestedCheckouts) {
+        if nested == NestedCheckouts::None {
+            return;
+        }
+        self.discovery_stop(root, dir, DiscoveryDiagnosticKind::RepositoryBoundary);
+        if nested == NestedCheckouts::Possible {
+            let root = root.to_string_lossy();
+            if let Some(diagnostic) = self
+                .diagnostics
+                .iter_mut()
+                .find(|d| d.root == root && d.kind == DiscoveryDiagnosticKind::RepositoryBoundary)
+            {
+                diagnostic.message = format!(
+                    "{}: this scan root is itself a repository, and discovery does not look inside repositories; it may hold nested repositories that could not all be checked; to include one nested inside it, add that folder as a scan root in Settings > Repositories",
+                    diagnostic.root,
+                );
+            }
         }
     }
 
@@ -2489,7 +2623,9 @@ impl RepoScan {
                 );
                 return;
             }
-            DiscoveryDiagnosticKind::ReadError | DiscoveryDiagnosticKind::GitError => {
+            DiscoveryDiagnosticKind::ReadError
+            | DiscoveryDiagnosticKind::GitError
+            | DiscoveryDiagnosticKind::SettingsError => {
                 unreachable!("errors are not traversal stops")
             }
         };
@@ -2521,8 +2657,66 @@ impl RepoScan {
 /// syscall or a `git` call the walk ALREADY made and already had to
 /// branch on. Nothing here stats a path twice and nothing here does
 /// safety work, so the fast path is still the fast path.
+///
+/// `#[cfg(test)]` since #1949: it ignores the discovery exclusions, and a
+/// production caller that used it walked folders the user had excluded.
+/// Production reaches the walk only through [`DiscoveryScope::scan`], and
+/// `invariants.rs` keeps this name out of every other file.
+#[cfg(test)]
 pub fn scan_dirs_fast_reporting(dirs: &[String]) -> RepoScan {
     scan_reporting(dirs, false)
+}
+
+/// What repository discovery covers: the configured roots and the
+/// configured exclusions, read together (#1949, #1956).
+///
+/// The ONE production entry to the discovery walk. #1923 added exclusions
+/// as a second entry point beside the first, and only two of the walkers
+/// moved to it; the rest kept walking excluded folders. Building a scope
+/// requires saying what the exclusions are -- or why they could not be
+/// read -- so a new caller cannot forget them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiscoveryScope {
+    pub roots: Vec<String>,
+    pub exclusions: Vec<String>,
+    /// Why the exclusions setting could not be read, when it could not.
+    ///
+    /// Not a reason to refuse the scan (#1956): the roots were read, and
+    /// scanning them without exclusions can only visit more, never miss
+    /// something configured. `scan` carries this as a `SettingsError`
+    /// diagnostic so the result says it ran unexcluded.
+    pub exclusions_unread: Option<String>,
+}
+
+impl DiscoveryScope {
+    /// The repositories under the roots, minus the exclusions, with what
+    /// could not be read.
+    pub fn scan(&self) -> RepoScan {
+        let mut scan = scan_reporting_excluding(&self.roots, false, &self.exclusions);
+        if let Some(why) = &self.exclusions_unread {
+            for root in &self.roots {
+                scan.diagnostics.push(DiscoveryDiagnostic {
+                    root: root.clone(),
+                    path: root.clone(),
+                    kind: DiscoveryDiagnosticKind::SettingsError,
+                    count: 1,
+                    message: format!(
+                        "{root}: discovery exclusions could not be read ({why}); this folder was scanned without them"
+                    ),
+                });
+            }
+        }
+        scan
+    }
+
+    /// The exclusions that fall at or under `root`, in `root`'s spelling.
+    ///
+    /// For the walkers that are not the repository walk but cover the same
+    /// roots (artifacts, `.claude` definitions): a folder the user
+    /// excluded from discovery is skipped there too.
+    pub fn excluded_under(&self, root: &str) -> Vec<std::path::PathBuf> {
+        exclusions_for_root(root, &self.exclusions)
+    }
 }
 
 /// Repos and their worktrees, WITHOUT classifying safety.
@@ -2541,10 +2735,12 @@ pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
     scan_dirs_fast_reporting(dirs).repos
 }
 
-pub fn scan_dirs_fast_reporting_excluding(dirs: &[String], excluded: &[String]) -> RepoScan {
+#[cfg(test)]
+fn scan_dirs_fast_reporting_excluding(dirs: &[String], excluded: &[String]) -> RepoScan {
     scan_reporting_excluding(dirs, false, excluded)
 }
 
+#[cfg(test)]
 fn scan_reporting(dirs: &[String], with_safety: bool) -> RepoScan {
     scan_reporting_excluding(dirs, with_safety, &[])
 }
@@ -2562,31 +2758,36 @@ fn discovery_path_identity(path: &Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+// Map canonical exclusions into one root's spelling once, not once per
+// visited directory. The walkers still refuse directory symlinks. An
+// exclusion that covers the root itself maps to the root.
+fn exclusions_for_root(base: &str, excluded: &[String]) -> Vec<std::path::PathBuf> {
+    let base_path = Path::new(base);
+    let canonical_base = discovery_path_identity(base_path);
+    excluded
+        .iter()
+        .filter_map(|excluded| {
+            let excluded = Path::new(excluded);
+            let resolved = discovery_path_identity(excluded);
+            if canonical_base.starts_with(&resolved) || base_path.starts_with(excluded) {
+                Some(base_path.to_path_buf())
+            } else if let Ok(rest) = resolved.strip_prefix(&canonical_base) {
+                Some(base_path.join(rest))
+            } else if excluded.starts_with(base_path) {
+                Some(excluded.to_path_buf())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn scan_reporting_excluding(dirs: &[String], with_safety: bool, excluded: &[String]) -> RepoScan {
     let mut scan = RepoScan::default();
     let mut common_dirs = std::collections::HashSet::new();
     for base in dirs {
         let mut remaining = 10_000;
-        // Map canonical exclusions into this root's spelling once, not once
-        // per visited directory. The walker still refuses directory symlinks.
-        let base_path = Path::new(base);
-        let canonical_base = discovery_path_identity(base_path);
-        let exclusions: Vec<_> = excluded
-            .iter()
-            .filter_map(|excluded| {
-                let excluded = Path::new(excluded);
-                let resolved = discovery_path_identity(excluded);
-                if canonical_base.starts_with(&resolved) || base_path.starts_with(excluded) {
-                    Some(base_path.to_path_buf())
-                } else if let Ok(rest) = resolved.strip_prefix(&canonical_base) {
-                    Some(base_path.join(rest))
-                } else if excluded.starts_with(base_path) {
-                    Some(excluded.to_path_buf())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let exclusions = exclusions_for_root(base, excluded);
         collect_bounded_excluding(
             Path::new(base),
             0,
@@ -12980,6 +13181,88 @@ mod nested_discovery_tests {
             .map(|d| d.path.clone())
             .collect();
         assert_eq!(boundaries, vec![root.to_string_lossy().into_owned()]);
+
+        // #1976: the clone kept deeper inside the root, as a dotfiles or
+        // monorepo root keeps `vendor/x` and `src/lib/tool`. Discovery
+        // still does not walk there (#1919), and must still SAY so.
+        for nested in ["vendor/child", "src/lib/tool"] {
+            let deep_root = tmp
+                .path()
+                .join(format!("deep-{}", nested.replace('/', "-")));
+            let clone = deep_root.join(nested);
+            std::fs::create_dir_all(&clone).unwrap();
+            run(&deep_root, &["init", "-q"]);
+            run(&clone, &["init", "-q"]);
+            let scan = scan_dirs_fast_reporting(&[deep_root.to_string_lossy().into_owned()]);
+            let boundary = scan
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary)
+                .unwrap_or_else(|| panic!("{nested}: the boundary must be reported: {scan:?}"));
+            assert_eq!(boundary.path, deep_root.to_string_lossy());
+            assert!(
+                !boundary.message.contains("may hold"),
+                "{nested}: a clone that was FOUND is not a maybe: {}",
+                boundary.message
+            );
+            assert!(!scan.is_partial(), "{:?}", scan.unreadable);
+        }
+    }
+
+    /// #1976: what the probe does NOT count. A root whose only `.git`
+    /// below it sits in a pruned dependency or build folder hides no
+    /// repository of the user's, and the probe never descends past its
+    /// depth: both stay silent, so an exact count is not qualified.
+    #[test]
+    fn the_nested_checkout_probe_skips_pruned_folders_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        for pruned in [
+            "node_modules/pkg",
+            "target/debug/build/x",
+            ".cache/clone",
+            "a/b/c/too-deep",
+        ] {
+            std::fs::create_dir_all(root.join(pruned).join(".git")).unwrap();
+        }
+        run(&root, &["init", "-q"]);
+        assert_eq!(nested_checkouts(&root), NestedCheckouts::None);
+        let scan = scan_dirs_fast_reporting(&[root.to_string_lossy().into_owned()]);
+        assert!(
+            !scan
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary),
+            "{:?}",
+            scan.diagnostics
+        );
+
+        // Out of budget before the tree is read: possibly hiding, never a
+        // clean answer it did not earn.
+        for i in 0..8 {
+            std::fs::create_dir_all(root.join(format!("pkg{i}/src"))).unwrap();
+        }
+        assert_eq!(nested_checkouts_within(&root, 4), NestedCheckouts::Possible);
+        assert_eq!(nested_checkouts_within(&root, 1_000), NestedCheckouts::None);
+
+        // And it is reported as a maybe, still as a scope rather than a
+        // read failure.
+        let mut possible = RepoScan::default();
+        possible.report_root_boundary(&root, &root, NestedCheckouts::Possible);
+        assert_eq!(possible.diagnostics.len(), 1);
+        assert_eq!(
+            possible.diagnostics[0].kind,
+            DiscoveryDiagnosticKind::RepositoryBoundary
+        );
+        assert!(
+            possible.diagnostics[0].message.contains("may hold"),
+            "{}",
+            possible.diagnostics[0].message
+        );
+        assert!(possible.diagnostics[0]
+            .message
+            .contains("add that folder as a scan root"));
+        assert!(!possible.is_partial());
     }
 
     /// #1948: a root repository whose only nested checkout is its OWN
@@ -13006,6 +13289,12 @@ mod nested_discovery_tests {
             ],
         );
         run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
+        // #1976: the probe now looks deeper than one level, so the root's
+        // own worktree two levels down must not count either.
+        run(
+            &root,
+            &["worktree", "add", "-q", "trees/second", "-b", "second"],
+        );
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut spellings = vec![root.clone()];
         // The root reached through a symlink, as macOS's /var -> /private/var

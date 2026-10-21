@@ -29,8 +29,30 @@ const MAX_DEPTH: usize = 4;
 /// Deliberately does NOT size anything. Sizing 111 directories measured
 /// at 56 seconds against 54ms to find them, so the two are separate
 /// passes and the UI renders the first while the second runs.
-pub fn scan(roots: &[String]) -> Vec<Artifact> {
-    scan_streaming(roots, &mut |_| {}).0
+///
+/// Skips the folders excluded from repository discovery (#1949): the
+/// exclusion is the user saying "do not walk this", and the budget and
+/// depth notices this walk raises inside an excluded backup are the ones
+/// the exclusion exists to remove.
+pub fn scan(scope: &crate::worktrees::DiscoveryScope) -> Vec<Artifact> {
+    scan_streaming_excluding(scope, &mut |_| {}).0
+}
+
+/// [`scan_streaming_excluding`] with no exclusions. Tests only, for the
+/// reason `worktrees::scan_dirs_fast_reporting` is: a production walk that
+/// ignores the exclusions walks folders the user excluded (#1949).
+#[cfg(test)]
+pub fn scan_streaming(
+    roots: &[String],
+    report: &mut dyn FnMut(ScanProgress),
+) -> (Vec<Artifact>, Vec<FailedRoot>) {
+    scan_streaming_excluding(
+        &crate::worktrees::DiscoveryScope {
+            roots: roots.to_vec(),
+            ..Default::default()
+        },
+        report,
+    )
 }
 
 /// Discovery omissions, including unreadable paths, depth limits and unproved candidates.
@@ -76,16 +98,30 @@ pub struct ScanProgress {
 /// Returns the failed roots alongside the artifacts, because a caller
 /// that only got a `Vec` could not tell a clean machine from one it
 /// could not read.
-pub fn scan_streaming(
-    roots: &[String],
+///
+/// The roots and exclusions come as one `DiscoveryScope` (#1949), the
+/// same scope the repository walk takes, so the two cannot disagree about
+/// which folders are scanned.
+pub fn scan_streaming_excluding(
+    scope: &crate::worktrees::DiscoveryScope,
     report: &mut dyn FnMut(ScanProgress),
 ) -> (Vec<Artifact>, Vec<FailedRoot>) {
+    let roots = &scope.roots;
     let mut out = Vec::new();
     let mut failed = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         let dir = Path::new(root);
         let mut remaining = 10_000;
-        walk(dir, dir, 0, &mut out, &mut failed, &mut remaining);
+        let excluded = scope.excluded_under(root);
+        walk(
+            dir,
+            dir,
+            0,
+            &mut out,
+            &mut failed,
+            &mut remaining,
+            &excluded,
+        );
         report(ScanProgress {
             roots_done: i + 1,
             roots_total: roots.len(),
@@ -117,7 +153,13 @@ fn walk(
     out: &mut Vec<Artifact>,
     failed: &mut Vec<FailedRoot>,
     remaining: &mut usize,
+    excluded: &[std::path::PathBuf],
 ) {
+    // Before the stat, as the repository walk does: an excluded folder is
+    // not looked at at all, so a missing or unreadable one reports nothing.
+    if excluded.iter().any(|path| dir.starts_with(path)) {
+        return;
+    }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return,
@@ -188,7 +230,7 @@ fn walk(
                 "Discovery depth limit reached; add this folder as a scan root",
             );
         } else {
-            walk(&path, root, depth + 1, out, failed, remaining);
+            walk(&path, root, depth + 1, out, failed, remaining, excluded);
         }
         if *remaining == 0 {
             omission(
@@ -395,6 +437,61 @@ fn repo_root(from: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// `super::scan` over bare roots with no exclusions, the shape these
+    /// tests were written against before #1949.
+    pub(super) fn scan(roots: &[String]) -> Vec<Artifact> {
+        super::scan(&crate::worktrees::DiscoveryScope {
+            roots: roots.to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// #1949: an excluded folder is not walked, so neither its artifacts
+    /// nor the depth and budget notices it would raise are reported --
+    /// and a sibling outside the exclusion still is.
+    #[test]
+    fn discovery_exclusions_skip_artifacts_and_their_notices() {
+        let t = tempfile::tempdir().unwrap();
+        let backup = t.path().join("backup");
+        fs::create_dir_all(backup.join("a/b/c/d/e/f/g/h")).unwrap();
+        let live = t.path().join("live");
+        fs::create_dir_all(live.join("node_modules")).unwrap();
+        fs::write(live.join("package.json"), "{}").unwrap();
+        let roots = vec![t.path().to_string_lossy().into_owned()];
+
+        let (_, unexcluded) = scan_streaming(&roots, &mut |_| {});
+        assert!(
+            unexcluded
+                .iter()
+                .any(|f| Path::new(&f.root).starts_with(&backup)),
+            "the fixture must raise a notice inside the backup: {unexcluded:?}"
+        );
+
+        let scope = crate::worktrees::DiscoveryScope {
+            roots,
+            exclusions: vec![backup.to_string_lossy().into_owned()],
+            exclusions_unread: None,
+        };
+        let (found, failed) = scan_streaming_excluding(&scope, &mut |_| {});
+        assert!(
+            !failed
+                .iter()
+                .any(|f| Path::new(&f.root).starts_with(&backup)),
+            "{failed:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|a| Path::new(&a.path).starts_with(&backup)),
+            "{found:?}"
+        );
+        assert_eq!(
+            super::scan(&scope).len(),
+            found.len(),
+            "the unattended cleanup walk takes the same scope"
+        );
+    }
 
     /// Whether git can be run at all.
     ///
@@ -761,6 +858,7 @@ dist/
 
 #[cfg(test)]
 mod streaming_tests {
+    use super::tests::scan;
     use super::*;
 
     /// A `TempDir` no other run can name, removed when dropped (#1554).
@@ -967,6 +1065,7 @@ mod coverage_tests {
     #[cfg(unix)]
     #[test]
     fn explicit_symlink_is_never_classified_or_followed() {
+        use super::tests::scan;
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
         fs::create_dir(tmp.path().join("real")).unwrap();

@@ -422,7 +422,9 @@ export interface DiscoveryDiagnostic {
   /// `repositoryBoundary`: the scan root is itself a repository, so
   /// discovery did not look inside it (#1948). A scope, not a failure --
   /// it never appears in `unreadable`.
-  kind: "depthLimit" | "directoryBudget" | "readError" | "gitError" | "repositoryBoundary";
+  /// `settingsError`: the exclusions setting could not be read, so the
+  /// folder was scanned without exclusions (#1956). Not a shortfall either.
+  kind: "depthLimit" | "directoryBudget" | "readError" | "gitError" | "repositoryBoundary" | "settingsError";
   count: number;
   message: string;
 }

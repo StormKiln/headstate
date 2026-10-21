@@ -342,11 +342,13 @@ pub fn cancel_disk_inventory(run_id: String) -> Result<(), String> {
 }
 #[tauri::command]
 pub async fn start_disk_inventory(app: AppHandle) -> Result<Status, String> {
+    // The bare roots, not the discovery scope: an inventory of where the
+    // disk went must count an excluded backup too -- it is often the
+    // largest thing there (#1949's named opt-out). And never a guessed
+    // `~/code` when the setting cannot be read (#1956).
+    let roots = crate::commands::get_worktree_dirs(app.clone())?;
     controller()
-        .start(
-            crate::commands::db_path(&app),
-            crate::commands::get_worktree_dirs(app),
-        )
+        .start(crate::commands::db_path(&app), roots)
         .await
 }
 

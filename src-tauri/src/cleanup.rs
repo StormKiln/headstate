@@ -311,7 +311,16 @@ pub fn prefs(conn: &Connection) -> CleanupPrefs {
 /// Pure apart from the filesystem reads the scanners do: it proposes,
 /// and the caller decides what to do with the list. In Phase 1 the only
 /// caller writes it to the ledger.
-pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerEntry> {
+///
+/// Takes the discovery scope (#1949), so worktrees, branches and artifacts
+/// are proposed only from folders the user has not excluded. Venvs
+/// deliberately use the bare roots -- see the opt-out below.
+pub fn propose(
+    prefs: &CleanupPrefs,
+    scope: &crate::worktrees::DiscoveryScope,
+    now: &str,
+) -> Vec<LedgerEntry> {
+    let roots = &scope.roots;
     if !prefs.enabled {
         return Vec::new();
     }
@@ -330,6 +339,13 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
         // The manual path deliberately has no such gate: ticking a row
         // and confirming a dialog is already the user's intent. Here
         // there is no such signal, which is why the opt-in lives here.
+        //
+        // The BARE roots, not the discovery scope: a deliberate opt-out of
+        // the exclusions (#1949). A venv is orphaned when no project
+        // directory hashes to it, so leaving an excluded folder out of
+        // that set would turn every venv whose project lives there into a
+        // removal proposal. Exclusions may narrow what is proposed; they
+        // must never be what makes something look removable.
         let dirs = crate::caches::project_dirs(roots);
         for v in crate::caches::scan_poetry(&dirs) {
             if out.len() >= cap {
@@ -368,7 +384,7 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
     }
 
     if prefs.artifacts {
-        for a in crate::artifacts::scan(roots) {
+        for a in crate::artifacts::scan(scope) {
             if out.len() >= cap {
                 break;
             }
@@ -424,11 +440,11 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
     }
 
     if prefs.worktrees {
-        propose_worktrees(prefs, roots, now, cap, &mut out);
+        propose_worktrees(prefs, scope, now, cap, &mut out);
     }
 
     if prefs.branches {
-        propose_branches(prefs, roots, now, cap, &mut out);
+        propose_branches(prefs, scope, now, cap, &mut out);
     }
 
     out
@@ -500,7 +516,7 @@ fn branch_eligible(d: &crate::branches::Deletable, prefs: &CleanupPrefs) -> bool
 /// property that could quietly stop being true.
 fn propose_worktrees(
     prefs: &CleanupPrefs,
-    roots: &[String],
+    scope: &crate::worktrees::DiscoveryScope,
     now: &str,
     cap: usize,
     out: &mut Vec<LedgerEntry>,
@@ -511,7 +527,7 @@ fn propose_worktrees(
     if !prefs.worktrees_safe {
         return;
     }
-    for repo in crate::worktrees::scan_dirs_fast_reporting(roots).repos {
+    for repo in scope.scan().repos {
         for wt in repo.worktrees {
             if out.len() >= cap {
                 return;
@@ -561,7 +577,7 @@ fn propose_worktrees(
 /// separately, exactly as the issue specifies.
 fn propose_branches(
     prefs: &CleanupPrefs,
-    roots: &[String],
+    scope: &crate::worktrees::DiscoveryScope,
     now: &str,
     cap: usize,
     out: &mut Vec<LedgerEntry>,
@@ -573,7 +589,7 @@ fn propose_branches(
     if !prefs.branches_ancestor && !prefs.branches_squash {
         return;
     }
-    for repo in crate::worktrees::scan_dirs_fast_reporting(roots).repos {
+    for repo in scope.scan().repos {
         if out.len() >= cap {
             return;
         }
@@ -643,6 +659,19 @@ const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `super::propose` over bare roots with no exclusions, the shape every
+    /// test here was written against before #1949.
+    fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerEntry> {
+        super::propose(
+            prefs,
+            &crate::worktrees::DiscoveryScope {
+                roots: roots.to_vec(),
+                ..Default::default()
+            },
+            now,
+        )
+    }
 
     fn on() -> CleanupPrefs {
         CleanupPrefs {
