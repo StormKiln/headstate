@@ -7642,10 +7642,14 @@ pub async fn update_all_repositories(
     // The MAIN CHECKOUT of each repository, which is what the button is
     // about. A repository's other worktrees are branches the user is
     // working on, and pulling them is a different promise entirely.
-    let paths = crate::worktrees::repository_update_paths(&scan.repos);
-    if let Some(expected) = expected_paths {
-        crate::worktrees::validate_update_scope(&expected, &paths)?;
-    }
+    let discovered = crate::worktrees::repository_update_paths(&scan.repos);
+    // The displayed scope against the fresh one (#1954). Never refused as
+    // a whole: the repositories both agree on are updated, and every other
+    // one gets an outcome naming why it was left alone.
+    let (paths, left_alone) = match expected_paths {
+        Some(expected) => crate::worktrees::reconcile_update_scope(&expected, &discovered),
+        None => (discovered, Vec::new()),
+    };
     let unreadable = scan.unreadable;
     let diagnostics = scan.diagnostics;
 
@@ -7655,33 +7659,72 @@ pub async fn update_all_repositories(
     // `index.lock`. It also returns the flag the run reads to stop, so
     // the registry owns both halves -- `apply_updates_in_background`'s
     // shape exactly.
-    let stop = app
-        .state::<crate::repos::runs::UpdateAllRuns>()
-        .start(paths.len())?;
+    //
+    // The claim is a guard (#1947): however this function leaves, the
+    // registry does not stay `Running`.
+    let runs = app.state::<crate::repos::runs::UpdateAllRuns>();
+    let claim = runs.start(&paths)?;
+    let stop = claim.stop_flag();
 
-    let _ = app.emit("update-all-progress", (0usize, paths.len()));
+    let run_total = paths.len();
+    let _ = app.emit("update-all-progress", (0usize, run_total));
 
     let progress_app = app.clone();
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::update_all_with(&paths, unreadable, &stop, |done, total| {
-            // Counts only -- never paths. The same rule the two progress
-            // emitters beside this one state in identical terms: a
-            // progress event is not a place to leak what the user is
-            // working on. The repository paths are in the RESULT, where
-            // the user needs them to know where to go.
-            let _ = progress_app.emit("update-all-progress", (done, total));
-            // And into the registry, so a client that was asleep for the
-            // whole run can still ask how far it got.
-            progress_app
-                .state::<crate::repos::runs::UpdateAllRuns>()
-                .progress(done, total);
-        })
+    let run_unreadable = unreadable.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::update_all_observed(
+            &paths,
+            run_unreadable,
+            &stop,
+            |done, total, outcome| {
+                // Into the registry, so a client that was asleep for the
+                // whole run can still ask how far it got -- and so a run
+                // that dies keeps what it already applied (#1947).
+                progress_app
+                    .state::<crate::repos::runs::UpdateAllRuns>()
+                    .outcome_landed(outcome.clone());
+                // Counts only -- never paths. The same rule the two
+                // progress emitters beside this one state in identical
+                // terms: a progress event is not a place to leak what the
+                // user is working on. The repository paths are in the
+                // RESULT, where the user needs them to know where to go.
+                let _ = progress_app.emit("update-all-progress", (done, total));
+            },
+        )
     })
     .await;
-    // Before the `?`: a run that died part-way may still have moved refs.
+    // Before the match: a run that died part-way may still have moved refs
+    // (#1943), so the classify epoch moves whether or not it finished.
     invalidate_classify_passes();
-    let mut report = report.map_err(|e| format!("the update run failed to finish: {e}"))?;
+    let mut report = match joined {
+        Ok(report) => report,
+        Err(e) => {
+            // Partial is not nothing: the registry keeps every outcome the
+            // run recorded before it died, and says how it ended.
+            let failed = claim.failed(
+                format!("the update run failed to finish: {e}"),
+                crate::worktrees::UpdateAllReport {
+                    diagnostics,
+                    outcomes: left_alone,
+                    cancelled: false,
+                    timed_out: false,
+                    unreadable,
+                },
+            );
+            // The run's own outcomes come first; the scope's follow.
+            let attempted = failed
+                .outcomes
+                .iter()
+                .take(run_total)
+                .filter(|o| !matches!(o.result, crate::worktrees::UpdateResult::NotAttempted))
+                .count();
+            return Err(format!(
+                "the update run failed to finish after {attempted} of {run_total} repositories: {e}"
+            ));
+        }
+    };
     report.diagnostics = diagnostics;
+    report.outcomes.extend(left_alone);
 
     let updated = report
         .outcomes
@@ -7710,8 +7753,7 @@ pub async fn update_all_repositories(
 
     // Recorded BEFORE returning, so a phone that slept through the run
     // can read the outcome even though it held no event stream.
-    app.state::<crate::repos::runs::UpdateAllRuns>()
-        .finished(report.clone());
+    claim.finished(report.clone());
     Ok(report)
 }
 

@@ -1958,8 +1958,10 @@ export interface UpdateAllReport {
 /// Fast-forward every repository in the configured scan roots.
 ///
 /// The optional displayed scope is checked against a fresh scan before any
-/// update. Cached branch/safety verdicts are never accepted. Older clients
-/// may omit the snapshot and use the freshly discovered scope.
+/// update: only repositories in both are updated, and each one on either
+/// side alone is reported with a reason (#1954), never refusing the rest.
+/// Cached branch/safety verdicts are never accepted. Older clients may omit
+/// the snapshot and use the freshly discovered scope.
 ///
 /// Resolves with an outcome per repository rather than throwing on the
 /// first refusal. Partial completion is the design, not the exception.
@@ -1976,10 +1978,16 @@ export const cancelUpdateAll = () => call<void>("cancel_update_all");
 /// How the Update All run is going, or how it ended.
 ///
 /// The read for a client that was not listening. Null when this desktop
-/// has run none.
+/// has run none. `run` numbers the desktop's runs, so a client can tell the
+/// run it just started from the one already on record (#1946).
+///
+/// `failed` is a run that ended without reporting how (#1947): its report
+/// was kept by the desktop from what the run recorded, so the repositories
+/// it already fast-forwarded are listed, and the rest are not attempted.
 export type UpdateAllState =
-  | { state: "running"; done: number; total: number }
-  | { state: "done"; report: UpdateAllReport };
+  | { state: "running"; run: number; done: number; total: number }
+  | { state: "done"; run: number; report: UpdateAllReport }
+  | { state: "failed"; run: number; reason: string; report: UpdateAllReport };
 
 export const updateAllState = () => call<UpdateAllState | null>("update_all_state");
 

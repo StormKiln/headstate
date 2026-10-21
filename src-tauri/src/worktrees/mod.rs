@@ -51,6 +51,6 @@ pub use scan::{
 // to destructure an outcome must be able to name its type.
 #[allow(unused_imports)]
 pub use update::{
-    repository_update_paths, update_all_with, validate_update_scope, RepoUpdateOutcome,
+    reconcile_update_scope, repository_update_paths, update_all_observed, RepoUpdateOutcome,
     UpdateAllReport, UpdateResult,
 };

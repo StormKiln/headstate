@@ -124,6 +124,9 @@ pub const EVENT_NAMES: &[&str] = &[
     "claude-transcript-activity",
     // Payload-free receipt for already-allowlisted local population summaries.
     "claude-population-updated",
+    // Update All's progress (#1946), counts only. Without it a phone sat
+    // on "Checking repository scope…" for a run of up to ~22 minutes.
+    "update-all-progress",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.
