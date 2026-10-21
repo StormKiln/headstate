@@ -419,7 +419,10 @@ export interface WorktreeRepo {
 export interface DiscoveryDiagnostic {
   root: string;
   path: string;
-  kind: "depthLimit" | "directoryBudget" | "readError" | "gitError";
+  /// `repositoryBoundary`: the scan root is itself a repository, so
+  /// discovery did not look inside it (#1948). A scope, not a failure --
+  /// it never appears in `unreadable`.
+  kind: "depthLimit" | "directoryBudget" | "readError" | "gitError" | "repositoryBoundary";
   count: number;
   message: string;
 }

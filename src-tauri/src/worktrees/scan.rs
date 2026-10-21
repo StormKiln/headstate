@@ -2295,6 +2295,22 @@ pub enum DiscoveryDiagnosticKind {
     DirectoryBudget,
     ReadError,
     GitError,
+    /// A scan root is itself a checkout, so the walk stopped at the root
+    /// and did not look inside it (#1948).
+    ///
+    /// The stop itself is deliberate (#1919): a checkout's source and build
+    /// folders consumed the directory budget and produced irrelevant
+    /// depth-limit notices, and Git enumerates registered worktrees without
+    /// a walk. At the root it costs everything the user pointed discovery
+    /// at, and before #1948 that was silent: one repository read as the
+    /// whole set. Emitted only at depth 0 -- see
+    /// `RepoScan::repository_root_boundary` for why.
+    ///
+    /// This kind makes the count a floor without making the scan partial:
+    /// nothing was UNREADABLE, so it is not mirrored into
+    /// `RepoScan::unreadable` and does not trip `is_partial()` or the
+    /// safety gates keyed on it.
+    RepositoryBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2346,6 +2362,55 @@ pub struct RepoScan {
     pub unreadable: Vec<String>,
 }
 
+/// Whether the checkout at `dir` holds another checkout one level down
+/// that discovery will not visit (#1948).
+///
+/// A child counts when its `.git` is a directory (an independent clone)
+/// or a `gitdir:` file pointing anywhere but `dir`'s own `.git` -- a
+/// linked worktree of the root repository is enumerated by Git, so it is
+/// not hidden. One level only: that is where `~/code`-under-VCS keeps its
+/// repositories, and it costs one directory read rather than a walk.
+/// Unreadable means `false`: the read failure, if real, is reported by
+/// the walk itself.
+fn has_nested_checkout(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let own = dir.join(".git");
+    entries.flatten().any(|entry| {
+        if entry.file_name() == ".git" || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            return false;
+        }
+        let marker = entry.path().join(".git");
+        if marker.is_dir() {
+            return true;
+        }
+        let Ok(contents) = std::fs::read_to_string(&marker) else {
+            return false;
+        };
+        let Some(admin) = contents.strip_prefix("gitdir:").map(str::trim) else {
+            return false;
+        };
+        // Lexically, so a relative `../.git/worktrees/x` (git worktree
+        // --relative-paths) resolves without touching the filesystem.
+        let mut target = std::path::PathBuf::new();
+        for part in entry.path().join(admin).components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    target.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => target.push(other),
+            }
+        }
+        // Git records the gitdir under the RESOLVED path, so a root spelled
+        // through a symlink (macOS's /var -> /private/var) must be resolved
+        // too before comparing. Lexical when a side does not resolve.
+        let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        !resolve(&target).starts_with(resolve(&own))
+    })
+}
+
 impl RepoScan {
     fn discovery_error(
         &mut self,
@@ -2364,6 +2429,28 @@ impl RepoScan {
         });
         self.unreadable.push(message);
     }
+    /// Report the checkout boundary when the SCAN ROOT itself is a checkout
+    /// (#1948), and only then.
+    ///
+    /// That is the case where the boundary hides what the user asked for:
+    /// they pointed discovery at `~/code` (under version control) or at a
+    /// wrapper repository, and the page shows one repository where they
+    /// expected the many beneath it. A checkout found BELOW an ordinary
+    /// root is not reported: nearly every scan finds one, so a note there
+    /// would show for everyone and teach the reader to ignore the real
+    /// partial-scan notices. Clones nested in those checkouts stay out of
+    /// scope by #1919's design, which its boundary tests pin.
+    ///
+    /// Only when something is actually hidden: a repository added as its
+    /// own scan root -- the very advice the note gives -- holds nothing
+    /// nested, and reporting it would put "at least" on a count that is
+    /// exact. One directory read decides it; see `has_nested_checkout`.
+    fn repository_root_boundary(&mut self, root: &Path, dir: &Path, depth: usize) {
+        if depth == 0 && has_nested_checkout(dir) {
+            self.discovery_stop(root, dir, DiscoveryDiagnosticKind::RepositoryBoundary);
+        }
+    }
+
     fn discovery_stop(&mut self, root: &Path, path: &Path, kind: DiscoveryDiagnosticKind) {
         let root = root.to_string_lossy().into_owned();
         let diagnostic = if let Some(index) = self
@@ -2372,8 +2459,10 @@ impl RepoScan {
             .position(|d| d.root == root && d.kind == kind)
         {
             let diagnostic = &mut self.diagnostics[index];
-            self.unreadable
-                .retain(|message| message != &diagnostic.message);
+            if diagnostic.kind != DiscoveryDiagnosticKind::RepositoryBoundary {
+                self.unreadable
+                    .retain(|message| message != &diagnostic.message);
+            }
             diagnostic.count += 1;
             if path.to_string_lossy().as_ref() < diagnostic.path.as_str() {
                 diagnostic.path = path.to_string_lossy().into_owned();
@@ -2392,6 +2481,14 @@ impl RepoScan {
         let reason = match diagnostic.kind {
             DiscoveryDiagnosticKind::DepthLimit => "depth limit",
             DiscoveryDiagnosticKind::DirectoryBudget => "directory budget",
+            DiscoveryDiagnosticKind::RepositoryBoundary => {
+                // Diagnostics only: a boundary is a scope, not a read failure.
+                diagnostic.message = format!(
+                    "{}: this scan root is itself a repository, and discovery does not look inside repositories; to include one nested inside it, add that folder as a scan root in Settings > Repositories",
+                    diagnostic.root,
+                );
+                return;
+            }
             DiscoveryDiagnosticKind::ReadError | DiscoveryDiagnosticKind::GitError => {
                 unreachable!("errors are not traversal stops")
             }
@@ -3769,6 +3866,7 @@ fn collect_bounded_excluding(
             });
             // An orphan marker is still a checkout boundary. Its source tree
             // is not another discovery root merely because its owner is gone.
+            out.repository_root_boundary(root, dir, depth);
             return;
         }
     }
@@ -3884,6 +3982,7 @@ fn collect_bounded_excluding(
         // Repository discovery ends here, including failed inspection and
         // already-seen common directories. Git enumerates registered worktrees;
         // finding unrelated nested repositories requires an explicit scan root.
+        out.repository_root_boundary(root, dir, depth);
         return;
     }
     // A BARE repository -- a clone or mirror with no working tree
@@ -12813,6 +12912,125 @@ mod nested_discovery_tests {
         }
     }
 
+    /// #1948: a scan root that is itself a repository, holding an
+    /// independent clone. The boundary #1919 drew is kept, so `child` is
+    /// not discovered -- and that must be SAID, or the one repository the
+    /// page lists reads as the whole set.
+    #[test]
+    fn repository_root_with_nested_clone_reports_the_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("code");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        run(&root, &["init", "-q"]);
+        run(&child, &["init", "-q"]);
+        let scan = scan_dirs_fast_reporting(&[root.to_string_lossy().into_owned()]);
+        let discovered = scan.repos.iter().any(|r| r.path == child.to_string_lossy());
+        let reported = scan
+            .diagnostics
+            .iter()
+            .any(|d| d.path == root.to_string_lossy());
+        assert!(discovered || reported, "{scan:?}");
+        let boundary = scan
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary)
+            .expect("the stop at the root checkout must be reported");
+        assert_eq!(boundary.path, root.to_string_lossy());
+        assert_eq!(boundary.count, 1);
+        assert!(boundary.message.contains("add that folder as a scan root"));
+        // A scope, not a read failure: the safety gates keyed on
+        // `is_partial()` must not change because a checkout was not walked.
+        assert!(!scan.is_partial(), "{:?}", scan.unreadable);
+
+        // An ORDINARY root holding the same repository: the checkout below
+        // the root is still a boundary (#1919), but not reported -- every
+        // scan finds one, and a note shown to everyone is noise.
+        let ordinary = scan_dirs_fast_reporting(&[tmp.path().to_string_lossy().into_owned()]);
+        assert!(ordinary
+            .repos
+            .iter()
+            .any(|r| r.path == root.to_string_lossy()));
+        assert!(!ordinary
+            .repos
+            .iter()
+            .any(|r| r.path == child.to_string_lossy()));
+        assert!(
+            ordinary.diagnostics.is_empty(),
+            "{:?}",
+            ordinary.diagnostics
+        );
+
+        // The note's own advice: the nested clone added as a scan root.
+        // It is a repository holding nothing nested, so its count is exact
+        // and must not be qualified -- following the advice must not
+        // produce the note again.
+        let followed = scan_dirs_fast_reporting(&[
+            root.to_string_lossy().into_owned(),
+            child.to_string_lossy().into_owned(),
+        ]);
+        assert!(followed
+            .repos
+            .iter()
+            .any(|r| r.path == child.to_string_lossy()));
+        let boundaries: Vec<_> = followed
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary)
+            .map(|d| d.path.clone())
+            .collect();
+        assert_eq!(boundaries, vec![root.to_string_lossy().into_owned()]);
+    }
+
+    /// #1948: a root repository whose only nested checkout is its OWN
+    /// linked worktree hides nothing -- Git enumerates that worktree -- so
+    /// no boundary is reported.
+    #[test]
+    fn a_root_repository_holding_only_its_own_worktree_reports_no_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("product");
+        std::fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut spellings = vec![root.clone()];
+        // The root reached through a symlink, as macOS's /var -> /private/var
+        // temp dir is: Git records the worktree's gitdir under the RESOLVED
+        // path, so a lexical comparison against the spelled root misses it.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("via-link");
+            std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+            spellings.push(link.join("product"));
+        }
+        for spelled in spellings {
+            let scan = scan_dirs_fast_reporting(&[spelled.to_string_lossy().into_owned()]);
+            assert!(
+                !scan
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary),
+                "{}: {:?}",
+                spelled.display(),
+                scan.diagnostics
+            );
+        }
+    }
+
     #[test]
     fn linked_and_already_seen_repositories_are_discovery_boundaries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12847,7 +13065,7 @@ mod nested_discovery_tests {
     }
 
     #[test]
-    fn unborn_wrapper_discovers_nested_product_and_external_linked_tree_once() {
+    fn explicit_roots_list_a_linked_first_repository_once_under_its_main_checkout_spelling() {
         let tmp = tempfile::tempdir().unwrap();
         let wrapper = tmp.path().join("wrapper");
         let product = wrapper.join("products/product");
@@ -13044,6 +13262,12 @@ mod nested_discovery_tests {
             .iter()
             .any(|d| d.kind == DiscoveryDiagnosticKind::GitError));
         assert_eq!(scan.unreadable.len(), scan.diagnostics.len());
+        // `broken` is a root checkout with nothing nested in it, so the
+        // root boundary (#1948) has nothing to report.
+        assert!(!scan
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiscoveryDiagnosticKind::RepositoryBoundary));
     }
 
     #[test]

@@ -85,6 +85,7 @@ import type {
 import { SavedScanNotice } from "./SavedScanNotice";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
+import { rootBoundaries } from "../lib/rootBoundaries";
 import { QueryError, errorMessage } from "./QueryError";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -2257,7 +2258,7 @@ export function WorktreesPage() {
               both halves of the phrase, because both are short together --
               an unreadable repository takes its worktrees with it. */}
           <span className="text-sm font-semibold text-[#e6edf3]">
-            {partial ? "at least " : ""}
+            {partial || rootBoundaries(diagnostics).length > 0 ? "at least " : ""}
             {worktrees.length} worktree{worktrees.length === 1 ? "" : "s"} across{" "}
             {repos.length} repositor{repos.length === 1 ? "y" : "ies"}
           </span>

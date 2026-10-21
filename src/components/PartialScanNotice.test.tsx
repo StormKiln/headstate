@@ -61,3 +61,48 @@ it("describes a grouped traversal boundary without claiming unreadable files", (
   fireEvent.click(screen.getByRole("button", { name: "Show details" }));
   expect(screen.getByText(message)).toBeTruthy();
 });
+
+describe("a scan root that is itself a repository (#1948)", () => {
+  const boundary = {
+    root: "/home/me/code",
+    path: "/home/me/code",
+    kind: "repositoryBoundary" as const,
+    count: 1,
+    message: "/home/me/code: this scan root is itself a repository",
+  };
+
+  it("qualifies the count with a note, not an alert, when nothing was unreadable", () => {
+    render(<PartialScanNotice unreadable={[]} diagnostics={[boundary]} consequence="the counts below are floors rather than totals." />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    const note = screen.getByRole("note");
+    expect(note.textContent).toContain(
+      "The scan root /home/me/code is itself a repository, and repositories nested inside it are not listed, so the counts below are floors rather than totals.",
+    );
+    expect(note.textContent).toContain("add its folder as a scan root in Settings > Repositories");
+  });
+
+  it("names the root briefly in a compact sidebar", () => {
+    render(<PartialScanNotice unreadable={[]} diagnostics={[boundary]} consequence="unused" compact />);
+    expect(screen.getByRole("note").textContent).toContain(
+      "The scan root code is itself a repository; repositories nested inside it are not listed.",
+    );
+  });
+
+  it("does not count the boundary as a read failure beside real limits", () => {
+    const message = "root: 128 depth boundaries";
+    render(
+      <PartialScanNotice
+        unreadable={[message]}
+        diagnostics={[{ root: "root", path: "root/deep", kind: "depthLimit", count: 128, message }, boundary]}
+        consequence="counts may be incomplete."
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toContain("Discovery limited");
+    expect(screen.getByRole("note")).toBeTruthy();
+  });
+
+  it("renders nothing when there is neither a shortfall nor a boundary", () => {
+    const { container } = render(<PartialScanNotice unreadable={[]} diagnostics={[]} consequence="x" />);
+    expect(container.textContent).toBe("");
+  });
+});
