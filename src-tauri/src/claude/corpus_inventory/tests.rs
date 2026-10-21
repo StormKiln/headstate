@@ -30,6 +30,7 @@ fn finish(
 }
 #[test]
 fn bounded_live_iterator_converges_and_matches_full_certificate_without_body_reads() {
+    let _clock = super::super::corpus_probe::slice_budget(None); // #1977
     let (_dir, root, mut conn) = fixture(200);
     let mut runtime = DiscoveryRuntime::default();
     #[cfg(feature = "enterprise-harness")]
@@ -62,6 +63,7 @@ fn bounded_live_iterator_converges_and_matches_full_certificate_without_body_rea
 }
 #[test]
 fn reopen_replays_incomplete_directory_but_keeps_completed_units_and_candidates() {
+    let _clock = super::super::corpus_probe::slice_budget(None); // #1977
     let (dir, root, mut conn) = fixture(100);
     let mut runtime = DiscoveryRuntime::default();
     let slice = reconcile_with_limit(
@@ -94,6 +96,7 @@ fn reopen_replays_incomplete_directory_but_keeps_completed_units_and_candidates(
 }
 #[test]
 fn partial_add_rename_delete_retains_accepted_until_authoritative_revalidation() {
+    let _clock = super::super::corpus_probe::slice_budget(None); // #1977
     let (_dir, root, mut conn) = fixture(3);
     let mut runtime = DiscoveryRuntime::default();
     finish(&mut conn, &root, &mut runtime, 64);
@@ -502,6 +505,9 @@ fn disappearing_project_restarts_epoch_instead_of_blocking_discovery_forever() {
 
 #[test]
 fn candidates_feed_actual_index_before_full_census() {
+    // What one 32-unit slice reaches is a property of the work limit, not of
+    // runner speed (#1977). The expired-deadline case is the next test.
+    let _clock = super::super::corpus_probe::slice_budget(None);
     let (_dir, root, mut conn) = fixture(200);
     let mut runtime = DiscoveryRuntime::default();
     let slice = reconcile_with_limit(
@@ -527,6 +533,98 @@ fn candidates_feed_actual_index_before_full_census() {
         .query_row("SELECT count(*) FROM claude_index_ledger", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, result.indexed as i64);
+}
+#[test]
+fn expired_slice_deadline_still_advances_and_feeds_candidates_before_census() {
+    // The slowest possible runner: every slice's deadline has already passed
+    // when its loop starts. Each slice must still do one unit of work, or a
+    // machine whose setup outlasts the slice never discovers anything (#1977).
+    let _clock = super::super::corpus_probe::slice_budget(Some(Duration::ZERO));
+    let (_dir, root, mut conn) = fixture(200);
+    let mut runtime = DiscoveryRuntime::default();
+    let mut slices = 0;
+    let candidates = loop {
+        let slice = reconcile_with_limit(
+            &mut conn,
+            &root,
+            &PopulationControl::discovery(),
+            &mut runtime,
+            WORK_PER_SLICE,
+        )
+        .unwrap();
+        slices += 1;
+        assert_eq!(
+            slice.work, 1,
+            "slice {slices} must make exactly one unit of progress"
+        );
+        assert!(!slice.authoritative);
+        if !slice.scan.sessions.is_empty() {
+            break slice;
+        }
+        assert!(slices < 64, "no candidate after {slices} expired slices");
+    };
+    assert!(candidates.scan.sessions.len() < 200);
+    let result = super::super::search::index_pass_controlled(
+        &mut conn,
+        &candidates.scan,
+        &PopulationControl::discovery(),
+    )
+    .unwrap();
+    assert!(result.indexed > 0);
+    assert!(!result.population.total_known);
+}
+#[test]
+fn no_directory_handle_outlives_a_slice() {
+    // Windows refuses to rename or delete a directory while any handle inside
+    // it is open (#1977). A slice that stops mid-directory must not leave its
+    // ReadDir in the long-lived runtime, or the user's transcript folder stays
+    // locked between population passes. One unit per slice stops mid-directory
+    // at every possible point, without depending on the clock.
+    let (dir, root, mut conn) = fixture(5);
+    let mut runtime = DiscoveryRuntime::default();
+    let moved = dir.path().join("moved-projects");
+    let (mut renamed_root_listing, mut renamed_project_listing) = (false, false);
+    let mut slices = 0;
+    let done = loop {
+        let slice = reconcile_with_limit(
+            &mut conn,
+            &root,
+            &PopulationControl::discovery(),
+            &mut runtime,
+            1,
+        )
+        .unwrap();
+        slices += 1;
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            super::super::corpus_probe::open_handles_under(&root),
+            Vec::<PathBuf>::new(),
+            "slice {slices} left a handle open inside the corpus root"
+        );
+        // The portable proof: the rename Windows refused in #1977, taken once
+        // while the root is mid-listing and once while its project is.
+        let listing = runtime
+            .current
+            .as_ref()
+            .filter(|d| d.count > 0 && d.sealed == 0)
+            .map(|d| d.path.clone());
+        let take = match &listing {
+            Some(path) if path == &root => !std::mem::replace(&mut renamed_root_listing, true),
+            Some(_) => !std::mem::replace(&mut renamed_project_listing, true),
+            None => false,
+        };
+        if take {
+            std::fs::rename(&root, &moved).unwrap();
+            std::fs::rename(&moved, &root).unwrap();
+        }
+        if slice.authoritative {
+            break slice;
+        }
+        assert!(slices < 1000, "one-unit slices must converge");
+    };
+    assert!(renamed_root_listing && renamed_project_listing);
+    assert_eq!(done.scan.sessions.len(), 5);
+    assert!(!done.scan.is_partial());
 }
 #[test]
 fn repeated_mid_directory_restart_is_conservative_then_live_continuation_finishes() {
