@@ -916,7 +916,27 @@ pub async fn issue_pairing_token(
 /// a second answer. Three states rather than a bool so that "keep both"
 /// is a choice the user made, never a default the UI fell into.
 #[tauri::command]
-pub fn respond_to_pairing(
+pub async fn respond_to_pairing(
+    app: AppHandle,
+    request_id: u64,
+    approve: bool,
+    replace_existing: Option<bool>,
+) -> Result<(), String> {
+    crate::commands::off_main_thread(move || {
+        use tauri::Manager;
+        respond_to_pairing_blocking(
+            app.clone(),
+            app.state(),
+            request_id,
+            approve,
+            replace_existing,
+        )
+    })
+    .await
+}
+
+/// [`respond_to_pairing`]'s work, on the caller's thread (#1959).
+fn respond_to_pairing_blocking(
     app: AppHandle,
     state: State<'_, Arc<PairingState>>,
     request_id: u64,
@@ -941,7 +961,12 @@ pub fn respond_to_pairing(
 
 /// Settings > Paired devices.
 #[tauri::command]
-pub fn list_paired_devices(app: AppHandle) -> Result<Vec<PairedDeviceSummary>, String> {
+pub async fn list_paired_devices(app: AppHandle) -> Result<Vec<PairedDeviceSummary>, String> {
+    crate::commands::off_main_thread(move || list_paired_devices_blocking(app)).await
+}
+
+/// [`list_paired_devices`]'s work, on the caller's thread (#1959).
+fn list_paired_devices_blocking(app: AppHandle) -> Result<Vec<PairedDeviceSummary>, String> {
     let conn = open_db(&crate::commands::db_path(&app)).map_err(|e| e.to_string())?;
     let rows = devices::list(&conn).map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(Into::into).collect())
@@ -950,7 +975,16 @@ pub fn list_paired_devices(app: AppHandle) -> Result<Vec<PairedDeviceSummary>, S
 /// Revoke: delete the row and close that certificate's connections.
 /// Succeeds when the row is already gone, so a double click is harmless.
 #[tauri::command]
-pub fn revoke_paired_device(
+pub async fn revoke_paired_device(app: AppHandle, id: i64) -> Result<(), String> {
+    crate::commands::off_main_thread(move || {
+        use tauri::Manager;
+        revoke_paired_device_blocking(app.clone(), app.state(), id)
+    })
+    .await
+}
+
+/// [`revoke_paired_device`]'s work, on the caller's thread (#1959).
+fn revoke_paired_device_blocking(
     app: AppHandle,
     state: State<'_, Arc<PairingState>>,
     id: i64,
@@ -973,7 +1007,27 @@ pub fn revoke_paired_device(
 /// Fails naming the device when it was revoked in the meantime -- a
 /// setting saved on nothing must not look saved.
 #[tauri::command]
-pub fn set_paired_device_access(
+pub async fn set_paired_device_access(
+    app: AppHandle,
+    id: i64,
+    transcripts_allowed: bool,
+    reveal_allowed: bool,
+) -> Result<(), String> {
+    crate::commands::off_main_thread(move || {
+        use tauri::Manager;
+        set_paired_device_access_blocking(
+            app.clone(),
+            app.state(),
+            id,
+            transcripts_allowed,
+            reveal_allowed,
+        )
+    })
+    .await
+}
+
+/// [`set_paired_device_access`]'s work, on the caller's thread (#1959).
+fn set_paired_device_access_blocking(
     app: AppHandle,
     state: State<'_, Arc<PairingState>>,
     id: i64,

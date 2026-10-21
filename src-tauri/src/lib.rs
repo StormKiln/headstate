@@ -804,7 +804,7 @@ pub fn run() {
                                 // notifications and not machine ones had
                                 // no way to say so; the master switch
                                 // turned off both or neither.
-                                let notify_prefs = commands::get_notify_prefs(app_handle.clone());
+                                let notify_prefs = commands::load_notify_prefs(app_handle.clone());
                                 let threshold = health::alerts::low_percent(
                                     commands::read_ui_prefs(&app_handle).battery_low_percent,
                                 );
@@ -961,7 +961,7 @@ pub fn run() {
                                     // the feature off must not be
                                     // interrupted by it.
                                     if !state.sweep.crashed_sessions.is_empty() {
-                                        let prefs = commands::get_notify_prefs(app_handle.clone());
+                                        let prefs = commands::load_notify_prefs(app_handle.clone());
                                         if prefs.enabled && prefs.claude_crashed {
                                             for crashed in &state.sweep.crashed_sessions {
                                                 notify_claude_crash(&app_handle, crashed);

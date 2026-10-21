@@ -346,7 +346,7 @@ pub async fn start_disk_inventory(app: AppHandle) -> Result<Status, String> {
     // disk went must count an excluded backup too -- it is often the
     // largest thing there (#1949's named opt-out). And never a guessed
     // `~/code` when the setting cannot be read (#1956).
-    let roots = crate::commands::get_worktree_dirs(app.clone())?;
+    let roots = crate::commands::get_worktree_dirs(app.clone()).await?;
     controller()
         .start(crate::commands::db_path(&app), roots)
         .await
