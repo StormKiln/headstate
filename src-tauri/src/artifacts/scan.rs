@@ -984,7 +984,6 @@ mod streaming_tests {
 
 #[cfg(test)]
 mod coverage_tests {
-    use super::tests::scan;
     use super::*;
     use std::fs;
 
@@ -1066,6 +1065,7 @@ mod coverage_tests {
     #[cfg(unix)]
     #[test]
     fn explicit_symlink_is_never_classified_or_followed() {
+        use super::tests::scan;
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
         fs::create_dir(tmp.path().join("real")).unwrap();
