@@ -936,7 +936,7 @@ export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   const scope = cachedScanScope(dirs.data, scoped ? exclusions.data : []);
   const query = useQuery({
     queryKey: ["cached-scan", kind, scope],
-    queryFn: async ({ signal }) => { const result = await readCachedScan(kind); signal.throwIfAborted(); return result; },
+    queryFn: () => readCachedScan(kind), // No `signal`: an unmount must not discard a finished read (#1944, #1974).
     enabled: enabled && scope !== null,
     staleTime: Infinity,
     // A cache miss is the answer, not a failure to retry three times.
@@ -986,7 +986,13 @@ export function useArtifacts(enabled: boolean) {
   const qc = useQueryClient();
   const query = useQuery({
     queryKey: ["artifacts"],
-    queryFn: async ({ signal }) => { const result = await SCAN_ARTIFACTS_FN(); signal.throwIfAborted(); return result; },
+    // `signal` is deliberately NOT read (#1974), for `useWorktrees`'
+    // reason (#1944): reading it makes the last observer's unmount
+    // cancel the query and revert it, but this walk cannot be aborted,
+    // so it ran to the end and its finished answer was thrown away.
+    // `refreshDiskMeasurements` and a root change still cancel it
+    // explicitly; `cancelQueries` rejects the in-flight fetch either way.
+    queryFn: () => SCAN_ARTIFACTS_FN(),
     enabled,
     // The set changes when someone builds or clones, not on a timer.
     staleTime: 60 * 1000,
@@ -1090,7 +1096,9 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
         },
         initialDataUpdatedAt: () => Math.min(...warm().map((row) => row[4] ?? Date.now())),
         placeholderData: warm,
-        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+        // No `signal` (#1974): these measurements are paid for once the
+        // call returns, and reading it made an unmount drop them.
+        queryFn: async () => {
           const refresh = qc.getQueryState(key)?.isInvalidated;
           const previous = artifactMeasurements(qc, repo, true);
           const kept = refresh ? new Map<string, unknown>() : retained();
@@ -1100,7 +1108,6 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
                 sizeArtifactsReport(missing),
               )
             : [];
-          signal.throwIfAborted();
           for (const row of measured) {
             const before = previous.get(row[0]) as ArtifactMeasurement | undefined;
             kept.set(row[0], row[1] === null && before?.[1] != null ? [row[0], before[1], null, true, before[4]] : [row[0], row[1], row[2], false, Date.now()]);
@@ -1191,7 +1198,7 @@ export function useRemoveArtifacts() {
 /// Discovery only. Sizes and idle times come from `useVenvSizes`,
 /// because deciding staleness needs a full walk of each venv.
 export function useVenvs(enabled: boolean) {
-  return useQuery({
+  const q = useQuery({
     queryKey: ["venvs"],
     queryFn: SCAN_VENVS_FN,
     enabled,
@@ -1241,6 +1248,20 @@ export function useVenvs(enabled: boolean) {
     // broadly.
     gcTime: 60 * 60 * 1000,
   });
+  // The previous scan, for the cold start (#1975, `useWorktrees`' #1950
+  // shape). `scan_venvs` saves every result and nothing read it back, so
+  // a 9-40 s walk started from "Looking for…" on every launch. Read only
+  // while the live scan is in flight, and kept BESIDE `data`, never in
+  // it: `VenvSection` tells pending from "none found" by `data`, and a
+  // saved row must never reach the remove path.
+  const cached = useCachedScan<Venv[]>("venvs", q.isLoading);
+  return {
+    ...q,
+    /// The last stored scan and its age, while the live one is pending
+    /// and only then. Read-only by contract (`ArtifactsFromCache` states
+    /// the rule): for painting, never for removal or a verdict.
+    cached: q.isLoading ? cached : undefined,
+  };
 }
 
 /// How many virtualenvs one sizing request measures.
