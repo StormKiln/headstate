@@ -272,8 +272,6 @@ const ROWS: Row[] = [
   row(api.setWorktreeDirs, [dirs], "set_worktree_dirs", { dirs }),
   row(api.getPollInterval, [], "get_poll_interval"),
   row(api.setPollInterval, [secs], "set_poll_interval", { secs }),
-  row(api.getReviewing, [], "get_reviewing"),
-  row(api.getCachedReviewing, [], "get_cached_reviewing"),
   row(api.getAuthState, [], "get_auth_state"),
   row(api.getGitLabAuthState, [], "get_gitlab_auth_state"),
   row(api.scanArtifacts, [], "scan_artifacts"),

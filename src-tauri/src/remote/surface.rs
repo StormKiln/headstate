@@ -87,7 +87,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("refresh_source", Class::Read),
     ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
-    ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
@@ -1072,7 +1071,6 @@ async fn call(
         )
         .await),
         "get_cached" => res(commands::get_cached(app.clone())),
-        "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
         "refresh_now" => {
             res(commands::refresh_now(app.clone(), app.state(), a.get("requestId")?).await)
         }

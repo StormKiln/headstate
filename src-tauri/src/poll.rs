@@ -666,29 +666,6 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
         .collect()
 }
 
-/// Persists a snapshot and emits `prs-updated`, matching every fallible
-/// step rather than unwrapping -- shared by both the regular poll tick and
-/// the #22 one-shot recheck so the "never panic, never blank the UI on
-/// failure" discipline lives in exactly one place.
-/// Tell the UI a local write failed.
-///
-/// Reuses the existing `poll-error` banner rather than adding a channel:
-/// the snapshot failing means offline readability and cold-start speed are
-/// gone, which the user should know about even though the live list is
-/// unaffected.
-fn emit_store_error(app: &AppHandle, msg: String) {
-    // Its OWN channel, not `poll-error`. Sharing it meant this banner was
-    // destroyed microseconds after it appeared: persist_and_emit emits
-    // the error and then UNCONDITIONALLY emits `prs-updated`, which the
-    // frontend uses to clear poll errors. A full disk was invisible.
-    //
-    // A store failure also describes a condition the successful poll did
-    // NOT fix, so a later success must not clear it.
-    if let Err(e) = app.emit("store-error", msg) {
-        log::warn!("failed to emit store error: {e}");
-    }
-}
-
 /// The user's notification choices, or the default if unreadable.
 ///
 /// Every failure path here -- no data dir, no database, a corrupt value
@@ -727,27 +704,12 @@ async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
     .unwrap_or_default()
 }
 
-/// Write the snapshot and tell the UI.
+/// Tell the UI the review queue changed.
 ///
-/// # Why the WRITE is `spawn_blocking` and the emits are not (#1090)
-///
-/// `save_snapshot` serialises the list and COMMITS, which is an `fsync` --
-/// the unbounded-latency case, on a runtime worker, on a timer, forever.
-/// `app.emit` is a channel send and `set_badge` is a platform call; both
-/// are cheap and neither touches the disk, so only the database half moves
-/// off the runtime. Splitting it this way also keeps the ordering the UI
-/// depends on: the snapshot is on disk before `prs-updated` says so.
-/// Write the review queue to the local cache.
-///
-/// The counterpart to [`persist_and_emit`] for the OTHER list this loop
-/// fetches. No event: the To Review page reads this cache on mount, and
-/// the live query it also runs is what keeps an OPEN page current. What
-/// was missing is that the cache went stale the moment the user navigated
-/// away, because nothing but that page ever wrote it (#1118).
-///
-/// A failed write is logged and swallowed, matching the foreground
-/// command's own reasoning: this is a cache, and the tick has real work
-/// behind it that must not fail because a cache write did.
+/// The counterpart to [`emit_authored`] for the OTHER list this loop
+/// fetches. It writes nothing: `source_poll::reconcile_github` already
+/// saved the snapshot inside its own transaction before this runs, and the
+/// To Review page reads that snapshot on mount (#1118, #1940).
 pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
     let short = result
         .total
@@ -756,93 +718,15 @@ pub(crate) fn emit_reviewing(app: &AppHandle, result: &FetchedList) {
     let _ = app.emit("reviewing-updated", &result.prs);
 }
 
-async fn persist_reviewing(app: &AppHandle, result: &FetchedList) {
-    if result.scan.is_some() {
-        return;
-    }
-    let prs = &result.prs;
-    let coverage = result.coverage.clone();
-    let owner = result.viewer.clone();
-    if owner.is_none() {
-        // The store keeps an attributed review list over this write (#1926).
-        log::info!("review list fetched with the viewer unknown; it will not replace an attributed saved list");
-    }
-    let Ok(dir) = crate::commands::profile_dir(app) else {
-        return;
-    };
-    let owned: Vec<PullRequest> = prs.to_vec();
-    let written = tauri::async_runtime::spawn_blocking(move || {
-        let conn = open_db(&dir.join("headstate.db")).map_err(|e| format!("{e}"))?;
-        crate::store::source_cache::save_owned_source_snapshot(
-            &conn,
-            &Source::default(),
-            CachedList::Reviewing,
-            &owned,
-            &coverage,
-            owner.as_deref(),
-        )
-        .map_err(|e| format!("{e}"))
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("could not cache the review list: {e}"),
-        Err(e) => log::warn!("the review-list cache write panicked: {e}"),
-    }
-}
-
-async fn persist_and_emit(
-    app: &AppHandle,
-    prs: &[PullRequest],
-    coverage: Coverage,
-    owner: Option<String>,
-    already_saved: bool,
-) {
-    if !already_saved {
-        match crate::commands::profile_dir(app) {
-            Ok(dir) => {
-                let owned: Vec<PullRequest> = prs.to_vec();
-                let written = tauri::async_runtime::spawn_blocking(move || {
-                    let conn =
-                        open_db(&dir.join("headstate.db")).map_err(|e| (true, format!("{e}")))?;
-                    crate::store::source_cache::save_owned_source_snapshot(
-                        &conn,
-                        &Source::default(),
-                        CachedList::Authored,
-                        &owned,
-                        &coverage,
-                        owner.as_deref(),
-                    )
-                    .map_err(|e| (false, format!("{e}")))
-                })
-                .await;
-                match written {
-                    Ok(Ok(())) => {}
-                    Ok(Err((opening, e))) if opening => {
-                        log::error!("failed to open db: {e}");
-                        emit_store_error(app, format!("could not open the local database: {e}"));
-                    }
-                    Ok(Err((_, e))) => {
-                        log::error!("failed to save snapshot: {e}");
-                        emit_store_error(app, format!("could not save local snapshot: {e}"));
-                    }
-                    // A panic in the closure. Reported rather than swallowed:
-                    // the snapshot not landing is exactly what `store-error`
-                    // exists to say, and silence here would be the "offline
-                    // readability is gone and nothing told you" failure the
-                    // banner was added for.
-                    Err(e) => {
-                        log::error!("the snapshot write task failed: {e}");
-                        emit_store_error(app, format!("could not save local snapshot: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("failed to resolve app data dir: {e}");
-                emit_store_error(app, format!("could not find the app data directory: {e}"));
-            }
-        }
-    }
+/// Emit `prs-updated` and set the badge for an authored list.
+///
+/// Writes nothing (#1940). Every caller runs after
+/// `source_poll::reconcile_github`, which is the one writer of the queue
+/// snapshot: it saves inside the same transaction as the scan checkpoint
+/// and the GitHub facts, and fails the publication if that save fails. A
+/// second write here, outside that transaction, could only ever persist
+/// the same rows again -- or, if it diverged, the wrong ones.
+fn emit_authored(app: &AppHandle, prs: &[PullRequest]) {
     if let Err(e) = app.emit("prs-updated", prs) {
         log::warn!("failed to emit prs-updated: {e}");
     }
@@ -896,14 +780,7 @@ fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, capture: source_poll
         }
         match source_poll::apply_checking(&app, &publication, &capture, rows).await {
             Ok(Some(result)) => {
-                persist_and_emit(
-                    &app,
-                    &result.prs,
-                    result.coverage.clone(),
-                    result.viewer.clone(),
-                    true,
-                )
-                .await;
+                emit_authored(&app, &result.prs);
                 source_poll::complete_checking(&app, publication, result);
             }
             Ok(None) => {}
@@ -983,10 +860,10 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// MEASURED (#844, and reproduced by this issue's own figures): sequential
 /// 3.5s against concurrent 5.6s -- GitHub contends on simultaneous
 /// node-heavy queries, so issuing both at once makes the slow one slower
-/// by more than the overlap saves. `fetch_prs_and_reviewing`
-/// (`client.rs:564`) does run two searches concurrently, and its own
-/// diagnostic comment is about exactly this: a total far above the slower
-/// of the two means they are not actually overlapping.
+/// by more than the overlap saves. The removed `fetch_prs_and_reviewing`
+/// ran the two searches concurrently, and its own diagnostic comment was
+/// about exactly this: a total far above the slower of the two meant they
+/// were not actually overlapping.
 ///
 /// # Why 45s
 ///
@@ -1292,14 +1169,7 @@ async fn continue_queues(
                 if list == CachedList::Reviewing {
                     emit_reviewing(&app, result);
                 } else {
-                    persist_and_emit(
-                        &app,
-                        &result.prs,
-                        result.coverage.clone(),
-                        result.viewer.clone(),
-                        true,
-                    )
-                    .await;
+                    emit_authored(&app, &result.prs);
                 }
             }
             source_poll::complete(&app, publication, result);
@@ -1411,11 +1281,10 @@ pub fn spawn(
                                 };
                             let receipt = result.clone();
                             let FetchedList {
-                                scan,
-                                viewer,
                                 prs,
                                 total,
                                 coverage,
+                                ..
                             } = result;
                             // Compare against the tick before this one. `previous`
                             // starts empty, so the first tick never notifies --
@@ -1488,8 +1357,7 @@ pub fn spawn(
                                 log::warn!("failed to emit prs-incomplete: {e}");
                             }
 
-                            persist_and_emit(&app, &prs, coverage.clone(), viewer, scan.is_some())
-                                .await;
+                            emit_authored(&app, &prs);
                             let capture =
                                 source_poll::complete_with_checking(&app, publication, receipt);
                             if let Some(capture) = capture.filter(|_| has_checking(&prs)) {
@@ -1556,7 +1424,6 @@ pub fn spawn(
                                     }
                                 }
                             }
-                            persist_reviewing(&app, &now).await;
                             emit_reviewing(&app, &now);
                             let complete = matches!(now.coverage, Coverage::Complete);
                             previous_reviewing = complete.then(|| now.prs.clone());

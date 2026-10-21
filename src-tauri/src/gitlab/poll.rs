@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -236,44 +236,6 @@ async fn preferences(app: &AppHandle) -> NotifyPrefs {
     .unwrap_or_default()
 }
 
-async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &FetchedList) {
-    if result.scan.is_some() {
-        return;
-    }
-    let saved = match app.path().app_data_dir() {
-        Ok(dir) => {
-            let source = source.clone();
-            let receipt = result.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&dir.join("headstate.db"))?;
-                let save = || {
-                    crate::store::source_cache::save_owned_gitlab_snapshot(
-                        &conn,
-                        &source,
-                        list,
-                        &receipt.mrs,
-                        &receipt.coverage,
-                        receipt.viewer.as_deref(),
-                    )
-                };
-                match &receipt.session {
-                    Some(owner) => owner.with_current(save).unwrap_or(Ok(())),
-                    None => save(),
-                }
-            })
-            .await
-            .is_ok_and(|result| result.is_ok())
-        }
-        Err(_) => false,
-    };
-    if !saved {
-        let _ = app.emit(
-            "store-error",
-            "The GitLab list could not be saved for offline use.",
-        );
-    }
-}
-
 async fn fetch_and_persist(
     app: &AppHandle,
     source: &Source,
@@ -290,7 +252,6 @@ async fn fetch_and_persist(
             if let Some(publication) = source_poll::success_publication(app, &attempt).await {
                 match source_poll::reconcile_gitlab(app, &publication, receipt).await {
                     Ok(receipt) => {
-                        persist(app, source, list, &receipt).await;
                         source_poll::complete_gitlab(app, publication, Ok(receipt));
                         return true;
                     }
@@ -311,7 +272,7 @@ async fn fetch_and_persist(
                     return None;
                 }
             };
-            persist(app, source, list, &receipt).await;
+            // `reconcile_gitlab` is the one snapshot writer (#1940).
             Some((publication, receipt))
         }
         Err(error) => {

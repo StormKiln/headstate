@@ -23,7 +23,6 @@ import type {
   ClaudeMdEffectiveScan,
   ClaudePrLink,
   AlertReport,
-  CachedSnapshot,
   Artifact,
   Branch,
   DeleteOutcome,
@@ -894,13 +893,6 @@ export const getPollInterval = () => call<number>("get_poll_interval");
 /// clamped -- the UI shows what the backend accepted, not what was asked.
 export const setPollInterval = (secs: number) =>
   call<number>("set_poll_interval", { secs });
-
-/// PRs awaiting the user's review. Rides along in the same GraphQL
-/// document as the authored list, so it costs no extra rate limit.
-export const getReviewing = () => call<PullRequest[]>("get_reviewing");
-/// The last successful review list, straight from SQLite. Never talks
-/// to GitHub.
-export const getCachedReviewing = () => call<CachedSnapshot>("get_cached_reviewing");
 
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
