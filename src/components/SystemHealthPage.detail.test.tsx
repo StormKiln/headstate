@@ -1,4 +1,4 @@
-const diskApi = vi.hoisted(() => ({diskStatus: vi.fn(async () => ({running:false,observations:[],error:null})),diskHistory:vi.fn(async()=>[]),diskSettings:vi.fn(async()=>({external_roots:[],additional_locations:false})),startDiskScan:vi.fn(),saveDiskSettings:vi.fn(),cancelDiskScan:vi.fn()}));
+const diskApi = vi.hoisted(() => ({diskStatus: vi.fn(async () => ({running:false,observations:[],error:null})),diskHistory:vi.fn(async()=>({observations:[],unreadable:0})),diskSettings:vi.fn(async()=>({external_roots:[],additional_locations:false})),startDiskScan:vi.fn(),saveDiskSettings:vi.fn(),cancelDiskScan:vi.fn()}));
 vi.mock("../api/diskInventory",()=>diskApi);
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";

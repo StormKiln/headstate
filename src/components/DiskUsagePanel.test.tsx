@@ -9,7 +9,7 @@ import { DiskUsagePanel } from "./DiskUsagePanel";
 const gib = 1073741824n;
 const bytes = (n: number) => (BigInt(n) * gib).toString();
 const sample = (): DiskObservation => ({ id: "one", volume: { id: "volume", identity_stable: true, mount: "/fixture", label: "Fixture volume", scope: "filesystem", capacity: bytes(200), used: bytes(100), available: bytes(100), method: "fixture", limitation: null }, method: "fixture", configuration: "one", started_at: 100, finished_at: 110, status: "complete", visited: 3, locations: [{ id: "target", identity_stable: true, path: "/fixture/output", aliases: [], owners: ["/fixture/project"], category: "Cargo output", evidence: ["Cargo signatures; manifest unavailable"], logical: bytes(80), allocated: bytes(70), reclaimable: null, complete: true, active: false, review_only: true }], categories: [{ name: "Cargo output", allocated: bytes(70), logical: bytes(80), locations: ["target"] }], coverage: [{ path: "/fixture/private", reason: "Permission denied; size unknown" }], measured: bytes(70), remainder: bytes(30), accounting_note: "The remainder is an accounting difference, not space known to be disposable.", approximate: true, comparison: { baseline_at: null, reason: "No baseline", changes: [] }, history_error: null });
-beforeEach(() => { vi.clearAllMocks(); api.diskStatus.mockResolvedValue({ run_id: null, running: false, visited: 0, current_path: null, observations: [sample()], error: null }); api.diskHistory.mockResolvedValue([]); api.diskSettings.mockResolvedValue({ external_roots: [], additional_locations: false }); });
+beforeEach(() => { vi.clearAllMocks(); api.diskStatus.mockResolvedValue({ run_id: null, running: false, visited: 0, current_path: null, observations: [sample()], error: null }); api.diskHistory.mockResolvedValue({ observations: [], unreadable: 0 }); api.diskSettings.mockResolvedValue({ external_roots: [], additional_locations: false }); });
 afterEach(cleanup);
 async function show() { await act(async () => { render(<DiskUsagePanel />); }); fireEvent.click(screen.getByText("Disk usage")); await act(async () => { }); }
 describe("disk reconciliation", () => {
@@ -17,6 +17,22 @@ describe("disk reconciliation", () => {
     it("exposes a negative difference instead of clamping to zero", async () => { const o = sample(); o.remainder = bytes(-5); o.accounting_note = "Measured allocation exceeds reported usage."; api.diskStatus.mockResolvedValue({ running: false, observations: [o] }); await show(); expect(screen.getByText(/5.0 GiB over reported usage/)).toBeTruthy(); });
     it("does not invent growth or zero for unavailable measurements", async () => { const o = sample(); o.remainder = null; o.measured = null; o.volume.used = null; o.comparison.reason = "Scan locations or exclusions changed"; api.diskStatus.mockResolvedValue({ running: false, observations: [o] }); await show(); expect(screen.getByText(/Used space unavailable/)).toBeTruthy(); expect(screen.getByText("Unexplained amount unavailable")).toBeTruthy(); expect(screen.getByText("Scan locations or exclusions changed")).toBeTruthy(); });
     it("shows comparable change with its observation interval", async () => { const o = sample(); o.comparison = { baseline_at: 10, reason: null, changes: [{ location_id: "target", path: "/fixture/output", bytes: bytes(4) }] }; api.diskStatus.mockResolvedValue({ running: false, observations: [o] }); await show(); expect(screen.getByText(/\+4.0 GiB/)).toBeTruthy(); expect(screen.getByText(/Change since/)).toBeTruthy(); });
+});
+describe("unreadable saved history (#1963)", () => {
+    it("says saved measurements were left out instead of claiming there are none", async () => {
+        api.diskStatus.mockResolvedValue({ run_id: null, running: false, visited: 0, current_path: null, observations: [], error: null });
+        api.diskHistory.mockResolvedValue({ observations: [], unreadable: 2 });
+        await show();
+        expect(screen.getByText("2 saved measurements could not be read and are not shown.")).toBeTruthy();
+        expect(screen.queryByText(/No disk measurement yet/)).toBeNull();
+    });
+    it("still shows the readable history beside the count", async () => {
+        api.diskStatus.mockResolvedValue({ run_id: null, running: false, visited: 0, current_path: null, observations: [], error: null });
+        api.diskHistory.mockResolvedValue({ observations: [sample()], unreadable: 1 });
+        await show();
+        expect(screen.getByText("30.0 GiB unexplained")).toBeTruthy();
+        expect(screen.getByText("1 saved measurement could not be read and is not shown.")).toBeTruthy();
+    });
 });
 describe("disk measurement lifecycle", () => {
     it("does not fetch or poll while the panel is closed", async () => {
