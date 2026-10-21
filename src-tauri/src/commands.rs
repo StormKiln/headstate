@@ -5417,6 +5417,13 @@ mod corpus_cancel_tests {
                 1
             );
         }
+        // Windows refuses this rename while population holds any handle inside
+        // the root (#1977); Linux allows it, so assert the cause directly.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            crate::claude::corpus_probe::open_handles_under(&root),
+            Vec::<std::path::PathBuf>::new()
+        );
         std::fs::rename(&root, dir.path().join("retained-projects")).unwrap();
         drop(conn);
         let mut conn = open_db(&db).unwrap();
