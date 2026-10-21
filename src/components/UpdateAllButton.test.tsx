@@ -280,7 +280,7 @@ describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
       data: { state: "running", run: 4, done: 3, total: 10 },
       refetch: vi.fn(),
     });
-    render(<UpdateAllButton count={10} unreadable={[]} />);
+    render(<UpdateAllButton count={10} />);
     expect(screen.getByText("Updating 3 of 10…")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Update 10 repositories" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy();
@@ -296,7 +296,7 @@ describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
       },
       refetch: vi.fn(),
     });
-    render(<UpdateAllButton count={1} unreadable={[]} />);
+    render(<UpdateAllButton count={1} />);
     expect(screen.getByRole("status").textContent).toBe("Updated 1");
   });
 
@@ -306,19 +306,19 @@ describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
     useUpdateAllRepositories.mockReturnValue(
       vi.fn().mockRejectedValue(new Error("the desktop took too long to answer: 120s")),
     );
-    const { rerender } = render(<UpdateAllButton count={45} unreadable={[]} />);
+    const { rerender } = render(<UpdateAllButton count={45} />);
     fireEvent.click(screen.getByRole("button", { name: "Update 45 repositories" }));
     await waitFor(() => expect(refetch).toHaveBeenCalled());
     // The registry now answers "running", as the poll would report it.
     useUpdateAllState.mockReturnValue({ data: { state: "running", run: 5, done: 1, total: 45 }, refetch });
-    rerender(<UpdateAllButton count={45} unreadable={[]} />);
+    rerender(<UpdateAllButton count={45} />);
     expect(await screen.findByText("Updating 1 of 45…")).toBeTruthy();
     expect(toastError).not.toHaveBeenCalled();
   });
 
   it("still reports a rejection when nothing is going", async () => {
     useUpdateAllRepositories.mockReturnValue(vi.fn().mockRejectedValue(new Error("could not scan")));
-    render(<UpdateAllButton count={2} unreadable={[]} />);
+    render(<UpdateAllButton count={2} />);
     fireEvent.click(screen.getByRole("button", { name: "Update 2 repositories" }));
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("could not scan"));
   });
@@ -331,7 +331,7 @@ describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
     };
     useUpdateAllState.mockReturnValue({ data: before, refetch: vi.fn().mockResolvedValue(before) });
     useUpdateAllRepositories.mockReturnValue(vi.fn().mockRejectedValue(new Error("could not scan")));
-    render(<UpdateAllButton count={1} unreadable={[]} />);
+    render(<UpdateAllButton count={1} />);
     expect(screen.getByRole("status").textContent).toBe("1 already level");
     fireEvent.click(screen.getByRole("button", { name: "Update 1 repository" }));
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("could not scan"));
@@ -355,7 +355,7 @@ describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
       },
       refetch: vi.fn(),
     });
-    render(<UpdateAllButton count={2} unreadable={[]} />);
+    render(<UpdateAllButton count={2} />);
     expect(screen.getByRole("alert").textContent).toMatch(/Did not finish: the update run failed to finish/);
     expect(screen.getByRole("status").textContent).toBe("Updated 1 · 1 not attempted");
     expect((screen.getByRole("button", { name: "Update 2 repositories" }) as HTMLButtonElement).disabled).toBe(false);
