@@ -31,6 +31,15 @@ describe("an empty list after a failed poll", () => {
     expect(screen.getByText(/no open pull requests/i)).toBeTruthy();
   });
 
+  // #1929: To Review asks for review requests, so "pull requests you
+  // opened" described a query that was never made.
+  it("describes the review queue in its own terms", () => {
+    render(<PrList prs={[]} hasFilters={false} list="reviewing" />);
+    expect(screen.queryByText(/no open pull requests/i)).toBeNull();
+    expect(screen.queryByText(/you opened/i)).toBeNull();
+    expect(screen.getByText(/no pull requests await your review/i)).toBeTruthy();
+  });
+
   // With rows on screen the banner already says what happened; the list
   // is showing real data and must not be replaced by an error.
   it("shows the rows it has even when a later poll failed", () => {

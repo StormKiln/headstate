@@ -1049,6 +1049,7 @@ export default function App() {
                 // rejected query, and this covers "the query returned
                 // the empty snapshot because no poll has ever landed".
                 unreachable={pollError !== null && source.length === 0}
+                list={view === "to-review" ? "reviewing" : "authored"}
               />
             )}
           </div>
