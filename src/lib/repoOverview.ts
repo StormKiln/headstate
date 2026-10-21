@@ -32,10 +32,6 @@ import type { Upstream, WorktreeRepo } from "@/types/pr";
 export interface RepoOverviewRow {
   /// Directory name, the table's leftmost cell and its sort key.
   name: string;
-  /// A repository with no working tree -- a bare clone or mirror
-  /// (#1142). Carried through so the table can decline to ask for an
-  /// upstream verdict about a checkout that is not there.
-  bare: boolean;
   /// Absolute path to the main checkout. The row's identity -- unique
   /// across the scan roots, where `name` is not (two scan roots may each
   /// hold an `api`).
@@ -87,6 +83,20 @@ function mainCheckout(repo: WorktreeRepo) {
   return repo.worktrees.find((w) => w.is_main);
 }
 
+/// Why a scanned repository has no files to browse, or `null` when it
+/// has (#1953).
+///
+/// THE definition of a browsable repository, shared by the All
+/// Repositories table and the Repositories sidebar so the two cannot
+/// disagree about which repositories exist. A bare repository has no
+/// working tree, and an orphaned checkout's repository is gone; the file
+/// browser lists the git index of a working tree, so it can open neither.
+export function notBrowsableReason(repo: WorktreeRepo): string | null {
+  if (repo.bare ?? false) return "bare repository, no files to browse";
+  if (!mainCheckout(repo)) return "orphaned, its repository is gone";
+  return null;
+}
+
 /// Project the worktree scan into one row per repository (#1029).
 ///
 /// # What the row carries, and what it deliberately does not
@@ -125,15 +135,12 @@ export function repoOverviewRows(repos: readonly WorktreeRepo[]): RepoOverviewRo
   const rows: RepoOverviewRow[] = [];
   for (const repo of repos) {
     const main = mainCheckout(repo);
-    if (!main) continue;
+    // `notBrowsableReason` is the one definition the sidebar shares
+    // (#1953): bare repositories and orphans are not rows.
+    if (!main || notBrowsableReason(repo) !== null) continue;
     rows.push({
       name: repo.name,
       path: repo.path,
-      // `?? false` because the Rust field is `#[serde(default)]`: a
-      // cached scan written before #1142 has no `bare` key, and an
-      // absent flag means an ordinary checkout, which is what every
-      // such scan held.
-      bare: repo.bare ?? false,
       // `""` is what the porcelain parser leaves for a detached HEAD, and
       // it is normalised to null HERE rather than at every reader.
       branch: main.branch === "" ? null : main.branch,
@@ -203,6 +210,16 @@ export interface RepoCurrency {
   current: number;
   /// Repositories where a comparison actually happened. The denominator.
   compared: number;
+  /// Rows whose verdict has not arrived yet (`null`). PENDING (#1951):
+  /// not "no upstream", and not a failure.
+  pending: number;
+  /// Rows git was asked about and could not answer (`unknown`). UNKNOWN
+  /// (#1951): "could not check", never "has no upstream".
+  unknown: number;
+  /// Rows MEASURED as having nothing to compare against: `untracked`
+  /// (no upstream) and `detached` (no branch to have one). The only rows
+  /// the summary may call "no upstream".
+  none: number;
   /// Every row, compared or not. Never a denominator for `current`.
   total: number;
 }
@@ -210,10 +227,18 @@ export interface RepoCurrency {
 export function repoCurrency(rows: readonly RepoOverviewRow[]): RepoCurrency {
   let current = 0;
   let compared = 0;
+  let pending = 0;
+  let unknown = 0;
+  let none = 0;
   for (const row of rows) {
     // `null` first and by identity, not by a truthiness check that would
-    // also swallow a future zero-valued state.
-    if (row.upstream === null) continue;
+    // also swallow a future zero-valued state. Counted as PENDING, not
+    // folded into "no upstream" by subtraction (#1951): that read "0 of 0
+    // up to date... 38 have no upstream" while every verdict was loading.
+    if (row.upstream === null) {
+      pending += 1;
+      continue;
+    }
     switch (row.upstream.kind) {
       case "current":
         current += 1;
@@ -224,17 +249,20 @@ export function repoCurrency(rows: readonly RepoOverviewRow[]): RepoCurrency {
       case "diverged":
         compared += 1;
         break;
-      // `untracked`, `detached` and `unknown` fall through counting
-      // NEITHER. Listed explicitly rather than left to a default, so
+      // `untracked`, `detached` and `unknown` count in NEITHER half of
+      // the ratio. Listed explicitly rather than left to a default, so
       // adding an eighth state to `Upstream` is a compile error here
       // rather than a silent assignment to one side of the ratio.
       case "untracked":
       case "detached":
+        none += 1;
+        break;
       case "unknown":
+        unknown += 1;
         break;
     }
   }
-  return { current, compared, total: rows.length };
+  return { current, compared, pending, unknown, none, total: rows.length };
 }
 
 /// Where a row sits when the table is ordered by currency (#1027).

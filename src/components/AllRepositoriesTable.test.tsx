@@ -167,6 +167,42 @@ describe("AllRepositoriesTable", () => {
     expect(screen.getByText(/1 repository has no upstream to compare against/)).toBeTruthy();
   });
 
+  /// #1951: while verdicts are still loading the summary says it is
+  /// checking, rather than "0 of 0 up to date... N have no upstream".
+  it("says it is checking while verdicts load, not that they have no upstream", () => {
+    useWorktrees.mockReturnValue(
+      scan({
+        data: [
+          repo({ name: "a", path: "/a", worktrees: [wt({ upstream: null })] }),
+          repo({ name: "b", path: "/b", worktrees: [wt({ upstream: null })] }),
+        ],
+      }),
+    );
+    render(<AllRepositoriesTable />);
+    expect(screen.getByText(/Checking 2 of 2 repositories/)).toBeTruthy();
+    expect(screen.queryByText(/no upstream to compare against/)).toBeNull();
+    expect(screen.queryByText(/0 of 0/)).toBeNull();
+  });
+
+  /// #1951: a failed check is "could not check", never "no upstream".
+  it("words a failed check as could not check, not as no upstream", () => {
+    useWorktrees.mockReturnValue(
+      scan({
+        data: [
+          repo({ name: "a", path: "/a" }),
+          repo({ name: "b", path: "/b", worktrees: [wt({ upstream: null })] }),
+        ],
+      }),
+    );
+    useRepoUpstreams.mockReturnValue(
+      verdicts({ "/b": { kind: "unknown", n: "could not list worktrees" } as Upstream }),
+    );
+    render(<AllRepositoriesTable />);
+    expect(screen.getByText(/1 of 1 repositories with an upstream are up to date/)).toBeTruthy();
+    expect(screen.getByText(/Could not check 1 repository/)).toBeTruthy();
+    expect(screen.queryByText(/no upstream to compare against/)).toBeNull();
+  });
+
   /// Paired with the test above: with nothing uncompared, the summary
   /// adds no caveat. A shortfall notice that always fires is noise.
   it("adds no uncompared caveat when every repository was compared", () => {

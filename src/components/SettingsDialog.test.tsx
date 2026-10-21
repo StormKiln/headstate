@@ -564,6 +564,24 @@ it("saves explicit discovery exclusions without changing scan roots", async () =
   await waitFor(() => expect(setExclusions).toHaveBeenCalledWith(["/code/backup", "/code/archive"]));
 });
 
+/// #1957: changing both fields used to rescan twice, once per setting.
+/// The exclusions are saved without a rescan, and saving the roots
+/// rescans once.
+it("rescans once when a Save changes both exclusions and scan roots", async () => {
+  setExclusions.mockClear();
+  setDirs.mockClear();
+  open();
+  fireEvent.change(screen.getByLabelText("Exclude folders from repository discovery"), {
+    target: { value: "/code/archive" },
+  });
+  fireEvent.change(screen.getByLabelText(/directories to scan/i), {
+    target: { value: "/code\n/work" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+  await waitFor(() => expect(setDirs).toHaveBeenCalledWith(["/code", "/work"]));
+  expect(setExclusions).toHaveBeenCalledWith(["/code/archive"], { rescan: false });
+});
+
 it("does not allow an unloaded exclusion list to overwrite saved exclusions and offers retry", () => {
   exclusionsState.ready = false;
   exclusionsState.error = new Error("database unavailable");

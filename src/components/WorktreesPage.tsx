@@ -74,6 +74,7 @@ import {
 import { LaunchTermsPicker } from "./LaunchTermsPicker";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isCancelled } from "@/lib/cancelled";
+import { commandError } from "@/lib/errorKind";
 import { copyText } from "../lib/clipboard";
 import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
@@ -266,7 +267,11 @@ function Row({
   // Fetched only once a row is opened: several git calls each, and
   // there can be hundreds of rows on screen.
   const [open, setOpen] = useState(false);
-  const { data: assessment, isLoading: assessing } = useAssessment(
+  const {
+    data: assessment,
+    isLoading: assessing,
+    error: assessError,
+  } = useAssessment(
     open ? repoPath : null,
     open ? wt.path : null,
     open ? wt.branch : null,
@@ -840,7 +845,11 @@ function Row({
             ) : null}
           </>
         ) : (
-          "Could not read this worktree."
+          // Why, in the command's own words (#1957): "Could not read this
+          // worktree." alone gave the reader nothing to act on.
+          assessError
+            ? `Could not read this worktree: ${commandError(assessError).message}`
+            : "Could not read this worktree."
         )}
       </div>
     ) : null}
@@ -1266,7 +1275,12 @@ export function WorktreesPage() {
   const { setFilter } = useFilters();
   const isMobile = useIsMobile();
 
-  const selected = repos?.find((r) => r.path === filters.repo) ?? repos?.[0];
+  // Only the repository `filters.repo` names, and NO fallback (#1945).
+  // This used to end `?? repos?.[0]`, so "All repositories" and
+  // "Orphaned" -- which select none -- started a classify pass, a size
+  // walk and a GitHub merge lookup on whichever repository sorted first,
+  // one the user was not looking at. Undefined disables both queries.
+  const selected = filters.repo ? repos?.find((r) => r.path === filters.repo) : undefined;
   /// The instant every ref age on this page is measured against (#788).
   ///
   /// `Date.now()` is NOT called here, and that is not a stylistic
@@ -2514,6 +2528,24 @@ export function WorktreesPage() {
   const measured = visible.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined);
   const totalBytes = measured.reduce((n, w) => n + (w.size_bytes ?? 0), 0);
   const sizesComplete = measured.length === visible.length;
+
+  // A selection the scan no longer contains (#1945). It used to fall back
+  // to the first repository and render that under the stale selection;
+  // say what happened instead.
+  if (!selected) {
+    return (
+      <div className="flex flex-col gap-2 rounded-md border border-[#30363d] px-4 py-3 text-sm">
+        <span>This repository is no longer in the scanned folders.</span>
+        <button
+          type="button"
+          onClick={() => setFilter("repo", undefined)}
+          className="self-start text-xs text-[#58a6ff] hover:underline"
+        >
+          All repositories
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-3">

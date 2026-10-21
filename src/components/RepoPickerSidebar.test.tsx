@@ -74,6 +74,29 @@ beforeEach(() => {
 });
 
 describe("RepoPickerSidebar", () => {
+  /// #1953: on the Repositories view the rows open the file browser, and
+  /// a bare repository or an orphan has nothing for it to open. They used
+  /// to be ordinary rows the table beside them did not have; now they are
+  /// listed disabled, with the reason.
+  it("lists bare and orphaned repositories disabled, with the reason, when browsing", () => {
+    const main = { path: "/code/app", branch: "main", is_main: true };
+    repos.mockReturnValue([
+      { ...repo("app"), worktrees: [main] },
+      { ...repo("mirror"), bare: true, worktrees: [] },
+      { ...repo("orphan"), worktrees: [{ path: "/code/orphan", branch: "", is_main: false }] },
+    ]);
+    render(<RepoPickerSidebar reviewingCount={0} browsing />);
+    const enabled = screen
+      .getAllByRole("button")
+      .filter((b) => !(b as HTMLButtonElement).disabled)
+      .map((b) => b.textContent);
+    expect(enabled).toEqual(["app"]);
+    expect(screen.getByText(/bare repository, no files to browse/)).toBeTruthy();
+    expect(screen.getByText(/orphaned, its repository is gone/)).toBeTruthy();
+    fireEvent.click(screen.getByText("mirror"));
+    expect(setFilter).not.toHaveBeenCalled();
+  });
+
   it("lists every scanned repository", () => {
     repos.mockReturnValue([repo("alpha"), repo("beta")]);
     render(<RepoPickerSidebar reviewingCount={0} />);

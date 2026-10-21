@@ -94,6 +94,15 @@ const state = vi.hoisted(() => ({
 /// How many worktree rows have rendered (#1582), counted through the one
 /// hook every row calls.
 const rowRenders = vi.hoisted(() => ({ count: 0 }));
+/// What `useAssessment` rejected with, for #1957's error wording.
+const assessment = vi.hoisted(() => ({ error: null as unknown }));
+
+/// The repository each per-repository query was ASKED for (#1945).
+/// `undefined` is a disabled query; anything else starts a pass.
+const askedFor = vi.hoisted(() => ({
+  safety: [] as (string | undefined)[],
+  sizes: [] as (string | undefined)[],
+}));
 
 const toastSuccess = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
@@ -154,7 +163,7 @@ vi.mock("../api/hooks", () => ({
   // counter for #1582's test below.
   useAssessment: () => {
     rowRenders.count += 1;
-    return { data: undefined, isLoading: false };
+    return { data: undefined, isLoading: false, error: assessment.error };
   },
   // The cleanup manifest joins worktrees to the images they own, so the
   // page now reads Docker state -- but only while the confirmation is
@@ -221,7 +230,8 @@ vi.mock("../api/hooks", () => ({
   // reason the real hook derives them: a stored `pending` can disagree
   // with the verdicts actually present, and a mock that can lie in a way
   // the real hook cannot would let a bug through.
-  useWorktreeSafety: (_repoPath?: string, listed?: Worktree[]) => {
+  useWorktreeSafety: (repoPath?: string, listed?: Worktree[]) => {
+    askedFor.safety.push(repoPath);
     const partial = new Map<string, Worktree>(state.partialVerdicts ?? []);
     for (const w of state.classified ?? []) partial.set(w.path, w);
     const total = listed?.length ?? state.classified?.length ?? 0;
@@ -253,7 +263,9 @@ vi.mock("../api/hooks", () => ({
   // `partial` mirrors the real hook's stream of per-worktree sizes: the
   // settled `data` is undefined until every tree in the repository has
   // been walked, and rows must fill from `partial` before then (#754).
-  useWorktreeSizes: () => ({
+  useWorktreeSizes: (repoPath?: string) => {
+    askedFor.sizes.push(repoPath);
+    return {
     data: state.sizes,
     partial: state.partialSizes ?? new Map<string, number | null>(),
     // The real hook's merged view (#1942): the settled answer once there
@@ -265,7 +277,8 @@ vi.mock("../api/hooks", () => ({
     // the "rejection shows skeletons forever" bug pass unnoticed.
     isError: state.sizingFailed,
     error: state.sizingFailed ? state.sizingError : null,
-  }),
+    };
+  },
 }));
 
 const removeFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -591,6 +604,56 @@ describe("WorktreesPage", () => {
     toastSuccess.mockClear();
     toastError.mockClear();
     toastInfo.mockClear();
+  });
+
+  // #1957: a failed assessment says why, in the command's words.
+  it("says why a worktree could not be read", () => {
+    assessment.error = "headstate:not-asked the desktop did not answer in time";
+    try {
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /what is in/i }));
+      expect(
+        screen.getByText("Could not read this worktree: the desktop did not answer in time"),
+      ).toBeTruthy();
+    } finally {
+      assessment.error = null;
+    }
+  });
+
+  // #1945: "All repositories" and "Orphaned" select no repository, and
+  // used to classify and size the first one anyway.
+  it.each([
+    ["All repositories", undefined],
+    ["Orphaned", ORPHAN_FILTER],
+  ])("classifies and sizes no repository on %s", (_view, repo) => {
+    state.repos = [
+      { identity: null, name: "alpha", path: "/code/alpha", worktrees: [wt({ path: "/code/alpha/wt" })] },
+      { identity: null, name: "beta", path: "/code/beta", worktrees: [wt({ path: "/code/beta/wt" })] },
+    ];
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: repo ? { repo } : {} },
+      view: "worktrees",
+    } as never);
+    askedFor.safety.length = 0;
+    askedFor.sizes.length = 0;
+    render(<WorktreesPage />);
+    expect(askedFor.safety.length).toBeGreaterThan(0);
+    expect(askedFor.safety.filter(Boolean)).toEqual([]);
+    expect(askedFor.sizes.filter(Boolean)).toEqual([]);
+  });
+
+  // #1945: a selection the scan no longer has says so, rather than
+  // showing the first repository under it.
+  it("says a stale selection is gone rather than showing another repository", () => {
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/deleted" } },
+      view: "worktrees",
+    } as never);
+    askedFor.safety.length = 0;
+    render(<WorktreesPage />);
+    expect(screen.getByText(/no longer in the scanned folders/i)).toBeTruthy();
+    expect(screen.queryByText("proj")).toBeNull();
+    expect(askedFor.safety.filter(Boolean)).toEqual([]);
   });
 
   it("says what it is doing while scanning", () => {
