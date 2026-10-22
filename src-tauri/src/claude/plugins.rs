@@ -2043,6 +2043,7 @@ mod tests {
     /// instead of "N".
     #[test]
     fn an_unreadable_transcript_makes_the_counts_a_floor() {
+        #[cfg(unix)]
         crate::test_permissions::skip_unless_chmod_denies!();
         let dir = tempfile::tempdir().unwrap();
         let slug = dir.path().join("proj");
