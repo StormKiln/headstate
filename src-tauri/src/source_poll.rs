@@ -3474,12 +3474,13 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
         let data = receipt(2);
-        crate::store::source_cache::save_source_snapshot(
+        crate::store::source_cache::save_owned_source_snapshot(
             &conn,
             &source,
             CachedList::Authored,
             &data.prs,
             &data.coverage,
+            Some("alice"),
         )
         .unwrap();
         // The saved list's first row, read the way production reads it.

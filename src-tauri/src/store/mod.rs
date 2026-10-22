@@ -54,14 +54,16 @@ mod tests {
     }
 
     /// Write the default source's list as the removed `save_snapshot` did
-    /// (#2003): `save_source_snapshot` with coverage left unknown.
+    /// (#2003), with coverage left unknown, through the writer production
+    /// uses and with an owner, as production records one (#2009).
     fn save(conn: &rusqlite::Connection, which: CachedList, prs: &[PullRequest]) {
-        source_cache::save_source_snapshot(
+        source_cache::save_owned_source_snapshot(
             conn,
             &crate::identity::Source::default(),
             which,
             prs,
             &source_cache::Coverage::Unknown,
+            Some("alice"),
         )
         .unwrap();
     }
