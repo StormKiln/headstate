@@ -148,6 +148,11 @@ closed!(Footer {
     PartlyChecked,
     CoverageUnknown,
     NotChecked,
+    // Headstate declined to send the request (#1996). Distinct from
+    // `NotChecked`, which is "nothing has run yet". A reader built before
+    // this value existed counts the record as malformed or invalid; it does
+    // not crash and does not misfile it as `not_checked`.
+    NotAsked,
     Checking,
     Retrying,
     LoadFailed,

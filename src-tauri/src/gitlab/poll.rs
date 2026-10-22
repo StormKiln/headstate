@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -236,44 +236,6 @@ async fn preferences(app: &AppHandle) -> NotifyPrefs {
     .unwrap_or_default()
 }
 
-async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &FetchedList) {
-    if result.scan.is_some() {
-        return;
-    }
-    let saved = match app.path().app_data_dir() {
-        Ok(dir) => {
-            let source = source.clone();
-            let receipt = result.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let conn = open_db(&dir.join("headstate.db"))?;
-                let save = || {
-                    crate::store::source_cache::save_owned_gitlab_snapshot(
-                        &conn,
-                        &source,
-                        list,
-                        &receipt.mrs,
-                        &receipt.coverage,
-                        receipt.viewer.as_deref(),
-                    )
-                };
-                match &receipt.session {
-                    Some(owner) => owner.with_current(save).unwrap_or(Ok(())),
-                    None => save(),
-                }
-            })
-            .await
-            .is_ok_and(|result| result.is_ok())
-        }
-        Err(_) => false,
-    };
-    if !saved {
-        let _ = app.emit(
-            "store-error",
-            "The GitLab list could not be saved for offline use.",
-        );
-    }
-}
-
 async fn fetch_and_persist(
     app: &AppHandle,
     source: &Source,
@@ -290,7 +252,6 @@ async fn fetch_and_persist(
             if let Some(publication) = source_poll::success_publication(app, &attempt).await {
                 match source_poll::reconcile_gitlab(app, &publication, receipt).await {
                     Ok(receipt) => {
-                        persist(app, source, list, &receipt).await;
                         source_poll::complete_gitlab(app, publication, Ok(receipt));
                         return true;
                     }
@@ -311,7 +272,7 @@ async fn fetch_and_persist(
                     return None;
                 }
             };
-            persist(app, source, list, &receipt).await;
+            // `reconcile_gitlab` is the one snapshot writer (#1940).
             Some((publication, receipt))
         }
         Err(error) => {
@@ -323,6 +284,7 @@ async fn fetch_and_persist(
                         error,
                         queues::QueueError::MissingCli | queues::QueueError::UnsupportedHost
                     ),
+                    superseded: false,
                 };
                 source_poll::complete_gitlab(app, publication, Err(failure));
             }
@@ -375,6 +337,27 @@ async fn poll_queue(
     source_poll::complete_gitlab(app, publication, Ok(receipt));
 }
 
+/// One list's settled status as a health outcome for the loop.
+///
+/// `Retrying` counts as a failure even though its banner is held back:
+/// `FAILURES_BEFORE_DEGRADED` already waits out a single blip on its own.
+/// A list that was not asked, or is still fetching under a newer request,
+/// says nothing about this cycle.
+fn cycle(status: &source_poll::Status) -> crate::background::Cycle {
+    use crate::background::Cycle;
+    use source_poll::Phase;
+    match status.phase {
+        Phase::Ready | Phase::Partial | Phase::Unknown => Cycle::Ok,
+        Phase::Failed | Phase::Retrying => Cycle::Failed(crate::redact::redact(
+            status
+                .error
+                .as_deref()
+                .unwrap_or("The GitLab list could not be refreshed"),
+        )),
+        Phase::NotRequested | Phase::Fetching | Phase::NotAsked => Cycle::NotAsked,
+    }
+}
+
 /// Start once at desktop setup, independently of whether a GitHub client exists.
 /// Both queue loaders run concurrently, each with its own bounded page budget.
 /// Cadence uses the configured focused interval and its background multiplier.
@@ -391,6 +374,8 @@ pub fn spawn(
         loop {
             let selection = control.selected();
             let Some(source) = selection.source.as_ref() else {
+                // No GitLab source selected: waiting on purpose (#1937).
+                crate::background::GITLAB_POLL.park();
                 control.wake.notified().await;
                 continue;
             };
@@ -417,12 +402,24 @@ pub fn spawn(
                     &mut reviewing,
                 ),
             );
+            // The loop's health (#1937), read from the statuses the two
+            // loaders just settled rather than threaded back out of them.
+            let polls = app.state::<source_poll::SourcePolls>();
+            let outcomes = [CachedList::Authored, CachedList::Reviewing]
+                .map(|list| cycle(&polls.get(source, list)));
+            crate::background::announce_degraded(
+                &app,
+                &crate::background::GITLAB_POLL,
+                crate::background::GITLAB_POLL.record_cycle(&outcomes),
+            );
+            let sleep_for = crate::poll::interval_for_secs(
+                focused.load(Ordering::Relaxed),
+                interval_secs.load(Ordering::Relaxed),
+            );
+            crate::background::GITLAB_POLL.tick(sleep_for);
             tokio::select! {
                 _ = control.wake.notified() => {}
-                _ = tokio::time::sleep(crate::poll::interval_for_secs(
-                    focused.load(Ordering::Relaxed),
-                    interval_secs.load(Ordering::Relaxed),
-                )) => {}
+                _ = tokio::time::sleep(sleep_for) => {}
             }
         }
     });

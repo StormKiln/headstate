@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -60,8 +60,8 @@ describe("closing a pull request updates the list", () => {
     const list = renderHook(() => usePullRequests(), { wrapper });
     await waitFor(() => expect(list.result.current.data).toHaveLength(stale.length));
 
-    const { result: act } = renderHook(() => useActOnPr(), { wrapper });
-    await act.current(closed.id, closed.repo, closed.number, "close");
+    const { result: actOn } = renderHook(() => useActOnPr(), { wrapper });
+    await act(() => actOn.current(closed.id, closed.repo, closed.number, "close"));
 
     // The whole point: the closed PR is gone WITHOUT an app reload.
     await waitFor(() => {
@@ -85,8 +85,8 @@ describe("closing a pull request updates the list", () => {
     await waitFor(() => expect(list.result.current.data).toBeDefined());
 
     const before = calls.filter((c) => c === "refresh_now").length;
-    const { result: act } = renderHook(() => useActOnPr(), { wrapper });
-    await act.current("id", "octocat/api", 1, "close");
+    const { result: actOn } = renderHook(() => useActOnPr(), { wrapper });
+    await act(() => actOn.current("id", "octocat/api", 1, "close"));
 
     await waitFor(() => {
       const after = calls.filter((c) => c === "refresh_now").length;

@@ -626,6 +626,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_unknown_and_never_sorts_among_the_passes() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, home) = fixture();

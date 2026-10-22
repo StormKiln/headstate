@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createQueryClient } from "../api/queryClient";
 
 /// Off the desktop's network, which is where a phone spends most of its
 /// life, the companion opened on a BLACK PAGE and then covered itself
@@ -15,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 /// away -- `get_cached` (`src-mobile/src/companion.rs`) -- so
 /// `get_auth_state` rejects with "<desktop> is unreachable: ...".
 ///
-/// 1. THE BLACK PAGE. `main.tsx` builds a bare `new QueryClient()`, so
+/// 1. THE BLACK PAGE. `main.tsx` built a bare `new QueryClient()`, so
 ///    the auth query carried TanStack's default three retries with
 ///    exponential backoff: roughly seven seconds of `isLoading`, during
 ///    which `AuthGate` returned `null`. `PairingGate` had meanwhile
@@ -87,15 +88,17 @@ vi.mock("../splash", () => ({
   initSplash: () => {},
 }));
 
-/// Production's client, NOT the suite's usual `retry: false` one.
+/// Production's client, built by the same factory `main.tsx` uses.
 ///
-/// `main.tsx` builds a bare `new QueryClient()`, and the retries are
-/// half the bug: a test that turns them off skips straight past the
-/// seven seconds of blank window that was the actual report. Every
-/// assertion about the black page has to be made under the real
-/// defaults or it is not about the black page.
+/// The retries were half the bug: a test that turns them off by hand
+/// skips straight past the seven seconds of blank window that was the
+/// actual report. Every assertion about the black page has to be made
+/// under the real defaults or it is not about the black page -- and
+/// since #1955 those defaults are `retry: false`, so the retry
+/// assertions below hold only because `AuthGate` opts in on the desktop
+/// and does not on the phone.
 function productionClient() {
-  return new QueryClient();
+  return createQueryClient();
 }
 
 async function renderGate(target: string, client: QueryClient = productionClient(), selection: "github" | "both" = "github") {
@@ -308,7 +311,7 @@ describe("the desktop build", () => {
       await renderGate("desktop");
       // Past TanStack's first retry delay (~1s), so the second attempt is
       // scheduled and run inside this window.
-      await vi.advanceTimersByTimeAsync(2000);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
       expect(authCalls.count).toBeGreaterThan(1);
     } finally {
       vi.useRealTimers();
@@ -316,8 +319,17 @@ describe("the desktop build", () => {
   });
 
   it("keeps local views open when the desktop auth IPC check rejects", async () => {
-    await renderGate("desktop", new QueryClient({ defaultOptions: { queries: { retry: false } } }));
-    expect(await screen.findByText("the app")).toBeTruthy();
-    expect(screen.queryByText("Headstate needs the GitHub CLI")).toBeNull();
+    // Past all three of the desktop's opted-in retries (1s, 2s, 4s), so
+    // this is the state after the check has finally given up.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderGate("desktop");
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      expect(authCalls.count).toBe(4);
+      expect(await screen.findByText("the app")).toBeTruthy();
+      expect(screen.queryByText("Headstate needs the GitHub CLI")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

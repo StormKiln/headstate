@@ -86,6 +86,9 @@ describe("a failed review refresh with nothing cached", () => {
     const { result } = renderHook(() => useReviewing(), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.message).toBe("GitHub sign-in is required");
+    // Stripped, but still classified: the view titles it as not checked
+    // rather than as a failed load (#1994).
+    expect(result.current.notAsked).toBe(true);
   });
 
   it("does not multiply the backend's own bounded attempts", async () => {
@@ -100,6 +103,8 @@ describe("a failed review refresh with nothing cached", () => {
     await waitFor(() => expect(result.current.isFetching).toBe(false));
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(calls("get_reviewing")).toBe(1);
+    // A request that was sent and failed is not a declined one (#1994).
+    expect(result.current.notAsked).toBe(false);
   });
 });
 

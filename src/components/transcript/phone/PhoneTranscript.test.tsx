@@ -347,7 +347,7 @@ describe("navigation on the phone (#1484)", () => {
       expect(container.querySelector('[data-slot="transcript-viewer"]')).toBeTruthy();
       expect(container.querySelector('[data-slot="transcript-composer"]')).toBeTruthy();
     } finally {
-      useFilters.setState({ transcriptShow: {} });
+      act(() => { useFilters.setState({ transcriptShow: {} }); });
     }
   });
 

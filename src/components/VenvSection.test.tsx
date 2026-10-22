@@ -81,6 +81,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { VenvSection } from "./VenvSection";
+import { settle } from "@/test/settle";
 
 const venv = (over: Partial<Venv> = {}): Venv => ({
   path: "/cache/hello-world-delivery-AAAAAAAA-py3.13",
@@ -248,13 +249,14 @@ describe("VenvSection", () => {
     expect(screen.getByText("no project directory found")).toBeTruthy();
   });
 
-  it("removes the selected orphans on confirm", () => {
+  it("removes the selected orphans on confirm", async () => {
     state.venvs = [venv()];
     state.sizes = new Map([[venv().path, 1_000_000]]);
     render(<VenvSection />);
     fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await settle();
     expect(removeFn).toHaveBeenCalledWith([venv().path]);
   });
 
@@ -302,7 +304,7 @@ describe("VenvSection bulk removal", () => {
 
   /// It must select ONLY orphans. A live venv swept into a bulk action
   /// is the one outcome that would make the button untrustworthy.
-  it("never sweeps a live venv into the bulk selection", () => {
+  it("never sweeps a live venv into the bulk selection", async () => {
     state.venvs = [
       venv({ path: "/cache/a-AAAAAAAA-py3.13" }),
       venv({
@@ -315,6 +317,7 @@ describe("VenvSection bulk removal", () => {
     render(<VenvSection />);
     fireEvent.click(screen.getByRole("button", { name: /Remove all 2 orphaned/ }));
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await settle();
     expect(removeFn).toHaveBeenCalledWith([
       "/cache/a-AAAAAAAA-py3.13",
       "/cache/c-CCCCCCCC-py3.13",

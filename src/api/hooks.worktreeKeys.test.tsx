@@ -88,6 +88,30 @@ describe("useWorktreeDirs on a Save that changes both settings", () => {
   });
 });
 
+/// #1995: `dirs: query.data ?? []` made a failed read of the scan-folder
+/// setting indistinguishable from "configured as empty" -- and from a read
+/// still in flight.
+describe("useWorktreeDirs keeps pending, failed and empty apart", () => {
+  it("is undefined, with the reason, when the setting cannot be read", async () => {
+    invoke.mockImplementation((cmd) =>
+      cmd === "get_worktree_dirs"
+        ? Promise.reject("could not read the scan-folders setting")
+        : Promise.resolve([]),
+    );
+    const { result } = renderHook(() => useWorktreeDirs(), { wrapper: wrapper(fresh()) });
+    expect(result.current.dirs).toBeUndefined();
+    await waitFor(() => expect(result.current.dirsError).toBeTruthy());
+    expect(result.current.dirs).toBeUndefined();
+    expect(String(result.current.dirsError)).toContain("scan-folders setting");
+  });
+  it("is [] only when the setting is read and empty", async () => {
+    invoke.mockImplementation(() => Promise.resolve([]));
+    const { result } = renderHook(() => useWorktreeDirs(), { wrapper: wrapper(fresh()) });
+    await waitFor(() => expect(result.current.dirs).toEqual([]));
+    expect(result.current.dirsError).toBeNull();
+  });
+});
+
 describe("useWorktreeSizes", () => {
   /// `Math.min()` of no members is `Infinity`, which made the query's
   /// data timestamp infinite: never stale, never refetched.

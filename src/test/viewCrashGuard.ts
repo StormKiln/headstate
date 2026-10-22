@@ -21,8 +21,17 @@
 /// The prefix `ViewErrorBoundary.componentDidCatch` logs with.
 const BOUNDARY_LOG = "Unhandled render error in ";
 
+/// What React's act() warnings contain (#1965). React logs
+/// `"An update to %s inside a test was not wrapped in act(...)..."` with
+/// the component name as the next argument, and the suspended-resource
+/// variant ends the same way. `viewCrashGuard.test.tsx` triggers a real
+/// one, so a React upgrade that rewords it fails there instead of
+/// quietly switching this off.
+const ACT_WARNING = "not wrapped in act(";
+
 let caught: string[] = [];
 let expected = false;
+let actWarnings: string[] = [];
 
 /// Declare that this test crashes a view deliberately.
 ///
@@ -42,8 +51,13 @@ export function expectViewCrash(): { readonly caught: readonly string[] } {
 export function installViewCrashGuard(): () => void {
   caught = [];
   expected = false;
+  actWarnings = [];
   const previous = console.error;
   const wrapper = (...args: unknown[]) => {
+    if (typeof args[0] === "string" && args[0].includes(ACT_WARNING)) {
+      const name = typeof args[1] === "string" ? args[1] : undefined;
+      actWarnings.push(name ? `An update to ${name} was not wrapped in act()` : args[0].split("\n")[0]);
+    }
     if (typeof args[0] === "string" && args[0].startsWith(BOUNDARY_LOG)) {
       const error = args[1];
       const detail = error instanceof Error ? error.message : String(error);
@@ -57,6 +71,19 @@ export function installViewCrashGuard(): () => void {
     // outright and left it that way is not ours to repair.
     if (console.error === wrapper) console.error = previous;
   };
+}
+
+/// The act() warnings this test produced, then reset for the next test.
+///
+/// A late update is a state the test never looked at: it ended, or
+/// asserted, before a load it started had landed (#1965). There is no
+/// way to declare one expected, because the fix is always in the test --
+/// await the settled state (`settle()`, `findBy*`, RTL's `waitFor`), or
+/// wrap the event or store change that caused it in `act()`.
+export function takeActWarnings(): string[] {
+  const out = actWarnings;
+  actWarnings = [];
+  return out;
 }
 
 /// The crashes this test did not declare, then reset for the next test.

@@ -519,6 +519,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_import_is_a_problem_not_a_zero_token_node() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         fs::write(t.path().join("CLAUDE.md"), "@child.md\n").unwrap();
@@ -612,6 +613,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_claude_md_is_reported_not_omitted() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         let file = t.path().join("CLAUDE.md");
@@ -650,6 +652,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_partial_scan_still_returns_the_files_it_could_read() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         fs::write(t.path().join("CLAUDE.md"), "the readable one").unwrap();
@@ -679,6 +682,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_reported_not_treated_as_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         let sub = t.path().join("packages");

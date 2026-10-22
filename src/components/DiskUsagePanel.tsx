@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useDiskInventory } from "../api/useDiskInventory";
 import { claudeRevealPath } from "../api/tauri";
 import { IS_MOBILE_BUILD } from "../lib/target";
+import { errorMessage } from "./QueryError";
 import type { DiskObservation } from "../types/disk";
 function size(value: string | null, unit: "GiB" | "GB"): string {
     if (value === null)
@@ -48,7 +49,9 @@ function Measurement({ observation: o, unit, onReveal }: {
 }
 export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean }) {
     const [open, setOpen] = useState(defaultOpen);
-    const { dirs, isLoading: scopeLoading, isError: scopeError } = useWorktreeDirs();
+    // `dirs` is `undefined` while unread or unreadable (#1995).
+    const { dirs, dirsError, retryDirs } = useWorktreeDirs();
+    const dirsReason = errorMessage(dirsError);
     const { status, settings, error, busy, historyUnreadable, save, start, cancel } = useDiskInventory(open);
     const [selected, setSelected] = useState<string | null>(null);
     const [unit, setUnit] = useState<"GiB" | "GB">("GiB");
@@ -58,7 +61,7 @@ export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean 
     const observation = observations.find(o => o.volume.id === selected) ?? observations[0];
     return <section className="m-4 rounded border border-border p-3"><button type="button" aria-expanded={open} onClick={() => setOpen(v => !v)}>Disk usage</button>{open && <div className="mt-3 space-y-3">
   <p>Measure selected locations and see what remains unexplained. Scans do not remove files.</p>
-  <div className="break-all"><h3>Scan scope</h3><p>Repository folders: {scopeError ? "Unavailable" : scopeLoading ? "Loading…" : dirs.length ? dirs.join(", ") : "None configured"}. Change these in Settings.</p><p>External folders are included only when saved below. Additional locations include developer caches, toolchains, archives and temporary build folders when available; ownership may be unknown.</p><p>This inventory covers all selected folders, regardless of the sidebar filter. Worktree and artifact lists show logical sizes and overlap; do not add their totals to this inventory.</p></div>
+  <div className="break-all"><h3>Scan scope</h3><p>Repository folders: {dirsError ? "Unavailable" : dirs === undefined ? "Loading…" : dirs.length ? dirs.join(", ") : "None configured"}. Change these in Settings.</p>{dirsError ? <p role="alert">The saved repository folders could not be read{dirsReason ? `: ${dirsReason}` : ""}. <button type="button" onClick={() => void retryDirs()}>Retry reading folders</button></p> : null}<p>External folders are included only when saved below. Additional locations include developer caches, toolchains, archives and temporary build folders when available; ownership may be unknown.</p><p>This inventory covers all selected folders, regardless of the sidebar filter. Worktree and artifact lists show logical sizes and overlap; do not add their totals to this inventory.</p></div>
   {error && <p role="alert">Disk measurement unavailable: {error}</p>}{status?.error && <p role="alert">{status.error}</p>}{revealError && <p role="alert">{revealError}</p>}
   {historyUnreadable > 0 && <p role="status">{historyUnreadable === 1 ? "1 saved measurement could not be read and is not shown." : `${historyUnreadable} saved measurements could not be read and are not shown.`}</p>}
   {!IS_MOBILE_BUILD && <><label className="block">External build and cache folders (one absolute path per line)<textarea value={draft ?? settings?.external_roots.join("\n") ?? ""} onChange={e => setDraft(e.target.value)} disabled={busy || status?.running} className="block w-full rounded border p-2"/></label>

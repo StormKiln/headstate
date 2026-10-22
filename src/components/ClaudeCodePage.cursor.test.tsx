@@ -135,7 +135,7 @@ describe("the sessions list claims the keyboard cursor (#953)", () => {
   /// and is tested there; this is the wiring underneath it.
   it("opens the session at the cursor", () => {
     render(<ClaudeSessionColumn />);
-    activeRowCursor()?.open(2);
+    act(() => { activeRowCursor()?.open(2); });
     expect(useFilters.getState().claudeSelected).toBe("session-0002");
   });
 
@@ -229,7 +229,7 @@ describe("the sessions list claims the keyboard cursor (#953)", () => {
   /// DRAWING as well as for the next key press.
   it("clamps a cursor the search has left past the end", () => {
     render(<ClaudeSessionColumn />);
-    useFilters.setState({ cursor: 4 });
+    act(() => { useFilters.setState({ cursor: 4 }); });
     fireEvent.change(screen.getByLabelText(/Search Claude Code sessions/i), {
       target: { value: "Session 3" },
     });
@@ -238,7 +238,7 @@ describe("the sessions list claims the keyboard cursor (#953)", () => {
 
   it("drops the cursor entirely when the search matches nothing", () => {
     render(<ClaudeSessionColumn />);
-    useFilters.setState({ cursor: 2 });
+    act(() => { useFilters.setState({ cursor: 2 }); });
     fireEvent.change(screen.getByLabelText(/Search Claude Code sessions/i), {
       target: { value: "nothing matches this" },
     });

@@ -8,7 +8,7 @@ vi.mock("../lib/target", () => ({
     return !build.mobile;
   },
 }));
-import { render, waitFor } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { TranscriptMarkdown } from "./TranscriptMarkdown";
 
@@ -50,7 +50,7 @@ describe("TranscriptMarkdown on the phone build", () => {
   it("says nothing of it on the desktop build, where the worker is verified", async () => {
     build.mobile = false;
     const { container } = render(<TranscriptMarkdown>{fence}</TranscriptMarkdown>);
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => { await new Promise((r) => setTimeout(r, 20)); });
     expect(container.textContent).not.toContain("did not load");
   });
 });

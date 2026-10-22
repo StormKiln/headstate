@@ -1,5 +1,5 @@
 import { stubViewport } from "@/test-utils";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeImported,
@@ -288,6 +288,7 @@ vi.mock("../api/tauri", () => ({
 }));
 
 import { ClaudeCodePage, ClaudeSessionColumn } from "./ClaudeCodePage";
+import { settle } from "@/test/settle";
 
 /// The desktop pair, which is TWO components since #939.
 ///
@@ -974,10 +975,11 @@ describe("the resume command carries the cwd that makes it work", () => {
   /// The configured terminal (#1126). Empty is the default, asserted
   /// above: the button copies and says to paste.
   describe("with a terminal configured", () => {
-    it("the button launches instead of copying, and says so", () => {
+    it("the button launches instead of copying, and says so", async () => {
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
+      await settle();
       fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
       expect(launchFn).toHaveBeenCalledWith(
         "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
@@ -991,12 +993,13 @@ describe("the resume command carries the cwd that makes it work", () => {
       expect(copyFn).not.toHaveBeenCalled();
     });
 
-    it("passes the id and cwd, never the built command string", () => {
+    it("passes the id and cwd, never the built command string", async () => {
       // Rust rebuilds the command from these, so `claude_launch_session`
       // can never become "run this text in a terminal".
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
+      await settle();
       fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
       const args = launchFn.mock.calls[0] as unknown[];
       expect(args.some((a) => typeof a === "string" && a.includes("claude --resume"))).toBe(
@@ -1004,12 +1007,13 @@ describe("the resume command carries the cwd that makes it work", () => {
       );
     });
 
-    it("still offers Copy beside it", () => {
+    it("still offers Copy beside it", async () => {
       // The terminal is one user's choice of one tool; the raw string
       // is what you need to paste elsewhere or read before running.
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
+      await settle();
       fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
       expect(copyFn).toHaveBeenCalledWith(
         "cd '/Users/acme/code/widget' && claude --resume e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
@@ -1017,13 +1021,14 @@ describe("the resume command carries the cwd that makes it work", () => {
       expect(launchFn).not.toHaveBeenCalled();
     });
 
-    it("stops telling the user to paste it somewhere", () => {
+    it("stops telling the user to paste it somewhere", async () => {
       // The old sentence -- "Headstate does not open one for you" --
       // would be a statement the app contradicts the moment the button
       // is pressed.
       state.terminal = "open -a Terminal {command}";
       renderView();
       open("HeadState GitHub issues filing");
+      await settle();
       expect(screen.queryByText(/does not open one for you/)).toBeNull();
       expect(screen.getByText(/terminal you configured/i)).toBeTruthy();
     });
@@ -1064,6 +1069,8 @@ describe("the resume command carries the cwd that makes it work", () => {
       fireEvent.change(screen.getByLabelText(/model/i), {
         target: { value: "sonnet" },
       });
+      // The preview re-reads the argv for the new choice; let it land.
+      await settle();
       fireEvent.click(screen.getByRole("button", { name: /resume in terminal/i }));
       expect(launchFn).toHaveBeenCalledWith(
         "e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2",
@@ -1174,7 +1181,7 @@ describe("the resume command carries the cwd that makes it work", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /copy resume command/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith(
         expect.stringMatching(/could not copy/i),
         expect.objectContaining({ description: "This window has no clipboard access." }),
@@ -1486,7 +1493,7 @@ describe("what the detail says about provenance", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /reveal directory/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith(
         expect.stringMatching(/could not reveal the directory/i),
         expect.objectContaining({
@@ -3700,7 +3707,7 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByText(/Running the integration suite/)).toBeTruthy(),
     );
     expect(screen.getByText(/2h 0m/)).toBeTruthy();
@@ -3717,7 +3724,7 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() => expect(screen.getByText(/SIGTERM first/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/SIGTERM first/i)).toBeTruthy());
     expect(screen.getByText(/leaves no end record/i)).toBeTruthy();
   });
 
@@ -3736,11 +3743,11 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
     );
     fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(stopFn).toHaveBeenCalledWith("e5dff3bd-1b5f-40cf-8d4b-5e0cc89393e2"),
     );
     expect(stopFn).toHaveBeenCalledTimes(1);
@@ -3764,11 +3771,11 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
     );
     fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(toastSuccess).toHaveBeenCalledWith(expect.stringMatching(/SIGKILL/)),
     );
   });
@@ -3789,7 +3796,7 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() => expect(screen.getByText(/reused by a different process/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/reused by a different process/)).toBeTruthy());
     expect(screen.getByText(/nothing was signalled/)).toBeTruthy();
     // And no stop is offered on a refusal.
     expect(screen.queryByRole("button", { name: /stop this session/i })).toBeNull();
@@ -3806,7 +3813,7 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() => expect(screen.getByText(/no compaction record/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/no compaction record/i)).toBeTruthy());
     expect(screen.getByText(/not the same as none/i)).toBeTruthy();
   });
 
@@ -3820,7 +3827,7 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByText(/transcript could not be read/i)).toBeTruthy(),
     );
   });
@@ -3836,7 +3843,7 @@ describe("stopping a session", () => {
     // Selecting the session proposed nothing.
     expect(proposeFn).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
     );
     // And the proposal signalled nothing.
@@ -3852,7 +3859,7 @@ describe("stopping a session", () => {
     const { container } = renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
     );
     expect(screen.getByText(/does not recommend stopping it/i)).toBeTruthy();
@@ -3871,11 +3878,11 @@ describe("stopping a session", () => {
     renderView();
     open("HeadState GitHub issues filing");
     fireEvent.click(screen.getByRole("button", { name: /review stopping it/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(screen.getByRole("button", { name: /stop this session/i })).toBeTruthy(),
     );
     fireEvent.click(screen.getByRole("button", { name: /stop this session/i }));
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith(
         expect.stringMatching(/nothing was signalled/i),
         expect.objectContaining({
