@@ -2675,6 +2675,7 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
     #[cfg(unix)]
     #[test]
     fn a_reference_into_an_unreadable_directory_is_unknown_and_named() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = fixture();
         let root = t.path();
@@ -2848,6 +2849,7 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
     #[cfg(unix)]
     #[test]
     fn a_make_target_against_an_unreadable_makefile_is_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = fixture();
         let p = t.path().join("Makefile");
@@ -3233,6 +3235,7 @@ Run `yarn paw`, not `yarn nope`. Use the `tentacle` skill, not the `ink` skill.
     #[cfg(unix)]
     #[test]
     fn no_file_read_and_a_walled_directory_is_unknown_as_a_whole() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let walled = t.path().join("walled");

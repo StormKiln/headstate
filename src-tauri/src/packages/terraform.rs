@@ -295,6 +295,7 @@ provider "registry.terraform.io/hashicorp/aws" {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_lock_file_is_reported_not_dropped() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         let lock = t.path().join(".terraform.lock.hcl");
@@ -334,6 +335,7 @@ provider "registry.terraform.io/hashicorp/aws" {
     #[cfg(unix)]
     #[test]
     fn the_readable_lock_files_survive_an_unreadable_sibling() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         std::fs::write(t.path().join(".terraform.lock.hcl"), LOCK).unwrap();
@@ -362,6 +364,7 @@ provider "registry.terraform.io/hashicorp/aws" {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_reported_not_treated_as_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         let nested = t.path().join("environments");

@@ -40,6 +40,10 @@ pub mod report;
 pub mod repos;
 pub mod source_poll;
 pub mod store;
+/// Whether `chmod 000` denies this process, for the permission tests
+/// that depend on it (#1999). Test-only.
+#[cfg(all(test, unix))]
+mod test_permissions;
 pub mod tools;
 pub mod tray;
 mod worktrees;

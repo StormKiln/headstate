@@ -1047,6 +1047,7 @@ mod facts_tests {
     #[cfg(unix)]
     #[test]
     fn an_unlistable_directory_is_recorded_as_unreadable_facts() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let locked = t.path().join("locked");

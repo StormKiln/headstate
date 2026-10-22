@@ -247,6 +247,7 @@ fn generation_change_discards_the_live_iterator_and_cannot_publish_old_epoch() {
 #[test]
 #[cfg(unix)]
 fn permission_failure_is_partial_and_cannot_remove_accepted_membership() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     use std::os::unix::fs::PermissionsExt;
     let (_dir, root, mut conn) = fixture(3);
     let mut runtime = DiscoveryRuntime::default();
@@ -681,6 +682,7 @@ fn pending_directory_lookup_uses_ordered_indices() {
 #[test]
 #[cfg(unix)]
 fn unreadable_transcript_does_not_starve_healthy_siblings_or_license_pruning() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     use std::os::unix::fs::PermissionsExt;
     let (_dir, root, mut conn) = fixture(3);
     let source = root.join("synthetic/s-0000.jsonl");
@@ -721,6 +723,7 @@ fn unreadable_transcript_does_not_starve_healthy_siblings_or_license_pruning() {
 #[test]
 #[cfg(unix)]
 fn unreadable_projects_do_not_pin_healthy_or_recovered_project_units() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     use std::os::unix::fs::PermissionsExt;
     let (_dir, root, mut conn) = fixture(3);
     let blocked = root.join("synthetic");
@@ -1085,6 +1088,7 @@ fn unsupported_raw_directories_do_not_alias_or_starve_healthy_sources() {
 #[test]
 #[cfg(unix)]
 fn unreadable_root_is_partial_and_never_reported_as_absent() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     use std::os::unix::fs::PermissionsExt;
     let (_dir, root, mut conn) = fixture(1);
     let permissions = std::fs::metadata(&root).unwrap().permissions();

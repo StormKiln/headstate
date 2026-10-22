@@ -686,6 +686,7 @@ specific: FOO = bar
     #[cfg(unix)]
     #[test]
     fn an_unreadable_makefile_is_neither_open_nor_closed() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("Makefile");
@@ -818,6 +819,7 @@ specific: FOO = bar
     #[cfg(unix)]
     #[test]
     fn an_unreadable_makefile_is_unreadable_not_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let mk = t.path().join("Makefile");

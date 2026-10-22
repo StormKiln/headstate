@@ -303,6 +303,10 @@ fn touching_without_editing_does_not_recompute() {
 /// instead of the whole acceptance test vanishing there.
 #[cfg(unix)]
 fn unverified_result() -> Option<AdviceResult> {
+    if !crate::test_permissions::chmod_denies_reads() {
+        crate::test_permissions::report_skip(Some("the unverified state"));
+        return None;
+    }
     let f = Fixture::new();
     f.seed(&[], "2026-01-01T00:00:00Z");
     unreadable(&f.repo.join("CLAUDE.md"));
@@ -400,6 +404,7 @@ fn the_three_freshness_states_are_distinguishable() {
 #[test]
 #[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn a_recomputed_report_over_an_unreadable_input_is_unverified_not_fresh() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     let f = Fixture::new();
     unreadable(&f.repo.join("CLAUDE.md"));
     let got = f.serve(Mode::Fresh, "2026-01-01T00:00:00Z");
@@ -891,6 +896,7 @@ fn the_input_record_is_length_prefixed() {
 #[test]
 #[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn an_unreadable_input_both_changes_the_digest_and_flags_it() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     let f = Fixture::new();
     let before = f.fingerprint();
     assert_eq!(before.verification, Verification::Complete);
@@ -949,6 +955,7 @@ fn restore(path: &Path) {
 #[test]
 #[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn a_missing_home_is_complete_and_an_unreadable_home_is_not() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -991,6 +998,7 @@ fn a_missing_home_is_complete_and_an_unreadable_home_is_not() {
 #[test]
 #[cfg(unix)] // see `unreadable`: Windows cannot cheaply make a listed file unreadable
 fn the_unverified_reason_names_one_input_and_counts_the_others() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     let f = Fixture::new();
     std::fs::create_dir_all(f.repo.join("a")).unwrap();
     std::fs::create_dir_all(f.repo.join("b")).unwrap();
@@ -1448,6 +1456,7 @@ fn a_nested_repository_is_not_descended() {
 #[test]
 #[cfg(unix)] // see `unreadable`
 fn an_input_seen_twice_is_one_refusal() {
+    crate::test_permissions::skip_unless_chmod_denies!();
     let f = Fixture::new();
     unreadable(&f.repo.join("CLAUDE.md"));
     let fp = f.fingerprint();
