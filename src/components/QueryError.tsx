@@ -1,6 +1,9 @@
 import type { ReactNode } from "react";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { ReportLink } from "./ReportLink";
 import { commandError } from "@/lib/errorKind";
+import { signInRemedy } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { NotAskedNotice } from "./NotAskedNotice";
 
 /// The panel shown when a query FAILED, as distinct from returning nothing.
@@ -18,6 +21,8 @@ export function QueryError({
   title,
   message,
   onRetry,
+  notAsked = false,
+  tokenRejected = false,
   report = false,
   reportView,
   reportDiagnostics,
@@ -27,6 +32,16 @@ export function QueryError({
   title: string;
   message?: string;
   onRetry?: () => void;
+  /// The caller already knows Headstate DECLINED this request (#2004):
+  /// its message has had the wire marker stripped upstream, so the kind
+  /// can no longer be read from it here. `title` is then the caller's
+  /// "not checked" title, and the action follows the reason, as for a
+  /// marker-carrying message.
+  notAsked?: boolean;
+  /// The caller already knows GitHub REFUSED the token for this request
+  /// (#2008) -- the `expired-token` kind, read before the marker was
+  /// stripped. A marker-carrying `message` is recognised without it.
+  tokenRejected?: boolean;
   /// Offer "Report this" beside the retry (#1148).
   ///
   /// OPT-IN rather than automatic, because not every failure is worth a
@@ -56,10 +71,32 @@ export function QueryError({
   // is stripped by `commandError`, so what reaches the screen is
   // display-ready in both arms -- a wire detail on screen is the failure
   // `cancelled.ts` exists because of.
+  //
+  // The retry is handed through, not dropped (#2004): whether it can
+  // work depends on the reason, and `NotAskedNotice` decides that per
+  // reason -- offered for a budget refusal, withheld for no credential.
   const err = message === undefined ? undefined : commandError(message);
-  if (err?.kind === "not-asked") {
-    return <NotAskedNotice message={err.message} />;
+  if (notAsked || err?.kind === "not-asked") {
+    return (
+      <NotAskedNotice
+        title={notAsked ? title : undefined}
+        message={err?.message ?? ""}
+        onRetry={onRetry}
+      />
+    );
   }
+  // GitHub answered and refused the token (#2008). Still a failure -- a
+  // request was sent -- so still an alert. But the token is read once at
+  // startup, so "Try again" would send the same refused credential: the
+  // retry cannot work (#1050), and the sign-in remedy #2004 gives a
+  // missing credential replaces it. No "Report this" either: a dead token
+  // is the user's to fix, not a bug.
+  //
+  // Decided on the KIND, which Rust sets from the HTTP status
+  // (`ClientError::TokenRejected`), never on the prose. A 403 rate or
+  // secondary limit is `RateLimited` there, reaches here as `other`, and
+  // keeps its retry below.
+  const signIn = tokenRejected || err?.kind === "expired-token";
   return (
     <div
       role="alert"
@@ -74,7 +111,23 @@ export function QueryError({
         <p className="mx-auto mt-2 max-w-lg break-words text-sm text-[#8b949e]">{err.message}</p>
       ) : null}
       {children}
-      {onRetry || report ? (
+      {signIn ? (
+        <>
+          <p className="mx-auto mt-2 max-w-lg text-xs text-[#8b949e]">{signInRemedy(IS_MOBILE_BUILD)}</p>
+          {/* The phone cannot relaunch its desktop, so it gets the words. */}
+          {IS_MOBILE_BUILD ? null : (
+            <div className="mt-4 flex items-center justify-center">
+              <button
+                type="button"
+                onClick={() => void relaunch()}
+                className="tap-target rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
+              >
+                Relaunch Headstate
+              </button>
+            </div>
+          )}
+        </>
+      ) : onRetry || report ? (
         <div className="mt-4 flex items-center justify-center gap-3">
           {onRetry ? (
             <button
@@ -144,15 +197,4 @@ export function NarrowQueryError({
       </button>
     </div>
   );
-}
-
-/// Normalises whatever a rejected Tauri command threw into display prose.
-///
-/// Tauri surfaces a Rust `Err(String)` as a rejected promise carrying the
-/// bare string, but a transport-level failure rejects with an `Error`. Both
-/// reach this function, and neither should render as "[object Object]".
-export function errorMessage(err: unknown): string | undefined {
-  if (typeof err === "string") return err;
-  if (err instanceof Error) return err.message;
-  return undefined;
 }

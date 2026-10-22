@@ -243,7 +243,7 @@ mod tests {
     /// This guard REFUSES a stale snapshot, which stopped the lie. It did
     /// not make the data fresh: the user still waited out a ~20s live
     /// query on every visit, because nothing kept the cache current
-    /// between them. `poll::persist_reviewing` now writes it on every
+    /// between them. The poll loop now writes it on every
     /// tick (#1118) -- the loop was already fetching that exact list to
     /// decide what to notify about, and discarding it.
     ///

@@ -105,6 +105,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { ArtifactsPage } from "./ArtifactsPage";
+import { settle } from "@/test/settle";
 
 /// The hoisted `state` is shared across every describe in this file, and
 /// only some of them reset each field. `sizesFailed` defaults to the
@@ -433,7 +434,7 @@ describe("ArtifactsPage removal", () => {
     expect(screen.getByText(/may have a build running/)).toBeTruthy();
   });
 
-  it("removes the selected paths on confirm", () => {
+  it("removes the selected paths on confirm", async () => {
     state.artifacts = [art()];
     state.sizes = new Map([["/code/repo/target", 1_000]]);
     state.ages = new Map();
@@ -441,6 +442,7 @@ describe("ArtifactsPage removal", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await settle();
     expect(removeFn).toHaveBeenCalledWith(["/code/repo/target"]);
   });
 
@@ -469,7 +471,7 @@ describe("ArtifactsPage bulk removal and grouping", () => {
   /// Those are refused at delete time anyway, so including them would
   /// only produce a failure report nobody asked for -- and the count in
   /// the label would promise more than the click delivers.
-  it("leaves recently-written directories out of the bulk selection", () => {
+  it("leaves recently-written directories out of the bulk selection", async () => {
     state.artifacts = [
       art({ path: "/code/a/target" }),
       art({ path: "/code/b/target" }),
@@ -482,6 +484,7 @@ describe("ArtifactsPage bulk removal and grouping", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Remove all 2/ }));
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await settle();
     expect(removeFn).toHaveBeenCalledWith(["/code/a/target", "/code/b/target"]);
   });
 

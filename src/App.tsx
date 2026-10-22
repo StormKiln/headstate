@@ -52,7 +52,10 @@ import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
 import { BranchesPage } from "./components/BranchesPage";
 import { WorktreesPage } from "./components/WorktreesPage";
-import { QueryError, errorMessage } from "./components/QueryError";
+import { QueryError } from "./components/QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
+import { commandError } from "./lib/errorKind";
+import { sourceBanner } from "./lib/notAskedRemedy";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { StatusBar } from "./components/StatusBar";
@@ -316,6 +319,8 @@ export default function App() {
     isFromCache: reviewingFromCache,
     staleSecs: reviewingStaleSecs,
     savedOwner: reviewingSavedOwner,
+    notAsked: reviewingNotAsked,
+    tokenRejected: reviewingTokenRejected,
   } = reviewingQuery;
   // DIAGNOSTIC LOGGING (Settings > diagnostic log).
   useReviewingDiag({
@@ -346,6 +351,23 @@ export default function App() {
   const authoredReceipt = useSourceRefresh("authored");
   const reviewingReceipt = useSourceRefresh("reviewing");
   const githubReceipt = view === "to-review" ? reviewingReceipt : authoredReceipt;
+  // The authored list's rejection, classified (#1994). `usePullRequests`
+  // hands back the raw rejection, so its wire marker is read and stripped
+  // here; `useReviewing` already did both for its own list.
+  const authoredErrorText = errorMessage(error);
+  const authoredError = authoredErrorText === undefined ? undefined : commandError(authoredErrorText);
+  const authoredNotAsked = isError && (authoredReceipt.phase === "not_asked" || authoredError?.kind === "not-asked");
+  // GitHub refused the token (#2008): a retry would send it again, so the
+  // panels and the banner offer sign-in instead of "Try again".
+  const authoredTokenRejected = isError && authoredError?.kind === "expired-token";
+  // The Both/GitLab banner's GitHub line, classified (#2005). It passed
+  // the authored error and `pollError` through raw, so a declined request
+  // read "Could not refresh GitHub" -- or showed the wire marker itself.
+  // Each list answers with its own error and its own verdicts.
+  const githubBanner = view === "to-review"
+    ? (reviewingError ? sourceBanner(errorMessage(reviewingErr), reviewingNotAsked, reviewingTokenRejected) : null)
+    : isError ? sourceBanner(authoredErrorText, authoredNotAsked)
+    : pollError !== null ? sourceBanner(pollError, false) : null;
   const githubCoverage = githubReceipt.coverage ?? "unknown";
   const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
@@ -685,8 +707,13 @@ export default function App() {
             ) : null}
             {view === "to-review" && reviewingError && reviewing.length > 0 ? (
               <QueryError
-                title="Could not refresh the pull requests awaiting your review"
+                // The same split as the empty-state panel below (#1994).
+                title={reviewingNotAsked ? "Review requests were not re-checked" : "Could not refresh the pull requests awaiting your review"}
                 message={errorMessage(reviewingErr)}
+                // The action follows the reason (#2004): "Try again" only
+                // where asking again can work.
+                notAsked={reviewingNotAsked}
+                tokenRejected={reviewingTokenRejected}
                 onRetry={() => void refetchReviewing()}
               />
             ) : null}
@@ -979,7 +1006,9 @@ export default function App() {
               gitlab={gitlabQueue.rows}
               githubLoading={view === "to-review" ? reviewingLoading : isLoading}
               gitlabLoading={gitlabHost.isPending || (gitlabHost.isSuccess && gitlabQueue.loading)}
-              githubError={view === "to-review" ? (reviewingError ? errorMessage(reviewingErr) ?? "Could not refresh GitHub" : null) : (isError ? errorMessage(error) ?? "Could not refresh GitHub" : pollError ?? null)}
+              githubError={githubBanner?.message ?? null}
+              githubNotAsked={githubBanner?.notAsked ?? null}
+              githubRemedy={githubBanner?.remedy}
               gitlabError={gitlabHost.isError ? "Could not read the configured GitLab host. Check the desktop connection or Settings." : gitlabQueue.error}
               githubCoverage={githubCoverage}
               gitlabCoverage={gitlabQueue.coverage}
@@ -1002,12 +1031,14 @@ export default function App() {
                 not shrink the batch out from under the user. */}
             {view === "my-prs" && !authoredSavedOwner ? <BulkBar prs={source} /> : null}
             {(view === "to-review" ? reviewingLoading : isLoading) ? (
-              // `get_cached` returns `[]` both for "never polled" and for
-              // "authenticated, first poll (~3s) still in flight" -- an
-              // empty PrList would misreport the latter as "no pull
+              // While the first poll (~3s) is in flight there are no rows
+              // yet, and an empty PrList would misreport that as "no pull
               // requests match these filters" when no filters are even
               // active. Gating on isLoading keeps a cold start visibly
-              // loading instead of falsely claiming zero matches.
+              // loading instead of falsely claiming zero matches. (Since
+              // #2000, `get_cached` no longer answers "never polled" with
+              // `[]` -- it rejects with a reason, and `[]` means a measured
+              // empty list -- so this guards the in-flight read itself.)
               <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
                 Loading pull requests…
               </div>
@@ -1020,15 +1051,30 @@ export default function App() {
               // emitted by the background loop, and a failure here means the
               // foreground fetch itself never produced data.
               <QueryError
+                // "We did not ask" is not "they did not answer" (#1050,
+                // #1994). A request Headstate declined to send is
+                // unchecked, so it is not titled as a failed load; the
+                // message line beneath says why it was not asked.
                 title={
                   view === "to-review"
-                    ? "Could not load the pull requests awaiting your review"
-                    : "Could not load your pull requests"
+                    ? reviewingNotAsked
+                      ? "Review requests were not checked"
+                      : "Could not load the pull requests awaiting your review"
+                    : authoredNotAsked
+                      ? "Your pull requests were not checked"
+                      : "Could not load your pull requests"
                 }
                 // The failing query's OWN error and retry. Reporting the
                 // authored query's here would show a stale message and
                 // a retry that refetches the wrong list.
-                message={errorMessage(view === "to-review" ? reviewingErr : error)}
+                message={view === "to-review" ? errorMessage(reviewingErr) : authoredError?.message}
+                // Declined requests get the action their reason allows
+                // (#2004): a retry for a budget refusal, sign-in for no
+                // credential -- never a retry that will be refused again.
+                notAsked={view === "to-review" ? reviewingNotAsked : authoredNotAsked}
+                // A refused token gets sign-in, not a retry that would
+                // send it again (#2008).
+                tokenRejected={view === "to-review" ? reviewingTokenRejected : authoredTokenRejected}
                 onRetry={() =>
                   void (view === "to-review" ? refetchReviewing() : refetch())
                 }

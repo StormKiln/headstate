@@ -2580,6 +2580,134 @@ static TABLE: &str = HIT_none_3;
     /// Sabotage: delete the `notify_claude_crash` call from the poll loop
     /// in `lib.rs`, or swap `crashed_sessions` for `crashed_already_known`
     /// there, and this names the failure.
+    /// Every `background::Task` static, as `(file, NAME, "key")`, from
+    /// production code only.
+    fn background_task_statics(files: &[(PathBuf, String)]) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (file, src) in files {
+            for line in production(file, src).lines().filter(|l| !is_comment(l)) {
+                let Some((head, tail)) = line.split_once("Task::new(\"") else {
+                    continue;
+                };
+                let Some(name) = head
+                    .split_once("static ")
+                    .and_then(|(_, rest)| rest.split_once(':'))
+                    .map(|(name, _)| name.trim())
+                else {
+                    continue;
+                };
+                let Some((key, _)) = tail.split_once('"') else {
+                    continue;
+                };
+                out.push((
+                    file.display().to_string(),
+                    name.to_string(),
+                    key.to_string(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every background loop's health task is on the page and is written
+    /// to by the loop it names (#1937).
+    ///
+    /// The defect: `snapshot_all` listed three tasks while seven loops
+    /// ran, so System Health called background work healthy while PR
+    /// polling had stopped. Its doc comment defended a fixed list as "a
+    /// lookup table with three entries" long after there were more.
+    ///
+    /// Derived, not enumerated: the `Task` statics are FOUND, so a new
+    /// one is checked without anyone adding it here. Two ways to get it
+    /// wrong, and each is a separate assertion:
+    ///
+    /// - declared and not in `snapshot_all` -- tracked, and never shown;
+    /// - declared and never referenced outside `background.rs` -- shown,
+    ///   and forever "not started", because nothing records to it.
+    ///
+    /// What it cannot see: a loop with no `Task` at all. A loop is not a
+    /// syntactic thing a scan can find without crying wolf at every
+    /// one-shot `spawn`, which is why the list's own unit test pins the
+    /// seven loops by name.
+    #[test]
+    fn every_background_task_is_reported_and_recorded() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let background = canonical(&root.join("background.rs"));
+        let files: Vec<(PathBuf, String)> = rust_files(&root)
+            .into_iter()
+            // By path, never by content: this file's own prose and
+            // fixtures name the pattern.
+            .filter(|f| !f.ends_with("invariants.rs"))
+            .map(|f| {
+                let src = std::fs::read_to_string(&f)
+                    .expect("read source")
+                    .replace("\r\n", "\n");
+                (f, src)
+            })
+            .collect();
+        let statics = background_task_statics(&files);
+        assert!(
+            statics.len() >= 7,
+            "found only {} background Task statics ({statics:?}); the scan \
+             has stopped seeing them, not the code stopped declaring them",
+            statics.len()
+        );
+
+        let reported: Vec<String> = crate::background::snapshot_all()
+            .into_iter()
+            .map(|t| t.task)
+            .collect();
+        let mut problems = Vec::new();
+        for (file, name, key) in &statics {
+            if !reported.contains(key) {
+                problems.push(format!(
+                    "{file}: `{name}` (\"{key}\") is not in `background::snapshot_all`, \
+                     so the page can never show it"
+                ));
+            }
+            let used = files.iter().any(|(f, src)| {
+                canonical(f) != background
+                    && production(f, src)
+                        .lines()
+                        .filter(|l| !is_comment(l))
+                        .any(|l| {
+                            l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|word| word == name)
+                        })
+            });
+            if !used {
+                problems.push(format!(
+                    "{file}: `{name}` (\"{key}\") is never recorded to outside \
+                     background.rs -- call `.tick`, `.ok`, `.failed` or `.record_cycle` \
+                     on it from the loop it names"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The negative direction: prose that names a task, and a static
+    /// declared inside a test module, are not declarations.
+    #[test]
+    fn the_task_scan_ignores_comments_and_test_code() {
+        let file = PathBuf::from("fixture.rs");
+        let src = "\
+/// `pub static DOC: Task = Task::new(\"doc\");` in a comment.
+// static LINE: Task = Task::new(\"line\");
+pub static REAL: Task = Task::new(\"real\");
+
+#[cfg(test)]
+mod tests {
+    static FIXTURE: Task = Task::new(\"fixture\");
+}
+"
+        .to_string();
+        assert_eq!(
+            background_task_statics(&[(file, src)]),
+            vec![("fixture.rs".into(), "REAL".into(), "real".into())]
+        );
+    }
+
     #[test]
     fn the_claude_crash_notifier_is_wired_and_reads_first_observations() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3232,6 +3360,7 @@ static TABLE: &str = HIT_none_3;
     /// `get_worktree_dirs`, `get_cached`, `get_cached_reviewing`,
     /// `cleanup_log`, five setters, `mark_assessed` and `clear_assessed`
     /// -- pass, and that was checked rather than assumed.
+    /// (`get_cached_reviewing` has since been removed as dead, #1940.)
     ///
     /// The two halves were then checked against each other, one command
     /// at a time: giving each of those 15 a real `read_to_string` in its
@@ -3571,19 +3700,31 @@ static TABLE: &str = HIT_none_3;
     /// emitted -- so the To Review page paid ~20s for a query the
     /// background had already made a minute earlier (#1118).
     ///
-    /// Asserted against the loop rather than the store: `save_snapshot`
-    /// has callers, and the question is whether THIS one is among them.
+    /// The write is `source_poll::reconcile_github`, the one snapshot
+    /// writer (#1940): it saves inside the scan's transaction. A separate
+    /// `persist_reviewing` used to write the same rows again afterwards,
+    /// outside it. So the question is whether the tick that fetched the
+    /// review list reconciles it -- `now` is that tick's review result.
+    ///
+    /// Asserted against the loop rather than the store: the question is
+    /// whether this tick publishes through the transactional reconciler.
     #[test]
     fn the_poll_loop_caches_the_review_queue_it_fetches() {
-        let src = include_str!("poll.rs");
+        let src = include_str!("poll.rs").replace("\r\n", "\n");
+        let code: String = src
+            .lines()
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            src.contains("CachedList::Reviewing"),
+            code.contains("CachedList::Reviewing"),
             "the poll loop must write the review list it already fetches, or the To Review \
              page is only ever as fresh as its last visit (#1118)"
         );
         assert!(
-            src.contains("persist_reviewing(&app, &now).await"),
-            "and it must do so on the tick that fetched it"
+            code.contains("source_poll::reconcile_github(&app, &publication, now)"),
+            "and it must reconcile -- which saves -- the review list on the tick that \
+             fetched it (poll.rs, the reviewing half of the tick)"
         );
     }
 
@@ -6279,5 +6420,290 @@ let f = std::env::temp_dir;
                 "fixture.rs:33: helped reaches read_prefs".to_string(),
             ]
         );
+    }
+
+    /// What [`chmod_probe_offenders`] found in one file.
+    struct ChmodScan {
+        /// `#[test]` functions that set mode `000`, directly or through a
+        /// helper -- so a scan that matched nothing is visible as zero.
+        tests: usize,
+        /// Helpers that set mode `000` for their caller, by name.
+        helpers: Vec<String>,
+        offenders: Vec<String>,
+    }
+
+    /// The tests in `src` that make something unreadable with mode `000`
+    /// without first asking whether that denies this process (#1999).
+    ///
+    /// Scoped to the test FUNCTION, the unit that owns the hazard: a file
+    /// that calls the probe in one test proves nothing about its others.
+    /// A helper that sets the mode for its caller (`cache/tests.rs`'s
+    /// `unreadable`, `gaps.rs`'s `with_walled`) makes every test calling
+    /// it a permission test too, followed through helpers that call
+    /// helpers. A helper that probes for itself (`unverified_result`,
+    /// which returns `None` when denial is not enforced) stops that, as
+    /// does one no test calls (the corpus harness's `make_unreadable`,
+    /// which reports "unavailable" on its own).
+    ///
+    /// The probe must come BEFORE the first chmod: a check after the read
+    /// has already decided the test.
+    fn chmod_probe_offenders(where_: &str, src: &str) -> ChmodScan {
+        const SHUT: &str = "from_mode(0o000)";
+        const PROBES: [&str; 2] = ["skip_unless_chmod_denies!", "chmod_denies_reads()"];
+        let src = src.replace("\r\n", "\n");
+        // Comment lines blanked, not dropped, so line numbers stay true:
+        // this codebase documents a rule right above the code it governs,
+        // and these tests' own docs say `0o000` often.
+        let lines: Vec<&str> = src
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect();
+        struct Fn {
+            line: usize,
+            name: String,
+            is_test: bool,
+            body: String,
+        }
+        let mut fns = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            let Some(rest) = ["fn ", "pub fn ", "pub(crate) fn ", "async fn "]
+                .iter()
+                .find_map(|p| t.strip_prefix(p))
+            else {
+                continue;
+            };
+            let name = rest
+                .split(['(', '<'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            // Up through this item's own attributes and (blanked) doc
+            // lines, stopping at anything else -- the previous item's `}`
+            // -- so a helper right after a test is not read as one.
+            let is_test = lines[..i]
+                .iter()
+                .rev()
+                .map(|a| a.trim())
+                .take_while(|a| a.is_empty() || a.starts_with("#["))
+                .any(|a| a == "#[test]" || a.starts_with("#[tokio::test"));
+            let end = item_end(&lines, i, line.len() - t.len());
+            fns.push(Fn {
+                line: i + 1,
+                name,
+                is_test,
+                // From the line AFTER the signature, so a helper's own
+                // `fn name(` is not read as a call to itself.
+                body: lines[i + 1..end].join("\n"),
+            });
+        }
+        // Where `name(` is first called in `body`, as a call and not a
+        // method or a longer identifier.
+        let first_call = |body: &str, name: &str| -> Option<usize> {
+            let pat = format!("{name}(");
+            body.match_indices(&pat).map(|(at, _)| at).find(|at| {
+                !body[..*at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            })
+        };
+        let probes = |body: &str| PROBES.iter().filter_map(|p| body.find(p)).min();
+        let mut helpers: Vec<String> = Vec::new();
+        loop {
+            let before = helpers.len();
+            for f in fns
+                .iter()
+                .filter(|f| !f.is_test && probes(&f.body).is_none())
+            {
+                if !helpers.contains(&f.name)
+                    && (f.body.contains(SHUT)
+                        || helpers.iter().any(|h| first_call(&f.body, h).is_some()))
+                {
+                    helpers.push(f.name.clone());
+                }
+            }
+            if helpers.len() == before {
+                break;
+            }
+        }
+        let mut scan = ChmodScan {
+            tests: 0,
+            helpers: helpers.clone(),
+            offenders: Vec::new(),
+        };
+        for f in fns.iter().filter(|f| f.is_test) {
+            let via = helpers
+                .iter()
+                .filter_map(|h| first_call(&f.body, h).map(|at| (at, h.as_str())));
+            let first = f
+                .body
+                .find(SHUT)
+                .map(|at| (at, "sets mode 000"))
+                .into_iter()
+                .chain(via)
+                .min();
+            let Some((at, what)) = first else {
+                continue;
+            };
+            scan.tests += 1;
+            if probes(&f.body).is_none_or(|p| p > at) {
+                let how = if what == "sets mode 000" {
+                    what.to_string()
+                } else {
+                    format!("calls `{what}`, which sets mode 000")
+                };
+                scan.offenders.push(format!(
+                    "{where_}:{}: {} {how} without `skip_unless_chmod_denies!()` first",
+                    f.line, f.name
+                ));
+            }
+        }
+        scan
+    }
+
+    /// Every test that sets mode `000` first asks whether that denies
+    /// this process (#1999).
+    ///
+    /// Root, or a process with `CAP_DAC_OVERRIDE`, reads through mode
+    /// `000`. About fifty tests assumed it could not, so every run in a
+    /// root container failed all of them, and a real failure had to be
+    /// diffed out by name from fifty expected ones. Each now starts with
+    /// `crate::test_permissions::skip_unless_chmod_denies!()`, which
+    /// returns early, naming the test on stderr, where denial is not
+    /// enforced. A new permission test without it fails here, before it
+    /// can bring the noise back.
+    ///
+    /// `test_permissions.rs` is skipped by path: its own test checks the
+    /// probe against a real chmod, and must not skip.
+    #[test]
+    fn every_permission_test_asks_whether_chmod_denies_first() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let (mut tests, mut helpers, mut offenders) = (0usize, Vec::new(), Vec::new());
+        for file in rust_files(&root) {
+            if file.ends_with("invariants.rs") || file.ends_with("test_permissions.rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            let scan = chmod_probe_offenders(&rel, &src);
+            tests += scan.tests;
+            helpers.extend(scan.helpers);
+            offenders.extend(scan.offenders);
+        }
+        assert!(
+            tests >= 60,
+            "found only {tests} tests that set mode 000 (62 when this guard was written); \
+             the scan no longer matches the source and this guard is reading nothing"
+        );
+        for helper in ["unreadable", "with_walled"] {
+            assert!(
+                helpers.iter().any(|h| h == helper),
+                "`{helper}` sets mode 000 for its callers but the scan did not see it, so it \
+                 is no longer following helpers; helpers seen: {helpers:?}"
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "these tests make something unreadable with mode 000 but do not first check \
+             that this denies the test process. Root and CAP_DAC_OVERRIDE read straight \
+             through it, so in a root container the test fails for a reason that is not the \
+             code's (#1999). Make `crate::test_permissions::skip_unless_chmod_denies!();` \
+             the test's first statement:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The other direction: silent on prose, on a probed test, on a helper
+    /// that probes for itself and on one no test calls; firing on a test
+    /// with no probe, a probe placed after the chmod, and a chmod reached
+    /// through two helpers -- in a CRLF checkout.
+    #[test]
+    fn the_chmod_probe_guard_ignores_prose_and_probed_helpers_but_not_late_probes() {
+        let safe = "/// Sets `from_mode(0o000)` in prose only.\n\
+                    #[test]\n\
+                    fn prose() {\n    \
+                    // fs::set_permissions(&p, Permissions::from_mode(0o000))\n    \
+                    assert!(true);\n\
+                    }\n\
+                    #[test]\n\
+                    fn probed() {\n    \
+                    crate::test_permissions::skip_unless_chmod_denies!();\n    \
+                    shut(&p);\n\
+                    }\n\
+                    fn shut(p: &Path) {\n    \
+                    fs::set_permissions(p, Permissions::from_mode(0o000)).unwrap();\n\
+                    }\n\
+                    fn guarded() -> Option<u8> {\n    \
+                    if !crate::test_permissions::chmod_denies_reads() {\n        \
+                    return None;\n    \
+                    }\n    \
+                    shut(&p);\n    \
+                    Some(1)\n\
+                    }\n\
+                    fn harness(p: &Path) {\n    \
+                    fs::set_permissions(p, Permissions::from_mode(0o000)).unwrap();\n\
+                    }\n\
+                    #[test]\n\
+                    fn partial() {\n    \
+                    if let Some(x) = guarded() { assert_eq!(x, 1); }\n    \
+                    is_shut(&p);\n    \
+                    p.shut();\n\
+                    }\n";
+        let quiet = chmod_probe_offenders("fixture.rs", safe);
+        assert_eq!(quiet.offenders, Vec::<String>::new());
+        assert_eq!(quiet.tests, 1, "only `probed` sets mode 000");
+        assert_eq!(
+            quiet.helpers,
+            vec!["shut".to_string(), "harness".to_string()]
+        );
+
+        let unsafe_ = format!(
+            "{safe}#[test]\n\
+             fn bare() {{\n    \
+             fs::set_permissions(&p, Permissions::from_mode(0o000)).unwrap();\n\
+             }}\n\
+             #[test]\n\
+             #[cfg(unix)]\n\
+             fn late() {{\n    \
+             shut(&p);\n    \
+             crate::test_permissions::skip_unless_chmod_denies!();\n\
+             }}\n\
+             fn twice(p: &Path) {{\n    \
+             shut(p);\n\
+             }}\n\
+             #[test]\n\
+             fn deep() {{\n    \
+             twice(&p);\n\
+             }}\n"
+        )
+        .replace('\n', "\r\n");
+        let loud = chmod_probe_offenders("fixture.rs", &unsafe_);
+        assert_eq!(
+            loud.offenders,
+            vec![
+                "fixture.rs:32: bare sets mode 000 without `skip_unless_chmod_denies!()` first"
+                    .to_string(),
+                "fixture.rs:37: late calls `shut`, which sets mode 000 without \
+                 `skip_unless_chmod_denies!()` first"
+                    .to_string(),
+                "fixture.rs:45: deep calls `twice`, which sets mode 000 without \
+                 `skip_unless_chmod_denies!()` first"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(loud.tests, 4);
     }
 }

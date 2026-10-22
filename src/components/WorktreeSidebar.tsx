@@ -3,6 +3,7 @@ import { type View, useActiveFilters, useFilters } from "../store/filters";
 import { current } from "../lib/ariaCurrent";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
 import { NarrowQueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { ViewSwitcher } from "./ViewSwitcher";
 import { SavedScanNotice } from "./SavedScanNotice";
@@ -87,7 +88,9 @@ export function WorktreeSidebar({
   const partial = unreadable.length > 0;
   // The scan's INPUT (#952), so the empty arm below can tell "nowhere to
   // look" from "nothing there". One cache hit: `staleTime: Infinity`.
-  const { dirs } = useWorktreeDirs();
+  // `undefined` while unread or unreadable (#1995) -- never "none".
+  const { dirs, dirsError, retryDirs } = useWorktreeDirs();
+  const dirsReason = errorMessage(dirsError);
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
 
@@ -287,12 +290,24 @@ export function WorktreeSidebar({
             The same distinction `RepoPickerSidebar` draws: having nowhere
             to look is a task, and finding nothing in three real folders
             is a finding. */}
+        {/* #1995: a folder setting that could not be read, or has not
+            been read yet, is neither "no folders" nor "check the folders"
+            -- both are claims about a setting this read never saw. */}
         {repos?.length === 0 ? (
-          <p className="px-3 py-2 text-xs text-[#8b949e]">
-            {dirs.length === 0
-              ? "Headstate does not know where your repositories are yet. Set the directories to scan in Settings."
-              : "No repositories found. Check the scanned directories in Settings."}
-          </p>
+          dirsError ? (
+            <NarrowQueryError
+              message={dirsReason ? `Could not read the folders to scan: ${dirsReason}` : "Could not read the folders to scan."}
+              onRetry={() => void retryDirs()}
+            />
+          ) : dirs === undefined ? (
+            <p className="px-3 py-2 text-xs text-[#8b949e]">Reading the folders to scan…</p>
+          ) : (
+            <p className="px-3 py-2 text-xs text-[#8b949e]">
+              {dirs.length === 0
+                ? "Headstate does not know where your repositories are yet. Set the directories to scan in Settings."
+                : "No repositories found. Check the scanned directories in Settings."}
+            </p>
+          )
         ) : null}
       </div>
 

@@ -2988,6 +2988,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_transcript_is_an_error() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let tmp = Tmp::new("perm");
         let p = write(

@@ -1,4 +1,4 @@
-import type { Branch } from "@/types/pr";
+import type { Branch, Deletable } from "@/types/pr";
 
 /// Where a deletion should happen.
 ///
@@ -113,5 +113,39 @@ export function scopeLabel(scope: Scope, t: Targets): string {
       return `Delete ${n(t.remote)} on the remote`;
     case "both":
       return `Delete ${n(t.local)} locally and on the remote`;
+  }
+}
+
+/// Why a branch is or is not deletable, in words. (Moved from
+/// `BranchesPage.tsx` so that file exports only components, #1965.)
+///
+/// The whole reason `Deletable` is a tagged union rather than a boolean:
+/// "not merged: 3 commits" and "checked out in ../foo" send the user to
+/// different places, and a greyed-out checkbox sends them nowhere.
+export function deletableReason(d: Deletable): string {
+  switch (d.kind) {
+    case "merged":
+      return d.how === "ancestor" ? "Merged" : "Merged (squashed)";
+    case "defaultBranch":
+      return "Default branch";
+    case "checkedOut":
+      return `Checked out in ${d.path}`;
+    case "unmerged":
+      // Three arms for two states of one number (#967). `.unwrap_or(0)`
+      // on the Rust side used to render this verbatim as "Not merged — 0
+      // commits not on the default branch": the warning and the
+      // reassurance that cancels it, in one sentence, beside a delete
+      // checkbox — and on a git older than 2.41 that was EVERY branch.
+      //
+      // The count is the only thing telling the user what deleting costs,
+      // so when it is absent the row says so rather than naming a number.
+      // "Not merged" itself is still asserted: that part was measured.
+      return d.ahead === null
+        ? "Not merged — commit count unavailable (git 2.41 or newer is needed to count)"
+        : `Not merged — ${d.ahead} commit${d.ahead === 1 ? "" : "s"} not on the default branch`;
+    case "pending":
+      return "Checking…";
+    case "unknown":
+      return d.reason;
   }
 }

@@ -5,13 +5,14 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { MeasurementExport } from "./MeasurementExport";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { ToolVersions } from "./ToolVersions";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
 import { GetCompanionPanel } from "./GetCompanionPanel";
 import { PairPhonePanel } from "./PairPhonePanel";
 import { PairedDesktopPanel } from "./PairedDesktopPanel";
-import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
+import { ALWAYS_OFFERED, VIEWS } from "./viewMenu";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
@@ -92,7 +93,10 @@ export function SettingsDialog({
   // the stacked layout too, and it is still a desktop with `gh`.
   const isMobile = useIsMobile();
   const { seconds, set: setInterval } = usePollInterval();
-  const { dirs, set: setDirs, exclusions = [], setExclusions, exclusionsError, exclusionsReady = false, retryExclusions, isError: dirsUnread } = useWorktreeDirs();
+  const { dirs, set: setDirs, exclusions = [], setExclusions, exclusionsError, exclusionsReady = false, retryExclusions, dirsError, retryDirs } = useWorktreeDirs();
+  // `dirs` is `undefined` until the saved folders have been READ (#1995).
+  const dirsUnread = dirsError != null;
+  const dirsReason = errorMessage(dirsError);
   const { prefs, set: setPrefs } = useNotifyPrefs();
   const { prefs: ui, set: setUi } = useUiPrefs();
   const { prefs: cleanup, set: setCleanup } = useCleanupPrefs();
@@ -118,7 +122,7 @@ export function SettingsDialog({
   // a setState inside an effect, which cascades renders -- and it fought
   // the query: whenever `dirs` refetched, an in-progress edit would be
   // silently overwritten.
-  const value = draft ?? dirs.join("\n");
+  const value = draft ?? (dirs ?? []).join("\n");
 
   const close = () => {
     setDraft(null);
@@ -141,7 +145,11 @@ export function SettingsDialog({
         if (draft !== null) await setExclusions(paths, { rescan: false });
         else await setExclusions(paths);
       }
-      if (draft !== null || exclusionDraft === null) await setDirs(next);
+      // Never write back folders this dialog did not read (#1995). An
+      // untouched box over an unread or unreadable setting is EMPTY, and
+      // saving it -- from any topic's Save -- replaced the user's real
+      // folders with none. An edited box is the user's own answer.
+      if (draft !== null || (exclusionDraft === null && dirs !== undefined)) await setDirs(next);
     };
     void saveChanges().then(
       () => close(),
@@ -498,11 +506,14 @@ export function SettingsDialog({
           {/* #1956: the setting is no longer read as `~/code` when it
               cannot be read, so an empty box here would otherwise look
               like "nothing configured". */}
-          {dirsUnread && (
-            <p role="alert" className="text-xs text-[#f85149]">
-              The saved folders could not be read. Folders saved here replace them.
-            </p>
-          )}
+          {dirsUnread ? (
+            <div role="alert" className="text-xs text-[#f85149]">
+              The saved folders could not be read{dirsReason ? `: ${dirsReason}` : ""}. Folders saved here replace them.
+              <button type="button" className="ml-2 underline" onClick={() => void retryDirs()}>Retry reading folders</button>
+            </div>
+          ) : dirs === undefined ? (
+            <p className="text-xs text-[#8b949e]">Loading the saved folders…</p>
+          ) : null}
           {!IS_MOBILE_BUILD && <>
             <label htmlFor="discovery-exclusions" className="mt-3 text-sm font-medium">
               Exclude folders from repository discovery

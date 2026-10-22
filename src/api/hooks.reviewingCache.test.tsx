@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { PullRequest } from "../types/pr";
@@ -61,7 +61,7 @@ describe("useReviewing paints from cache while the live query runs", () => {
     expect(result.current.isFromCache).toBe(true);
     expect(result.current.isRefreshing).toBe(true);
 
-    live.resolve([pr(1), pr(2), pr(3)]);
+    await act(async () => live.resolve([pr(1), pr(2), pr(3)]));
   });
 
   /// Painting from cache must not mean showing stale data forever.
@@ -152,7 +152,7 @@ describe("useReviewing paints from cache while the live query runs", () => {
     const { result } = renderHook(() => useReviewing(true), { wrapper: wrapper(client()) });
     await waitFor(() => expect(result.current.data).toHaveLength(1));
     expect(result.current.staleSecs).toBeNull();
-    live.resolve([pr(1)]);
+    await act(async () => live.resolve([pr(1)]));
   });
 
   it("retains the SQLite rows and stale marker when a correlated failure has no receipt", async () => {

@@ -87,7 +87,8 @@ import { SavedScanNotice } from "./SavedScanNotice";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { rootBoundaries } from "../lib/rootBoundaries";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
@@ -1245,7 +1246,8 @@ export function WorktreesPage() {
   // The scan's INPUT (#952): whether there were any folders to walk at
   // all, which nothing in the scan's OUTPUT can distinguish from a walk
   // that found nothing. One cache hit -- `staleTime: Infinity`.
-  const { dirs } = useWorktreeDirs();
+  // `undefined` while unread or unreadable (#1995) -- never "none".
+  const { dirs, dirsError, retryDirs } = useWorktreeDirs();
   const filters = useActiveFilters();
   /// Rows ticked for a bulk action, keyed by path (#1140).
   ///
@@ -1707,33 +1709,40 @@ export function WorktreesPage() {
   // genuinely unsafe option.
   const settledAt = useFirstSizingSettled(selected?.path, sizing);
   const orderKey = `${sort}:${sortedAt}:${settledAt}`;
-  const snapshot = useMemo(
-    () => ({
-      order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
-      // Which paths already had a size when this order was fixed. Kept
-      // alongside the order because it is the only way to tell later
-      // that a measurement has landed SINCE -- comparing against the
-      // live rows would compare them with themselves.
-      measured: new Set(
-        withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
-      ),
-      // Which paths were assessed when this order was fixed, for the
-      // same reason and read the same way (#817).
-      //
-      // `sortWorktrees` ranks assessed rows above unassessed ones on
-      // EVERY sort, size or not, so an assessment landing changes what
-      // the correct order would be just as a measurement does. The
-      // staleness count used to look only at sizes, which left that
-      // half of the data silently stale: the order was wrong and the
-      // page did not say so -- precisely the dishonesty the re-sort
-      // button exists to prevent.
-      assessedThen: new Set(
-        withSizes.filter((w) => assessed.has(w.path)).map((w) => w.path),
-      ),
-    }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [orderKey, withSizes.length],
-  );
+  // Frozen until `snapshotKey` changes, and held in STATE rather than a
+  // memo (#1965). It was `useMemo([orderKey, withSizes.length])` with the
+  // rows it reads left out behind a suppression: a deliberate freeze, but
+  // a memo is a cache React may drop and recompute, which would re-sort
+  // the list under the user. State replaced during render ("adjust state
+  // when a prop changes") is the freeze React guarantees.
+  const snapshotKey = `${orderKey}:${withSizes.length}`;
+  const takeSnapshot = () => ({
+    order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
+    // Which paths already had a size when this order was fixed. Kept
+    // alongside the order because it is the only way to tell later
+    // that a measurement has landed SINCE -- comparing against the
+    // live rows would compare them with themselves.
+    measured: new Set(
+      withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
+    ),
+    // Which paths were assessed when this order was fixed, for the
+    // same reason and read the same way (#817).
+    //
+    // `sortWorktrees` ranks assessed rows above unassessed ones on
+    // EVERY sort, size or not, so an assessment landing changes what
+    // the correct order would be just as a measurement does. The
+    // staleness count used to look only at sizes, which left that
+    // half of the data silently stale: the order was wrong and the
+    // page did not say so -- precisely the dishonesty the re-sort
+    // button exists to prevent.
+    assessedThen: new Set(
+      withSizes.filter((w) => assessed.has(w.path)).map((w) => w.path),
+    ),
+  });
+  const [frozen, setFrozen] = useState(() => ({ key: snapshotKey, snapshot: takeSnapshot() }));
+  const refreeze = frozen.key !== snapshotKey;
+  const snapshot = refreeze ? takeSnapshot() : frozen.snapshot;
+  if (refreeze) setFrozen({ key: snapshotKey, snapshot });
   const order = snapshot.order;
   // The live rows, in the frozen order. A path the snapshot has not
   // seen yet sorts to the end rather than being dropped -- a worktree
@@ -2084,6 +2093,25 @@ export function WorktreesPage() {
     // "No repositories found" is a claim about the user's disk that this
     // scan never tested. It looked nowhere. That is a task to state, not
     // a finding to report -- and the two want opposite words.
+    // #1995: the folder setting could not be read. "Does not know where
+    // your repositories are" and "No git repositories under …" are both
+    // claims about a setting this read never saw.
+    if (dirsError) {
+      return (
+        <QueryError
+          title="Could not read the folders to scan"
+          message={errorMessage(dirsError)}
+          onRetry={() => void retryDirs()}
+        />
+      );
+    }
+    if (dirs === undefined) {
+      return (
+        <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
+          Reading the folders to scan…
+        </div>
+      );
+    }
     if (dirs.length === 0) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">

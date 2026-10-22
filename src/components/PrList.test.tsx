@@ -1,5 +1,5 @@
 import { renderWithQuery as render } from "@/test-utils";
-import { fireEvent, screen } from "@testing-library/react";
+import { act, fireEvent, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { PrList } from "@/components/PrList";
@@ -25,7 +25,7 @@ describe("PrList", () => {
     const rows = [...container.querySelectorAll('[role="button"][aria-current]')];
     expect(rows).toHaveLength(1);
     expect(rows[0].textContent).toContain(`#${open.number}`);
-    useFilters.setState({ selectedPr: null });
+    act(() => { useFilters.setState({ selectedPr: null }); });
   });
 
   it("marks no row current when nothing is open", () => {
@@ -87,5 +87,5 @@ it("selects and checks only the matching source/project among overlapping IIDs",
   fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
   expect(useFilters.getState().checked).toEqual(prs.map(prKey));
   expect(new Set(useFilters.getState().checked).size).toBe(4);
-  useFilters.setState({ selectedPr: null, checked: [] });
+  act(() => { useFilters.setState({ selectedPr: null, checked: [] }); });
 });

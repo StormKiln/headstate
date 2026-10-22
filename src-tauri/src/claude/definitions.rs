@@ -1039,6 +1039,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_scope_is_reported_and_named() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home").join(".claude");

@@ -1867,6 +1867,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_transcript_that_could_not_be_checked_is_not_reported_as_gone() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("headstate-919-eacces");

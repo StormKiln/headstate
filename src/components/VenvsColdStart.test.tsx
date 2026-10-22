@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,7 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 import { ArtifactsPage } from "./ArtifactsPage";
-import { VENV_GROUP } from "./ArtifactSidebar";
+import { VENV_GROUP } from "./artifactGroups";
 
 const venv = (project: string, state: Venv["state"] = "orphaned"): Venv => ({
   path: `/venvs/${project}-py3.12`,
@@ -60,6 +60,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Unmount before resetting the store: this hook runs BEFORE Testing
+  // Library's cleanup, so the reset below would otherwise re-render the
+  // still-mounted page outside act() (#1965).
+  cleanup();
   bridge.saved = null;
   bridge.scans = [];
   bridge.artifacts = [];

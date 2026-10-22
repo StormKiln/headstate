@@ -33,7 +33,8 @@ import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
 
 import type { DanglingVolume, DockerBuild, DockerImage } from "../types/pr";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// One line of the disk summary.

@@ -54,6 +54,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
+import { settle } from "@/test/settle";
 
 beforeEach(() => {
   calls.status.mockReset().mockResolvedValue({ enabled: false, schema: 1, epochs: 1,
@@ -68,6 +69,7 @@ const showGeneral = () => {
 };
 it("mounts the separate measurement export in the actual General section", async () => {
   render(<SettingsDialog open onOpenChange={() => {}} />);
+  await settle();
   fireEvent.click(screen.getByRole("button", { name: /^general$/i }));
   expect(screen.getByRole("button", { name: /save measurement report/i }).closest(".hidden")).toBeNull();
 });

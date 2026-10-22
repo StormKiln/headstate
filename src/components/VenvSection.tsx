@@ -16,7 +16,8 @@ import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { SavedScanNotice } from "./SavedScanNotice";
 
 /// The hardcoded `STALE_SECS` that used to live here is gone (#957).

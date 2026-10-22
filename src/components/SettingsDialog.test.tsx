@@ -5,7 +5,9 @@ const setExclusions = vi.hoisted(() => vi.fn((d: string[]) => Promise.resolve(d)
 const setDirs = vi.hoisted(() => vi.fn((d: string[]) => Promise.resolve(d)));
 const setInterval_ = vi.hoisted(() => vi.fn((s: number) => Promise.resolve(s)));
 const exclusionsState = vi.hoisted(() => ({ ready: true, error: null as Error | null, retry: vi.fn() }));
-const dirs = vi.hoisted(() => ({ current: ["/Users/x/code"] as string[] }));
+const dirs = vi.hoisted(() => ({ current: ["/Users/x/code"] as string[] | undefined }));
+/// The folder setting's read failure and its retry (#1995).
+const dirsState = vi.hoisted(() => ({ error: null as Error | null, retry: vi.fn() }));
 
 const setCleanup = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 /// `staleVenvDays` since #957: the setting that had no control at all,
@@ -74,7 +76,7 @@ vi.mock("../api/hooks", () => ({
   usePairedDevices: () => ({ data: [], isLoading: false, error: null }),
   useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
-  useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs, exclusions: [], setExclusions, exclusionsReady: exclusionsState.ready, exclusionsError: exclusionsState.error, retryExclusions: exclusionsState.retry }),
+  useWorktreeDirs: () => ({ dirs: dirs.current, dirsError: dirsState.error, retryDirs: dirsState.retry, set: setDirs, exclusions: [], setExclusions, exclusionsReady: exclusionsState.ready, exclusionsError: exclusionsState.error, retryExclusions: exclusionsState.retry }),
   // #915's panel. "Not installed" is the state a fresh machine is in, and
   // deliberately not `undefined`: an unresolved status renders a "checking"
   // line rather than any of the four answers, which would make the
@@ -95,7 +97,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
-import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
+import { ALWAYS_OFFERED, VIEWS } from "./viewMenu";
 import { ALL_VIEWS } from "@/store/filters";
 
 function open() {
@@ -594,4 +596,57 @@ it("does not allow an unloaded exclusion list to overwrite saved exclusions and 
     exclusionsState.ready = true;
     exclusionsState.error = null;
   }
+});
+
+/// #1995: `useWorktreeDirs` used to hand an unread or unreadable folder
+/// setting over as `dirs: []`. The box then rendered EMPTY, and any Save --
+/// from any topic -- wrote that emptiness back over the user's real folders.
+describe("an unread scan-folder setting (#1995)", () => {
+  it("says why the saved folders could not be read, offers a retry, and does not overwrite them", async () => {
+    dirs.current = undefined;
+    dirsState.error = new Error("scan-folders setting unreadable");
+    setDirs.mockClear();
+    try {
+      open();
+      expect(screen.getByText(/saved folders could not be read: scan-folders setting unreadable/i)).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry reading folders" }));
+      expect(dirsState.retry).toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeTruthy());
+      expect(setDirs).not.toHaveBeenCalled();
+    } finally {
+      dirs.current = ["/Users/x/code"];
+      dirsState.error = null;
+      dirsState.retry.mockReset();
+    }
+  });
+
+  it("shows a read in flight as loading, and an untouched Save does not write it as empty", async () => {
+    dirs.current = undefined;
+    setDirs.mockClear();
+    try {
+      open();
+      expect(screen.getByText(/loading the saved folders/i)).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeTruthy());
+      expect(setDirs).not.toHaveBeenCalled();
+    } finally {
+      dirs.current = ["/Users/x/code"];
+    }
+  });
+
+  it("still saves folders the user typed over an unreadable setting", async () => {
+    dirs.current = undefined;
+    dirsState.error = new Error("scan-folders setting unreadable");
+    setDirs.mockClear();
+    try {
+      open();
+      fireEvent.change(screen.getByLabelText(/directories to scan/i), { target: { value: "/new" } });
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      await waitFor(() => expect(setDirs).toHaveBeenCalledWith(["/new"]));
+    } finally {
+      dirs.current = ["/Users/x/code"];
+      dirsState.error = null;
+    }
+  });
 });

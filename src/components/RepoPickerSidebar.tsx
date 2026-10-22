@@ -4,6 +4,7 @@ import { current } from "@/lib/ariaCurrent";
 import { notBrowsableReason } from "@/lib/repoOverview";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { NarrowQueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { SettingsDialog } from "./SettingsDialog";
 import { ViewSwitcher } from "./ViewSwitcher";
@@ -84,7 +85,9 @@ export function RepoPickerSidebar({
   // was missing is a component that can tell the two apart. Costs one
   // cache hit: `useWorktreeDirs` is `staleTime: Infinity` and Settings
   // already holds the same query.
-  const { dirs } = useWorktreeDirs();
+  // `undefined` while unread or unreadable (#1995) -- never "none".
+  const { dirs, dirsError, retryDirs } = useWorktreeDirs();
+  const dirsReason = errorMessage(dirsError);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const rowClass = (active: boolean) =>
@@ -147,7 +150,18 @@ export function RepoPickerSidebar({
             No repositories could be read. The paths below explain why — the
             scanned folders may well be correct.
           </p>
-        ) : repos.length === 0 && dirs.length === 0 ? (
+        ) : repos.length === 0 && dirsError ? (
+          /* The folder setting itself could not be read (#1995). The
+             arm below says "no folders to scan", which is a claim
+             about a setting this read never saw: a failure, not an
+             empty configuration. */
+          <NarrowQueryError
+            message={dirsReason ? `Could not read the folders to scan: ${dirsReason}` : "Could not read the folders to scan."}
+            onRetry={() => void retryDirs()}
+          />
+        ) : repos.length === 0 && dirs === undefined ? (
+          <p className="px-3 py-2 text-xs text-[#8b949e]">Reading the folders to scan…</p>
+        ) : repos.length === 0 && dirs?.length === 0 ? (
           /* The FIFTH answer, and the first one a new user actually gets
              (#952): there is nowhere to look. Distinct from the empty arm
              below in exactly the way the arms above are distinct from each
@@ -192,11 +206,11 @@ export function RepoPickerSidebar({
              neither. */
           <div className="px-3 py-2">
             <p className="text-xs text-[#8b949e]">
-              No git repositories found in the {dirs.length === 1 ? "folder" : "folders"}{" "}
+              No git repositories found in the {dirs?.length === 1 ? "folder" : "folders"}{" "}
               being scanned.
             </p>
             <ul className="mt-1 space-y-0.5">
-              {dirs.map((d) => (
+              {(dirs ?? []).map((d) => (
                 <li key={d} className="break-all font-mono text-[11px] text-[#8b949e]">
                   {d}
                 </li>

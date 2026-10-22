@@ -3,17 +3,17 @@ import { useState } from "react";
 import { useViewer } from "@/api/hooks";
 import { readyBatchPrompt } from "@/lib/readyClaudify";
 import type { ReadyRow } from "@/lib/readyMarkdown";
+import { PrClaudifyDialogs } from "./PrClaudify";
 import {
   CLAUDIFY_CLASS,
   PLAIN_CLASS,
-  PrClaudifyDialogs,
   type PrClaudifyDialog,
   compactClass,
   shortReason,
   startClaudify,
   unavailableReason,
   useClaudifyCheckout,
-} from "./PrClaudify";
+} from "./claudifyStart";
 
 /// Claudify for the whole Ready for review strip (#1579).
 ///

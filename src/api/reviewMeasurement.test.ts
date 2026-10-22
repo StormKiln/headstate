@@ -30,6 +30,14 @@ describe("bounded Ready measurement traversal", () => {
     expect(readyMeasurementLastKnown(row, undefined, { freshness: "retained", value: { pusher: { state: "viewer" } } }, now)).toBe(true);
     expect(readyMeasurementLastKnown(row, { freshness: "fresh", value: { kind: "stacked" } }, { freshness: "fresh", value: { pusher: { state: "viewer" } } }, now)).toBe(false);
   });
+  // SKIPPED BY DEFAULT, deliberately (#1965 asked why). This is evidence
+  // collection, not a check: it times 400 passes per population with
+  // `performance.now()` and writes the samples to `ready-cost.json` for the
+  // native measurement-export smoke, so it runs only when that smoke opts
+  // in by setting `HEADSTATE_MEASUREMENT_SMOKE` to a fresh directory
+  // (`scripts/measurement-evidence.mjs`); without that directory there is
+  // nowhere for the samples to go. Run here it passes, in about 1.7 s:
+  //   HEADSTATE_MEASUREMENT_SMOKE=$(mktemp -d) yarn vitest run src/api/reviewMeasurement.test.ts
   it.skipIf(!evidenceEnabled)("preserves actual qualifier cost samples for synthetic Ready populations", async () => {
     const results = [];
     const now = new Date("2026-10-06T00:00:00Z");

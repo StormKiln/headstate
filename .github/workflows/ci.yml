@@ -46,22 +46,22 @@ permissions:
 # records which release each SHA is, since a bare SHA is unreadable.
 
 jobs:
-  lint:
+  lint-static:
     # 2m measured. Generous on purpose: this must never fire on a slow but
     # healthy run, only on a hang. Without it the job inherits
     # GitHub's 360-minute default (#885).
     timeout-minutes: 30
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
         with:
-          rust-components: clippy, rustfmt
+          rust: 'false'
       - name: Privacy guard
         run: ./scripts/check-privacy.sh
       - name: Install signature verifier for release contract tests
         timeout-minutes: 5
-        run: brew install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Native transcript evidence qualification
         run: python3 scripts/transcript-native-bench.test.py
       - name: Release artifact selection
@@ -79,6 +79,10 @@ jobs:
       # later `run:` step reported (eleven at once, in this macos-only
       # job). A guard whose failure mode is a silent pass needs something
       # watching it fail.
+      - name: CI orchestration regression tests
+        run: |
+          python3 scripts/ci-maintenance.test.py
+          python3 scripts/check-ci-throughput.test.py
       - name: Workflow shells
         run: |
           python3 scripts/check-workflow-shells.test.py
@@ -235,14 +239,6 @@ jobs:
         run: |
           python3 scripts/check-supply-chain-pins.test.py
           python3 scripts/check-supply-chain-pins.py
-      # Both crates. `crates/headstate-stepup` is a PATH DEPENDENCY of
-      # src-tauri rather than a workspace member, so a run from src-tauri
-      # never looks at it -- and it is the one place the step-up
-      # canonical bytes, header grammar and verifier now live (#695).
-      - name: Rust formatting
-        run: |
-          (cd crates/headstate-stepup && cargo fmt --check)
-          (cd src-tauri && cargo fmt --check)
       - name: Remote wire contract
         run: make check-wire-contract
       - name: Typecheck
@@ -251,12 +247,6 @@ jobs:
         run: yarn eslint .
       - name: Knip
         run: yarn knip
-      - name: Clippy
-        shell: bash
-        run: |
-          (cd crates/headstate-stepup && python3 ../../scripts/ci-command.py run clippy-stepup -- cargo clippy --all-targets -- -D warnings)
-          (cd src-tauri && python3 ../scripts/ci-command.py run clippy-desktop -- cargo clippy --all-targets -- -D warnings)
-
       - name: Retain command diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -265,6 +255,51 @@ jobs:
           path: ${{ runner.temp }}/ci-diagnostics/
           if-no-files-found: warn
           retention-days: 7
+
+  lint-native:
+    timeout-minutes: 30
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          node: 'false'
+          rust-components: clippy, rustfmt
+      # Both crates. `crates/headstate-stepup` is a PATH DEPENDENCY of
+      # src-tauri rather than a workspace member, so a run from src-tauri
+      # never looks at it -- and it is the one place the step-up
+      # canonical bytes, header grammar and verifier now live (#695).
+      - name: Rust formatting
+        run: |
+          (cd crates/headstate-stepup && cargo fmt --check)
+          (cd src-tauri && cargo fmt --check)
+      - name: Clippy
+        shell: bash
+        run: |
+          (cd crates/headstate-stepup && python3 ../../scripts/ci-command.py run clippy-stepup -- cargo clippy --all-targets -- -D warnings)
+          (cd src-tauri && python3 ../scripts/ci-command.py run clippy-desktop -- cargo clippy --all-targets -- -D warnings)
+
+      - name: Retain native lint diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: command-diagnostics-lint-native
+          path: ${{ runner.temp }}/ci-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Preserve the required context; neither a skipped nor a cancelled dependency passes.
+  lint:
+    if: always()
+    needs: [lint-static, lint-native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require all lint checks
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-maintenance.py --gate
 
   test-rust:
     # Whole-job bound, including compilation, enterprise contracts and three
@@ -316,10 +351,12 @@ jobs:
     # healthy run, only on a hang. Without it the job inherits
     # GitHub's 360-minute default (#885).
     timeout-minutes: 20
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
+        with:
+          rust: 'false'
       - name: Frontend diagnostic wrapper self-tests
         run: |
           python3 scripts/collect-frontend-crash.test.py
@@ -331,7 +368,7 @@ jobs:
         run: bash scripts/test-frontend-ci.sh
       - name: Production contrast and representative rendered states
         run: |
-          yarn playwright install chromium
+          yarn playwright install --with-deps chromium
           make check-contrast
       - name: Frontend diagnostics
         if: always()
@@ -451,7 +488,7 @@ jobs:
     # healthy run, only on a hang. Without it the job inherits
     # GitHub's 360-minute default (#885).
     timeout-minutes: 20
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup

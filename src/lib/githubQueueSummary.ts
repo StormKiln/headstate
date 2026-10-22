@@ -26,8 +26,11 @@ export function githubQueueSummary({ list, receipt }: GitHubQueueStatus) {
   // "We did not ask" is not "they did not answer" (#1050, #1927). A request
   // Headstate declined to send is unchecked, not failed -- whether the
   // receipt says so by its phase or only by its error's marker.
+  // Recorded as `not_asked`, not `not_checked` (#1996): "Headstate chose
+  // not to ask" and "nothing has run yet" are different findings, and a
+  // measurement report must be able to tell them apart.
   if (receipt.phase === "not_asked" || error?.kind === "not-asked") {
-    measurement = "not_checked";
+    measurement = "not_asked";
     text = `${subject} not checked`;
     notes.unshift(error?.message ? `Not asked: ${error.message}` : "Not asked");
   } else if (error || receipt.phase === "failed") {

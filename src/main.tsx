@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { createQueryClient } from "./api/queryClient";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
@@ -27,7 +28,7 @@ import "sonner/dist/styles.css";
 // the timing with fake timers instead of real sleeps.
 initSplash();
 
-const queryClient = new QueryClient();
+const queryClient = createQueryClient();
 
 // iOS suspends the webview, and a resume fires `visibilitychange` but
 // does NOT reliably fire `window.focus` -- which is what TanStack's
