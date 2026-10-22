@@ -192,8 +192,7 @@ export function SourceQueue({
     <p className="text-xs text-[#8b949e]">GitLab queues use the host configured in Settings on the desktop.</p>
     {sources.map((source) => <div key={source.name}>
       {source.error ? <div role={source.notAsked ? "status" : "alert"} className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
-        {source.name}: {source.error}{source.rows !== undefined ? " Saved rows remain visible." : ""}
-        {source.notAsked === "sign-in" ? ` ${signInRemedy(IS_MOBILE_BUILD)}` : null}
+        {source.name}: {source.error}{source.notAsked === "sign-in" ? `. ${signInRemedy(IS_MOBILE_BUILD)}` : ""}{source.rows !== undefined ? " Saved rows remain visible." : ""}
         {source.notAsked === null || source.notAsked === "retry" ? <button type="button" onClick={source.retry} className="ml-2 underline">Retry</button> : null}
       </div> : source.loading && source.rows === undefined ? <p role="status" className="text-sm text-[#8b949e]">Loading {source.name}…</p> : null}
       {source.rows !== undefined && source.coverage !== "complete" ? <p role="status" className="mt-1 text-xs text-[#d29922]">{coverageMessage(source.name, source.coverage, source.rows)}</p> : null}
