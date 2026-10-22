@@ -5088,6 +5088,11 @@ export function useReviewing(enabled = true) {
     /// stripped, so this is the only place a caller can still tell "we
     /// did not ask" from "they did not answer" (#1050).
     notAsked: isError && (source.phase === "not_asked" || classified?.kind === "not-asked"),
+    /// Whether GitHub REFUSED the token this request was sent with
+    /// (#2008). Read here for the same reason as `notAsked`: once the
+    /// marker is stripped, nothing downstream can tell that a retry
+    /// would send the same refused credential.
+    tokenRejected: isError && classified?.kind === "expired-token",
     isSuccess: status === "success",
     isPending: status === "pending",
     status,

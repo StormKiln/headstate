@@ -91,6 +91,24 @@ describe("a failed review refresh with nothing cached", () => {
     expect(result.current.notAsked).toBe(true);
   });
 
+  /// #2008: a refused token is stripped too, so the hook must say so --
+  /// the view cannot tell from the stripped prose that a retry would send
+  /// the same refused credential.
+  it("strips the expired-token marker and still says the token was refused", async () => {
+    ipc.call.mockImplementation((command: string) => {
+      if (command === "get_reviewing") return Promise.reject(new Error("headstate:expired-token GitHub rejected the token: Bad credentials"));
+      if (command === "get_source_snapshot") return Promise.reject(new Error("no saved snapshot"));
+      return Promise.resolve(undefined);
+    });
+    const { wrapper } = setup();
+    const { result } = renderHook(() => useReviewing(), { wrapper });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe("GitHub rejected the token: Bad credentials");
+    expect(result.current.tokenRejected).toBe(true);
+    // Sent and refused, not declined.
+    expect(result.current.notAsked).toBe(false);
+  });
+
   it("does not multiply the backend's own bounded attempts", async () => {
     ipc.call.mockImplementation((command: string) => {
       if (command === "get_reviewing") return Promise.reject(new Error("offline"));
@@ -105,6 +123,8 @@ describe("a failed review refresh with nothing cached", () => {
     expect(calls("get_reviewing")).toBe(1);
     // A request that was sent and failed is not a declined one (#1994).
     expect(result.current.notAsked).toBe(false);
+    // ...nor a refused token, so its retry stays (#2008).
+    expect(result.current.tokenRejected).toBe(false);
   });
 });
 

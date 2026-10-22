@@ -1,6 +1,9 @@
 import type { ReactNode } from "react";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { ReportLink } from "./ReportLink";
 import { commandError } from "@/lib/errorKind";
+import { signInRemedy } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { NotAskedNotice } from "./NotAskedNotice";
 
 /// The panel shown when a query FAILED, as distinct from returning nothing.
@@ -19,6 +22,7 @@ export function QueryError({
   message,
   onRetry,
   notAsked = false,
+  tokenRejected = false,
   report = false,
   reportView,
   reportDiagnostics,
@@ -34,6 +38,10 @@ export function QueryError({
   /// "not checked" title, and the action follows the reason, as for a
   /// marker-carrying message.
   notAsked?: boolean;
+  /// The caller already knows GitHub REFUSED the token for this request
+  /// (#2008) -- the `expired-token` kind, read before the marker was
+  /// stripped. A marker-carrying `message` is recognised without it.
+  tokenRejected?: boolean;
   /// Offer "Report this" beside the retry (#1148).
   ///
   /// OPT-IN rather than automatic, because not every failure is worth a
@@ -77,6 +85,18 @@ export function QueryError({
       />
     );
   }
+  // GitHub answered and refused the token (#2008). Still a failure -- a
+  // request was sent -- so still an alert. But the token is read once at
+  // startup, so "Try again" would send the same refused credential: the
+  // retry cannot work (#1050), and the sign-in remedy #2004 gives a
+  // missing credential replaces it. No "Report this" either: a dead token
+  // is the user's to fix, not a bug.
+  //
+  // Decided on the KIND, which Rust sets from the HTTP status
+  // (`ClientError::TokenRejected`), never on the prose. A 403 rate or
+  // secondary limit is `RateLimited` there, reaches here as `other`, and
+  // keeps its retry below.
+  const signIn = tokenRejected || err?.kind === "expired-token";
   return (
     <div
       role="alert"
@@ -91,7 +111,23 @@ export function QueryError({
         <p className="mx-auto mt-2 max-w-lg break-words text-sm text-[#8b949e]">{err.message}</p>
       ) : null}
       {children}
-      {onRetry || report ? (
+      {signIn ? (
+        <>
+          <p className="mx-auto mt-2 max-w-lg text-xs text-[#8b949e]">{signInRemedy(IS_MOBILE_BUILD)}</p>
+          {/* The phone cannot relaunch its desktop, so it gets the words. */}
+          {IS_MOBILE_BUILD ? null : (
+            <div className="mt-4 flex items-center justify-center">
+              <button
+                type="button"
+                onClick={() => void relaunch()}
+                className="tap-target rounded border border-[#30363d] px-3 py-1.5 text-sm text-[#e6edf3] hover:bg-[#161b22]"
+              >
+                Relaunch Headstate
+              </button>
+            </div>
+          )}
+        </>
+      ) : onRetry || report ? (
         <div className="mt-4 flex items-center justify-center gap-3">
           {onRetry ? (
             <button

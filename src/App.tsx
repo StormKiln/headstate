@@ -320,6 +320,7 @@ export default function App() {
     staleSecs: reviewingStaleSecs,
     savedOwner: reviewingSavedOwner,
     notAsked: reviewingNotAsked,
+    tokenRejected: reviewingTokenRejected,
   } = reviewingQuery;
   // DIAGNOSTIC LOGGING (Settings > diagnostic log).
   useReviewingDiag({
@@ -356,12 +357,15 @@ export default function App() {
   const authoredErrorText = errorMessage(error);
   const authoredError = authoredErrorText === undefined ? undefined : commandError(authoredErrorText);
   const authoredNotAsked = isError && (authoredReceipt.phase === "not_asked" || authoredError?.kind === "not-asked");
+  // GitHub refused the token (#2008): a retry would send it again, so the
+  // panels and the banner offer sign-in instead of "Try again".
+  const authoredTokenRejected = isError && authoredError?.kind === "expired-token";
   // The Both/GitLab banner's GitHub line, classified (#2005). It passed
   // the authored error and `pollError` through raw, so a declined request
   // read "Could not refresh GitHub" -- or showed the wire marker itself.
-  // Each list answers with its own error and its own not-asked verdict.
+  // Each list answers with its own error and its own verdicts.
   const githubBanner = view === "to-review"
-    ? (reviewingError ? sourceBanner(errorMessage(reviewingErr), reviewingNotAsked) : null)
+    ? (reviewingError ? sourceBanner(errorMessage(reviewingErr), reviewingNotAsked, reviewingTokenRejected) : null)
     : isError ? sourceBanner(authoredErrorText, authoredNotAsked)
     : pollError !== null ? sourceBanner(pollError, false) : null;
   const githubCoverage = githubReceipt.coverage ?? "unknown";
@@ -709,6 +713,7 @@ export default function App() {
                 // The action follows the reason (#2004): "Try again" only
                 // where asking again can work.
                 notAsked={reviewingNotAsked}
+                tokenRejected={reviewingTokenRejected}
                 onRetry={() => void refetchReviewing()}
               />
             ) : null}
@@ -1003,6 +1008,7 @@ export default function App() {
               gitlabLoading={gitlabHost.isPending || (gitlabHost.isSuccess && gitlabQueue.loading)}
               githubError={githubBanner?.message ?? null}
               githubNotAsked={githubBanner?.notAsked ?? null}
+              githubRemedy={githubBanner?.remedy}
               gitlabError={gitlabHost.isError ? "Could not read the configured GitLab host. Check the desktop connection or Settings." : gitlabQueue.error}
               githubCoverage={githubCoverage}
               gitlabCoverage={gitlabQueue.coverage}
@@ -1066,6 +1072,9 @@ export default function App() {
                 // (#2004): a retry for a budget refusal, sign-in for no
                 // credential -- never a retry that will be refused again.
                 notAsked={view === "to-review" ? reviewingNotAsked : authoredNotAsked}
+                // A refused token gets sign-in, not a retry that would
+                // send it again (#2008).
+                tokenRejected={view === "to-review" ? reviewingTokenRejected : authoredTokenRejected}
                 onRetry={() =>
                   void (view === "to-review" ? refetchReviewing() : refetch())
                 }
