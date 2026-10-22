@@ -2074,11 +2074,11 @@ export function useClaudeSessionsForPrQuery(query: string, enabled: boolean): Pr
     if (key === settled) return;
     const t = setTimeout(() => setSettled(key), PR_QUERY_DEBOUNCE_MS);
     return () => clearTimeout(t);
-    // `settled` is read to skip the timer when it already agrees, and
-    // must not be a dependency: including it would re-run this effect
-    // the moment the timer lands and schedule a second one.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+    // `settled` IS a dependency (#1965; it was suppressed). The re-run it
+    // causes when the timer lands schedules nothing: the timer only ever
+    // lands with `settled` set to the current `key` -- a key change
+    // clears the old timer first -- so the guard above returns.
+  }, [key, settled]);
 
   const ref = settled === key ? key : "";
   const live = ref === "" ? null : parsed;
@@ -2738,7 +2738,16 @@ async function readPrDetail(qc: QueryClient, repo: string, number: number, signa
 /// spinner branch stays.
 export function usePrDetail(repo: string | undefined, number: number | undefined) {
   const qc = useQueryClient();
-  const polling = useMemo(() => new DetailPollBackoff(), [repo, number]);
+  // One backoff per pull request this hook is showing: a fresh one when
+  // the identity changes, the same one across re-renders. Held in state
+  // and replaced during render (React's "adjust state when a prop
+  // changes"), not `useMemo([repo, number])`: the memo listed deps its
+  // body never read (#1965), and a memo is a cache React may drop, not a
+  // place to keep state that must survive.
+  const [backoff, setBackoff] = useState(() => ({ repo, number, polling: new DetailPollBackoff() }));
+  const moved = backoff.repo !== repo || backoff.number !== number;
+  const polling = moved ? new DetailPollBackoff() : backoff.polling;
+  if (moved) setBackoff({ repo, number, polling });
   const result = useQuery({
     queryKey: ["pr-detail", repo, number],
     // Observer option updates must preserve the query-owned confirmed review fact.

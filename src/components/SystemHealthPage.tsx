@@ -896,6 +896,14 @@ function GpuCard({ gpu }: { gpu: HealthGpu }) {
   );
 }
 
+/// One chart series from the history. Module scope, taking `samples` as
+/// an argument, so the memos below depend on exactly what they read
+/// (#1965): a per-render closure over `samples` had to be left out of
+/// their dependency lists behind three suppressions.
+function toPoints(samples: HealthSample[], pick: (s: HealthSample) => number | null): Point[] {
+  return samples.map((s) => ({ t: Date.parse(s.sampled_at), v: pick(s) }));
+}
+
 export function SystemHealthPage() {
   // Both queries are enabled unconditionally HERE, because this
   // component only mounts while the view is open -- `App` renders it
@@ -928,22 +936,18 @@ export function SystemHealthPage() {
   const unreachable = IS_MOBILE_BUILD && connection.kind === "unreachable";
 
   const samples = useMemo(() => history.data ?? [], [history.data]);
-  const toPoint = (pick: (s: HealthSample) => number | null): Point[] =>
-    samples.map((s) => ({ t: Date.parse(s.sampled_at), v: pick(s) }));
 
   // Built once per history change rather than inline, so the two charts
   // do not rebuild on every five-second live tick.
   const cpuSeries = useMemo(
-    () => toPoint((s) => s.cpu_percent),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => toPoints(samples, (s) => s.cpu_percent),
     [samples],
   );
   const memSeries = useMemo(
     // Used as a PERCENTAGE of total, not raw bytes: the y axis is then
     // comparable across machines and across a chart whose total never
     // changes anyway.
-    () => toPoint((s) => percentOf(s.memory.used, s.memory.total)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => toPoints(samples, (s) => percentOf(s.memory.used, s.memory.total)),
     [samples],
   );
   // The FIRST GPU only. A second one would need its own series, and a
@@ -956,8 +960,7 @@ export function SystemHealthPage() {
   // running and did not measure a GPU, which is not the same as a GPU
   // that was idle.
   const gpuSeries = useMemo(
-    () => toPoint((s) => s.gpus[0]?.utilization_percent ?? null),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => toPoints(samples, (s) => s.gpus[0]?.utilization_percent ?? null),
     [samples],
   );
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import * as api from "./diskInventory";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import type { DiskObservation, DiskSettings, DiskStatus } from "../types/disk";
@@ -16,18 +16,21 @@ export function useDiskInventory(enabled: boolean) {
   // what remains is not the whole history, and must not read as if it were.
   const [historyUnreadable, setHistoryUnreadable] = useState(0);
   const [busy, setBusy] = useState(false);
-  const generation = useRef(0);
   const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
     if (!enabled) return;
+    // This run's answers count only while it is the current run. `live`
+    // is enough on its own (#1965): the next run's cleanup-before-start
+    // ordering means a newer run exists only once this one's cleanup has
+    // set it false. A shared generation ref duplicated that check and
+    // was read in the cleanup after it might have moved on.
     let live = true;
-    const epoch = ++generation.current;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function poll() {
       try {
         const next = await api.diskStatus();
-        if (!live || generation.current !== epoch) return;
+        if (!live) return;
         setStatus(previous => retainMeasurement(next, previous));
         if (next.running) timer = setTimeout(() => void poll(), 1000);
       } catch (error) {
@@ -38,7 +41,7 @@ export function useDiskInventory(enabled: boolean) {
       api.diskHistory(),
       IS_MOBILE_BUILD ? Promise.resolve(null) : api.diskSettings(),
     ]).then(([history, config]) => {
-      if (!live || generation.current !== epoch) return;
+      if (!live) return;
       const newest = new Map<string, DiskObservation>();
       setHistoryUnreadable(history.unreadable);
       for (const observation of history.observations) {
@@ -53,7 +56,6 @@ export function useDiskInventory(enabled: boolean) {
     void poll();
     return () => {
       live = false;
-      generation.current++;
       if (timer) clearTimeout(timer);
     };
   }, [enabled, refresh]);
