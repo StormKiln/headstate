@@ -149,32 +149,11 @@ pub(crate) fn load_qualified_snapshot(
     })
 }
 
-pub fn save_source_snapshot(
-    conn: &Connection,
-    source: &Source,
-    list: CachedList,
-    prs: &[PullRequest],
-    coverage: &Coverage,
-) -> Result<(), StoreError> {
-    // Reject a mixed/wrong source instead of silently relabelling records.
-    if source.provider != Provider::Github || prs.iter().any(|pr| &pr.source != source) {
-        return Err(StoreError::SnapshotSourceMismatch);
-    }
-    save_owned_source_snapshot(conn, source, list, prs, coverage, None)
-}
-
-pub fn save_gitlab_snapshot(
-    conn: &Connection,
-    source: &Source,
-    list: CachedList,
-    mrs: &[MergeRequest],
-    coverage: &Coverage,
-) -> Result<(), StoreError> {
-    if source.provider != Provider::Gitlab || mrs.iter().any(|mr| &mr.source != source) {
-        return Err(StoreError::SnapshotSourceMismatch);
-    }
-    save_owned_gitlab_snapshot(conn, source, list, mrs, coverage, None)
-}
+// The owner-less writers `save_source_snapshot` (GitHub, until #2009) and
+// `save_gitlab_snapshot` (GitLab, until #2014) lived here. Only tests
+// reached them; production writes every snapshot through
+// `save_owned_source_snapshot` or `save_owned_gitlab_snapshot`, whose
+// owner decides visibility (#1926).
 
 pub fn save_owned_source_snapshot(
     conn: &Connection,
@@ -184,6 +163,7 @@ pub fn save_owned_source_snapshot(
     coverage: &Coverage,
     owner: Option<&str>,
 ) -> Result<(), StoreError> {
+    // Reject a mixed/wrong source instead of silently relabelling records.
     if source.provider != Provider::Github || prs.iter().any(|pr| &pr.source != source) {
         return Err(StoreError::SnapshotSourceMismatch);
     }
@@ -386,6 +366,22 @@ mod tests {
         crate::store::migrate(&conn).unwrap();
         conn
     }
+    /// The owner every test write records unless it is testing ownership.
+    const OWNER: Option<&str> = Some("alice");
+    /// Stands for LEGACY data: a row saved before #1926 recorded owners,
+    /// so its `owner` column is NULL. Tests that need such a row on disk
+    /// write it here, by name, rather than through a writer production
+    /// never calls (#2009).
+    fn save_legacy_unowned_snapshot(
+        conn: &Connection,
+        source: &Source,
+        list: CachedList,
+        prs: &[PullRequest],
+        coverage: &Coverage,
+    ) {
+        save_owned_source_snapshot(conn, source, list, prs, coverage, None).unwrap();
+        assert_eq!(snapshot_owner(conn, source, list).unwrap(), None);
+    }
     fn gitlab(host: &str) -> Source {
         Source {
             provider: Provider::Gitlab,
@@ -416,6 +412,13 @@ mod tests {
             "review": null, "unresolved_threads": null
         }))
         .unwrap()
+    }
+    /// A merge request as production saves it: fetched by `OWNER`, so its
+    /// `viewer` is the owner `save_owned_gitlab_snapshot` records (#2014).
+    fn owned_mr(source: Source) -> MergeRequest {
+        let mut mr = sample_mr(source);
+        mr.viewer = OWNER.map(Into::into);
+        mr
     }
     #[test]
     fn qualified_warm_read_does_not_reserve_a_wal_writer() {
@@ -688,13 +691,15 @@ mod tests {
                 .as_deref(),
             Some("second-account")
         );
-        // An unattributed write does not erase a known owner (#1926).
-        save_source_snapshot(
+        // An unattributed write (viewer unknown) does not erase a known
+        // owner (#1926).
+        save_owned_source_snapshot(
             &conn,
             &source,
             CachedList::Reviewing,
             &[],
             &Coverage::Unknown,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -781,16 +786,22 @@ mod tests {
             Some("bob"),
         )
         .unwrap();
-        for rows in [vec![sample(source.clone())], vec![]] {
-            save_source_snapshot(
-                &conn,
-                &source,
-                CachedList::Authored,
-                &rows,
-                &Coverage::Unknown,
-            )
-            .unwrap();
-        }
+        save_legacy_unowned_snapshot(
+            &conn,
+            &source,
+            CachedList::Authored,
+            &[sample(source.clone())],
+            &Coverage::Unknown,
+        );
+        save_owned_source_snapshot(
+            &conn,
+            &source,
+            CachedList::Authored,
+            &[],
+            &Coverage::Unknown,
+            None,
+        )
+        .unwrap();
         let SnapshotData::Available { prs, .. } =
             load_source_snapshot(&conn, &source, CachedList::Authored)
                 .unwrap()
@@ -824,12 +835,13 @@ mod tests {
         crate::inventory::apply_confirmed_review(&mut a, &effect);
         let mut b = a.clone();
         b.number += 1;
-        save_source_snapshot(
+        save_owned_source_snapshot(
             &conn,
             &source,
             CachedList::Reviewing,
             &[a.clone(), b],
             &Coverage::Complete,
+            OWNER,
         )
         .unwrap();
         let SnapshotData::Available { prs: previous, .. } =
@@ -840,12 +852,13 @@ mod tests {
             panic!("snapshot")
         };
         let rows = crate::inventory::reconcile(previous, vec![a], false, chrono::Utc::now());
-        save_source_snapshot(
+        save_owned_source_snapshot(
             &conn,
             &source,
             CachedList::Reviewing,
             &rows,
             &Coverage::Partial { total: Some(2) },
+            OWNER,
         )
         .unwrap();
         let SnapshotData::Available { prs, coverage, .. } =
@@ -875,12 +888,13 @@ mod tests {
     fn gitlab_snapshot_wire_keeps_absence_and_coverage_distinct() {
         let conn = db();
         let source = gitlab("gitlab.com");
-        save_gitlab_snapshot(
+        save_owned_gitlab_snapshot(
             &conn,
             &source,
             CachedList::Reviewing,
-            &[sample_mr(source.clone())],
+            &[owned_mr(source.clone())],
             &Coverage::Partial { total: Some(3) },
+            OWNER,
         )
         .unwrap();
         let wire = serde_json::to_value(
@@ -897,28 +911,31 @@ mod tests {
         let conn = db();
         let gh = Source::default();
         let gl = gitlab("gitlab.com");
-        save_source_snapshot(
+        save_owned_source_snapshot(
             &conn,
             &gh,
             CachedList::Authored,
             &[sample(gh.clone())],
             &Coverage::Complete,
+            OWNER,
         )
         .unwrap();
-        save_gitlab_snapshot(
+        save_owned_gitlab_snapshot(
             &conn,
             &gl,
             CachedList::Authored,
-            &[sample_mr(gl.clone())],
+            &[owned_mr(gl.clone())],
             &Coverage::Complete,
+            OWNER,
         )
         .unwrap();
-        assert!(save_source_snapshot(
+        assert!(save_owned_source_snapshot(
             &conn,
             &gh,
             CachedList::Authored,
             &[sample(gl.clone())],
-            &Coverage::Complete
+            &Coverage::Complete,
+            OWNER,
         )
         .is_err());
         assert!(
@@ -927,7 +944,7 @@ mod tests {
         );
         assert!(
             matches!(load_source_snapshot(&conn, &gl, CachedList::Authored).unwrap().data,
-            SnapshotData::GitLabAvailable { mrs, .. } if mrs == vec![sample_mr(gl.clone())])
+            SnapshotData::GitLabAvailable { mrs, .. } if mrs == vec![owned_mr(gl.clone())])
         );
         conn.execute("UPDATE snapshot SET provider = 'gitlab', host = 'wrong.example' WHERE provider = 'github'", []).unwrap();
         assert_eq!(
@@ -944,16 +961,33 @@ mod tests {
         let gh = Source::default();
         let gl = gitlab("gitlab.com");
         let other = gitlab("gitlab.example");
-        save_source_snapshot(&conn, &gh, CachedList::Authored, &[], &Coverage::Complete).unwrap();
-        save_gitlab_snapshot(
+        save_owned_source_snapshot(
+            &conn,
+            &gh,
+            CachedList::Authored,
+            &[],
+            &Coverage::Complete,
+            OWNER,
+        )
+        .unwrap();
+        save_owned_gitlab_snapshot(
             &conn,
             &gl,
             CachedList::Authored,
             &[],
             &Coverage::Partial { total: Some(4) },
+            OWNER,
         )
         .unwrap();
-        save_gitlab_snapshot(&conn, &other, CachedList::Authored, &[], &Coverage::Unknown).unwrap();
+        save_owned_gitlab_snapshot(
+            &conn,
+            &other,
+            CachedList::Authored,
+            &[],
+            &Coverage::Unknown,
+            OWNER,
+        )
+        .unwrap();
         conn.execute("UPDATE snapshot SET fetched_at = datetime('now', '-2 hours') WHERE provider = 'github'", []).unwrap();
         assert!(matches!(
             load_source_snapshot(&conn, &gh, CachedList::Authored)
@@ -1001,12 +1035,13 @@ mod tests {
                 .data,
             SnapshotData::Missing
         );
-        save_source_snapshot(
+        save_owned_source_snapshot(
             &conn,
             &source,
             CachedList::Authored,
             &[],
             &Coverage::Complete,
+            OWNER,
         )
         .unwrap();
         assert!(
