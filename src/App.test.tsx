@@ -9,6 +9,7 @@ import { useFilters } from "./store/filters";
 import { useSourceSelection } from "./store/sourceSelection";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
+import { settle } from "@/test/settle";
 
 // The shell talks to Tauri on mount. Stub the command surface so these tests
 // exercise the wiring, not the backend.
@@ -356,6 +357,7 @@ describe("App — priorities strip scoping", () => {
     }));
     mockPrs.mockReturnValue(population);
     renderApp();
+    await settle();
     expect(screen.getByText("Needs your attention (275)")).toBeTruthy();
     await act(() => useFilters.setState({ filtersByView: { ...useFilters.getState().filtersByView, "my-prs": { repo: "synthetic/repo-0" } } }));
     const selected = screen.getByText("Needs your attention (7)").closest("section")!;
@@ -416,14 +418,16 @@ describe("keyboard triage", () => {
   const press = (key: string) =>
     fireEvent.keyDown(window, { key, bubbles: true });
 
-  it("puts the cursor on the first row on the first press", () => {
+  it("puts the cursor on the first row on the first press", async () => {
     renderApp();
+    await settle();
     press("j");
     expect(useFilters.getState().cursor).toBe(0);
   });
 
-  it("walks down and back up", () => {
+  it("walks down and back up", async () => {
     renderApp();
+    await settle();
     press("j");
     press("j");
     expect(useFilters.getState().cursor).toBe(1);
@@ -433,16 +437,18 @@ describe("keyboard triage", () => {
 
   // Clamped, not wrapped: wrapping from the bottom back to the top
   // silently moves the eye across the whole screen.
-  it("stops at the top rather than wrapping", () => {
+  it("stops at the top rather than wrapping", async () => {
     renderApp();
+    await settle();
     press("j");
     press("k");
     press("k");
     expect(useFilters.getState().cursor).toBe(0);
   });
 
-  it("selects the cursor row with x", () => {
+  it("selects the cursor row with x", async () => {
     renderApp();
+    await settle();
     press("j");
     press("x");
     expect(useFilters.getState().checked).toHaveLength(1);
@@ -497,8 +503,9 @@ describe("opening a pull request from To review", () => {
     mockReviewError.mockReturnValue(null);
   });
 
-  it("selects the pull request when its row is clicked", () => {
+  it("selects the pull request when its row is clicked", async () => {
     renderApp();
+    await settle();
     fireEvent.click(screen.getByText(theirs.title));
     expect(useFilters.getState().selectedPr).toEqual({
       repo: "someone/else",
@@ -797,10 +804,13 @@ describe("notification click in the assembled shell", () => {
     qc.setQueryData(["gitlab-host"], "gitlab.com");
     const shell = (viewer: string | null) => <QueryClientProvider client={qc}><GitLabViewerProvider viewer={viewer}><App /></GitLabViewerProvider></QueryClientProvider>;
     const mounted = render(shell(null));
+    await settle();
     expect((await screen.findByRole("link", { name: "Open on GitLab" })).getAttribute("href")).toBe("https://gitlab.com/example/sub/project/-/merge_requests/7");
     mounted.rerender(shell("first-viewer"));
+    await settle();
     expect(useFilters.getState().selectedPr).toEqual(target);
     mounted.rerender(shell("second-viewer"));
+    await settle();
     expect(useFilters.getState().selectedPr).toBeNull();
   });
 
@@ -844,7 +854,10 @@ it.each(["github", "both"] as const)("keeps GitHub Court confidence independent 
   useFilters.setState({ view: "my-prs", selectedPr: null });
   useSourceSelection.setState({ selection, repoKey: null, query: "" });
   renderApp(); expect(await screen.findByText("Nothing needs your attention")).toBeTruthy();
-  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  await settle();
+  // The shell is still mounted; restoring the selection re-renders it.
+  act(() => { useSourceSelection.setState({ selection: "github", repoKey: null, query: "" }); });
+  await settle();
 });
 
 it("qualifies an old complete Court receipt while a newer source attempt is fetching", () => {
@@ -938,19 +951,21 @@ describe("active inventory footer wiring", () => {
     expect(measurements).not.toHaveBeenCalled();
     await mounted.unmount();
   });
-  it("switches from reviewing failure to the independently accepted authored receipt", () => {
+  it("switches from reviewing failure to the independently accepted authored receipt", async () => {
     mockReviewError.mockReturnValue(new Error("Review queue unavailable"));
     renderApp();
+    await settle();
     expect(screen.getByText("Could not refresh review requests")).toBeTruthy();
     expect(screen.queryByText("Your PRs checked")).toBeNull();
     act(() => { useFilters.setState({ view: "my-prs" }); });
     expect(screen.getByText("Your PRs checked")).toBeTruthy();
     expect(screen.queryByText("Could not refresh review requests")).toBeNull();
   });
-  it.each(["github", "both"] as const)("follows partial, retrying and recovered reviewing receipts in %s mode", selection => {
+  it.each(["github", "both"] as const)("follows partial, retrying and recovered reviewing receipts in %s mode", async selection => {
     useSourceSelection.setState({ selection });
     mockReviewCoverage.mockReturnValue({ partial: { total: 236 } });
     renderApp();
+    await settle();
     expect(screen.getByText(/Review requests partly checked/)).toBeTruthy();
     mockReviewPhase.mockReturnValue("retrying");
     act(() => useFilters.getState().setFilter("query", "synthetic"));
@@ -959,13 +974,15 @@ describe("active inventory footer wiring", () => {
     act(() => useFilters.getState().setFilter("query", ""));
     expect(screen.getByText(/Review requests checked/)).toBeTruthy();
   });
-  it("keeps whole-list coverage qualified when a repository filter is selected", () => {
+  it("keeps whole-list coverage qualified when a repository filter is selected", async () => {
     mockReviewCoverage.mockReturnValue({ partial: { total: 236 } });
     useFilters.getState().setFilter("repo", "synthetic/repo");
     renderApp();
+    await settle();
     const status = screen.getByText("Review requests partly checked");
     expect(status.getAttribute("title")).toContain("across all repositories");
-    useFilters.getState().setFilter("repo", undefined);
+    // The shell is still mounted; clearing the filter re-renders it.
+    act(() => useFilters.getState().setFilter("repo", undefined));
   });
   it("withholds query-cache time when the active receipt has no provider time", () => {
     mockDataUpdatedAt.mockReturnValue(Date.now());
@@ -973,10 +990,11 @@ describe("active inventory footer wiring", () => {
     expect(screen.queryByText(/^Updated /)).toBeNull();
     mockDataUpdatedAt.mockReturnValue(0);
   });
-  it("does not show a GitHub failure when GitLab alone is selected", () => {
+  it("does not show a GitHub failure when GitLab alone is selected", async () => {
     mockReviewError.mockReturnValue(new Error("Review queue unavailable"));
     useSourceSelection.setState({ selection: "gitlab" });
     renderApp();
+    await settle();
     expect(screen.queryByText("Could not refresh review requests")).toBeNull();
   });
 });

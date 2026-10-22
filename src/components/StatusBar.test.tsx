@@ -62,6 +62,7 @@ import { ReviewMeasurementProvider } from "../api/reviewMeasurement";
 import type { SourceRefreshSnapshot } from "../api/sourceRefresh";
 import type { PullRequest } from "../types/pr";
 import { StatusBar } from "./StatusBar";
+import { settle } from "@/test/settle";
 
 describe("StatusBar on a phone", () => {
   afterEach(() => stubViewport(null));
@@ -76,9 +77,10 @@ describe("StatusBar on a phone", () => {
   /// more list than they informed (#649). The version, the settings
   /// entry point and the progress counter stay, because nothing else
   /// carries them.
-  it("drops the poll state and interval, keeping version and settings", () => {
+  it("drops the poll state and interval, keeping version and settings", async () => {
     stubViewport(390);
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    await settle();
     expect(screen.queryByLabelText("Poll interval")).toBeNull();
     expect(screen.queryByText(/up to date/i)).toBeNull();
     expect(screen.queryByText(/^updated /i)).toBeNull();
@@ -86,66 +88,76 @@ describe("StatusBar on a phone", () => {
   });
 
   /// And the desktop keeps both, unchanged.
-  it("keeps the poll state and timestamp on the desktop", () => {
+  it("keeps the poll state and timestamp on the desktop", async () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    await settle();
     expect(screen.getByText(/up to date/i)).toBeTruthy();
     expect(screen.getByText(/updated/i)).toBeTruthy();
   });
 
-  it("keeps the poll-interval control on the desktop", () => {
+  it("keeps the poll-interval control on the desktop", async () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    await settle();
     expect(screen.getByLabelText("Poll interval")).toBeTruthy();
   });
 });
 
 describe("StatusBar", () => {
-  it("does not diagnose sign-out when GitHub auth could not be checked", () => {
+  it("does not diagnose sign-out when GitHub auth could not be checked", async () => {
     render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={null} />);
+    await settle();
     expect(screen.getByText("GitHub status unavailable")).toBeTruthy();
     expect(screen.queryByText("PRs up to date")).toBeNull();
     expect(screen.queryByText(/Updated just now/)).toBeNull();
     expect(screen.queryByText(/sign in/)).toBeNull();
   });
-  it("shows when the data was last updated", () => {
+  it("shows when the data was last updated", async () => {
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    await settle();
     expect(screen.getByText(/updated/i)).toBeTruthy();
   });
 
   // A stalled poll should be visible, not inferred from a stale timestamp.
-  it("distinguishes fetching from idle", () => {
+  it("distinguishes fetching from idle", async () => {
     state.current = "fetching";
     const { unmount } = render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.getByText("Checking PRs…")).toBeTruthy();
     unmount();
     state.current = "idle";
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.getByText(/up to date/i)).toBeTruthy();
   });
 
   // Never claim a time the app does not have: on a cold start there is no
   // previous fetch to report.
-  it("says nothing about freshness before the first fetch", () => {
+  it("says nothing about freshness before the first fetch", async () => {
     render(<StatusBar updatedAt={0} />);
+    await settle();
     expect(screen.queryByText(/updated/i)).toBeNull();
   });
 
-  it("defaults to the two-minute interval", () => {
+  it("defaults to the two-minute interval", async () => {
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.getByLabelText(/poll interval/i)).toHaveProperty("value", "120");
   });
 
-  it("applies a chosen interval", () => {
+  it("applies a chosen interval", async () => {
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     fireEvent.change(screen.getByLabelText(/poll interval/i), { target: { value: "300" } });
     expect(setInterval_).toHaveBeenCalledWith(300);
   });
 
   // The floor is 60s on the Rust side; offering a faster choice would let
   // the UI ask for something the backend silently clamps.
-  it("offers no interval below the backend floor", () => {
+  it("offers no interval below the backend floor", async () => {
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     const opts = Array.from(
       screen.getByLabelText(/poll interval/i).querySelectorAll("option"),
     ).map((o) => Number(o.getAttribute("value")));
@@ -163,10 +175,11 @@ describe("StatusBar", () => {
   /// Asserted because nothing did. Every label was changed here without a
   /// single test failing -- the suite checked colours and absence, never
   /// the words.
-  it("says WHICH thing is up to date", () => {
+  it("says WHICH thing is up to date", async () => {
     state.current = "idle";
     state.error = null;
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.getByText("PRs up to date")).toBeTruthy();
   });
 
@@ -222,10 +235,11 @@ describe("StatusBar", () => {
       state.error = null;
     });
 
-    it("goes back to up to date once a poll succeeds", () => {
+    it("goes back to up to date once a poll succeeds", async () => {
       state.current = "idle";
       state.error = null;
       render(<StatusBar updatedAt={Date.now()} />);
+      await settle();
       expect(screen.getByText(/up to date/i)).toBeTruthy();
     });
 
@@ -268,10 +282,11 @@ describe("StatusBar", () => {
   // A suppressed transient failure emits neither poll-error nor
   // prs-updated, so the bar had nothing to go on and showed a green
   // "Up to date" beside a stale timestamp.
-  it("shows a distinct retrying state rather than claiming success", () => {
+  it("shows a distinct retrying state rather than claiming success", async () => {
     state.current = "retrying";
     state.error = null;
     const { container } = render(<StatusBar updatedAt={Date.now() - 300_000} />);
+    await settle();
     expect(screen.getByText("Retrying PRs…")).toBeTruthy();
     expect(screen.queryByText(/up to date/i)).toBeNull();
     expect(container.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
@@ -296,6 +311,7 @@ describe("StatusBar", () => {
     it("says nothing when this build is current", async () => {
       version.newer = null;
       render(<StatusBar updatedAt={Date.now()} />);
+      await settle();
       await new Promise((r) => setTimeout(r, 0));
       expect(screen.queryByRole("link", { name: /available/ })).toBeNull();
     });
@@ -379,9 +395,10 @@ describe("StatusBar", () => {
   /// A live region must EXIST before its text appears, or the first
   /// announcement -- the one saying work started -- is never made. So the
   /// container is always mounted and only its content changes.
-  it("keeps the progress live region mounted while idle", () => {
+  it("keeps the progress live region mounted while idle", async () => {
     state.removal = null;
     const { container } = render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     const live = container.querySelector('[aria-live="polite"]');
     expect(live).toBeTruthy();
     expect(live?.textContent).toBe("");
@@ -405,9 +422,10 @@ describe("StatusBar", () => {
     state.removal = null;
   });
 
-  it("says nothing about removals when none is running", () => {
+  it("says nothing about removals when none is running", async () => {
     state.removal = null;
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.queryByText(/Removing worktrees/)).toBeNull();
   });
 
@@ -423,13 +441,14 @@ describe("StatusBar", () => {
     state.updating = null;
   });
 
-  it("prefers the removal count when both somehow run at once", () => {
+  it("prefers the removal count when both somehow run at once", async () => {
     // They cannot overlap in practice, which is why they share one live
     // region -- but the fallback must be deterministic rather than
     // rendering two counters into the same span.
     state.removal = { done: 1, total: 2 };
     state.updating = { done: 8, total: 47 };
     render(<StatusBar updatedAt={Date.now()} />);
+    await settle();
     expect(screen.getByText(/Removing worktrees . 1 of 2/)).toBeTruthy();
     expect(screen.queryByText(/Updating packages/)).toBeNull();
     state.removal = null;
@@ -484,35 +503,39 @@ describe("selected source status", () => {
   const gitlab = { rows: [], coverage: "complete" as const, staleSecs: null, loading: false, refreshing: false, error: null };
   afterEach(() => { state.error = null; stubViewport(null); });
 
-  it("uses GitLab freshness and ignores GitHub auth and poll failures in GitLab-only mode", () => {
+  it("uses GitLab freshness and ignores GitHub auth and poll failures in GitLab-only mode", async () => {
     stubViewport(1400);
     state.error = "GitHub failed";
     render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
+    await settle();
     expect(screen.getByText("GitLab MRs updated within the last hour").previousElementSibling?.className).toContain("3fb950");
     expect(screen.queryByText(/GitHub/)).toBeNull();
     expect(screen.queryByText("PRs up to date")).toBeNull();
     expect(screen.queryByText("Updated just now")).toBeNull();
   });
 
-  it("names each provider in Both mode and qualifies a failed partial GitLab receipt", () => {
+  it("names each provider in Both mode and qualifies a failed partial GitLab receipt", async () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, coverage: { partial: { total: null } }, error: "GitLab refused credentials" }} />);
+    await settle();
     expect(screen.getByText("GitHub · PRs up to date")).toBeTruthy();
     const status = screen.getByText("GitLab MRs updated within the last hour · partial list · refresh failed");
     expect(status.previousElementSibling?.className).toContain("d29922");
     expect(screen.queryByText("PRs up to date")).toBeNull();
   });
 
-  it("marks a stale GitLab receipt amber even when its coverage is complete", () => {
+  it("marks a stale GitLab receipt amber even when its coverage is complete", async () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: 7200 }} />);
+    await settle();
     const status = screen.getByText("GitLab MRs last updated 2 hours ago · stale");
     expect(status.previousElementSibling?.className).toContain("d29922");
   });
 
-  it("does not substitute a GitHub timestamp for missing GitLab freshness", () => {
+  it("does not substitute a GitHub timestamp for missing GitLab freshness", async () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: "unknown", coverage: "unknown" }} />);
+    await settle();
     expect(screen.getByText("GitLab MRs freshness unavailable · completeness unknown")).toBeTruthy();
     expect(screen.queryByText(/just now/)).toBeNull();
   });
@@ -520,17 +543,20 @@ describe("selected source status", () => {
 
 describe("active GitHub inventory receipt", () => {
   const receipt = { modern: true, prs: [], error: null, coverage: "complete" as const, phase: "ready", lastReceivedAt: "2026-10-01T12:00:00Z" };
-  it("uses active reviewing failure despite healthy global polling", () => {
+  it("uses active reviewing failure despite healthy global polling", async () => {
     render(<StatusBar updatedAt={Date.now()} github={{ list: "reviewing", receipt: { ...receipt, error: "Review requests failed" } }} />);
+    await settle();
     expect(screen.getByText("Could not refresh review requests")).toBeTruthy();
     expect(screen.queryByText("PRs up to date")).toBeNull();
   });
-  it("qualifies partial coverage independently from a recent receipt", () => {
+  it("qualifies partial coverage independently from a recent receipt", async () => {
     render(<StatusBar updatedAt={Date.now()} github={{ list: "reviewing", receipt: { ...receipt, coverage: { partial: { total: 236 } } } }} />);
+    await settle();
     expect(screen.getByText("Review requests partly checked")).toBeTruthy();
   });
-  it("does not fabricate a provider timestamp from the query cache", () => {
+  it("does not fabricate a provider timestamp from the query cache", async () => {
     render(<StatusBar updatedAt={Date.now()} github={{ list: "authored", receipt: { ...receipt, lastReceivedAt: undefined } }} />);
+    await settle();
     expect(screen.queryByText(/^Updated /)).toBeNull();
   });
 });

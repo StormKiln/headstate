@@ -10,6 +10,7 @@ vi.mock("../api/hooks", () => ({ useActOnPr: () => actFn }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
 
 import { PrActions } from "./PrActions";
+import { settle } from "@/test/settle";
 
 const pr = (over: Partial<PrDetail> = {}): PrDetail => ({
   id: "PR_abc",
@@ -165,10 +166,11 @@ describe("PrActions", () => {
   // Merge applies immediately: it is the action this app exists to speed
   // up, and it is recoverable. Safety comes from the button being
   // enabled only when GitHub says the PR is mergeable.
-  it("merges immediately, with no confirmation", () => {
+  it("merges immediately, with no confirmation", async () => {
     render(<PrActions pr={pr()} />);
     fireEvent.click(screen.getByRole("button", { name: "Merge" }));
     expect(actFn).toHaveBeenCalledWith("PR_abc", "octocat/hello-world", 42, "merge");
+    await settle();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
@@ -180,13 +182,14 @@ describe("PrActions", () => {
     expect(screen.getByRole("dialog")).toBeTruthy();
   });
 
-  it("closes only after confirmation", () => {
+  it("closes only after confirmation", async () => {
     render(<PrActions pr={pr()} />);
     fireEvent.click(screen.getByRole("button", { name: "Close PR" }));
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", { name: /close pull request/i }),
     );
     expect(actFn).toHaveBeenCalledWith("PR_abc", "octocat/hello-world", 42, "close");
+    await settle();
   });
 
   it("cancelling closes nothing", () => {

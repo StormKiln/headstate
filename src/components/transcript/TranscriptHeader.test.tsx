@@ -6,6 +6,7 @@ import type {
   ClaudeUsage,
   Liveness,
 } from "../../types/pr";
+import { settle } from "@/test/settle";
 
 /// The session header (#1485), on both builds.
 
@@ -405,13 +406,15 @@ it("renders structured possible process evidence in the mounted phone header", (
   expect(screen.getByText("Showing 1 of 2 possible processes")).toBeTruthy();
 });
 
-it("keeps the existing uncertain-resume confirmation with a possible PID", () => {
+it("keeps the existing uncertain-resume confirmation with a possible PID", async () => {
   state.terminal = "iterm";
   renderHeader({ liveness: { state: "unknown", why: "uncertain", possible_processes: {
     candidates: [{ pid: 42, cwd: null, cwd_truncated: false }], total: 1,
   } } });
   expect(launchSession).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Resume in terminal" }));
+  // The confirmation mounts the terms picker, which reads its choices.
+  await settle();
   expect(screen.getByText(/may already be open somewhere/)).toBeTruthy();
   expect(launchSession).not.toHaveBeenCalled();
 });

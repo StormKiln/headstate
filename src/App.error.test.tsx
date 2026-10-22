@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { settle } from "@/test/settle";
 
 /// Regression test for the audit's top finding: a REJECTED pull-request
 /// query rendered as "0 Open -- No pull requests match these filters",
@@ -58,7 +59,7 @@ describe("App — failed PR query", () => {
     expect(screen.queryByText(/match these filters/i)).toBeNull();
   });
 
-  it("surfaces the rejection message so the user can act on it", () => {
+  it("surfaces the rejection message so the user can act on it", async () => {
     mockQuery.mockReturnValue({
       data: undefined,
       isLoading: false,
@@ -67,10 +68,11 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     expect(screen.getByText(/gh auth login/)).toBeTruthy();
   });
 
-  it("offers a retry that refetches", () => {
+  it("offers a retry that refetches", async () => {
     const refetch = vi.fn();
     mockQuery.mockReturnValue({
       data: undefined,
@@ -80,12 +82,13 @@ describe("App — failed PR query", () => {
       refetch,
     });
     renderApp();
+    await settle();
     screen.getByRole("button", { name: /try again/i }).click();
     expect(refetch).toHaveBeenCalled();
   });
 
   // A genuinely empty result must still read as empty, not as an error.
-  it("still shows the empty state when the query succeeds with no PRs", () => {
+  it("still shows the empty state when the query succeeds with no PRs", async () => {
     mockQuery.mockReturnValue({
       data: [],
       isLoading: false,
@@ -94,6 +97,7 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     // No filters active in this test, so the unfiltered copy applies.
     expect(screen.getByText(/no open pull requests/i)).toBeTruthy();
     expect(screen.queryByText(/could not load/i)).toBeNull();

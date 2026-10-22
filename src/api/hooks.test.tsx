@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import type { ReactNode } from "react";
@@ -85,7 +85,7 @@ describe("usePullRequests", () => {
     await waitFor(() => expect(result.current.data).toMatchObject(PR_FIXTURES));
 
     const updated = [PR_FIXTURES[0]];
-    await emit("prs-updated", updated);
+    await act(() => emit("prs-updated", updated));
 
     await waitFor(() => expect(result.current.data).toEqual(updated));
   });
@@ -115,7 +115,7 @@ describe("usePollError", () => {
     const { result } = renderHook(() => usePollError(), { wrapper: makeWrapper() });
     expect(result.current).toBeNull();
 
-    await emit("poll-error", "GitHub API rate limit exceeded");
+    await act(() => emit("poll-error", "GitHub API rate limit exceeded"));
     await waitFor(() =>
       expect(result.current).toBe("GitHub API rate limit exceeded"),
     );
@@ -125,10 +125,10 @@ describe("usePollError", () => {
     mockIPC(() => undefined, { shouldMockEvents: true });
 
     const { result } = renderHook(() => usePollError(), { wrapper: makeWrapper() });
-    await emit("poll-error", "network error");
+    await act(() => emit("poll-error", "network error"));
     await waitFor(() => expect(result.current).toBe("network error"));
 
-    await emit("prs-updated", PR_FIXTURES);
+    await act(() => emit("prs-updated", PR_FIXTURES));
     await waitFor(() => expect(result.current).toBeNull());
   });
 });
@@ -157,7 +157,7 @@ describe("useRefreshRequested", () => {
     );
     await waitFor(() => expect(result.current.data).toBeDefined());
 
-    await emit("refresh-requested", null);
+    await act(() => emit("refresh-requested", null));
     // It must ask GitHub, not just re-read the snapshot -- the poll loop
     // keeps that snapshot non-empty, so an invalidate would be a no-op.
     await waitFor(() => expect(calls).toContain("refresh_now"));
@@ -180,7 +180,7 @@ describe("useRefreshRequested", () => {
       { wrapper },
     );
 
-    await emit("refresh-requested", null);
+    await act(() => emit("refresh-requested", null));
     await waitFor(() => expect(result.current).toMatch(/rate limit exceeded/));
   });
 
@@ -201,12 +201,12 @@ describe("useRefreshRequested", () => {
     );
 
     // A background poll failed a moment ago.
-    await emit("poll-error", "network unreachable");
+    await act(() => emit("poll-error", "network unreachable"));
     await waitFor(() => expect(result.current).toBe("network unreachable"));
 
     // The user clicks "Refresh now" and it works. `refresh_now` never emits
     // `prs-updated`, so before the fix the banner stayed up to 300s.
-    await emit("refresh-requested", null);
+    await act(() => emit("refresh-requested", null));
     await waitFor(() => expect(result.current).toBeNull());
   });
 });
@@ -215,9 +215,9 @@ describe("clearPollError", () => {
   it("resets the banner state", async () => {
     mockIPC(() => undefined, { shouldMockEvents: true });
     const { result } = renderHook(() => usePollError(), { wrapper: makeWrapper() });
-    await emit("poll-error", "boom");
+    await act(() => emit("poll-error", "boom"));
     await waitFor(() => expect(result.current).toBe("boom"));
-    clearPollError();
+    act(() => clearPollError());
     await waitFor(() => expect(result.current).toBeNull());
   });
 });

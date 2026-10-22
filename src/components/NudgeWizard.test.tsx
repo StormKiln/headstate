@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import { NudgeWizard } from "./NudgeWizard";
+import { settle } from "@/test/settle";
 
 /// Advances the wizard past the repo and filter steps to the preview step,
 /// using the same "Next" button a user would click.
@@ -32,6 +33,7 @@ describe("NudgeWizard", () => {
 
     openToPreview();
     fireEvent.click(screen.getByRole("button", { name: /copy/i }));
+    await settle();
 
     expect(writeText).toHaveBeenCalled();
   });
@@ -105,6 +107,7 @@ describe("NudgeWizard", () => {
 
     openToPreview();
     fireEvent.click(screen.getByRole("button", { name: /copy/i }));
+    await settle();
 
     expect(fetchSpy).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
