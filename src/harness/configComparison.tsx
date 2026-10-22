@@ -1,6 +1,7 @@
 // Synthetic screenshot fixture; no access to real repositories or providers.
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createQueryClient } from "../api/queryClient";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { ConfigComparisonPanel } from "../components/ConfigComparisonPanel";
 import type { ClaudeConfigComparison } from "../api/tauri";
@@ -30,7 +31,7 @@ mockIPC((command, input) => {
   throw new Error(`Unsupported synthetic command: ${command}`);
 });
 createRoot(document.getElementById("root")!).render(
-  <QueryClientProvider client={new QueryClient()}>
+  <QueryClientProvider client={createQueryClient()}>
     <main className="mx-auto max-w-3xl p-5 text-[#e6edf3]">
       <h1 className="text-lg font-semibold">Claude Code</h1>
       <p className="text-xs text-[#8b949e]">Synthetic configuration comparison</p>

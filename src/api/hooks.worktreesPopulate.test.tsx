@@ -154,6 +154,10 @@ describe("the previous scan paints a cold start (#1950)", () => {
       age_secs: 7200,
       stale: false,
     });
+    // The saved scan is read for a known scope (#1962), so the roots and
+    // exclusions it is keyed on have to answer first.
+    bridge.immediate.set("get_worktree_dirs", ["/code"]);
+    bridge.immediate.set("get_discovery_exclusions", []);
     const { wrapper } = harness();
     const { result } = renderHook(() => useWorktrees(), { wrapper });
 

@@ -25,7 +25,8 @@
 ///   nudge. Growth is the fixture page's own messages under fresh ids,
 ///   so the merge and the eviction see distinct messages.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createQueryClient } from "../api/queryClient";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { StrictMode, useState } from "react";
@@ -212,7 +213,7 @@ async function main() {
   });
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={createQueryClient()}>
         <Harness liveness={liveness} sessionId={follow ? SESSION : null} phone={params.get("host") === "phone"} />
       </QueryClientProvider>
     </StrictMode>,
