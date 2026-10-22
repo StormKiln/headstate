@@ -36,10 +36,13 @@
 //! \n
 //! ```
 //!
-//! The first frame is always a `prs-updated` carrying the cached
-//! snapshot -- the same list `get_cached` returns -- so a phone renders
-//! immediately after (re)connecting instead of waiting up to a poll
-//! interval. The latest versioned source frames follow it, so modern clients
+//! The first frame is a `prs-updated` carrying the cached snapshot --
+//! the same list `get_cached` returns -- so a phone renders immediately
+//! after (re)connecting instead of waiting up to a poll interval. It is
+//! sent only when that list can be shown as current: an old, never
+//! loaded or withheld list sends no opening frame, because a bare array
+//! cannot say so and `[]` reads as "no pull requests" (#1997). The
+//! latest versioned source frames follow it, so modern clients
 //! recover missed rows and status for both lists. A bare comment line `:` goes out after every [`KEEP_ALIVE`]
 //! of silence so NAT tables stay warm and the phone can tell idle from
 //! dead.
@@ -213,8 +216,9 @@ pub struct Emitted {
 /// that `get_cached` returns. A closure, like the listener's
 /// `ViewerLookup`, so this module needs neither the database nor a
 /// Tauri app to be tested. `None` means no snapshot frame is sent (the
-/// database could not be read); the phone falls back to `get_cached`
-/// over `/v1/call` as it would anyway.
+/// database could not be read, or the list cannot be shown as current);
+/// the phone falls back to `get_cached` over `/v1/call` as it would
+/// anyway, and that answers with the reason.
 pub type SnapshotSource =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 

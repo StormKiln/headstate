@@ -856,13 +856,6 @@ impl GitHubClient {
 
     /// Share overlapping equivalent searches, with a deadline that includes
     /// waiting for an existing load. No spawned tasks survive cancellation.
-    async fn search_page_with_fallback(
-        &self,
-        query: &str,
-    ) -> Result<serde_json::Value, ClientError> {
-        self.search_with_budget(query, SEARCH_BUDGET).await
-    }
-
     async fn search_with_budget(
         &self,
         query: &str,
@@ -1060,20 +1053,10 @@ impl GitHubClient {
         .await
     }
 
-    /// Every open PR authored by the viewer, with CI, mergeability, review
-    /// decision, and merge-queue state.
-    ///
-    /// Octocrab unwraps the GraphQL `data` envelope, so the value returned
-    /// here has `search` at its top level rather than under `data`.
-    pub async fn fetch_prs(&self) -> Result<Vec<PullRequest>, ClientError> {
-        let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
-        Ok(map_search(&v))
-    }
-
     /// PRs awaiting the user's review.
     ///
     /// Rides along in PRS_QUERY at zero extra rate-limit cost. Kept a
-    /// separate call rather than folded into `fetch_prs`'s return type so
+    /// separate call rather than folded into the authored list's type so
     /// the snapshot cache, poll loop and existing commands keep their
     /// shapes; the poll loop fetches both in one request via
     /// `fetch_prs_and_reviewing`.
@@ -1234,7 +1217,7 @@ impl GitHubClient {
         // arrive are real and worth showing, and blanking the list over
         // an incomplete one is the exact regression v3.5.1 had to undo.
         // The smallest total any page reported, not page 1's. See the
-        // paging note in `search_page_with_fallback` (#744).
+        // paging note in `collect_search_pages` (#744).
         let total = v["headstate_paging"]["truest_total"]
             .as_u64()
             .or_else(|| v["authored"]["issueCount"].as_u64())
@@ -1315,8 +1298,8 @@ impl GitHubClient {
         // at either query.
         let started = std::time::Instant::now();
         let (authored, reviewing) = tokio::join!(
-            self.search_page_with_fallback(AUTHORED_OPEN),
-            self.search_page_with_fallback(REVIEW_REQUESTED),
+            self.search_with_budget(AUTHORED_OPEN, SEARCH_BUDGET),
+            self.search_with_budget(REVIEW_REQUESTED, SEARCH_BUDGET),
         );
         crate::diag!(
             "[diag] fetch_prs_and_reviewing both searches settled in {}ms",
@@ -2603,6 +2586,13 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The authored list's rows, read through `fetch_prs_snapshot`: the
+    /// same search and mapping the removed `fetch_prs` ran (#1998), so
+    /// these transport tests keep exercising it.
+    async fn authored(client: &GitHubClient) -> Result<Vec<PullRequest>, ClientError> {
+        client.fetch_prs_snapshot().await.map(|list| list.prs)
+    }
 
     async fn client_for(server: &MockServer) -> GitHubClient {
         let oc = octocrab::Octocrab::builder()
@@ -4010,7 +4000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_prs_maps_the_response() {
+    async fn the_authored_list_maps_the_response() {
         let server = MockServer::start().await;
         let body: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
@@ -4022,7 +4012,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server).await.fetch_prs().await.unwrap();
+        let prs = authored(&client_for(&server).await).await.unwrap();
         assert_eq!(prs.len(), 3);
         assert_eq!(prs[0].number, 42);
     }
@@ -4172,7 +4162,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert!(client_for(&server).await.fetch_prs().await.is_err());
+        assert!(authored(&client_for(&server).await).await.is_err());
     }
 
     /// Reported from a fresh install: two banners within 30 seconds,
@@ -4198,7 +4188,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             err.is_transient(),
             "a truncated response must wait for a second opinion, not alarm the user: {err}"
@@ -4234,7 +4224,7 @@ mod tests {
             .await;
 
         let client = client_for(&server).await;
-        let r = tokio::time::timeout(std::time::Duration::from_secs(1), client.fetch_prs()).await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), authored(&client)).await;
         assert!(
             r.is_err(),
             "a stalled request must be cut off, not awaited forever"
@@ -4507,7 +4497,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("line 1 column 1"),
@@ -4610,7 +4600,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(matches!(err, ClientError::RateLimited(_)), "got {err:?}");
         assert!(err.to_string().contains("resume automatically"));
     }
@@ -4642,7 +4632,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             matches!(err, ClientError::TokenRejected { .. }),
             "a 401 must be a rejected token, got {err:?}"
@@ -4678,7 +4668,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             matches!(err, ClientError::TokenRejected { .. }),
             "got {err:?}"
@@ -4709,7 +4699,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             !matches!(err, ClientError::TokenRejected { .. }),
             "a 403 must not claim the token expired, got {err:?}"
@@ -4737,7 +4727,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             !matches!(err, ClientError::TokenRejected { .. }),
             "got {err:?}"
@@ -4868,7 +4858,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server).await.fetch_prs().await.unwrap();
+        let prs = authored(&client_for(&server).await).await.unwrap();
         assert_eq!(prs.len(), 3, "a partial success must not blank the list");
         assert_eq!(prs[0].number, 42);
     }
@@ -4965,9 +4955,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server)
-            .await
-            .fetch_prs()
+        let prs = authored(&client_for(&server).await)
             .await
             .expect("must not fail");
         assert_eq!(
@@ -5030,7 +5018,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("Could not resolve to a Repository"),

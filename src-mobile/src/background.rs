@@ -13,15 +13,17 @@
 //!
 //! **Never `/v1/events`.** The snapshot the subscriber gets is the first
 //! frame of the stream; the background path must not open the stream,
-//! so it asks for the same list through `get_cached` instead (the
-//! desktop's `remote/events.rs` documents them as the same data). The
+//! so it asks for the same list through `get_source_snapshot` instead,
+//! the qualified receipt that says whether the list is old or withheld
+//! (`get_cached`'s bare array cannot, and refuses those, #1997). The
 //! [`Desktop`] seam has no way to open the stream at all, and the tests
 //! pin the request sequence -- against the fake, and against the
 //! loopback server with the real client.
 //!
 //! [`Desktop`] and [`SnapshotSink`] are implemented by [`Companion`]:
-//! `hello` is `Client::hello`, `get_cached` is
-//! `Client::call("get_cached", {}, None)` on the live client, `save` is
+//! `hello` is `Client::hello`, the seam's `get_cached` (named for the
+//! command it once called) is `Client::call("get_source_snapshot", ..)`
+//! for the authored list on the live client, `save` is
 //! `events::save_owned_receipt` with its original provider time. A window does
 //! not move the connection state: the subscriber owns that, and a
 //! desktop that is away is the expected case for a phone in a pocket.
@@ -94,7 +96,9 @@ pub type DesktopFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Sen
 pub trait Desktop: Send + Sync {
     /// `GET /v1/hello`. Proves the desktop is there and still knows us.
     fn hello(&self) -> DesktopFuture<()>;
-    /// The cached PR list as `get_cached` returns it, JSON verbatim.
+    /// The saved authored list as the desktop's `get_source_snapshot`
+    /// receipt, JSON, with the pairing it came from. Named for the
+    /// `get_cached` command it called before the receipt existed.
     fn get_cached(&self) -> DesktopFuture<String>;
     /// The desktop's current health conditions, as `health_alerts`
     /// returns them: verdicts the desktop evaluated, never the raw
