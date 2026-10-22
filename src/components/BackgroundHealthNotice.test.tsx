@@ -11,6 +11,8 @@ const task = (over: Partial<TaskHealth> = {}): TaskHealth => ({
   total_failures: 0,
   last_error: null,
   last_success_ms: NOW - 60_000,
+  last_tick_ms: NOW - 60_000,
+  stalled: false,
   degraded: false,
   ...over,
 });
@@ -131,4 +133,41 @@ describe("BackgroundHealthNotice", () => {
     expect(screen.queryByText(/Session history and crash detection/)).toBeNull();
   });
 
+
+  // #1937: a loop stuck on an await has failed zero times. "Failed 0
+  // times in a row" would read as fine, so a stall says it stopped.
+  it("says a stalled loop has stopped, not that it failed zero times", () => {
+    render(
+      <BackgroundHealthNotice
+        tasks={[
+          task({
+            task: "github-poll",
+            stalled: true,
+            degraded: true,
+            last_tick_ms: NOW - 20 * 60_000,
+          }),
+        ]}
+        now={NOW}
+      />,
+    );
+    expect(screen.getByText(/GitHub pull request polling has stopped/)).toBeTruthy();
+    expect(screen.getByText(/since 20 minutes ago/)).toBeTruthy();
+    expect(screen.queryByText(/failed 0 times/)).toBeNull();
+    expect(screen.getByText(/tray badge may be out of date/)).toBeTruthy();
+  });
+
+  it.each([
+    ["github-poll", /GitHub pull request polling has failed/],
+    ["github-continuation", /Loading the rest of a long GitHub queue has failed/],
+    ["gitlab-poll", /GitLab merge request polling has failed/],
+    ["claude-activity", /Live Claude Code session activity has failed/],
+  ])("names the %s loop in words", (name, text) => {
+    render(
+      <BackgroundHealthNotice
+        tasks={[task({ task: name, consecutive_failures: 3, degraded: true, last_error: "boom" })]}
+        now={NOW}
+      />,
+    );
+    expect(screen.getByText(text)).toBeTruthy();
+  });
 });

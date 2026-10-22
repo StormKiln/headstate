@@ -1659,69 +1659,74 @@ mod tests {
         assert!(run(tmp.path(), &[]).is_err());
     }
 
-    /// Progress is reported per package, counting FINISHED work.
-    ///
-    /// `apply_updates_in_background`'s doc claimed "progress and
-    /// completion arrive as events" long before either could:
-    /// `run_on_branch` took no callback, so only the terminal event
-    /// ever fired and a run of 122 packages said nothing for minutes.
-    ///
-    /// The packages here are made to fail -- there is no real registry
-    /// in a test repo -- which is the point: a run does not stop at the
-    /// first failure, so a failed package still counts as done. A
-    /// progress bar that stalled on a refused package would misreport a
-    /// run that is still going.
-    #[test]
-    fn progress_counts_every_package_including_the_ones_that_fail() {
+    /// Real git and manifest edits, with no registry or package-manager
+    /// process. Progress/cancellation exercise the batch runner; npm's
+    /// network integration has its own explicit end-to-end test below.
+    fn local_update_repo() -> tempfile::TempDir {
         let tmp = repo();
-        let reqs: Vec<UpdateRequest> = ["lodash", "express", "chalk"]
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\na = \"1.0.0\"\nb = \"1.0.0\"\nc = \"1.0.0\"\nd = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let add = std::process::Command::new(crate::auth::git_program())
+            .args(["add", "Cargo.toml"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add failed: {add:?}");
+        let commit = std::process::Command::new(crate::auth::git_program())
+            .args(commit_args())
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+        tmp
+    }
+
+    fn local_updates(names: &[&str]) -> Vec<UpdateRequest> {
+        names
             .iter()
-            .map(|n| UpdateRequest {
-                name: (*n).into(),
+            .map(|name| UpdateRequest {
+                name: (*name).into(),
                 version: "2.0.0".into(),
-                ecosystem: Ecosystem::Npm,
+                ecosystem: Ecosystem::Cargo,
                 project: String::new(),
             })
-            .collect();
+            .collect()
+    }
 
+    /// Finished failures count too, and must not stop later successes.
+    /// A missing dependency fails deterministically without a registry.
+    #[test]
+    fn progress_counts_every_package_including_the_ones_that_fail() {
+        let tmp = local_update_repo();
+        let reqs = local_updates(&["missing", "a", "b"]);
         let seen = std::sync::Mutex::new(Vec::new());
         let report = run_on_branch_with_progress(tmp.path(), &reqs, None, |done, total| {
             seen.lock().unwrap().push((done, total));
-        });
-        // The run itself may fail for want of a registry; what is being
-        // asserted is the callback, which fires either way.
-        let _ = report;
-
-        let seen = seen.into_inner().unwrap();
-        assert_eq!(
-            seen,
-            vec![(1, 3), (2, 3), (3, 3)],
-            "progress should count each package once, finishing at the total"
-        );
+        })
+        .unwrap();
+        assert_eq!(seen.into_inner().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
+        assert_eq!(report.results.len(), 3);
+        assert!(report.results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("not declared"));
+        for result in &report.results[1..] {
+            assert!(result.error.is_none(), "{result:?}");
+            assert_eq!(result.resolved_constraint.as_deref(), Some("2.0.0"));
+        }
     }
 
-    /// A cancelled run stops at a package boundary and still reports
-    /// what it managed to apply.
-    ///
-    /// The stop is checked BEFORE each package, never during one: a
-    /// package manager killed halfway leaves a worktree in a state
-    /// nobody asked for. So "cancel" means "stop after this one", and
-    /// the packages that already landed stay landed.
+    /// Stop at a package boundary, retaining completed edits and leaving
+    /// the remaining dependencies unchanged in the actual worktree.
     #[test]
     fn a_cancelled_run_stops_at_the_next_package_boundary() {
-        let tmp = repo();
-        let reqs: Vec<UpdateRequest> = ["a", "b", "c", "d"]
-            .iter()
-            .map(|n| UpdateRequest {
-                name: (*n).into(),
-                version: "2.0.0".into(),
-                ecosystem: Ecosystem::Npm,
-                project: String::new(),
-            })
-            .collect();
-
+        let tmp = local_update_repo();
+        let reqs = local_updates(&["a", "b", "c", "d"]);
         let seen = std::sync::Mutex::new(Vec::new());
-        // Stop once two have gone through.
         let stop_after_two = || seen.lock().unwrap().len() >= 2;
         let report = run_on_branch_cancellable(
             tmp.path(),
@@ -1729,59 +1734,50 @@ mod tests {
             None,
             |done, total| seen.lock().unwrap().push((done, total)),
             stop_after_two,
-        );
-
-        assert_eq!(
-            seen.into_inner().unwrap(),
-            vec![(1, 4), (2, 4)],
-            "the run should stop after the second package, not mid-package"
-        );
-        // And the report still describes what was applied, rather than
-        // being an error: a cancelled run is not a failed one.
-        if let Ok(r) = report {
-            assert_eq!(r.results.len(), 2);
-        }
+        )
+        .unwrap();
+        assert_eq!(seen.into_inner().unwrap(), vec![(1, 4), (2, 4)]);
+        assert_eq!(report.results.len(), 2);
+        assert!(report.results.iter().all(|result| result.error.is_none()));
+        let text = std::fs::read_to_string(Path::new(&report.worktree).join("Cargo.toml")).unwrap();
+        let manifest = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(manifest["dependencies"]["a"].as_str(), Some("2.0.0"));
+        assert_eq!(manifest["dependencies"]["b"].as_str(), Some("2.0.0"));
+        assert_eq!(manifest["dependencies"]["c"].as_str(), Some("1.0.0"));
+        assert_eq!(manifest["dependencies"]["d"].as_str(), Some("1.0.0"));
     }
 
-    /// Never stopping is the ordinary case, and must not change.
     #[test]
     fn a_run_that_is_never_cancelled_does_every_package() {
-        let tmp = repo();
-        let reqs: Vec<UpdateRequest> = ["a", "b", "c"]
-            .iter()
-            .map(|n| UpdateRequest {
-                name: (*n).into(),
-                version: "2.0.0".into(),
-                ecosystem: Ecosystem::Npm,
-                project: String::new(),
-            })
-            .collect();
+        let tmp = local_update_repo();
+        let reqs = local_updates(&["a", "b", "c"]);
         let seen = std::sync::Mutex::new(Vec::new());
-        let _ = run_on_branch_cancellable(
+        let report = run_on_branch_cancellable(
             tmp.path(),
             &reqs,
             None,
             |done, total| seen.lock().unwrap().push((done, total)),
             || false,
-        );
+        )
+        .unwrap();
         assert_eq!(seen.into_inner().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
+        assert_eq!(report.results.len(), 3);
+        for result in &report.results {
+            assert!(result.error.is_none(), "{result:?}");
+            assert_eq!(result.resolved_constraint.as_deref(), Some("2.0.0"));
+        }
     }
 
-    /// The plain entry point still works, and reports nothing.
-    ///
-    /// `run` and `run_on_branch` share one body with the progress
-    /// version, so this pins that the no-callback path is still there
-    /// for every existing caller.
     #[test]
     fn run_on_branch_needs_no_callback() {
-        let tmp = repo();
-        let reqs = [UpdateRequest {
-            name: "lodash".into(),
-            version: "2.0.0".into(),
-            ecosystem: Ecosystem::Npm,
-            project: String::new(),
-        }];
-        let _ = run_on_branch(tmp.path(), &reqs, None);
+        let tmp = local_update_repo();
+        let report = run_on_branch(tmp.path(), &local_updates(&["a"]), None).unwrap();
+        assert_eq!(report.results.len(), 1);
+        assert!(report.results[0].error.is_none());
+        assert_eq!(
+            report.results[0].resolved_constraint.as_deref(),
+            Some("2.0.0")
+        );
     }
 
     /// A refusal must not leave a worktree behind.

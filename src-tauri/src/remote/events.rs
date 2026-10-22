@@ -224,9 +224,27 @@ pub type SnapshotSource =
 
 type SourceFrames = Arc<
     std::sync::Mutex<
-        std::collections::HashMap<(crate::identity::Source, crate::store::CachedList), Emitted>,
+        std::collections::HashMap<
+            (crate::identity::Source, crate::store::CachedList),
+            SourceReplay,
+        >,
     >,
 >;
+
+/// What a reconnecting phone is replayed for one source/list.
+///
+/// A status event leaves out rows it would only repeat (#1941,
+/// `SourcePolls::event_update`), so the newest frame alone may carry no
+/// rows. The newest frame that DID is kept beside it while the newer
+/// status still describes the same receipt -- same `receipt_revision`,
+/// same owner -- and replayed first, so the phone still opens with rows.
+#[derive(Default)]
+struct SourceReplay {
+    /// The newest frame that carried rows, with the receipt it describes.
+    rows: Option<(Emitted, Option<u64>, Option<String>)>,
+    /// A newer frame that carried no rows, if there is one.
+    status: Option<Emitted>,
+}
 
 /// The broadcast every subscriber hangs off. One per process, held in
 /// `gate::Remote`, attached to the app once at startup; the listener
@@ -237,8 +255,10 @@ pub struct Hub {
     sources: SourceFrames,
 }
 
-/// Retain only the newest publication for each source/list, including while no
-/// phone is connected. Parsing just the routing fields skips the row payload.
+/// Retain the newest publication for each source/list, including while no
+/// phone is connected, plus the newest one with rows when the newest has
+/// none (see [`SourceReplay`]). Parsing just the routing fields skips the
+/// row payload.
 fn remember_source(sources: &SourceFrames, event: &Emitted) {
     if event.name != "source-poll-status" {
         return;
@@ -247,13 +267,50 @@ fn remember_source(sources: &SourceFrames, event: &Emitted) {
     struct Key {
         source: crate::identity::Source,
         list: crate::store::CachedList,
+        #[serde(default)]
+        receipt_revision: Option<u64>,
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        prs: Option<serde::de::IgnoredAny>,
+        #[serde(default)]
+        mrs: Option<serde::de::IgnoredAny>,
     }
-    if let Ok(key) = serde_json::from_str::<Key>(&event.json) {
-        sources
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((key.source, key.list), event.clone());
+    let Ok(key) = serde_json::from_str::<Key>(&event.json) else {
+        return;
+    };
+    let mut sources = sources.lock().unwrap_or_else(|e| e.into_inner());
+    let replay = sources.entry((key.source, key.list)).or_default();
+    if key.prs.is_some() || key.mrs.is_some() {
+        replay.rows = Some((event.clone(), key.receipt_revision, key.owner));
+        replay.status = None;
+    } else {
+        // Rows describing another receipt (or none) must not be replayed
+        // under this status.
+        if replay.rows.as_ref().is_some_and(|(_, revision, owner)| {
+            *revision != key.receipt_revision || *owner != key.owner
+        }) {
+            replay.rows = None;
+        }
+        replay.status = Some(event.clone());
     }
+}
+
+/// The frames a newly connected phone is replayed, oldest first per
+/// source/list: the last rows, then any newer status.
+fn replay_sources(sources: &SourceFrames) -> Vec<Emitted> {
+    sources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .flat_map(|replay| {
+            replay
+                .rows
+                .iter()
+                .map(|(frame, _, _)| frame.clone())
+                .chain(replay.status.clone())
+        })
+        .collect()
 }
 
 impl Hub {
@@ -342,13 +399,7 @@ pub async fn subscribe(
     // need versioned receipts/status too: they deliberately ignore unversioned
     // rows after seeing source status. Replay both lists without waiting for a
     // new poll; queued older events are rejected by their revisions.
-    let sources: Vec<_> = hub
-        .sources
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .cloned()
-        .collect();
+    let sources = replay_sources(&hub.sources);
     let frames = stream::iter(first.into_iter().chain(sources))
         .chain(live(events, sub))
         .map(|e| Ok(sse::Event::default().event(e.name).data(e.json)));
@@ -746,6 +797,51 @@ pub(crate) mod tests {
             Some(("source-poll-status".into(), frame(2)))
         );
         server.handle.stop().await;
+    }
+
+    /// A status event without rows does not cost a reconnecting phone its
+    /// rows (#1941). Before, every event carried them, so replaying the
+    /// newest frame alone was enough; now the newest may be a `fetching`
+    /// status that left unchanged rows out.
+    #[test]
+    fn replay_keeps_the_last_rows_beside_a_newer_status_for_the_same_receipt() {
+        let sources = SourceFrames::default();
+        let frame = |revision: u64, receipt: Option<u64>, owner: &str, rows: bool| Emitted {
+            name: "source-poll-status".into(),
+            json: webview_json(&json!({
+                "source": { "provider": "github", "host": "github.com" },
+                "list": "authored", "session": "desktop", "revision": revision,
+                "receipt_revision": receipt, "owner": owner,
+                "phase": if rows { "ready" } else { "fetching" }, "error": null,
+                "prs": if rows { json!([{ "number": 1 }]) } else { serde_json::Value::Null },
+                "mrs": null
+            })),
+        };
+        let with_rows = frame(2, Some(2), "fixture", true);
+        remember_source(&sources, &with_rows);
+        assert_eq!(replay_sources(&sources), vec![with_rows.clone()]);
+
+        // A status for the same receipt: the rows are replayed first.
+        let fetching = frame(3, Some(2), "fixture", false);
+        remember_source(&sources, &fetching);
+        assert_eq!(
+            replay_sources(&sources),
+            vec![with_rows.clone(), fetching.clone()]
+        );
+
+        // A status for a different receipt or owner retires the old rows.
+        let other_owner = frame(4, Some(2), "someone-else", false);
+        remember_source(&sources, &other_owner);
+        assert_eq!(replay_sources(&sources), vec![other_owner]);
+        remember_source(&sources, &with_rows);
+        let newer_receipt = frame(5, Some(5), "fixture", false);
+        remember_source(&sources, &newer_receipt);
+        assert_eq!(replay_sources(&sources), vec![newer_receipt]);
+
+        // New rows replace everything before them.
+        let newest = frame(6, Some(6), "fixture", true);
+        remember_source(&sources, &newest);
+        assert_eq!(replay_sources(&sources), vec![newest]);
     }
 
     #[tokio::test]
