@@ -38,16 +38,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
     //
     // Kept for the DESKTOP, where a rejection is a genuinely transient
     // IPC failure worth a second attempt and there is no connection
-    // state to consult.
-    //
-    // SPREAD, not `retry: IS_MOBILE_BUILD ? false : undefined`. That
-    // reads the same and is not: an explicit `undefined` is still a
-    // present key, and TanStack takes a present key over the client's
-    // `defaultOptions.queries.retry`. Written that way it silently
-    // turned retries back ON for every desktop test that had switched
-    // them off, which is a thing this file's own test caught only
-    // because it asserts on the desktop path too.
-    ...(IS_MOBILE_BUILD ? { retry: false } : {}),
+    // state to consult. An explicit opt-in since #1955: the app's
+    // client (`api/queryClient.ts`) defaults every query to no retry,
+    // so leaving the key out would silently drop this one. Three, the
+    // count the desktop had under TanStack's old default.
+    retry: IS_MOBILE_BUILD ? false : 3,
   });
   const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
   const gitlab = useQuery({
