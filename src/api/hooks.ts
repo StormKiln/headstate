@@ -207,10 +207,12 @@ import {
 /// real content, then reconciled by the Rust poll loop via `prs-updated`.
 /// React never talks to GitHub directly.
 ///
-/// `get_cached` returns `[]` both on a genuinely PR-free account and while
-/// the first poll (~3s cold) hasn't landed yet. This hook does not attempt
-/// to tell those apart -- it falls back to `refresh_now` so the first paint
-/// is never a bare empty screen while a poll is in flight. Callers that
+/// `get_cached` returns `[]` only for a measured empty list. A snapshot
+/// that is stale, was never loaded, or is withheld is an error carrying
+/// its reason, not `[]` (#1997, as of #2000; before that it answered all
+/// of those with `[]`). On that error this hook falls back to
+/// `refresh_now`, so the first paint is never a bare empty screen while
+/// the first poll (~3s cold) is in flight. Callers that
 /// need "never authenticated" vs. "authenticated, still loading" should
 /// consult `get_auth_state` (see `AuthGate`).
 export function usePullRequests(enabled = true) {
@@ -4347,7 +4349,12 @@ export function useWorktreeDirs() {
       await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
       return applied;
     });
-  return { dirs: query.data ?? [], set, exclusions: exclusionsQuery.data ?? [], setExclusions, exclusionsError: exclusionsQuery.error, exclusionsReady: exclusionsQuery.isSuccess, retryExclusions: exclusionsQuery.refetch, isLoading: query.isLoading, isError: query.isError };
+  // `dirs` is `undefined` until the setting has been READ (#1995): pending
+  // and failed are not "configured as empty", and `?? []` let every
+  // consumer render a failed read as "no folders to scan". `[]` now only
+  // ever means the saved setting is empty. `dirsError` and `retryDirs`
+  // are the failure's reason and remedy, as for the exclusions beside it.
+  return { dirs: query.data, dirsError: query.error, retryDirs: query.refetch, set, exclusions: exclusionsQuery.data ?? [], setExclusions, exclusionsError: exclusionsQuery.error, exclusionsReady: exclusionsQuery.isSuccess, retryExclusions: exclusionsQuery.refetch, isLoading: query.isLoading, isError: query.isError };
 }
 
 /// The poll interval setting, and a way to change it.
@@ -4973,7 +4980,8 @@ export function useReviewing(enabled = true) {
   // and `reviewing = []` rendered as a confident empty queue.
   // Display prose either way: the wire marker never reaches the screen.
   const errorText = source.error ?? (data === undefined && live.error ? live.error : null);
-  const error = errorText === null ? null : new Error(commandError(errorText).message);
+  const classified = errorText === null ? null : commandError(errorText);
+  const error = classified === null ? null : new Error(classified.message);
   const isError = error !== null;
   const status = isError ? "error" as const
     : data === undefined ? "pending" as const : "success" as const;
@@ -4982,6 +4990,11 @@ export function useReviewing(enabled = true) {
     data,
     error,
     isError,
+    /// Whether the error is Headstate DECLINING to send the request
+    /// rather than a request that failed (#1994). `error` has the marker
+    /// stripped, so this is the only place a caller can still tell "we
+    /// did not ask" from "they did not answer" (#1050).
+    notAsked: isError && (source.phase === "not_asked" || classified?.kind === "not-asked"),
     isSuccess: status === "success",
     isPending: status === "pending",
     status,

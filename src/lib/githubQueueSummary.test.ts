@@ -30,10 +30,14 @@ describe("GitHub inventory summary", () => {
     const result = summary(patch);
     expect(result.text).toBe("Review requests not checked");
     expect(result.text).not.toMatch(/^Could not/);
-    expect(result.measurement).toBe("not_checked");
+    // #1996: declined is its own measurement, not "never checked".
+    expect(result.measurement).toBe("not_asked");
     expect(result.warning).toBe(true);
     expect(result.explanation).toContain("Not asked");
     expect(result.explanation).not.toContain("headstate:");
+  });
+  it("keeps not_checked for a list nothing has checked yet (#1996)", () => {
+    expect(summary({ prs: undefined }).measurement).toBe("not_checked");
   });
   it("strips the expired-token marker from a real failure", () => {
     const result = summary({ phase: "failed", error: "headstate:expired-token GitHub rejected the token" });

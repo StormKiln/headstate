@@ -273,6 +273,27 @@ fn malformed_unknown_fields_and_old_optional_client_counts_remain_distinct() {
     )
     .is_err());
 }
+/// #1996: a declined request is its own footer value, not "never checked",
+/// and the closed set still refuses a value it does not know.
+#[test]
+fn not_asked_footer_is_distinct_from_not_checked() {
+    let mounted = |footer: &str| {
+        format!(
+            r#"{{"kind":"mounted_review","source":"github","list":"reviewing","surface":"ready_panel","selection":"all_repositories","receipt":null,"scope":null,"inventory_count":null,"eligible_count":null,"visible_count":null,"visible_retained_count":null,"visible_retained_readiness_count":null,"visible_readiness_unknown_count":null,"visible_last_known_count":null,"visible_advisory_unavailable_count":null,"footer_location":"desktop_footer","footer":"{footer}"}}"#
+        )
+    };
+    let footer = |text: &str| match serde_json::from_str::<ClientMeasurement>(text).unwrap() {
+        ClientMeasurement::MountedReview { footer, .. } => footer,
+        other => panic!("not a mounted review: {other:?}"),
+    };
+    assert_eq!(footer(&mounted("not_asked")), Footer::NotAsked);
+    assert_eq!(footer(&mounted("not_checked")), Footer::NotChecked);
+    assert_eq!(
+        serde_json::to_string(&Footer::NotAsked).unwrap(),
+        "\"not_asked\""
+    );
+    assert!(serde_json::from_str::<ClientMeasurement>(&mounted("invented")).is_err());
+}
 #[tokio::test]
 async fn destination_refusal_preserves_original_and_writer_remains_usable() {
     let (dir, r, _) = fixture(Caps::default());

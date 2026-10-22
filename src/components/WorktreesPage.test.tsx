@@ -25,7 +25,10 @@ const state = vi.hoisted(() => ({
   /// task rather than a finding about the disk. Defaults to one
   /// configured path so every existing assertion keeps reading the
   /// "looked and found nothing" arm it was written for.
-  dirs: ["/code"] as string[],
+  dirs: ["/code"] as string[] | undefined,
+  /// The folder setting's read failure (#1995); `dirs` is then undefined.
+  dirsError: null as unknown,
+  retryDirs: vi.fn(),
   /// The scan's own `dataUpdatedAt`, epoch ms, which is the instant every
   /// ref age on the page is measured against (#788).
   ///
@@ -152,7 +155,7 @@ vi.mock("../api/hooks", () => ({
   useClaudeSessions: () => ({ list: { data: undefined }, imported: { data: undefined }, now: 0, rescan: async () => {} }),
   // #952: the scan's input, so the empty arm can tell "nowhere to look"
   // from "nothing there".
-  useWorktreeDirs: () => ({ dirs: state.dirs, set: vi.fn() }),
+  useWorktreeDirs: () => ({ dirs: state.dirs, dirsError: state.dirsError, retryDirs: state.retryDirs, set: vi.fn() }),
   // Idle: the progress line only appears mid-removal.
   useRemovalProgress: () => null,
   useUpdateProgress: () => null,
@@ -700,6 +703,36 @@ describe("WorktreesPage", () => {
     render(<WorktreesPage />);
     expect(screen.getByText(/no repositories found/i)).toBeTruthy();
     expect(screen.getByText(/settings/i)).toBeTruthy();
+  });
+
+  /// #1995: `useWorktreeDirs` handed a failed read of the folder setting
+  /// over as `dirs: []`, which this page rendered as "does not know where
+  /// your repositories are" -- a claim about a setting it never saw.
+  describe("an unread folder setting is not an empty one (#1995)", () => {
+    afterEach(() => {
+      state.dirsError = null;
+      state.retryDirs.mockReset();
+    });
+    it("renders a failed read as a failure, with the reason and a retry", () => {
+      state.repos = [];
+      state.dirs = undefined;
+      state.dirsError = new Error("scan-folders setting unreadable");
+      render(<WorktreesPage />);
+      expect(screen.getByText("Could not read the folders to scan")).toBeTruthy();
+      expect(screen.getByText(/scan-folders setting unreadable/)).toBeTruthy();
+      expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
+      expect(screen.queryByText(/no repositories found/i)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+      expect(state.retryDirs).toHaveBeenCalled();
+    });
+    it("renders a read in flight as pending", () => {
+      state.repos = [];
+      state.dirs = undefined;
+      render(<WorktreesPage />);
+      expect(screen.getByText(/reading the folders to scan/i)).toBeTruthy();
+      expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
+      expect(screen.queryByText(/no repositories found/i)).toBeNull();
+    });
   });
 
   it("lists worktrees with their branch and size", () => {
