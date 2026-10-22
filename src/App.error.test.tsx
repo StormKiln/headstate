@@ -1,6 +1,8 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useFilters } from "./store/filters";
+import { PR_FIXTURES } from "./fixtures/prs";
 
 /// Regression test for the audit's top finding: a REJECTED pull-request
 /// query rendered as "0 Open -- No pull requests match these filters",
@@ -22,11 +24,12 @@ vi.mock("./api/hooks", async (orig) => {
   useCancelUpdateRun: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
-  useReviewing: () => ({ data: [], isLoading: false }),
+  useReviewing: () => mockReviewing(),
   };
 });
 
 const mockQuery = vi.fn();
+const mockReviewing = vi.fn(() => ({ data: [], isLoading: false }) as Record<string, unknown>);
 
 const { default: App } = await import("./App");
 
@@ -97,5 +100,66 @@ describe("App — failed PR query", () => {
     // No filters active in this test, so the unfiltered copy applies.
     expect(screen.getByText(/no open pull requests/i)).toBeTruthy();
     expect(screen.queryByText(/could not load/i)).toBeNull();
+  });
+});
+
+/// #1994: a request Headstate DECLINED to send is "not checked", not a
+/// failed load. The message line already said why (#1979); the title still
+/// read "Could not load…", which is "they did not answer" for "we did not
+/// ask" (#1050).
+describe("App — a declined request is titled as not checked", () => {
+  afterEach(() => {
+    useFilters.setState({ view: "my-prs" });
+    mockReviewing.mockImplementation(() => ({ data: [], isLoading: false }));
+  });
+  const noRows = { data: [], isLoading: false, isError: false, error: null, refetch: vi.fn() };
+
+  it("To Review: not-asked is not 'Could not load'", () => {
+    mockQuery.mockReturnValue(noRows);
+    mockReviewing.mockImplementation(() => ({
+      data: [], isLoading: false, isError: true, notAsked: true,
+      error: new Error("over the request budget"), refetch: vi.fn(),
+    }));
+    useFilters.setState({ view: "to-review" });
+    renderApp();
+    expect(screen.getByText("Review requests were not checked")).toBeTruthy();
+    expect(screen.queryByText(/could not load the pull requests awaiting your review/i)).toBeNull();
+    expect(screen.getByText(/over the request budget/)).toBeTruthy();
+  });
+
+  it("To Review with saved rows: not-asked is not 'Could not refresh'", () => {
+    mockQuery.mockReturnValue(noRows);
+    mockReviewing.mockImplementation(() => ({
+      data: [PR_FIXTURES[0]], isLoading: false, isError: true, notAsked: true,
+      error: new Error("over the request budget"), refetch: vi.fn(),
+    }));
+    useFilters.setState({ view: "to-review" });
+    renderApp();
+    expect(screen.getByText("Review requests were not re-checked")).toBeTruthy();
+    expect(screen.queryByText(/could not refresh the pull requests awaiting your review/i)).toBeNull();
+  });
+
+  it("To Review: a real failure keeps 'Could not load'", () => {
+    mockQuery.mockReturnValue(noRows);
+    mockReviewing.mockImplementation(() => ({
+      data: [], isLoading: false, isError: true, notAsked: false,
+      error: new Error("network down"), refetch: vi.fn(),
+    }));
+    useFilters.setState({ view: "to-review" });
+    renderApp();
+    expect(screen.getByText(/could not load the pull requests awaiting your review/i)).toBeTruthy();
+    expect(screen.queryByText(/were not checked/i)).toBeNull();
+  });
+
+  it("My PRs: not-asked is not 'Could not load', and the marker never shows", () => {
+    mockQuery.mockReturnValue({
+      data: undefined, isLoading: false, isError: true,
+      error: new Error("headstate:not-asked GitHub sign-in is required"), refetch: vi.fn(),
+    });
+    renderApp();
+    expect(screen.getByText("Your pull requests were not checked")).toBeTruthy();
+    expect(screen.queryByText(/could not load your pull requests/i)).toBeNull();
+    expect(screen.getByText("GitHub sign-in is required")).toBeTruthy();
+    expect(screen.queryByText(/headstate:/)).toBeNull();
   });
 });

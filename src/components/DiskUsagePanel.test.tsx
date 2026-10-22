@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiskObservation } from "../types/disk";
 const api = vi.hoisted(() => ({ diskStatus: vi.fn(), diskHistory: vi.fn(), diskSettings: vi.fn(), saveDiskSettings: vi.fn(), startDiskScan: vi.fn(), cancelDiskScan: vi.fn() }));
 vi.mock("../api/diskInventory", () => api);
-vi.mock("../api/hooks", () => ({ useWorktreeDirs: () => ({ dirs: ["/fixture/projects"] }) }));
+const dirs = vi.hoisted(() => ({ current: { dirs: ["/fixture/projects"] } as Record<string, unknown> }));
+vi.mock("../api/hooks", () => ({ useWorktreeDirs: () => dirs.current }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: vi.fn() }));
 import { DiskUsagePanel } from "./DiskUsagePanel";
 const gib = 1073741824n;
@@ -96,4 +97,25 @@ it("keeps comparable growth and known allocation visible in a partial observatio
  expect(screen.getByText(/persistent: \+3.0 GiB/)).toBeTruthy();
  expect(screen.getByText(/Recorded scan scope:.*fixture\/cache/)).toBeTruthy();
  expect(screen.getByRole("button",{name:"Continue disk measurement"})).toBeTruthy();
+});
+
+/// #1995: the scan scope's folder setting could not be read. "Unavailable"
+/// alone gave neither the reason nor a way out.
+describe("an unread scan-folder setting (#1995)", () => {
+  afterEach(() => { dirs.current = { dirs: ["/fixture/projects"] }; });
+  it("says why and offers a retry", async () => {
+    const retryDirs = vi.fn();
+    dirs.current = { dirs: undefined, dirsError: new Error("scan-folders setting unreadable"), isError: true, retryDirs };
+    await show();
+    expect(screen.queryByText(/None configured/)).toBeNull();
+    expect(screen.getByText(/could not be read: scan-folders setting unreadable/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /retry reading folders/i }));
+    expect(retryDirs).toHaveBeenCalled();
+  });
+  it("is loading, not 'None configured', while the read is in flight", async () => {
+    dirs.current = { dirs: undefined, isLoading: true };
+    await show();
+    expect(screen.getByText(/Repository folders: Loading…/)).toBeTruthy();
+    expect(screen.queryByText(/None configured/)).toBeNull();
+  });
 });

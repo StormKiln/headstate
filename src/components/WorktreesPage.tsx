@@ -1245,7 +1245,8 @@ export function WorktreesPage() {
   // The scan's INPUT (#952): whether there were any folders to walk at
   // all, which nothing in the scan's OUTPUT can distinguish from a walk
   // that found nothing. One cache hit -- `staleTime: Infinity`.
-  const { dirs } = useWorktreeDirs();
+  // `undefined` while unread or unreadable (#1995) -- never "none".
+  const { dirs, dirsError, retryDirs } = useWorktreeDirs();
   const filters = useActiveFilters();
   /// Rows ticked for a bulk action, keyed by path (#1140).
   ///
@@ -2084,6 +2085,25 @@ export function WorktreesPage() {
     // "No repositories found" is a claim about the user's disk that this
     // scan never tested. It looked nowhere. That is a task to state, not
     // a finding to report -- and the two want opposite words.
+    // #1995: the folder setting could not be read. "Does not know where
+    // your repositories are" and "No git repositories under …" are both
+    // claims about a setting this read never saw.
+    if (dirsError) {
+      return (
+        <QueryError
+          title="Could not read the folders to scan"
+          message={errorMessage(dirsError)}
+          onRetry={() => void retryDirs()}
+        />
+      );
+    }
+    if (dirs === undefined) {
+      return (
+        <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
+          Reading the folders to scan…
+        </div>
+      );
+    }
     if (dirs.length === 0) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">

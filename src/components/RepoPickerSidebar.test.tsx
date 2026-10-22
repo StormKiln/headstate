@@ -20,7 +20,9 @@ const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
 const scan = vi.hoisted(() => ({
   loading: false,
   unreadable: [] as string[],
-  dirs: ["/code"] as string[],
+  dirs: ["/code"] as string[] | undefined,
+  dirsError: null as unknown,
+  retryDirs: vi.fn(),
 }));
 const selected = vi.hoisted(() => ({ repo: undefined as string | undefined }));
 
@@ -30,7 +32,7 @@ vi.mock("@/api/hooks", () => ({
     isLoading: scan.loading,
     unreadable: scan.unreadable,
   }),
-  useWorktreeDirs: () => ({ dirs: scan.dirs, set: vi.fn() }),
+  useWorktreeDirs: () => ({ dirs: scan.dirs, dirsError: scan.dirsError, retryDirs: scan.retryDirs, set: vi.fn() }),
 }));
 vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
 /// Stubbed to its identity, not rendered: the real dialog subscribes to
@@ -69,6 +71,8 @@ beforeEach(() => {
   scan.loading = false;
   scan.unreadable = [];
   scan.dirs = ["/code"];
+  scan.dirsError = null;
+  scan.retryDirs.mockReset();
   selected.repo = undefined;
   setFilter.mockReset();
 });
@@ -137,6 +141,31 @@ describe("RepoPickerSidebar", () => {
   /// folders": a claim about the user's disk, made by a scan that had
   /// never looked at it, with no remedy on screen and no mention of
   /// Settings.
+  /// #1995: a folder setting that could not be read, or is still being
+  /// read, is not "no folders configured" -- `useWorktreeDirs` used to
+  /// hand both over as `dirs: []`.
+  describe("an unread folder setting is not an empty one (#1995)", () => {
+    it("renders a failed read as a failure, with the reason and a retry", () => {
+      repos.mockReturnValue([]);
+      scan.dirs = undefined;
+      scan.dirsError = new Error("scan-folders setting unreadable");
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.getByRole("alert").textContent).toMatch(/could not read the folders to scan: scan-folders setting unreadable/i);
+      expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
+      expect(screen.queryByText(/no git repositories found/i)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+      expect(scan.retryDirs).toHaveBeenCalled();
+    });
+    it("renders a read in flight as pending", () => {
+      repos.mockReturnValue([]);
+      scan.dirs = undefined;
+      render(<RepoPickerSidebar reviewingCount={0} />);
+      expect(screen.getByText(/reading the folders to scan/i)).toBeTruthy();
+      expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+  });
+
   describe("nowhere to look, versus nothing there (#952)", () => {
     it("states the task rather than diagnosing a disk it never scanned", () => {
       repos.mockReturnValue([]);
