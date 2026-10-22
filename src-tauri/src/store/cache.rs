@@ -103,8 +103,9 @@ pub(super) fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
 // The bare-rows reader `load_snapshot` and its writer `save_snapshot`
 // lived here until #2003. Only tests reached either: the reader collapsed
 // "too old", "missing" and "unreadable" into one empty list, which is the
-// state production keeps apart, and the writer was `save_source_snapshot`
-// for the default source with unknown coverage. Rows are read through
+// state production keeps apart, and the writer wrapped the (also removed,
+// #2009) unowned `save_source_snapshot` for the default source with unknown
+// coverage. Rows are read through
 // `source_cache::load_source_snapshot` / `load_qualified_snapshot` and
 // written through `source_cache::save_owned_source_snapshot`.
 
@@ -113,19 +114,21 @@ mod tests {
     use super::*;
     use crate::github::model::MergeStateStatus;
     use crate::store::source_cache::{
-        load_source_snapshot, save_source_snapshot, Coverage, SnapshotData,
+        load_source_snapshot, save_owned_source_snapshot, Coverage, SnapshotData,
     };
     use rusqlite::Connection;
 
     /// Write the default source's list the way the removed `save_snapshot`
-    /// did: `save_source_snapshot` with coverage left unknown.
+    /// did, with coverage left unknown, through the writer production uses
+    /// and with an owner, as production records one (#2009).
     fn save(conn: &Connection, which: CachedList, prs: &[PullRequest]) {
-        save_source_snapshot(
+        save_owned_source_snapshot(
             conn,
             &crate::identity::Source::default(),
             which,
             prs,
             &Coverage::Unknown,
+            Some("alice"),
         )
         .unwrap();
     }
