@@ -3038,6 +3038,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_import_makes_already_written_unknown_not_advice() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
@@ -3183,6 +3184,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_skill_makes_already_written_unknown_not_advice() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
@@ -3225,6 +3227,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_rule_makes_already_written_unknown_not_advice() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
@@ -3262,6 +3265,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_transcript_is_an_unknown_finding_and_the_others_stand() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();
@@ -3343,6 +3347,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn missing_transcripts_are_counted_and_unreadable_ones_grouped() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path();

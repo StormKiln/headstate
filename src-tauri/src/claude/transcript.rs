@@ -1750,6 +1750,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_project_directory_is_reported_not_zero() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = Tmp::new("noperm");
         let open = t.path().join("-Users-acme-readable");
@@ -1856,6 +1857,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_root_is_still_partial_and_not_reported_as_absent() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = Tmp::new("root-denied");
         let root = t.path().join("walled");

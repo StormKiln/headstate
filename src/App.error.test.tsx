@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { settle } from "@/test/settle";
 import { useFilters } from "./store/filters";
 import { PR_FIXTURES } from "./fixtures/prs";
 
@@ -61,7 +62,7 @@ describe("App — failed PR query", () => {
     expect(screen.queryByText(/match these filters/i)).toBeNull();
   });
 
-  it("surfaces the rejection message so the user can act on it", () => {
+  it("surfaces the rejection message so the user can act on it", async () => {
     mockQuery.mockReturnValue({
       data: undefined,
       isLoading: false,
@@ -70,10 +71,11 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     expect(screen.getByText(/gh auth login/)).toBeTruthy();
   });
 
-  it("offers a retry that refetches", () => {
+  it("offers a retry that refetches", async () => {
     const refetch = vi.fn();
     mockQuery.mockReturnValue({
       data: undefined,
@@ -83,12 +85,13 @@ describe("App — failed PR query", () => {
       refetch,
     });
     renderApp();
+    await settle();
     screen.getByRole("button", { name: /try again/i }).click();
     expect(refetch).toHaveBeenCalled();
   });
 
   // A genuinely empty result must still read as empty, not as an error.
-  it("still shows the empty state when the query succeeds with no PRs", () => {
+  it("still shows the empty state when the query succeeds with no PRs", async () => {
     mockQuery.mockReturnValue({
       data: [],
       isLoading: false,
@@ -97,6 +100,7 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     // No filters active in this test, so the unfiltered copy applies.
     expect(screen.getByText(/no open pull requests/i)).toBeTruthy();
     expect(screen.queryByText(/could not load/i)).toBeNull();
@@ -109,12 +113,13 @@ describe("App — failed PR query", () => {
 /// ask" (#1050).
 describe("App — a declined request is titled as not checked", () => {
   afterEach(() => {
+    cleanup();
     useFilters.setState({ view: "my-prs" });
     mockReviewing.mockImplementation(() => ({ data: [], isLoading: false }));
   });
   const noRows = { data: [], isLoading: false, isError: false, error: null, refetch: vi.fn() };
 
-  it("To Review: not-asked is not 'Could not load'", () => {
+  it("To Review: not-asked is not 'Could not load'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [], isLoading: false, isError: true, notAsked: true,
@@ -122,12 +127,13 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText("Review requests were not checked")).toBeTruthy();
     expect(screen.queryByText(/could not load the pull requests awaiting your review/i)).toBeNull();
     expect(screen.getByText(/over the request budget/)).toBeTruthy();
   });
 
-  it("To Review with saved rows: not-asked is not 'Could not refresh'", () => {
+  it("To Review with saved rows: not-asked is not 'Could not refresh'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [PR_FIXTURES[0]], isLoading: false, isError: true, notAsked: true,
@@ -135,11 +141,12 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText("Review requests were not re-checked")).toBeTruthy();
     expect(screen.queryByText(/could not refresh the pull requests awaiting your review/i)).toBeNull();
   });
 
-  it("To Review: a real failure keeps 'Could not load'", () => {
+  it("To Review: a real failure keeps 'Could not load'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [], isLoading: false, isError: true, notAsked: false,
@@ -147,16 +154,18 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText(/could not load the pull requests awaiting your review/i)).toBeTruthy();
     expect(screen.queryByText(/were not checked/i)).toBeNull();
   });
 
-  it("My PRs: not-asked is not 'Could not load', and the marker never shows", () => {
+  it("My PRs: not-asked is not 'Could not load', and the marker never shows", async () => {
     mockQuery.mockReturnValue({
       data: undefined, isLoading: false, isError: true,
       error: new Error("headstate:not-asked GitHub sign-in is required"), refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     expect(screen.getByText("Your pull requests were not checked")).toBeTruthy();
     expect(screen.queryByText(/could not load your pull requests/i)).toBeNull();
     expect(screen.getByText("GitHub sign-in is required")).toBeTruthy();

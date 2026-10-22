@@ -1243,6 +1243,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unlistable_directory_is_unknown_and_never_a_gap() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         let t = fixture();
         let locked = t.path().join("locked");
         let report = with_walled(&locked, || run_over(t.path()));
@@ -1382,6 +1383,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_root_claude_md_makes_the_check_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = fixture();
         let file = t.path().join("CLAUDE.md");
@@ -1527,6 +1529,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_rule_withholds_the_candidates_as_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = fixture();
         let rule = t.path().join(".claude").join("rules").join("tests.md");

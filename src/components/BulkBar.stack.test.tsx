@@ -7,6 +7,7 @@ import { PR_FIXTURES } from "@/fixtures/prs";
 import { useFilters } from "@/store/filters";
 import { renderWithQuery as render } from "@/test-utils";
 import type { PullRequest } from "@/types/pr";
+import { settle } from "@/test/settle";
 
 type Batch = (prs: [string, string, number][], action: string) => Promise<BatchOutcome[]>;
 const batch = vi.fn<Batch>(() => Promise.resolve([]));
@@ -29,7 +30,7 @@ beforeEach(() => {
 });
 
 describe("BulkBar enqueue on a stacked selection (#1452)", () => {
-  it("skips the stacked pull request with the reason, and queues the rest", () => {
+  it("skips the stacked pull request with the reason, and queues the rest", async () => {
     batch.mockResolvedValueOnce([{ repo: parent.repo, number: parent.number, error: null }]);
     render(<BulkBar prs={[parent, child]} />);
     fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
@@ -39,6 +40,7 @@ describe("BulkBar enqueue on a stacked selection (#1452)", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /^Add to merge queue 1 pull request$/ }));
 
     expect(batch).toHaveBeenCalledWith([[parent.id, parent.repo, parent.number]], "enqueue");
+    await settle();
   });
 
   /// The gate is for the queue only: other bulk actions still include it.

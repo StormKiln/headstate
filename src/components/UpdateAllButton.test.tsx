@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { UpdateAllReport, RepoUpdateOutcome } from "@/api/tauri";
 
 /// The hooks are mocked rather than the Tauri boundary, because what is
@@ -211,7 +211,7 @@ describe("UpdateAllButton", () => {
     fireEvent.click(screen.getByRole("button", { name: /update \d+ repositor/i }));
 
     expect(await screen.findByText(/Updating 7 of 45/)).not.toBeNull();
-    finish(report());
+    await act(async () => finish(report()));
   });
 });
 

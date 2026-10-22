@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { settle } from "@/test/settle";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Lock, Worktree, WorktreeRepo } from "@/types/pr";
 import { useFilters } from "@/store/filters";
@@ -797,13 +798,15 @@ describe("WorktreesPage", () => {
     expect(removeFn).not.toHaveBeenCalled();
   });
 
-  it("removes only after confirmation", () => {
+  it("removes only after confirmation", async () => {
     state.classified = [wt({ path: "/code/proj-gone", safety: { kind: "safe" } })];
     render(<WorktreesPage />);
     fireEvent.click(screen.getByRole("button", { name: /^remove$/i }));
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: /^remove$/i }));
     expect(removeFn).toHaveBeenCalledWith("/code/proj", "/code/proj-gone");
+    // The removal's answer re-renders the row; let it land.
+    await settle();
   });
 
   it("cancelling removes nothing", () => {
@@ -1465,7 +1468,7 @@ describe("WorktreesPage", () => {
         expect(launchWorktree).not.toHaveBeenCalled();
 
         fireEvent.click(await screen.findByRole("button", { name: /open in terminal/i }));
-        await vi.waitFor(() =>
+        await waitFor(() =>
           expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature", {}),
         );
         // Not both: a button that copies AND launches is a button
@@ -1520,7 +1523,7 @@ describe("WorktreesPage", () => {
         // and not a whitespace-normalised match, either of which could
         // pass against a rendering that had lost the newlines or merged
         // two arguments.
-        const box = await vi.waitFor(() => {
+        const box = await waitFor(() => {
           const found = Array.from(document.querySelectorAll("code")).filter(
             (c) => c.textContent === brief,
           );
@@ -1561,7 +1564,7 @@ describe("WorktreesPage", () => {
         expect(await screen.findByText(/act without asking/i)).toBeTruthy();
 
         fireEvent.click(screen.getByRole("button", { name: /open in terminal/i }));
-        await vi.waitFor(() =>
+        await waitFor(() =>
           expect(launchWorktree).toHaveBeenCalledWith("/code/proj", "/code/proj-a", "feature", {
             model: "opus",
             permissionMode: "bypassPermissions",
@@ -1582,7 +1585,7 @@ describe("WorktreesPage", () => {
         render(<WorktreesPage />);
         fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
         fireEvent.click(await screen.findByRole("button", { name: /open in terminal/i }));
-        await vi.waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+        await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
         const opts = toastSuccess.mock.calls.at(-1)?.[1] as
           | { action?: { label?: string } }
           | undefined;
@@ -1885,7 +1888,7 @@ describe("WorktreesPage", () => {
       expect(others).toHaveLength(1);
       expect((others[0] as HTMLButtonElement).disabled).toBe(false);
 
-      release();
+      await act(async () => release());
     });
   });
 
@@ -2982,7 +2985,7 @@ describe("WorktreesPage", () => {
 
     /// Nothing is deleted by opening a menu. The confirmation is the
     /// gate, and it has to be answered.
-    it("removes nothing until the confirmation is answered", () => {
+    it("removes nothing until the confirmation is answered", async () => {
       forceFn.mockClear();
       state.classified = [wt({ safety: { kind: "never_pushed" } })];
       render(<WorktreesPage />);
@@ -2992,6 +2995,7 @@ describe("WorktreesPage", () => {
 
       fireEvent.click(screen.getByRole("button", { name: /i have reviewed this/i }));
       expect(forceFn).toHaveBeenCalled();
+      await settle();
     });
 
     /// #753's finding, reused rather than reworded.
@@ -4355,10 +4359,13 @@ describe("WorktreesPage selection", () => {
       anchor: null,
     } as never);
     render(<WorktreesPage />);
-    // Now narrow so one of the two is hidden.
-    useFilters.setState({
-      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["safe"] } },
-    } as never);
+    // Now narrow so one of the two is hidden. The store change re-renders
+    // the tree already mounted, so it is an update like any other.
+    act(() => {
+      useFilters.setState({
+        filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj", safety: ["safe"] } },
+      } as never);
+    });
     render(<WorktreesPage />);
 
     fireEvent.click(screen.getAllByRole("button", { name: /Remove 1 selected/ })[0]);

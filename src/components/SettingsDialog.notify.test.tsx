@@ -46,6 +46,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
+import { settle } from "@/test/settle";
 
 beforeEach(() => {
   setPrefs.mockClear();
@@ -60,15 +61,17 @@ const show = () => render(<SettingsDialog open onOpenChange={() => {}} />);
 /// denying permission at the OS level, which the poll loop treats as
 /// permanent.
 describe("notification settings", () => {
-  it("offers a master switch and one toggle per kind", () => {
+  it("offers a master switch and one toggle per kind", async () => {
     show();
+    await settle();
     expect(screen.getByRole("checkbox", { name: /desktop notifications/i })).toBeTruthy();
     expect(screen.getByRole("checkbox", { name: /ci/i })).toBeTruthy();
     expect(screen.getByRole("checkbox", { name: /conflict/i })).toBeTruthy();
   });
 
-  it("turns everything off through the master switch", () => {
+  it("turns everything off through the master switch", async () => {
     show();
+    await settle();
     fireEvent.click(screen.getByRole("checkbox", { name: /desktop notifications/i }));
     expect(setPrefs).toHaveBeenCalledWith({
       enabled: false,
@@ -79,9 +82,10 @@ describe("notification settings", () => {
 
   // Turning the master switch off must not discard the per-kind choices,
   // so turning it back on restores what the user picked.
-  it("keeps the per-kind choices when the master switch goes off", () => {
+  it("keeps the per-kind choices when the master switch goes off", async () => {
     prefsState.prefs = { enabled: true, ci_failed: true, conflicted: false };
     show();
+    await settle();
     fireEvent.click(screen.getByRole("checkbox", { name: /desktop notifications/i }));
     expect(setPrefs).toHaveBeenCalledWith({
       enabled: false,
@@ -90,8 +94,9 @@ describe("notification settings", () => {
     });
   });
 
-  it("silences one kind without touching the other", () => {
+  it("silences one kind without touching the other", async () => {
     show();
+    await settle();
     fireEvent.click(screen.getByRole("checkbox", { name: /conflict/i }));
     expect(setPrefs).toHaveBeenCalledWith({
       enabled: true,
@@ -102,9 +107,10 @@ describe("notification settings", () => {
 
   // With the master switch off, the per-kind boxes must not imply they
   // still do something.
-  it("disables the per-kind toggles when notifications are off", () => {
+  it("disables the per-kind toggles when notifications are off", async () => {
     prefsState.prefs = { enabled: false, ci_failed: true, conflicted: true };
     show();
+    await settle();
     expect(screen.getByRole("checkbox", { name: /ci/i })).toHaveProperty("disabled", true);
   });
 
@@ -115,8 +121,9 @@ describe("notification settings", () => {
   /// (#436) is good news, so the promise is now about the TRANSITION
   /// rather than the direction -- and that is the part users rely on:
   /// no repeats, and nothing on first launch.
-  it("says notifications fire on a change, not repeatedly", () => {
+  it("says notifications fire on a change, not repeatedly", async () => {
     show();
+    await settle();
     expect(screen.getByText(/only when something newly changes/i)).toBeTruthy();
     expect(screen.getByText(/never on first launch/i)).toBeTruthy();
   });
@@ -137,8 +144,9 @@ describe("the new-PR and health categories (#789)", () => {
     };
   });
 
-  it("offers a toggle for a pull request appearing", () => {
+  it("offers a toggle for a pull request appearing", async () => {
     show();
+    await settle();
     const box = screen.getByRole("checkbox", { name: /a pull request appears/i });
     fireEvent.click(box);
     expect(setPrefs).toHaveBeenCalledWith(
@@ -150,8 +158,9 @@ describe("the new-PR and health categories (#789)", () => {
   /// unconditionally -- only the threshold was adjustable -- so a user
   /// who wanted pull-request notifications and not machine ones had no
   /// way to say so.
-  it("offers separate toggles for battery and CPU", () => {
+  it("offers separate toggles for battery and CPU", async () => {
     show();
+    await settle();
     fireEvent.click(screen.getByRole("checkbox", { name: /battery problems/i }));
     expect(setPrefs).toHaveBeenCalledWith(
       expect.objectContaining({ health_battery: false, health_cpu: true }),
@@ -167,7 +176,7 @@ describe("the new-PR and health categories (#789)", () => {
   /// A threshold for an alert that cannot fire is a control that does
   /// nothing, and leaving it live would imply the alert was still
   /// coming.
-  it("disables the battery threshold when battery notifications are off", () => {
+  it("disables the battery threshold when battery notifications are off", async () => {
     prefsState.prefs = {
       enabled: true,
       ci_failed: true,
@@ -178,6 +187,7 @@ describe("the new-PR and health categories (#789)", () => {
       health_cpu: true,
     };
     show();
+    await settle();
     expect(
       screen.getByRole("spinbutton", { name: /battery charge warning threshold/i }),
     ).toHaveProperty("disabled", true);
@@ -187,12 +197,13 @@ describe("the new-PR and health categories (#789)", () => {
   /// busy" is something nobody wants and is not what the rule does: the
   /// aggregate shape is the whole point, because ten runaway processes
   /// each look unremarkable in a sorted list.
-  it("says the CPU alert is about load nothing explains", () => {
+  it("says the CPU alert is about load nothing explains", async () => {
     show();
+    await settle();
     expect(screen.getByText(/no single process accounts for/i)).toBeTruthy();
   });
 
-  it("silences both health categories through the master switch", () => {
+  it("silences both health categories through the master switch", async () => {
     prefsState.prefs = {
       enabled: false,
       ci_failed: true,
@@ -203,6 +214,7 @@ describe("the new-PR and health categories (#789)", () => {
       health_cpu: true,
     };
     show();
+    await settle();
     for (const name of [/battery problems/i, /cpu is busy/i, /a pull request appears/i]) {
       expect(screen.getByRole("checkbox", { name })).toHaveProperty("disabled", true);
     }

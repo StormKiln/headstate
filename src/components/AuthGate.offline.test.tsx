@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createQueryClient } from "../api/queryClient";
 
@@ -311,7 +311,7 @@ describe("the desktop build", () => {
       await renderGate("desktop");
       // Past TanStack's first retry delay (~1s), so the second attempt is
       // scheduled and run inside this window.
-      await vi.advanceTimersByTimeAsync(2000);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
       expect(authCalls.count).toBeGreaterThan(1);
     } finally {
       vi.useRealTimers();
@@ -324,7 +324,7 @@ describe("the desktop build", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       await renderGate("desktop");
-      await vi.advanceTimersByTimeAsync(10_000);
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
       expect(authCalls.count).toBe(4);
       expect(await screen.findByText("the app")).toBeTruthy();
       expect(screen.queryByText("Headstate needs the GitHub CLI")).toBeNull();
