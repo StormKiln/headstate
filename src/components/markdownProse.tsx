@@ -1,15 +1,10 @@
-import { createContext, useContext } from "react";
-import type { ReactNode } from "react";
 import type { Components } from "react-markdown";
+import { Item, List } from "./MarkdownList";
 
 /// What `Markdown` (GitHub bodies) and `TranscriptMarkdown` (Claude Code
 /// transcripts, #1482) share: how prose LOOKS. The two differ in what
 /// they let through -- raw HTML, images, links, code -- and that stays in
 /// each renderer; the spacing, lists, headings and tables live here once.
-
-/// A list nested in another list must not add the outer list's
-/// vertical margin -- see `List`.
-const InList = createContext(false);
 
 /// Strips react-markdown's `node` before it reaches the DOM.
 ///
@@ -70,48 +65,4 @@ export const PROSE: Components = {
   th: (props) => (
     <th {...clean(props)} className="border border-[#30363d] px-2 py-1 font-semibold" />
   ),
-};
-
-/// A NESTED list drops its vertical margin: `my-2` inside the parent's
-/// `li` stacks on that item's own spacing and opens a gap in the middle
-/// of a list that should read as one block.
-///
-/// The bullet is decided per ITEM, by `Item`, not here -- see there.
-///
-/// `className` is dropped (this computes its own) but everything else
-/// is passed through: an `<ol>` starting at `3.` carries `start`, and
-/// swallowing it would silently renumber the list from 1.
-function List({ ordered, start, children }: ListProps) {
-  const nested = useContext(InList);
-  const Tag = ordered ? "ol" : "ul";
-  return (
-    <InList value={true}>
-      <Tag
-        start={start}
-        className={`${nested ? "mt-1" : "my-2"} ${ordered ? "list-decimal" : "list-disc"} space-y-1 pl-5`}
-      >
-        {children}
-      </Tag>
-    </InList>
-  );
-}
-
-/// A task item is a checkbox, not a bullet.
-///
-/// GFM renders `- [ ]` as an `<input type="checkbox">` and marks the
-/// item `task-list-item`; the list's `list-disc` then gave it a bullet
-/// AND a box. Suppressing the marker on the LIST is wrong -- GFM puts
-/// `contains-task-list` on a list with even one task item, and a mixed
-/// list would lose the bullets from its ordinary items too. Only the
-/// task items themselves drop their marker.
-function Item({ className, ...props }: { className?: string; children?: ReactNode }) {
-  const task = (className ?? "").includes("task-list-item");
-  return <li {...props} className={task ? "list-none -ml-5 pl-5" : undefined} />;
-}
-
-type ListProps = {
-  ordered: boolean;
-  className?: string;
-  start?: number;
-  children?: ReactNode;
 };

@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Filters } from "../lib/derive";
 import { MOBILE_BREAKPOINT } from "../lib/useIsMobile";
 import { ALL_VIEWS, type View, useFilters } from "../store/filters";
-import { GROUPS, VIEWS, ViewSwitcher } from "./ViewSwitcher";
+import { ViewSwitcher } from "./ViewSwitcher";
+import { GROUPS, VIEWS } from "./viewMenu";
 
 /// What `useUiPrefs` answers, per test.
 ///

@@ -65,7 +65,8 @@ vi.mock("../api/tauri", () => ({
   deleteRemoteBranches: delRemote,
 }));
 
-import { BranchesPage, reason } from "./BranchesPage";
+import { BranchesPage } from "./BranchesPage";
+import { deletableReason as reason } from "@/lib/branchDelete";
 import { useFilters } from "../store/filters";
 
 const branch = (over: Partial<Branch> = {}): Branch => ({

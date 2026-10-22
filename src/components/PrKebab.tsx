@@ -9,7 +9,8 @@ import type { PrActionName } from "../api/tauri";
 import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
 import { inverseOf } from "../lib/undo";
 import type { PullRequest } from "../types/pr";
-import { PrClaudifyDialogs, PrClaudifyMenuItem, type PrClaudifyDialog } from "./PrClaudify";
+import { PrClaudifyDialogs, PrClaudifyMenuItem } from "./PrClaudify";
+import type { PrClaudifyDialog } from "./claudifyStart";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Why a row-level action is unavailable, or null when offered.

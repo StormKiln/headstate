@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ALL_VIEWS, viewLabel } from "./filters";
-import { VIEWS } from "../components/ViewSwitcher";
+import { VIEWS } from "../components/viewMenu";
 
 /// The header label table against the switcher's.
 ///

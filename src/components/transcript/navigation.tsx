@@ -23,7 +23,7 @@ import { useFilters } from "../../store/filters";
 import type { FindHit, TranscriptMessage } from "../../types/transcript";
 import { unsearchedNote } from "../../lib/masked";
 import { MaskedText } from "../MaskedText";
-import { errorMessage } from "../QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { SHOW_LABELS, type TranscriptShow } from "./filters";
 import { palette } from "./palette";
 import { messagesMarkdown } from "./transcriptCopy";

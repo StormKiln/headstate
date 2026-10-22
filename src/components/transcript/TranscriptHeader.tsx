@@ -39,7 +39,7 @@ import { canClaudify, sessionWorktree } from "@/lib/worktrees";
 import type { ClaudeSession, ClaudeSessionDetail, ClaudeUsage } from "@/types/pr";
 import { LaunchTermsPicker } from "../LaunchTermsPicker";
 import { MaskedText } from "../MaskedText";
-import { errorMessage } from "../QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import {
   abbreviatePath,
   compactCount,

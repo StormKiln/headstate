@@ -36,7 +36,8 @@ import { recheckSummary } from "@/lib/adviceRecheck";
 import { IS_DESKTOP_BUILD } from "@/lib/target";
 import { ClaudifyAction, ClaudifyButton, CopyBriefButton, RunPanel } from "./ClaudifyAction";
 import { PartialScanNotice } from "./PartialScanNotice";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 
 /// The three arrangements, and what the control calls them (#1291).
 ///

@@ -1,7 +1,8 @@
 import { useMemo } from "react";
 import { useRepoUpstreams, useWorktrees } from "@/api/hooks";
 import { PartialScanNotice } from "@/components/PartialScanNotice";
-import { QueryError, errorMessage } from "@/components/QueryError";
+import { QueryError } from "@/components/QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
 import type { RepoCurrency, RepoOverviewRow } from "@/lib/repoOverview";
 import { upstreamReasonAged, upstreamToneAged } from "@/lib/worktrees";

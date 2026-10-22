@@ -36,7 +36,8 @@ import { Section } from "./Section";
 import { PrActions } from "./PrActions";
 import { StackBadge } from "./StackBadge";
 import { ReviewBox } from "./ReviewBox";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { scopeEffect } from "../lib/branchDelete";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 

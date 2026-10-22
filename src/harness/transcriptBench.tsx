@@ -29,11 +29,10 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { createQueryClient } from "../api/queryClient";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { StrictMode, useState } from "react";
+import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { SESSION_ACTIVITY_EVENT } from "../api/hooks";
-import { PhoneTranscript } from "../components/transcript/phone/PhoneTranscript";
-import { DesktopTranscript } from "../components/transcript/DesktopTranscript";
+import { TranscriptBenchHarness } from "./TranscriptBenchHarness";
 import "../index.css";
 import type { Liveness } from "../types/pr";
 import { markNewestText } from "./elementTiming";
@@ -214,27 +213,11 @@ async function main() {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <QueryClientProvider client={createQueryClient()}>
-        <Harness liveness={liveness} sessionId={follow ? SESSION : null} phone={params.get("host") === "phone"} />
+        <TranscriptBenchHarness path={PATH} liveness={liveness} sessionId={follow ? SESSION : null} phone={params.get("host") === "phone"} />
       </QueryClientProvider>
     </StrictMode>,
   );
   document.body.dataset.harness = "ready";
-}
-
-function Harness({ liveness, sessionId, phone }: { liveness: Liveness; sessionId: string | null; phone: boolean }) {
-  const Host = phone ? PhoneTranscript : DesktopTranscript;
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="flex h-screen flex-col bg-[#0d1117] p-3">
-      {!open ? (
-        <button type="button" onClick={() => setOpen(true)} className="text-[#e6edf3]">
-          Open
-        </button>
-      ) : (
-        <Host path={PATH} liveness={liveness} sessionId={sessionId} />
-      )}
-    </div>
-  );
 }
 
 void main();

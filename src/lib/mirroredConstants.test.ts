@@ -17,7 +17,7 @@ import { ERROR_KINDS, commandError } from "./errorKind";
 import { ABSOLUTE_GAP_MS } from "./health";
 import { AUTO_COMPACT_PRESSURE } from "./subagentDisagreement";
 import { CANCELLED } from "./cancelled";
-import { AUTH_EXPIRED, NOT_ASKED } from "./notAsked";
+import { AUTH_EXPIRED, NOT_ASKED, NOT_AUTHENTICATED, SOURCE_NOT_ENABLED } from "./notAsked";
 import {
   DEFAULT_STALE_DAYS,
   MAX_STALE_DAYS,
@@ -536,6 +536,15 @@ describe("the command rejection kinds", () => {
     const commandsRs = (await import("../../src-tauri/src/commands.rs?raw")).default;
     expect(NOT_ASKED).toBe(rustStrConst(commandsRs, "NOT_ASKED", "commands.rs"));
     expect(AUTH_EXPIRED).toBe(rustStrConst(commandsRs, "AUTH_EXPIRED", "commands.rs"));
+  });
+
+  /// The not-asked REASONS a retry cannot clear (#2004). A drifted one
+  /// does not fail anything: `notAskedRemedy` stops recognising it and
+  /// offers "Try again" for a request that will be refused again.
+  it("carry the not-asked reasons the remedy reads", async () => {
+    const commandsRs = (await import("../../src-tauri/src/commands.rs?raw")).default;
+    expect(NOT_AUTHENTICATED).toBe(rustStrConst(commandsRs, "AUTH_ERR_TEXT", "commands.rs"));
+    expect(commandsRs).toContain(`"${NOT_ASKED}: ${SOURCE_NOT_ENABLED}"`);
   });
 
   /// And that each marker actually produces its kind, end to end.

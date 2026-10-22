@@ -97,7 +97,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
-import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
+import { ALWAYS_OFFERED, VIEWS } from "./viewMenu";
 import { ALL_VIEWS } from "@/store/filters";
 
 function open() {

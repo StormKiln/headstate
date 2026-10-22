@@ -2,7 +2,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { useLogTail } from "@/api/hooks";
 import { copyText } from "@/lib/clipboard";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 
 /// Bytes as a short human figure.
 ///

@@ -4,7 +4,8 @@ import { useActiveFilters, useFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
 import { notBrowsableReason } from "@/lib/repoOverview";
 import type { RepoEntry } from "@/types/pr";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { AllRepositoriesTable } from "./AllRepositoriesTable";
 
 /// Browse one repository's files, the way GitHub's code view does

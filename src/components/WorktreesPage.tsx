@@ -87,7 +87,8 @@ import { SavedScanNotice } from "./SavedScanNotice";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { rootBoundaries } from "../lib/rootBoundaries";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
@@ -1708,33 +1709,40 @@ export function WorktreesPage() {
   // genuinely unsafe option.
   const settledAt = useFirstSizingSettled(selected?.path, sizing);
   const orderKey = `${sort}:${sortedAt}:${settledAt}`;
-  const snapshot = useMemo(
-    () => ({
-      order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
-      // Which paths already had a size when this order was fixed. Kept
-      // alongside the order because it is the only way to tell later
-      // that a measurement has landed SINCE -- comparing against the
-      // live rows would compare them with themselves.
-      measured: new Set(
-        withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
-      ),
-      // Which paths were assessed when this order was fixed, for the
-      // same reason and read the same way (#817).
-      //
-      // `sortWorktrees` ranks assessed rows above unassessed ones on
-      // EVERY sort, size or not, so an assessment landing changes what
-      // the correct order would be just as a measurement does. The
-      // staleness count used to look only at sizes, which left that
-      // half of the data silently stale: the order was wrong and the
-      // page did not say so -- precisely the dishonesty the re-sort
-      // button exists to prevent.
-      assessedThen: new Set(
-        withSizes.filter((w) => assessed.has(w.path)).map((w) => w.path),
-      ),
-    }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [orderKey, withSizes.length],
-  );
+  // Frozen until `snapshotKey` changes, and held in STATE rather than a
+  // memo (#1965). It was `useMemo([orderKey, withSizes.length])` with the
+  // rows it reads left out behind a suppression: a deliberate freeze, but
+  // a memo is a cache React may drop and recompute, which would re-sort
+  // the list under the user. State replaced during render ("adjust state
+  // when a prop changes") is the freeze React guarantees.
+  const snapshotKey = `${orderKey}:${withSizes.length}`;
+  const takeSnapshot = () => ({
+    order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
+    // Which paths already had a size when this order was fixed. Kept
+    // alongside the order because it is the only way to tell later
+    // that a measurement has landed SINCE -- comparing against the
+    // live rows would compare them with themselves.
+    measured: new Set(
+      withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
+    ),
+    // Which paths were assessed when this order was fixed, for the
+    // same reason and read the same way (#817).
+    //
+    // `sortWorktrees` ranks assessed rows above unassessed ones on
+    // EVERY sort, size or not, so an assessment landing changes what
+    // the correct order would be just as a measurement does. The
+    // staleness count used to look only at sizes, which left that
+    // half of the data silently stale: the order was wrong and the
+    // page did not say so -- precisely the dishonesty the re-sort
+    // button exists to prevent.
+    assessedThen: new Set(
+      withSizes.filter((w) => assessed.has(w.path)).map((w) => w.path),
+    ),
+  });
+  const [frozen, setFrozen] = useState(() => ({ key: snapshotKey, snapshot: takeSnapshot() }));
+  const refreeze = frozen.key !== snapshotKey;
+  const snapshot = refreeze ? takeSnapshot() : frozen.snapshot;
+  if (refreeze) setFrozen({ key: snapshotKey, snapshot });
   const order = snapshot.order;
   // The live rows, in the frozen order. A path the snapshot has not
   // seen yet sorts to the end rather than being dropped -- a worktree

@@ -18,6 +18,7 @@ export function QueryError({
   title,
   message,
   onRetry,
+  notAsked = false,
   report = false,
   reportView,
   reportDiagnostics,
@@ -27,6 +28,12 @@ export function QueryError({
   title: string;
   message?: string;
   onRetry?: () => void;
+  /// The caller already knows Headstate DECLINED this request (#2004):
+  /// its message has had the wire marker stripped upstream, so the kind
+  /// can no longer be read from it here. `title` is then the caller's
+  /// "not checked" title, and the action follows the reason, as for a
+  /// marker-carrying message.
+  notAsked?: boolean;
   /// Offer "Report this" beside the retry (#1148).
   ///
   /// OPT-IN rather than automatic, because not every failure is worth a
@@ -56,9 +63,19 @@ export function QueryError({
   // is stripped by `commandError`, so what reaches the screen is
   // display-ready in both arms -- a wire detail on screen is the failure
   // `cancelled.ts` exists because of.
+  //
+  // The retry is handed through, not dropped (#2004): whether it can
+  // work depends on the reason, and `NotAskedNotice` decides that per
+  // reason -- offered for a budget refusal, withheld for no credential.
   const err = message === undefined ? undefined : commandError(message);
-  if (err?.kind === "not-asked") {
-    return <NotAskedNotice message={err.message} />;
+  if (notAsked || err?.kind === "not-asked") {
+    return (
+      <NotAskedNotice
+        title={notAsked ? title : undefined}
+        message={err?.message ?? ""}
+        onRetry={onRetry}
+      />
+    );
   }
   return (
     <div
@@ -144,15 +161,4 @@ export function NarrowQueryError({
       </button>
     </div>
   );
-}
-
-/// Normalises whatever a rejected Tauri command threw into display prose.
-///
-/// Tauri surfaces a Rust `Err(String)` as a rejected promise carrying the
-/// bare string, but a transport-level failure rejects with an `Error`. Both
-/// reach this function, and neither should render as "[object Object]".
-export function errorMessage(err: unknown): string | undefined {
-  if (typeof err === "string") return err;
-  if (err instanceof Error) return err.message;
-  return undefined;
 }

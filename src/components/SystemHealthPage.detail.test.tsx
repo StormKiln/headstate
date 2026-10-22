@@ -154,7 +154,8 @@ vi.mock("@/api/tauri", async (orig) => ({
 }));
 
 import { SystemHealthPage } from "./SystemHealthPage";
-import { HEALTH_PAGES, SystemHealthSidebar, healthPagesFor } from "./SystemHealthSidebar";
+import { SystemHealthSidebar } from "./SystemHealthSidebar";
+import { HEALTH_PAGES, healthPagesFor } from "./healthPages";
 import { ALL_HEALTH_PAGES, useFilters } from "@/store/filters";
 
 const sample = (over: Partial<HealthSample> = {}): HealthSample => ({

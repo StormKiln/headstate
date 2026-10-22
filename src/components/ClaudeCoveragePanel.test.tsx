@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { ABSENCE, CoverageBody, ofTotal } from "./ClaudeCoveragePanel";
+import { CoverageBody } from "./ClaudeCoveragePanel";
+import { ABSENCE, ofTotal } from "./coverageCopy";
 import panelSource from "./ClaudeCoveragePanel.tsx?raw";
 import type { ClaudeCoverage, ClaudeMeasurement, ClaudeReach } from "@/types/pr";
 

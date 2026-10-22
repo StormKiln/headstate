@@ -6,7 +6,7 @@ import { PR_FIXTURES } from "./fixtures/prs";
 import { REQUIRED_PROTOCOL_VERSION } from "./lib/protocol";
 import { useFilters } from "./store/filters";
 import { useSourceSelection } from "./store/sourceSelection";
-import { sourceRepoKey } from "./components/SourceQueue";
+import { sourceRepoKey } from "./lib/sourceRows";
 import { stubViewport } from "./test-utils";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";

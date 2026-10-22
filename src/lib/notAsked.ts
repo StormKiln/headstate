@@ -43,3 +43,17 @@ export const NOT_ASKED = "headstate:not-asked";
 /// Read in one place only, `commandError` in `errorKind.ts`, which
 /// strips it. It must never reach the screen.
 export const AUTH_EXPIRED = "headstate:expired-token";
+
+/// The reason a request was declined because there is NO credential to
+/// send it with (#2004). Must match `AUTH_ERR_TEXT` in
+/// `src-tauri/src/commands.rs`; `mirroredConstants.test.ts` asserts it.
+///
+/// It is the one not-asked reason a retry can never clear: the token is
+/// read once at startup, so pressing "Try again" issues the same refused
+/// request. `notAskedRemedy` reads it to offer sign-in instead.
+export const NOT_AUTHENTICATED = "not authenticated: run `gh auth login`";
+
+/// A not-asked reason that is a property of how a source is set up, not
+/// of the moment (#2004). Written inline in `refresh_source_request` in
+/// `commands.rs`; `mirroredConstants.test.ts` asserts it is still there.
+export const SOURCE_NOT_ENABLED = "fetching is not enabled for this source";

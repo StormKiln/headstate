@@ -22,7 +22,8 @@ vi.mock("../api/hooks", () => ({
   }),
 }));
 
-const { McpSection, mcpInForce } = await import("./ClaudePluginsPage");
+const { McpSection } = await import("./ClaudePluginsPage");
+const { mcpInForce } = await import("../lib/mcpInForce");
 
 /// #1216: the configuration blind spot the app could not name.
 describe("the MCP section", () => {
