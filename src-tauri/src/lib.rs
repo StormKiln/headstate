@@ -723,6 +723,9 @@ pub fn run() {
                     let mut watcher = health::runaway::Watcher::default();
                     let mut last_pass = std::time::Instant::now();
                     loop {
+                        // Before the wait, so a sample or live pass that
+                        // never returns reads as stalled (#1937).
+                        background::HEALTH_SAMPLER.tick(std::time::Duration::from_secs(60));
                         std::thread::sleep(std::time::Duration::from_secs(60));
                         let sample = collector.sample(&chrono::Utc::now().to_rfc3339());
 

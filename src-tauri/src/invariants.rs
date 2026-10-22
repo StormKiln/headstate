@@ -2580,6 +2580,134 @@ static TABLE: &str = HIT_none_3;
     /// Sabotage: delete the `notify_claude_crash` call from the poll loop
     /// in `lib.rs`, or swap `crashed_sessions` for `crashed_already_known`
     /// there, and this names the failure.
+    /// Every `background::Task` static, as `(file, NAME, "key")`, from
+    /// production code only.
+    fn background_task_statics(files: &[(PathBuf, String)]) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (file, src) in files {
+            for line in production(file, src).lines().filter(|l| !is_comment(l)) {
+                let Some((head, tail)) = line.split_once("Task::new(\"") else {
+                    continue;
+                };
+                let Some(name) = head
+                    .split_once("static ")
+                    .and_then(|(_, rest)| rest.split_once(':'))
+                    .map(|(name, _)| name.trim())
+                else {
+                    continue;
+                };
+                let Some((key, _)) = tail.split_once('"') else {
+                    continue;
+                };
+                out.push((
+                    file.display().to_string(),
+                    name.to_string(),
+                    key.to_string(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every background loop's health task is on the page and is written
+    /// to by the loop it names (#1937).
+    ///
+    /// The defect: `snapshot_all` listed three tasks while seven loops
+    /// ran, so System Health called background work healthy while PR
+    /// polling had stopped. Its doc comment defended a fixed list as "a
+    /// lookup table with three entries" long after there were more.
+    ///
+    /// Derived, not enumerated: the `Task` statics are FOUND, so a new
+    /// one is checked without anyone adding it here. Two ways to get it
+    /// wrong, and each is a separate assertion:
+    ///
+    /// - declared and not in `snapshot_all` -- tracked, and never shown;
+    /// - declared and never referenced outside `background.rs` -- shown,
+    ///   and forever "not started", because nothing records to it.
+    ///
+    /// What it cannot see: a loop with no `Task` at all. A loop is not a
+    /// syntactic thing a scan can find without crying wolf at every
+    /// one-shot `spawn`, which is why the list's own unit test pins the
+    /// seven loops by name.
+    #[test]
+    fn every_background_task_is_reported_and_recorded() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let background = canonical(&root.join("background.rs"));
+        let files: Vec<(PathBuf, String)> = rust_files(&root)
+            .into_iter()
+            // By path, never by content: this file's own prose and
+            // fixtures name the pattern.
+            .filter(|f| !f.ends_with("invariants.rs"))
+            .map(|f| {
+                let src = std::fs::read_to_string(&f)
+                    .expect("read source")
+                    .replace("\r\n", "\n");
+                (f, src)
+            })
+            .collect();
+        let statics = background_task_statics(&files);
+        assert!(
+            statics.len() >= 7,
+            "found only {} background Task statics ({statics:?}); the scan \
+             has stopped seeing them, not the code stopped declaring them",
+            statics.len()
+        );
+
+        let reported: Vec<String> = crate::background::snapshot_all()
+            .into_iter()
+            .map(|t| t.task)
+            .collect();
+        let mut problems = Vec::new();
+        for (file, name, key) in &statics {
+            if !reported.contains(key) {
+                problems.push(format!(
+                    "{file}: `{name}` (\"{key}\") is not in `background::snapshot_all`, \
+                     so the page can never show it"
+                ));
+            }
+            let used = files.iter().any(|(f, src)| {
+                canonical(f) != background
+                    && production(f, src)
+                        .lines()
+                        .filter(|l| !is_comment(l))
+                        .any(|l| {
+                            l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|word| word == name)
+                        })
+            });
+            if !used {
+                problems.push(format!(
+                    "{file}: `{name}` (\"{key}\") is never recorded to outside \
+                     background.rs -- call `.tick`, `.ok`, `.failed` or `.record_cycle` \
+                     on it from the loop it names"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The negative direction: prose that names a task, and a static
+    /// declared inside a test module, are not declarations.
+    #[test]
+    fn the_task_scan_ignores_comments_and_test_code() {
+        let file = PathBuf::from("fixture.rs");
+        let src = "\
+/// `pub static DOC: Task = Task::new(\"doc\");` in a comment.
+// static LINE: Task = Task::new(\"line\");
+pub static REAL: Task = Task::new(\"real\");
+
+#[cfg(test)]
+mod tests {
+    static FIXTURE: Task = Task::new(\"fixture\");
+}
+"
+        .to_string();
+        assert_eq!(
+            background_task_statics(&[(file, src)]),
+            vec![("fixture.rs".into(), "REAL".into(), "real".into())]
+        );
+    }
+
     #[test]
     fn the_claude_crash_notifier_is_wired_and_reads_first_observations() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

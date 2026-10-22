@@ -1452,13 +1452,20 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
             let polls = polls.clone();
             let path = path.clone();
             let now = now.clone();
-            move |list| {
+            move |list, visible| {
                 let client = client.clone();
                 let polls = polls.clone();
                 let path = path.clone();
                 let now = now.clone();
                 let tx = tx.clone();
                 async move {
+                    // The clock no longer stops while hidden (#1935); the
+                    // production adapter applies `queue_continuation_due`,
+                    // under which these passes are not owed to a hidden
+                    // window, so the stand-in adapter declines them too.
+                    if !visible {
+                        return;
+                    }
                     let dispatch_now = now.load(Ordering::SeqCst);
                     tx.send(ContinuationEvent {
                         list,
@@ -1693,7 +1700,7 @@ async fn pending_continuation_allows_real_detail_and_review_and_cannot_erase_rec
             let client = client.clone();
             let path = path.clone();
             let polls = polls.clone();
-            move |list| {
+            move |list, _visible| {
                 let client = client.clone();
                 let path = path.clone();
                 let polls = polls.clone();
@@ -2379,13 +2386,20 @@ async fn completed_discovery_continuations_drain_terminal_inventory_within_budge
             let polls = polls.clone();
             let path = path.clone();
             let now = now.clone();
-            move |list| {
+            move |list, visible| {
                 let polls = polls.clone();
                 let client = client.clone();
                 let path = path.clone();
                 let now = now.clone();
                 let tx = tx.clone();
                 async move {
+                    // The clock no longer stops while hidden (#1935); the
+                    // production adapter applies `queue_continuation_due`,
+                    // under which these passes are not owed to a hidden
+                    // window, so the stand-in adapter declines them too.
+                    if !visible {
+                        return;
+                    }
                     let dispatch_now = now.load(Ordering::SeqCst);
                     tx.send(ContinuationEvent {
                         list,

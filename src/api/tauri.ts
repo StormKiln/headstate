@@ -1039,7 +1039,9 @@ export const backgroundPanicked = () => call<boolean>("background_panicked");
 
 /// One background loop's recent history (#1145).
 export interface TaskHealth {
-  /// A stable identifier: `health-sampler` or `claude-live`.
+  /// A stable identifier: `health-sampler`, `claude-live`, `claude-index`,
+  /// `github-poll`, `github-continuation`, `gitlab-poll` or
+  /// `claude-activity`.
   task: string;
   /// Failures since the last success. Zero means it is working now.
   consecutive_failures: number;
@@ -1058,7 +1060,18 @@ export interface TaskHealth {
   /// `null` means it has never succeeded, which with a non-zero failure
   /// count is a different state from "has not started yet" (#1042).
   last_success_ms: number | null;
-  /// Whether it has crossed the threshold that counts as broken.
+  /// Epoch milliseconds at which the loop last came round, whatever the
+  /// outcome; `null` before its first cycle.
+  ///
+  /// Optional, like `stalled`, because a phone may be paired with a
+  /// desktop that predates both (#1937); absent reads as "not reported",
+  /// never as a stall.
+  last_tick_ms?: number | null;
+  /// Past the deadline the loop set for its next cycle: stuck, not
+  /// failing (#1937). `false` before the first cycle and while the loop
+  /// is paused on purpose.
+  stalled?: boolean;
+  /// Whether it has crossed the failure threshold, or stalled.
   ///
   /// Carried rather than re-derived, so the page and any future
   /// notifier cannot disagree about what counts.
@@ -1067,9 +1080,9 @@ export interface TaskHealth {
 
 /// Whether the background loops are still doing their job.
 ///
-/// The health sampler and the Claude live pass both log their failures
-/// and carry on -- deliberately, so one cannot stop the other -- and
-/// neither had any path to the screen. A gap in the health chart could
+/// Every background loop logs its failures and carries on --
+/// deliberately, so one cannot stop another -- and none had any path to
+/// the screen. A gap in the health chart could
 /// mean the app was closed OR that the sampler ran every minute for an
 /// hour and failed to write every time, and the page said the former.
 export const backgroundHealth = () => call<TaskHealth[]>("background_health");

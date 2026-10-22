@@ -368,6 +368,9 @@ pub fn spawn(app: tauri::AppHandle) {
         let mut tick: u32 = 0;
         let mut enabled = false;
         loop {
+            // Health (#1937): the deadline is set before the wait, so a
+            // pass stuck in a stat reads as stalled.
+            crate::background::CLAUDE_ACTIVITY.tick(TICK);
             std::thread::sleep(TICK);
             if tick.is_multiple_of(REFRESH_EVERY) {
                 enabled = crate::commands::read_ui_prefs(&app).claude_integrations_enabled;
@@ -395,6 +398,9 @@ pub fn spawn(app: tauri::AppHandle) {
             for n in child_nudges {
                 let _ = app.emit(TRANSCRIPT_EVENT, &n);
             }
+            // A pass has no failure path: unreadable files are skipped
+            // per session. Finishing one is the success.
+            crate::background::CLAUDE_ACTIVITY.ok(crate::background::now_ms());
         }
     });
 }

@@ -376,6 +376,27 @@ async fn poll_queue(
     source_poll::complete_gitlab(app, publication, Ok(receipt));
 }
 
+/// One list's settled status as a health outcome for the loop.
+///
+/// `Retrying` counts as a failure even though its banner is held back:
+/// `FAILURES_BEFORE_DEGRADED` already waits out a single blip on its own.
+/// A list that was not asked, or is still fetching under a newer request,
+/// says nothing about this cycle.
+fn cycle(status: &source_poll::Status) -> crate::background::Cycle {
+    use crate::background::Cycle;
+    use source_poll::Phase;
+    match status.phase {
+        Phase::Ready | Phase::Partial | Phase::Unknown => Cycle::Ok,
+        Phase::Failed | Phase::Retrying => Cycle::Failed(crate::redact::redact(
+            status
+                .error
+                .as_deref()
+                .unwrap_or("The GitLab list could not be refreshed"),
+        )),
+        Phase::NotRequested | Phase::Fetching | Phase::NotAsked => Cycle::NotAsked,
+    }
+}
+
 /// Start once at desktop setup, independently of whether a GitHub client exists.
 /// Both queue loaders run concurrently, each with its own bounded page budget.
 /// Cadence uses the configured focused interval and its background multiplier.
@@ -392,6 +413,8 @@ pub fn spawn(
         loop {
             let selection = control.selected();
             let Some(source) = selection.source.as_ref() else {
+                // No GitLab source selected: waiting on purpose (#1937).
+                crate::background::GITLAB_POLL.park();
                 control.wake.notified().await;
                 continue;
             };
@@ -418,12 +441,24 @@ pub fn spawn(
                     &mut reviewing,
                 ),
             );
+            // The loop's health (#1937), read from the statuses the two
+            // loaders just settled rather than threaded back out of them.
+            let polls = app.state::<source_poll::SourcePolls>();
+            let outcomes = [CachedList::Authored, CachedList::Reviewing]
+                .map(|list| cycle(&polls.get(source, list)));
+            crate::background::announce_degraded(
+                &app,
+                &crate::background::GITLAB_POLL,
+                crate::background::GITLAB_POLL.record_cycle(&outcomes),
+            );
+            let sleep_for = crate::poll::interval_for_secs(
+                focused.load(Ordering::Relaxed),
+                interval_secs.load(Ordering::Relaxed),
+            );
+            crate::background::GITLAB_POLL.tick(sleep_for);
             tokio::select! {
                 _ = control.wake.notified() => {}
-                _ = tokio::time::sleep(crate::poll::interval_for_secs(
-                    focused.load(Ordering::Relaxed),
-                    interval_secs.load(Ordering::Relaxed),
-                )) => {}
+                _ = tokio::time::sleep(sleep_for) => {}
             }
         }
     });
