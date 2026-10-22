@@ -652,6 +652,14 @@ impl GitHubClient {
                 return BoundReviewOutcome::NotDispatched { message }
             }
             Err(ClientError::Graphql(message)) => return BoundReviewOutcome::Rejected { message },
+            // GitHub refused the token, so it did NOT apply the review: a
+            // definite refusal, never `Uncertain` (#2013). The message
+            // keeps the marker so the frontend offers sign-in, not a retry.
+            Err(error @ ClientError::TokenRejected { .. }) => {
+                return BoundReviewOutcome::Rejected {
+                    message: error.to_string(),
+                }
+            }
             Err(ClientError::Api(octocrab::Error::GitHub { source, .. }))
                 if source.status_code.is_client_error() =>
             {

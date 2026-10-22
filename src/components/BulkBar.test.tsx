@@ -7,6 +7,12 @@ import { PR_FIXTURES } from "@/fixtures/prs";
 import { useFilters } from "@/store/filters";
 import { renderWithQuery as render } from "@/test-utils";
 
+const target = vi.hoisted(() => ({ mobile: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() { return target.mobile; },
+  get IS_DESKTOP_BUILD() { return !target.mobile; },
+}));
+
 type Batch = (prs: [string, string, number][], action: string) => Promise<BatchOutcome[]>;
 const batch = vi.fn<Batch>(() => Promise.resolve([]));
 vi.mock("@/api/hooks", () => ({ useActOnPrs: () => batch }));
@@ -23,6 +29,7 @@ vi.mock("sonner", () => ({
 }));
 
 beforeEach(() => {
+  target.mobile = false;
   batch.mockClear();
   toastError.mockClear();
   toastSuccess.mockClear();
@@ -145,6 +152,33 @@ describe("BulkBar", () => {
     const [title, opts] = toastError.mock.calls[0] as [string, { description: string }];
     expect(title).toMatch(/1 of 2 failed/);
     expect(opts.description).toContain("not mergeable");
+  });
+
+  it.each([false, true])("explains rejected tokens in mixed bulk results (mobile=%s)", async (mobile) => {
+    target.mobile = mobile;
+    const [ok, expired, limited] = PR_FIXTURES;
+    select(ok, expired, limited);
+    batch.mockResolvedValueOnce([
+      { repo: ok.repo, number: ok.number, error: null },
+      { repo: expired.repo, number: expired.number,
+        error: "headstate:expired-token GitHub rejected the token: Bad credentials" },
+      { repo: limited.repo, number: limited.number,
+        error: "GitHub request failed: You have exceeded a secondary rate limit" },
+    ]);
+    render(<BulkBar prs={PR_FIXTURES} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close PRs" }));
+    confirm("Close PRs");
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    const [title, opts] = toastError.mock.calls[0] as [string, { description: string }];
+    expect(title).toBe("2 of 3 failed");
+    expect(opts.description).not.toContain("headstate:expired-token");
+    expect(opts.description).toContain(`${expired.repo}#${expired.number}: GitHub rejected the token: Bad credentials`);
+    expect(opts.description).toContain(mobile
+      ? "On the desktop, sign in with `gh auth login`, then relaunch Headstate there."
+      : "Sign in with `gh auth login`, then relaunch Headstate.");
+    expect(opts.description).toContain(`${limited.repo}#${limited.number}: GitHub request failed: You have exceeded a secondary rate limit`);
+    expect(useFilters.getState().checked).toEqual([prKey(expired), prKey(limited)]);
+    expect(toastSuccess).not.toHaveBeenCalled();
   });
 
   // Retrying should not repeat what already worked.

@@ -182,17 +182,31 @@ impl Drop for MutationEpoch<'_> {
     }
 }
 
+/// How every write path classifies an octocrab error (#2013).
+///
+/// - No response: the write may have landed, so `UnconfirmedWrite`.
+/// - A 401: GitHub refused the token and did NOT apply the write, so
+///   `TokenRejected` -- by the same rule reads use
+///   (`read_transport::token_rejected`), so the sign-in remedy appears
+///   for a refused approve or merge exactly as for a refused poll.
+/// - Anything else GitHub answered: `Api`, as before. A 403 rate or
+///   secondary limit is here and never `TokenRejected`.
 fn write_error(error: octocrab::Error) -> ClientError {
     if is_transport_error(&error) {
         ClientError::UnconfirmedWrite
-    } else if matches!(&error, octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401)
-    {
-        ClientError::TokenRejected {
-            said: "HTTP 401".into(),
-        }
+    } else if let Some(rejected) = super::read_transport::token_rejected(&error) {
+        rejected
     } else {
         ClientError::Api(error)
     }
+}
+
+/// GitHub's "Bad credentials" in a GraphQL `errors` array: the shape a
+/// refused token takes when it arrives as a 200 rather than a 401. Read
+/// off GitHub's body, not our own `Display`, and shared by the read and
+/// write paths so they agree (#1230, #2013).
+fn graphql_bad_credentials(message: &str) -> bool {
+    message.to_lowercase().contains("bad credentials")
 }
 
 fn is_transport_error(e: &octocrab::Error) -> bool {
@@ -1483,6 +1497,19 @@ impl GitHubClient {
                 .body_to_string(response)
                 .await
                 .map_err(write_error)?;
+            // A 401 is GitHub refusing the token, so the write was NOT
+            // applied -- whatever the body says, and even if it is not
+            // JSON. Decided on the status, like every other 401 (#2013);
+            // the body only supplies GitHub's own words.
+            if status == 401 {
+                admission.complete();
+                return Err(ClientError::TokenRejected {
+                    said: serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| v["message"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "HTTP 401".into()),
+                });
+            }
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|_| ClientError::UnconfirmedWrite)?;
             // PUT's non-success JSON is a semantic answer consumed by its caller.
@@ -1567,12 +1594,9 @@ impl GitHubClient {
         );
         let raw: serde_json::Value = match posted {
             Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                if is_transport_error(&error) {
-                    return Err(ClientError::UnconfirmedWrite);
-                }
-                return Err(ClientError::Api(error));
-            }
+            // The REST writes' rule, so a 401 is `TokenRejected` here too
+            // (#2013) rather than "GitHub request failed".
+            Ok(Err(error)) => return Err(write_error(error)),
             Err(_) => return Err(ClientError::UnconfirmedWrite),
         };
 
@@ -1588,6 +1612,13 @@ impl GitHubClient {
                     .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
                     .collect::<Vec<_>>()
                     .join("; ");
+                // A refused token in the 200 shape: nothing was applied,
+                // and the remedy is signing in, as for a 401 (#2013).
+                if raw.get("data").is_none_or(serde_json::Value::is_null)
+                    && graphql_bad_credentials(&msg)
+                {
+                    return Err(ClientError::TokenRejected { said: msg });
+                }
                 return Err(ClientError::Graphql(if msg.is_empty() {
                     "GitHub refused the change".to_string()
                 } else {
@@ -2192,7 +2223,7 @@ async fn graphql_with_transport(
             // point the condition is first known, GitHub's body is the
             // only evidence that exists at this shape, and it is decided
             // once rather than re-derived at every consumer.
-            if msg.to_lowercase().contains("bad credentials") {
+            if graphql_bad_credentials(&msg) {
                 return Err(ClientError::TokenRejected { said: msg });
             }
             Err(ClientError::Graphql(if msg.is_empty() {
@@ -4748,6 +4779,112 @@ mod tests {
         assert!(err.to_string().starts_with(crate::commands::AUTH_EXPIRED));
     }
 
+    /// Drive one write transport: 0 GraphQL mutation, 1 REST POST with a
+    /// body (create PR), 2 REST PUT (stack merge), 3 bodiless REST POST
+    /// (rerun checks).
+    async fn write_through(client: &GitHubClient, kind: usize) -> Result<(), ClientError> {
+        match kind {
+            0 => client
+                .graphql_mutation_inner(&json!({"query":"mutation Synthetic {}"}))
+                .await
+                .map(|_| ()),
+            1 => client
+                .rest_post_json("/synthetic", &json!({}))
+                .await
+                .map(|_| ()),
+            2 => client
+                .rest_put("/synthetic", &json!({}), &client.request_budget())
+                .await
+                .map(|_| ()),
+            _ => client.rest_post("/synthetic").await,
+        }
+    }
+
+    /// A 401 on a WRITE is a rejected token, exactly as on a read (#2013).
+    ///
+    /// The GraphQL mutation path mapped it to `Api` -- "GitHub request
+    /// failed" with a retry that sends the same dead token -- and the
+    /// stack-merge PUT handed `(401, body)` back as an answer. A 401 also
+    /// means GitHub did NOT apply the write, so it must never read as the
+    /// uncertain outcome a stalled write gets, and is sent exactly once.
+    #[tokio::test]
+    async fn a_401_on_every_write_is_a_rejected_token_not_an_uncertain_outcome() {
+        for kind in 0..4 {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                    "message": "Bad credentials"
+                })))
+                .expect(1)
+                .named("exactly one attempt")
+                .mount(&server)
+                .await;
+            let err = write_through(&bound_client_for(&server).await, kind)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ClientError::TokenRejected { said } if said == "Bad credentials"),
+                "write {kind}: a 401 must be a rejected token, got {err:?}"
+            );
+            assert!(
+                err.to_string().starts_with(crate::commands::AUTH_EXPIRED),
+                "write {kind}: the marker must lead: {err}"
+            );
+            assert!(!err.is_transient(), "write {kind}");
+        }
+    }
+
+    /// The 200 shape of a refused token on a mutation: no data, "Bad
+    /// credentials" in `errors`. Same variant as the read path gives it.
+    #[tokio::test]
+    async fn bad_credentials_in_a_mutation_body_is_a_rejected_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": null,
+                "errors": [{ "message": "Bad credentials" }]
+            })))
+            .mount(&server)
+            .await;
+        let err = write_through(&bound_client_for(&server).await, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::TokenRejected { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A 403 rate or secondary limit on a write is NOT a rejected token
+    /// (#2013): signing in clears neither, and the sign-in remedy would
+    /// withhold the retry that works after the reset.
+    #[tokio::test]
+    async fn a_403_limit_on_a_write_is_not_a_rejected_token() {
+        for kind in 0..4 {
+            for retry_after in [Some("60"), None] {
+                let server = MockServer::start().await;
+                let mut response = ResponseTemplate::new(403).set_body_json(json!({
+                    "message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+                }));
+                if let Some(seconds) = retry_after {
+                    response = response.insert_header("retry-after", seconds);
+                }
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+                let result = write_through(&bound_client_for(&server).await, kind).await;
+                assert!(
+                    !matches!(result, Err(ClientError::TokenRejected { .. })),
+                    "write {kind}, retry-after {retry_after:?}: got {result:?}"
+                );
+                if let Err(err) = result {
+                    assert!(!err.to_string().contains(crate::commands::AUTH_EXPIRED));
+                }
+            }
+        }
+    }
+
     /// A 5xx is not a rejected token either, and stays transient.
     ///
     /// `server_gave_up` and `is_transient` both already depend on the
@@ -5973,6 +6110,49 @@ mod tests {
             BoundReviewOutcome::NotDispatched { .. }
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    /// A review GitHub refused for the token was NOT applied (#2013): it is
+    /// `Rejected` -- carrying the marker so the frontend offers sign-in --
+    /// never `Uncertain`, which would hold the review as unresolved and
+    /// tell the user to check GitHub for a write that cannot have landed.
+    /// Both shapes: an HTTP 401, and "Bad credentials" in a 200 body.
+    #[tokio::test]
+    async fn head_bound_review_with_a_rejected_token_is_rejected_not_uncertain() {
+        use super::super::mutate::{BoundReviewOutcome, BoundReviewRequest};
+        let request = BoundReviewRequest {
+            id: "PR-7".into(),
+            repo: "fixture/project".into(),
+            number: 7,
+            verdict: "approve".into(),
+            body: String::new(),
+            expected_head: "viewed-head".into(),
+            expected_viewer: "fixture".into(),
+        };
+        for (status, body) in [
+            (401, json!({"message":"Bad credentials"})),
+            (
+                200,
+                json!({"data":null,"errors":[{"message":"Bad credentials"}]}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let outcome = bound_client_for(&server)
+                .await
+                .add_review_at_head(&request)
+                .await;
+            match outcome {
+                BoundReviewOutcome::Rejected { message } => assert!(
+                    message.starts_with(crate::commands::AUTH_EXPIRED),
+                    "status {status}: the marker must lead: {message}"
+                ),
+                other => panic!("status {status}: expected Rejected, got {other:?}"),
+            }
+        }
     }
     #[tokio::test]
     async fn head_bound_review_timeout_is_uncertain_once_and_cooldown_never_dispatches() {

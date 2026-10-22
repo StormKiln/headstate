@@ -1,3 +1,5 @@
+import { actionFailure } from "../lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "../lib/target";
 import { prKey } from "../lib/prIdentity";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -155,7 +157,7 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
           clearChecked();
         } else {
           toast.error(`${failed.length} of ${outcomes.length} failed`, {
-            description: failed.map((f) => `${f.repo}#${f.number}: ${f.error}`).join("\n"),
+            description: failed.map((f) => `${f.repo}#${f.number}: ${actionFailure(f.error ?? undefined, IS_MOBILE_BUILD)}`).join("\n"),
           });
           // Keep the failures selected so they can be retried; drop the
           // ones that worked, or a retry would repeat them.

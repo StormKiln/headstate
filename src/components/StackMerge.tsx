@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
+import { actionFailure } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useMergeStack } from "../api/hooks";
 import { numberList } from "../lib/stack";
 import type { PrDetail, StackMember } from "../types/pr";
@@ -94,7 +96,7 @@ export function StackMerge({
       (e: unknown) => {
         setBusy(false);
         toast.error(`Could not submit the stack for #${pr.number}`, {
-          description: typeof e === "string" ? e : undefined,
+          description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
         });
       },
     );

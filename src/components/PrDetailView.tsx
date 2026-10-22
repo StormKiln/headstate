@@ -8,6 +8,8 @@ import { ExternalLink } from "./ExternalLink";
 import { PrDetailNavigation } from "./PrDetailNavigation";
 import { ArrowLeft, Trash2, Check, CircleDot, CircleSlash, ExternalLink as ExternalLinkIcon, X } from "lucide-react";
 import { toast } from "sonner";
+import { actionFailure } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import {
   useClaudeSessionsForPr,
   useCommentOnPr,
@@ -364,7 +366,7 @@ function PrDetailIdentity({
         // your own pull request" tells the user exactly what
         // happened where a generic message would not.
         toast.error(`Could not review #${pr.number}`, {
-          description: e instanceof Error ? e.message : String(e),
+          description: actionFailure(e instanceof Error ? e.message : String(e), IS_MOBILE_BUILD),
         });
       },
     );
@@ -733,7 +735,7 @@ function PrDetailIdentity({
                       // workflow run cannot be retried" says exactly why
                       // where a generic message would not.
                       toast.error(`Could not re-run checks on #${pr.number}`, {
-                        description: e instanceof Error ? e.message : String(e),
+                        description: actionFailure(e instanceof Error ? e.message : String(e), IS_MOBILE_BUILD),
                       });
                     },
                   );
@@ -954,7 +956,7 @@ function PrDetailIdentity({
                     (e: unknown) => {
                       if (!active.current) return;
                       toast.error(`Could not delete ${pr.head_ref}`, {
-                        description: e instanceof Error ? e.message : String(e),
+                        description: actionFailure(e instanceof Error ? e.message : String(e), IS_MOBILE_BUILD),
                       });
                     },
                   );

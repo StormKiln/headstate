@@ -4,6 +4,8 @@ import { copyText } from "../lib/clipboard";
 import { Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { actionFailure } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useActOnPr, useSetAutoMerge, useUpdatePrBranch } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
 import { stackBlocksQueue, stackFactsFromList } from "../lib/stack";
@@ -133,7 +135,7 @@ export function PrKebab({
                       ),
                     (e: unknown) =>
                       toast.error(`Could not undo #${pr.number}`, {
-                        description: typeof e === "string" ? e : undefined,
+                        description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
                       }),
                   );
                 },
@@ -143,7 +145,7 @@ export function PrKebab({
       },
       (e: unknown) =>
         toast.error(`Could not ${VERB[action]} #${pr.number}`, {
-          description: typeof e === "string" ? e : undefined,
+          description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
         }),
     );
   };
@@ -221,7 +223,7 @@ export function PrKebab({
                   () => toast.success(`${pr.repo}#${pr.number} will merge when green`),
                   (e: unknown) =>
                     toast.error(`Could not enable auto-merge on #${pr.number}`, {
-                      description: typeof e === "string" ? e : undefined,
+                      description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
                     }),
                 );
               }}
@@ -241,7 +243,7 @@ export function PrKebab({
                   () => toast.success(`${pr.repo}#${pr.number} updated from base`),
                   (e: unknown) =>
                     toast.error(`Could not update #${pr.number}`, {
-                      description: typeof e === "string" ? e : undefined,
+                      description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
                     }),
                 );
               }}
