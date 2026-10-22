@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
+import { actionFailure } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useActOnPr } from "../api/hooks";
 import type { PrActionName } from "../api/tauri";
 import { stackBlocksMerge, stackBlocksQueue, stackGate, stackMergePlan } from "../lib/stack";
@@ -145,7 +147,7 @@ export function PrActions({
                     (e: unknown) => {
                       setBusy(null);
                       toast.error(`Could not undo #${pr.number}`, {
-                        description: typeof e === "string" ? e : undefined,
+                        description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
                       });
                     },
                   );
@@ -160,7 +162,7 @@ export function PrActions({
         // modified" tells the user what to do, where a generic message
         // does not.
         toast.error(`Could not ${VERB[action]} #${pr.number}`, {
-          description: typeof e === "string" ? e : undefined,
+          description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD),
         });
       },
     );

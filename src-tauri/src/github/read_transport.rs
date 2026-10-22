@@ -54,15 +54,32 @@ fn operation(body: &Value) -> &'static str {
     }
 }
 
+/// GitHub refused the token, read off the HTTP status (#1230).
+///
+/// The one rule for a 401, shared by reads (`map_error`) and writes
+/// (`client.rs`'s `write_error`, #2013) so the two cannot drift: a
+/// GraphQL write refused for its token surfaced as a generic `Api`
+/// failure while the identical read offered the sign-in remedy. A 403 is
+/// never this -- rate and secondary limits, SAML and missing scopes all
+/// answer 403, and signing in clears none of them.
+pub(super) fn token_rejected(error: &octocrab::Error) -> Option<ClientError> {
+    match error {
+        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401 => {
+            Some(ClientError::TokenRejected {
+                said: source.message.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn map_error(error: octocrab::Error) -> ClientError {
+    if let Some(rejected) = token_rejected(&error) {
+        return rejected;
+    }
     match &error {
         octocrab::Error::Serde { .. } | octocrab::Error::Json { .. } => {
             ClientError::NotJson("non-JSON response".into())
-        }
-        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 401 => {
-            ClientError::TokenRejected {
-                said: source.message.clone(),
-            }
         }
         _ => ClientError::Api(error),
     }

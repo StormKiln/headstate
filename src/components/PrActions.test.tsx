@@ -8,8 +8,19 @@ const toastError = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/hooks", () => ({ useActOnPr: () => actFn }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
+const target = vi.hoisted(() => ({ mobile: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() {
+    return target.mobile;
+  },
+  get IS_DESKTOP_BUILD() {
+    return !target.mobile;
+  },
+}));
 
 import { PrActions } from "./PrActions";
+import { AUTH_EXPIRED } from "@/lib/notAsked";
+import { signInRemedy } from "@/lib/notAskedRemedy";
 import { settle } from "@/test/settle";
 
 const pr = (over: Partial<PrDetail> = {}): PrDetail => ({
@@ -243,6 +254,43 @@ describe("PrActions", () => {
         expect.objectContaining({
           description: "Base branch was modified. Review and try the merge again.",
         }),
+      ),
+    );
+  });
+
+  /// #2013: a write GitHub refused for the token says to sign in, on the
+  /// desktop and on the phone, and offers no retry -- the token is read
+  /// once at startup, so repeating the action sends the same dead one.
+  it("sends a merge refused for the token to sign-in, with no retry", async () => {
+    for (const mobile of [false, true]) {
+      target.mobile = mobile;
+      toastError.mockClear();
+      actFn.mockImplementationOnce(() =>
+        Promise.reject(`${AUTH_EXPIRED} GitHub rejected the token: Bad credentials`),
+      );
+      render(<PrActions pr={pr()} />);
+      fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+      await waitFor(() => expect(toastError).toHaveBeenCalled());
+      const [, options] = toastError.mock.calls[0] as unknown as [string, { description?: string; action?: unknown }];
+      expect(options.description).toContain(signInRemedy(mobile));
+      expect(options.description).not.toContain(AUTH_EXPIRED);
+      expect(options.action, "no Try again").toBeUndefined();
+      cleanup();
+    }
+    target.mobile = false;
+  });
+
+  /// A 403 rate or secondary limit is not a refused token: it reads as
+  /// before, with no sign-in remedy.
+  it("leaves a rate-limited merge's refusal as GitHub worded it", async () => {
+    const limited = "GitHub request failed: You have exceeded a secondary rate limit";
+    actFn.mockImplementationOnce(() => Promise.reject(limited));
+    render(<PrActions pr={pr()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        expect.stringContaining("42"),
+        expect.objectContaining({ description: limited }),
       ),
     );
   });

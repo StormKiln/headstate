@@ -80,3 +80,20 @@ export function sourceBanner(
     remedy: tokenRejected || err?.kind === "expired-token" ? "sign-in" : "retry",
   };
 }
+
+/// The description a failed ACTION's toast shows -- approve, merge,
+/// review, rerun, update branch, any write (#2013).
+///
+/// `raw` is the rejection exactly as the call site already rendered it
+/// (`undefined` stays `undefined`). The wire marker is stripped, and when
+/// GitHub refused the token (the `expired-token` kind, decided in Rust on
+/// the HTTP 401 as `ClientError::TokenRejected`) the sign-in remedy is
+/// appended: the token is read once at startup, so repeating the action
+/// sends the same refused credential (#1050). Action toasts offer no
+/// "Try again", and this adds none. A 403 rate or secondary limit is not
+/// that kind, so it reads exactly as before.
+export function actionFailure(raw: string | undefined, mobile: boolean): string | undefined {
+  if (raw === undefined) return undefined;
+  const err = commandError(raw);
+  return err.kind === "expired-token" ? `${err.message}. ${signInRemedy(mobile)}` : err.message;
+}

@@ -18,7 +18,7 @@
 //! is not "it did not work".
 
 use super::budget::Budget;
-use super::client::GitHubClient;
+use super::client::{ClientError, GitHubClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -169,12 +169,18 @@ impl GitHubClient {
 
         // A transport failure on the SUBMIT leaves it unknown whether GitHub
         // took the request, so the message says that rather than "failed".
-        let (status, answer) = self.rest_put(&path, &body, budget).await.map_err(|e| {
-            format!(
-                "No answer from GitHub ({e}), so the stack may or may not have been \
-                 submitted. Check the pull request on GitHub before trying again."
-            )
-        })?;
+        let (status, answer) = self
+            .rest_put(&path, &body, budget)
+            .await
+            .map_err(|e| match e {
+                // GitHub answered, refusing the token: nothing was submitted,
+                // and the marker carries the sign-in remedy (#2013).
+                ClientError::TokenRejected { .. } => e.to_string(),
+                _ => format!(
+                    "No answer from GitHub ({e}), so the stack may or may not have been \
+                     submitted. Check the pull request on GitHub before trying again."
+                ),
+            })?;
         let uuid = match read(status, &answer)? {
             Reading::Done(outcome) => return Ok(outcome),
             Reading::Pending { uuid } => uuid,
@@ -257,6 +263,40 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// A 401 on the submit is a refused token, so nothing was submitted
+    /// (#2013): the error carries the sign-in marker, and never the "may
+    /// or may not have been submitted" wording of a write with no answer.
+    #[tokio::test]
+    async fn a_401_on_submit_is_a_rejected_token_not_an_unknown_submission() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(PUT_PATH))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({ "message": "Bad credentials" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = client_for(&server)
+            .await
+            .merge_stack_with(
+                "acme/widgets",
+                30,
+                StackMergeAction::DirectMerge,
+                "abc123",
+                &Budget::new(),
+                Duration::from_millis(5),
+                Duration::from_millis(500),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with(crate::commands::AUTH_EXPIRED),
+            "the marker must lead: {err}"
+        );
+        assert!(!err.contains("may or may not"), "{err}");
     }
 
     /// The queue path asks for the QUEUE, with the head the user saw, and

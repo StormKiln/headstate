@@ -3,6 +3,8 @@ import { commentKeys } from "../lib/commentIdentity";
 import { useEffect, useRef, useState } from "react";
 import { ChevronRight, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
+import { actionFailure } from "@/lib/notAskedRemedy";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import type { ReviewThread } from "@/types/pr";
 import { Markdown } from "./Markdown";
 import { relativeTime } from "@/lib/time";
@@ -150,7 +152,7 @@ function ThreadCard({ thread, repo, number, forceOpen = false, actionsDisabled =
         setBusy(false);
         // GitHub's own refusal is the useful part -- a generic message
         // hides which permission was missing.
-        toast.error(bad, { description: typeof e === "string" ? e : undefined });
+        toast.error(bad, { description: actionFailure(typeof e === "string" ? e : undefined, IS_MOBILE_BUILD) });
       },
     );
   };
