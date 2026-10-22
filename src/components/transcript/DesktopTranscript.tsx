@@ -28,7 +28,7 @@ import { claudeTranscriptBlockText } from "../../api/tauri";
 import { useFilters } from "../../store/filters";
 import type { ClaudeWaiting, Liveness } from "../../types/pr";
 import type { TranscriptMessage, TranscriptSubagent } from "../../types/transcript";
-import { errorMessage } from "../QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { Composer } from "./Composer";
 import { FollowStatus } from "./FollowStatus";
 import { earlierCallLoader } from "./loadEarlier";

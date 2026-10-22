@@ -38,7 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 import { ArtifactsPage } from "./ArtifactsPage";
-import { VENV_GROUP } from "./ArtifactSidebar";
+import { VENV_GROUP } from "./artifactGroups";
 
 const venv = (project: string, state: Venv["state"] = "orphaned"): Venv => ({
   path: `/venvs/${project}-py3.12`,

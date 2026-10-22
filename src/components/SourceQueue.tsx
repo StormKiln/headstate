@@ -18,37 +18,15 @@ import { relativeSeconds } from "../lib/time";
 import { signInRemedy, type NotAskedRemedy } from "../lib/notAskedRemedy";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import { useFilters, useActiveFilters, type View } from "../store/filters";
-import { applyFilters, deriveStacked, type Filters } from "../lib/derive";
-import { filterGitLab, gitlabParents } from "../lib/gitlabFilters";
+import { deriveStacked } from "../lib/derive";
+import { gitlabParents } from "../lib/gitlabFilters";
+import { combinedRows, sourceRepoKey, type Row } from "../lib/sourceRows";
 import { FilterBar } from "./FilterBar";
 import { BulkBar } from "./BulkBar";
 import { useRowCursor } from "../lib/useRowCursor";
 import { GitLabDetail } from "./GitLabDetail";
 import { GitLabBulkActions } from "./GitLabBulkActions";
 import { getGitLabDetail } from "../api/tauri";
-
-type Row = { kind: "github"; value: PullRequest } | { kind: "gitlab"; value: MergeRequest };
-
-export function sourceRepoKey(row: PrIdentity): string {
-  const source = row.source ?? { provider: "github", host: "github.com" };
-  return JSON.stringify([source.provider, source.host, row.repo]);
-}
-
-export function combinedRows(github: PullRequest[], gitlab: MergeRequest[], selection: SourceSelection, repoKey: string | null, query: string, filters: Filters = {}): Row[] {
-  const all: Row[] = [
-    ...(selection === "gitlab" ? [] : applyFilters(github, filters).map((value): Row => ({ kind: "github", value }))),
-    ...(selection === "github" ? [] : filterGitLab(gitlab, filters).map((value): Row => ({ kind: "gitlab", value }))),
-  ];
-  const needle = query.toLowerCase().trim();
-  return all.filter(({ value }) =>
-    (repoKey === null || sourceRepoKey(value) === repoKey) &&
-    (!needle || value.title.toLowerCase().includes(needle) || value.repo.toLowerCase().includes(needle) || String(value.number) === needle.replace(/^#|^!/, "")),
-  ).sort((a, b) => {
-    const field = filters.sort === "recently-updated" || filters.sort === "least-recently-updated" ? "updated_at" : "created_at";
-    const direction = filters.sort === "oldest" || filters.sort === "least-recently-updated" ? 1 : -1;
-    return direction * (Date.parse(a.value[field]) - Date.parse(b.value[field])) || prKey(a.value).localeCompare(prKey(b.value));
-  });
-}
 
 function coverageMessage(provider: string, coverage: SourceCoverage | null, count: number): string | null {
   if (coverage === null || coverage === "unknown") return `${provider} could not confirm whether this list is complete.`;

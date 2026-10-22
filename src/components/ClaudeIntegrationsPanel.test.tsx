@@ -45,7 +45,8 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyFn }));
 vi.mock("@/api/tauri", () => ({ claudeRevealPath: revealFn }));
 vi.mock("@/lib/target", () => ({ IS_MOBILE_BUILD: false }));
 
-import { ClaudeIntegrationsPanel, refusalPath, statusLine } from "./ClaudeIntegrationsPanel";
+import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
+import { refusalPath, statusLine } from "./hooksStatus";
 
 const PREFS: UiPrefs = {
   hidden_views: [],

@@ -4,11 +4,11 @@ import { useClaudeDefinitions, useClaudeMcpServers, useClaudePlugins } from "../
 import type {
   ClaudeDefinition,
   ClaudeDefinitionSource,
-  ClaudeMcpServer,
   ClaudeMcpTransport,
   ClaudeSettingsOrigin,
 } from "../api/tauri";
 import { definitionSourceLabel } from "../lib/definitionSource";
+import { mcpInForce } from "../lib/mcpInForce";
 import { relativeTime } from "../lib/time";
 import type {
   InstalledPlugin,
@@ -18,7 +18,8 @@ import type {
   PluginsReport,
 } from "../types/pr";
 import { PartialScanNotice } from "./PartialScanNotice";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { PluginCallsChart } from "./stats/PluginCallsChart";
 
 /// How many days the plugin activity chart covers.
@@ -842,29 +843,6 @@ const MCP_ORIGIN_LABEL: Record<ClaudeSettingsOrigin, string> = {
   local: ".claude/settings.local.json",
   plugin: "a plugin's .mcp.json",
 };
-
-/// Whether a server applies in the selected repository.
-///
-/// The per-repository half of #1216. User-scope and plugin-scope
-/// servers apply everywhere; a project-scope server applies only to the
-/// project it was configured under. Mirrors
-/// `claude::mcp::Inventory::in_force`, whose doc comment argues the
-/// trailing-separator rule, why no symlink is resolved, and why the
-/// rule deliberately exists on both sides. A change here is a change
-/// there.
-///
-/// `null` when no repository is selected -- the question has no subject
-/// then, and answering it anyway would mark rows as out of force for a
-/// repository the user has not named.
-export function mcpInForce(server: ClaudeMcpServer, repo: string | undefined): boolean | null {
-  if (repo === undefined) return null;
-  if (server.origin !== "project") return true;
-  // BOTH separators, matching `claude::mcp::normalise`. Trimming only
-  // `/` is correct on Unix and wrong on Windows, where the same project
-  // would be reported twice with the second showing nothing.
-  const trim = (p: string) => p.replace(/[/\\]+$/, "");
-  return server.scopeDetail !== null && trim(server.scopeDetail) === trim(repo);
-}
 
 /// One server's transport, for display.
 function transportText(t: ClaudeMcpTransport): string {

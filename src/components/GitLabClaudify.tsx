@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { GitLabDetail } from "../types/gitlabActions";
-import { PrClaudifyDialogs, startClaudify, unavailableReason, useClaudifyCheckout, type PrClaudifyDialog } from "./PrClaudify";
+import { PrClaudifyDialogs } from "./PrClaudify";
+import { startClaudify, unavailableReason, useClaudifyCheckout, type PrClaudifyDialog } from "./claudifyStart";
 
 /** Reuse the same checkout validation, quoting, launch preview and mobile flow. */
 export function GitLabClaudify({ detail }: { detail: GitLabDetail }) {

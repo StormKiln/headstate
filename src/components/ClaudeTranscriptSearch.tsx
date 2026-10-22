@@ -39,7 +39,7 @@ import type { PopulationProgress } from "../types/pr";
 import { useState } from "react";
 
 import { useClaudeIndexCoverage, useClaudeTranscriptSearch } from "../api/hooks";
-import { errorMessage } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { MaskedText } from "./MaskedText";
 import { maskingNote, unsearchedNote } from "@/lib/masked";
 

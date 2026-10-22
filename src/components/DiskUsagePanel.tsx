@@ -3,7 +3,7 @@ import { useState } from "react";
 import { useDiskInventory } from "../api/useDiskInventory";
 import { claudeRevealPath } from "../api/tauri";
 import { IS_MOBILE_BUILD } from "../lib/target";
-import { errorMessage } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import type { DiskObservation } from "../types/disk";
 function size(value: string | null, unit: "GiB" | "GB"): string {
     if (value === null)

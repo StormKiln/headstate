@@ -76,4 +76,9 @@ function TabsContent({ className, ...props }: TabsPrimitive.Panel.Props) {
   )
 }
 
+// A shadcn registry file (`make shadcn-add`), kept in the registry's shape,
+// which exports its variants beside its components. Splitting it would
+// diverge from the registry and be undone by the next re-add; the cost is
+// only dev hot-reload of this one file (#1965).
+// eslint-disable-next-line react-refresh/only-export-components
 export { Tabs, TabsList, TabsTrigger, TabsContent, tabsListVariants }

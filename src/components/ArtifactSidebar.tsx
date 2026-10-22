@@ -1,30 +1,11 @@
 import { HardDrive } from "lucide-react";
-import type { ArtifactKind } from "@/types/pr";
 import { useFilters, useActiveFilters } from "@/store/filters";
 import { useArtifacts, useArtifactSizes, useVenvs, useVenvSizes } from "@/api/hooks";
 import { current } from "@/lib/ariaCurrent";
 import { NarrowQueryError } from "./QueryError";
 import { ViewSwitcher } from "./ViewSwitcher";
 import { formatSize } from "@/lib/worktrees";
-
-/// The venv "kind", which is not an `ArtifactKind` -- virtualenvs are a
-/// tool cache rather than build output, and giving them a fake kind in
-/// that enum would put them behind the manifest rules that decide what
-/// counts as an artifact.
-export const VENV_GROUP = "poetry-venvs";
-
-/// A group id: either a build-artifact kind or the venv group.
-export type ArtifactGroup = ArtifactKind | typeof VENV_GROUP;
-
-export const GROUP_LABEL: Record<ArtifactGroup, string> = {
-  cargo_target: "Rust targets",
-  node_modules: "Node modules",
-  terraform: "Terraform providers",
-  dotnet_build: ".NET build output",
-  build_output: "Build output",
-  swift_build: "Swift builds",
-  [VENV_GROUP]: "Poetry virtualenvs",
-};
+import { GROUP_LABEL, VENV_GROUP, type ArtifactGroup } from "./artifactGroups";
 
 /// One sidebar entry per kind actually FOUND, largest first.
 ///

@@ -47,7 +47,8 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("../api/tauri", () => ({ claudeRevealPath: vi.fn() }));
 
-import { CLAUDE_PAGES, ClaudeCodeSidebar } from "./ClaudeCodeSidebar";
+import { ClaudeCodeSidebar } from "./ClaudeCodeSidebar";
+import { CLAUDE_PAGES } from "./claudePages";
 
 /// One LIST row. The detail half is not built here: this file renders
 /// `ClaudeSessionColumn`, which since #985 receives only what the list

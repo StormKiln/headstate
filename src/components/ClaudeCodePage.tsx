@@ -55,7 +55,8 @@ import { ROW_HEIGHT } from "@/lib/virtualWindow";
 import {
   formatSize, pathBasename, safetyReason, sessionWorktree } from "@/lib/worktrees";
 import { type ClaudeSessionFilter, useFilters } from "@/store/filters";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { ExternalLink } from "./ExternalLink";
 import { MaskedText } from "./MaskedText";
 import { PhoneTranscript } from "./transcript/phone/PhoneTranscript";
@@ -405,7 +406,7 @@ export function ClaudeCodePage() {
 /// out of 1,474, and the missing rows are the ones whose directory could
 /// not be checked. The counts beside the chips are what makes that visible
 /// rather than a silent shortfall.
-export function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilter): boolean {
+function matchesClaudeFilter(s: ClaudeSession, filter: ClaudeSessionFilter): boolean {
   switch (filter) {
     case "all":
       return true;

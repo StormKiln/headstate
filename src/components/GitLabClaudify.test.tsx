@@ -2,12 +2,12 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import type { GitLabDetail } from "../types/gitlabActions";
 const controls = vi.hoisted(() => ({ lookup: vi.fn(), start: vi.fn() }));
-vi.mock("./PrClaudify", () => ({
+vi.mock("./claudifyStart", () => ({
   useClaudifyCheckout: controls.lookup,
   startClaudify: controls.start,
   unavailableReason: () => null,
-  PrClaudifyDialogs: () => null,
 }));
+vi.mock("./PrClaudify", () => ({ PrClaudifyDialogs: () => null }));
 import { GitLabClaudify } from "./GitLabClaudify";
 it("uses the host and full namespace with the existing guarded launch flow", () => {
   controls.lookup.mockReturnValue({ checkout: { kind: "found", path: "/code/project" }, terminalConfigured: true });

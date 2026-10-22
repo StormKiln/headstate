@@ -11,7 +11,8 @@ import {
   useSystemHealthHistory,
   useUiPrefs,
 } from "@/api/hooks";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { formatSize } from "@/lib/worktrees";
 import {
   CAPACITY_BAR_MAX,
@@ -55,7 +56,7 @@ import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
 import { type HealthPage, type View, useFilters } from "@/store/filters";
-import { healthPagesFor } from "./SystemHealthSidebar";
+import { healthPagesFor } from "./healthPages";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { ChevronLeft } from "lucide-react";
 

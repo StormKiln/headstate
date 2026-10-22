@@ -87,7 +87,8 @@ import { SavedScanNotice } from "./SavedScanNotice";
 import { toast } from "sonner";
 import { PartialScanNotice } from "./PartialScanNotice";
 import { rootBoundaries } from "../lib/rootBoundaries";
-import { QueryError, errorMessage } from "./QueryError";
+import { QueryError } from "./QueryError";
+import { errorMessage } from "@/lib/queryErrorMessage";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
