@@ -154,6 +154,15 @@ class Contracts(unittest.TestCase):
         self.assertEqual(len(g['client_populations']),6)
         self.assertTrue(all(p['identity']=='unlinked_mixed' for p in g['client_populations']))
         self.assertEqual(len([k for k in g['series'] if k.endswith(':visible_count')]),6)
+    def test_not_asked_footer_is_accepted_and_an_unknown_footer_is_counted(self):
+        # #1996: `not_asked` is a closed footer value of its own. A value
+        # this reader does not know is reported as an invalid record -- the
+        # behaviour an older reader keeps for `not_asked` -- never a crash.
+        base={'kind':'mounted_review','source':'github','list':'reviewing','surface':'ready_panel','selection':'all_repositories','footer_location':'desktop_footer','footer':'not_asked'}
+        out=self.run_report(report([envelope({'kind':'client','observation':base})]))
+        self.assertNotIn('invalid_record',out['issues'])
+        out=self.run_report(report([envelope({'kind':'client','observation':dict(base,footer='invented')})]))
+        self.assertIn('invalid_record',out['issues'])
     def test_client_scope_ordinals_are_capture_qualified_and_receipts_do_not_invent_scope(self):
         records=[]
         for i,(capture,provenance) in enumerate([(1,'readback'),(1,'mounted'),(2,'mounted')]):

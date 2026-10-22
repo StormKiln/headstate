@@ -17,7 +17,9 @@ const scan = vi.hoisted(() => ({
   loading: false,
   failed: false,
   unreadable: [] as string[],
-  dirs: ["/code"] as string[],
+  dirs: ["/code"] as string[] | undefined,
+  dirsError: null as unknown,
+  retryDirs: vi.fn(),
 }));
 const refetchFn = vi.hoisted(() => vi.fn());
 
@@ -26,7 +28,7 @@ vi.mock("../api/hooks", () => ({
   // assertion below keeps reading the arm it was written for: with no
   // directories the column now says "does not know where your
   // repositories are" instead, which is the point of the split.
-  useWorktreeDirs: () => ({ dirs: scan.dirs, set: vi.fn() }),
+  useWorktreeDirs: () => ({ dirs: scan.dirs, dirsError: scan.dirsError, retryDirs: scan.retryDirs, set: vi.fn() }),
   useWorktrees: () => ({
     data: repos(),
     isLoading: scan.loading,
@@ -135,6 +137,8 @@ beforeEach(() => {
   // above the rows they assert on.
   scan.unreadable = [];
   scan.dirs = ["/code"];
+  scan.dirsError = null;
+  scan.retryDirs.mockReset();
   refetchFn.mockClear();
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
@@ -180,6 +184,27 @@ describe("WorktreeSidebar", () => {
     render(<WorktreeSidebar />);
     expect(screen.getByText(/No repositories found/i)).toBeTruthy();
     expect(screen.queryByText(/No worktrees in any scanned/i)).toBeNull();
+  });
+
+  /// #1995: an unread folder setting is not an empty one.
+  /// `useWorktreeDirs` used to hand a failed read over as `dirs: []`.
+  it("renders a failed folder read as a failure with a retry, not 'does not know'", () => {
+    repos.mockReturnValue([]);
+    scan.dirs = undefined;
+    scan.dirsError = new Error("scan-folders setting unreadable");
+    render(<WorktreeSidebar />);
+    expect(screen.getByRole("alert").textContent).toMatch(/could not read the folders to scan: scan-folders setting unreadable/i);
+    expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
+    expect(screen.queryByText(/no repositories found/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(scan.retryDirs).toHaveBeenCalled();
+  });
+  it("renders a folder read in flight as pending", () => {
+    repos.mockReturnValue([]);
+    scan.dirs = undefined;
+    render(<WorktreeSidebar />);
+    expect(screen.getByText(/reading the folders to scan/i)).toBeTruthy();
+    expect(screen.queryByText(/does not know where your repositories are/i)).toBeNull();
   });
 
   /// Reported: orphans were invisible in the sidebar. `n - 1` assumed

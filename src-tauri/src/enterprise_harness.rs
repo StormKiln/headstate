@@ -103,7 +103,6 @@ fn supported(command: &str) -> bool {
             | "claude_sessions_for_pr_number"
             | "get_source_snapshot"
             | "get_cached"
-            | "get_cached_reviewing"
             | "refresh_source"
             | "refresh_now"
             | "get_pr_detail"

@@ -235,6 +235,11 @@ CLASS_BUDGET_GIB = {
     "v0-rust-build-Darwin-arm64": 1.2,
     "v0-rust-test-rust-Darwin-arm64": 0.9,
     "v0-rust-mobile-ios-Darwin-arm64": 0.7,
+    # CI throughput split: same lint workload; supply-chain now runs on Linux.
+    "v0-rust-lint-native-Darwin-arm64": 0.5,
+    "v0-rust-supply-chain-Linux-x64": 0.2,
+    # Retain old class bounds while main's former caches age out; global quota
+    # checks still count both generations, so migration cannot hide eviction.
     "v0-rust-lint-Darwin-arm64": 0.5,
     "v0-rust-supply-chain-Darwin-arm64": 0.2,
     "v0-rust-test-frontend-Darwin-arm64": 0.2,

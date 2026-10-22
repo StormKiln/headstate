@@ -25,6 +25,12 @@ mod partition;
 pub(crate) enum ScanMode {
     Refresh,
     Continue,
+    /// A refresh the user asked for before this process holds any receipt
+    /// for the list (#1938). The pass cadence (`eligible_at` after a
+    /// finished pass, or the 15 s step pacing) does not hold it back, so a
+    /// restart cannot leave Refresh doing nothing until the next tick.
+    /// Failure backoff, admission and the rate budget still apply.
+    Manual,
 }
 
 type Receipt = Option<Result<FetchedList, Arc<ClientError>>>;
@@ -126,6 +132,8 @@ fn clean(value: &Value) -> bool {
 }
 
 impl GitHubClient {
+    /// A refresh step. Production names its mode through `advance_scan_mode`.
+    #[cfg(test)]
     pub(crate) async fn advance_scan(
         &self,
         list: CachedList,
@@ -165,6 +173,15 @@ impl GitHubClient {
                 // Last-consumer retirement may race registry selection. No
                 // registration or receipt can revive an abandoned producer.
                 if state.abandoned {
+                    reads.remove(&key);
+                    continue;
+                }
+                // A manual refresh cannot be answered by a finished no-work
+                // step that the pass cadence produced for another caller.
+                if mode == ScanMode::Manual
+                    && matches!(&state.receipt, Some(Ok(r))
+                        if r.scan.as_ref().is_some_and(|s| s.state.no_work))
+                {
                     reads.remove(&key);
                     continue;
                 }
@@ -246,10 +263,14 @@ impl GitHubClient {
                                 let mode = {
                                     let state =
                                         shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                                    if state.callers.values().any(|(c, m)| {
-                                        c.deadline > tokio::time::Instant::now()
-                                            && *m == ScanMode::Refresh
-                                    }) {
+                                    let live = |mode| {
+                                        state.callers.values().any(|(c, m)| {
+                                            c.deadline > tokio::time::Instant::now() && *m == mode
+                                        })
+                                    };
+                                    if live(ScanMode::Manual) {
+                                        ScanMode::Manual
+                                    } else if live(ScanMode::Refresh) {
                                         ScanMode::Refresh
                                     } else {
                                         ScanMode::Continue
@@ -379,9 +400,14 @@ impl GitHubClient {
                 state.eligible_at = finished_at + state.completed_pass_delay();
             }
         }
+        // A manual refresh is not held back by the pass cadence (#1938); a
+        // failure backoff (`failures > 0`) still holds it.
+        if mode == ScanMode::Manual && state.failures == 0 {
+            state.eligible_at = state.eligible_at.min(now);
+        }
         if state.done
             && now >= state.eligible_at
-            && (mode == ScanMode::Refresh || state.repair_due(now))
+            && (mode != ScanMode::Continue || state.repair_due(now))
         {
             state.fresh_pass();
         }

@@ -11,7 +11,7 @@ export type ClientMeasurement = {
   visible_readiness_unknown_count?: number | null; visible_last_known_count?: number | null;
   visible_advisory_unavailable_count?: number | null;
   footer_location: "desktop_footer" | "phone_banner" | "hidden" | "unmeasured";
-  footer: "checked" | "needs_checking" | "partly_checked" | "coverage_unknown" | "not_checked" | "checking" | "retrying" | "load_failed" | "refresh_failed" | "background_stopped" | "auth_unavailable" | "auth_unknown" | "legacy_up_to_date" | "hidden" | "unavailable";
+  footer: "checked" | "needs_checking" | "partly_checked" | "coverage_unknown" | "not_checked" | "not_asked" | "checking" | "retrying" | "load_failed" | "refresh_failed" | "background_stopped" | "auth_unavailable" | "auth_unknown" | "legacy_up_to_date" | "hidden" | "unavailable";
 } | {
   kind: "transcript_view"; operation?: MeasurementReference | null; phase: MeasurementTranscriptPhase;
   elapsed_ms?: number | null; rows?: number | null; resident_rows?: number | null; capability: "measured" | "unsupported" | "unmeasured";

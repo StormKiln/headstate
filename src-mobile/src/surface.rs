@@ -54,7 +54,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("refresh_source", Class::Read),
     ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
-    ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),

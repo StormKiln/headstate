@@ -1,6 +1,12 @@
 name: setup
 description: Node, yarn, and Rust with caching
 inputs:
+  node:
+    description: Install pinned Node and immutable Yarn dependencies
+    default: 'true'
+  rust:
+    description: Install pinned Rust and restore its cache
+    default: 'true'
   rust-components:
     description: Extra rustup components, comma separated
     required: false
@@ -109,13 +115,16 @@ runs:
     # "packageManager": "yarn@4.18.0+sha224.…". That fails setup-node
     # itself, before any later `corepack enable` step could possibly run.
     - name: Enable initial Corepack
+      if: inputs.node == 'true'
       shell: bash
       run: python3 scripts/ci-command.py run setup-corepack-initial -- "$BASH" -c 'corepack enable'
 
     - name: Record Node setup start
+      if: inputs.node == 'true'
       shell: bash
       run: python3 scripts/ci-command.py mark setup-node
     - name: Install pinned Node
+      if: inputs.node == 'true'
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         # `.nvmrc`, not a major-line float (#1153). "24" silently moves
@@ -135,6 +144,7 @@ runs:
     # project pinned to yarn@4.18.0. Observed on windows-latest; harmless
     # and idempotent on the platforms that did not need it.
     - name: Enable pinned Corepack
+      if: inputs.node == 'true'
       shell: bash
       run: python3 scripts/ci-command.py run setup-corepack-pinned -- "$BASH" -c 'corepack enable'
 
@@ -178,6 +188,7 @@ runs:
     # confident and wrong root cause. The tail is what makes the next
     # occurrence evidence instead.
     - name: Install immutable dependencies
+      if: inputs.node == 'true'
       shell: bash
       run: python3 scripts/ci-command.py run setup-install -- "$BASH" scripts/install-dependencies.sh
 
@@ -187,17 +198,21 @@ runs:
     # truth and a developer's local `rustup` picks up the same version
     # from the same file.
     - name: Record Rust toolchain setup start
+      if: inputs.rust == 'true'
       shell: bash
       run: python3 scripts/ci-command.py mark setup-rust-toolchain
     - name: Install pinned Rust toolchain
+      if: inputs.rust == 'true'
       uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       with:
         components: ${{ inputs.rust-components }}
 
     - name: Record Rust cache start
+      if: inputs.rust == 'true'
       shell: bash
       run: python3 scripts/ci-command.py mark setup-rust-cache
     - name: Restore Rust cache
+      if: inputs.rust == 'true'
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: ${{ inputs.rust-workspaces }}

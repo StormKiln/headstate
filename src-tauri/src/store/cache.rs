@@ -118,34 +118,25 @@ pub(super) fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
     Some(now.signed_duration_since(naive.and_utc()).num_seconds())
 }
 
-/// `load_snapshot`, but a too-old snapshot is returned and MARKED
-/// rather than discarded. See [`CachedSnapshot`].
-pub fn load_snapshot_marked(
-    conn: &Connection,
-    which: CachedList,
-) -> Result<CachedSnapshot, StoreError> {
+/// The default source's list as bare rows, or empty when it is too old,
+/// missing or unreadable. Only tests read it today; it collapses states
+/// that production keeps apart, so do not wire it to a caller.
+///
+/// The rows-with-their-age reading this used to sit beside
+/// (`load_snapshot_marked`) was reached only by tests and was removed
+/// (#1998). The production reader is
+/// `source_cache::load_qualified_snapshot`, which keeps "too old",
+/// "missing" and "unreadable" apart instead of collapsing them here.
+pub fn load_snapshot(conn: &Connection, which: CachedList) -> Result<Vec<PullRequest>, StoreError> {
     use super::source_cache::{load_source_snapshot, SnapshotData};
     let snapshot = load_source_snapshot(conn, &crate::identity::Source::default(), which)?;
     Ok(match snapshot.data {
         SnapshotData::Available {
-            prs, stale_secs, ..
-        } => CachedSnapshot { prs, stale_secs },
-        SnapshotData::Missing
-        | SnapshotData::Unreadable
-        | SnapshotData::Withheld { .. }
-        | SnapshotData::GitLabAvailable { .. } => CachedSnapshot {
-            prs: Vec::new(),
+            prs,
             stale_secs: None,
-        },
-    })
-}
-
-pub fn load_snapshot(conn: &Connection, which: CachedList) -> Result<Vec<PullRequest>, StoreError> {
-    let cached = load_snapshot_marked(conn, which)?;
-    Ok(if cached.stale_secs.is_some() {
-        Vec::new()
-    } else {
-        cached.prs
+            ..
+        } => prs,
+        _ => Vec::new(),
     })
 }
 
@@ -250,7 +241,7 @@ mod tests {
     /// This guard REFUSES a stale snapshot, which stopped the lie. It did
     /// not make the data fresh: the user still waited out a ~20s live
     /// query on every visit, because nothing kept the cache current
-    /// between them. `poll::persist_reviewing` now writes it on every
+    /// between them. The poll loop now writes it on every
     /// tick (#1118) -- the loop was already fetching that exact list to
     /// decide what to notify about, and discarding it.
     ///

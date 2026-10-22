@@ -213,12 +213,22 @@ describe("App shell on a phone", () => {
       if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
       return undefined;
     }, { shouldMockEvents: true });
-    renderGatedApp();
-    const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
-    expect(banner.textContent).toContain("reachable");
-    expect(banner.textContent).not.toContain("updated");
-    expect(banner.textContent).not.toContain("sign in");
-    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    // This file runs the desktop build, where `AuthGate` opts its check
+    // in to three retries whatever the client's default (#1955). Driven
+    // past their backoff (1s, 2s, 4s) so the assertion is about the
+    // settled failure, not a race with TanStack's clock.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderGatedApp();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
+      expect(banner.textContent).toContain("reachable");
+      expect(banner.textContent).not.toContain("updated");
+      expect(banner.textContent).not.toContain("sign in");
+      expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("puts the repo sidebar behind a menu button", async () => {
