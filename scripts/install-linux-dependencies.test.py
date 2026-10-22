@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise bounded download recovery without changing the host packages (#1776)."""
+"""Exercise bounded index and download recovery without changing the host packages (#1776)."""
 import json
 import os
 from pathlib import Path
@@ -19,7 +19,7 @@ MIRRORS = ('http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n'
 class LinuxDependencies(unittest.TestCase):
     def fixture(self, root, *, update_status=0, downloads=(0,), install_status=0,
                 download_error='E: Failed to fetch synthetic archive', mirrors=MIRRORS,
-                hanging=False, incomplete_download=False):
+                hanging=False, incomplete_download=False, incomplete_update=False, update_error=None):
         bin_dir = root / 'bin'
         bin_dir.mkdir()
         mirrorlist = root / 'apt-mirrors.txt'
@@ -34,6 +34,8 @@ class LinuxDependencies(unittest.TestCase):
             # Inject the wrapper's retained incomplete-capture signal. Child
             # status alone cannot establish whether its evidence is complete.
             wrapper = wrapper.replace("    data['checkpointAt'] = now()", "    if label == 'apt-download-primary': data['captureIncomplete'] = True\n    data['checkpointAt'] = now()")
+        if incomplete_update:
+            wrapper = wrapper.replace("    data['checkpointAt'] = now()", "    if label == 'apt-update': data['captureIncomplete'] = True\n    data['checkpointAt'] = now()")
         (root / 'ci-command.py').write_text(wrapper)
 
         def executable(name, code):
@@ -57,7 +59,13 @@ with calls.open('a') as f: f.write(json.dumps({{'operation':operation, 'args':sy
 print('apt output before exit', flush=True)
 hang_mode = {hanging!r}
 if hang_mode and (hang_mode is True or (operation == hang_mode and not any(x['operation'] == operation for x in previous))): time.sleep(30)
-if operation == 'update': sys.exit({update_status})
+if operation == 'update':
+    if {update_error!r}: print({update_error!r}, file=sys.stderr)
+    statuses = {update_status!r}
+    if isinstance(statuses, int): statuses = (statuses,)
+    attempt = sum(x['operation'] == 'update' for x in previous)
+    if attempt: assert 'azure.archive.ubuntu.com' not in (root / 'apt-mirrors.txt').read_text()
+    sys.exit(statuses[min(attempt, len(statuses)-1)])
 if operation == 'download':
     attempt = sum(x['operation'] == 'download' for x in previous)
     if attempt:
@@ -79,7 +87,8 @@ sys.exit({install_status})
         executable('timeout', f'''import os,sys
 args = sys.argv[1:]
 assert args[0] == '--kill-after=5s', args
-assert args[1] in ('300s', '600s'), args
+assert args[1] in ('150s', '300s', '600s'), args
+if 'update' in args: assert args[1] == '150s', args
 if '--download-only' in args: assert args[1] == '300s', args
 if '--no-download' in args: assert args[1] == '600s', args
 if {hanging!r}:
@@ -140,6 +149,79 @@ os.execvp(args[2], args[2:])
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual([c['operation'] for c in self.calls(root)], ['update', 'download', 'download'])
                 self.assertEqual(self.evidence(root, 'apt-download-fallback')['exitCode'], status)
+
+    def test_index_timeout_recovers_before_download_and_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_installer(root, update_status=(124, 0))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.calls(root)
+            self.assertEqual([c['operation'] for c in calls], ['update', 'update', 'download', 'install'])
+            for call in calls[:2]:
+                self.assertIn('APT::Update::Error-Mode=any', call['args'])
+            self.assertEqual(self.evidence(root, 'apt-update')['exitCode'], 124)
+            self.assertEqual(self.evidence(root, 'apt-update-fallback')['exitCode'], 0)
+
+    def test_timeout_with_reported_index_error_does_not_retry(self):
+        diagnostics = (
+            'E: The repository is not signed.',
+            "Err:2 https://archive.ubuntu.com/ubuntu noble InRelease\n"
+            "  The following signatures couldn't be verified: NO_PUBKEY ABCD",
+            'W: GPG error: the following signatures were invalid: EXPKEYSIG ABCD',
+        )
+        for error in diagnostics:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_installer(root, update_status=124, update_error=error)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertEqual([c['operation'] for c in self.calls(root)], ['update'])
+                self.assertEqual((root / 'apt-mirrors.txt').read_text(), MIRRORS)
+
+    @unittest.skipUnless(TIMEOUT, 'GNU timeout is supplied by the Linux runner')
+    def test_hung_index_refresh_recovers_with_strict_indexes_before_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_installer(root, hanging='update')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.calls(root)
+            self.assertEqual([c['operation'] for c in calls], ['update', 'update', 'download', 'install'])
+            for call in calls[:2]:
+                self.assertIn('APT::Update::Error-Mode=any', call['args'])
+            self.assertEqual(self.evidence(root, 'apt-update')['exitCode'], 124)
+            self.assertEqual(self.evidence(root, 'apt-update-fallback')['exitCode'], 0)
+            self.assertIn('apt output before exit', (root / 'ci-diagnostics/apt-update.log').read_text())
+            self.assertEqual((root / 'apt-mirrors.txt').read_text(), MIRRORS.split('\n', 1)[1])
+
+    def test_failed_index_fallback_never_downloads_or_installs(self):
+        for status in (100, 124, 137):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_installer(root, update_status=(124, status))
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual([c['operation'] for c in self.calls(root)], ['update', 'update'])
+                self.assertEqual(self.evidence(root, 'apt-update-fallback')['exitCode'], status)
+
+    def test_index_capture_and_unrecognized_mirrors_cannot_trigger_fallback(self):
+        cases = ({'incomplete_update': True}, {'mirrors': None},
+                 {'mirrors': MIRRORS + 'https://custom.example/ubuntu/\n'})
+        for options in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_installer(root, update_status=124, **options)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertEqual([c['operation'] for c in self.calls(root)], ['update'])
+                expected = options.get('mirrors', MIRRORS)
+                actual = (root / 'apt-mirrors.txt').read_text() if expected is not None else None
+                self.assertEqual(actual, expected)
+
+    def test_index_forced_kill_and_configuration_errors_are_not_retried(self):
+        for status in (100, 137, 7):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_installer(root, update_status=status)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual([c['operation'] for c in self.calls(root)], ['update'])
+                self.assertEqual((root / 'apt-mirrors.txt').read_text(), MIRRORS)
 
     def test_update_failure_never_downloads_or_changes_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
