@@ -226,6 +226,7 @@ fn history_retention_is_bounded_and_does_not_replace_complete_baseline_with_part
     assert!(
         crate::store::disk_observations::history(&conn)
             .unwrap()
+            .observations
             .len()
             <= 32
     );
@@ -235,6 +236,56 @@ fn history_retention_is_bounded_and_does_not_replace_complete_baseline_with_part
             .is_some(),
         "partial history must retain last complete baseline"
     );
+}
+
+/// #1963: one undecodable row used to fail the whole history. The rest
+/// must load, and the skipped row must be counted rather than hidden.
+#[test]
+fn one_undecodable_observation_does_not_fail_the_history() {
+    use crate::store::disk_observations::{history, save};
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(crate::store::disk_observations::MIGRATION_SQL)
+        .unwrap();
+    let mut o = observation();
+    save(&mut conn, &o).unwrap();
+    o.id = "two".into();
+    o.finished_at = 200;
+    save(&mut conn, &o).unwrap();
+    // A row written before the payload carried a version reads as one.
+    let mut legacy = serde_json::to_value(&o).unwrap();
+    legacy["id"] = "legacy".into();
+    conn.execute(
+        "INSERT INTO disk_observations(id,scope_id,observed_at,complete,payload) VALUES('legacy','stable',150,1,?1)",
+        [legacy.to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO disk_observations(id,scope_id,observed_at,complete,payload) VALUES('stale','stable',180,1,'{\"id\":\"stale\",\"shape\":\"old\"}')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO disk_observations(id,scope_id,observed_at,complete,payload) VALUES('newer','stable',190,1,?1)",
+        [serde_json::json!({"schema_version": 99}).to_string()],
+    )
+    .unwrap();
+    let loaded = history(&conn).unwrap();
+    let ids: Vec<_> = loaded.observations.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["two", "legacy", "one"]);
+    assert_eq!(loaded.unreadable, 2);
+}
+
+#[test]
+fn a_saved_observation_carries_its_payload_version() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(crate::store::disk_observations::MIGRATION_SQL)
+        .unwrap();
+    crate::store::disk_observations::save(&mut conn, &observation()).unwrap();
+    let payload: String = conn
+        .query_row("SELECT payload FROM disk_observations", [], |r| r.get(0))
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["schema_version"], 1);
 }
 
 #[test]
@@ -589,7 +640,7 @@ fn partial_history_across_scopes_cannot_evict_complete_baseline() {
         history::latest(&conn, "stable").unwrap().is_some(),
         "global partial pressure removed baseline"
     );
-    assert!(history::history(&conn).unwrap().len() <= 256);
+    assert!(history::history(&conn).unwrap().observations.len() <= 256);
 }
 
 #[test]
@@ -783,7 +834,7 @@ fn same_scope_partial_byte_pressure_prunes_partial_before_its_complete_baseline(
         history::save(&mut conn, &partial).unwrap();
     }
     assert_eq!(history::latest(&conn, "stable").unwrap().unwrap().id, "one");
-    let saved = history::history(&conn).unwrap();
+    let saved = history::history(&conn).unwrap().observations;
     assert_eq!(saved.len(), 2);
     assert!(saved.iter().any(|o| o.id == "large-partial-1"));
     let bytes: i64 = conn

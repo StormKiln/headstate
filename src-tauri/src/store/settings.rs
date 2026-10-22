@@ -38,6 +38,34 @@ pub(crate) fn get_strict<T: DeserializeOwned>(
         .transpose()
 }
 
+/// Read-modify-write a setting atomically, refusing to write when the
+/// current value cannot be read (#1960).
+///
+/// [`get`] maps a decode failure to `None`, and callers then wrote the
+/// default back over the stored value -- a busy database or a corrupt
+/// entry wiped every assessment mark but the one being added. Here the
+/// read is strict and an error leaves the stored value untouched.
+///
+/// IMMEDIATE, because this reads and then writes: a DEFERRED transaction
+/// would let two concurrent updates both read the old value and the
+/// second commit discard the first one's change (#1958).
+///
+/// `update` returns whether it changed anything; nothing is written when
+/// it did not.
+pub(crate) fn update_strict<T: DeserializeOwned + Serialize + Default>(
+    conn: &Connection,
+    key: &str,
+    update: impl FnOnce(&mut T) -> bool,
+) -> Result<(), StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut value: T = get_strict(&tx, key)?.unwrap_or_default();
+    if update(&mut value) {
+        set(&tx, key, &value)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 /// Write a setting, replacing any previous value.
 pub fn set<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<(), StoreError> {
     conn.execute(
@@ -130,6 +158,64 @@ mod tests {
         assert!(get_strict::<bool>(&conn, "control").is_err());
         conn.execute("DROP TABLE settings", []).unwrap();
         assert!(get_strict::<bool>(&conn, "control").is_err());
+    }
+
+    /// #1960: a mark written over an unreadable map must not wipe it.
+    #[test]
+    fn a_strict_update_refuses_to_overwrite_a_value_it_could_not_read() {
+        use std::collections::BTreeMap;
+        let (_d, conn) = db();
+        let key = keys::ASSESSED_WORKTREES;
+        let mark = |path: &str| {
+            update_strict(&conn, key, |seen: &mut BTreeMap<String, String>| {
+                seen.insert(path.into(), "oid".into());
+                true
+            })
+        };
+        mark("/a").unwrap();
+        mark("/b").unwrap();
+        let stored = get_strict::<BTreeMap<String, String>>(&conn, key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+
+        // A corrupt value: the write must be refused, the value kept.
+        let corrupt = "{\"/a\":\"oid\",\"/b\":";
+        conn.execute(
+            "UPDATE settings SET value=?1 WHERE key=?2",
+            rusqlite::params![corrupt, key],
+        )
+        .unwrap();
+        assert!(mark("/c").is_err());
+        let raw: String = conn
+            .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(raw, corrupt);
+    }
+
+    /// The update runs inside the write lock, so a held writer is a
+    /// refusal rather than a stale read followed by a lost write.
+    #[test]
+    fn a_strict_update_takes_the_write_lock_before_reading() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let a = open_db(&path).unwrap();
+        let b = open_db(&path).unwrap();
+        b.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let held =
+            rusqlite::Transaction::new_unchecked(&a, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let mut ran = false;
+        let result = update_strict(&b, "k", |v: &mut u64| {
+            ran = true;
+            *v += 1;
+            true
+        });
+        assert!(result.is_err());
+        assert!(!ran, "the read must not happen before the lock is held");
+        drop(held);
     }
 
     #[test]

@@ -194,12 +194,30 @@ pub const MAX_ROWS: i64 = 2_000;
 /// reason `store::health::record` gives: a timer is a second thing to
 /// schedule and to get wrong, and deleting a handful of rows next to an
 /// insert costs nothing.
+///
+/// One run is one IMMEDIATE transaction (#1963). Written as one
+/// autocommit insert per row, a failure part-way left a ledger holding
+/// part of a run that read as the whole of it, and every row cost its
+/// own fsync. Now a run is recorded whole or not at all.
 pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
-    for e in entries {
-        let r = conn.execute(
+    if let Err(err) = record_run(conn, entries) {
+        log::warn!(
+            "could not record the cleanup run ({} entries): {err}",
+            entries.len()
+        );
+    }
+}
+
+fn record_run(conn: &Connection, entries: &[LedgerEntry]) -> Result<(), rusqlite::Error> {
+    // IMMEDIATE: the trim reads the table it then deletes from (#1958).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut insert = tx.prepare(
             "INSERT INTO cleanup_log (at, kind, target, detail, bytes, action, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
+        )?;
+        for e in entries {
+            insert.execute(rusqlite::params![
                 e.at,
                 e.kind,
                 e.target,
@@ -207,13 +225,11 @@ pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
                 e.bytes.map(|b| b as i64),
                 e.action,
                 e.error
-            ],
-        );
-        if let Err(err) = r {
-            log::warn!("could not record a cleanup entry: {err}");
+            ])?;
         }
     }
-    trim(conn);
+    trim(&tx);
+    tx.commit()
 }
 
 /// Drop all but the newest [`MAX_ROWS`] ledger rows.
@@ -1085,6 +1101,34 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].target, "/code/x/target");
         assert_eq!(back[0].bytes, Some(1234));
+    }
+
+    /// #1963: a run that fails part-way must not leave part of itself in
+    /// the ledger, where it would read as the whole run.
+    #[test]
+    fn a_run_is_recorded_whole_or_not_at_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_second BEFORE INSERT ON cleanup_log
+             WHEN NEW.target = '/b' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+        let entry = |target: &str| LedgerEntry {
+            at: "2026-09-02T00:00:00Z".into(),
+            kind: "artifact".into(),
+            target: target.into(),
+            detail: None,
+            bytes: None,
+            action: "proposed".into(),
+            error: None,
+        };
+        record(&conn, &[entry("/a"), entry("/b"), entry("/c")]);
+        assert_eq!(recent(&conn, 10).unwrap().len(), 0);
+        conn.execute_batch("DROP TRIGGER fail_second").unwrap();
+        record(&conn, &[entry("/a"), entry("/b"), entry("/c")]);
+        assert_eq!(recent(&conn, 10).unwrap().len(), 3);
+        assert!(conn.is_autocommit(), "no transaction may be left open");
     }
 
     /// The ledger is bounded, so the table cannot grow without bound.

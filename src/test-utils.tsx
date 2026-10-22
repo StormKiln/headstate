@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createQueryClient } from "./api/queryClient";
 import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
 
@@ -7,12 +8,11 @@ import type { ReactElement } from "react";
 /// Components below the list level now reach for the query cache -- the
 /// kebab menu invalidates `prs` after acting -- so a bare `render` throws
 /// "No QueryClient set" for a component whose test has nothing to do with
-/// fetching. Retries are off so a failing query surfaces immediately
-/// instead of after three silent attempts.
+/// fetching. Built by production's own factory, so a test sees the
+/// app's retry policy (off unless a query opts in, #1955) rather than a
+/// test-only `retry: false` that would hide a change to it.
 export function renderWithQuery(ui: ReactElement) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  const client = createQueryClient();
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 

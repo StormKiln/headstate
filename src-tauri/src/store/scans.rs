@@ -33,7 +33,7 @@
 //! a confident "nothing found" for the seventeen seconds a live scan
 //! took. An unlabelled stale scan is the same lie about disk.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::StoreError;
@@ -148,7 +148,10 @@ pub fn load_at(
             rusqlite::params![kind.id(), root],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok();
+        // Only "no row" is "nothing cached". A locked, corrupt or
+        // missing table is a failure the caller must render as one, not
+        // a first run that paints a scanning skeleton forever (#1961).
+        .optional()?;
     let Some((payload, fetched_at)) = row else {
         return Ok(None);
     };
@@ -394,6 +397,16 @@ mod tests {
         // And the CURRENT set survives, or the next cold start pays the
         // full scan for nothing.
         assert!(load(&c, ScanKind::Artifacts, "/new-set").unwrap().is_some());
+    }
+
+    /// #1961: a read that failed is not "nothing cached". `Ok(None)`
+    /// paints the scanning skeleton; a failure must reach the caller.
+    #[test]
+    fn a_failed_read_is_an_error_not_a_miss() {
+        let c = conn();
+        assert_eq!(load(&c, ScanKind::Venvs, "/code").unwrap(), None);
+        c.execute("DROP TABLE scan_cache", []).unwrap();
+        assert!(load(&c, ScanKind::Venvs, "/code").is_err());
     }
 
     #[test]

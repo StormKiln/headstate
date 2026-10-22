@@ -199,6 +199,14 @@ pub fn accept(
     }
     // A terminal fact replaces the active fields with one compact barrier.
     // Reopening requires positive newer evidence, never a time-based eviction.
+    //
+    // Retention, deliberately (#1963): terminal rows are kept with no age
+    // limit, because an eviction would let a late, older response reopen a
+    // merged or closed pull request. The bound is structural instead: one
+    // row, holding only its `State` fact, per (list, pull request) this
+    // account has seen, and the whole journal of a list is dropped when
+    // its owner changes (above). Growth is therefore linear in the pull
+    // requests one account authors or is asked to review.
     if next
         .facts
         .iter()

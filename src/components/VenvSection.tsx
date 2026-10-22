@@ -17,6 +17,7 @@ import { useIsMobile } from "@/lib/useIsMobile";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
 import { QueryError, errorMessage } from "./QueryError";
+import { SavedScanNotice } from "./SavedScanNotice";
 
 /// The hardcoded `STALE_SECS` that used to live here is gone (#957).
 ///
@@ -105,6 +106,47 @@ const TONE: Record<VenvState, string> = {
   unknown: "bg-[#8b949e]/15 text-[#b1bac4]",
 };
 
+/// The previous venv scan, painted while the live one runs (#1975).
+///
+/// `ArtifactsFromCache`'s shape and its rule: the rows are real but
+/// dated, so this renders no selection, no remove, no orphan count and no
+/// state badge -- an orphan verdict from an earlier scan is a stale
+/// "safe to delete", the one thing a cache must not authorise -- and the
+/// age sits above them every time. The live section replaces it whole
+/// the moment the scan answers.
+function VenvsFromCache({
+  venvs,
+  ageSecs,
+  stale,
+}: {
+  venvs: Venv[];
+  ageSecs: number;
+  stale: boolean;
+}) {
+  return (
+    <section className="mt-6">
+      <div className="mb-3 flex items-center gap-2 text-sm">
+        <span className="font-semibold text-[#e6edf3]">Poetry virtualenvs</span>
+        <HelpButton topic="poetry-venvs" />
+      </div>
+      <SavedScanNotice ageSecs={ageSecs} stale={stale} />
+      <ul className="mt-3 space-y-1" aria-label="Virtualenvs from the last scan">
+        {venvs.slice(0, 50).map((v) => (
+          <li key={v.path} className="flex justify-between text-xs text-[#8b949e]">
+            <span className="truncate">{v.project}</span>
+            <span className="ml-3 truncate font-mono">{v.path}</span>
+          </li>
+        ))}
+      </ul>
+      {venvs.length > 50 ? (
+        <p className="mt-2 text-xs text-[#8b949e]">
+          and {venvs.length - 50} more — the full list appears when the scan finishes.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 /// Poetry virtualenvs, on the Artifacts page.
 ///
 /// Here rather than in its own view because it answers the same question
@@ -134,7 +176,7 @@ export function VenvSection() {
   // FAILURE for half an hour. `useVenvs` now carries `retry: false` and
   // this renders an explicit retry, which is the pairing
   // `useStatsBoard`'s rule requires.
-  const { data: venvs = [], isLoading, isError, error, refetch } = useVenvs(true);
+  const { data: venvs = [], isLoading, isError, error, refetch, cached } = useVenvs(true);
   /// How far the directory walk has got (#1151). Only while it runs: a
   /// figure left on screen afterwards would describe a walk that is
   /// over.
@@ -174,6 +216,12 @@ export function VenvSection() {
   // Say the scan is running rather than rendering nothing. The
   // artifacts list already does this; this section did not.
   if (isLoading) {
+    // The previous scan, if there is one (#1975): a 9-40 s walk against
+    // a sentence is what every cold start used to get, while the result
+    // of the last walk sat saved in the database.
+    if (cached && cached.data.length > 0) {
+      return <VenvsFromCache venvs={cached.data} ageSecs={cached.ageSecs} stale={cached.stale} />;
+    }
     return (
       <p className="px-1 py-2 text-xs text-[#8b949e]" aria-live="polite">
         Looking for Poetry virtualenvs

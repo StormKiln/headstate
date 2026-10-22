@@ -386,7 +386,8 @@ pub fn load(
             state: State::default(),
         });
     };
-    let mut state = if stored_owner == owner {
+    // Logins compare without regard to case, as the snapshot owner does (#1961).
+    let mut state = if stored_owner.eq_ignore_ascii_case(owner) {
         serde_json::from_str::<State>(&payload)
             .ok()
             .filter(|state| {
@@ -490,7 +491,7 @@ pub fn taint(
     let mut state = loaded.state;
     state.taint_effect();
     let provider = serde_json::to_value(source.provider)?;
-    conn.execute("UPDATE queue_scan SET payload=?1,revision=revision+1 WHERE provider=?2 AND host=?3 AND list=?4 AND owner=?5",
+    conn.execute("UPDATE queue_scan SET payload=?1,revision=revision+1 WHERE provider=?2 AND host=?3 AND list=?4 AND owner=?5 COLLATE NOCASE",
         params![serde_json::to_string(&state)?,provider.as_str(),source.host,list.id(),owner])?;
     Ok(())
 }

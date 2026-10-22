@@ -195,8 +195,11 @@ function ArtifactInventory() {
   /// and so outlives the progress figure.
   const failedRoots = useArtifactScanFailures(true);
   // Read here only to decide the empty state; VenvSection owns the rest.
-  const { data: venvList = [] } = useVenvs(true);
+  const { data: venvList = [], isLoading: venvsLoading, isError: venvsFailed } = useVenvs(true);
   const venvCount = venvList.length;
+  // Whether `venvCount` is a measured count: 0 while scanning or after a
+  // rejection is absent, not zero (#1975).
+  const venvsAnswered = !venvsLoading && !venvsFailed;
   // Filtered BEFORE sizing, so a group page measures only what it shows
   // rather than paying for the whole machine to render one section.
   const artifacts =
@@ -398,7 +401,13 @@ function ArtifactInventory() {
   // default -- so without the `!isError` guard this branch was reached
   // first and reported a clean machine. It is the branch the whole issue
   // is about, and `artifactsError` below is unreachable without this.
-  if (!isError && artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
+  //
+  // The same holds for the virtualenvs (#1975): `venvCount` is 0 while
+  // their scan is still running and on its rejection, so the virtualenv
+  // page said "No poetry virtualenvs found" for the whole 9-40 s walk of
+  // every cold start, and unmounted `VenvSection` -- its scanning line,
+  // its saved scan and its error panel with it.
+  if (!isError && artifacts.length === 0 && (!showVenvs || (venvsAnswered && venvCount === 0))) {
     return (
       <div>{failedRootsNotice}<button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button><p className="p-4 text-sm text-[#8b949e]">
         No {label} found in {failedRoots?.length ? "the completed portion of the scan" : "the scanned directories"}.

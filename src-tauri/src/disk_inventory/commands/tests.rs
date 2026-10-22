@@ -145,6 +145,7 @@ async fn failed_history_save_still_publishes_current_actual_measurement() {
         .contains("controlled history refusal"));
     assert!(disk_observations::history(&open_db(&db).unwrap())
         .unwrap()
+        .observations
         .is_empty());
 }
 
@@ -172,6 +173,7 @@ async fn start_continues_bounded_observation_and_restart_keeps_durable_floor() {
     assert!(floor.is_some());
     assert!(disk_observations::history(&open_db(&db).unwrap())
         .unwrap()
+        .observations
         .iter()
         .any(|o| o.id == observation_id && o.known_allocated == floor));
     let mut done = first;
