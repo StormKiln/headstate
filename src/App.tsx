@@ -1049,7 +1049,11 @@ export default function App() {
                 // is the fresh-install case: `isError` above covers a
                 // rejected query, and this covers "the query returned
                 // the empty snapshot because no poll has ever landed".
-                unreachable={pollError !== null && source.length === 0}
+                // Each view answers for its own list: `pollError` is the
+                // authored list's, so To Review reads its own receipt
+                // (#1934). Only a settled failure counts -- retrying and
+                // not-asked are not "could not reach".
+                unreachable={(view === "to-review" ? reviewingReceipt.phase === "failed" : pollError !== null) && source.length === 0}
               />
             )}
           </div>

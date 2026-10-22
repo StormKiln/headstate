@@ -465,10 +465,10 @@ impl SourcePolls {
                     if !settled {
                         status.consecutive_failures = status.consecutive_failures.saturating_add(1);
                     }
-                    if failure.transient && status.consecutive_failures < 2 {
-                        Phase::Retrying
-                    } else {
+                    if crate::poll::should_surface(failure.transient, status.consecutive_failures) {
                         Phase::Failed
+                    } else {
+                        Phase::Retrying
                     }
                 };
                 status.error = Some(failure.message.clone());
@@ -672,10 +672,10 @@ impl SourcePolls {
                     Phase::NotAsked
                 } else {
                     status.consecutive_failures = status.consecutive_failures.saturating_add(1);
-                    if failure.transient && status.consecutive_failures < 2 {
-                        Phase::Retrying
-                    } else {
+                    if crate::poll::should_surface(failure.transient, status.consecutive_failures) {
                         Phase::Failed
+                    } else {
+                        Phase::Retrying
                     }
                 };
                 status.error = Some(failure.message);
@@ -697,8 +697,19 @@ impl From<&crate::github::client::ClientError> for Failure {
         Self {
             message: error.to_string(),
             transient: error.is_transient(),
-            not_asked: false,
+            not_asked: not_dispatched(error),
         }
+    }
+}
+
+/// A request Headstate declined to send is "not asked", never a provider
+/// failure (#1928). A shared in-flight result carries the same refusal.
+fn not_dispatched(error: &crate::github::client::ClientError) -> bool {
+    use crate::github::client::ClientError;
+    match error {
+        ClientError::Shared(inner) => not_dispatched(inner),
+        ClientError::NotDispatched(_) => true,
+        _ => false,
     }
 }
 #[derive(Clone)]
@@ -712,12 +723,10 @@ pub struct Attempt {
 fn emit_status(app: &AppHandle, status: Status, completed_request: Option<String>) {
     // The legacy authored bar must also preserve a newer pending/failure state
     // when an older successful response supplies usable rows.
+    // The only emitter of `poll-state`/`poll-error` (#1934): one status, one
+    // failure counter, one surfacing rule (`poll::should_surface`).
     if status.source == Source::default() && status.list == CachedList::Authored {
-        let phase = match status.phase {
-            Phase::Fetching => "fetching",
-            Phase::Retrying => "retrying",
-            _ => "idle",
-        };
+        let phase = crate::poll::tick_state(&status.phase);
         if status.phase == Phase::Failed {
             if let Some(error) = &status.error {
                 let _ = app.emit("poll-error", error);
@@ -985,7 +994,7 @@ pub(crate) async fn fetch_github_step_at(
     continuation: bool,
     timing: impl FnOnce() -> (u64, i64),
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    use crate::github::{admission::ReadContext, client::ClientError};
+    use crate::github::admission::ReadContext;
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
         .with_attempt_limit(3);
@@ -1020,8 +1029,8 @@ pub(crate) async fn fetch_github_step_at(
             Ok((checkpoint, rows))
         })
         .await
-        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?
-        .map_err(|_| ClientError::Graphql("queue checkpoint could not be loaded".into()))?;
+        .map_err(|error| checkpoint_load_failure(&error))?
+        .map_err(|error| checkpoint_load_failure(&error))?;
     // Match the desktop path's timing: a blocked checkpoint load must not
     // freeze an old clock reading or a superseded interval setting.
     let (interval_secs, now) = timing();
@@ -1064,6 +1073,13 @@ pub(crate) async fn fetch_github_step_at(
     } else {
         client.advance_scan(list, loaded, &rows, now).await
     }
+}
+
+/// A local read failure, named as one: GitHub was not involved (#1928).
+fn checkpoint_load_failure(error: &dyn std::fmt::Display) -> crate::github::client::ClientError {
+    crate::github::client::ClientError::Local(format!(
+        "Headstate could not read its saved refresh progress on this computer: {error}"
+    ))
 }
 
 /// Called with the source publication permit held, before persistence and emission.
@@ -2168,6 +2184,34 @@ mod tests {
             transient: true,
             not_asked: false,
         }
+    }
+
+    /// #1928: a request Headstate declined to send settles as NotAsked and
+    /// never counts toward the failures that end in Failed -- directly, and
+    /// when an in-flight result is shared between callers.
+    #[test]
+    fn a_declined_request_is_not_asked_rather_than_failed() {
+        use crate::github::client::ClientError;
+        let declined = || ClientError::NotDispatched("provider cooldown is active".into());
+        for error in [
+            declined(),
+            ClientError::Shared(Arc::new(declined())),
+            ClientError::Shared(Arc::new(ClientError::Shared(Arc::new(declined())))),
+        ] {
+            let failure = Failure::from(&error);
+            assert!(failure.not_asked, "{error:?} was never sent");
+            let polls = SourcePolls::default();
+            let source = Source::default();
+            for _ in 0..3 {
+                let attempt = attempt(&polls, &source, CachedList::Reviewing);
+                let status = polls.finish(&attempt, Err(Failure::from(&error))).unwrap();
+                assert_eq!(status.phase, Phase::NotAsked, "{error:?}");
+                assert_eq!(status.consecutive_failures, 0, "{error:?}");
+            }
+        }
+        // A real answer is still a failure.
+        assert!(!Failure::from(&ClientError::Timeout(30)).not_asked);
+        assert!(!Failure::from(&ClientError::Graphql("bad field".into())).not_asked);
     }
     fn receipt(number: u64) -> FetchedList {
         let pr = serde_json::from_value(serde_json::json!({

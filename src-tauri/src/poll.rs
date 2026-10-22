@@ -1020,28 +1020,55 @@ pub const TICK_TIMEOUT: Duration = Duration::from_secs(45);
 ///
 /// Saturating, so a first fetch that somehow outran the whole budget
 /// yields zero rather than wrapping into a near-infinite ceiling. The
-/// caller treats zero as "skip": a request with no time to answer still
-/// spends a rate-limit point.
+/// caller skips the second list below [`MIN_USEFUL_FETCH_BUDGET`]: a
+/// request with no time to answer still spends a rate-limit point.
 pub fn remaining_tick_budget(spent: Duration) -> Duration {
     TICK_TIMEOUT.saturating_sub(spent).min(FETCH_TIMEOUT)
 }
 
+/// The least budget worth sending the second list's request with.
+///
+/// Below this the request would be issued only to hit its own deadline,
+/// and that timeout would then be reported as GitHub failing to answer --
+/// the #1050 pattern (#1932). Not issuing it is the honest outcome: the
+/// list keeps its last receipt and status, and the next tick asks again.
+/// A few seconds, because a measured tick needs ~4.2s for both lists and a
+/// completed page inside a short budget is still kept.
+pub const MIN_USEFUL_FETCH_BUDGET: Duration = Duration::from_secs(5);
+
 // Sequential avoids multiplying provider contention. The selected list owns
 // the first full budget and publishes inside its callback before the next starts.
-async fn prioritized_pair<A, R, T, U>(reviewing_first: bool, authored: A, reviewing: R) -> (T, U)
+// The second list is `None` when it was not asked: too little of the tick was
+// left to send it (#1932). Its callback is then never invoked, so it neither
+// begins an attempt nor spends a request.
+async fn prioritized_pair<A, R, T, U>(
+    reviewing_first: bool,
+    authored: A,
+    reviewing: R,
+) -> (Option<T>, Option<U>)
 where
     A: std::ops::AsyncFnOnce(Duration) -> T,
     R: std::ops::AsyncFnOnce(Duration) -> U,
 {
     let started = tokio::time::Instant::now();
+    let second_budget = || {
+        Some(remaining_tick_budget(started.elapsed()))
+            .filter(|budget| *budget >= MIN_USEFUL_FETCH_BUDGET)
+    };
     if reviewing_first {
         let review = reviewing(FETCH_TIMEOUT).await;
-        let own = authored(remaining_tick_budget(started.elapsed())).await;
-        (own, review)
+        let own = match second_budget() {
+            Some(budget) => Some(authored(budget).await),
+            None => None,
+        };
+        (own, Some(review))
     } else {
         let own = authored(FETCH_TIMEOUT).await;
-        let review = reviewing(remaining_tick_budget(started.elapsed())).await;
-        (own, review)
+        let review = match second_budget() {
+            Some(budget) => Some(reviewing(budget).await),
+            None => None,
+        };
+        (Some(own), review)
     }
 }
 
@@ -1094,27 +1121,31 @@ const FAILURES_BEFORE_BANNER: u32 = 2;
 /// malformed query -- surface immediately, because the next tick will
 /// fail identically and waiting cannot help. Transient ones wait for a
 /// second opinion.
-fn should_surface(e: &ClientError, consecutive: u32) -> bool {
-    !e.is_transient() || consecutive >= FAILURES_BEFORE_BANNER
+///
+/// The ONE rule: `source_poll` settles a failed attempt as `Failed` when
+/// this holds and `Retrying` when it does not, and `emit_status` derives
+/// `poll-error` from that phase. The loop no longer applies a second copy
+/// of it to a second counter (#1934).
+pub(crate) fn should_surface(transient: bool, consecutive: u32) -> bool {
+    !transient || consecutive >= FAILURES_BEFORE_BANNER
 }
 
-/// The `poll-state` a finished tick leaves behind.
+/// The `poll-state` the authored list's status stands for.
 ///
-/// The loop emits this ONCE, at the end of every tick, after the request is
-/// no longer in flight. It carries the tick's outcome rather than a fixed
-/// `"idle"` because a suppressed transient failure has nothing else to
-/// announce it: no `poll-error`, no `prs-updated`. Emitting `"idle"`
-/// unconditionally told the bar the data was current when the fetch had just
-/// failed, so it showed a green "Up to date" over stale rows for up to ten
-/// minutes (#1104).
+/// `emit_status` sends this with every authored status change. It carries
+/// the outcome rather than a fixed `"idle"` because a suppressed transient
+/// failure has nothing else to announce it: no `poll-error`, no
+/// `prs-updated`. Emitting `"idle"` unconditionally told the bar the data was
+/// current when the fetch had just failed, so it showed a green "Up to date"
+/// over stale rows for up to ten minutes (#1104).
 ///
-/// `None` is a success. `Some(surfaced)` is a failure, where `surfaced` says
-/// whether a `poll-error` banner was already emitted for it -- in that case
-/// the banner is the signal and the bar has no further work to do.
-fn tick_state(failure: Option<bool>) -> &'static str {
-    match failure {
-        Some(false) => "retrying",
-        Some(true) | None => "idle",
+/// `Retrying` is a suppressed failure. `Failed` already has its `poll-error`
+/// banner, which is the signal, so the bar has no further work to do.
+pub(crate) fn tick_state(phase: &source_poll::Phase) -> &'static str {
+    match phase {
+        source_poll::Phase::Fetching => "fetching",
+        source_poll::Phase::Retrying => "retrying",
+        _ => "idle",
     }
 }
 
@@ -1312,10 +1343,6 @@ pub fn spawn(
         // indistinguishable -- and the first tick would announce every
         // pull request already waiting.
         let mut previous_reviewing: Option<Vec<PullRequest>> = None;
-        // Consecutive failures, reset by any success. Transient failures
-        // are not surfaced until this crosses the threshold -- see
-        // `should_surface`.
-        let mut consecutive_failures: u32 = 0;
         loop {
             if !github_source_enabled.load(Ordering::Relaxed) {
                 // Source selection pauses GitHub network work, including the
@@ -1323,13 +1350,11 @@ pub fn spawn(
                 waker.notified().await;
                 continue;
             }
-            // `timeout` collapses a hang into the Err arm the loop already
-            // handles, so a wedged request costs one tick instead of the
-            // rest of the session.
-            let _ = app.emit("poll-state", "fetching");
-            // What this tick leaves behind, emitted once at the end. A
-            // suppressed failure sets "retrying"; everything else is
-            // genuinely idle. Reset per tick so a recovery clears it.
+            // `poll-state` and `poll-error` come from `source_poll`'s
+            // `emit_status` alone, driven by the authored list's status and
+            // its one failure counter. The loop emitting them as well, under
+            // its own counter, sent each banner twice and let the two
+            // copies disagree (#1934).
 
             // DIAGNOSTIC LOGGING (Settings > diagnostic log). The background loop
             // shares one client -- and one connection pool -- with
@@ -1380,7 +1405,6 @@ pub fn spawn(
                                     Ok(result) => result,
                                     Err(failure) => {
                                         let message = failure.message.clone();
-                                        consecutive_failures += 1;
                                         source_poll::complete(&app, publication, Err(failure));
                                         return (fetch_ms, Some((message, None)));
                                     }
@@ -1464,10 +1488,8 @@ pub fn spawn(
                                 log::warn!("failed to emit prs-incomplete: {e}");
                             }
 
-                            consecutive_failures = 0;
                             persist_and_emit(&app, &prs, coverage.clone(), viewer, scan.is_some())
                                 .await;
-                            let _ = app.emit("poll-state", tick_state(None));
                             let capture =
                                 source_poll::complete_with_checking(&app, publication, receipt);
                             if let Some(capture) = capture.filter(|_| has_checking(&prs)) {
@@ -1478,30 +1500,9 @@ pub fn spawn(
                         // than blanking the UI; the next tick retries.
                         Err(e) => {
                             log::warn!("poll failed: {e}");
-                            consecutive_failures += 1;
-                            let surfaced = should_surface(&e, consecutive_failures);
-                            if surfaced {
-                                if let Err(emit_err) = app.emit("poll-error", e.to_string()) {
-                                    log::warn!("failed to emit poll-error: {emit_err}");
-                                }
-                            } else {
-                                log::info!(
-                            "not surfacing a transient failure ({consecutive_failures} in a row); \
-                             the next tick should recover"
-                        );
-                                // The bar has nothing else to go on: no
-                                // poll-error and no prs-updated on a suppressed
-                                // failure, so it would otherwise show a green
-                                // "Up to date" while the data is stale.
-                                //
-                                // Recorded rather than emitted here: the terminal
-                                // emit below runs on EVERY tick, so emitting
-                                // "retrying" at this point would be overwritten by
-                                // it microseconds later and the bar would settle on
-                                // green anyway -- the exact bug this branch exists
-                                // to prevent (#1104).
-                            }
-                            let _ = app.emit("poll-state", tick_state(Some(surfaced)));
+                            // `complete` settles the status, and `emit_status`
+                            // decides from it whether this surfaces as a
+                            // banner or stays "retrying" (#1104, #1934).
                             source_poll::complete(
                                 &app,
                                 publication,
@@ -1523,10 +1524,11 @@ pub fn spawn(
                     source_poll::fetch_github_step(&app, &scoped, CachedList::Reviewing, budget)
                         .await
                         .map_err(|e| source_poll::Failure::from(&e));
-                let reviewing_outcome = if reviewing_now.is_ok() {
-                    "ok"
-                } else {
-                    "failed"
+                // A declined request was not sent, so it did not fail (#1928).
+                let reviewing_outcome = match &reviewing_now {
+                    Ok(_) => "ok",
+                    Err(failure) if failure.not_asked => "not asked",
+                    Err(_) => "failed",
                 };
                 // Each successful queue survives a failure from the other queue.
                 let review_publication = if reviewing_now.is_ok() {
@@ -1565,25 +1567,41 @@ pub fn spawn(
                 }
                 reviewing_outcome
             };
-            let ((fetch_ms, tick_failure), reviewing_outcome) =
+            let (authored_outcome, reviewing_outcome) =
                 prioritized_pair(client.reviewing_first(), authored_work, reviewing_work).await;
+            // A list left unasked keeps its last status and receipt: it was
+            // not sent, so nothing failed (#1932).
+            let reviewing_outcome = reviewing_outcome.unwrap_or("not asked");
             crate::diag!(
-                "[diag] poll tick fetch done {}ms authored_ok={} reviewing={}",
+                "[diag] poll tick fetch done {}ms authored={} reviewing={}",
                 tick_started.elapsed().as_millis(),
-                tick_failure.is_none(),
+                match &authored_outcome {
+                    None => "not asked",
+                    Some((_, None)) => "ok",
+                    Some((_, Some(_))) => "failed",
+                },
                 reviewing_outcome
             );
-            let ok = tick_failure.is_none();
-            let (error, timed_out_after_secs) = tick_failure.unzip();
-            crate::report::record_tick(crate::report::PollTickRecord {
-                at_unix_ms: crate::report::now_unix_ms(),
-                ok,
-                fetch_ms,
-                error,
-                timed_out_after_secs: timed_out_after_secs.flatten(),
-                attempt: consecutive_failures,
-                reviewing: reviewing_outcome.to_string(),
-            });
+            // The report describes the open-pull-request search; a tick that
+            // did not send it has no outcome to record for it.
+            if let Some((fetch_ms, tick_failure)) = authored_outcome {
+                let ok = tick_failure.is_none();
+                let (error, timed_out_after_secs) = tick_failure.unzip();
+                crate::report::record_tick(crate::report::PollTickRecord {
+                    at_unix_ms: crate::report::now_unix_ms(),
+                    ok,
+                    fetch_ms,
+                    error,
+                    timed_out_after_secs: timed_out_after_secs.flatten(),
+                    // The authored status's own counter: one count of
+                    // consecutive failures, not a second one kept here.
+                    attempt: app
+                        .state::<source_poll::SourcePolls>()
+                        .get(&Source::default(), CachedList::Authored)
+                        .consecutive_failures,
+                    reviewing: reviewing_outcome.to_string(),
+                });
+            }
 
             // Whichever comes first: the cadence elapsing, or someone
             // asking for a refresh. `Notify` stores one permit, so a
@@ -1768,9 +1786,9 @@ mod tests {
     fn a_transient_failure_is_named_only_when_it_repeats() {
         let e = ClientError::Timeout(90);
         assert!(e.is_transient());
-        assert!(!should_surface(&e, 1), "one blip is weather");
+        assert!(!should_surface(e.is_transient(), 1), "one blip is weather");
         assert!(
-            should_surface(&e, FAILURES_BEFORE_BANNER),
+            should_surface(e.is_transient(), FAILURES_BEFORE_BANNER),
             "two in a row is a problem"
         );
     }
@@ -1894,7 +1912,10 @@ mod tests {
     fn one_transient_failure_does_not_surface() {
         let e = ClientError::Timeout(90);
         assert!(e.is_transient());
-        assert!(!should_surface(&e, 1), "one blip must stay quiet");
+        assert!(
+            !should_surface(e.is_transient(), 1),
+            "one blip must stay quiet"
+        );
     }
 
     /// A suppressed transient failure must NOT end the tick as "idle".
@@ -1908,7 +1929,7 @@ mod tests {
     /// passed against the broken code for the whole time it was broken.
     #[test]
     fn a_suppressed_failure_does_not_end_the_tick_idle() {
-        assert_eq!(tick_state(Some(false)), "retrying");
+        assert_eq!(tick_state(&source_poll::Phase::Retrying), "retrying");
     }
 
     /// A surfaced failure DOES end the tick idle: `poll-error` is already on
@@ -1916,14 +1937,14 @@ mod tests {
     /// with its own banner.
     #[test]
     fn a_surfaced_failure_leaves_the_banner_to_speak() {
-        assert_eq!(tick_state(Some(true)), "idle");
+        assert_eq!(tick_state(&source_poll::Phase::Failed), "idle");
     }
 
     /// A successful tick is genuinely idle -- the guard above must not be so
     /// broad that the bar can never return to green.
     #[test]
     fn a_successful_tick_is_idle() {
-        assert_eq!(tick_state(None), "idle");
+        assert_eq!(tick_state(&source_poll::Phase::Ready), "idle");
     }
 
     /// But a real outage must not be hidden. Two in a row stops being
@@ -1931,8 +1952,8 @@ mod tests {
     #[test]
     fn repeated_transient_failures_do_surface() {
         let e = ClientError::Timeout(90);
-        assert!(should_surface(&e, FAILURES_BEFORE_BANNER));
-        assert!(should_surface(&e, FAILURES_BEFORE_BANNER + 5));
+        assert!(should_surface(e.is_transient(), FAILURES_BEFORE_BANNER));
+        assert!(should_surface(e.is_transient(), FAILURES_BEFORE_BANNER + 5));
     }
 
     /// Waiting cannot fix a rate limit or a malformed query, so those
@@ -1946,7 +1967,7 @@ mod tests {
         ] {
             assert!(!e.is_transient(), "{e} should not be transient");
             assert!(
-                should_surface(&e, 1),
+                should_surface(e.is_transient(), 1),
                 "{e} must surface on the first failure"
             );
         }
@@ -1965,7 +1986,7 @@ mod tests {
         for _ in 0..5 {
             consecutive += 1;
             assert!(
-                !should_surface(&e, consecutive),
+                !should_surface(e.is_transient(), consecutive),
                 "an isolated blip must never surface"
             );
             consecutive = 0; // the success arm
@@ -1973,9 +1994,9 @@ mod tests {
 
         // Two back to back, with no success between them, does surface.
         consecutive += 1;
-        assert!(!should_surface(&e, consecutive));
+        assert!(!should_surface(e.is_transient(), consecutive));
         consecutive += 1;
-        assert!(should_surface(&e, consecutive));
+        assert!(should_surface(e.is_transient(), consecutive));
     }
 
     /// A timeout is transient by definition: the request was still in
@@ -2146,7 +2167,7 @@ mod tests {
             },
         )
         .await;
-        assert!(!authored_ok && reviewing_ok);
+        assert_eq!((authored_ok, reviewing_ok), (Some(false), Some(true)));
         assert_eq!(started.elapsed(), TICK_TIMEOUT);
     }
 
@@ -2168,7 +2189,70 @@ mod tests {
             },
         )
         .await;
-        assert!(authored_ok && !reviewing_ok);
+        assert_eq!((authored_ok, reviewing_ok), (Some(true), Some(false)));
+    }
+
+    /// #1932: when the first list used up the tick, the second is not sent.
+    /// Sending it would spend a rate-limit point on a request that times out
+    /// at once, and that timeout would read as GitHub failing to answer.
+    /// The callback is never invoked, so no attempt begins and no status
+    /// moves -- in either order.
+    #[tokio::test(start_paused = true)]
+    async fn the_second_list_is_not_asked_when_the_tick_is_spent() {
+        for reviewing_first in [false, true] {
+            for spent in [TICK_TIMEOUT, TICK_TIMEOUT - MIN_USEFUL_FETCH_BUDGET / 2] {
+                let second_invoked = std::cell::Cell::new(false);
+                let (authored, reviewing) = prioritized_pair(
+                    reviewing_first,
+                    async |_budget| {
+                        if reviewing_first {
+                            second_invoked.set(true);
+                        } else {
+                            tokio::time::advance(spent).await;
+                        }
+                        "authored"
+                    },
+                    async |_budget| {
+                        if reviewing_first {
+                            tokio::time::advance(spent).await;
+                        } else {
+                            second_invoked.set(true);
+                        }
+                        "reviewing"
+                    },
+                )
+                .await;
+                assert!(
+                    !second_invoked.get(),
+                    "reviewing_first={reviewing_first} spent={spent:?}: the second list was asked"
+                );
+                if reviewing_first {
+                    assert_eq!((authored, reviewing), (None, Some("reviewing")));
+                } else {
+                    assert_eq!((authored, reviewing), (Some("authored"), None));
+                }
+            }
+        }
+    }
+
+    /// The other side of the boundary: a second list with a useful budget
+    /// left is still asked, so the skip cannot swallow ordinary ticks.
+    #[tokio::test(start_paused = true)]
+    async fn the_second_list_is_asked_with_a_useful_budget_left() {
+        let spent = TICK_TIMEOUT - MIN_USEFUL_FETCH_BUDGET;
+        let (authored, reviewing) = prioritized_pair(
+            false,
+            async |_budget| {
+                tokio::time::advance(spent).await;
+                "authored"
+            },
+            async |budget| {
+                assert_eq!(budget, MIN_USEFUL_FETCH_BUDGET);
+                "reviewing"
+            },
+        )
+        .await;
+        assert_eq!((authored, reviewing), (Some("authored"), Some("reviewing")));
     }
 
     /// A hung request must collapse into the error arm rather than
