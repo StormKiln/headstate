@@ -3360,6 +3360,7 @@ mod tests {
     /// `get_worktree_dirs`, `get_cached`, `get_cached_reviewing`,
     /// `cleanup_log`, five setters, `mark_assessed` and `clear_assessed`
     /// -- pass, and that was checked rather than assumed.
+    /// (`get_cached_reviewing` has since been removed as dead, #1940.)
     ///
     /// The two halves were then checked against each other, one command
     /// at a time: giving each of those 15 a real `read_to_string` in its
@@ -3699,19 +3700,31 @@ mod tests {
     /// emitted -- so the To Review page paid ~20s for a query the
     /// background had already made a minute earlier (#1118).
     ///
+    /// The write is `source_poll::reconcile_github`, the one snapshot
+    /// writer (#1940): it saves inside the scan's transaction. A separate
+    /// `persist_reviewing` used to write the same rows again afterwards,
+    /// outside it. So the question is whether the tick that fetched the
+    /// review list reconciles it -- `now` is that tick's review result.
+    ///
     /// Asserted against the loop rather than the store: `save_snapshot`
     /// has callers, and the question is whether THIS one is among them.
     #[test]
     fn the_poll_loop_caches_the_review_queue_it_fetches() {
-        let src = include_str!("poll.rs");
+        let src = include_str!("poll.rs").replace("\r\n", "\n");
+        let code: String = src
+            .lines()
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            src.contains("CachedList::Reviewing"),
+            code.contains("CachedList::Reviewing"),
             "the poll loop must write the review list it already fetches, or the To Review \
              page is only ever as fresh as its last visit (#1118)"
         );
         assert!(
-            src.contains("persist_reviewing(&app, &now).await"),
-            "and it must do so on the tick that fetched it"
+            code.contains("source_poll::reconcile_github(&app, &publication, now)"),
+            "and it must reconcile -- which saves -- the review list on the tick that \
+             fetched it (poll.rs, the reviewing half of the tick)"
         );
     }
 

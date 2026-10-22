@@ -136,6 +136,9 @@ pub enum Cycle {
     Ok,
     /// The work was attempted and failed, with the reason.
     Failed(String),
+    /// Another publication won; this attempt contributes no new health
+    /// outcome and must neither clear nor increment failure counts.
+    Superseded,
     /// Nothing was attempted -- declined by admission, a source switched
     /// off, nothing due. Neither a success nor a failure (#1050: what we
     /// did not ask must not read as what they did not answer).

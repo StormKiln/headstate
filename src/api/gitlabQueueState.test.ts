@@ -135,3 +135,15 @@ it("requires envelope ownership for empty receipts and rejects wrong envelopes e
   state.accept(update({ mrs: [], owner: "alice" }));
   expect(state.snapshot().rows).toEqual([]);
 });
+
+// #1941: a status event that would only repeat the accepted receipt's rows
+// arrives with `mrs: null`. The rows stay; the phase and error move.
+it("keeps accepted rows when a status repeats their receipt without carrying them", () => {
+  const state = new GitLabQueueState();
+  state.accept(update({ revision: 2, receipt_revision: 2, mrs: [mr("accepted")] }));
+  state.accept(update({ phase: "fetching", revision: 3, receipt_revision: 2, mrs: null }));
+  expect(state.snapshot().rows?.[0].title).toBe("accepted");
+  state.accept(update({ phase: "failed", error: "GitLab timed out", revision: 4, receipt_revision: 2, mrs: null }));
+  expect(state.snapshot().rows?.[0].title).toBe("accepted");
+  expect(state.snapshot().error).toBe("GitLab timed out");
+});
