@@ -28,6 +28,7 @@ const mockRefused = vi.fn<() => number>(() => 0);
 const mockShortfall = vi.fn<() => number | null>(() => 0);
 const mockTruncation = vi.fn<() => number | null | undefined>(() => undefined);
 const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
+const mockPollError = vi.fn<() => string | null>(() => null);
 
 vi.mock("./api/sourceRefreshHooks", () => ({
   usePhoneGitHubRefresh: () => undefined,
@@ -91,7 +92,7 @@ vi.mock("./api/hooks", () => ({
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
   usePullRequests: () => ({ data: mockPrs(), staleSecs: null, isSuccess: true, isLoading: false, dataUpdatedAt: mockDataUpdatedAt() }),
-  usePollError: () => null,
+  usePollError: () => mockPollError(),
   useStoreError: () => ({ message: null, dismiss: () => {} }),
   clearPollError: () => {},
   useRefreshRequested: () => undefined,
@@ -469,6 +470,37 @@ describe("opening a pull request from To review", () => {
     useFilters.setState({ selectedPr: { repo: "someone/else", number: 71 } });
     renderApp();
     expect(screen.getByRole("button", { name: /back to list/i })).toBeTruthy();
+  });
+
+  // #1934: "Could not reach GitHub" on To Review must follow the review
+  // queue's own receipt, not My PRs' poll error.
+  describe("an empty review queue", () => {
+    afterEach(() => {
+      mockPollError.mockReturnValue(null);
+      mockReviewPhase.mockReturnValue(undefined);
+    });
+
+    it("is a normal empty list when only the authored list failed", () => {
+      mockReviewing.mockReturnValue([]);
+      mockPollError.mockReturnValue("GitHub request timed out after 30s");
+      mockReviewPhase.mockReturnValue("ready");
+      renderApp();
+      expect(screen.queryByText("Could not reach GitHub.")).toBeNull();
+    });
+
+    it("is unreachable when the review queue itself failed", () => {
+      mockReviewing.mockReturnValue([]);
+      mockReviewPhase.mockReturnValue("failed");
+      renderApp();
+      expect(screen.getByText("Could not reach GitHub.")).toBeTruthy();
+    });
+
+    it("is not unreachable when the review queue was not asked", () => {
+      mockReviewing.mockReturnValue([]);
+      mockReviewPhase.mockReturnValue("not_asked");
+      renderApp();
+      expect(screen.queryByText("Could not reach GitHub.")).toBeNull();
+    });
   });
 });
 

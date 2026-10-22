@@ -54,6 +54,12 @@ pub enum ClientError {
     RateLimited(String),
     #[error("headstate:not-asked {0}")]
     NotDispatched(String),
+    /// Something on THIS machine failed before or around the request: the
+    /// local database, or the blocking task that reads it. Distinct from
+    /// `Graphql` so a local fault is never reported as GitHub's answer
+    /// (#1928). The text names the local step and keeps the underlying error.
+    #[error("{0}")]
+    Local(String),
     /// GitHub refused the token: HTTP 401, or a GraphQL body saying so.
     ///
     /// # Why this is a variant rather than a message the UI recognises
@@ -107,6 +113,7 @@ impl ClientError {
             Self::Graphql(message) => Self::Graphql(message.clone()),
             Self::RateLimited(message) => Self::RateLimited(message.clone()),
             Self::NotDispatched(message) => Self::NotDispatched(message.clone()),
+            Self::Local(message) => Self::Local(message.clone()),
             Self::TokenRejected { said } => Self::TokenRejected { said: said.clone() },
             Self::UnconfirmedWrite => Self::UnconfirmedWrite,
         }
@@ -147,6 +154,10 @@ impl ClientError {
             // server gave up rather than objected, so the next tick may
             // well succeed.
             ClientError::NotJson(_) => true,
+            // A busy or locked database clears when the other writer
+            // finishes; the next tick opens it again. A persistent fault
+            // still surfaces on the second consecutive failure.
+            ClientError::Local(_) => true,
         }
     }
 }
