@@ -1075,8 +1075,7 @@ impl GitHubClient {
     /// Rides along in PRS_QUERY at zero extra rate-limit cost. Kept a
     /// separate call rather than folded into `fetch_prs`'s return type so
     /// the snapshot cache, poll loop and existing commands keep their
-    /// shapes; the poll loop fetches both in one request via
-    /// `fetch_prs_and_reviewing`.
+    /// shapes.
     /// Fails rather than returning an empty list GitHub did not mean.
     ///
     /// When GitHub refuses fields it nulls the NODES, and the mapper
@@ -1145,30 +1144,6 @@ impl GitHubClient {
         }
     }
 
-    pub async fn fetch_reviewing(&self) -> Result<Vec<PullRequest>, ClientError> {
-        self.fetch_reviewing_with_shortfall()
-            .await
-            .map(|(prs, _)| prs)
-    }
-
-    /// The review list, plus how many pull requests are MISSING from it.
-    ///
-    /// The shortfall is a second return value rather than an error: the
-    /// pull requests that did arrive are real and worth showing, and
-    /// blanking the list over an incomplete one is exactly the
-    /// regression v3.5.1 had to undo.
-    pub async fn fetch_reviewing_with_shortfall(
-        &self,
-    ) -> Result<(Vec<PullRequest>, u64), ClientError> {
-        self.fetch_reviewing_snapshot().await.map(|result| {
-            let short = result
-                .total
-                .unwrap_or(0)
-                .saturating_sub(result.prs.len() as u64);
-            (result.prs, short)
-        })
-    }
-
     fn owned_list_evidence(&self, value: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
         let mut result = list_evidence(value, prs);
         // This cell belongs to the immutable authenticated client, not to a
@@ -1186,6 +1161,12 @@ impl GitHubClient {
         self.viewer.get().map(String::as_str)
     }
 
+    /// The review-requested search as one bounded read, outside the scan.
+    ///
+    /// Not a production path: the poll loop and the refresh command read
+    /// the queue through `advance_scan` (`source_poll::fetch_github_step`).
+    /// Kept because the read-transport tests here and in `tests/` drive
+    /// coalescing, deadlines and refusals through it (#1940).
     pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_reviewing_snapshot_with_budget(SEARCH_BUDGET)
             .await
@@ -1195,7 +1176,7 @@ impl GitHubClient {
         &self,
         budget: std::time::Duration,
     ) -> Result<FetchedList, ClientError> {
-        // Its OWN request, not both lists. It used to call
+        // Its OWN request, not both lists. It used to call the removed
         // `fetch_prs_and_reviewing`, so opening To review paid for the
         // authored list as well -- and on a reported account with 40
         // authored and 71 review-requested, that is 111 pull requests
@@ -1297,37 +1278,6 @@ impl GitHubClient {
             refused_fields(&v),
             "review count",
         )
-    }
-
-    /// Both lists, as two CONCURRENT requests.
-    ///
-    /// Two requests rather than one aliased query: the aliased form made
-    /// every caller pay for both searches, so opening To review fetched
-    /// the authored list too. Concurrent, so the wall-clock is one
-    /// request rather than the sum.
-    pub async fn fetch_prs_and_reviewing(
-        &self,
-    ) -> Result<(Vec<PullRequest>, Vec<PullRequest>), ClientError> {
-        // DIAGNOSTIC LOGGING (Settings > diagnostic log). These two run
-        // concurrently, so a total far above the slower of the two
-        // means they are NOT actually overlapping -- which would point
-        // at connection-pool or rate-limiter serialization rather than
-        // at either query.
-        let started = std::time::Instant::now();
-        let (authored, reviewing) = tokio::join!(
-            self.search_page_with_fallback(AUTHORED_OPEN),
-            self.search_page_with_fallback(REVIEW_REQUESTED),
-        );
-        crate::diag!(
-            "[diag] fetch_prs_and_reviewing both searches settled in {}ms",
-            started.elapsed().as_millis()
-        );
-        // Both map from the `authored` alias: the query has one search,
-        // named that whatever it is searching for.
-        Ok((
-            map_list(&authored?, "authored"),
-            map_list(&reviewing?, "authored"),
-        ))
     }
 
     /// Run a mutation, treating ANY error as failure.
@@ -4058,13 +4008,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, short) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_reviewing_with_shortfall()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap();
-        assert_eq!(prs.len(), 3, "the pull requests that arrived are kept");
-        assert_eq!(short, 7, "and the seven that did not are reported");
+        assert_eq!(list.prs.len(), 3, "the pull requests that arrived are kept");
+        let short = list
+            .total
+            .map(|total| total.saturating_sub(list.prs.len() as u64));
+        assert_eq!(short, Some(7), "and the seven that did not are reported");
     }
 
     /// A complete list must report NO shortfall, or the banner would
@@ -4090,12 +4043,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, short) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_reviewing_with_shortfall()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap();
-        assert_eq!(short, 0);
+        let short = list
+            .total
+            .map(|total| total.saturating_sub(list.prs.len() as u64));
+        assert_eq!(short, Some(0));
     }
 
     #[tokio::test]
@@ -4520,7 +4476,7 @@ mod tests {
 
     /// `$first` is non-null, so every call site must pass it.
     ///
-    /// It became a variable when the page size did, and
+    /// It became a variable when the page size did, and the since-removed
     /// `fetch_prs_and_reviewing` was missed -- GitHub then rejected that
     /// query outright ("Variable $first of type Int! was provided
     /// invalid value") and the review queue returned nothing at all.
@@ -4544,13 +4500,18 @@ mod tests {
 
         // Unmatched requests 404 in wiremock, so a call that omits
         // `first` fails here rather than passing silently.
-        assert!(client_for(&server).await.fetch_reviewing().await.is_ok());
+        assert!(client_for(&server)
+            .await
+            .fetch_reviewing_snapshot()
+            .await
+            .is_ok());
     }
 
     /// To review fetches ONLY the review queue.
     ///
-    /// It used to call `fetch_prs_and_reviewing`, so opening that view
-    /// also fetched the authored list -- on a reported account, 111
+    /// It used to call the since-removed `fetch_prs_and_reviewing`, so
+    /// opening that view also fetched the authored list -- on a reported
+    /// account, 111
     /// fully populated pull requests when 71 were wanted. That is why My
     /// pull requests recovered there once the page shrank and To review
     /// did not.
@@ -4573,7 +4534,11 @@ mod tests {
 
         // Any request NOT matching `review-requested` is unmatched and
         // 404s, so fetching the authored list too fails this.
-        assert!(client_for(&server).await.fetch_reviewing().await.is_ok());
+        assert!(client_for(&server)
+            .await
+            .fetch_reviewing_snapshot()
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -4899,11 +4864,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server)
-            .await
-            .fetch_reviewing()
-            .await
-            .unwrap_err();
+        let Err(err) = client_for(&server).await.fetch_reviewing_snapshot().await else {
+            panic!("a refused page with no usable rows must fail");
+        };
         assert!(err.to_string().contains("refused"), "{err}");
     }
 
@@ -4924,9 +4887,10 @@ mod tests {
 
         assert!(client_for(&server)
             .await
-            .fetch_reviewing()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap()
+            .prs
             .is_empty());
     }
 
@@ -5618,7 +5582,7 @@ mod tests {
     /// accompanies it, which is right: 26 good PR nodes beat none. The
     /// corollary is that every caller inherits a response that may be
     /// PARTIAL and has to decide what to do about it. One caller did:
-    /// `fetch_reviewing_with_shortfall` has called
+    /// `fetch_reviewing_snapshot` has called
     /// `reject_empty_after_refusals` since #317, whose doc spells the cost
     /// out -- a refused page cached as "No open pull requests", shown
     /// indefinitely because the query stays fresh for a minute.
@@ -5665,8 +5629,8 @@ mod tests {
         /// that cries wolf is a guard somebody disables.
         const NO_REFUSAL_READ: &[(&str, &str)] = &[
             // Runs the document; its callers consult the count on the
-            // response it returns. `fetch_reviewing_with_shortfall` does
-            // so through `reject_empty_after_refusals`.
+            // response it returns. `fetch_reviewing_snapshot` does so
+            // through `reject_empty_after_refusals`.
             (
                 "search_page",
                 "returns the raw response; its callers read the count",

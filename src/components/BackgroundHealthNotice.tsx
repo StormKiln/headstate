@@ -13,10 +13,39 @@ function label(task: string): string {
       return "The transcript search index";
     case "claude-live":
       return "The Claude Code session reader";
+    case "github-poll":
+      return "GitHub pull request polling";
+    case "github-continuation":
+      return "Loading the rest of a long GitHub queue";
+    case "gitlab-poll":
+      return "GitLab merge request polling";
+    case "claude-activity":
+      return "Live Claude Code session activity";
     default:
       // Not "Unknown task": a loop added later with no case here should
       // still be reportable, and its key is more useful than a shrug.
       return task;
+  }
+}
+
+/// What a broken loop means for what is on screen, in the reader's terms.
+function consequence(task: string): string {
+  switch (task) {
+    case "health-sampler":
+      return "The app has been running, so any gap in the chart below is missing data rather than time the app was closed.";
+    case "claude-index":
+      return "Transcript search results may be incomplete.";
+    case "claude-live":
+      return "Session history and crash detection have not been updating.";
+    case "github-poll":
+    case "gitlab-poll":
+      return "Pull request lists and the tray badge may be out of date.";
+    case "github-continuation":
+      return "A long pull request list may stay partly loaded.";
+    case "claude-activity":
+      return "Running sessions may be slow to show new activity.";
+    default:
+      return "Data it maintains may be out of date.";
   }
 }
 
@@ -69,8 +98,13 @@ export function BackgroundHealthNotice({
       {bad.map((t) => (
         <div key={t.task} className="text-xs">
           <p className="font-semibold text-[#ff7b72]">
-            {label(t.task)} has failed {t.consecutive_failures} time
-            {t.consecutive_failures === 1 ? "" : "s"} in a row.
+            {/* Stalled and failing are different facts (#1937): a stuck
+                loop has failed zero times, and "failed 0 times in a row"
+                would read as fine. A stall wins when both hold -- it is
+                not running at all now -- and the last error still shows. */}
+            {t.stalled
+              ? `${label(t.task)} has stopped: it has not finished a cycle ${t.last_tick_ms == null ? "since the app started" : `since ${ago(t.last_tick_ms, now)}`}.`
+              : `${label(t.task)} has failed ${t.consecutive_failures} time${t.consecutive_failures === 1 ? "" : "s"} in a row.`}
           </p>
           {/* The REASON, verbatim. Without it the user knows only that
               something is wrong, which is where they were before. */}
@@ -81,11 +115,7 @@ export function BackgroundHealthNotice({
               the app's fault, not the user's, and the page otherwise
               tells them the opposite. */}
           <p className="mt-0.5 text-[#8b949e]">
-            {t.task === "health-sampler"
-              ? "The app has been running, so any gap in the chart below is missing data rather than time the app was closed."
-              : t.task === "claude-index"
-                ? "Transcript search results may be incomplete."
-                : "Session history and crash detection have not been updating."}{" "}
+            {consequence(t.task)}{" "}
             {t.last_success_ms === null
               ? "It has not succeeded once since the app started."
               : `Last succeeded ${ago(t.last_success_ms, now)}.`}

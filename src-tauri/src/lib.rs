@@ -322,7 +322,6 @@ pub fn run() {
             commands::fetch_refs,
             commands::remove_orphan,
             commands::get_cached,
-            commands::get_cached_reviewing,
             commands::refresh_now,
             commands::get_reviewing,
             commands::count_reviewing,
@@ -723,6 +722,9 @@ pub fn run() {
                     let mut watcher = health::runaway::Watcher::default();
                     let mut last_pass = std::time::Instant::now();
                     loop {
+                        // Before the wait, so a sample or live pass that
+                        // never returns reads as stalled (#1937).
+                        background::HEALTH_SAMPLER.tick(std::time::Duration::from_secs(60));
                         std::thread::sleep(std::time::Duration::from_secs(60));
                         let sample = collector.sample(&chrono::Utc::now().to_rfc3339());
 
@@ -886,7 +888,29 @@ pub fn run() {
                                 }
                             }
                         }
+                    }
+                });
+            }
 
+            // The Claude Code live pass, on its OWN thread (#1941).
+            //
+            // It shared the health sampler's thread until #1941. A slow
+            // indexing pass then delayed the next health sample by its
+            // whole duration and inflated the runaway watcher's
+            // `elapsed`, so the watcher could credit a process with
+            // minutes it had not been observed for. Separate threads give
+            // each its own 60-second cadence; neither can starve the
+            // other.
+            {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // What the previous pass observed, so the population
+                    // event fires on change only (#1941). `None` until a
+                    // pass succeeds, so the first one always announces.
+                    let mut last_population: Option<commands::PopulationReceipt> = None;
+                    loop {
+                        background::CLAUDE_LIVE.tick(std::time::Duration::from_secs(60));
+                        std::thread::sleep(std::time::Duration::from_secs(60));
                         // ---- The Claude Code live pass (#947) ----
                         //
                         // Here rather than in a frontend `useQuery`,
@@ -919,16 +943,11 @@ pub fn run() {
                         // the registry and does not depend on this pass
                         // at all; what this pass adds is the recorded
                         // run history and crash rows, where a minute of
-                        // latency costs nothing. Sharing the existing
-                        // thread also avoids a second timer to reason
-                        // about.
+                        // latency costs nothing.
                         if commands::read_ui_prefs(&app_handle).claude_integrations_enabled {
                             match commands::claude_live_pass(&commands::db_path(&app_handle)) {
                                 Ok(state) => {
                                     background::CLAUDE_LIVE.ok(background::now_ms());
-                                    // Receipt only: observers re-read cheap stored summaries.
-                                    // No paths, transcript content or provider reads.
-                                    let _ = app_handle.emit("claude-population-updated", ());
                                     // ---- "your session died" (#979) ----
                                     //
                                     // `crashed_sessions` and NOT a query
@@ -969,6 +988,15 @@ pub fn run() {
                                         }
                                     }
 
+                                    // Receipt only: observers re-read cheap stored summaries.
+                                    // No paths, transcript content or provider reads.
+                                    // Only when the pass changed something (#1941): every
+                                    // receipt makes the frontend refetch five summaries.
+                                    if state.population_changed(last_population.as_ref()) {
+                                        let _ = app_handle.emit("claude-population-updated", ());
+                                    }
+                                    last_population = Some(state.population_receipt());
+
                                     // Deferred work and deliberate stops are neutral; only
                                     // actual index faults affect background health.
                                     if state.index_health.record_health(
@@ -1001,11 +1029,13 @@ pub fn run() {
                                     }
                                 }
                                 // Warned and skipped, never fatal, for
-                                // the reason the health sample above
-                                // gives: a pass that could not read
-                                // `~/.claude` must not stop the loop
-                                // that also records system health.
+                                // the reason the health sample gives: a
+                                // pass that could not read `~/.claude`
+                                // must not stop the loop.
                                 Err(e) => {
+                                    // A failed pass may have stored part of its
+                                    // work; the next good one must announce.
+                                    last_population = None;
                                     log::warn!("claude: live pass failed: {e}");
                                     if background::CLAUDE_LIVE.failed(e.to_string()) {
                                         use tauri::Emitter;
@@ -1016,6 +1046,10 @@ pub fn run() {
                                     }
                                 }
                             }
+                        } else {
+                            background::CLAUDE_LIVE.park();
+                            // Turned off: re-enabling must announce.
+                            last_population = None;
                         }
                     }
                 });
