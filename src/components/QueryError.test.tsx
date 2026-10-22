@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { NOT_ASKED } from "@/lib/notAsked";
+import { NOT_ASKED, NOT_AUTHENTICATED } from "@/lib/notAsked";
 import { QueryError } from "./QueryError";
 
 describe("QueryError", () => {
@@ -31,8 +31,29 @@ describe("QueryError", () => {
   it("withholds a retry that cannot work", () => {
     const onRetry = vi.fn();
     render(
-      <QueryError title="Could not load" message={`${NOT_ASKED} not authenticated`} onRetry={onRetry} />,
+      <QueryError title="Could not load" message={`${NOT_ASKED} ${NOT_AUTHENTICATED}`} onRetry={onRetry} />,
     );
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+  });
+
+  /// ...and handed through where it CAN work (#2004): a budget refusal
+  /// clears, so withholding its retry would strand the reader.
+  it("keeps the retry for a declined request that can clear", () => {
+    const onRetry = vi.fn();
+    render(
+      <QueryError title="Could not load" message={`${NOT_ASKED} provider cooldown is active`} onRetry={onRetry} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  /// A caller whose message was stripped upstream says so, and gets its
+  /// own "not checked" title rather than a failure's (#2004).
+  it("takes the caller's not-asked verdict and title", () => {
+    render(<QueryError title="Your pull requests were not checked" message={NOT_AUTHENTICATED} notAsked onRetry={vi.fn()} />);
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText("Your pull requests were not checked")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
   });
 
