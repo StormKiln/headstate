@@ -31,7 +31,7 @@ pub mod source_cache;
 #[cfg(test)]
 mod sqlite_efficiency;
 
-pub use cache::{load_snapshot, save_snapshot, CachedList, CachedSnapshot};
+pub use cache::{CachedList, CachedSnapshot};
 pub use schema::{open_db, StoreError};
 
 /// Test-only: the remote pairing tests migrate an in-memory connection.
@@ -45,11 +45,44 @@ mod tests {
         CiState, Label, MergeState, MergeStateStatus, PullRequest, ReviewState,
     };
     use chrono::Utc;
+    use source_cache::SnapshotData;
 
     fn db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn
+    }
+
+    /// Write the default source's list as the removed `save_snapshot` did
+    /// (#2003): `save_source_snapshot` with coverage left unknown.
+    fn save(conn: &rusqlite::Connection, which: CachedList, prs: &[PullRequest]) {
+        source_cache::save_source_snapshot(
+            conn,
+            &crate::identity::Source::default(),
+            which,
+            prs,
+            &source_cache::Coverage::Unknown,
+        )
+        .unwrap();
+    }
+
+    /// The default source's list, read the way production reads it.
+    fn read(conn: &rusqlite::Connection, which: CachedList) -> SnapshotData {
+        source_cache::load_source_snapshot(conn, &crate::identity::Source::default(), which)
+            .unwrap()
+            .data
+    }
+
+    /// The rows of a FRESH available snapshot; panics on any other state.
+    fn fresh_rows(conn: &rusqlite::Connection, which: CachedList) -> Vec<PullRequest> {
+        match read(conn, which) {
+            SnapshotData::Available {
+                prs,
+                stale_secs: None,
+                ..
+            } => prs,
+            other => panic!("expected a fresh snapshot, got {other:?}"),
+        }
     }
 
     fn sample() -> PullRequest {
@@ -106,7 +139,7 @@ mod tests {
             rusqlite::params![legacy],
         )
         .unwrap();
-        let loaded = load_snapshot(&conn, CachedList::Authored).unwrap();
+        let loaded = fresh_rows(&conn, CachedList::Authored);
         assert_eq!(loaded, vec![original.clone()]);
         assert_eq!(
             loaded[0].identity().source,
@@ -122,8 +155,8 @@ mod tests {
     #[test]
     fn round_trips_a_snapshot() {
         let conn = db();
-        save_snapshot(&conn, CachedList::Authored, &[sample()]).unwrap();
-        let loaded = load_snapshot(&conn, CachedList::Authored).unwrap();
+        save(&conn, CachedList::Authored, &[sample()]);
+        let loaded = fresh_rows(&conn, CachedList::Authored);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].number, 42);
         assert_eq!(loaded[0].labels[0].name, "bug");
@@ -132,29 +165,23 @@ mod tests {
     #[test]
     fn a_snapshot_replaces_the_previous_one() {
         let conn = db();
-        save_snapshot(&conn, CachedList::Authored, &[sample()]).unwrap();
-        save_snapshot(&conn, CachedList::Authored, &[]).unwrap();
-        assert_eq!(load_snapshot(&conn, CachedList::Authored).unwrap().len(), 0);
+        save(&conn, CachedList::Authored, &[sample()]);
+        save(&conn, CachedList::Authored, &[]);
+        assert_eq!(fresh_rows(&conn, CachedList::Authored).len(), 0);
     }
 
     #[test]
     fn loading_from_an_empty_db_returns_empty_not_an_error() {
-        assert_eq!(load_snapshot(&db(), CachedList::Authored).unwrap().len(), 0);
+        // `read` unwraps, so an error fails here; and "nothing saved" is
+        // its own state, not a measured empty list.
+        assert_eq!(read(&db(), CachedList::Authored), SnapshotData::Missing);
     }
 
     /// The saved reviewing list, read the way production reads it
     /// (`source_cache::load_source_snapshot`), as its rows and age.
     /// `None` when nothing usable is saved.
     fn rows_and_age(conn: &rusqlite::Connection) -> Option<(Vec<PullRequest>, Option<i64>)> {
-        use source_cache::SnapshotData;
-        match source_cache::load_source_snapshot(
-            conn,
-            &crate::identity::Source::default(),
-            CachedList::Reviewing,
-        )
-        .unwrap()
-        .data
-        {
+        match read(conn, CachedList::Reviewing) {
             SnapshotData::Available {
                 prs, stale_secs, ..
             } => Some((prs, stale_secs)),
@@ -166,16 +193,17 @@ mod tests {
     /// #742: a snapshot past the freshness window must come back MARKED,
     /// not discarded.
     ///
-    /// `load_snapshot` returns an empty Vec for a stale snapshot, which
-    /// the UI could not tell from "nothing awaits your review" -- so it
-    /// rendered a confident empty list for as long as the live fetch
+    /// The old `load_snapshot` returned an empty Vec for a stale snapshot,
+    /// which the UI could not tell from "nothing awaits your review" -- so
+    /// it rendered a confident empty list for as long as the live fetch
     /// took. The production reader returns the rows and their age.
     /// (These drove `load_snapshot_marked`, which only tests reached;
-    /// #1998 moved them onto `load_source_snapshot`.)
+    /// #1998 moved them onto `load_source_snapshot`. `load_snapshot`
+    /// itself was test-only too and went in #2003.)
     #[test]
     fn a_stale_snapshot_is_returned_with_its_age() {
         let conn = db();
-        save_snapshot(&conn, CachedList::Reviewing, &[sample()]).unwrap();
+        save(&conn, CachedList::Reviewing, &[sample()]);
         // Backdate past the hour-long window.
         // Every row: this database holds only the one snapshot just
         // written, and `id()` is private to the cache module.
@@ -184,14 +212,6 @@ mod tests {
             [],
         )
         .unwrap();
-
-        // The old path still hides it, which is what callers that only
-        // want fresh data rely on.
-        assert_eq!(
-            load_snapshot(&conn, CachedList::Reviewing).unwrap().len(),
-            0,
-            "load_snapshot still ages out"
-        );
 
         let (prs, stale_secs) = rows_and_age(&conn).expect("the rows survive");
         assert_eq!(prs.len(), 1, "the rows survive");
@@ -208,7 +228,7 @@ mod tests {
     #[test]
     fn a_fresh_snapshot_is_not_marked() {
         let conn = db();
-        save_snapshot(&conn, CachedList::Reviewing, &[sample()]).unwrap();
+        save(&conn, CachedList::Reviewing, &[sample()]);
         let (prs, stale_secs) = rows_and_age(&conn).expect("just written");
         assert_eq!(prs.len(), 1);
         assert_eq!(stale_secs, None, "just written: nothing to warn about");
@@ -227,6 +247,6 @@ mod tests {
         let conn = db();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(load_snapshot(&conn, CachedList::Authored).unwrap().len(), 0);
+        assert_eq!(read(&conn, CachedList::Authored), SnapshotData::Missing);
     }
 }
