@@ -3337,7 +3337,10 @@ function worktreeSizeOptions(
     },
     initialDataUpdatedAt: () => {
       const queries = qc.getQueryCache().findAll({ queryKey: ["worktree-sizes", repoPath] });
-      return Math.min(...(paths ?? []).map((path) => Math.max(0, ...queries.filter((q) => (q.state.data as Map<string, number | null> | undefined)?.has(path)).map((q) => q.state.dataUpdatedAt))));
+      const stamps = (paths ?? []).map((path) => Math.max(0, ...queries.filter((q) => (q.state.data as Map<string, number | null> | undefined)?.has(path)).map((q) => q.state.dataUpdatedAt)));
+      // `Math.min()` of nothing is `Infinity`, which made a member-less
+      // query never stale (#1957). No members, no age to inherit.
+      return stamps.length > 0 ? Math.min(...stamps) : undefined;
     },
     // Maps are not structurally shared by TanStack's default JSON comparator.
     // An equivalent placeholder must not notify every observer on each parent
@@ -4270,7 +4273,11 @@ export function useWorktreeDirs() {
     queryFn: getDiscoveryExclusions,
     staleTime: Infinity,
   });
-  const setExclusions = async (paths: string[]) => {
+  /// `rescan: false` when the caller is about to save the scan roots too
+  /// (#1957): `set` below refetches the scan, and rescanning here first
+  /// made one Save walk every root twice, in sequence, with Save
+  /// disabled throughout.
+  const setExclusions = async (paths: string[], opts: { rescan?: boolean } = {}) => {
     const applied = await setDiscoveryExclusions(paths);
     diskRefreshes.get(qc)?.delete("worktrees");
     await Promise.all([
@@ -4283,7 +4290,12 @@ export function useWorktreeDirs() {
     // earlier scope asks the backend rather than trusting this session.
     qc.setQueryData(["discovery-exclusions"], applied);
     await qc.invalidateQueries({ queryKey: ["cached-scan"], refetchType: "none" });
-    await qc.resetQueries({ queryKey: ["worktrees"] });
+    if (opts.rescan === false) {
+      // Stale, not refetched: the caller's next step rescans.
+      await qc.invalidateQueries({ queryKey: ["worktrees"], refetchType: "none" });
+    } else {
+      await qc.resetQueries({ queryKey: ["worktrees"] });
+    }
     return applied;
   };
   const set = (dirs: string[]) =>
@@ -4816,7 +4828,10 @@ export function useAssessment(
   branch: string | null,
 ) {
   return useQuery({
-    queryKey: ["assessment", repoPath, worktreePath],
+    // The BRANCH is part of the key (#1957): the answer is about what the
+    // branch holds, so after a checkout the old branch's assessment must
+    // not be served for the five minutes below.
+    queryKey: ["assessment", repoPath, worktreePath, branch],
     queryFn: () => assessWorktree(repoPath!, worktreePath!, branch!),
     enabled: repoPath !== null && worktreePath !== null && branch !== null,
     staleTime: 5 * 60 * 1000,

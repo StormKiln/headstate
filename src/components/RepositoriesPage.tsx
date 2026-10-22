@@ -2,6 +2,7 @@ import { ChevronRight, File, Folder, Link2 } from "lucide-react";
 import { useRepoFile, useRepoTree, useWorktrees } from "@/api/hooks";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
+import { notBrowsableReason } from "@/lib/repoOverview";
 import type { RepoEntry } from "@/types/pr";
 import { QueryError, errorMessage } from "./QueryError";
 import { AllRepositoriesTable } from "./AllRepositoriesTable";
@@ -112,7 +113,23 @@ export function RepositoriesPage() {
     );
   }
 
-  const name = repos?.find((r) => r.path === repo)?.name ?? repo;
+  // A selection the browser cannot open (#1953): a bare repository or an
+  // orphan. The sidebar lists these disabled; one selected before that,
+  // or restored from the store, says why rather than failing in git.
+  const selected = repos?.find((r) => r.path === repo);
+  const unbrowsable = selected ? notBrowsableReason(selected) : null;
+  if (unbrowsable !== null) {
+    return (
+      <div role="alert" className="rounded-md border border-[#30363d] px-4 py-8 text-center">
+        <p className="text-sm text-[#e6edf3]">This repository has no files to browse.</p>
+        <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
+          {selected?.name}: {unbrowsable}. Pick another repository on the left.
+        </p>
+      </div>
+    );
+  }
+
+  const name = selected?.name ?? repo;
 
   return (
     <div className="space-y-3">

@@ -43,7 +43,9 @@ const state = vi.hoisted(() => ({
 
 vi.mock("../api/hooks", () => ({
   useWorktrees: () => ({
-    data: [{ path: "/code/app", name: "app" }],
+    // With its main checkout: a repository without one is an orphan,
+    // which the browser declines to open (#1953).
+    data: [{ path: "/code/app", name: "app", worktrees: [{ path: "/code/app", is_main: true }] }],
     isError: false,
   }),
   useRepoTree: () => ({

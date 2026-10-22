@@ -485,6 +485,20 @@ describe("the repository browser's selection", () => {
     expect(screen.getByText(/no longer in the scanned folders/i)).toBeTruthy();
   });
 
+  /// #1953: a bare repository has no working tree for the browser to
+  /// list. Selected (from before the sidebar disabled it, or restored
+  /// from the store), it says so rather than failing inside git.
+  it("says a bare repository has no files to browse rather than listing it", () => {
+    state.repo = "/code/mirror.git";
+    state.repos = [
+      appRepo(),
+      { ...appRepo(), name: "mirror.git", path: "/code/mirror.git", bare: true, worktrees: [] },
+    ];
+    render(<RepositoriesPage />);
+    expect(screen.getByText(/has no files to browse/i)).toBeTruthy();
+    expect(screen.queryByText("README.md")).toBeNull();
+  });
+
   /// Absent is not zero, in the direction every other check in this
   /// codebase fails in. A scan that has not answered is not evidence
   /// that a repository is gone, and saying so would send the user to

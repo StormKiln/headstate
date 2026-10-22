@@ -547,6 +547,7 @@ export default function App() {
       <RepoPickerSidebar
         reviewingCount={reviewingCount}
         allLabel={view === "repositories" ? "All Repositories" : undefined}
+        browsing={view === "repositories"}
       />
     ) : view === "artifacts" ? (
       <ArtifactSidebar reviewingCount={reviewingCount} />
