@@ -10,7 +10,6 @@ vi.mock("./transport", () => ({ listen: vi.fn(async () => () => {}), call: vi.fn
 vi.mock("./tauri", async (original) => ({
   ...await original<Record<string, unknown>>(),
   getCached: vi.fn(async () => PR_FIXTURES),
-  getCachedReviewing: vi.fn(async () => ({ prs: PR_FIXTURES, stale_secs: null })),
   refreshSource: vi.fn(async () => PR_FIXTURES.slice(1)),
 }));
 import { refreshSource } from "./tauri";
@@ -96,5 +95,21 @@ describe("phone source refresh", () => {
     renderHook(() => usePhoneGitHubRefresh(true), { wrapper });
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(refreshSource).not.toHaveBeenCalled();
+  });
+
+  // #1933: on the desktop, window focus wakes the poll loop itself. A
+  // second refresh of the review queue from here raced that tick.
+  it("does not refresh the desktop review queue on focus", async () => {
+    target.mobile = false;
+    const hook = renderHook(() => useReviewing(true), { wrapper });
+    await settle();
+    expect(refreshSource).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.data).toEqual(PR_FIXTURES.slice(1));
+    // Past the query's staleTime, so only the focus rule decides.
+    await act(async () => { await vi.advanceTimersByTimeAsync(61_000); });
+    act(() => focusManager.setFocused(false));
+    act(() => focusManager.setFocused(true));
+    await settle();
+    expect(refreshSource).toHaveBeenCalledTimes(1);
   });
 });

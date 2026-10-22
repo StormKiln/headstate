@@ -1,10 +1,28 @@
 //! Whether the background loops are still doing their job (#1145).
 //!
-//! Two long-running loops log their failures and carry on:
-//! the health sampler every 60 s, and the Claude live pass. Both are
-//! deliberately never fatal -- a pass that could not read `~/.claude`
-//! must not stop the loop that also records system health -- and
-//! neither had any path to the screen.
+//! Every long-running loop logs its failures and carries on: the health
+//! sampler and the Claude live pass every 60 s, the GitHub and GitLab
+//! polls, the queue continuation clock, and the Claude activity nudge.
+//! Each is deliberately never fatal -- a pass that could not read
+//! `~/.claude` must not stop the loop that also records system health --
+//! and until #1145 none had any path to the screen. Until #1937 only the
+//! first two did, so System Health called background work healthy while
+//! PR polling had stopped.
+//!
+//! # Failed, and stalled
+//!
+//! Two different ways to stop doing the job. A loop that runs and fails
+//! counts [`Task::failed`]. A loop stuck on an `.await` that never
+//! returns counts nothing at all -- so each loop also declares, before
+//! it waits, when its next cycle should have finished ([`Task::tick`]),
+//! and a snapshot taken past that deadline is `stalled`. A loop waiting
+//! on purpose (its source switched off) says so with [`Task::park`],
+//! which is not a stall.
+//!
+//! The deadline is on the monotonic clock, the one `tokio::time::sleep`
+//! and `std::thread::sleep` wait on, so a laptop lid closed for a night
+//! does not read as a night-long stall: the loop's own sleep and its
+//! deadline pause together.
 //!
 //! # The gap that means two different things
 //!
@@ -80,11 +98,51 @@ pub struct TaskHealth {
     /// ever failed has `None` here and a non-zero failure count, which
     /// is a different state from one that has not started yet (#1042).
     pub last_success_ms: Option<u64>,
-    /// Whether this crossed the threshold.
+    /// Milliseconds since the epoch at which the loop last came round to
+    /// wait for its next cycle, whatever the last cycle's outcome; `None`
+    /// if it has not got that far yet.
+    ///
+    /// Distinct from `last_success_ms`: a loop that keeps finishing
+    /// cycles that fail is alive, and one that has stopped finishing them
+    /// is stuck. Those want different words on the page.
+    pub last_tick_ms: Option<u64>,
+    /// Whether the loop is past the deadline it set for its next cycle.
+    ///
+    /// `false` before the first cycle -- "not started yet" is Pending,
+    /// not a stall (#1042) -- and while the loop is parked on purpose.
+    pub stalled: bool,
+    /// Whether this crossed the threshold, or stalled.
     ///
     /// Carried rather than re-derived at each call site, so the page and
     /// any future notifier cannot come to disagree about what counts.
     pub degraded: bool,
+}
+
+/// How far past its own declared cadence a cycle may run before the loop
+/// counts as stalled.
+///
+/// Generous on purpose -- a stall report that might be wrong is worse
+/// than one that is late. The longest bounded cycle here is a GitHub tick
+/// (`poll::TICK_TIMEOUT`, 45 s, plus persistence) or a health sample with
+/// its Claude live pass; five minutes clears both with room, and still
+/// says "stuck" long before a user would otherwise find out.
+pub const STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One cycle's result, for a loop that does more than one piece of work
+/// per cycle (both PR queues, for instance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cycle {
+    /// The work was done.
+    Ok,
+    /// The work was attempted and failed, with the reason.
+    Failed(String),
+    /// Another publication won; this attempt contributes no new health
+    /// outcome and must neither clear nor increment failure counts.
+    Superseded,
+    /// Nothing was attempted -- declined by admission, a source switched
+    /// off, nothing due. Neither a success nor a failure (#1050: what we
+    /// did not ask must not read as what they did not answer).
+    NotAsked,
 }
 
 /// A background loop's failure state.
@@ -105,6 +163,11 @@ pub struct Task {
     /// real success timestamp cannot be it.
     last_success_ms: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// Wall-clock ms of the last finished cycle; 0 means none yet.
+    last_tick_ms: AtomicU64,
+    /// Monotonic ms ([`mono_ms`]) by which the next cycle should have
+    /// finished; 0 means no deadline (not started, or parked).
+    due_mono_ms: AtomicU64,
 }
 
 impl Task {
@@ -115,7 +178,54 @@ impl Task {
             total: AtomicU64::new(0),
             last_success_ms: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            last_tick_ms: AtomicU64::new(0),
+            due_mono_ms: AtomicU64::new(0),
         }
+    }
+
+    /// The loop finished a cycle and is about to wait up to `next_in`
+    /// before starting the next one.
+    ///
+    /// Call it after recording the cycle's outcome and before the wait,
+    /// with the wait's own length: the deadline is that wait plus
+    /// [`STALL_GRACE`] for the next cycle's work.
+    pub fn tick(&self, next_in: std::time::Duration) {
+        self.last_tick_ms.store(now_ms(), Ordering::Relaxed);
+        let due = mono_ms()
+            .saturating_add(next_in.as_millis() as u64)
+            .saturating_add(STALL_GRACE.as_millis() as u64);
+        // `max(1)`: 0 is the no-deadline sentinel.
+        self.due_mono_ms.store(due.max(1), Ordering::Relaxed);
+    }
+
+    /// The loop is about to wait with no deadline, on purpose -- its
+    /// source is switched off and only a wake will start it again.
+    ///
+    /// Cleared by the next [`Task::tick`].
+    pub fn park(&self) {
+        self.due_mono_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Record one cycle made of several pieces of work.
+    ///
+    /// Any failure fails the cycle -- naming the first reason -- because
+    /// a loop that refreshes one queue and not the other is not doing its
+    /// job. Otherwise any success is a success. A cycle that asked for
+    /// nothing changes neither count: it would be a lie to call it a
+    /// success, and a worse one to call it a failure.
+    ///
+    /// Returns whether the task is NOW degraded, as [`Task::failed`] does.
+    pub fn record_cycle(&self, outcomes: &[Cycle]) -> bool {
+        if let Some(why) = outcomes.iter().find_map(|o| match o {
+            Cycle::Failed(why) => Some(why.clone()),
+            _ => None,
+        }) {
+            return self.failed(why);
+        }
+        if outcomes.contains(&Cycle::Ok) {
+            self.ok(now_ms());
+        }
+        false
     }
 
     /// Record a successful cycle.
@@ -147,8 +257,17 @@ impl Task {
 
     /// What the page should show.
     pub fn snapshot(&self) -> TaskHealth {
+        self.snapshot_at(mono_ms())
+    }
+
+    /// [`Task::snapshot`] against a given monotonic instant, so a test can
+    /// look past a deadline without sleeping through it.
+    fn snapshot_at(&self, mono_now: u64) -> TaskHealth {
         let consecutive = self.consecutive.load(Ordering::Relaxed);
         let last = self.last_success_ms.load(Ordering::Relaxed);
+        let tick = self.last_tick_ms.load(Ordering::Relaxed);
+        let due = self.due_mono_ms.load(Ordering::Relaxed);
+        let stalled = due != 0 && mono_now > due;
         TaskHealth {
             task: self.name.to_string(),
             consecutive_failures: consecutive,
@@ -156,7 +275,9 @@ impl Task {
             last_error: self.last_error.lock().ok().and_then(|s| s.clone()),
             // 0 is the never-succeeded sentinel, not a 1970 timestamp.
             last_success_ms: (last != 0).then_some(last),
-            degraded: consecutive >= FAILURES_BEFORE_DEGRADED,
+            last_tick_ms: (tick != 0).then_some(tick),
+            stalled,
+            degraded: consecutive >= FAILURES_BEFORE_DEGRADED || stalled,
         }
     }
 }
@@ -230,17 +351,67 @@ pub static CLAUDE_LIVE: Task = Task::new("claude-live");
 /// permanently stuck indexer.
 pub static CLAUDE_INDEX: Task = Task::new("claude-index");
 
-/// Every tracked loop, for the command.
+/// The GitHub poll loop: both PR queues, on the configured cadence
+/// (#1937).
+pub static GITHUB_POLL: Task = Task::new("github-poll");
+
+/// The 15 s clock that advances incomplete GitHub queue traversals
+/// between full ticks (#1935, #1937).
+pub static GITHUB_CONTINUATION: Task = Task::new("github-continuation");
+
+/// The GitLab poll loop (#1937).
+pub static GITLAB_POLL: Task = Task::new("gitlab-poll");
+
+/// The one-second Claude session activity nudge (#1477, #1937).
+pub static CLAUDE_ACTIVITY: Task = Task::new("claude-activity");
+
+/// Every tracked task, for the command.
 ///
-/// A fixed list rather than a registry: there are three, they are named
-/// in `lib.rs`, and a registry would be a lookup table with three
-/// entries plus a way to get them wrong.
+/// Still a fixed list rather than a registry, now of seven: every
+/// long-running loop, plus the transcript indexer that rides on the live
+/// pass and fails independently of it. A registry would let a loop
+/// register itself and so make the list correct by construction -- but
+/// only for a loop that remembered to register, which is the same
+/// remembering this list needs. What keeps it complete instead is
+/// `invariants.rs`' `every_background_task_is_reported_and_recorded`,
+/// which finds every `Task` static in the tree and fails if one is
+/// missing here or is never written to.
 pub fn snapshot_all() -> Vec<TaskHealth> {
     vec![
         HEALTH_SAMPLER.snapshot(),
         CLAUDE_LIVE.snapshot(),
         CLAUDE_INDEX.snapshot(),
+        GITHUB_POLL.snapshot(),
+        GITHUB_CONTINUATION.snapshot(),
+        GITLAB_POLL.snapshot(),
+        CLAUDE_ACTIVITY.snapshot(),
     ]
+}
+
+/// Tell the frontend a task just crossed into degraded, so the notice
+/// appears now rather than on the next 30 s health poll.
+///
+/// Only on the threshold -- callers pass what [`Task::failed`] or
+/// [`Task::record_cycle`] returned -- for the reason `FAILURES_BEFORE_DEGRADED`
+/// gives. A stall cannot announce itself (the stuck loop is the one that
+/// would have to), so stalls reach the page through that poll alone.
+pub fn announce_degraded<R: tauri::Runtime>(app: &tauri::AppHandle<R>, task: &Task, crossed: bool) {
+    if crossed {
+        use tauri::Emitter;
+        let _ = app.emit("background-degraded", task.snapshot());
+    }
+}
+
+/// Milliseconds on the monotonic clock since this process first asked.
+///
+/// `Instant`, not wall time, for the reason the module docs give: it is
+/// the clock the loops' own sleeps run on, so a suspended machine pauses
+/// both together.
+fn mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Milliseconds since the epoch.
@@ -411,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn both_real_loops_are_reported_and_named_distinctly() {
+    fn every_real_loop_is_reported_and_named_distinctly() {
         // The command returns this list; two entries sharing a name
         // would make the page unable to say which loop is broken.
         //
@@ -424,16 +595,83 @@ mod tests {
         // a permanently stuck indexer -- and a user searching a corpus
         // whose index quietly stopped would read a partial answer as a
         // settled one.
+        //
+        // Seven since #1937: the GitHub poll, the queue continuation
+        // clock, the GitLab poll and the Claude activity nudge were
+        // untracked, so the page said "healthy" while PR polling stopped.
         let all = snapshot_all();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 7);
         let names: Vec<&str> = all.iter().map(|t| t.task.as_str()).collect();
-        assert!(names.contains(&"health-sampler"), "{names:?}");
-        assert!(names.contains(&"claude-live"), "{names:?}");
-        assert!(names.contains(&"claude-index"), "{names:?}");
+        for name in [
+            "health-sampler",
+            "claude-live",
+            "claude-index",
+            "github-poll",
+            "github-continuation",
+            "gitlab-poll",
+            "claude-activity",
+        ] {
+            assert!(names.contains(&name), "{name} missing from {names:?}");
+        }
         let mut uniq = names.clone();
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), names.len());
+    }
+
+    #[test]
+    fn a_loop_past_its_deadline_is_stalled_and_degraded() {
+        // #1937: a loop stuck on an `.await` records no failure at all.
+        // The deadline it set before waiting is what gives it away.
+        let t = task();
+        assert!(!t.snapshot().stalled, "not started is Pending, not stalled");
+        t.ok(now_ms());
+        t.tick(std::time::Duration::from_secs(60));
+        let due = t.due_mono_ms.load(Ordering::Relaxed);
+        let on_time = t.snapshot_at(due);
+        assert!(!on_time.stalled && !on_time.degraded);
+        assert!(on_time.last_tick_ms.is_some());
+        let late = t.snapshot_at(due + 1);
+        assert!(late.stalled);
+        assert!(late.degraded, "a stall is degraded with zero failures");
+        assert_eq!(late.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn a_parked_loop_is_not_stalled() {
+        let t = task();
+        t.tick(std::time::Duration::from_secs(1));
+        t.park();
+        assert!(!t.snapshot_at(u64::MAX).stalled);
+        // The next cycle re-arms the deadline.
+        t.tick(std::time::Duration::from_secs(1));
+        assert!(t.snapshot_at(u64::MAX).stalled);
+    }
+
+    #[test]
+    fn a_cycle_that_asked_nothing_is_neither_success_nor_failure() {
+        // #1050's rule at the loop level: a declined or switched-off cycle
+        // did not succeed and did not fail.
+        let t = task();
+        assert!(!t.record_cycle(&[Cycle::NotAsked, Cycle::NotAsked]));
+        let s = t.snapshot();
+        assert_eq!(s.last_success_ms, None);
+        assert_eq!(s.total_failures, 0);
+    }
+
+    #[test]
+    fn one_failed_queue_fails_the_cycle_and_names_its_reason() {
+        let t = task();
+        assert!(!t.record_cycle(&[Cycle::Ok, Cycle::Failed("review queue: 502".into())]));
+        assert_eq!(t.snapshot().consecutive_failures, 1);
+        assert_eq!(
+            t.snapshot().last_error.as_deref(),
+            Some("review queue: 502")
+        );
+        assert!(t.record_cycle(&[Cycle::Failed("timed out".into()), Cycle::NotAsked]));
+        assert!(!t.record_cycle(&[Cycle::Ok, Cycle::NotAsked]));
+        assert_eq!(t.snapshot().consecutive_failures, 0);
+        assert!(t.snapshot().last_success_ms.is_some());
     }
 
     #[test]

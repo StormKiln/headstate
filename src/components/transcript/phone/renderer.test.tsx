@@ -1,4 +1,4 @@
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stubViewport } from "@/test-utils";
 import { useTranscriptRenderer } from "./renderer";
@@ -32,7 +32,7 @@ describe("useTranscriptRenderer", () => {
     const vp = stubViewport(1280);
     const { result, rerender } = renderHook(() => useTranscriptRenderer());
     expect(result.current).toBe("desktop");
-    vp.resize(600);
+    act(() => { vp.resize(600); });
     rerender();
     expect(result.current).toBe("phone");
   });

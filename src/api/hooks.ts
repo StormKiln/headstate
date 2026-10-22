@@ -355,20 +355,45 @@ export function usePollState(): "idle" | "fetching" | "retrying" {
   return state;
 }
 
+/// Which views render polled GitHub pull-request data (#1936).
+///
+/// An ALLOWLIST, total over `View`: a view added to `ALL_VIEWS` does not
+/// typecheck until someone decides which way it goes. The previous
+/// `view !== "worktrees"` was a one-entry denylist, so Repositories,
+/// Branches, System Health, Claude Code and every later view kept the
+/// focused GitHub cadence and competed for scan permits while showing no
+/// pull request at all.
+const VIEW_NEEDS_GITHUB: Record<View, boolean> = {
+  "my-prs": true,
+  "to-review": true,
+  worktrees: false,
+  branches: false,
+  docker: false,
+  artifacts: false,
+  packages: false,
+  "claude-md": false,
+  "claude-code": false,
+  repositories: false,
+  "system-health": false,
+};
+
 /// Keep the poll cadence in step with the active view.
 ///
-/// The worktrees view needs no GitHub data, so the loop drops to the
-/// background rate while it is open. It does NOT stop: the tray badge
-/// would silently go stale, and the badge staying honest while the window
-/// is not being watched is the reason polling lives in Rust.
-export function useViewCadence(view: string): void {
+/// Only views in `VIEW_NEEDS_GITHUB` ask for the focused rate; every other
+/// view drops the loop to the background rate. It does NOT stop: the tray
+/// badge would silently go stale, and the badge staying honest while the
+/// window is not being watched is the reason polling lives in Rust.
+export function useViewCadence(view: View): void {
   useEffect(() => {
     // Phone demand uses explicit minute/resume refreshes; cadence belongs to the desktop.
     if (IS_MOBILE_BUILD) return;
-    // Tolerate a host without the command, as the other listeners do:
-    // cadence is an optimisation, and failing to set it must not break
-    // the page.
-    void setViewNeedsGithub(view !== "worktrees", view === "to-review").catch(() => {});
+    // Cadence is an optimisation, so a host without the command must not
+    // break the page -- but the failure is logged rather than swallowed,
+    // because a cadence the backend never heard about is otherwise
+    // invisible.
+    void setViewNeedsGithub(VIEW_NEEDS_GITHUB[view], view === "to-review").catch((e: unknown) => {
+      console.warn("set_view_needs_github failed", e);
+    });
   }, [view]);
 }
 
@@ -925,11 +950,34 @@ export function useVenvWalkProgress(enabled: boolean) {
 ///
 /// A parse failure yields `undefined`, not a throw: a corrupt cache row
 /// must cost the cold-start paint and nothing else.
+///
+/// # The key carries the scope the backend keys on (#1962)
+///
+/// `read_cached_scan` looks the row up by kind AND by the sorted root
+/// set -- plus the discovery exclusions, for worktrees and artifacts. Keyed by kind
+/// alone, this side held one answer per kind for the whole session, so
+/// after a directory change the Artifacts page went on painting the
+/// previous folders' scan, with its age, because `staleTime: Infinity`
+/// never asked again. With the scope in the key, a new root set is a
+/// new entry: an answer read under the old roots cannot be served under
+/// the new ones, whatever invalidation does or does not run.
+///
+/// Not read until the scope is known. Reading without it would cache
+/// whatever the backend's current scope is under a key that names none.
 export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
+  const dirs = useQuery({ queryKey: ["worktree-dirs"], queryFn: getWorktreeDirs, staleTime: Infinity, enabled });
+  const scoped = kind === "worktrees" || kind === "artifacts";
+  const exclusions = useQuery({
+    queryKey: ["discovery-exclusions"],
+    queryFn: getDiscoveryExclusions,
+    staleTime: Infinity,
+    enabled: enabled && scoped,
+  });
+  const scope = cachedScanScope(dirs.data, scoped ? exclusions.data : []);
   const query = useQuery({
-    queryKey: ["cached-scan", kind],
+    queryKey: ["cached-scan", kind, scope],
     queryFn: () => readCachedScan(kind), // No `signal`: an unmount must not discard a finished read (#1944, #1974).
-    enabled,
+    enabled: enabled && scope !== null,
     staleTime: Infinity,
     // A cache miss is the answer, not a failure to retry three times.
     retry: false,
@@ -945,6 +993,15 @@ export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   } catch {
     return undefined;
   }
+}
+
+/// What `read_cached_scan` keys a row on, as a query-key part, or
+/// `null` while either half is unknown -- including an answer that is not
+/// a list, which names no scope. Sorted, as the backend's `scan_key`
+/// sorts, so reordering the directories is not a new entry.
+function cachedScanScope(dirs: string[] | undefined, exclusions: string[] | undefined) {
+  if (!Array.isArray(dirs) || !Array.isArray(exclusions)) return null;
+  return { roots: [...dirs].sort(), exclusions: [...exclusions].sort() };
 }
 
 const diskRefreshes = new WeakMap<QueryClient, Map<string, Promise<unknown>>>();
@@ -4329,11 +4386,11 @@ export function useWorktreeDirs() {
       qc.cancelQueries({ queryKey: ["worktrees"] }),
       qc.cancelQueries({ queryKey: ["cached-scan", "worktrees"] }),
     ]);
+    // The saved-scan key carries the exclusions (#1962), so writing the
+    // new set moves `useCachedScan` to a new entry and the old scope's
+    // row cannot be read under it. Still marked stale, so a return to an
+    // earlier scope asks the backend rather than trusting this session.
     qc.setQueryData(["discovery-exclusions"], applied);
-    qc.setQueryData(["cached-scan", "worktrees"], null);
-    // And marked stale, so the next cold paint asks the backend again
-    // under the NEW scope rather than trusting this session's answer for
-    // the old one (#1962's frontend half; the key still omits the scope).
     await qc.invalidateQueries({ queryKey: ["cached-scan"], refetchType: "none" });
     if (opts.rescan === false) {
       // Stale, not refetched: the caller's next step rescans.
@@ -4346,10 +4403,10 @@ export function useWorktreeDirs() {
   const set = (dirs: string[]) =>
     setWorktreeDirs(dirs).then(async (applied) => {
       diskRefreshes.get(qc)?.clear();
-      // `cached-scan` too (#1962's frontend half): its key does not carry
-      // the roots and it is `staleTime: Infinity`, so without this a
-      // changed root set would go on painting the previous set's saved
-      // scan, labelled with an age, for the rest of the session.
+      // `cached-scan` too: its key carries the roots (#1962), so a new
+      // set is a new entry anyway, but a return to an earlier set must
+      // ask the backend again rather than trust a `staleTime: Infinity`
+      // answer from before the change.
       const keys = ["worktrees", "artifacts", "worktree-sizes", "artifact-sizes", "venvs", "venv-sizes", "disk-inventory", "cached-scan"];
       await Promise.all(keys.map((key) => qc.cancelQueries({ queryKey: [key] })));
       await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key], refetchType: "none" })));
@@ -4410,7 +4467,31 @@ export function usePollInterval() {
 /// Returns the raw list rather than a boolean, unlike the panic hook:
 /// the notice names WHICH loop failed and why, and a boolean would make
 /// that impossible.
+///
+/// `background-degraded` re-reads it at once (#1937). The backend emits it
+/// the moment a loop crosses the failure threshold, and for a long time
+/// nothing listened, so the notice waited up to 30 s for news already
+/// sent. The poll stays: a STALLED loop cannot announce itself -- it is
+/// the thing that is stuck -- so only the poll ever sees a stall.
 export function useBackgroundHealth() {
+  const qc = useQueryClient();
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen("background-degraded", () => {
+      void qc.invalidateQueries({ queryKey: ["background-health"] });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, [qc]);
   return useQuery<TaskHealth[]>({
     queryKey: ["background-health"],
     queryFn: backgroundHealth,
@@ -4955,7 +5036,10 @@ export function useReviewing(enabled = true) {
     // The phone may select GitHub while the desktop poller selects GitLab.
     // Keep the visible review queue live without polling hidden views.
     refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
-    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
+    // On the desktop, focus already wakes the poll loop, whose receipt
+    // reaches this view through `useSourceRefresh`. A second refresh from
+    // here raced that tick for the same queue (#1933).
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : false,
     // The backend already bounds its own attempts; a client retry
     // multiplied `get_reviewing` calls behind it (#1929). The view
     // offers an explicit retry instead.

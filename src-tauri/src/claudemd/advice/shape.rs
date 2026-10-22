@@ -1884,6 +1884,7 @@ ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     #[cfg(unix)]
     #[test]
     fn an_unreadable_file_makes_the_check_unknown_not_clean() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let (_t, _home, repo) = fixture();
         let file = repo.join("CLAUDE.md");

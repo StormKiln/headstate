@@ -383,6 +383,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_rules_directory_is_recorded_not_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join(".claude").join("rules");

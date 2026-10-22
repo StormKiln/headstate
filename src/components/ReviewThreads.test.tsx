@@ -16,6 +16,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { ReviewThreads } from "./ReviewThreads";
+import { settle } from "@/test/settle";
 
 const thread = (over: Partial<ReviewThread> = {}): ReviewThread => ({
   id: "RT_1",
@@ -80,18 +81,20 @@ describe("ReviewThreads", () => {
     expect(labels[1]).toContain("a.ts");
   });
 
-  it("resolves a conversation by its thread id", () => {
+  it("resolves a conversation by its thread id", async () => {
     view([thread()]);
     fireEvent.click(screen.getByRole("button", { name: "Resolve conversation" }));
+    await settle();
     expect(resolve).toHaveBeenCalledWith("RT_1", "o/r", 7);
   });
 
-  it("replies with the typed body", () => {
+  it("replies with the typed body", async () => {
     view([thread()]);
     fireEvent.change(screen.getByRole("textbox"), {
       target: { value: "good catch" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+    await settle();
     expect(reply).toHaveBeenCalledWith("RT_1", "o/r", 7, "good catch");
   });
 
@@ -122,12 +125,13 @@ describe("ReviewThreads", () => {
     expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
   });
 
-  it("offers Reopen only on a resolved thread the viewer may unresolve", () => {
+  it("offers Reopen only on a resolved thread the viewer may unresolve", async () => {
     view([thread({ is_resolved: true })]);
     fireEvent.click(
       screen.getAllByRole("button").filter((b) => b.getAttribute("aria-expanded"))[0],
     );
     fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    await settle();
     expect(unresolve).toHaveBeenCalledWith("RT_1", "o/r", 7);
   });
 

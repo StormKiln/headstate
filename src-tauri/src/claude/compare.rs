@@ -764,6 +764,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_directory_never_proves_a_definition_missing() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let a = tempfile::tempdir().unwrap();

@@ -9,6 +9,7 @@ use crate::{
 use serde::Serialize;
 #[path = "source_poll_measurement.rs"]
 mod observation;
+use crate::github::scan::ScanMode;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -84,6 +85,18 @@ type PublicationGates = HashMap<PollKey, Arc<tokio::sync::Mutex<()>>>;
 type Receipts = HashMap<PollKey, (u64, FetchedList)>;
 type GitLabReceipts = HashMap<PollKey, (u64, crate::gitlab::queues::FetchedList)>;
 
+/// What the last `source-poll-status` event that carried rows carried, per
+/// source/list: its receipt revision, owner and rows (#1941).
+type CarriedRows = HashMap<
+    PollKey,
+    (
+        Option<u64>,
+        Option<String>,
+        Option<Vec<crate::github::model::PullRequest>>,
+        Option<Vec<crate::gitlab::queues::MergeRequest>>,
+    ),
+>;
+
 /// One atomic event/reply. Rows and attempt status have independent ordering:
 /// an older successful attempt can publish rows beside a newer failure.
 #[derive(Clone, Serialize)]
@@ -108,6 +121,7 @@ pub struct SourcePolls(
     Mutex<HashMap<PollKey, u64>>,
     std::sync::atomic::AtomicU64,
     observation::Observer,
+    Mutex<CarriedRows>,
 );
 impl Default for SourcePolls {
     fn default() -> Self {
@@ -120,12 +134,17 @@ impl Default for SourcePolls {
             Mutex::default(),
             std::sync::atomic::AtomicU64::new(0),
             observation::Observer::default(),
+            Mutex::default(),
         )
     }
 }
 
 pub struct Publication {
     attempt: Attempt,
+    /// When the attempt's result reached its caller, before waiting for
+    /// this permit. A receipt is stamped with this, never with the time it
+    /// was published behind other work (#1933).
+    received_at: chrono::DateTime<chrono::Utc>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -207,7 +226,7 @@ impl SourcePolls {
             status.github_receipt_epoch += 1;
             status.revision += 1;
             status.receipt_revision = Some(status.revision);
-            status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+            status.last_received_at = Some(publication.received_at.to_rfc3339());
             status.clone()
         };
         self.observe_measurement(&status, crate::measurement::Acceptance::Accepted);
@@ -290,6 +309,7 @@ impl SourcePolls {
         (attempt, self.get(&source, list))
     }
     async fn publication(&self, attempt: &Attempt) -> Option<Publication> {
+        let received_at = chrono::Utc::now();
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
         let current = self
             .0
@@ -299,10 +319,12 @@ impl SourcePolls {
             .is_some_and(|(generation, _)| *generation == attempt.generation);
         current.then_some(Publication {
             attempt: attempt.clone(),
+            received_at,
             _guard: guard,
         })
     }
     async fn success_publication(&self, attempt: &Attempt) -> Option<Publication> {
+        let received_at = chrono::Utc::now();
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
         if self.before_mutation(attempt) {
             self.observe_measurement(
@@ -332,6 +354,7 @@ impl SourcePolls {
         }
         (!newer_success).then_some(Publication {
             attempt: attempt.clone(),
+            received_at,
             _guard: guard,
         })
     }
@@ -371,9 +394,10 @@ impl SourcePolls {
         };
         let no_work = scan_state.as_ref().is_some_and(|s| s.no_work);
         let successful = status_result.is_ok();
+        let received_at = publication.received_at;
         let status = match (scan_state, status_result) {
-            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage),
-            (_, result) => self.finish(attempt, result),
+            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage, received_at),
+            (_, result) => self.finish_at(attempt, result, received_at),
         };
         if let Some(status) = status {
             self.observe_measurement(
@@ -396,6 +420,7 @@ impl SourcePolls {
         attempt: &Attempt,
         state: &crate::queue_scan::State,
         coverage: Coverage,
+        received_at: chrono::DateTime<chrono::Utc>,
     ) -> Option<Status> {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
@@ -451,7 +476,7 @@ impl SourcePolls {
                 status.published_scan_receipt = state.receipt_id.clone();
                 status.published_scan_generation = Some(attempt.generation);
                 if state.received || state.step_failure.is_none() {
-                    status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                    status.last_received_at = Some(received_at.to_rfc3339());
                 }
             }
         }
@@ -520,7 +545,7 @@ impl SourcePolls {
                 }
                 Err(error) => Err(error),
             };
-            if let Some(status) = self.finish(attempt, status_result) {
+            if let Some(status) = self.finish_at(attempt, status_result, publication.received_at) {
                 emit(status);
             }
         };
@@ -601,6 +626,58 @@ impl SourcePolls {
             mrs,
         }
     }
+    /// The update a `source-poll-status` EVENT carries (#1941).
+    ///
+    /// The same as [`Self::update`] except that rows identical to the ones
+    /// the previous rows-carrying event for this source/list already sent
+    /// -- same receipt revision, same owner, same rows -- are left out
+    /// (`prs`/`mrs` null). The `fetching` status the poll and continuation
+    /// loops emit at the start of every attempt used to re-send the whole
+    /// list each time with nothing changed.
+    ///
+    /// Nothing a listener reads is lost:
+    /// - the desktop and phone frontends adopt rows only when
+    ///   `receipt_revision` advances, and a repeat never advances it;
+    /// - the phone caches a receipt from any event with rows, and the
+    ///   first event with these rows already delivered them;
+    /// - a phone that connects later gets the rows from `remote::events`,
+    ///   which replays the last rows-carrying event beside the newest
+    ///   status.
+    ///
+    /// Command replies ([`Self::snapshot`]) always carry the rows.
+    fn event_update(&self, status: Status, completed_request: Option<String>) -> Update {
+        let mut update = self.update(status, completed_request);
+        let key = (update.status.source.clone(), update.status.list);
+        let mut carried = self.8.lock().unwrap_or_else(|e| e.into_inner());
+        if update.prs.is_none() && update.mrs.is_none() {
+            // No receipt: whatever arrives next is news.
+            carried.remove(&key);
+            return update;
+        }
+        let repeat = carried
+            .get(&key)
+            .is_some_and(|(revision, owner, prs, mrs)| {
+                *revision == update.status.receipt_revision
+                    && *owner == update.owner
+                    && *prs == update.prs
+                    && *mrs == update.mrs
+            });
+        if repeat {
+            update.prs = None;
+            update.mrs = None;
+        } else {
+            carried.insert(
+                key,
+                (
+                    update.status.receipt_revision,
+                    update.owner.clone(),
+                    update.prs.clone(),
+                    update.mrs.clone(),
+                ),
+            );
+        }
+        update
+    }
     pub async fn snapshot(&self, source: &Source, list: CachedList) -> Update {
         let _guard = self.gate(source, list).lock_owned().await;
         self.update(self.get(source, list), None)
@@ -637,7 +714,16 @@ impl SourcePolls {
         status.request_id = request_id;
         (*generation, status.clone())
     }
+    #[cfg(test)]
     fn finish(&self, attempt: &Attempt, result: Result<Coverage, Failure>) -> Option<Status> {
+        self.finish_at(attempt, result, chrono::Utc::now())
+    }
+    fn finish_at(
+        &self,
+        attempt: &Attempt,
+        result: Result<Coverage, Failure>,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<Status> {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
         if *generation != attempt.generation {
@@ -647,13 +733,32 @@ impl SourcePolls {
             if let Ok(coverage) = result {
                 status.revision += 1;
                 status.receipt_revision = Some(status.revision);
-                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                status.last_received_at = Some(received_at.to_rfc3339());
                 status.coverage = Some(coverage);
                 return Some(status.clone());
             }
             return None;
         }
         status.revision += 1;
+        if result.as_ref().is_err_and(|failure| failure.superseded) {
+            // A lost write race is not a failure (#1933). Another attempt's
+            // newer data was saved and stands: no failure is counted, its
+            // error and receipt are untouched, and the list returns to the
+            // outcome it had before this attempt began.
+            status.phase = match status.settled_phase.clone() {
+                Some(phase) if phase != Phase::NotRequested && phase != Phase::Fetching => phase,
+                _ => status.coverage.as_ref().map_or(
+                    Phase::NotRequested,
+                    |coverage| match coverage {
+                        Coverage::Complete => Phase::Ready,
+                        Coverage::Partial { .. } => Phase::Partial,
+                        Coverage::Unknown => Phase::Unknown,
+                    },
+                ),
+            };
+            status.settled_generation = attempt.generation;
+            return Some(status.clone());
+        }
         match result {
             Ok(coverage) => {
                 status.receipt_revision = Some(status.revision);
@@ -662,7 +767,7 @@ impl SourcePolls {
                     Coverage::Partial { .. } => Phase::Partial,
                     Coverage::Unknown => Phase::Unknown,
                 };
-                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                status.last_received_at = Some(received_at.to_rfc3339());
                 status.coverage = Some(coverage);
                 status.consecutive_failures = 0;
                 status.error = None;
@@ -691,6 +796,10 @@ pub struct Failure {
     pub message: String,
     pub transient: bool,
     pub not_asked: bool,
+    /// This attempt lost a write race to another attempt whose newer
+    /// progress was saved (#1933). Not a provider failure: it is never
+    /// counted, never surfaced, and never re-stamps the winner's receipt.
+    pub superseded: bool,
 }
 impl From<&crate::github::client::ClientError> for Failure {
     fn from(error: &crate::github::client::ClientError) -> Self {
@@ -698,6 +807,7 @@ impl From<&crate::github::client::ClientError> for Failure {
             message: error.to_string(),
             transient: error.is_transient(),
             not_asked: not_dispatched(error),
+            superseded: false,
         }
     }
 }
@@ -734,7 +844,9 @@ fn emit_status(app: &AppHandle, status: Status, completed_request: Option<String
         }
         let _ = app.emit("poll-state", phase);
     }
-    let update = app.state::<SourcePolls>().update(status, completed_request);
+    let update = app
+        .state::<SourcePolls>()
+        .event_update(status, completed_request);
     let _ = app.emit("source-poll-status", update);
 }
 
@@ -921,6 +1033,16 @@ pub async fn success_publication(app: &AppHandle, attempt: &Attempt) -> Option<P
         .await
 }
 
+/// The receipt currently published for this list, whichever attempt won it.
+pub fn latest(app: &AppHandle, source: &Source, list: CachedList) -> Option<FetchedList> {
+    app.state::<SourcePolls>()
+        .2
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .map(|(_, receipt)| receipt.clone())
+}
+
 /// Read the newest already-published success; never wait for a network request.
 pub fn winner(
     app: &AppHandle,
@@ -946,7 +1068,7 @@ pub async fn fetch_github_step(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_mode(app, client, list, budget, false).await
+    fetch_github_step_mode(app, client, list, budget, ScanMode::Refresh).await
 }
 
 pub(crate) async fn fetch_github_continuation(
@@ -955,7 +1077,71 @@ pub(crate) async fn fetch_github_continuation(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_mode(app, client, list, budget, true).await
+    fetch_github_step_mode(app, client, list, budget, ScanMode::Continue).await
+}
+
+/// A refresh someone asked for (#1938). `cold` is true while this process
+/// holds no receipt for the list: the pass cadence then does not hold the
+/// request back, so Refresh right after a restart fetches instead of
+/// answering with the saved rows' absence. A request that still asks
+/// GitHub nothing (failure backoff, admission, rate budget) settles as not
+/// asked, never as an answer.
+pub async fn fetch_github_refresh(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    cold: bool,
+) -> Result<FetchedList, Failure> {
+    let mode = if cold {
+        ScanMode::Manual
+    } else {
+        ScanMode::Refresh
+    };
+    unanswered_refresh(
+        cold,
+        fetch_github_step_mode(app, client, list, budget, mode).await,
+    )
+}
+
+/// `fetch_github_refresh` with the caller's database and clock.
+#[cfg(test)]
+pub(crate) async fn fetch_github_refresh_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    cold: bool,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, Failure> {
+    let mode = if cold {
+        ScanMode::Manual
+    } else {
+        ScanMode::Refresh
+    };
+    unanswered_refresh(
+        cold,
+        fetch_github_step_mode_at(path, client, list, budget, mode, timing).await,
+    )
+}
+
+fn unanswered_refresh(
+    cold: bool,
+    fetched: Result<FetchedList, crate::github::client::ClientError>,
+) -> Result<FetchedList, Failure> {
+    let fetched = fetched.map_err(|error| Failure::from(&error))?;
+    if cold && fetched.scan.as_ref().is_some_and(|scan| scan.state.no_work) {
+        return Err(Failure {
+            message: format!(
+                "{} GitHub was not asked for this list yet. The saved list is shown.",
+                crate::commands::NOT_ASKED
+            ),
+            transient: true,
+            not_asked: true,
+            superseded: false,
+        });
+    }
+    Ok(fetched)
 }
 
 async fn fetch_github_step_mode(
@@ -963,14 +1149,14 @@ async fn fetch_github_step_mode(
     client: &crate::github::client::GitHubClient,
     list: CachedList,
     budget: std::time::Duration,
-    continuation: bool,
+    mode: ScanMode,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_at(
+    fetch_github_step_mode_at(
         crate::commands::db_path(app),
         client,
         list,
         budget,
-        continuation,
+        mode,
         || {
             (
                 app.state::<crate::poll::PollInterval>()
@@ -983,9 +1169,8 @@ async fn fetch_github_step_mode(
     .await
 }
 
-/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
-/// tests. The caller supplies the clock reading and configured interval; all
-/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+/// The boolean form the synthetic runtime tests use.
+#[cfg(test)]
 pub(crate) async fn fetch_github_step_at(
     path: std::path::PathBuf,
     client: &crate::github::client::GitHubClient,
@@ -994,7 +1179,27 @@ pub(crate) async fn fetch_github_step_at(
     continuation: bool,
     timing: impl FnOnce() -> (u64, i64),
 ) -> Result<FetchedList, crate::github::client::ClientError> {
+    let mode = if continuation {
+        ScanMode::Continue
+    } else {
+        ScanMode::Refresh
+    };
+    fetch_github_step_mode_at(path, client, list, budget, mode, timing).await
+}
+
+/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
+/// tests. The caller supplies the clock reading and configured interval; all
+/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+async fn fetch_github_step_mode_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    mode: ScanMode,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, crate::github::client::ClientError> {
     use crate::github::admission::ReadContext;
+    let continuation = mode == ScanMode::Continue;
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
         .with_attempt_limit(3);
@@ -1060,19 +1265,9 @@ pub(crate) async fn fetch_github_step_at(
             }),
         });
     }
-    if continuation {
-        client
-            .advance_scan_mode(
-                list,
-                loaded,
-                &rows,
-                now,
-                crate::github::scan::ScanMode::Continue,
-            )
-            .await
-    } else {
-        client.advance_scan(list, loaded, &rows, now).await
-    }
+    client
+        .advance_scan_mode(list, loaded, &rows, now, mode)
+        .await
 }
 
 /// A local read failure, named as one: GitHub was not involved (#1928).
@@ -1139,6 +1334,16 @@ fn inventory_failure(message: &str) -> Failure {
         message: message.into(),
         transient: true,
         not_asked: false,
+        superseded: false,
+    }
+}
+
+/// Another attempt committed newer queue progress from the same checkpoint
+/// revision first. Its data stands; this attempt has nothing to add (#1933).
+fn superseded_failure() -> Failure {
+    Failure {
+        superseded: true,
+        ..inventory_failure("The queue changed during this step. Its newer progress was retained.")
     }
 }
 
@@ -1218,9 +1423,7 @@ fn reconcile_github_snapshot_observed(
             .map_err(|_| inventory_failure("The queue checkpoint could not be read."))?;
         if loaded.revision != scan.expected_revision {
             *decision = Some(crate::measurement::Acceptance::RejectedCas);
-            return Err(inventory_failure(
-                "The queue changed during this step. Its newer progress was retained.",
-            ));
+            return Err(superseded_failure());
         }
         result.prs = previous;
         if let crate::store::source_cache::SnapshotData::Available { coverage, .. } =
@@ -1282,9 +1485,7 @@ fn reconcile_github_snapshot_observed(
         .map_err(|_| inventory_failure("The queue progress could not be saved."))?;
         if !committed {
             *decision = Some(crate::measurement::Acceptance::RejectedCas);
-            return Err(inventory_failure(
-                "The queue changed during this step. Its newer progress was retained.",
-            ));
+            return Err(superseded_failure());
         }
     } else {
         let mut save = || -> Result<(), crate::store::StoreError> {
@@ -1432,6 +1633,28 @@ fn reconcile_gitlab_snapshot_current(
                 "The GitLab queue changed during this step. Newer progress was retained.",
             ));
         }
+    } else {
+        // A receipt without a scan checkpoint is saved here too, so this is
+        // the one GitLab snapshot writer, as `reconcile_github` is for GitHub
+        // (#1940). The pollers and the refresh command used to write it a
+        // second time after this returned.
+        let save = || -> Result<(), crate::store::StoreError> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            crate::store::source_cache::save_owned_gitlab_snapshot(
+                &tx,
+                source,
+                list,
+                &result.mrs,
+                &result.coverage,
+                Some(owner),
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        save().map_err(|_| inventory_failure("The GitLab list could not be saved."))?;
     }
     Ok(result)
 }
@@ -2183,6 +2406,7 @@ mod tests {
             message: "request failed".into(),
             transient: true,
             not_asked: false,
+            superseded: false,
         }
     }
 
@@ -3258,21 +3482,31 @@ mod tests {
             &data.coverage,
         )
         .unwrap();
+        // The saved list's first row, read the way production reads it.
+        let saved_first = || match crate::store::source_cache::load_source_snapshot(
+            &conn,
+            &source,
+            CachedList::Authored,
+        )
+        .unwrap()
+        .data
+        {
+            crate::store::source_cache::SnapshotData::Available {
+                prs,
+                stale_secs: None,
+                ..
+            } => prs[0].number,
+            other => panic!("expected a fresh snapshot, got {other:?}"),
+        };
         polls.complete(publication, Ok(data), |status| {
             assert_eq!(status.phase, Phase::Retrying, "C's failure stays visible");
             assert_eq!(status.coverage, Some(Coverage::Complete));
             assert!(status.last_received_at.is_some());
-            assert_eq!(
-                crate::store::load_snapshot(&conn, CachedList::Authored).unwrap()[0].number,
-                2
-            );
+            assert_eq!(saved_first(), 2);
         });
         assert!(polls.success_publication(&a).await.is_none());
         assert_eq!(polls.winner(&a, Ok(receipt(1))).unwrap().prs[0].number, 2);
-        assert_eq!(
-            crate::store::load_snapshot(&conn, CachedList::Authored).unwrap()[0].number,
-            2
-        );
+        assert_eq!(saved_first(), 2);
         assert_eq!(
             polls.get(&source, CachedList::Authored).phase,
             Phase::Retrying
@@ -3301,6 +3535,7 @@ mod tests {
                     message: "fixture".into(),
                     transient: false,
                     not_asked,
+                    superseded: false,
                 }),
                 |status| {
                     assert!(polls
@@ -3423,6 +3658,7 @@ mod tests {
                     message: "not enabled".into(),
                     transient: false,
                     not_asked: true,
+                    superseded: false,
                 }),
             )
             .unwrap();
@@ -3450,7 +3686,12 @@ mod tests {
             ..Default::default()
         };
         let status = polls
-            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .finish_scan(
+                &a,
+                &state,
+                Coverage::Partial { total: Some(1001) },
+                chrono::Utc::now(),
+            )
             .unwrap();
         assert_eq!(status.phase, Phase::Partial);
         assert_eq!(status.consecutive_failures, 0);
@@ -3462,7 +3703,12 @@ mod tests {
         let restarted = SourcePolls::default();
         let a = attempt(&restarted, &source, CachedList::Reviewing);
         let status = restarted
-            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .finish_scan(
+                &a,
+                &state,
+                Coverage::Partial { total: Some(1001) },
+                chrono::Utc::now(),
+            )
             .unwrap();
         assert_eq!(status.phase, Phase::Partial);
         assert!(status.error.is_some());
@@ -3654,6 +3900,205 @@ printf 'HTTP/2 200\n\n{"id":%s,"username":"fixture"}' "$id"
         polls.complete_gitlab(publication, Ok(receipt), |_| emitted = true);
         assert!(!emitted);
         assert!(!polls.4.lock().unwrap().contains_key(&(source, list)));
+    }
+
+    /// A status event re-sends the rows only when they changed (#1941).
+    ///
+    /// Measured per tick on a 50-row list: the poll loop's tick is a
+    /// `fetching` event then a terminal one with a new receipt; the
+    /// continuation loop's no-work tick is a `fetching` event then a
+    /// settled one for the SAME receipt. Every one of those events used to
+    /// carry all 50 rows. The count of events is unchanged -- only the
+    /// repeated rows are left out -- and every non-row field is identical.
+    #[tokio::test]
+    async fn a_status_event_without_a_new_receipt_does_not_resend_the_rows() {
+        let polls = SourcePolls::default();
+        let source = Source::default();
+        let list = CachedList::Authored;
+        let mut rows = receipt(1);
+        rows.viewer = Some("fixture".into());
+        rows.prs = (1..=50).map(|n| receipt(n).prs.remove(0)).collect();
+        rows.total = Some(50);
+        let no_work = || {
+            let mut result = rows.clone();
+            result.scan = Some(crate::queue_scan::Commit {
+                expected_revision: 0,
+                state: crate::queue_scan::State {
+                    no_work: true,
+                    ..Default::default()
+                },
+                removals: vec![],
+            });
+            result
+        };
+        let bytes = |update: &Update| serde_json::to_string(update).unwrap().len();
+        // One tick: (legacy bytes, event bytes, events carrying rows).
+        let tick = |legacy: Update, event: Update, totals: &mut (usize, usize, usize)| {
+            assert_eq!(event.status, legacy.status);
+            assert_eq!(event.owner, legacy.owner);
+            assert_eq!(event.session, legacy.session);
+            totals.0 += bytes(&legacy);
+            totals.1 += bytes(&event);
+            totals.2 += usize::from(event.prs.is_some());
+            event
+        };
+
+        // Tick 1 (poll loop): nothing to repeat yet, so the terminal event
+        // carries the new receipt.
+        let mut first = (0, 0, 0);
+        let (attempt, fetching) = polls.begin_attempt(source.clone(), list).await;
+        let event = tick(
+            polls.update(fetching.clone(), None),
+            polls.event_update(fetching, None),
+            &mut first,
+        );
+        assert!(event.prs.is_none(), "no receipt exists yet");
+        let publication = polls.success_publication(&attempt).await.unwrap();
+        let mut settled = None;
+        polls.complete(publication, Ok(rows.clone()), |s| settled = Some(s));
+        let settled = settled.unwrap();
+        let event = tick(
+            polls.update(settled.clone(), None),
+            polls.event_update(settled, None),
+            &mut first,
+        );
+        assert_eq!(event.prs.as_ref().map(Vec::len), Some(50));
+
+        // Tick 2 (poll loop): `fetching` repeats the receipt and leaves the
+        // rows out; the terminal event has a new receipt revision and
+        // carries them.
+        let mut poll_tick = (0, 0, 0);
+        let (attempt, fetching) = polls.begin_attempt(source.clone(), list).await;
+        let event = tick(
+            polls.update(fetching.clone(), None),
+            polls.event_update(fetching, None),
+            &mut poll_tick,
+        );
+        assert!(event.prs.is_none(), "a fetching status re-sent the rows");
+        assert!(event.status.receipt_revision.is_some());
+        let publication = polls.success_publication(&attempt).await.unwrap();
+        let mut settled = None;
+        polls.complete(publication, Ok(rows.clone()), |s| settled = Some(s));
+        let settled = settled.unwrap();
+        let event = tick(
+            polls.update(settled.clone(), None),
+            polls.event_update(settled, None),
+            &mut poll_tick,
+        );
+        assert!(
+            event.prs.is_some(),
+            "a new receipt revision carries its rows"
+        );
+
+        // Tick 3 (continuation loop, no work): the receipt never changes,
+        // so neither event repeats the rows.
+        let mut idle_tick = (0, 0, 0);
+        let (attempt, fetching) = polls.begin_attempt(source.clone(), list).await;
+        tick(
+            polls.update(fetching.clone(), None),
+            polls.event_update(fetching, None),
+            &mut idle_tick,
+        );
+        let publication = polls.success_publication(&attempt).await.unwrap();
+        let mut settled = None;
+        polls.complete(publication, Ok(no_work()), |s| settled = Some(s));
+        let settled = settled.unwrap();
+        let receipt_before = settled.receipt_revision;
+        let event = tick(
+            polls.update(settled.clone(), None),
+            polls.event_update(settled, None),
+            &mut idle_tick,
+        );
+        assert_eq!(event.status.receipt_revision, receipt_before);
+        assert_eq!(idle_tick.2, 0, "a no-work tick re-sent unchanged rows");
+
+        eprintln!(
+            "source-poll-status bytes per tick, 50 rows (before -> after): \
+             poll tick {} -> {} ({} of 2 events with rows), \
+             no-work tick {} -> {} ({} of 2 events with rows)",
+            poll_tick.0, poll_tick.1, poll_tick.2, idle_tick.0, idle_tick.1, idle_tick.2
+        );
+        assert_eq!(poll_tick.2, 1);
+        assert!(poll_tick.1 * 10 < poll_tick.0 * 6, "{poll_tick:?}");
+        assert!(idle_tick.1 * 10 < idle_tick.0, "{idle_tick:?}");
+
+        // Rows that change without a new receipt revision are still news.
+        let mut changed = rows.clone();
+        changed.prs[0].title = "changed".into();
+        let (attempt, _) = polls.begin_attempt(source.clone(), list).await;
+        let publication = polls.success_publication(&attempt).await.unwrap();
+        let mut settled = None;
+        let mut changed_no_work = changed;
+        changed_no_work.scan = no_work().scan;
+        polls.complete(publication, Ok(changed_no_work), |s| settled = Some(s));
+        let event = polls.event_update(settled.unwrap(), None);
+        assert_eq!(event.prs.unwrap()[0].title, "changed");
+    }
+
+    /// Reconciliation is the one queue-snapshot writer (#1940).
+    ///
+    /// The poll loops and the refresh command used to save the snapshot a
+    /// second (and third) time after this returned, outside its
+    /// transaction. Those writes are gone, so each provider's reconcile
+    /// must save every receipt it accepts itself -- with or without a scan
+    /// checkpoint -- under the verified owner. `get_source_snapshot`,
+    /// `get_cached`, the phone's opening frame and the next tick's
+    /// baseline (`fetch_github_step_at`) all read this one row.
+    #[test]
+    fn reconcile_is_the_one_snapshot_writer_for_both_providers() {
+        use crate::store::source_cache::{load_source_snapshot, snapshot_owner, SnapshotData};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+
+        let github = Source::default();
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let mut fetched = receipt(7);
+            fetched.viewer = Some("fixture".into());
+            fetched.scan = None;
+            let accepted = reconcile_github_snapshot(&conn, &github, list, fetched, None)
+                .unwrap_or_else(|f| panic!("{}", f.message));
+            let SnapshotData::Available { prs, coverage, .. } =
+                load_source_snapshot(&conn, &github, list).unwrap().data
+            else {
+                panic!("the GitHub {list:?} receipt was not saved by reconcile");
+            };
+            assert_eq!(prs, accepted.prs);
+            assert_eq!(coverage, accepted.coverage);
+            assert_eq!(
+                snapshot_owner(&conn, &github, list).unwrap().as_deref(),
+                Some("fixture")
+            );
+        }
+
+        let gitlab = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let mut mr = gitlab_mr(&gitlab);
+            mr.viewer = Some("fixture".into());
+            let fetched = crate::gitlab::queues::FetchedList {
+                session: None,
+                scan: None,
+                viewer: Some("fixture".into()),
+                mrs: vec![mr],
+                total: Some(1),
+                coverage: Coverage::Complete,
+            };
+            let accepted = reconcile_gitlab_snapshot(&conn, &gitlab, list, fetched, None)
+                .unwrap_or_else(|f| panic!("{}", f.message));
+            let SnapshotData::GitLabAvailable { mrs, coverage, .. } =
+                load_source_snapshot(&conn, &gitlab, list).unwrap().data
+            else {
+                panic!("the GitLab {list:?} receipt was not saved by reconcile");
+            };
+            assert_eq!(mrs, accepted.mrs);
+            assert_eq!(coverage, Coverage::Complete);
+            assert_eq!(
+                snapshot_owner(&conn, &gitlab, list).unwrap().as_deref(),
+                Some("fixture")
+            );
+        }
     }
 
     #[test]

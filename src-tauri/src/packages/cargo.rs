@@ -1565,6 +1565,7 @@ version = "2.0.17"
     #[cfg(unix)]
     #[test]
     fn an_unreadable_lockfile_is_an_error_not_an_empty_update_list() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = project(&[
             (
@@ -1657,6 +1658,7 @@ version = "2.0.17"
     #[cfg(unix)]
     #[test]
     fn an_unreadable_workspace_directory_is_reported_not_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = project(&[
             (
@@ -1691,6 +1693,7 @@ version = "2.0.17"
     #[cfg(unix)]
     #[test]
     fn an_unreadable_root_manifest_is_reported_not_empty() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = project(&[(
             "Cargo.toml",
@@ -1735,6 +1738,7 @@ version = "2.0.17"
     #[cfg(unix)]
     #[test]
     fn a_workspace_with_one_unreadable_member_still_reports_the_others() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = project(&[
             (

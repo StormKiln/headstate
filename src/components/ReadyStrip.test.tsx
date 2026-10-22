@@ -39,6 +39,7 @@ import { PR_FIXTURES } from "../fixtures/prs";
 import { useFilters } from "@/store/filters";
 import type { PullRequest, RowPusher } from "@/types/pr";
 import { sortReadyForReview } from "@/lib/derive";
+import { settle } from "@/test/settle";
 
 /// What `get_ready_pushers` answers; `[]` (nothing checked) by default.
 let pusherAnswers: RowPusher[] = [];
@@ -141,35 +142,40 @@ describe("ReadyStrip", () => {
     }
   });
 
-  it("lists what a reviewer can pick up", () => {
+  it("lists what a reviewer can pick up", async () => {
     render(<ReadyStrip prs={[ready]} onOpen={vi.fn()} />);
+    await settle();
     expect(screen.getByText("Ready one")).toBeTruthy();
     expect(screen.getByText(/ready for review \(1\)/i)).toBeTruthy();
   });
 
-  it("leaves out what is not ready", () => {
+  it("leaves out what is not ready", async () => {
     render(<ReadyStrip prs={[{ ...ready, ci: "failure" }]} onOpen={vi.fn()} />);
+    await settle();
     expect(screen.queryByText("Ready one")).toBeNull();
   });
 
   // Matches the attention strip: a section that shouts when there is
   // nothing in it stops being read.
-  it("stays quiet when nothing is ready", () => {
+  it("stays quiet when nothing is ready", async () => {
     render(<ReadyStrip prs={[]} onOpen={vi.fn()} />);
+    await settle();
     expect(screen.getByText(/nothing ready to review/i)).toBeTruthy();
     expect(screen.queryByText(/ready for review \(/i)).toBeNull();
   });
 
-  it("opens the detail view when clicked", () => {
+  it("opens the detail view when clicked", async () => {
     const onOpen = vi.fn();
     render(<ReadyStrip prs={[ready]} onOpen={onOpen} />);
+    await settle();
     fireEvent.click(screen.getByText("Ready one"));
     expect(onOpen).toHaveBeenCalledWith(ready);
   });
 
-  it("is keyboard reachable, like the attention strip", () => {
+  it("is keyboard reachable, like the attention strip", async () => {
     const onOpen = vi.fn();
     render(<ReadyStrip prs={[ready]} onOpen={onOpen} />);
+    await settle();
     const button = screen.getByRole("button", { name: /ready one/i });
     button.focus();
     expect(document.activeElement).toBe(button);
@@ -178,8 +184,9 @@ describe("ReadyStrip", () => {
   });
 
   // With nothing to open, the entry must not look interactive.
-  it("does not pretend to be clickable without a handler", () => {
+  it("does not pretend to be clickable without a handler", async () => {
     render(<ReadyStrip prs={[ready]} />);
+    await settle();
     expect(screen.queryByRole("button", { name: /ready one/i })).toBeNull();
   });
 });
@@ -210,8 +217,9 @@ describe("ReadyStrip ordering", () => {
       .getAllByRole("button", { name: /^PR \d/ })
       .map((el) => el.textContent?.match(/PR \d/)?.[0]);
 
-  it("defaults to oldest ready first, without touching the store", () => {
+  it("defaults to oldest ready first, without touching the store", async () => {
     render(<ReadyStrip prs={NEWEST_FIRST} onOpen={vi.fn()} />);
+    await settle();
     expect(titlesInOrder()).toEqual(["PR 1", "PR 2", "PR 3"]);
     // The default is a DEFAULT, not a value written on first render: a
     // store key nobody chose would persist and then outlive a change to
@@ -220,13 +228,14 @@ describe("ReadyStrip ordering", () => {
     expect(s.filtersByView["to-review"].readySort).toBeUndefined();
   });
 
-  it("keeps a retained qualified date in order and labels it last known", () => {
+  it("keeps a retained qualified date in order and labels it last known", async () => {
     const older = at(1, "2026-09-01T00:00:00Z");
     older.observation = {
       state: "observed", last_observed_at: null, unknown_fields: [], retained_fields: [],
       detail_fields: ["base"], ready_at_state: "retained",
     };
     render(<ReadyStrip prs={[at(2, "2026-09-02T00:00:00Z"), older]} onOpen={vi.fn()} />);
+    await settle();
     expect(titlesInOrder()).toEqual(["PR 1", "PR 2"]);
     expect(screen.queryByText("Ready date last known")).toBeNull();
     expect(screen.getByTitle(/Last known ready for review since/)).toBeTruthy();
@@ -259,16 +268,18 @@ describe("ReadyStrip ordering", () => {
 
   // A default nobody can see is one nobody can trust, and this list
   // having a non-obvious default is the point of the issue.
-  it("names the field it sorts on, not just the direction", () => {
+  it("names the field it sorts on, not just the direction", async () => {
     render(<ReadyStrip prs={NEWEST_FIRST} onOpen={vi.fn()} />);
+    await settle();
     const trigger = screen.getByRole("button", { name: /sort/i });
     expect(trigger.textContent).toContain("Oldest ready first");
     // "Oldest first" alone is the ambiguity #1277 was filed about.
     expect(trigger.textContent).toMatch(/ready/i);
   });
 
-  it("switches to newest ready first", () => {
+  it("switches to newest ready first", async () => {
     render(<ReadyStrip prs={NEWEST_FIRST} onOpen={vi.fn()} />);
+    await settle();
     fireEvent.click(screen.getByRole("button", { name: /sort/i }));
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Newest ready first" }));
     expect(titlesInOrder()).toEqual(["PR 3", "PR 2", "PR 1"]);
@@ -281,12 +292,13 @@ describe("ReadyStrip ordering", () => {
   // chaining the two would be testing the menu's animation rather than
   // the ordering. Starting from `newest-opened` in the store is the state
   // the previous test leaves a real user in.
-  it("switches back to oldest ready first", () => {
+  it("switches back to oldest ready first", async () => {
     useFilters.setState({
       filtersByView: { ...EMPTY, "to-review": { readySort: "newest-opened" } },
       view: "to-review",
     });
     render(<ReadyStrip prs={NEWEST_FIRST} onOpen={vi.fn()} />);
+    await settle();
     expect(titlesInOrder()).toEqual(["PR 3", "PR 2", "PR 1"]);
     fireEvent.click(screen.getByRole("button", { name: /sort/i }));
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Oldest ready first" }));
@@ -294,28 +306,31 @@ describe("ReadyStrip ordering", () => {
     expect(useFilters.getState().filtersByView["to-review"].readySort).toBe("oldest-opened");
   });
 
-  it("honours a readySort already in the store", () => {
+  it("honours a readySort already in the store", async () => {
     useFilters.setState({
       filtersByView: { ...EMPTY, "to-review": { readySort: "newest-opened" } },
       view: "to-review",
     });
     render(<ReadyStrip prs={[...NEWEST_FIRST].reverse()} onOpen={vi.fn()} />);
+    await settle();
     expect(titlesInOrder()).toEqual(["PR 3", "PR 2", "PR 1"]);
   });
 
   /// An undated row at the TOP would claim to be the longest-waiting work
   /// and push genuinely old pull requests down -- the one outcome this
   /// ordering exists to prevent.
-  it("does not let an unparseable ready_at sort as the oldest", () => {
+  it("does not let an unparseable ready_at sort as the oldest", async () => {
     render(<ReadyStrip prs={[at(9, "not a date"), ...NEWEST_FIRST]} onOpen={vi.fn()} />);
+    await settle();
     expect(titlesInOrder()).toEqual(["PR 1", "PR 2", "PR 3", "PR 9"]);
   });
 
   // The strip is the only list #1277 changes. Reordering it must not
   // touch `sort`, which the PR list below it reads and which stays
   // newest-first.
-  it("leaves the main list's sort alone", () => {
+  it("leaves the main list's sort alone", async () => {
     render(<ReadyStrip prs={NEWEST_FIRST} onOpen={vi.fn()} />);
+    await settle();
     fireEvent.click(screen.getByRole("button", { name: /sort/i }));
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Newest ready first" }));
     expect(useFilters.getState().filtersByView["to-review"].sort).toBeUndefined();
@@ -352,13 +367,14 @@ describe("ReadyStrip age", () => {
     vi.useRealTimers();
   });
 
-  it("shows green, yellow and red ages, each with its text", () => {
+  it("shows green, yellow and red ages, each with its text", async () => {
     render(
       <ReadyStrip
         prs={[row(1, hoursAgo(3)), row(2, hoursAgo(30)), row(3, hoursAgo(60))]}
         onOpen={vi.fn()}
       />,
     );
+    await settle();
     expect(ageOf(1).textContent).toBe("3h");
     expect(ageOf(1).dataset.readyAge).toBe("fresh");
     expect(ageOf(1).className).toContain("#3fb950");
@@ -371,10 +387,11 @@ describe("ReadyStrip age", () => {
   });
 
   // Absent is not zero: never green, and never a number.
-  it("renders an unknown age as a neutral 'age unknown'", () => {
+  it("renders an unknown age as a neutral 'age unknown'", async () => {
     render(
       <ReadyStrip prs={[row(1, undefined), row(2, null), row(3, "garbage")]} onOpen={vi.fn()} />,
     );
+    await settle();
     for (const n of [1, 2, 3]) {
       expect(ageOf(n).textContent).toBe("age unknown");
       expect(ageOf(n).dataset.readyAge).toBe("unknown");
@@ -383,28 +400,32 @@ describe("ReadyStrip age", () => {
     }
   });
 
-  it("gives the exact ready time in the accessible name and the title", () => {
+  it("gives the exact ready time in the accessible name and the title", async () => {
     const at = hoursAgo(3);
     const since = new Date(at).toLocaleString();
     render(<ReadyStrip prs={[row(1, at)]} onOpen={vi.fn()} />);
+    await settle();
     expect(ageOf(1).getAttribute("title")).toBe(`Ready for review since ${since}`);
     expect(ageOf(1).getAttribute("datetime")).toBe(at);
   });
 
-  it("says in the accessible name when the ready time is unknown", () => {
+  it("says in the accessible name when the ready time is unknown", async () => {
     render(<ReadyStrip prs={[row(1, null)]} onOpen={vi.fn()} />);
+    await settle();
     expect(ageOf(1).getAttribute("title")).toBe("Ready-for-review time unknown");
   });
 
-  it("shows the age on a plain-link row too", () => {
+  it("shows the age on a plain-link row too", async () => {
     render(<ReadyStrip prs={[row(1, hoursAgo(3))]} />);
+    await settle();
     expect(screen.getByText("3h")).toBeTruthy();
   });
 
   // The age keeps counting while the view is open, from the clock and not
   // from a re-fetch: the same `prs` prop crosses from green to yellow.
-  it("stays current while the view is open", () => {
+  it("stays current while the view is open", async () => {
     render(<ReadyStrip prs={[row(1, hoursAgo(23.99))]} onOpen={vi.fn()} />);
+    await settle();
     expect(ageOf(1).dataset.readyAge).toBe("fresh");
     act(() => {
       vi.advanceTimersByTime(2 * 60_000);
@@ -421,8 +442,9 @@ describe("ReadyStrip unresolved conversations", () => {
     unresolved_threads_floor: boolean | undefined,
   ): PullRequest => ({ ...ready, unresolved_threads, unresolved_threads_floor });
 
-  it("tags a row with open conversations and carries the count", () => {
+  it("tags a row with open conversations and carries the count", async () => {
     const { container } = render(<ReadyStrip prs={[withThreads(3, false)]} onOpen={vi.fn()} />);
+    await settle();
     const chip = container.querySelector("[data-unresolved]");
     expect(chip?.textContent).toBe("3");
     expect(chip?.getAttribute("data-unresolved")).toBe("exact");
@@ -430,14 +452,16 @@ describe("ReadyStrip unresolved conversations", () => {
     expect(chip?.getAttribute("title")).toBe("3 unresolved conversations");
   });
 
-  it("shows nothing for zero", () => {
+  it("shows nothing for zero", async () => {
     const { container } = render(<ReadyStrip prs={[withThreads(0, false)]} onOpen={vi.fn()} />);
+    await settle();
     expect(container.querySelector("[data-unresolved]")).toBeNull();
     expect(screen.queryByText(/unresolved conversation/)).toBeNull();
   });
 
-  it("qualifies a count that may be a floor, never printing it as exact", () => {
+  it("qualifies a count that may be a floor, never printing it as exact", async () => {
     const { container } = render(<ReadyStrip prs={[withThreads(3, true)]} onOpen={vi.fn()} />);
+    await settle();
     const chip = container.querySelector("[data-unresolved]");
     expect(chip?.textContent).toBe("3+");
     expect(chip?.getAttribute("title")).toBe("At least 3 unresolved conversations");
@@ -445,18 +469,21 @@ describe("ReadyStrip unresolved conversations", () => {
   });
 
   // A payload from an older desktop has no flag: qualified, not exact.
-  it("qualifies a count whose floor flag is absent", () => {
+  it("qualifies a count whose floor flag is absent", async () => {
     const { container } = render(<ReadyStrip prs={[withThreads(2, undefined)]} onOpen={vi.fn()} />);
+    await settle();
     expect(container.querySelector("[data-unresolved]")?.textContent).toBe("2+");
   });
 
-  it("singular for one", () => {
+  it("singular for one", async () => {
     render(<ReadyStrip prs={[withThreads(1, false)]} onOpen={vi.fn()} />);
+    await settle();
     expect(document.querySelector("[data-unresolved]")?.getAttribute("title")).toBe("1 unresolved conversation");
   });
 
-  it("tags a plain-link row too", () => {
+  it("tags a plain-link row too", async () => {
     const { container } = render(<ReadyStrip prs={[withThreads(4, false)]} />);
+    await settle();
     expect(container.querySelector("[data-unresolved]")?.textContent).toBe("4");
     expect(screen.getByText(", 4 unresolved conversations")).toBeTruthy();
   });
@@ -656,16 +683,18 @@ describe("ReadyStrip last pusher", () => {
     expect(status()).toBe("1 hidden: you pushed last and your approval can't count");
   });
 
-  it("says it is checking while the first answer is on its way", () => {
+  it("says it is checking while the first answer is on its way", async () => {
     invoke.mockImplementation((cmd: string) =>
       cmd === "get_ready_pushers" ? new Promise(() => {}) : viewerLogin,
     );
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await settle();
     expect(status()).toBe("Checking who pushed last…");
   });
 
-  it("persists the choice like the sort", () => {
+  it("persists the choice like the sort", async () => {
     render(<ReadyStrip prs={[mine]} onOpen={vi.fn()} />);
+    await settle();
     const trigger = screen.getByRole("button", { name: /pull requests you pushed last/i });
     expect(trigger.textContent).toContain("auto");
     fireEvent.click(trigger);
@@ -831,6 +860,7 @@ describe("Ready stack context (#1602)", () => {
 
 it("keeps an omitted last-known Ready row visibly qualified", async () => {
   render(<ReadyStrip prs={[{ ...ready, observation: { state: "retained", last_observed_at: null, unknown_fields: [], retained_fields: [] } }]} />);
+  await settle();
   expect(screen.getByText("Ready one")).toBeTruthy();
   expect(screen.getByText("Membership unconfirmed")).toBeTruthy();
 });
@@ -852,7 +882,7 @@ describe("Ready observation status", () => {
     expect(status.getAttribute("title")).toBe(item.explanation);
     expect(document.getElementById(status.getAttribute("aria-describedby")!)?.textContent).toBe(item.explanation);
     expect(status.getAttribute("tabindex")).toBe("0");
-    status.focus();
+    act(() => status.focus());
     fireEvent.focus(status);
     expect(document.activeElement).toBe(status);
     expect(screen.getByRole("tooltip").textContent).toBe(item.explanation);
@@ -875,7 +905,7 @@ describe("Ready observation status", () => {
     const retained = { ...ready, observation: cases[0].observation };
     const view = render(<ReadyObservationStatus pr={retained} focusable />);
     const status = screen.getByRole("button", { name: "Membership unconfirmed" });
-    status.focus();
+    act(() => status.focus());
     fireEvent.focus(status);
     fireEvent.click(status);
     expect(screen.getByRole("tooltip").style.top).toBe("24px");
@@ -888,10 +918,11 @@ describe("Ready observation status", () => {
     rect.mockRestore();
   });
 
-  it.each([true, false])("keeps a long retained title compact and described in the interactive=%s row", (interactive) => {
+  it.each([true, false])("keeps a long retained title compact and described in the interactive=%s row", async (interactive) => {
     const item = cases[0];
     const pr = { ...ready, title: longTitle, observation: item.observation };
     render(<ReadyStrip prs={[pr]} onOpen={interactive ? vi.fn() : undefined} />);
+    await settle();
     const status = screen.getByText("Membership unconfirmed");
     const explanation = document.getElementById(status.getAttribute("aria-describedby")!);
     if (interactive) {
