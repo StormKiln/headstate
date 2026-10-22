@@ -1637,6 +1637,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_walled_off_skills_dir_downgrades_not_held_to_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let file = skill(t.path(), "octocat-verify", GOOD);
@@ -1681,6 +1682,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_scope_with_a_refusal_counts_at_least() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         skill(t.path(), "octocat-verify", GOOD);

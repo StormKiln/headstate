@@ -18,6 +18,7 @@ vi.mock("../api/hooks", async (original) => ({
   useReviewGates: () => ({ data: undefined, refetch: vi.fn(async () => {}), isFetching: false }),
 }));
 import { PrDetailView } from "./PrDetailView";
+import { settle } from "@/test/settle";
 
 function detail(number = 7, merge_status: PrDetail["merge_status"] = "clean"): PrDetail {
   return {
@@ -375,8 +376,8 @@ it.each([1200, 390])("preserves converged own approval through later lag and rem
     }
     return base(name, args);
   });
-  let view = mount(); await loaded();
-  const sibling = mount();
+  let view = mount(); await settle(); await loaded();
+  const sibling = mount(); await settle();
   fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
   await waitFor(() => expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(0));
   current = { ...detail(), latest_reviews: [{ author: "reviewer", state: "APPROVED", id: receipt.review_id, commit_oid: "head-7", submitted_at: receipt.submitted_at }] };
@@ -388,7 +389,7 @@ it.each([1200, 390])("preserves converged own approval through later lag and rem
   for (const latest_reviews of [[], [{ author: "reviewer", state: "CHANGES_REQUESTED", id: "OLDER", commit_oid: "head-7", submitted_at: "2026-10-01T11:00:00Z" }]]) {
     current = { ...detail(), latest_reviews };
     await act(async () => { await qc.refetchQueries({ queryKey: key }); });
-    view.unmount(); view = mount(); await loaded();
+    view.unmount(); view = mount(); await settle(); await loaded();
     expect(screen.getAllByRole("button", { name: /^Approved$/ }).length).toBeGreaterThan(1);
     expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(1);
   }
@@ -401,6 +402,7 @@ it.each([1200, 390])("preserves converged own approval through later lag and rem
   fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
   await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")).toHaveLength(2));
   expect(invoke.mock.calls.filter(([name]) => name === "review_pr_at_head")[1][1]?.request).toMatchObject({ expected_head: "new-head" });
+  await settle();
 });
 
 it.each([1200, 390])("does not revive an older approval after an acknowledged different verdict expires at width %s", async width => {
@@ -416,7 +418,7 @@ it.each([1200, 390])("does not revive an older approval after an acknowledged di
     }
     return base(name, args);
   });
-  let view = mount(); await loaded();
+  let view = mount(); await settle(); await loaded();
   fireEvent.click(screen.getAllByRole("button", { name: /^Approve$/ })[0]);
   await waitFor(() => expect(writes).toBe(1));
   current = { ...detail(), latest_reviews: [first] };
@@ -430,7 +432,7 @@ it.each([1200, 390])("does not revive an older approval after an acknowledged di
   for (const latest_reviews of [[], [first]]) {
     current = { ...detail(), latest_reviews };
     await act(async () => { await qc.refetchQueries({ queryKey: key }); });
-    view.unmount(); view = mount(); await loaded();
+    view.unmount(); view = mount(); await settle(); await loaded();
     await screen.findByRole("link", { name: "Check review on GitHub" });
     expect(screen.queryAllByRole("button", { name: /^Approved$/ })).toHaveLength(0);
     expect(writes).toBe(2);

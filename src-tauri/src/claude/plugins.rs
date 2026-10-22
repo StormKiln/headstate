@@ -1926,6 +1926,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_project_path_is_undecided() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let repo = t.path().join("repo");
@@ -2042,6 +2043,8 @@ mod tests {
     /// instead of "N".
     #[test]
     fn an_unreadable_transcript_makes_the_counts_a_floor() {
+        #[cfg(unix)]
+        crate::test_permissions::skip_unless_chmod_denies!();
         let dir = tempfile::tempdir().unwrap();
         let slug = dir.path().join("proj");
         std::fs::create_dir(&slug).unwrap();

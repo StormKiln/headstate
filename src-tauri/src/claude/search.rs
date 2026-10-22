@@ -1840,6 +1840,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_transcript_is_counted_and_reported() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1898,6 +1899,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_transcript_the_scan_could_not_read_is_also_a_gap() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2042,6 +2044,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_listing_still_reports_an_unreadable_transcript() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2376,6 +2379,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_denominator_is_recorded_even_when_nothing_indexes() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();

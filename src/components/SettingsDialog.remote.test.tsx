@@ -48,6 +48,7 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
+import { settle } from "@/test/settle";
 
 beforeEach(() => {
   setRemote.mockClear();
@@ -62,30 +63,35 @@ const box = () => screen.getByRole("checkbox", { name: /allow phone connections/
 /// The listener opens a port on every interface. It must be off until
 /// the user says otherwise, and the switch must say what it does.
 describe("phone connections setting", () => {
-  it("mounts the away-from-home guide with phone connections still off", () => {
+  it("mounts the away-from-home guide with phone connections still off", async () => {
     show();
+    await settle();
     expect(screen.getByRole("region", { name: "Use away from home" })).toBeTruthy();
     expect(setRemote).not.toHaveBeenCalled();
   });
-  it("offers the switch, off by default", () => {
+  it("offers the switch, off by default", async () => {
     show();
+    await settle();
     expect(box()).toHaveProperty("checked", false);
   });
 
-  it("has its own topic in the left rail", () => {
+  it("has its own topic in the left rail", async () => {
     show();
+    await settle();
     expect(screen.getByRole("button", { name: /^phone$/i })).toBeTruthy();
   });
 
-  it("turns the listener on", () => {
+  it("turns the listener on", async () => {
     show();
+    await settle();
     fireEvent.click(box());
     expect(setRemote).toHaveBeenCalledWith(true);
   });
 
-  it("turns the listener off when it is on", () => {
+  it("turns the listener off when it is on", async () => {
     remoteState.enabled = true;
     show();
+    await settle();
     expect(box()).toHaveProperty("checked", true);
     fireEvent.click(box());
     expect(setRemote).toHaveBeenCalledWith(false);
@@ -122,14 +128,16 @@ describe("phone connections setting", () => {
     expect(setRemote).toHaveBeenCalledExactlyOnceWith(true);
   });
 
-  it("names the port, so the user knows what was opened", () => {
+  it("names the port, so the user knows what was opened", async () => {
     show();
+    await settle();
     expect(screen.getByText(/Lets the Headstate companion app reach this desktop on port 41919/)).toBeTruthy();
   });
 
   // Same topic as the switch: pairing is the only reason to turn it on.
-  it("offers pairing and the paired-device list on the same topic", () => {
+  it("offers pairing and the paired-device list on the same topic", async () => {
     show();
+    await settle();
     expect(screen.getByRole("button", { name: /pair a phone/i })).toBeTruthy();
     expect(screen.getByText(/paired devices/i)).toBeTruthy();
   });

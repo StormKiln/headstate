@@ -403,6 +403,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_resolved_file_is_reported_not_dropped() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         let file = t.path().join("Package.resolved");
@@ -467,6 +468,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_readable_resolved_files_survive_an_unreadable_sibling() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         std::fs::write(t.path().join("Package.resolved"), V3).unwrap();

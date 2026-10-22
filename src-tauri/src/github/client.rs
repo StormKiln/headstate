@@ -856,6 +856,13 @@ impl GitHubClient {
 
     /// Share overlapping equivalent searches, with a deadline that includes
     /// waiting for an existing load. No spawned tasks survive cancellation.
+    ///
+    /// Reached only through `fetch_prs_snapshot_with_budget` and
+    /// `fetch_reviewing_snapshot_with_budget`, which production does not
+    /// call: it reads both lists through `advance_scan`, whose own sharing
+    /// lives in `scan::Reads`. This and `collect_search_pages` stay because
+    /// those two are the integration-test seam (`tests/queue_reliability.rs`,
+    /// `tests/read_reliability.rs`); see #2003 before wiring a caller.
     async fn search_with_budget(
         &self,
         query: &str,
@@ -1923,12 +1930,15 @@ impl GitHubClient {
         Ok(v)
     }
 
-    pub async fn fetch_prs_with_total(&self) -> Result<(Vec<PullRequest>, u64), ClientError> {
-        self.fetch_prs_snapshot()
-            .await
-            .map(|result| (result.prs, result.total.unwrap_or(0)))
-    }
-
+    /// The authored search as one bounded read, outside the scan.
+    ///
+    /// Not a production path: the poll loop and the refresh command read
+    /// both lists through `advance_scan` (`source_poll::fetch_github_step`)
+    /// and the source cache. Kept, with `fetch_reviewing_snapshot`, as the
+    /// seam the read-transport tests here and in `tests/` drive retries,
+    /// cooldowns, coalescing and paging through. It cannot be
+    /// `#[cfg(test)]`: integration tests link the library built without
+    /// it. Its test-only wrapper `fetch_prs_with_total` went in #2003.
     pub async fn fetch_prs_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_prs_snapshot_with_budget(SEARCH_BUDGET).await
     }
@@ -4213,7 +4223,7 @@ mod tests {
     ///
     /// # What this is actually protecting
     ///
-    /// `fetch_prs_with_total` calls `budget::note_remaining` at the top of
+    /// `fetch_prs_snapshot_with_budget` calls `budget::note_remaining` in
     /// this file, which stores to the PROCESS-WIDE `OBSERVED_REMAINING`.
     /// `budget.rs` serialises every test that touches that static behind
     /// `observed_test_lock()`, and #874's invariant enforces the rule --
@@ -4298,12 +4308,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .expect("a 25-item page must not need a fallback");
-        assert_eq!(total, 1);
+        assert_eq!(list.total, Some(1));
     }
 
     /// A result larger than one page is fetched as SEVERAL pages, and
@@ -4344,12 +4354,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .unwrap();
-        assert_eq!(total, 30, "the true total comes from issueCount");
+        let prs = list.prs;
+        assert_eq!(list.total, Some(30), "the true total comes from issueCount");
         assert_eq!(prs.len(), 2, "both pages are merged: {prs:?}");
     }
 
@@ -4428,13 +4439,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .expect("a failed page must not fail the whole fetch");
-        assert_eq!(prs.len(), 1, "what arrived is kept");
-        assert_eq!(total, 30, "and the shortfall stays visible");
+        assert_eq!(list.prs.len(), 1, "what arrived is kept");
+        assert_eq!(list.total, Some(30), "and the shortfall stays visible");
     }
 
     /// Only when the SERVER gave up. A 401 means asking again changes
@@ -4545,7 +4556,7 @@ mod tests {
 
         assert!(client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .is_err());
         // `expect(1)` is verified on drop: a second attempt fails the test.
@@ -4781,11 +4792,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .unwrap();
+        let prs = list.prs;
+        // `fetch_prs_with_total` read an absent total as 0; asserting the
+        // `Some` is the stronger form of the same check (#2003).
+        let total = list.total.expect("an agreed issueCount is a known total");
         // The mock answers EVERY page with the same 3 nodes, so the
         // merged list is a multiple of 3 rather than 3 -- that is an
         // artefact of the fixture, not of the code. What this test is
