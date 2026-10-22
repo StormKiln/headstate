@@ -9,6 +9,7 @@ use crate::{
 use serde::Serialize;
 #[path = "source_poll_measurement.rs"]
 mod observation;
+use crate::github::scan::ScanMode;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -126,6 +127,10 @@ impl Default for SourcePolls {
 
 pub struct Publication {
     attempt: Attempt,
+    /// When the attempt's result reached its caller, before waiting for
+    /// this permit. A receipt is stamped with this, never with the time it
+    /// was published behind other work (#1933).
+    received_at: chrono::DateTime<chrono::Utc>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -207,7 +212,7 @@ impl SourcePolls {
             status.github_receipt_epoch += 1;
             status.revision += 1;
             status.receipt_revision = Some(status.revision);
-            status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+            status.last_received_at = Some(publication.received_at.to_rfc3339());
             status.clone()
         };
         self.observe_measurement(&status, crate::measurement::Acceptance::Accepted);
@@ -290,6 +295,7 @@ impl SourcePolls {
         (attempt, self.get(&source, list))
     }
     async fn publication(&self, attempt: &Attempt) -> Option<Publication> {
+        let received_at = chrono::Utc::now();
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
         let current = self
             .0
@@ -299,10 +305,12 @@ impl SourcePolls {
             .is_some_and(|(generation, _)| *generation == attempt.generation);
         current.then_some(Publication {
             attempt: attempt.clone(),
+            received_at,
             _guard: guard,
         })
     }
     async fn success_publication(&self, attempt: &Attempt) -> Option<Publication> {
+        let received_at = chrono::Utc::now();
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
         if self.before_mutation(attempt) {
             self.observe_measurement(
@@ -332,6 +340,7 @@ impl SourcePolls {
         }
         (!newer_success).then_some(Publication {
             attempt: attempt.clone(),
+            received_at,
             _guard: guard,
         })
     }
@@ -371,9 +380,10 @@ impl SourcePolls {
         };
         let no_work = scan_state.as_ref().is_some_and(|s| s.no_work);
         let successful = status_result.is_ok();
+        let received_at = publication.received_at;
         let status = match (scan_state, status_result) {
-            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage),
-            (_, result) => self.finish(attempt, result),
+            (Some(state), Ok(coverage)) => self.finish_scan(attempt, &state, coverage, received_at),
+            (_, result) => self.finish_at(attempt, result, received_at),
         };
         if let Some(status) = status {
             self.observe_measurement(
@@ -396,6 +406,7 @@ impl SourcePolls {
         attempt: &Attempt,
         state: &crate::queue_scan::State,
         coverage: Coverage,
+        received_at: chrono::DateTime<chrono::Utc>,
     ) -> Option<Status> {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
@@ -451,7 +462,7 @@ impl SourcePolls {
                 status.published_scan_receipt = state.receipt_id.clone();
                 status.published_scan_generation = Some(attempt.generation);
                 if state.received || state.step_failure.is_none() {
-                    status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                    status.last_received_at = Some(received_at.to_rfc3339());
                 }
             }
         }
@@ -520,7 +531,7 @@ impl SourcePolls {
                 }
                 Err(error) => Err(error),
             };
-            if let Some(status) = self.finish(attempt, status_result) {
+            if let Some(status) = self.finish_at(attempt, status_result, publication.received_at) {
                 emit(status);
             }
         };
@@ -637,7 +648,16 @@ impl SourcePolls {
         status.request_id = request_id;
         (*generation, status.clone())
     }
+    #[cfg(test)]
     fn finish(&self, attempt: &Attempt, result: Result<Coverage, Failure>) -> Option<Status> {
+        self.finish_at(attempt, result, chrono::Utc::now())
+    }
+    fn finish_at(
+        &self,
+        attempt: &Attempt,
+        result: Result<Coverage, Failure>,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<Status> {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, status) = entries.get_mut(&(attempt.source.clone(), attempt.list))?;
         if *generation != attempt.generation {
@@ -647,13 +667,32 @@ impl SourcePolls {
             if let Ok(coverage) = result {
                 status.revision += 1;
                 status.receipt_revision = Some(status.revision);
-                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                status.last_received_at = Some(received_at.to_rfc3339());
                 status.coverage = Some(coverage);
                 return Some(status.clone());
             }
             return None;
         }
         status.revision += 1;
+        if result.as_ref().is_err_and(|failure| failure.superseded) {
+            // A lost write race is not a failure (#1933). Another attempt's
+            // newer data was saved and stands: no failure is counted, its
+            // error and receipt are untouched, and the list returns to the
+            // outcome it had before this attempt began.
+            status.phase = match status.settled_phase.clone() {
+                Some(phase) if phase != Phase::NotRequested && phase != Phase::Fetching => phase,
+                _ => status.coverage.as_ref().map_or(
+                    Phase::NotRequested,
+                    |coverage| match coverage {
+                        Coverage::Complete => Phase::Ready,
+                        Coverage::Partial { .. } => Phase::Partial,
+                        Coverage::Unknown => Phase::Unknown,
+                    },
+                ),
+            };
+            status.settled_generation = attempt.generation;
+            return Some(status.clone());
+        }
         match result {
             Ok(coverage) => {
                 status.receipt_revision = Some(status.revision);
@@ -662,7 +701,7 @@ impl SourcePolls {
                     Coverage::Partial { .. } => Phase::Partial,
                     Coverage::Unknown => Phase::Unknown,
                 };
-                status.last_received_at = Some(chrono::Utc::now().to_rfc3339());
+                status.last_received_at = Some(received_at.to_rfc3339());
                 status.coverage = Some(coverage);
                 status.consecutive_failures = 0;
                 status.error = None;
@@ -691,6 +730,10 @@ pub struct Failure {
     pub message: String,
     pub transient: bool,
     pub not_asked: bool,
+    /// This attempt lost a write race to another attempt whose newer
+    /// progress was saved (#1933). Not a provider failure: it is never
+    /// counted, never surfaced, and never re-stamps the winner's receipt.
+    pub superseded: bool,
 }
 impl From<&crate::github::client::ClientError> for Failure {
     fn from(error: &crate::github::client::ClientError) -> Self {
@@ -698,6 +741,7 @@ impl From<&crate::github::client::ClientError> for Failure {
             message: error.to_string(),
             transient: error.is_transient(),
             not_asked: not_dispatched(error),
+            superseded: false,
         }
     }
 }
@@ -921,6 +965,16 @@ pub async fn success_publication(app: &AppHandle, attempt: &Attempt) -> Option<P
         .await
 }
 
+/// The receipt currently published for this list, whichever attempt won it.
+pub fn latest(app: &AppHandle, source: &Source, list: CachedList) -> Option<FetchedList> {
+    app.state::<SourcePolls>()
+        .2
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(source.clone(), list))
+        .map(|(_, receipt)| receipt.clone())
+}
+
 /// Read the newest already-published success; never wait for a network request.
 pub fn winner(
     app: &AppHandle,
@@ -946,7 +1000,7 @@ pub async fn fetch_github_step(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_mode(app, client, list, budget, false).await
+    fetch_github_step_mode(app, client, list, budget, ScanMode::Refresh).await
 }
 
 pub(crate) async fn fetch_github_continuation(
@@ -955,7 +1009,71 @@ pub(crate) async fn fetch_github_continuation(
     list: CachedList,
     budget: std::time::Duration,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_mode(app, client, list, budget, true).await
+    fetch_github_step_mode(app, client, list, budget, ScanMode::Continue).await
+}
+
+/// A refresh someone asked for (#1938). `cold` is true while this process
+/// holds no receipt for the list: the pass cadence then does not hold the
+/// request back, so Refresh right after a restart fetches instead of
+/// answering with the saved rows' absence. A request that still asks
+/// GitHub nothing (failure backoff, admission, rate budget) settles as not
+/// asked, never as an answer.
+pub async fn fetch_github_refresh(
+    app: &AppHandle,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    cold: bool,
+) -> Result<FetchedList, Failure> {
+    let mode = if cold {
+        ScanMode::Manual
+    } else {
+        ScanMode::Refresh
+    };
+    unanswered_refresh(
+        cold,
+        fetch_github_step_mode(app, client, list, budget, mode).await,
+    )
+}
+
+/// `fetch_github_refresh` with the caller's database and clock.
+#[cfg(test)]
+pub(crate) async fn fetch_github_refresh_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    cold: bool,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, Failure> {
+    let mode = if cold {
+        ScanMode::Manual
+    } else {
+        ScanMode::Refresh
+    };
+    unanswered_refresh(
+        cold,
+        fetch_github_step_mode_at(path, client, list, budget, mode, timing).await,
+    )
+}
+
+fn unanswered_refresh(
+    cold: bool,
+    fetched: Result<FetchedList, crate::github::client::ClientError>,
+) -> Result<FetchedList, Failure> {
+    let fetched = fetched.map_err(|error| Failure::from(&error))?;
+    if cold && fetched.scan.as_ref().is_some_and(|scan| scan.state.no_work) {
+        return Err(Failure {
+            message: format!(
+                "{} GitHub was not asked for this list yet. The saved list is shown.",
+                crate::commands::NOT_ASKED
+            ),
+            transient: true,
+            not_asked: true,
+            superseded: false,
+        });
+    }
+    Ok(fetched)
 }
 
 async fn fetch_github_step_mode(
@@ -963,14 +1081,14 @@ async fn fetch_github_step_mode(
     client: &crate::github::client::GitHubClient,
     list: CachedList,
     budget: std::time::Duration,
-    continuation: bool,
+    mode: ScanMode,
 ) -> Result<FetchedList, crate::github::client::ClientError> {
-    fetch_github_step_at(
+    fetch_github_step_mode_at(
         crate::commands::db_path(app),
         client,
         list,
         budget,
-        continuation,
+        mode,
         || {
             (
                 app.state::<crate::poll::PollInterval>()
@@ -983,9 +1101,8 @@ async fn fetch_github_step_mode(
     .await
 }
 
-/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
-/// tests. The caller supplies the clock reading and configured interval; all
-/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+/// The boolean form the synthetic runtime tests use.
+#[cfg(test)]
 pub(crate) async fn fetch_github_step_at(
     path: std::path::PathBuf,
     client: &crate::github::client::GitHubClient,
@@ -994,7 +1111,27 @@ pub(crate) async fn fetch_github_step_at(
     continuation: bool,
     timing: impl FnOnce() -> (u64, i64),
 ) -> Result<FetchedList, crate::github::client::ClientError> {
+    let mode = if continuation {
+        ScanMode::Continue
+    } else {
+        ScanMode::Refresh
+    };
+    fetch_github_step_mode_at(path, client, list, budget, mode, timing).await
+}
+
+/// Shared durable fetch boundary for Tauri scheduling and synthetic runtime
+/// tests. The caller supplies the clock reading and configured interval; all
+/// authentication, owner checks, attempt bounds and continuation rechecks live here.
+async fn fetch_github_step_mode_at(
+    path: std::path::PathBuf,
+    client: &crate::github::client::GitHubClient,
+    list: CachedList,
+    budget: std::time::Duration,
+    mode: ScanMode,
+    timing: impl FnOnce() -> (u64, i64),
+) -> Result<FetchedList, crate::github::client::ClientError> {
     use crate::github::admission::ReadContext;
+    let continuation = mode == ScanMode::Continue;
     let client = client
         .with_read_context(ReadContext::new(client.read_context().class, budget))
         .with_attempt_limit(3);
@@ -1060,19 +1197,16 @@ pub(crate) async fn fetch_github_step_at(
             }),
         });
     }
-    if continuation {
-        client
-            .advance_scan_mode(
-                list,
-                loaded,
-                &rows,
-                now,
-                crate::github::scan::ScanMode::Continue,
-            )
-            .await
-    } else {
-        client.advance_scan(list, loaded, &rows, now).await
-    }
+    client
+        .advance_scan_mode(list, loaded, &rows, now, mode)
+        .await
+}
+
+/// A local read failure, named as one: GitHub was not involved (#1928).
+fn checkpoint_load_failure(error: &dyn std::fmt::Display) -> crate::github::client::ClientError {
+    crate::github::client::ClientError::Local(format!(
+        "Headstate could not read its saved refresh progress on this computer: {error}"
+    ))
 }
 
 /// A local read failure, named as one: GitHub was not involved (#1928).
@@ -1139,6 +1273,16 @@ fn inventory_failure(message: &str) -> Failure {
         message: message.into(),
         transient: true,
         not_asked: false,
+        superseded: false,
+    }
+}
+
+/// Another attempt committed newer queue progress from the same checkpoint
+/// revision first. Its data stands; this attempt has nothing to add (#1933).
+fn superseded_failure() -> Failure {
+    Failure {
+        superseded: true,
+        ..inventory_failure("The queue changed during this step. Its newer progress was retained.")
     }
 }
 
@@ -1218,9 +1362,7 @@ fn reconcile_github_snapshot_observed(
             .map_err(|_| inventory_failure("The queue checkpoint could not be read."))?;
         if loaded.revision != scan.expected_revision {
             *decision = Some(crate::measurement::Acceptance::RejectedCas);
-            return Err(inventory_failure(
-                "The queue changed during this step. Its newer progress was retained.",
-            ));
+            return Err(superseded_failure());
         }
         result.prs = previous;
         if let crate::store::source_cache::SnapshotData::Available { coverage, .. } =
@@ -1282,9 +1424,7 @@ fn reconcile_github_snapshot_observed(
         .map_err(|_| inventory_failure("The queue progress could not be saved."))?;
         if !committed {
             *decision = Some(crate::measurement::Acceptance::RejectedCas);
-            return Err(inventory_failure(
-                "The queue changed during this step. Its newer progress was retained.",
-            ));
+            return Err(superseded_failure());
         }
     } else {
         let mut save = || -> Result<(), crate::store::StoreError> {
@@ -2183,6 +2323,7 @@ mod tests {
             message: "request failed".into(),
             transient: true,
             not_asked: false,
+            superseded: false,
         }
     }
 
@@ -3301,6 +3442,7 @@ mod tests {
                     message: "fixture".into(),
                     transient: false,
                     not_asked,
+                    superseded: false,
                 }),
                 |status| {
                     assert!(polls
@@ -3423,6 +3565,7 @@ mod tests {
                     message: "not enabled".into(),
                     transient: false,
                     not_asked: true,
+                    superseded: false,
                 }),
             )
             .unwrap();
@@ -3450,7 +3593,12 @@ mod tests {
             ..Default::default()
         };
         let status = polls
-            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .finish_scan(
+                &a,
+                &state,
+                Coverage::Partial { total: Some(1001) },
+                chrono::Utc::now(),
+            )
             .unwrap();
         assert_eq!(status.phase, Phase::Partial);
         assert_eq!(status.consecutive_failures, 0);
@@ -3462,7 +3610,12 @@ mod tests {
         let restarted = SourcePolls::default();
         let a = attempt(&restarted, &source, CachedList::Reviewing);
         let status = restarted
-            .finish_scan(&a, &state, Coverage::Partial { total: Some(1001) })
+            .finish_scan(
+                &a,
+                &state,
+                Coverage::Partial { total: Some(1001) },
+                chrono::Utc::now(),
+            )
             .unwrap();
         assert_eq!(status.phase, Phase::Partial);
         assert!(status.error.is_some());

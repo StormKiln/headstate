@@ -4971,7 +4971,10 @@ export function useReviewing(enabled = true) {
     // The phone may select GitHub while the desktop poller selects GitLab.
     // Keep the visible review queue live without polling hidden views.
     refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
-    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
+    // On the desktop, focus already wakes the poll loop, whose receipt
+    // reaches this view through `useSourceRefresh`. A second refresh from
+    // here raced that tick for the same queue (#1933).
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : false,
     // The backend already bounds its own attempts; a client retry
     // multiplied `get_reviewing` calls behind it (#1929). The view
     // offers an explicit retry instead.
