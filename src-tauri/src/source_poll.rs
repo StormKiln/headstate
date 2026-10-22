@@ -3258,21 +3258,31 @@ mod tests {
             &data.coverage,
         )
         .unwrap();
+        // The saved list's first row, read the way production reads it.
+        let saved_first = || match crate::store::source_cache::load_source_snapshot(
+            &conn,
+            &source,
+            CachedList::Authored,
+        )
+        .unwrap()
+        .data
+        {
+            crate::store::source_cache::SnapshotData::Available {
+                prs,
+                stale_secs: None,
+                ..
+            } => prs[0].number,
+            other => panic!("expected a fresh snapshot, got {other:?}"),
+        };
         polls.complete(publication, Ok(data), |status| {
             assert_eq!(status.phase, Phase::Retrying, "C's failure stays visible");
             assert_eq!(status.coverage, Some(Coverage::Complete));
             assert!(status.last_received_at.is_some());
-            assert_eq!(
-                crate::store::load_snapshot(&conn, CachedList::Authored).unwrap()[0].number,
-                2
-            );
+            assert_eq!(saved_first(), 2);
         });
         assert!(polls.success_publication(&a).await.is_none());
         assert_eq!(polls.winner(&a, Ok(receipt(1))).unwrap().prs[0].number, 2);
-        assert_eq!(
-            crate::store::load_snapshot(&conn, CachedList::Authored).unwrap()[0].number,
-            2
-        );
+        assert_eq!(saved_first(), 2);
         assert_eq!(
             polls.get(&source, CachedList::Authored).phase,
             Phase::Retrying

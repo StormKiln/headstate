@@ -1596,7 +1596,7 @@ static TABLE: &str = HIT_none_3;
             // `async` spellings are listed explicitly and are not
             // decoration: every function that reaches `OBSERVED_REMAINING`
             // WITHOUT naming it is async -- `client::fetch_viewer`,
-            // `client::fetch_viewer_metered`, `client::fetch_prs_with_total`
+            // `client::fetch_viewer_metered`, `client::fetch_prs_snapshot_with_budget`
             // and `fetch::read_metered`. Omitting them would leave invariant
             // 7 unable to follow the only indirect paths that exist, which
             // is the half of the rule `observed_test_lock`'s doc insists on.
@@ -1817,10 +1817,10 @@ static TABLE: &str = HIT_none_3;
     /// will get wrong: *"`record` is not the only reachable path, and 'my
     /// test does not mention `note_remaining`' is not the question. The
     /// question is whether anything it calls can store to
-    /// `OBSERVED_REMAINING`."* Four production functions reach the static
+    /// `OBSERVED_REMAINING`."* Four functions reach the static
     /// without naming it -- `client::fetch_viewer`,
-    /// `client::fetch_viewer_metered`, `client::fetch_prs_with_total` and
-    /// `fetch::read_metered` -- so a grep for the two names misses any test
+    /// `client::fetch_viewer_metered`, `client::fetch_prs_snapshot_with_budget`
+    /// and `fetch::read_metered` -- so a grep for the two names misses any test
     /// that goes through one of them. None does today, because all four are
     /// `async` and need a live client; the guard covers them so the first
     /// one that appears fails here rather than in a release.
@@ -1884,7 +1884,7 @@ static TABLE: &str = HIT_none_3;
     ///   under the `-D warnings` that CI's `lint` job runs -- rejects
     ///   holding one across an `.await`. So an async test cannot comply.
     ///   `client.rs` has five that reach `note_remaining` through
-    ///   `fetch_prs_with_total` and are latent races for that reason;
+    ///   `fetch_prs_snapshot_with_budget` and are latent races for that reason;
     ///   MEASURED, adding the lock to them fails the build with five
     ///   `await_holding_lock` errors. Giving the lock an async form is a
     ///   change to `budget.rs`'s test surface and wants its own issue. The
@@ -1960,8 +1960,8 @@ static TABLE: &str = HIT_none_3;
                 // `await_holding_lock` errors and a failed build.
                 //
                 // Those five are real latent hazards, not false positives:
-                // `fetch_prs_with_total` calls `note_remaining` at
-                // `client.rs:1059` whenever a response carries `rateLimit`,
+                // `fetch_prs_snapshot_with_budget` calls `note_remaining`
+                // whenever a response carries `rateLimit`,
                 // and they drive it through a mock server. They do not race
                 // TODAY only because none of their mocks selects that field
                 // -- which is one line away from being untrue, and is

@@ -4,9 +4,7 @@
 //! GitHub search stays authoritative for the displayed numbers; this is
 //! purely a cache of the last successful fetch.
 
-use super::schema::StoreError;
 use crate::github::model::PullRequest;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Which cached list a row holds.
@@ -33,22 +31,6 @@ impl CachedList {
             CachedList::Reviewing => 2,
         }
     }
-}
-
-/// The whole snapshot is one JSON row. At ~30 PRs this is a few hundred KB,
-/// so a normalised schema would buy nothing and cost migrations later.
-pub fn save_snapshot(
-    conn: &Connection,
-    which: CachedList,
-    prs: &[PullRequest],
-) -> Result<(), StoreError> {
-    super::source_cache::save_source_snapshot(
-        conn,
-        &crate::identity::Source::default(),
-        which,
-        prs,
-        &super::source_cache::Coverage::Unknown,
-    )
 }
 
 /// How old a cached list may be and still be shown.
@@ -118,32 +100,55 @@ pub(super) fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
     Some(now.signed_duration_since(naive.and_utc()).num_seconds())
 }
 
-/// The default source's list as bare rows, or empty when it is too old,
-/// missing or unreadable. Only tests read it today; it collapses states
-/// that production keeps apart, so do not wire it to a caller.
-///
-/// The rows-with-their-age reading this used to sit beside
-/// (`load_snapshot_marked`) was reached only by tests and was removed
-/// (#1998). The production reader is
-/// `source_cache::load_qualified_snapshot`, which keeps "too old",
-/// "missing" and "unreadable" apart instead of collapsing them here.
-pub fn load_snapshot(conn: &Connection, which: CachedList) -> Result<Vec<PullRequest>, StoreError> {
-    use super::source_cache::{load_source_snapshot, SnapshotData};
-    let snapshot = load_source_snapshot(conn, &crate::identity::Source::default(), which)?;
-    Ok(match snapshot.data {
-        SnapshotData::Available {
-            prs,
-            stale_secs: None,
-            ..
-        } => prs,
-        _ => Vec::new(),
-    })
-}
+// The bare-rows reader `load_snapshot` and its writer `save_snapshot`
+// lived here until #2003. Only tests reached either: the reader collapsed
+// "too old", "missing" and "unreadable" into one empty list, which is the
+// state production keeps apart, and the writer was `save_source_snapshot`
+// for the default source with unknown coverage. Rows are read through
+// `source_cache::load_source_snapshot` / `load_qualified_snapshot` and
+// written through `source_cache::save_owned_source_snapshot`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github::model::MergeStateStatus;
+    use crate::store::source_cache::{
+        load_source_snapshot, save_source_snapshot, Coverage, SnapshotData,
+    };
+    use rusqlite::Connection;
+
+    /// Write the default source's list the way the removed `save_snapshot`
+    /// did: `save_source_snapshot` with coverage left unknown.
+    fn save(conn: &Connection, which: CachedList, prs: &[PullRequest]) {
+        save_source_snapshot(
+            conn,
+            &crate::identity::Source::default(),
+            which,
+            prs,
+            &Coverage::Unknown,
+        )
+        .unwrap();
+    }
+
+    /// The default source's list, read the way production reads it.
+    fn read(conn: &Connection, which: CachedList) -> SnapshotData {
+        load_source_snapshot(conn, &crate::identity::Source::default(), which)
+            .unwrap()
+            .data
+    }
+
+    /// The rows of a FRESH available snapshot; panics on any other state,
+    /// so a test cannot pass by reading a stale or missing one as rows.
+    fn fresh_rows(conn: &Connection, which: CachedList) -> Vec<PullRequest> {
+        match read(conn, which) {
+            SnapshotData::Available {
+                prs,
+                stale_secs: None,
+                ..
+            } => prs,
+            other => panic!("expected a fresh snapshot, got {other:?}"),
+        }
+    }
 
     /// A snapshot exactly as v1.0.1 wrote it.
     ///
@@ -216,17 +221,11 @@ mod tests {
         let mut reviewing = authored.clone();
         reviewing[0].number = 99;
 
-        save_snapshot(&conn, CachedList::Authored, &authored).unwrap();
-        save_snapshot(&conn, CachedList::Reviewing, &reviewing).unwrap();
+        save(&conn, CachedList::Authored, &authored);
+        save(&conn, CachedList::Reviewing, &reviewing);
 
-        assert_eq!(
-            load_snapshot(&conn, CachedList::Authored).unwrap()[0].number,
-            42
-        );
-        assert_eq!(
-            load_snapshot(&conn, CachedList::Reviewing).unwrap()[0].number,
-            99
-        );
+        assert_eq!(fresh_rows(&conn, CachedList::Authored)[0].number, 42);
+        assert_eq!(fresh_rows(&conn, CachedList::Reviewing)[0].number, 99);
     }
 
     /// The reported bug, at its root.
@@ -253,7 +252,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
         let prs: Vec<PullRequest> = serde_json::from_str(V1_SNAPSHOT).unwrap();
-        save_snapshot(&conn, CachedList::Reviewing, &prs).unwrap();
+        save(&conn, CachedList::Reviewing, &prs);
 
         // Backdate the row the way four days of not visiting the view
         // would have.
@@ -263,11 +262,15 @@ mod tests {
         )
         .unwrap();
 
+        // The production reader keeps the rows but marks them, so the
+        // caller cannot paint them as current (#742). The removed
+        // `load_snapshot` dropped them instead; either way, never fresh.
+        let SnapshotData::Available { stale_secs, .. } = read(&conn, CachedList::Reviewing) else {
+            panic!("the old rows are kept, marked");
+        };
         assert!(
-            load_snapshot(&conn, CachedList::Reviewing)
-                .unwrap()
-                .is_empty(),
-            "a four-day-old review list must not be painted as current"
+            stale_secs.is_some_and(|age| age >= 4 * 24 * 3600 - 60),
+            "a four-day-old review list must not be painted as current: {stale_secs:?}"
         );
     }
 
@@ -278,12 +281,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
         let prs: Vec<PullRequest> = serde_json::from_str(V1_SNAPSHOT).unwrap();
-        save_snapshot(&conn, CachedList::Reviewing, &prs).unwrap();
+        save(&conn, CachedList::Reviewing, &prs);
 
-        assert_eq!(
-            load_snapshot(&conn, CachedList::Reviewing).unwrap()[0].number,
-            42
-        );
+        assert_eq!(fresh_rows(&conn, CachedList::Reviewing)[0].number, 42);
     }
 
     /// The boundary, from both sides.
@@ -350,9 +350,7 @@ mod tests {
     fn an_absent_review_cache_reads_as_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
-        assert!(load_snapshot(&conn, CachedList::Reviewing)
-            .unwrap()
-            .is_empty());
+        assert_eq!(read(&conn, CachedList::Reviewing), SnapshotData::Missing);
     }
 
     /// An unreadable cache must not assert "you have no pull requests".
@@ -367,8 +365,17 @@ mod tests {
         )
         .unwrap();
 
-        let got = load_snapshot(&conn, CachedList::Authored)
-            .expect("a corrupt cache must not be an error");
-        assert!(got.is_empty(), "a corrupt cache must not invent rows");
+        let got = load_source_snapshot(
+            &conn,
+            &crate::identity::Source::default(),
+            CachedList::Authored,
+        )
+        .expect("a corrupt cache must not be an error")
+        .data;
+        assert_eq!(
+            got,
+            SnapshotData::Unreadable,
+            "a corrupt cache must not invent rows"
+        );
     }
 }
