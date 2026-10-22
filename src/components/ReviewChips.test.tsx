@@ -62,7 +62,8 @@ describe("ReviewChips", () => {
       fireEvent.click(btn);
       const s = useFilters.getState();
       expect(applyFilters(PRS, s.filtersByView[s.view]).length).toBe(shown);
-      useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" });
+      // Reset for the next chip. The chips are mounted, so this is an update.
+      act(() => { useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" }); });
     }
   });
 

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, vi } from "vitest";
-import { installViewCrashGuard, takeUnexpectedViewCrashes } from "./viewCrashGuard";
+import {
+  installViewCrashGuard,
+  takeActWarnings,
+  takeUnexpectedViewCrashes,
+} from "./viewCrashGuard";
 
 /// Shared setup for every test file (`vite.config.ts` `setupFiles`).
 ///
@@ -38,9 +42,13 @@ let uninstall: (() => void) | undefined;
 beforeEach(() => {
   uninstall = installViewCrashGuard();
 });
+/// Runs after Testing Library's own cleanup (vitest runs `afterEach` in
+/// reverse registration order, and this file registers first), so an
+/// update that lands while the tree unmounts is still this test's.
 afterEach(() => {
   uninstall?.();
   uninstall = undefined;
+  const late = takeActWarnings();
   const crashes = takeUnexpectedViewCrashes();
   if (crashes.length > 0) {
     throw new Error(
@@ -48,6 +56,18 @@ afterEach(() => {
         `pass over the error panel (#1965). Fix the crash (often an incomplete vi.mock), or ` +
         `call expectViewCrash() if the test crashes a view on purpose.\n` +
         crashes.join("\n"),
+    );
+  }
+  if (late.length > 0) {
+    const counts = new Map<string, number>();
+    for (const line of late) counts.set(line, (counts.get(line) ?? 0) + 1);
+    throw new Error(
+      `React reported ${late.length} update${late.length === 1 ? "" : "s"} outside act() during ` +
+        `this test (#1965): state changed after the test had looked, so it checked a frame ` +
+        `the user only sees for a moment. Await the settled state (settle() from ` +
+        `src/test/settle.ts, findBy*, or Testing Library's waitFor -- not vi.waitFor), or wrap ` +
+        `the event or store change that caused it in act().\n` +
+        [...counts].map(([line, n]) => (n > 1 ? `${line} (x${n})` : line)).join("\n"),
     );
   }
 });

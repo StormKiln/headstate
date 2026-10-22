@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -80,7 +80,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", "GitHub API rate limit exceeded");
+    await act(() => emit("poll-error", "GitHub API rate limit exceeded"));
 
     await waitFor(() => {
       expect(
@@ -115,7 +115,7 @@ describe("AuthGate", () => {
       </QueryClientProvider>,
     );
     await screen.findByText("protected content");
-    await emit("poll-error", "GitHub request timed out after 30s");
+    await act(() => emit("poll-error", "GitHub request timed out after 30s"));
     const button = await screen.findByRole("button", { name: "Report this" });
     // Prefs load asynchronously; the report reads them when opened.
     await waitFor(() => expect(qc.getQueryData(["ui-prefs"])).toBeTruthy());
@@ -144,7 +144,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", `${NOT_ASKED} not authenticated: run \`gh auth login\``);
+    await act(() => emit("poll-error", `${NOT_ASKED} not authenticated: run \`gh auth login\``));
 
     await waitFor(() => {
       expect(
@@ -181,7 +181,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", `${AUTH_EXPIRED} GitHub rejected the token: Bad credentials`);
+    await act(() => emit("poll-error", `${AUTH_EXPIRED} GitHub rejected the token: Bad credentials`));
 
     await waitFor(() => {
       expect(screen.getByText(/Your GitHub token may have expired/)).toBeTruthy();
@@ -215,7 +215,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", "GitHub could not answer (it returned a 401 rather than data)");
+    await act(() => emit("poll-error", "GitHub could not answer (it returned a 401 rather than data)"));
 
     await waitFor(() => {
       expect(screen.getByText(/Background refresh failed/)).toBeTruthy();
@@ -230,7 +230,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", `${NOT_ASKED} not authenticated: run \`gh auth login\``);
+    await act(() => emit("poll-error", `${NOT_ASKED} not authenticated: run \`gh auth login\``));
 
     await waitFor(() => {
       expect(screen.getByText(/Not refreshing in the background/)).toBeTruthy();
@@ -250,7 +250,7 @@ describe("AuthGate", () => {
     renderGated({ ok: true, message: "" });
     await screen.findByText("protected content");
 
-    await emit("poll-error", "request timed out after 60s");
+    await act(() => emit("poll-error", "request timed out after 60s"));
 
     await waitFor(() => {
       expect(screen.getByText(/Background refresh failed: request timed out/)).toBeTruthy();
@@ -266,7 +266,7 @@ it("reports GitLab authentication failure in GitLab-only mode without hiding con
     renderGated({ ok: true, message: "" });
     expect(await screen.findByRole("button", { name: "Retry GitLab authentication" })).toBeTruthy();
     expect(screen.getByText("protected content")).toBeTruthy();
-  } finally { useSourceSelection.setState({ selection: "github" }); }
+  } finally { act(() => { useSourceSelection.setState({ selection: "github" }); }); }
 });
 
 it("starts no automatic GitLab auth on a GitHub-only mount, focus or timer", async () => {

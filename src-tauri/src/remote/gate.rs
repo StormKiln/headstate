@@ -285,11 +285,19 @@ fn snapshot_source(app: &AppHandle) -> SnapshotSource {
         let app = app.clone();
         Box::pin(async move {
             let loaded = tauri::async_runtime::spawn_blocking(move || {
-                crate::commands::get_cached_blocking(app)
+                crate::commands::get_cached_answer(app)
             })
             .await;
             match loaded {
-                Ok(Ok(prs)) => serde_json::to_string(&prs).ok(),
+                Ok(Ok(Ok(prs))) => serde_json::to_string(&prs).ok(),
+                // Old, never loaded or withheld: no opening frame rather
+                // than `[]`, which a phone stores and shows as "no pull
+                // requests" (#1997). Any versioned source frames that
+                // follow carry the list with its qualification.
+                Ok(Ok(Err(not_current))) => {
+                    log::info!("remote: no opening list for a phone: {}", not_current.0);
+                    None
+                }
                 Ok(Err(e)) => {
                     log::warn!("remote: could not load the snapshot for a phone: {e}");
                     None

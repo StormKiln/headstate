@@ -86,9 +86,9 @@ describe("TriageChips", () => {
       fireEvent.click(btn);
       const listed = applyFilters(PRS, useFilters.getState().filtersByView[useFilters.getState().view], NOW).length;
       expect(listed).toBe(shown);
-      // Reset for the next chip.
-      useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} }, view: "my-prs" } as never);
+      // Reset for the next chip. The chips are mounted, so this is an update.
+      act(() => { useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  "system-health": {} }, view: "my-prs" } as never); });
     }
   });
 

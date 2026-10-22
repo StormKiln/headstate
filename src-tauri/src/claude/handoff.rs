@@ -1537,6 +1537,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_file_is_an_error() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::TempDir::new().unwrap();
         // A real file, with real records in it, that we then make

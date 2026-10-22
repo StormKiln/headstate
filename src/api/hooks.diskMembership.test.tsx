@@ -92,9 +92,9 @@ describe("disk measurement membership", () => {
     qc.setQueryData(["artifact-sizes", "/repo"], [["/repo/target", 10, 60]]);
     qc.setQueryData(["worktree-sizes", "/repo"], new Map([["/repo", 10]]));
     qc.setQueryData(["artifacts"], [artifact("/repo/target")]);
-    // The saved scans are keyed by kind alone on this side, so a changed
-    // root set must mark them stale or the old roots' scan keeps painting
-    // (#1962's frontend half).
+    // The saved scans' keys carry the roots (#1962), so a new set is a new
+    // entry; marking every saved scan stale as well means a return to an
+    // earlier set asks the backend again.
     qc.setQueryData(["cached-scan", "artifacts"], { payload: "[]", age_secs: 60, stale: false });
     qc.setQueryData(["cached-scan", "worktrees"], { payload: "{}", age_secs: 60, stale: false });
     const { result } = renderHook(() => useWorktreeDirs(), { wrapper });
@@ -203,7 +203,11 @@ it("exclusion changes discard an old discovery response and cached scope without
     return Promise.resolve([]);
   });
   const { qc, wrapper } = harness();
-  qc.setQueryData(["cached-scan", "worktrees"], { payload: "old scope" });
+  // Keyed by the scope it was read under (#1962): no roots and no
+  // exclusions, which is what this bridge's `[]` answers make the scope.
+  const oldScope = ["cached-scan", "worktrees", { roots: [], exclusions: [] }];
+  const newScope = ["cached-scan", "worktrees", { roots: [], exclusions: ["/repo/backup"] }];
+  qc.setQueryData(oldScope, { payload: "old scope" });
   qc.setQueryData(["artifacts"], [artifact("/repo/target")]);
   const { result } = renderHook(() => ({ dirs: useWorktreeDirs(), scan: useWorktrees() }), { wrapper });
   await waitFor(() => expect(scans).toBe(1));
@@ -211,8 +215,11 @@ it("exclusion changes discard an old discovery response and cached scope without
   await waitFor(() => expect(result.current.scan.data).toEqual([]));
   await act(async () => finishOld({ repos: [{ path: "/old" }], unreadable: ["old warning"] }));
   expect(result.current.scan.data).toEqual([]);
-  expect(qc.getQueryData(["cached-scan", "worktrees"])).toBeNull();
-  expect(qc.getQueryState(["cached-scan", "worktrees"])?.isInvalidated).toBe(true);
+  // The old scope's row is never what the new scope reads: the new key
+  // holds the backend's answer for the new scope (none saved), and the
+  // old entry is marked stale for a later return to that scope.
+  expect(qc.getQueryData(newScope)).not.toEqual({ payload: "old scope" });
+  expect(qc.getQueryState(oldScope)?.isInvalidated).toBe(true);
   expect(qc.getQueryData(["artifacts"])).toEqual([artifact("/repo/target")]);
   expect(calls("list_artifacts")).toHaveLength(0);
 });

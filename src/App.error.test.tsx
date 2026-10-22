@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { settle } from "@/test/settle";
 import { useFilters } from "./store/filters";
 import { useSourceSelection } from "./store/sourceSelection";
 import { PR_FIXTURES } from "./fixtures/prs";
@@ -73,7 +74,7 @@ describe("App — failed PR query", () => {
     expect(screen.queryByText(/match these filters/i)).toBeNull();
   });
 
-  it("surfaces the rejection message so the user can act on it", () => {
+  it("surfaces the rejection message so the user can act on it", async () => {
     mockQuery.mockReturnValue({
       data: undefined,
       isLoading: false,
@@ -82,10 +83,11 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     expect(screen.getByText(/gh auth login/)).toBeTruthy();
   });
 
-  it("offers a retry that refetches", () => {
+  it("offers a retry that refetches", async () => {
     const refetch = vi.fn();
     mockQuery.mockReturnValue({
       data: undefined,
@@ -95,12 +97,13 @@ describe("App — failed PR query", () => {
       refetch,
     });
     renderApp();
+    await settle();
     screen.getByRole("button", { name: /try again/i }).click();
     expect(refetch).toHaveBeenCalled();
   });
 
   // A genuinely empty result must still read as empty, not as an error.
-  it("still shows the empty state when the query succeeds with no PRs", () => {
+  it("still shows the empty state when the query succeeds with no PRs", async () => {
     mockQuery.mockReturnValue({
       data: [],
       isLoading: false,
@@ -109,6 +112,7 @@ describe("App — failed PR query", () => {
       refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     // No filters active in this test, so the unfiltered copy applies.
     expect(screen.getByText(/no open pull requests/i)).toBeTruthy();
     expect(screen.queryByText(/could not load/i)).toBeNull();
@@ -121,12 +125,13 @@ describe("App — failed PR query", () => {
 /// ask" (#1050).
 describe("App — a declined request is titled as not checked", () => {
   afterEach(() => {
+    cleanup();
     useFilters.setState({ view: "my-prs" });
     mockReviewing.mockImplementation(() => ({ data: [], isLoading: false }));
   });
   const noRows = { data: [], isLoading: false, isError: false, error: null, refetch: vi.fn() };
 
-  it("To Review: not-asked is not 'Could not load'", () => {
+  it("To Review: not-asked is not 'Could not load'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [], isLoading: false, isError: true, notAsked: true,
@@ -134,12 +139,13 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText("Review requests were not checked")).toBeTruthy();
     expect(screen.queryByText(/could not load the pull requests awaiting your review/i)).toBeNull();
     expect(screen.getByText(/over the request budget/)).toBeTruthy();
   });
 
-  it("To Review with saved rows: not-asked is not 'Could not refresh'", () => {
+  it("To Review with saved rows: not-asked is not 'Could not refresh'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [PR_FIXTURES[0]], isLoading: false, isError: true, notAsked: true,
@@ -147,11 +153,12 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText("Review requests were not re-checked")).toBeTruthy();
     expect(screen.queryByText(/could not refresh the pull requests awaiting your review/i)).toBeNull();
   });
 
-  it("To Review: a real failure keeps 'Could not load'", () => {
+  it("To Review: a real failure keeps 'Could not load'", async () => {
     mockQuery.mockReturnValue(noRows);
     mockReviewing.mockImplementation(() => ({
       data: [], isLoading: false, isError: true, notAsked: false,
@@ -159,16 +166,18 @@ describe("App — a declined request is titled as not checked", () => {
     }));
     useFilters.setState({ view: "to-review" });
     renderApp();
+    await settle();
     expect(screen.getByText(/could not load the pull requests awaiting your review/i)).toBeTruthy();
     expect(screen.queryByText(/were not checked/i)).toBeNull();
   });
 
-  it("My PRs: not-asked is not 'Could not load', and the marker never shows", () => {
+  it("My PRs: not-asked is not 'Could not load', and the marker never shows", async () => {
     mockQuery.mockReturnValue({
       data: undefined, isLoading: false, isError: true,
       error: new Error("headstate:not-asked GitHub sign-in is required"), refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     expect(screen.getByText("Your pull requests were not checked")).toBeTruthy();
     expect(screen.queryByText(/could not load your pull requests/i)).toBeNull();
     expect(screen.getByText("GitHub sign-in is required")).toBeTruthy();
@@ -182,6 +191,7 @@ describe("App — a declined request is titled as not checked", () => {
 /// that will be refused again (#1050). Every not-asked panel, both builds.
 describe("App — a declined panel offers only an action that can work", () => {
   afterEach(() => {
+    cleanup();
     build.mobile = false;
     relaunch.mockClear();
     useFilters.setState({ view: "my-prs" });
@@ -229,10 +239,11 @@ describe("App — a declined panel offers only an action that can work", () => {
   for (const panel of panels) {
     for (const mobile of [false, true]) {
       const on = mobile ? "phone" : "desktop";
-      it(`${panel.name} (${on}): no credential offers sign-in, not Try again`, () => {
+      it(`${panel.name} (${on}): no credential offers sign-in, not Try again`, async () => {
         build.mobile = mobile;
         panel.arrange(NO_CREDENTIAL, vi.fn());
         renderApp();
+        await settle();
         expect(screen.getByText(panel.title)).toBeTruthy();
         expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
         expect(
@@ -248,11 +259,12 @@ describe("App — a declined panel offers only an action that can work", () => {
         expect(screen.queryByText(/headstate:/)).toBeNull();
       });
 
-      it(`${panel.name} (${on}): a budget refusal keeps Try again`, () => {
+      it(`${panel.name} (${on}): a budget refusal keeps Try again`, async () => {
         build.mobile = mobile;
         const refetch = vi.fn();
         panel.arrange(BUDGET, refetch);
         renderApp();
+        await settle();
         expect(screen.getByText(panel.title)).toBeTruthy();
         screen.getByRole("button", { name: /try again/i }).click();
         expect(refetch).toHaveBeenCalledOnce();
@@ -268,6 +280,7 @@ describe("App — a declined panel offers only an action that can work", () => {
 /// banner is the main GitHub status line.
 describe("App — the source banner classifies a declined GitHub request", () => {
   afterEach(() => {
+    cleanup();
     build.mobile = false;
     useFilters.setState({ view: "my-prs" });
     useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
@@ -278,7 +291,7 @@ describe("App — the source banner classifies a declined GitHub request", () =>
 
   for (const mobile of [false, true]) {
     const on = mobile ? "phone" : "desktop";
-    it(`My PRs (${on}): not-asked is "not checked", never "Could not refresh", and no marker`, () => {
+    it(`My PRs (${on}): not-asked is "not checked", never "Could not refresh", and no marker`, async () => {
       build.mobile = mobile;
       useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
       mockQuery.mockReturnValue({
@@ -286,6 +299,7 @@ describe("App — the source banner classifies a declined GitHub request", () =>
         error: new Error(`${NOT_ASKED} operation attempt allowance is spent`), refetch: vi.fn(),
       });
       renderApp();
+      await settle();
       const line = githubLine();
       expect(line.textContent).toContain("not checked: operation attempt allowance is spent");
       expect(line.textContent).not.toMatch(/could not refresh/i);
@@ -295,7 +309,7 @@ describe("App — the source banner classifies a declined GitHub request", () =>
       expect(within(line).getByRole("button", { name: "Retry" })).toBeTruthy();
     });
 
-    it(`My PRs (${on}): no credential offers sign-in, not Retry`, () => {
+    it(`My PRs (${on}): no credential offers sign-in, not Retry`, async () => {
       build.mobile = mobile;
       useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
       mockQuery.mockReturnValue({
@@ -303,6 +317,7 @@ describe("App — the source banner classifies a declined GitHub request", () =>
         error: new Error(`${NOT_ASKED} not authenticated: run \`gh auth login\``), refetch: vi.fn(),
       });
       renderApp();
+      await settle();
       const line = githubLine();
       expect(line.textContent).not.toMatch(/could not refresh/i);
       expect(line.textContent).not.toContain("headstate:");
@@ -310,7 +325,7 @@ describe("App — the source banner classifies a declined GitHub request", () =>
       expect(within(line).queryByRole("button", { name: "Retry" })).toBeNull();
     });
 
-    it(`To Review (${on}): not-asked is "not checked", never a bare reason`, () => {
+    it(`To Review (${on}): not-asked is "not checked", never a bare reason`, async () => {
       build.mobile = mobile;
       useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
       useFilters.setState({ view: "to-review" });
@@ -320,18 +335,20 @@ describe("App — the source banner classifies a declined GitHub request", () =>
         error: new Error("operation attempt allowance is spent"), refetch: vi.fn(),
       }));
       renderApp();
+      await settle();
       const line = githubLine();
       expect(line.textContent).toContain("not checked: operation attempt allowance is spent");
       expect(line.getAttribute("role")).toBe("status");
     });
   }
 
-  it("a real failure still reads as one, with its retry", () => {
+  it("a real failure still reads as one, with its retry", async () => {
     useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
     mockQuery.mockReturnValue({
       data: undefined, isLoading: false, isError: true, error: new Error("network down"), refetch: vi.fn(),
     });
     renderApp();
+    await settle();
     const line = githubLine();
     expect(line.textContent).toContain("GitHub: network down");
     expect(line.textContent).not.toContain("not checked");

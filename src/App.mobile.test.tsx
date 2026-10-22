@@ -10,6 +10,7 @@ import { sourceRepoKey } from "./lib/sourceRows";
 import { stubViewport } from "./test-utils";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
+import { settle } from "@/test/settle";
 
 const cacheReadAt = vi.hoisted(() => ({ value: 0, savedOwner: undefined as string | undefined, reviewing: [] as typeof PR_FIXTURES }));
 
@@ -128,13 +129,14 @@ afterEach(() => {
 });
 
 describe("App shell on the desktop", () => {
-  it("renders the repo sidebar inline, with no menu button and no banner", () => {
+  it("renders the repo sidebar inline, with no menu button and no banner", async () => {
     stubViewport(1400);
     connection.current = {
       kind: "connected", desktop: "octocat's laptop", lastPoll: null,
       protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
     };
     renderApp();
+    await settle();
     const nav = screen.getByRole("navigation");
     expect(within(nav).getByText("All repositories")).toBeTruthy();
     expect(within(nav).getByRole("button", { name: /my pull requests/i })).toBeTruthy();
@@ -173,6 +175,7 @@ describe("App shell on a phone", () => {
     cacheReadAt.reviewing = PR_FIXTURES;
     useFilters.setState({ view: "to-review", selectedPr: { repo: PR_FIXTURES[0].repo, number: PR_FIXTURES[0].number } });
     renderApp();
+    await settle();
     expect(screen.queryByText(/Refresh from the paired desktop to verify the current account/)).toBeNull();
     expect(screen.getByRole("navigation", { name: "Pull request navigation" })).toBeTruthy();
   });
@@ -210,12 +213,22 @@ describe("App shell on a phone", () => {
       if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
       return undefined;
     }, { shouldMockEvents: true });
-    renderGatedApp();
-    const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
-    expect(banner.textContent).toContain("reachable");
-    expect(banner.textContent).not.toContain("updated");
-    expect(banner.textContent).not.toContain("sign in");
-    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    // This file runs the desktop build, where `AuthGate` opts its check
+    // in to three retries whatever the client's default (#1955). Driven
+    // past their backoff (1s, 2s, 4s) so the assertion is about the
+    // settled failure, not a race with TanStack's clock.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderGatedApp();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
+      expect(banner.textContent).toContain("reachable");
+      expect(banner.textContent).not.toContain("updated");
+      expect(banner.textContent).not.toContain("sign in");
+      expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("puts the repo sidebar behind a menu button", async () => {
@@ -254,8 +267,9 @@ describe("App shell on a phone", () => {
   /// notch-height gap between them -- about a tenth of an iPhone screen.
   /// Asserted on the class rather than by measuring, because jsdom
   /// resolves `env()` to nothing and would pass either way.
-  it("does not pay the safe-area inset twice", () => {
+  it("does not pay the safe-area inset twice", async () => {
     renderApp();
+    await settle();
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     const header = screen.getByRole("heading", { level: 1 }).closest("header");
     expect(banner.className).toContain("pt-safe");
@@ -263,8 +277,9 @@ describe("App shell on a phone", () => {
     expect(header?.className ?? "").not.toContain("safe");
   });
 
-  it("renders the connection banner above everything", () => {
+  it("renders the connection banner above everything", async () => {
     renderApp();
+    await settle();
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     expect(banner.textContent).toContain("reachable");
     // The desktop's own poll time moved out of this line: while the
@@ -277,8 +292,9 @@ describe("App shell on a phone", () => {
     expect(banner.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("still renders the pull requests as rows", () => {
+  it("still renders the pull requests as rows", async () => {
     renderApp();
+    await settle();
     // `getAll`: a blocked pull request is also named in the priorities
     // strip above the list.
     for (const pr of PR_FIXTURES) expect(screen.getAllByText(pr.title).length).toBeGreaterThan(0);
@@ -317,6 +333,9 @@ describe("Stats on the companion build", () => {
     stubViewport(390);
     await renderMobileApp();
     fireEvent.change(screen.getByLabelText("Source"), { target: { value: "gitlab" } });
+    // The new selection starts its own loads; a desktop write, if one
+    // were sent, would be among them, so wait for them before saying none was.
+    await settle();
     expect((screen.getByLabelText("Source") as HTMLSelectElement).value).toBe("gitlab");
     expect(commands).not.toContain("set_source_selection");
   });
@@ -365,42 +384,47 @@ describe("the phone's shell with the desktop unreachable", () => {
     };
   });
 
-  it("still renders the cached pull requests", () => {
+  it("still renders the cached pull requests", async () => {
     // "Show what it can." A saved copy is worth more than a wall, and
     // the two markers below are what make showing it honest.
     renderApp();
+    await settle();
     for (const pr of PR_FIXTURES) expect(screen.getAllByText(pr.title).length).toBeGreaterThan(0);
   });
 
-  it("marks the rows as a saved copy rather than presenting them as live", () => {
+  it("marks the rows as a saved copy rather than presenting them as live", async () => {
     // #602's rule: cached data is MARKED, never hidden and never passed
     // off as current. `StaleRibbon` is attached to the content, which is
     // the thing being doubted.
     renderApp();
+    await settle();
     const ribbon = screen.getByRole("status");
     expect(ribbon.textContent).toContain("Showing a saved copy");
     expect(ribbon.textContent).toContain("octocat's laptop");
   });
 
-  it("uses yesterday's provider receipt for the saved-copy age", () => {
+  it("uses yesterday's provider receipt for the saved-copy age", async () => {
     connection.current = { kind: "unreachable", desktop: "octocat's laptop", lastPoll: new Date(Date.now() - 86400_000).toISOString(), stale: true } as ConnectionState;
     renderApp();
+    await settle();
     expect(screen.getByRole("status").textContent).toContain("last updated 1 day ago");
   });
 
-  it("puts the desktop's status in the banner, in one line", () => {
+  it("puts the desktop's status in the banner, in one line", async () => {
     // The right home for this fact, and the issue says so: one line
     // naming the desktop and when it was last seen -- not a screen.
     renderApp();
+    await settle();
     const banner = screen.getByRole("button", { name: /octocat's laptop is unreachable/ });
     expect(banner.textContent).toContain("last seen");
   });
 
-  it("covers nothing with a full-screen error", () => {
+  it("covers nothing with a full-screen error", async () => {
     // The report's other half. An unreachable desktop is the ordinary
     // state of a phone, so nothing here may read as a failure of the
     // app: no crash screen, no auth accusation, no impossible advice.
     renderApp();
+    await settle();
     expect(screen.queryByText(/something went wrong/i)).toBeNull();
     expect(screen.queryByText(/not signed in to GitHub/i)).toBeNull();
     expect(screen.queryByText(/brew install/i)).toBeNull();

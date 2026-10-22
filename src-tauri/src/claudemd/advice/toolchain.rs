@@ -2866,6 +2866,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_import_makes_the_negative_unknown_not_advice() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, repo, home) = fixture();
@@ -2999,6 +3000,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_rule_makes_the_negative_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, repo, home) = fixture();
@@ -3104,6 +3106,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_skill_makes_the_negative_unknown() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, repo, home) = fixture();
@@ -3139,6 +3142,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_package_json_is_unknown_with_the_io_error() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, repo, home) = fixture();
@@ -4085,6 +4089,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_makefile_is_unknown_not_unnamed() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let (_t, repo, home) = fixture();

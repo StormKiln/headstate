@@ -856,13 +856,13 @@ impl GitHubClient {
 
     /// Share overlapping equivalent searches, with a deadline that includes
     /// waiting for an existing load. No spawned tasks survive cancellation.
-    async fn search_page_with_fallback(
-        &self,
-        query: &str,
-    ) -> Result<serde_json::Value, ClientError> {
-        self.search_with_budget(query, SEARCH_BUDGET).await
-    }
-
+    ///
+    /// Reached only through `fetch_prs_snapshot_with_budget` and
+    /// `fetch_reviewing_snapshot_with_budget`, which production does not
+    /// call: it reads both lists through `advance_scan`, whose own sharing
+    /// lives in `scan::Reads`. This and `collect_search_pages` stay because
+    /// those two are the integration-test seam (`tests/queue_reliability.rs`,
+    /// `tests/read_reliability.rs`); see #2003 before wiring a caller.
     async fn search_with_budget(
         &self,
         query: &str,
@@ -1060,23 +1060,12 @@ impl GitHubClient {
         .await
     }
 
-    /// Every open PR authored by the viewer, with CI, mergeability, review
-    /// decision, and merge-queue state.
-    ///
-    /// Octocrab unwraps the GraphQL `data` envelope, so the value returned
-    /// here has `search` at its top level rather than under `data`.
-    pub async fn fetch_prs(&self) -> Result<Vec<PullRequest>, ClientError> {
-        let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
-        Ok(map_search(&v))
-    }
-
     /// PRs awaiting the user's review.
     ///
     /// Rides along in PRS_QUERY at zero extra rate-limit cost. Kept a
-    /// separate call rather than folded into `fetch_prs`'s return type so
+    /// separate call rather than folded into the authored list's type so
     /// the snapshot cache, poll loop and existing commands keep their
-    /// shapes; the poll loop fetches both in one request via
-    /// `fetch_prs_and_reviewing`.
+    /// shapes.
     /// Fails rather than returning an empty list GitHub did not mean.
     ///
     /// When GitHub refuses fields it nulls the NODES, and the mapper
@@ -1145,30 +1134,6 @@ impl GitHubClient {
         }
     }
 
-    pub async fn fetch_reviewing(&self) -> Result<Vec<PullRequest>, ClientError> {
-        self.fetch_reviewing_with_shortfall()
-            .await
-            .map(|(prs, _)| prs)
-    }
-
-    /// The review list, plus how many pull requests are MISSING from it.
-    ///
-    /// The shortfall is a second return value rather than an error: the
-    /// pull requests that did arrive are real and worth showing, and
-    /// blanking the list over an incomplete one is exactly the
-    /// regression v3.5.1 had to undo.
-    pub async fn fetch_reviewing_with_shortfall(
-        &self,
-    ) -> Result<(Vec<PullRequest>, u64), ClientError> {
-        self.fetch_reviewing_snapshot().await.map(|result| {
-            let short = result
-                .total
-                .unwrap_or(0)
-                .saturating_sub(result.prs.len() as u64);
-            (result.prs, short)
-        })
-    }
-
     fn owned_list_evidence(&self, value: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
         let mut result = list_evidence(value, prs);
         // This cell belongs to the immutable authenticated client, not to a
@@ -1186,6 +1151,12 @@ impl GitHubClient {
         self.viewer.get().map(String::as_str)
     }
 
+    /// The review-requested search as one bounded read, outside the scan.
+    ///
+    /// Not a production path: the poll loop and the refresh command read
+    /// the queue through `advance_scan` (`source_poll::fetch_github_step`).
+    /// Kept because the read-transport tests here and in `tests/` drive
+    /// coalescing, deadlines and refusals through it (#1940).
     pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_reviewing_snapshot_with_budget(SEARCH_BUDGET)
             .await
@@ -1195,7 +1166,7 @@ impl GitHubClient {
         &self,
         budget: std::time::Duration,
     ) -> Result<FetchedList, ClientError> {
-        // Its OWN request, not both lists. It used to call
+        // Its OWN request, not both lists. It used to call the removed
         // `fetch_prs_and_reviewing`, so opening To review paid for the
         // authored list as well -- and on a reported account with 40
         // authored and 71 review-requested, that is 111 pull requests
@@ -1234,7 +1205,7 @@ impl GitHubClient {
         // arrive are real and worth showing, and blanking the list over
         // an incomplete one is the exact regression v3.5.1 had to undo.
         // The smallest total any page reported, not page 1's. See the
-        // paging note in `search_page_with_fallback` (#744).
+        // paging note in `collect_search_pages` (#744).
         let total = v["headstate_paging"]["truest_total"]
             .as_u64()
             .or_else(|| v["authored"]["issueCount"].as_u64())
@@ -1297,37 +1268,6 @@ impl GitHubClient {
             refused_fields(&v),
             "review count",
         )
-    }
-
-    /// Both lists, as two CONCURRENT requests.
-    ///
-    /// Two requests rather than one aliased query: the aliased form made
-    /// every caller pay for both searches, so opening To review fetched
-    /// the authored list too. Concurrent, so the wall-clock is one
-    /// request rather than the sum.
-    pub async fn fetch_prs_and_reviewing(
-        &self,
-    ) -> Result<(Vec<PullRequest>, Vec<PullRequest>), ClientError> {
-        // DIAGNOSTIC LOGGING (Settings > diagnostic log). These two run
-        // concurrently, so a total far above the slower of the two
-        // means they are NOT actually overlapping -- which would point
-        // at connection-pool or rate-limiter serialization rather than
-        // at either query.
-        let started = std::time::Instant::now();
-        let (authored, reviewing) = tokio::join!(
-            self.search_page_with_fallback(AUTHORED_OPEN),
-            self.search_page_with_fallback(REVIEW_REQUESTED),
-        );
-        crate::diag!(
-            "[diag] fetch_prs_and_reviewing both searches settled in {}ms",
-            started.elapsed().as_millis()
-        );
-        // Both map from the `authored` alias: the query has one search,
-        // named that whatever it is searching for.
-        Ok((
-            map_list(&authored?, "authored"),
-            map_list(&reviewing?, "authored"),
-        ))
     }
 
     /// Run a mutation, treating ANY error as failure.
@@ -1990,12 +1930,15 @@ impl GitHubClient {
         Ok(v)
     }
 
-    pub async fn fetch_prs_with_total(&self) -> Result<(Vec<PullRequest>, u64), ClientError> {
-        self.fetch_prs_snapshot()
-            .await
-            .map(|result| (result.prs, result.total.unwrap_or(0)))
-    }
-
+    /// The authored search as one bounded read, outside the scan.
+    ///
+    /// Not a production path: the poll loop and the refresh command read
+    /// both lists through `advance_scan` (`source_poll::fetch_github_step`)
+    /// and the source cache. Kept, with `fetch_reviewing_snapshot`, as the
+    /// seam the read-transport tests here and in `tests/` drive retries,
+    /// cooldowns, coalescing and paging through. It cannot be
+    /// `#[cfg(test)]`: integration tests link the library built without
+    /// it. Its test-only wrapper `fetch_prs_with_total` went in #2003.
     pub async fn fetch_prs_snapshot(&self) -> Result<FetchedList, ClientError> {
         self.fetch_prs_snapshot_with_budget(SEARCH_BUDGET).await
     }
@@ -2603,6 +2546,13 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The authored list's rows, read through `fetch_prs_snapshot`: the
+    /// same search and mapping the removed `fetch_prs` ran (#1998), so
+    /// these transport tests keep exercising it.
+    async fn authored(client: &GitHubClient) -> Result<Vec<PullRequest>, ClientError> {
+        client.fetch_prs_snapshot().await.map(|list| list.prs)
+    }
 
     async fn client_for(server: &MockServer) -> GitHubClient {
         let oc = octocrab::Octocrab::builder()
@@ -4010,7 +3960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_prs_maps_the_response() {
+    async fn the_authored_list_maps_the_response() {
         let server = MockServer::start().await;
         let body: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/search.json")).unwrap();
@@ -4022,7 +3972,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server).await.fetch_prs().await.unwrap();
+        let prs = authored(&client_for(&server).await).await.unwrap();
         assert_eq!(prs.len(), 3);
         assert_eq!(prs[0].number, 42);
     }
@@ -4058,13 +4008,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, short) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_reviewing_with_shortfall()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap();
-        assert_eq!(prs.len(), 3, "the pull requests that arrived are kept");
-        assert_eq!(short, 7, "and the seven that did not are reported");
+        assert_eq!(list.prs.len(), 3, "the pull requests that arrived are kept");
+        let short = list
+            .total
+            .map(|total| total.saturating_sub(list.prs.len() as u64));
+        assert_eq!(short, Some(7), "and the seven that did not are reported");
     }
 
     /// A complete list must report NO shortfall, or the banner would
@@ -4090,12 +4043,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, short) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_reviewing_with_shortfall()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap();
-        assert_eq!(short, 0);
+        let short = list
+            .total
+            .map(|total| total.saturating_sub(list.prs.len() as u64));
+        assert_eq!(short, Some(0));
     }
 
     #[tokio::test]
@@ -4172,7 +4128,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert!(client_for(&server).await.fetch_prs().await.is_err());
+        assert!(authored(&client_for(&server).await).await.is_err());
     }
 
     /// Reported from a fresh install: two banners within 30 seconds,
@@ -4198,7 +4154,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             err.is_transient(),
             "a truncated response must wait for a second opinion, not alarm the user: {err}"
@@ -4234,7 +4190,7 @@ mod tests {
             .await;
 
         let client = client_for(&server).await;
-        let r = tokio::time::timeout(std::time::Duration::from_secs(1), client.fetch_prs()).await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), authored(&client)).await;
         assert!(
             r.is_err(),
             "a stalled request must be cut off, not awaited forever"
@@ -4267,7 +4223,7 @@ mod tests {
     ///
     /// # What this is actually protecting
     ///
-    /// `fetch_prs_with_total` calls `budget::note_remaining` at the top of
+    /// `fetch_prs_snapshot_with_budget` calls `budget::note_remaining` in
     /// this file, which stores to the PROCESS-WIDE `OBSERVED_REMAINING`.
     /// `budget.rs` serialises every test that touches that static behind
     /// `observed_test_lock()`, and #874's invariant enforces the rule --
@@ -4352,12 +4308,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .expect("a 25-item page must not need a fallback");
-        assert_eq!(total, 1);
+        assert_eq!(list.total, Some(1));
     }
 
     /// A result larger than one page is fetched as SEVERAL pages, and
@@ -4398,12 +4354,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .unwrap();
-        assert_eq!(total, 30, "the true total comes from issueCount");
+        let prs = list.prs;
+        assert_eq!(list.total, Some(30), "the true total comes from issueCount");
         assert_eq!(prs.len(), 2, "both pages are merged: {prs:?}");
     }
 
@@ -4482,13 +4439,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .expect("a failed page must not fail the whole fetch");
-        assert_eq!(prs.len(), 1, "what arrived is kept");
-        assert_eq!(total, 30, "and the shortfall stays visible");
+        assert_eq!(list.prs.len(), 1, "what arrived is kept");
+        assert_eq!(list.total, Some(30), "and the shortfall stays visible");
     }
 
     /// Only when the SERVER gave up. A 401 means asking again changes
@@ -4507,7 +4464,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("line 1 column 1"),
@@ -4520,7 +4477,7 @@ mod tests {
 
     /// `$first` is non-null, so every call site must pass it.
     ///
-    /// It became a variable when the page size did, and
+    /// It became a variable when the page size did, and the since-removed
     /// `fetch_prs_and_reviewing` was missed -- GitHub then rejected that
     /// query outright ("Variable $first of type Int! was provided
     /// invalid value") and the review queue returned nothing at all.
@@ -4544,13 +4501,18 @@ mod tests {
 
         // Unmatched requests 404 in wiremock, so a call that omits
         // `first` fails here rather than passing silently.
-        assert!(client_for(&server).await.fetch_reviewing().await.is_ok());
+        assert!(client_for(&server)
+            .await
+            .fetch_reviewing_snapshot()
+            .await
+            .is_ok());
     }
 
     /// To review fetches ONLY the review queue.
     ///
-    /// It used to call `fetch_prs_and_reviewing`, so opening that view
-    /// also fetched the authored list -- on a reported account, 111
+    /// It used to call the since-removed `fetch_prs_and_reviewing`, so
+    /// opening that view also fetched the authored list -- on a reported
+    /// account, 111
     /// fully populated pull requests when 71 were wanted. That is why My
     /// pull requests recovered there once the page shrank and To review
     /// did not.
@@ -4573,7 +4535,11 @@ mod tests {
 
         // Any request NOT matching `review-requested` is unmatched and
         // 404s, so fetching the authored list too fails this.
-        assert!(client_for(&server).await.fetch_reviewing().await.is_ok());
+        assert!(client_for(&server)
+            .await
+            .fetch_reviewing_snapshot()
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -4590,7 +4556,7 @@ mod tests {
 
         assert!(client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .is_err());
         // `expect(1)` is verified on drop: a second attempt fails the test.
@@ -4610,7 +4576,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(matches!(err, ClientError::RateLimited(_)), "got {err:?}");
         assert!(err.to_string().contains("resume automatically"));
     }
@@ -4642,7 +4608,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             matches!(err, ClientError::TokenRejected { .. }),
             "a 401 must be a rejected token, got {err:?}"
@@ -4678,7 +4644,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             matches!(err, ClientError::TokenRejected { .. }),
             "got {err:?}"
@@ -4709,7 +4675,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             !matches!(err, ClientError::TokenRejected { .. }),
             "a 403 must not claim the token expired, got {err:?}"
@@ -4737,7 +4703,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             !matches!(err, ClientError::TokenRejected { .. }),
             "got {err:?}"
@@ -4826,11 +4792,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (prs, total) = client_for(&server)
+        let list = client_for(&server)
             .await
-            .fetch_prs_with_total()
+            .fetch_prs_snapshot()
             .await
             .unwrap();
+        let prs = list.prs;
+        // `fetch_prs_with_total` read an absent total as 0; asserting the
+        // `Some` is the stronger form of the same check (#2003).
+        let total = list.total.expect("an agreed issueCount is a known total");
         // The mock answers EVERY page with the same 3 nodes, so the
         // merged list is a multiple of 3 rather than 3 -- that is an
         // artefact of the fixture, not of the code. What this test is
@@ -4868,7 +4838,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server).await.fetch_prs().await.unwrap();
+        let prs = authored(&client_for(&server).await).await.unwrap();
         assert_eq!(prs.len(), 3, "a partial success must not blank the list");
         assert_eq!(prs[0].number, 42);
     }
@@ -4899,11 +4869,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server)
-            .await
-            .fetch_reviewing()
-            .await
-            .unwrap_err();
+        let Err(err) = client_for(&server).await.fetch_reviewing_snapshot().await else {
+            panic!("a refused page with no usable rows must fail");
+        };
         assert!(err.to_string().contains("refused"), "{err}");
     }
 
@@ -4924,9 +4892,10 @@ mod tests {
 
         assert!(client_for(&server)
             .await
-            .fetch_reviewing()
+            .fetch_reviewing_snapshot()
             .await
             .unwrap()
+            .prs
             .is_empty());
     }
 
@@ -4965,9 +4934,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let prs = client_for(&server)
-            .await
-            .fetch_prs()
+        let prs = authored(&client_for(&server).await)
             .await
             .expect("must not fail");
         assert_eq!(
@@ -5030,7 +4997,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+        let err = authored(&client_for(&server).await).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("Could not resolve to a Repository"),
@@ -5618,7 +5585,7 @@ mod tests {
     /// accompanies it, which is right: 26 good PR nodes beat none. The
     /// corollary is that every caller inherits a response that may be
     /// PARTIAL and has to decide what to do about it. One caller did:
-    /// `fetch_reviewing_with_shortfall` has called
+    /// `fetch_reviewing_snapshot` has called
     /// `reject_empty_after_refusals` since #317, whose doc spells the cost
     /// out -- a refused page cached as "No open pull requests", shown
     /// indefinitely because the query stays fresh for a minute.
@@ -5665,8 +5632,8 @@ mod tests {
         /// that cries wolf is a guard somebody disables.
         const NO_REFUSAL_READ: &[(&str, &str)] = &[
             // Runs the document; its callers consult the count on the
-            // response it returns. `fetch_reviewing_with_shortfall` does
-            // so through `reject_empty_after_refusals`.
+            // response it returns. `fetch_reviewing_snapshot` does so
+            // through `reject_empty_after_refusals`.
             (
                 "search_page",
                 "returns the raw response; its callers read the count",

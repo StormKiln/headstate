@@ -1518,6 +1518,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_rules_probe_is_stated_not_assumed_absent() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let t = octo(OCTO_SECTION);
@@ -1633,6 +1634,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_path_is_unknown_for_the_section() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let t = octo("## Octo rules\n\nEdit `octo/a.rs`, `octo/b.rs` and `walled/secrets/c.rs`.\n");
@@ -1752,6 +1754,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_caller_search_that_could_not_finish_qualifies_and_a_hit_still_counts() {
+        crate::test_permissions::skip_unless_chmod_denies!();
         use std::os::unix::fs::PermissionsExt;
 
         let t = lib_thing();

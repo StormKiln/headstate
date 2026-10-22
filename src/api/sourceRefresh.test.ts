@@ -248,3 +248,14 @@ describe("seeding from the saved snapshot", () => {
     expect(state.snapshot()).toMatchObject({ prs: rows(1), error: null });
   });
 });
+
+// #1941: a status event that would only repeat the accepted receipt's rows
+// arrives without them. It must still move the phase and keep the rows.
+it("keeps accepted rows when a status repeats their receipt without carrying them", () => {
+  const state = new SourceRefreshState();
+  state.accept(update(2, null, { coverage: "complete" }));
+  state.accept(update(3, null, { phase: "fetching", receipt_revision: 2, prs: null }));
+  expect(state.snapshot()).toMatchObject({ prs: rows(2), phase: "fetching", coverage: "complete", error: null });
+  state.accept(update(4, "offline", { phase: "failed", receipt_revision: 2, prs: null }));
+  expect(state.snapshot()).toMatchObject({ prs: rows(2), error: "offline" });
+});

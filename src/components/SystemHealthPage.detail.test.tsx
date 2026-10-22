@@ -1,7 +1,7 @@
 const diskApi = vi.hoisted(() => ({diskStatus: vi.fn(async () => ({running:false,observations:[],error:null})),diskHistory:vi.fn(async()=>({observations:[],unreadable:0})),diskSettings:vi.fn(async()=>({external_roots:[],additional_locations:false})),startDiskScan:vi.fn(),saveDiskSettings:vi.fn(),cancelDiskScan:vi.fn()}));
 vi.mock("../api/diskInventory",()=>diskApi);
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   Footprint,
@@ -1832,8 +1832,8 @@ describe("grouping processes by name (#721)", () => {
     await screen.findByText(/covering 29 of 1436/i);
 
     // Away and back, the way the sidebar moves you.
-    useFilters.setState({ healthPage: "memory" });
-    useFilters.setState({ healthPage: "cpu" });
+    act(() => { useFilters.setState({ healthPage: "memory" }); });
+    act(() => { useFilters.setState({ healthPage: "cpu" }); });
     const again = renderPage();
     await waitFor(() =>
       expect(
