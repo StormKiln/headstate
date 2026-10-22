@@ -15,7 +15,7 @@ pub async fn save_markdown(
 use crate::github::client::GitHubClient;
 use crate::github::model::{PrDetail, PullRequest};
 use crate::github::mutate::{PrAction, ReviewVerdict};
-use crate::store::{open_db, settings, CachedList, CachedSnapshot};
+use crate::store::{open_db, settings, CachedList};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -187,30 +187,187 @@ pub fn diag_log(line: String) {
     crate::diag!("[diag][ui] {line}");
 }
 
-/// The cached snapshot, so the window paints real content at launch rather
-/// than a spinner. Never talks to GitHub.
+/// The saved authored list as a bare array, for callers that cannot read
+/// a qualification. Never talks to GitHub.
+///
+/// The bare-array contract is kept for wire compatibility: phones from
+/// before 9.0 call this and read the answer as `PullRequest[]`, and the
+/// first frame of `/v1/events` carries the same list. Callers that can
+/// render a qualification read [`get_source_snapshot`] instead, which is
+/// what the frontend and the current companion do.
+///
+/// An array cannot say "old" or "not loaded yet", and an empty array
+/// says "you have no open pull requests". So only a list that can be
+/// presented as current is answered with rows; every other state is an
+/// error naming why (#1997). See [`current_rows`].
 #[tauri::command]
 pub async fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
     off_main_thread(move || get_cached_blocking(app)).await
 }
 
 /// [`get_cached`]'s work, on the caller's thread (#1959).
-pub(crate) fn get_cached_blocking(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+fn get_cached_blocking(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+    get_cached_answer(app)?.map_err(|not_current| not_current.0)
+}
+
+/// Why a saved list cannot be answered as a bare array: a sentence for
+/// the reader. Distinct from an outer `Err`, which means the database
+/// could not be read at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NotCurrent(pub(crate) String);
+
+/// [`get_cached`]'s answer, with "the database could not be read" (outer)
+/// kept apart from "read, but not presentable as current" (inner). The
+/// event stream's opening frame needs the difference: the second is an
+/// ordinary state that sends no frame, not a fault worth a warning.
+pub(crate) fn get_cached_answer(
+    app: AppHandle,
+) -> Result<Result<Vec<PullRequest>, NotCurrent>, String> {
     let snapshot = get_source_snapshot_blocking(
         app,
         crate::identity::Source::default(),
         CachedList::Authored,
     )?;
-    match snapshot.snapshot.data {
-        crate::store::source_cache::SnapshotData::Available {
+    Ok(current_rows(snapshot.snapshot.data))
+}
+
+/// The rows of a saved list only when they can be shown as current.
+///
+/// - Fresh and verified: the rows, including a measured empty list.
+/// - Too old: refused, with its age. Returning `[]` here read as "no pull
+///   requests" (#1997); returning the rows bare would present an
+///   hour-old list as current. A bare array has no third option.
+/// - Never loaded: refused. Absent is not zero.
+/// - Withheld or unreadable: refused, with the reason.
+fn current_rows(
+    data: crate::store::source_cache::SnapshotData,
+) -> Result<Vec<PullRequest>, NotCurrent> {
+    use crate::store::source_cache::SnapshotData;
+    match data {
+        SnapshotData::Available {
             prs,
             stale_secs: None,
             ..
         } => Ok(prs),
-        crate::store::source_cache::SnapshotData::Available { .. }
-        | crate::store::source_cache::SnapshotData::Missing => Ok(vec![]),
-        crate::store::source_cache::SnapshotData::Withheld { reason } => Err(reason),
-        _ => Err("The saved snapshot could not be read.".into()),
+        SnapshotData::Available {
+            stale_secs: Some(age),
+            ..
+        } => Err(NotCurrent(format!(
+            "The saved pull request list is {} old and may no longer be accurate. \
+             Refresh to load the current list.",
+            coarse_age(age)
+        ))),
+        SnapshotData::Missing => Err(NotCurrent(
+            "No pull request list has been loaded yet. Refresh to load it.".into(),
+        )),
+        SnapshotData::Withheld { reason } => Err(NotCurrent(reason)),
+        SnapshotData::Unreadable | SnapshotData::GitLabAvailable { .. } => Err(NotCurrent(
+            "The saved pull request list could not be read. Refresh to load it again.".into(),
+        )),
+    }
+}
+
+/// "3 hours", "2 days": the precision a reader needs to judge a saved list.
+fn coarse_age(secs: i64) -> String {
+    let (n, unit) = match secs.max(0) {
+        s if s < 2 * 60 => (s.max(1), "second"),
+        s if s < 2 * 60 * 60 => (s / 60, "minute"),
+        s if s < 2 * 24 * 60 * 60 => (s / (60 * 60), "hour"),
+        s => (s / (24 * 60 * 60), "day"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod get_cached_tests {
+    use super::{current_rows, NotCurrent};
+    use crate::github::model::PullRequest;
+    use crate::identity::Source;
+    use crate::store::source_cache::{
+        load_qualified_snapshot, save_owned_source_snapshot, Coverage,
+    };
+    use crate::store::CachedList;
+
+    fn row() -> PullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": 7, "title": "fixture", "url": "https://github.com/o/r/pull/7",
+            "repo": "o/r", "author": "alice", "is_draft": false,
+            "head_ref": "topic", "base_ref": "main", "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z", "ci": "pending", "merge": "checking",
+            "review": "review_required", "in_merge_queue": false, "labels": [], "comment_count": 0
+        }))
+        .unwrap()
+    }
+
+    /// `get_cached`'s answer for what is on disk, read the way the
+    /// command reads it: owned by `alice`, viewed as `alice`.
+    fn answer(rows: Option<&[PullRequest]>, age: &str) -> Result<Vec<PullRequest>, NotCurrent> {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        if let Some(rows) = rows {
+            save_owned_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+                rows,
+                &Coverage::Complete,
+                Some("alice"),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE snapshot SET fetched_at = datetime('now', ?1)",
+                [age],
+            )
+            .unwrap();
+        }
+        let snapshot = load_qualified_snapshot(
+            &conn,
+            &Source::default(),
+            CachedList::Authored,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+        current_rows(snapshot.snapshot.data)
+    }
+
+    /// #1997: a saved list too old to show as current answered `Ok([])`,
+    /// which the phone stored and painted as "no pull requests". It is
+    /// refused instead, with its age -- never an unqualified empty list.
+    #[test]
+    fn a_stale_list_is_refused_with_its_age_not_answered_as_empty() {
+        let got = answer(Some(&[row()]), "-3 hours");
+        let Err(NotCurrent(why)) = got else {
+            panic!("a stale list must not be answered as a bare array: {got:?}");
+        };
+        assert!(why.contains("3 hours old"), "{why}");
+    }
+
+    /// Absent is not zero: a list never loaded is refused, not `[]`.
+    #[test]
+    fn a_list_never_loaded_is_refused_not_answered_as_empty() {
+        let got = answer(None, "");
+        assert!(
+            matches!(&got, Err(NotCurrent(why)) if why.contains("loaded yet")),
+            "{got:?}"
+        );
+    }
+
+    /// The other direction: a current list keeps its rows, and a
+    /// MEASURED empty list is still an empty answer -- zero is zero.
+    #[test]
+    fn a_current_list_is_answered_with_its_rows_including_a_measured_empty_one() {
+        assert_eq!(answer(Some(&[row()]), "-1 minute").unwrap().len(), 1);
+        assert_eq!(answer(Some(&[]), "-1 minute").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn coarse_age_reads_as_a_person_would_say_it() {
+        assert_eq!(super::coarse_age(3601), "60 minutes");
+        assert_eq!(super::coarse_age(3 * 3600 + 5), "3 hours");
+        assert_eq!(super::coarse_age(86_400), "24 hours");
+        assert_eq!(super::coarse_age(3 * 86_400), "3 days");
+        assert_eq!(super::coarse_age(60 * 60 * 48), "2 days");
     }
 }
 
@@ -426,6 +583,13 @@ async fn refresh_source_request(
     request_id: Option<String>,
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
+    // No receipt yet in this process: typically the first Refresh after a
+    // restart, which the pass cadence must not swallow (#1938).
+    let cold = app
+        .state::<source_poll::SourcePolls>()
+        .get(&source, list)
+        .receipt_revision
+        .is_none();
     let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
     let gitlab_source = source.provider == crate::identity::Provider::Gitlab
         && crate::gitlab::host::validate(&source.host).is_ok();
@@ -444,6 +608,7 @@ async fn refresh_source_request(
                 message: message.clone(),
                 transient: false,
                 not_asked: true,
+                superseded: false,
             },
         )
         .await;
@@ -454,9 +619,9 @@ async fn refresh_source_request(
     }
     // The loader owns its deadline so completed pages survive a timeout.
     let client = client.0.as_ref().expect("checked above");
-    let result =
-        source_poll::fetch_github_step(&app, client, list, crate::poll::FETCH_TIMEOUT).await;
-    let fetched = result.map_err(|error| Failure::from(&error));
+    let fetched =
+        source_poll::fetch_github_refresh(&app, client, list, crate::poll::FETCH_TIMEOUT, cold)
+            .await;
     match fetched {
         Ok(result) => {
             let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
@@ -473,45 +638,34 @@ async fn refresh_source_request(
                 Ok(result) => result,
                 Err(failure) => {
                     let message = failure.message.clone();
+                    let superseded = failure.superseded;
                     source_poll::complete(&app, publication, Err(failure));
+                    // A lost write race answers with the winner's receipt,
+                    // which is already published (#1933).
+                    if let Some(winner) = superseded
+                        .then(|| source_poll::latest(&app, &source, list))
+                        .flatten()
+                    {
+                        return Ok(SourceRefresh {
+                            source,
+                            list,
+                            prs: Some(winner.prs),
+                            mrs: None,
+                            coverage: winner.coverage,
+                        });
+                    }
                     return Err(message);
                 }
             };
             let receipt = result.clone();
+            // No snapshot write here: `reconcile_github` above already saved
+            // it in its own transaction, or failed this refresh (#1940).
             let crate::github::client::FetchedList {
-                scan,
-                viewer,
                 prs,
                 total,
                 coverage,
+                ..
             } = result;
-            let path = db_path(&app);
-            let owned = prs.clone();
-            let owned_source = source.clone();
-            let owned_coverage = coverage.clone();
-            let saved = if scan.is_some() {
-                Ok(Ok(()))
-            } else {
-                tauri::async_runtime::spawn_blocking(move || {
-                    let conn = open_db(&path).map_err(|e| e.to_string())?;
-                    crate::store::source_cache::save_owned_source_snapshot(
-                        &conn,
-                        &owned_source,
-                        list,
-                        &owned,
-                        &owned_coverage,
-                        viewer.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())
-                })
-                .await
-            };
-            if !matches!(saved, Ok(Ok(()))) {
-                let _ = app.emit(
-                    "store-error",
-                    "The refreshed list could not be saved for offline use.",
-                );
-            }
             if list == CachedList::Reviewing {
                 crate::poll::emit_reviewing(&app, &receipt);
             } else {
@@ -593,34 +747,8 @@ async fn refresh_gitlab_request(
                 }
             };
             let receipt = result.clone();
-            let path = db_path(&app);
-            let owned_source = source.clone();
-            let owned = result.mrs.clone();
-            let owned_coverage = result.coverage.clone();
-            let owner = result.viewer.clone();
-            let saved = if result.scan.is_some() {
-                Ok(Ok(()))
-            } else {
-                tauri::async_runtime::spawn_blocking(move || {
-                    let conn = open_db(&path).map_err(|e| e.to_string())?;
-                    crate::store::source_cache::save_owned_gitlab_snapshot(
-                        &conn,
-                        &owned_source,
-                        list,
-                        &owned,
-                        &owned_coverage,
-                        owner.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())
-                })
-                .await
-            };
-            if !matches!(saved, Ok(Ok(()))) {
-                let _ = app.emit(
-                    "store-error",
-                    "The refreshed list could not be saved for offline use.",
-                );
-            }
+            // No snapshot write here: `reconcile_gitlab` above already saved
+            // it, or failed this refresh (#1940).
             source_poll::complete_gitlab(&app, publication, Ok(receipt));
             Ok(SourceRefresh {
                 source,
@@ -636,6 +764,7 @@ async fn refresh_gitlab_request(
                 message: message.clone(),
                 transient: error.transient(),
                 not_asked: matches!(error, crate::gitlab::queues::QueueError::MissingCli),
+                superseded: false,
             };
             if let Some(publication) = source_poll::publication(&app, &attempt).await {
                 source_poll::complete_gitlab(&app, publication, Err(failure));
@@ -1903,14 +2032,13 @@ pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, Strin
     for f in &failed {
         log::warn!("artifact scan: could not read {}: {}", f.root, f.why);
     }
-    {
-        use tauri::Emitter;
-        let _ = app.emit("artifact-scan-failed-roots", &failed);
-    }
+    // The failed roots are reported in the return value below; the
+    // `artifact-scan-failed-roots` event that also carried them had no
+    // listener on either platform and is gone (#1940).
+    //
     // ~1.5 s to discover and ~56 s to size, every cold start, against a
-    // blank page (#1152). Stored AFTER the failed roots are reported:
-    // the cache holds what this scan actually found, and a root that
-    // could not be read contributes nothing to it either way.
+    // blank page (#1152). The cache holds what this scan actually found,
+    // and a root that could not be read contributes nothing to it.
     remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out).await;
     Ok(ArtifactScan {
         artifacts: out,
@@ -5308,34 +5436,6 @@ pub async fn count_reviewing(client: State<'_, GhClient>) -> Result<u64, String>
     out
 }
 
-/// The cached review list, so To review paints real content instead of
-/// an empty panel while the live query runs.
-///
-/// Never talks to GitHub -- the mirror of `get_cached` for the other
-/// list. The query it stands in for takes ~20s on a 60-PR queue and
-/// cannot be made meaningfully faster (see #328), so the only way to
-/// stop the user staring at nothing is to have something to show.
-#[tauri::command]
-pub async fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
-    off_main_thread(move || get_cached_reviewing_blocking(app)).await
-}
-
-/// [`get_cached_reviewing`]'s work, on the caller's thread (#1959).
-fn get_cached_reviewing_blocking(app: AppHandle) -> Result<CachedSnapshot, String> {
-    let snapshot = get_source_snapshot_blocking(
-        app,
-        crate::identity::Source::default(),
-        CachedList::Reviewing,
-    )?;
-    match snapshot.snapshot.data {
-        crate::store::source_cache::SnapshotData::Available {
-            prs, stale_secs, ..
-        } => Ok(CachedSnapshot { prs, stale_secs }),
-        crate::store::source_cache::SnapshotData::Withheld { reason } => Err(reason),
-        _ => Err("No readable saved reviewing snapshot is available.".into()),
-    }
-}
-
 #[tauri::command]
 pub async fn get_reviewing(
     app: AppHandle,
@@ -6759,6 +6859,10 @@ pub async fn claude_event_profile(
 pub struct ClaudeLiveState {
     #[serde(skip)]
     pub(crate) index_health: crate::background::IndexOutcome,
+    /// Links the link lane added this pass. Not on the wire; read by
+    /// [`ClaudeLiveState::population_changed`].
+    #[serde(skip)]
+    pub(crate) links_added: usize,
     pub metadata_population: Option<crate::claude::transcript::PopulationProgress>,
     pub usage_population: Option<crate::claude::transcript::PopulationProgress>,
     /// What the hook's handoff file contributed.
@@ -6783,6 +6887,61 @@ pub struct ClaudeLiveState {
     /// transcript that could not be indexed is a known gap in what a
     /// search can cover, not a silent absence.
     pub indexed: Option<crate::claude::search::Indexed>,
+}
+
+/// What one live pass observed, as the Claude summary views would see it
+/// (#1941). Two passes with equal receipts and no writes changed nothing
+/// those views read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PopulationReceipt {
+    metadata: Option<crate::claude::transcript::PopulationProgress>,
+    usage: Option<crate::claude::transcript::PopulationProgress>,
+    handoff: crate::claude::handoff::Consumed,
+    sweep: crate::claude::crash::Recorded,
+    indexed: Option<crate::claude::search::Indexed>,
+}
+
+impl ClaudeLiveState {
+    pub(crate) fn population_receipt(&self) -> PopulationReceipt {
+        PopulationReceipt {
+            metadata: self.metadata_population.clone(),
+            usage: self.usage_population.clone(),
+            handoff: self.handoff.clone(),
+            sweep: self.sweep.clone(),
+            indexed: self.indexed.clone(),
+        }
+    }
+
+    /// Whether this pass stored anything: hook records, crashes, links,
+    /// or sessions written (not skipped as unchanged) by a population lane.
+    fn wrote(&self) -> bool {
+        let wrote_progress = |p: &Option<crate::claude::transcript::PopulationProgress>| {
+            p.as_ref().is_some_and(|p| p.completed > p.unchanged)
+        };
+        self.handoff.runs > 0
+            || self.handoff.sessions > 0
+            || self.sweep.crashed > 0
+            || self.links_added > 0
+            || wrote_progress(&self.metadata_population)
+            || wrote_progress(&self.usage_population)
+            || self
+                .indexed
+                .as_ref()
+                .is_some_and(|i| i.indexed > 0 || i.population.completed > i.population.unchanged)
+    }
+
+    /// Whether `claude-population-updated` should fire after this pass.
+    ///
+    /// It used to fire after EVERY pass, once a minute, and each one makes
+    /// the frontend invalidate and refetch five Claude summary queries
+    /// (#1941). Now only when the pass wrote something, or what it observed
+    /// differs from the previous pass (a total moved, a lane failed or
+    /// recovered, a session started) -- erring toward an extra event,
+    /// which costs a refetch, over a missed one, which leaves a view stale.
+    /// The first pass always fires: there is nothing to compare it with.
+    pub(crate) fn population_changed(&self, previous: Option<&PopulationReceipt>) -> bool {
+        self.wrote() || previous != Some(&self.population_receipt())
+    }
 }
 
 /// Consume the hook's handoff file and sweep the live session registry
@@ -6918,6 +7077,7 @@ fn claude_live_pass_with_population(
 
         Ok(ClaudeLiveState {
             index_health: population.index_health,
+            links_added: population.links_added,
             metadata_population: population.metadata,
             usage_population: population.usage,
             handoff,
@@ -6931,6 +7091,7 @@ fn claude_live_pass_with_population(
 
 #[derive(Default)]
 struct LivePopulation {
+    links_added: usize,
     #[cfg(any(test, feature = "enterprise-harness"))]
     links: Option<crate::claude::linkscan::Refreshed>,
     #[cfg(feature = "enterprise-harness")]
@@ -7074,6 +7235,7 @@ fn populate_live_corpus_with_controls(
                             done.unreadable.len()
                         );
                     }
+                    out.links_added += done.links_added;
                     #[cfg(any(test, feature = "enterprise-harness"))]
                     {
                         out.links = Some(done);
@@ -8579,6 +8741,79 @@ mod claudify_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `claude-population-updated` fires when a live pass changed what the
+    /// Claude summaries read, not once a minute regardless (#1941).
+    ///
+    /// Before: every pass emitted, so two quiet passes were two events and
+    /// ten refetches. After: the first pass announces (nothing to compare
+    /// with), a quiet repeat does not, and any write or moved figure does.
+    #[test]
+    fn the_population_event_fires_only_when_a_pass_changed_something() {
+        use crate::claude::transcript::PopulationProgress;
+        let settled = PopulationProgress {
+            total: 10,
+            total_known: true,
+            completed: 10,
+            unchanged: 10,
+            ..Default::default()
+        };
+        let quiet = ClaudeLiveState {
+            metadata_population: Some(settled.clone()),
+            usage_population: Some(settled.clone()),
+            indexed: Some(crate::claude::search::Indexed {
+                population: settled.clone(),
+                unchanged: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut last = None;
+        let mut emitted = 0;
+        for _ in 0..3 {
+            if quiet.population_changed(last.as_ref()) {
+                emitted += 1;
+            }
+            last = Some(quiet.population_receipt());
+        }
+        assert_eq!(emitted, 1, "three quiet passes, one announcement");
+        let last = last.unwrap();
+
+        // Anything the pass STORED announces, even when every figure it
+        // reports is the same as last time.
+        let wrote: [fn(&mut ClaudeLiveState); 6] = [
+            |s| s.handoff.runs = 1,
+            |s| s.sweep.crashed = 1,
+            |s| s.links_added = 1,
+            |s| s.metadata_population.as_mut().unwrap().unchanged = 9,
+            |s| s.usage_population.as_mut().unwrap().unchanged = 9,
+            |s| s.indexed.as_mut().unwrap().indexed = 1,
+        ];
+        for (i, change) in wrote.iter().enumerate() {
+            let mut pass = quiet.clone();
+            change(&mut pass);
+            assert!(
+                pass.population_changed(Some(&pass.population_receipt())),
+                "write {i} did not announce"
+            );
+        }
+
+        // So does a figure that moved without a write: a new transcript
+        // raises a total, a failure appears, a lane could not run.
+        let moved: [fn(&mut ClaudeLiveState); 3] = [
+            |s| s.indexed.as_mut().unwrap().population.total = 11,
+            |s| s.indexed.as_mut().unwrap().unreadable = vec!["x".into()],
+            |s| s.usage_population = None,
+        ];
+        for (i, change) in moved.iter().enumerate() {
+            let mut pass = quiet.clone();
+            change(&mut pass);
+            assert!(
+                pass.population_changed(Some(&last)),
+                "change {i} did not announce"
+            );
+        }
+    }
     #[test]
     fn a_removal_frame_carries_no_path() {
         let dir = tempfile::TempDir::new().unwrap();

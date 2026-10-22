@@ -12,8 +12,10 @@
 //! ```
 //!
 //! A bare `:` comment line every 15 seconds is the keep-alive. The first
-//! frame after connecting is always `prs-updated` with the cached
-//! snapshot. The stream ends when the device is revoked, when it fell
+//! frame after connecting is `prs-updated` with the cached snapshot when
+//! the desktop has a list it can show as current; an old or withheld
+//! list sends none (#1997), and the versioned source frames carry it
+//! with its qualification. The stream ends when the device is revoked, when it fell
 //! too far behind, or when the listener stops; the phone reconnects and
 //! gets a fresh snapshot. Only the names in [`EVENT_NAMES`] are
 //! re-emitted; anything else is dropped, so the desktop cannot fire an
