@@ -4720,6 +4720,68 @@ mod tests {
         );
     }
 
+    /// A 403 rate or secondary limit is a rate limit, never a refused
+    /// token (#2008).
+    ///
+    /// The frontend now withholds "Try again" for the `expired-token`
+    /// kind, so the cost of a 403 limit landing there is a reader told to
+    /// re-authenticate and denied the retry that works after the reset.
+    /// Both shapes: a `retry-after` header, and the body's own wording
+    /// with no header.
+    #[tokio::test]
+    async fn a_403_rate_limit_is_rate_limited_not_a_rejected_token() {
+        for retry_after in [Some("60"), None] {
+            let server = MockServer::start().await;
+            let mut response = ResponseTemplate::new(403).set_body_json(json!({
+                "message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+            }));
+            if let Some(seconds) = retry_after {
+                response = response.insert_header("retry-after", seconds);
+            }
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server).await.fetch_prs().await.unwrap_err();
+            assert!(
+                matches!(err, ClientError::RateLimited(_)),
+                "retry-after {retry_after:?}: a 403 limit must be a rate limit, got {err:?}"
+            );
+            assert!(
+                !err.to_string().contains(crate::commands::AUTH_EXPIRED),
+                "the marker must not be on a 403 limit: {err}"
+            );
+        }
+    }
+
+    /// The REST read shape of a 401 is the same refused token as the
+    /// GraphQL one (#2008): `rest_get` goes through `read_transport`'s
+    /// own status mapping, not `fetch_prs`'s.
+    #[tokio::test]
+    async fn a_rest_401_is_a_rejected_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/synthetic"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "message": "Bad credentials"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).await;
+        let err = client
+            .rest_get("/synthetic", &client.request_budget())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::TokenRejected { .. }),
+            "a REST 401 must be a rejected token, got {err:?}"
+        );
+        assert!(err.to_string().starts_with(crate::commands::AUTH_EXPIRED));
+    }
+
     /// A 5xx is not a rejected token either, and stays transient.
     ///
     /// `server_gave_up` and `is_transient` both already depend on the

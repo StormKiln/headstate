@@ -43,23 +43,40 @@ export function signInRemedy(mobile: boolean): string {
     : "Sign in with `gh auth login`, then relaunch Headstate.";
 }
 
-/// One source's line in the multi-source banner (#2005): its prose, and
-/// -- when Headstate declined the request -- what can clear it.
+/// One source's line in the multi-source banner (#2005): its prose,
+/// whether Headstate declined the request, and what can clear it.
 ///
 /// `raw` may still carry a wire marker (the authored list and `pollError`
 /// hand theirs over unstripped), or may already be stripped with the
-/// verdict passed as `notAsked` (`useReviewing` does both). Either way the
-/// marker never reaches the screen, and a declined request is never
-/// reported as "Could not refresh": that is "they did not answer" for
-/// "we did not ask" (#1050).
+/// verdict passed as `notAsked` / `tokenRejected` (`useReviewing` does
+/// both). Either way the marker never reaches the screen, and a declined
+/// request is never reported as "Could not refresh": that is "they did
+/// not answer" for "we did not ask" (#1050).
+///
+/// - `notAsked`: the declined request's remedy, or `null` for a request
+///   that was sent.
+/// - `remedy`: the action the line offers, for every outcome. A sent
+///   request that failed keeps its retry -- unless GitHub refused the
+///   token (#2008). The token is read once at startup, so a retry sends
+///   the same refused credential and cannot work; that gets the sign-in
+///   remedy, as having no credential does. The refusal is decided in Rust
+///   on the HTTP status (`ClientError::TokenRejected`) and arrives as the
+///   `expired-token` kind. A 403 rate or secondary limit is
+///   `RateLimited` there, arrives as `other`, and keeps its retry.
 export function sourceBanner(
   raw: string | undefined,
   notAsked: boolean,
-): { message: string; notAsked: NotAskedRemedy | null } {
+  tokenRejected = false,
+): { message: string; notAsked: NotAskedRemedy | null; remedy: NotAskedRemedy } {
   const err = raw === undefined ? undefined : commandError(raw);
   if (notAsked || err?.kind === "not-asked") {
     const reason = err?.message ?? "";
-    return { message: reason ? `not checked: ${reason}` : "not checked", notAsked: notAskedRemedy(reason) };
+    const remedy = notAskedRemedy(reason);
+    return { message: reason ? `not checked: ${reason}` : "not checked", notAsked: remedy, remedy };
   }
-  return { message: err?.message || "Could not refresh GitHub", notAsked: null };
+  return {
+    message: err?.message || "Could not refresh GitHub",
+    notAsked: null,
+    remedy: tokenRejected || err?.kind === "expired-token" ? "sign-in" : "retry",
+  };
 }

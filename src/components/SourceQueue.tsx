@@ -125,7 +125,7 @@ export function SourceQueue({
   selection, github, gitlab, githubLoading, gitlabLoading, githubError, gitlabError,
   githubCoverage, gitlabCoverage, onOpen, onRefreshGitHub, onRefreshGitLab,
   githubStaleSecs, gitlabStaleSecs,
-  canWriteGitHub, githubNotAsked = null,
+  canWriteGitHub, githubNotAsked = null, githubRemedy = githubNotAsked ?? "retry",
 }: {
   selection: SourceSelection;
   github: PullRequest[];
@@ -138,6 +138,11 @@ export function SourceQueue({
   /// line is then a status, and it offers "Retry" only where asking
   /// again can work.
   githubNotAsked?: NotAskedRemedy | null;
+  /// What `githubError`'s line offers, whether or not the request was
+  /// sent (`sourceBanner`'s `remedy`). A sent request GitHub refused the
+  /// token for is still a failure -- an alert -- but its retry would
+  /// send the same refused token, so it offers sign-in instead (#2008).
+  githubRemedy?: NotAskedRemedy;
   gitlabError: string | null;
   githubCoverage: SourceCoverage | null;
   gitlabCoverage: SourceCoverage | null;
@@ -185,15 +190,18 @@ export function SourceQueue({
     if (cursor !== null && cursor >= rows.length) setCursor(rows.length > 0 ? rows.length - 1 : null);
   }, [cursor, rows.length, setCursor]);
   const sources = [
-    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.filter((row) => row.observation?.state !== "retained").length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub, notAsked: githubNotAsked }]),
-    { name: "GitLab", rows: gitlab?.filter((row) => row.observation?.state !== "retained").length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab, notAsked: null },
+    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.filter((row) => row.observation?.state !== "retained").length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub, notAsked: githubNotAsked, remedy: githubRemedy }]),
+    // GitLab keeps its retry for every failure, a refused credential
+    // included: glab reads its credential on each request, so after
+    // `glab auth login` -- which the error itself names -- a retry works.
+    { name: "GitLab", rows: gitlab?.filter((row) => row.observation?.state !== "retained").length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab, notAsked: null, remedy: "retry" as NotAskedRemedy },
   ];
   return <div className="space-y-3">
     <p className="text-xs text-[#8b949e]">GitLab queues use the host configured in Settings on the desktop.</p>
     {sources.map((source) => <div key={source.name}>
       {source.error ? <div role={source.notAsked ? "status" : "alert"} className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
-        {source.name}: {source.error}{source.notAsked === "sign-in" ? `. ${signInRemedy(IS_MOBILE_BUILD)}` : ""}{source.rows !== undefined ? " Saved rows remain visible." : ""}
-        {source.notAsked === null || source.notAsked === "retry" ? <button type="button" onClick={source.retry} className="ml-2 underline">Retry</button> : null}
+        {source.name}: {source.error}{source.remedy === "sign-in" ? `. ${signInRemedy(IS_MOBILE_BUILD)}` : ""}{source.rows !== undefined ? " Saved rows remain visible." : ""}
+        {source.remedy === "retry" ? <button type="button" onClick={source.retry} className="ml-2 underline">Retry</button> : null}
       </div> : source.loading && source.rows === undefined ? <p role="status" className="text-sm text-[#8b949e]">Loading {source.name}…</p> : null}
       {source.rows !== undefined && source.coverage !== "complete" ? <p role="status" className="mt-1 text-xs text-[#d29922]">{coverageMessage(source.name, source.coverage, source.rows)}</p> : null}
       {source.rows !== undefined && source.staleSecs !== null ? <p role="status" className="mt-1 text-xs text-[#d29922]">{source.staleSecs === "unknown" ? `${source.name} saved list age could not be confirmed.` : `${source.name} is showing a saved list from ${relativeSeconds(source.staleSecs)}.`}</p> : null}

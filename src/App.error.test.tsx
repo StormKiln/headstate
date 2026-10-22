@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useFilters } from "./store/filters";
 import { useSourceSelection } from "./store/sourceSelection";
 import { PR_FIXTURES } from "./fixtures/prs";
-import { NOT_ASKED } from "./lib/notAsked";
+import { AUTH_EXPIRED, NOT_ASKED } from "./lib/notAsked";
 
 // #2004/#2005 render the same panels on the phone build: the shared
 // frontend is the phone's frontend. A getter, so one file covers both.
@@ -338,4 +338,116 @@ describe("App — the source banner classifies a declined GitHub request", () =>
     expect(line.getAttribute("role")).toBe("alert");
     expect(within(line).getByRole("button", { name: "Retry" })).toBeTruthy();
   });
+});
+
+/// #2008: a request that WAS sent and that GitHub refused the token for
+/// (a 401, or a "Bad credentials" body) is a failure -- but the token is
+/// read once at startup, so "Try again" sends the same refused credential
+/// and cannot work (#1050). Every panel and the banner offer #2004's
+/// sign-in remedy instead, on both builds. A 403 rate or secondary limit
+/// is a different kind (`RateLimited` in Rust, no marker) and keeps its
+/// retry: it clears after the reset.
+describe("App — a refused token offers sign-in, never a retry", () => {
+  afterEach(() => {
+    build.mobile = false;
+    relaunch.mockClear();
+    useFilters.setState({ view: "my-prs" });
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    mockReviewing.mockImplementation(() => ({ data: [], isLoading: false }));
+  });
+  const noRows = { data: [], isLoading: false, isError: false, error: null, refetch: vi.fn() };
+  // Exactly what `ClientError::TokenRejected` and `RateLimited` format.
+  const REFUSED = "GitHub rejected the token: Bad credentials";
+  const RATE_LIMITED = "GitHub rate limit reached — polling will resume automatically (retry in 60 seconds)";
+  const signIn = (mobile: boolean) =>
+    mobile ? /On the desktop, sign in with `gh auth login`/ : /Sign in with `gh auth login`, then relaunch Headstate/;
+
+  // `useReviewing` hands its error over stripped, with the verdicts beside
+  // it; `usePullRequests` hands over the raw rejection, marker and all.
+  const reviewing = (data: unknown[], refused: boolean, refetch: () => void) => {
+    mockQuery.mockReturnValue(noRows);
+    mockReviewing.mockImplementation(() => ({
+      data, isLoading: false, isError: true, notAsked: false, tokenRejected: refused,
+      error: new Error(refused ? REFUSED : RATE_LIMITED), refetch,
+    }));
+    useFilters.setState({ view: "to-review" });
+  };
+  const authored = (refused: boolean, refetch: () => void) => {
+    mockQuery.mockReturnValue({
+      data: undefined, isLoading: false, isError: true,
+      error: new Error(refused ? `${AUTH_EXPIRED} ${REFUSED}` : RATE_LIMITED), refetch,
+    });
+  };
+  const panels = [
+    { name: "To Review, empty", title: "Could not load the pull requests awaiting your review", arrange: (refused: boolean, refetch: () => void) => reviewing([], refused, refetch) },
+    { name: "To Review, saved rows", title: "Could not refresh the pull requests awaiting your review", arrange: (refused: boolean, refetch: () => void) => reviewing([PR_FIXTURES[0]], refused, refetch) },
+    { name: "My PRs, empty", title: "Could not load your pull requests", arrange: authored },
+  ];
+  const banners = [
+    { name: "My PRs", arrange: (refused: boolean) => authored(refused, vi.fn()) },
+    { name: "To Review", arrange: (refused: boolean) => reviewing([], refused, vi.fn()) },
+  ];
+  const githubLine = () => screen.getByText(/^GitHub: /);
+
+  for (const mobile of [false, true]) {
+    const on = mobile ? "phone" : "desktop";
+    for (const panel of panels) {
+      it(`${panel.name} (${on}): a refused token offers sign-in, not Try again`, () => {
+        build.mobile = mobile;
+        panel.arrange(true, vi.fn());
+        renderApp();
+        // Still a failure: the request was sent and GitHub answered.
+        expect(screen.getByText(panel.title)).toBeTruthy();
+        expect(screen.getByRole("alert")).toBeTruthy();
+        expect(screen.getByText(REFUSED)).toBeTruthy();
+        expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+        expect(screen.getByText(signIn(mobile))).toBeTruthy();
+        if (mobile) {
+          expect(screen.queryByRole("button", { name: /relaunch/i })).toBeNull();
+        } else {
+          screen.getByRole("button", { name: "Relaunch Headstate" }).click();
+          expect(relaunch).toHaveBeenCalledOnce();
+        }
+        expect(screen.queryByText(/headstate:/)).toBeNull();
+      });
+
+      it(`${panel.name} (${on}): a 403 rate limit keeps Try again`, () => {
+        build.mobile = mobile;
+        const refetch = vi.fn();
+        panel.arrange(false, refetch);
+        renderApp();
+        expect(screen.getByText(panel.title)).toBeTruthy();
+        screen.getByRole("button", { name: /try again/i }).click();
+        expect(refetch).toHaveBeenCalledOnce();
+        expect(screen.queryByText(/sign in with/i)).toBeNull();
+      });
+    }
+
+    for (const banner of banners) {
+      it(`banner, ${banner.name} (${on}): a refused token offers sign-in, not Retry`, () => {
+        build.mobile = mobile;
+        useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
+        banner.arrange(true);
+        renderApp();
+        const line = githubLine();
+        expect(line.textContent).toContain(`GitHub: ${REFUSED}`);
+        expect(line.textContent).toMatch(signIn(mobile));
+        expect(line.textContent).not.toContain("headstate:");
+        expect(line.textContent).not.toContain("not checked");
+        expect(line.getAttribute("role")).toBe("alert");
+        expect(within(line).queryByRole("button", { name: "Retry" })).toBeNull();
+      });
+
+      it(`banner, ${banner.name} (${on}): a 403 rate limit keeps Retry`, () => {
+        build.mobile = mobile;
+        useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
+        banner.arrange(false);
+        renderApp();
+        const line = githubLine();
+        expect(line.textContent).toContain(`GitHub: ${RATE_LIMITED}`);
+        expect(line.textContent).not.toMatch(/sign in with/i);
+        expect(within(line).getByRole("button", { name: "Retry" })).toBeTruthy();
+      });
+    }
+  }
 });

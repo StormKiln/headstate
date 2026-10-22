@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { NOT_ASKED, NOT_AUTHENTICATED } from "@/lib/notAsked";
+import { AUTH_EXPIRED, NOT_ASKED, NOT_AUTHENTICATED } from "@/lib/notAsked";
 import { QueryError } from "./QueryError";
 
 describe("QueryError", () => {
@@ -62,6 +62,47 @@ describe("QueryError", () => {
   it("never shows the marker itself", () => {
     render(<QueryError title="Could not load" message={`${NOT_ASKED} not authenticated`} />);
     expect(screen.queryByText(new RegExp(NOT_ASKED))).toBeNull();
+  });
+});
+
+/// #2008: GitHub refused the token. A request WAS sent, so it is a
+/// failure -- but the token is read once at startup, so a retry sends the
+/// same refused credential and cannot work (#1050).
+describe("QueryError, refused token", () => {
+  const REFUSED = "GitHub rejected the token: Bad credentials";
+
+  it("is an alert offering sign-in and a relaunch, not Try again, even with a retry and a report", () => {
+    render(<QueryError title="Could not load" message={`${AUTH_EXPIRED} ${REFUSED}`} onRetry={vi.fn()} report />);
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(REFUSED)).toBeTruthy();
+    expect(screen.getByText(/Sign in with `gh auth login`, then relaunch Headstate\./)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Relaunch Headstate" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    // A dead token is the user's to fix, not a bug to report.
+    expect(screen.queryByRole("button", { name: /report this/i })).toBeNull();
+    expect(screen.queryByText(new RegExp(AUTH_EXPIRED))).toBeNull();
+  });
+
+  it("takes the caller's verdict for an already-stripped message", () => {
+    render(<QueryError title="Could not load" message={REFUSED} tokenRejected onRetry={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    expect(screen.getByText(/Sign in with `gh auth login`/)).toBeTruthy();
+  });
+
+  /// A 403 rate or secondary limit is not a refused token: it clears after
+  /// the reset, so its retry must stay.
+  it("keeps Try again for a rate limit", () => {
+    const onRetry = vi.fn();
+    render(
+      <QueryError
+        title="Could not load"
+        message="GitHub rate limit reached — polling will resume automatically (retry in 60 seconds)"
+        onRetry={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/sign in with/i)).toBeNull();
   });
 });
 
