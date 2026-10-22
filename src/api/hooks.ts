@@ -923,11 +923,34 @@ export function useVenvWalkProgress(enabled: boolean) {
 ///
 /// A parse failure yields `undefined`, not a throw: a corrupt cache row
 /// must cost the cold-start paint and nothing else.
+///
+/// # The key carries the scope the backend keys on (#1962)
+///
+/// `read_cached_scan` looks the row up by kind AND by the sorted root
+/// set -- plus the discovery exclusions, for worktrees and artifacts. Keyed by kind
+/// alone, this side held one answer per kind for the whole session, so
+/// after a directory change the Artifacts page went on painting the
+/// previous folders' scan, with its age, because `staleTime: Infinity`
+/// never asked again. With the scope in the key, a new root set is a
+/// new entry: an answer read under the old roots cannot be served under
+/// the new ones, whatever invalidation does or does not run.
+///
+/// Not read until the scope is known. Reading without it would cache
+/// whatever the backend's current scope is under a key that names none.
 export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
+  const dirs = useQuery({ queryKey: ["worktree-dirs"], queryFn: getWorktreeDirs, staleTime: Infinity, enabled });
+  const scoped = kind === "worktrees" || kind === "artifacts";
+  const exclusions = useQuery({
+    queryKey: ["discovery-exclusions"],
+    queryFn: getDiscoveryExclusions,
+    staleTime: Infinity,
+    enabled: enabled && scoped,
+  });
+  const scope = cachedScanScope(dirs.data, scoped ? exclusions.data : []);
   const query = useQuery({
-    queryKey: ["cached-scan", kind],
+    queryKey: ["cached-scan", kind, scope],
     queryFn: () => readCachedScan(kind), // No `signal`: an unmount must not discard a finished read (#1944, #1974).
-    enabled,
+    enabled: enabled && scope !== null,
     staleTime: Infinity,
     // A cache miss is the answer, not a failure to retry three times.
     retry: false,
@@ -943,6 +966,15 @@ export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   } catch {
     return undefined;
   }
+}
+
+/// What `read_cached_scan` keys a row on, as a query-key part, or
+/// `null` while either half is unknown -- including an answer that is not
+/// a list, which names no scope. Sorted, as the backend's `scan_key`
+/// sorts, so reordering the directories is not a new entry.
+function cachedScanScope(dirs: string[] | undefined, exclusions: string[] | undefined) {
+  if (!Array.isArray(dirs) || !Array.isArray(exclusions)) return null;
+  return { roots: [...dirs].sort(), exclusions: [...exclusions].sort() };
 }
 
 const diskRefreshes = new WeakMap<QueryClient, Map<string, Promise<unknown>>>();
@@ -4318,11 +4350,11 @@ export function useWorktreeDirs() {
       qc.cancelQueries({ queryKey: ["worktrees"] }),
       qc.cancelQueries({ queryKey: ["cached-scan", "worktrees"] }),
     ]);
+    // The saved-scan key carries the exclusions (#1962), so writing the
+    // new set moves `useCachedScan` to a new entry and the old scope's
+    // row cannot be read under it. Still marked stale, so a return to an
+    // earlier scope asks the backend rather than trusting this session.
     qc.setQueryData(["discovery-exclusions"], applied);
-    qc.setQueryData(["cached-scan", "worktrees"], null);
-    // And marked stale, so the next cold paint asks the backend again
-    // under the NEW scope rather than trusting this session's answer for
-    // the old one (#1962's frontend half; the key still omits the scope).
     await qc.invalidateQueries({ queryKey: ["cached-scan"], refetchType: "none" });
     if (opts.rescan === false) {
       // Stale, not refetched: the caller's next step rescans.
@@ -4335,10 +4367,10 @@ export function useWorktreeDirs() {
   const set = (dirs: string[]) =>
     setWorktreeDirs(dirs).then(async (applied) => {
       diskRefreshes.get(qc)?.clear();
-      // `cached-scan` too (#1962's frontend half): its key does not carry
-      // the roots and it is `staleTime: Infinity`, so without this a
-      // changed root set would go on painting the previous set's saved
-      // scan, labelled with an age, for the rest of the session.
+      // `cached-scan` too: its key carries the roots (#1962), so a new
+      // set is a new entry anyway, but a return to an earlier set must
+      // ask the backend again rather than trust a `staleTime: Infinity`
+      // answer from before the change.
       const keys = ["worktrees", "artifacts", "worktree-sizes", "artifact-sizes", "venvs", "venv-sizes", "disk-inventory", "cached-scan"];
       await Promise.all(keys.map((key) => qc.cancelQueries({ queryKey: [key] })));
       await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key], refetchType: "none" })));
