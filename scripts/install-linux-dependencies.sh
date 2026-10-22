@@ -26,8 +26,59 @@ run_apt() {
     timeout --kill-after=5s "$deadline" apt-get "${apt_options[@]}" "$@"
 }
 
-# Reject incomplete indexes. No index/configuration failure is retried.
-run_apt apt-update 300s -o APT::Update::Error-Mode=any update
+retire_azure_mirror() {
+  local stage="$1" label="$2"
+  # Hosted runners use this exact mirror-list pathname. Only recognize their
+  # official entries; never rewrite custom sources or introduce another mirror.
+  # Index paths and signed metadata remain unchanged: mirror+file identifies
+  # the same archive, and APT validates cached/new .debs against its indexes.
+  python3 "$script_dir/ci-command.py" run "$label" -- \
+    sudo -n python3 - /etc/apt/apt-mirrors.txt \
+      "$RUNNER_TEMP/ci-diagnostics/$stage.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+evidence = json.loads(Path(sys.argv[2]).read_text())
+if evidence.get("captureIncomplete") or evidence.get("state") != "completed":
+    print("Primary APT evidence is incomplete; refusing recovery.")
+    sys.exit(1)
+path = Path(sys.argv[1])
+azure = 'http://azure.archive.ubuntu.com/ubuntu/'
+archive = 'https://archive.ubuntu.com/ubuntu/'
+security = 'https://security.ubuntu.com/ubuntu/'
+if not path.is_file():
+    print('No hosted-runner mirror list; refusing to change sources.')
+    sys.exit(1)
+lines = path.read_text().splitlines(keepends=True)
+entries = [(line, line.split()[0]) for line in lines
+           if line.strip() and not line.lstrip().startswith('#')]
+urls = {url for _, url in entries}
+if not {azure, archive} <= urls or not urls <= {azure, archive, security}:
+    print('Unrecognized mirror list; refusing to change sources.')
+    sys.exit(1)
+path.write_text(''.join(line for line in lines
+                        if not line.strip() or line.lstrip().startswith('#')
+                        or line.split()[0] != azure))
+print('Retrying APT with the existing official Ubuntu HTTPS mirrors.')
+PY
+}
+
+# #2018: index fetches can stall on the same Azure mirror as package archives.
+# Split the existing five-minute index budget across two attempts; strict signed
+# indexes remain mandatory. Retry only a clean timeout, never APT validation or
+# configuration failures, and retain each attempt's evidence separately. APT
+# may report Err:/W: before its final E: summary, so refuse all three forms.
+update_status=0
+run_apt apt-update 150s -o APT::Update::Error-Mode=any update || update_status=$?
+if [ "$update_status" -ne 0 ]; then
+  if [ "$update_status" -ne 124 ] ||
+     grep -Eq '^(E:|Err:|W:)' "$RUNNER_TEMP/ci-diagnostics/apt-update.log" ||
+     ! retire_azure_mirror apt-update apt-index-mirror-fallback; then
+    exit "$update_status"
+  fi
+  run_apt apt-update-fallback 150s -o APT::Update::Error-Mode=any update
+fi
 
 # Download first: no dpkg changes can have happened if this attempt fails.
 # Two 300s attempts share the original 600s network budget, and keep completed
@@ -50,41 +101,7 @@ if [ "$apt_status" -ne 0 ]; then
     *) exit "$apt_status" ;; # Includes forced SIGKILL (137) and capture failures.
   esac
 
-  # Hosted runners use this exact mirror-list pathname. Only recognize their
-  # official entries; never rewrite custom sources or introduce another mirror.
-  # Index paths and signed metadata remain unchanged: mirror+file identifies
-  # the same archive, and APT validates cached/new .debs against its indexes.
-  if ! python3 "$script_dir/ci-command.py" run apt-mirror-fallback -- \
-    sudo -n python3 - /etc/apt/apt-mirrors.txt \
-      "$RUNNER_TEMP/ci-diagnostics/apt-download-primary.json" <<'PY'
-from pathlib import Path
-import json
-import sys
-
-evidence = json.loads(Path(sys.argv[2]).read_text())
-if evidence.get("captureIncomplete") or evidence.get("state") != "completed":
-    print("Primary download evidence is incomplete; refusing recovery.")
-    sys.exit(1)
-path = Path(sys.argv[1])
-azure = 'http://azure.archive.ubuntu.com/ubuntu/'
-archive = 'https://archive.ubuntu.com/ubuntu/'
-security = 'https://security.ubuntu.com/ubuntu/'
-if not path.is_file():
-    print('No hosted-runner mirror list; refusing to change sources.')
-    sys.exit(1)
-lines = path.read_text().splitlines(keepends=True)
-entries = [(line, line.split()[0]) for line in lines
-           if line.strip() and not line.lstrip().startswith('#')]
-urls = {url for _, url in entries}
-if not {azure, archive} <= urls or not urls <= {azure, archive, security}:
-    print('Unrecognized mirror list; refusing to change sources.')
-    sys.exit(1)
-path.write_text(''.join(line for line in lines
-                        if not line.strip() or line.lstrip().startswith('#')
-                        or line.split()[0] != azure))
-print('Retrying downloads with the existing official Ubuntu HTTPS mirrors.')
-PY
-  then
+  if ! retire_azure_mirror apt-download-primary apt-mirror-fallback; then
     exit "$apt_status"
   fi
   run_apt apt-download-fallback 300s --download-only install -y "$@"
