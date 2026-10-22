@@ -18,6 +18,29 @@ describe("GitHub inventory summary", () => {
   ] as [Partial<SourceRefreshSnapshot>, string][])("qualifies %j", (patch, text) => {
     expect(summary(patch)).toMatchObject({ text, warning: true });
   });
+  // #1927: a request Headstate declined to send is not a failure to load,
+  // and the wire marker must never reach the title or a screen reader.
+  it.each([
+    [{ phase: "not_asked", error: "headstate:not-asked GitHub sign-in is required", prs: undefined }],
+    [{ phase: "not_asked", error: "headstate:not-asked GitHub sign-in is required" }],
+    // Declined requests can still arrive as `failed`; the marker decides.
+    [{ phase: "failed", error: "headstate:not-asked over the request budget" }],
+    [{ phase: "not_asked", error: null }],
+  ] as [Partial<SourceRefreshSnapshot>][])("reports %j as not asked, not as a failure", (patch) => {
+    const result = summary(patch);
+    expect(result.text).toBe("Review requests not checked");
+    expect(result.text).not.toMatch(/^Could not/);
+    expect(result.measurement).toBe("not_checked");
+    expect(result.warning).toBe(true);
+    expect(result.explanation).toContain("Not asked");
+    expect(result.explanation).not.toContain("headstate:");
+  });
+  it("strips the expired-token marker from a real failure", () => {
+    const result = summary({ phase: "failed", error: "headstate:expired-token GitHub rejected the token" });
+    expect(result.text).toBe("Could not refresh review requests");
+    expect(result.explanation).toContain("GitHub rejected the token");
+    expect(result.explanation).not.toContain("headstate:");
+  });
   it("separates ready date history from current readiness", () => {
     const result = summary({ prs: [{ ...row, observation: { ...row.observation, ready_at_state: "retained" } }] });
     expect(result).toMatchObject({ text: "Review requests checked", warning: false });

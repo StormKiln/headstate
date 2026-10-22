@@ -895,7 +895,11 @@ mod tests {
         }
         let dirs = vec![root.display().to_string()];
         let census = std::time::Instant::now();
-        let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+        let scan = crate::worktrees::DiscoveryScope {
+            roots: dirs,
+            ..Default::default()
+        }
+        .scan();
         let census_ms = census.elapsed().as_millis();
         let repos: Vec<(String, String)> = scan
             .repos

@@ -1054,6 +1054,7 @@ export default function App() {
                 // (#1934). Only a settled failure counts -- retrying and
                 // not-asked are not "could not reach".
                 unreachable={(view === "to-review" ? reviewingReceipt.phase === "failed" : pollError !== null) && source.length === 0}
+                list={view === "to-review" ? "reviewing" : "authored"}
               />
             )}
           </div>

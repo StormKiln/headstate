@@ -66,16 +66,95 @@ pub fn repository_update_paths(repos: &[super::model::Repo]) -> Vec<String> {
         .collect()
 }
 
-/// Refuse a changed repository set before a bulk action touches any checkout.
-/// Canonical paths admit aliases and overlapping roots without widening scope.
-pub fn validate_update_scope(expected: &[String], actual: &[String]) -> Result<(), String> {
-    fn keys(paths: &[String]) -> Result<std::collections::BTreeSet<std::path::PathBuf>, String> {
-        paths.iter().map(|path| std::fs::canonicalize(path).map_err(|error| format!("Could not verify repository scope at {path}: {error}; refresh the repository list"))).collect()
+/// The repositories a run may act on: those the user was SHOWN
+/// (`expected`) that the fresh scan (`actual`) still finds, in the fresh
+/// scan's order. Every other repository on either side gets an outcome
+/// saying why it was left alone (#1954).
+///
+/// The scope never WIDENS: a repository the fresh scan found that the user
+/// was not shown is skipped, not updated. Canonical paths admit aliases
+/// and overlapping roots without widening it.
+///
+/// It also never refuses the whole run. It used to: one deleted folder, or
+/// one repository the fresh scan could not list, refused all 45 with a
+/// "refresh" message beside a button with no refresh. Partial is not
+/// nothing -- the other 44 are an answer.
+///
+/// - A path that cannot be canonicalised -> `Failed`, carrying the OS's
+///   reason. It could not be read, which is the side that needs attention,
+///   and the same side `classify_for_update` puts a missing directory on.
+/// - Shown, but no longer found by discovery -> `Skipped`.
+/// - Found, but not shown -> `Skipped`.
+pub fn reconcile_update_scope(
+    expected: &[String],
+    actual: &[String],
+) -> (Vec<String>, Vec<RepoUpdateOutcome>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+    type Keyed<'p> = (BTreeMap<PathBuf, &'p String>, Vec<PathBuf>);
+    /// Canonical key -> the first spelling of it, plus first-seen order.
+    /// `unreadable` is by raw path, so a path unreadable on both sides is
+    /// reported once.
+    fn keys<'p>(
+        paths: &'p [String],
+        unreadable: &mut BTreeSet<String>,
+        left_alone: &mut Vec<RepoUpdateOutcome>,
+    ) -> Keyed<'p> {
+        let mut out: BTreeMap<PathBuf, &'p String> = BTreeMap::new();
+        let mut order = Vec::new();
+        for path in paths {
+            match std::fs::canonicalize(path) {
+                Ok(key) => {
+                    if let std::collections::btree_map::Entry::Vacant(slot) = out.entry(key) {
+                        order.push(slot.key().clone());
+                        slot.insert(path);
+                    }
+                }
+                Err(error) => {
+                    if unreadable.insert(path.clone()) {
+                        left_alone.push(RepoUpdateOutcome {
+                            path: path.clone(),
+                            result: UpdateResult::Failed {
+                                error: format!("could not read this path: {error}"),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        (out, order)
     }
-    if keys(expected)? != keys(actual)? {
-        return Err("Repository discovery changed since this list was displayed; refresh the repository list before updating".into());
+    let mut left_alone = Vec::new();
+    let mut unreadable = BTreeSet::new();
+    let (shown, shown_order) = keys(expected, &mut unreadable, &mut left_alone);
+    let (found, found_order) = keys(actual, &mut unreadable, &mut left_alone);
+
+    let mut scope = Vec::new();
+    for key in &found_order {
+        let path = found[key];
+        if shown.contains_key(key) {
+            scope.push(path.clone());
+        } else {
+            left_alone.push(RepoUpdateOutcome {
+                path: path.clone(),
+                result: UpdateResult::Skipped {
+                    reason: "not in the list this update started from -- refresh to include it"
+                        .into(),
+                },
+            });
+        }
     }
-    Ok(())
+    for key in &shown_order {
+        if !found.contains_key(key) {
+            left_alone.push(RepoUpdateOutcome {
+                path: shown[key].clone(),
+                result: UpdateResult::Skipped {
+                    reason: "no longer found by repository discovery".into(),
+                },
+            });
+        }
+    }
+    (scope, left_alone)
 }
 
 /// How long a whole run may take before it stops by itself.
@@ -213,7 +292,9 @@ pub struct RepoUpdateOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAllReport {
     pub diagnostics: Vec<super::scan::DiscoveryDiagnostic>,
-    /// One entry per input, in the input's order.
+    /// One entry per input, in the input's order -- followed, from the
+    /// command, by one per repository [`reconcile_update_scope`] left out
+    /// of the run, each saying why (#1954).
     pub outcomes: Vec<RepoUpdateOutcome>,
     /// Whether the user stopped it. Distinct from an error: the
     /// repositories that were fast-forwarded before the stop really were.
@@ -415,7 +496,7 @@ fn classify_for_update(path: &str) -> Verdict {
     match upstream_now(dir) {
         Upstream::Behind(_) => Verdict::Pull,
         // Level as of the refs on disk. The pull is still what confirms
-        // it, because those refs may be old -- see `update_all_with`.
+        // it, because those refs may be old -- see `update_all_observed`.
         Upstream::Current => Verdict::Pull,
         Upstream::Ahead(n) => Verdict::Skip(format!(
             "{n} commit{} ahead of the remote, nothing to pull",
@@ -495,9 +576,13 @@ fn upstream_now(dir: &Path) -> Upstream {
 /// > pure git plumbing and has no AppHandle, which is also what keeps it
 /// > testable without a running app.
 ///
-/// `on_progress` is called with `(done, total)` AFTER each repository, so
-/// the count means "done" and not "started" -- a progress bar that
-/// reaches 100% before the work finishes is worse than none.
+/// `on_progress` is called with `(done, total, outcome)` AFTER each
+/// repository, so the count means "done" and not "started" -- a progress
+/// bar that reaches 100% before the work finishes is worse than none.
+///
+/// The outcome travels with it so the run registry keeps what a run
+/// applied even when the run itself never returns (#1947): an outcome that
+/// exists only inside this function's stack is lost with it.
 ///
 /// # Why a level repository is still pulled
 ///
@@ -511,11 +596,11 @@ fn upstream_now(dir: &Path) -> Upstream {
 /// ACTUALLY did, not from what the stale refs predicted -- which is the
 /// whole of "the table's verdict may decide what to offer, never what to
 /// do".
-pub fn update_all_with(
+pub fn update_all_observed(
     paths: &[String],
     unreadable: Vec<String>,
     stop: &Arc<AtomicBool>,
-    mut on_progress: impl FnMut(usize, usize),
+    mut on_progress: impl FnMut(usize, usize, &RepoUpdateOutcome),
 ) -> UpdateAllReport {
     let total = paths.len();
     let started = Instant::now();
@@ -564,13 +649,14 @@ pub fn update_all_with(
                 Err(error) => UpdateResult::Failed { error },
             },
         };
-        outcomes.push(RepoUpdateOutcome {
+        let outcome = RepoUpdateOutcome {
             path: path.clone(),
             result,
-        });
+        };
         // AFTER the work, and INCLUDING failures -- a batch where several
         // fail would otherwise appear to stall.
-        on_progress(i + 1, total);
+        on_progress(i + 1, total, &outcome);
+        outcomes.push(outcome);
     }
 
     UpdateAllReport {
@@ -580,6 +666,19 @@ pub fn update_all_with(
         timed_out,
         unreadable,
     }
+}
+
+/// [`update_all_observed`] for tests that only count.
+#[cfg(test)]
+fn update_all_with(
+    paths: &[String],
+    unreadable: Vec<String>,
+    stop: &Arc<AtomicBool>,
+    mut on_progress: impl FnMut(usize, usize),
+) -> UpdateAllReport {
+    update_all_observed(paths, unreadable, stop, |done, total, _| {
+        on_progress(done, total)
+    })
 }
 
 #[cfg(test)]
@@ -695,19 +794,40 @@ mod tests {
             vec![main_path.clone()],
             "hidden scan records cannot enter the bulk action scope"
         );
-        assert!(validate_update_scope(std::slice::from_ref(&main_path), &paths).is_ok());
+        let (scope, left) = reconcile_update_scope(std::slice::from_ref(&main_path), &paths);
+        assert_eq!(scope, paths);
+        assert!(left.is_empty(), "{left:?}");
+        let (scope, left) = reconcile_update_scope(&[], &paths);
         assert!(
-            validate_update_scope(&[], &paths).is_err(),
-            "a newly visible checkout still changes scope"
+            scope.is_empty(),
+            "a newly visible checkout is never updated unseen"
         );
         assert!(
-            validate_update_scope(&paths, &[]).is_err(),
-            "a removed visible checkout still changes scope"
+            matches!(
+                &left[..],
+                [RepoUpdateOutcome {
+                    result: UpdateResult::Skipped { .. },
+                    ..
+                }]
+            ),
+            "{left:?}"
+        );
+        let (scope, left) = reconcile_update_scope(&paths, &[]);
+        assert!(scope.is_empty(), "a removed checkout is not updated");
+        assert!(
+            matches!(
+                &left[..],
+                [RepoUpdateOutcome {
+                    result: UpdateResult::Skipped { .. },
+                    ..
+                }]
+            ),
+            "{left:?}"
         );
     }
 
     #[test]
-    fn scope_comparison_accepts_aliases_duplicates_and_rejects_changes() {
+    fn scope_comparison_accepts_aliases_duplicates_and_never_widens() {
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("first");
         let second = tmp.path().join("second");
@@ -716,14 +836,62 @@ mod tests {
         let a = first.to_string_lossy().into_owned();
         let b = second.to_string_lossy().into_owned();
         let alias = first.join(".").to_string_lossy().into_owned();
-        assert!(validate_update_scope(&[a.clone(), alias], std::slice::from_ref(&a)).is_ok());
-        assert!(validate_update_scope(std::slice::from_ref(&a), &[a.clone(), b]).is_err());
-        assert!(validate_update_scope(std::slice::from_ref(&a), &[]).is_err());
-        assert!(validate_update_scope(
-            &[tmp.path().join("missing").to_string_lossy().into_owned()],
-            &[a]
-        )
-        .is_err());
+        let (scope, left) = reconcile_update_scope(&[a.clone(), alias], std::slice::from_ref(&a));
+        assert_eq!(scope, vec![a.clone()], "an alias is the same repository");
+        assert!(left.is_empty(), "{left:?}");
+
+        let (scope, left) =
+            reconcile_update_scope(std::slice::from_ref(&a), &[a.clone(), b.clone()]);
+        assert_eq!(scope, vec![a.clone()], "the unseen repository is not added");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, b);
+        assert!(
+            matches!(&left[0].result, UpdateResult::Skipped { reason } if reason.contains("refresh")),
+            "{left:?}"
+        );
+    }
+
+    /// #1954: one shown repository that no longer exists used to refuse
+    /// the whole run. The others are still updated, and the missing one is
+    /// reported with a reason rather than silently dropped.
+    #[test]
+    fn one_missing_repository_does_not_refuse_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let a = first.to_string_lossy().into_owned();
+        let b = second.to_string_lossy().into_owned();
+        let missing = tmp.path().join("missing").to_string_lossy().into_owned();
+
+        let (scope, left) = reconcile_update_scope(
+            &[a.clone(), missing.clone(), b.clone()],
+            &[a.clone(), b.clone()],
+        );
+        assert_eq!(
+            scope,
+            vec![a.clone(), b.clone()],
+            "the rest are still updated"
+        );
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].path, missing);
+        assert!(
+            matches!(&left[0].result, UpdateResult::Failed { error } if error.contains("could not read")),
+            "{left:?}"
+        );
+
+        // Shown and still on disk, but absent from the fresh scan (a
+        // transient failure while listing it): skipped, the rest go on.
+        let (scope, left) =
+            reconcile_update_scope(&[a.clone(), b.clone()], std::slice::from_ref(&a));
+        assert_eq!(scope, vec![a.clone()]);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].path, b);
+        assert!(
+            matches!(&left[0].result, UpdateResult::Skipped { reason } if reason.contains("no longer found")),
+            "{left:?}"
+        );
     }
 
     #[test]

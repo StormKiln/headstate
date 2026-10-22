@@ -1,4 +1,5 @@
 import { observeCorpusPopulation } from "./corpusPopulationEvents";
+import { commandError } from "../lib/errorKind";
 import { observeTranscript } from "./transcriptMeasurement";
 import { beginCaptureWrite, acceptCaptureWrite } from "./measurementCapture";
 import { hydratePossibleProcesses } from "@/lib/possibleProcesses";
@@ -122,6 +123,8 @@ import {
   fetchRefs,
   updateAllRepositories,
   cancelUpdateAll,
+  updateAllState,
+  type UpdateAllState,
   removeOrphan,
   assessedWorktrees,
   dockerBuilds,
@@ -399,6 +402,16 @@ const SCAN_ARTIFACTS_FN = timed("scan_artifacts_report", scanArtifactsReport);
 const SCAN_VENVS_FN = timed("scan_venvs", scanVenvs);
 
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
+const REVIEWING_COUNT_KEY = ["reviewing-count"] as const;
+
+/// Invalidate the review list AND its sidebar badge (#1930).
+///
+/// `["reviewing"]` does not prefix-match `["reviewing-count"]`, so every
+/// site that invalidated the list left the badge on its old number.
+function invalidateReviewing(qc: QueryClient) {
+  void qc.invalidateQueries({ queryKey: ["reviewing"] });
+  void qc.invalidateQueries({ queryKey: REVIEWING_COUNT_KEY });
+}
 
 
 /// The `refreshPrs` currently in flight, so a second caller joins it
@@ -587,7 +600,7 @@ export function useActOnPr() {
       const patch = listPatchFor(action);
       if (patch !== undefined && row?.id === id) patchListRows(qc, repo, number, patch, row);
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
-      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      invalidateReviewing(qc);
       await refreshPrs(qc);
     });
   };
@@ -610,7 +623,7 @@ export function useMergeStack() {
   ) =>
     mergeStack(repo, number, action, expectedHead).then((outcome) => {
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
-      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      invalidateReviewing(qc);
       void refreshPrs(qc);
       return outcome;
     });
@@ -735,7 +748,7 @@ export function useReviewPr() {
         qc.setQueryData<PullRequest[]>(key, rows => patched ?? (rows ? apply(rows) : rows));
       }
     }
-    void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    invalidateReviewing(qc);
     void mergeFieldsAfterReview(qc, repo, number);
     void refreshPrs(qc);
     return outcome.receipt;
@@ -914,7 +927,7 @@ export function useVenvWalkProgress(enabled: boolean) {
 /// # The key carries the scope the backend keys on (#1962)
 ///
 /// `read_cached_scan` looks the row up by kind AND by the sorted root
-/// set -- plus the discovery exclusions, for worktrees. Keyed by kind
+/// set -- plus the discovery exclusions, for worktrees and artifacts. Keyed by kind
 /// alone, this side held one answer per kind for the whole session, so
 /// after a directory change the Artifacts page went on painting the
 /// previous folders' scan, with its age, because `staleTime: Infinity`
@@ -926,7 +939,7 @@ export function useVenvWalkProgress(enabled: boolean) {
 /// whatever the backend's current scope is under a key that names none.
 export function useCachedScan<T>(kind: ScanKind, enabled: boolean) {
   const dirs = useQuery({ queryKey: ["worktree-dirs"], queryFn: getWorktreeDirs, staleTime: Infinity, enabled });
-  const scoped = kind === "worktrees";
+  const scoped = kind === "worktrees" || kind === "artifacts";
   const exclusions = useQuery({
     queryKey: ["discovery-exclusions"],
     queryFn: getDiscoveryExclusions,
@@ -2537,7 +2550,7 @@ export function useUpdatePrBranch() {
   return (id: string, repo: string, number: number, expectedHead: string) =>
     updatePrBranch(id, repo, number, expectedHead).then(async () => {
       void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
-      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      invalidateReviewing(qc);
       await refreshPrs(qc);
     });
 }
@@ -2569,7 +2582,7 @@ export function useActOnPrs() {
           if (!o.inventory_managed && o.error === null && target?.row?.id === target?.id) patchListRows(qc, o.repo, o.number, patch, target?.row);
         }
       }
-      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      invalidateReviewing(qc);
       await refreshPrs(qc);
       return outcomes;
     });
@@ -3692,17 +3705,70 @@ export function useFetchRefs() {
 export function useUpdateAllRepositories() {
   const qc = useQueryClient();
   return (expectedPaths?: readonly string[]) =>
-    updateAllRepositories(expectedPaths).then((report) => {
-      void qc.invalidateQueries({ queryKey: ["worktrees"] });
-      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
-      // And the overview's verdicts (#1042). This button lives ON the
-      // All Repositories table, so its own rows are the ones that would
-      // otherwise sit stale for five minutes -- a run that moved 30
-      // repositories, reporting so, above a table still saying they are
-      // behind.
-      void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
-      return report;
+    updateAllRepositories(expectedPaths).finally(() => {
+      // On a rejection too (#1947, #1954): a run that died part-way, or a
+      // phone whose call timed out while the desktop carried on, may still
+      // have moved repositories, and a scope the desktop found changed is
+      // only fixed by a fresh list.
+      invalidateUpdatedRepositories(qc);
+      // The registry is the record of how the run went (#1946).
+      void qc.invalidateQueries({ queryKey: UPDATE_ALL_STATE_KEY });
     });
+}
+
+function invalidateUpdatedRepositories(qc: QueryClient) {
+  void qc.invalidateQueries({ queryKey: ["worktrees"] });
+  void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+  // And the overview's verdicts (#1042). This button lives ON the
+  // All Repositories table, so its own rows are the ones that would
+  // otherwise sit stale for five minutes -- a run that moved 30
+  // repositories, reporting so, above a table still saying they are
+  // behind.
+  void qc.invalidateQueries({ queryKey: ["repo-upstream"] });
+}
+
+const UPDATE_ALL_STATE_KEY = ["update-all-state"] as const;
+
+/// How often a running Update All is re-read from the desktop's registry.
+const UPDATE_ALL_POLL_MS = 2_000;
+
+/// The desktop's record of the Update All run: going, or how the last one
+/// ended (#1946).
+///
+/// The run outlives whoever started it. On the desktop the button unmounts
+/// when the user leaves the page and the run carries on for up to ~22
+/// minutes; on the phone the call itself gives up after 120 s while the
+/// desktop carries on. Component state and the command's return value both
+/// die with them, so this registry read is what the button shows from.
+///
+/// Polls while the run is going, and stops once it has ended. Refetched on
+/// mount, so returning to the page shows the run as it is now. When a run
+/// this hook watched ends, the repository views are invalidated, because
+/// the caller that would have done it may be long gone.
+export function useUpdateAllState(): { data: UpdateAllState | null | undefined; refetch: () => Promise<UpdateAllState | null | undefined> } {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: UPDATE_ALL_STATE_KEY,
+    queryFn: updateAllState,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchInterval: (q) => (q.state.data?.state === "running" ? UPDATE_ALL_POLL_MS : false),
+  });
+  const data = query.data;
+  const watched = useRef<number | null>(null);
+  useEffect(() => {
+    if (data?.state === "running") {
+      watched.current = data.run;
+    } else if (data && watched.current === data.run) {
+      watched.current = null;
+      invalidateUpdatedRepositories(qc);
+    }
+  }, [data, qc]);
+  const { refetch } = query;
+  return {
+    data,
+    refetch: useCallback(() => refetch().then((r) => r.data), [refetch]),
+  };
 }
 
 /// Ask the Update All run to stop.
@@ -4906,6 +4972,10 @@ export function useReviewing(enabled = true) {
     // Keep the visible review queue live without polling hidden views.
     refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
     refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
+    // The backend already bounds its own attempts; a client retry
+    // multiplied `get_reviewing` calls behind it (#1929). The view
+    // offers an explicit retry instead.
+    retry: false,
   });
 
   // Live data the moment it exists; the cache only until then. Note
@@ -4927,7 +4997,15 @@ export function useReviewing(enabled = true) {
 
   // Provider status and command transport outcomes are reconciled separately;
   // TanStack's last promise completion cannot replace a newer publication.
-  const error = source.error === null ? null : new Error(source.error);
+  //
+  // With NOTHING to show, the live query's own rejection is the answer
+  // (#1929). Several of `refreshWithState`'s throws -- a changed pairing,
+  // session or account, or no snapshot at all -- never reach `source.error`,
+  // and without this the view had no data, no error and no loading state,
+  // and `reviewing = []` rendered as a confident empty queue.
+  // Display prose either way: the wire marker never reaches the screen.
+  const errorText = source.error ?? (data === undefined && live.error ? live.error : null);
+  const error = errorText === null ? null : new Error(commandError(errorText).message);
   const isError = error !== null;
   const status = isError ? "error" as const
     : data === undefined ? "pending" as const : "success" as const;
@@ -4963,9 +5041,24 @@ export function useReviewing(enabled = true) {
 /// The badge's own query, so it does not depend on the list being
 /// fetched. MEASURED: 1 rate-limit point and ~0.9s, against 6 and ~4s
 /// for the list it replaces here.
+///
+/// Re-counted whenever the review list's accepted rows change (#1930):
+/// a poll, an approval or a native receipt all land there, and the badge
+/// used to keep its old number until a focus change or remount -- beside
+/// a list that already disagreed with it. Unchanged polls keep the same
+/// row identity (`replaceEqualDeep`), so this costs nothing when nothing
+/// moved.
 export function useReviewingCount(enabled = true) {
+  const qc = useQueryClient();
+  const rows = useSourceRefresh("reviewing").prs;
+  const seen = useRef(rows);
+  useEffect(() => {
+    if (rows === seen.current) return;
+    seen.current = rows;
+    if (rows !== undefined) void qc.invalidateQueries({ queryKey: REVIEWING_COUNT_KEY });
+  }, [qc, rows]);
   return useQuery({
-    queryKey: ["reviewing-count"],
+    queryKey: REVIEWING_COUNT_KEY,
     queryFn: REVIEWING_COUNT_FN,
     enabled,
     staleTime: 60_000,
@@ -5002,7 +5095,8 @@ export function useIncomplete(): number {
   return refused;
 }
 
-/// How many pull requests the review list is MISSING, or 0.
+/// How many pull requests the review list is MISSING: `0` once complete,
+/// `null` when completeness cannot be established, `undefined` unchecked.
 ///
 /// The 100 -> 50 fallback returns a short list and everything
 /// downstream presented it as complete. The v3.5.3 diagnostic log
@@ -5015,9 +5109,14 @@ export function useIncomplete(): number {
 /// Advisory, like `useTruncation` and `useIncomplete`: the pull
 /// requests that arrived are real, so the list is shown and annotated
 /// rather than replaced with an error.
-export function useReviewShortfall(): number | null {
+///
+/// `undefined` until a receipt or event reports -- not yet checked, so no
+/// claim either way. It used to start at `0`, which means "nothing
+/// missing", and presented an unchecked list as a confirmed census until
+/// the first event (#1964). `useTruncation` already had it right.
+export function useReviewShortfall(): number | null | undefined {
   const receipt = useSourceRefresh("reviewing");
-  const [short, setShort] = useState<number | null>(0);
+  const [short, setShort] = useState<number | null>();
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;

@@ -190,8 +190,13 @@ pub fn diag_log(line: String) {
 /// The cached snapshot, so the window paints real content at launch rather
 /// than a spinner. Never talks to GitHub.
 #[tauri::command]
-pub fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
-    let snapshot = get_source_snapshot(
+pub async fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+    off_main_thread(move || get_cached_blocking(app)).await
+}
+
+/// [`get_cached`]'s work, on the caller's thread (#1959).
+pub(crate) fn get_cached_blocking(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+    let snapshot = get_source_snapshot_blocking(
         app,
         crate::identity::Source::default(),
         CachedList::Authored,
@@ -264,7 +269,16 @@ async fn refresh_reply(
 
 /// Source-scoped cache/readback for slice 6. Legacy commands stay GitHub-only.
 #[tauri::command]
-pub fn get_source_snapshot(
+pub async fn get_source_snapshot(
+    app: AppHandle,
+    source: crate::identity::Source,
+    list: CachedList,
+) -> Result<crate::store::source_cache::OwnedSourceSnapshot, String> {
+    off_main_thread(move || get_source_snapshot_blocking(app, source, list)).await
+}
+
+/// [`get_source_snapshot`]'s work, on the caller's thread (#1959).
+fn get_source_snapshot_blocking(
     app: AppHandle,
     source: crate::identity::Source,
     list: CachedList,
@@ -301,7 +315,21 @@ pub fn get_source_snapshot(
 
 /// Persist the desktop's selected network sources independently of auth.
 #[tauri::command]
-pub fn set_source_selection(
+pub async fn set_source_selection(app: AppHandle, selection: String) -> Result<(), String> {
+    off_main_thread(move || {
+        set_source_selection_blocking(
+            app.clone(),
+            selection,
+            app.state(),
+            app.state(),
+            app.state(),
+        )
+    })
+    .await
+}
+
+/// [`set_source_selection`]'s work, on the caller's thread (#1959).
+fn set_source_selection_blocking(
     app: AppHandle,
     selection: String,
     enabled: State<'_, crate::poll::GithubSourceEnabled>,
@@ -1444,11 +1472,14 @@ pub async fn read_cached_scan(
     app: AppHandle,
     kind: crate::store::scans::ScanKind,
 ) -> Result<Option<crate::store::scans::CachedScan>, String> {
-    let dirs = get_worktree_dirs(app.clone());
-    let dirs = if kind == crate::store::scans::ScanKind::Worktrees {
-        discovery_cache_scope(&dirs, &get_discovery_exclusions(app.clone())?)
-    } else {
-        dirs
+    let scope = discovery_scope(&app).await?;
+    // The walks that honour exclusions key on them; venvs deliberately do
+    // not honour them (see `scan_venvs`), so they key on the roots.
+    let dirs = match kind {
+        crate::store::scans::ScanKind::Worktrees | crate::store::scans::ScanKind::Artifacts => {
+            discovery_cache_scope(&scope)
+        }
+        _ => scope.roots,
     };
     let db = db_path(&app);
     tauri::async_runtime::spawn_blocking(move || {
@@ -1481,7 +1512,11 @@ fn scan_key(dirs: &[String]) -> String {
 /// costs the NEXT cold start a blank page, and turning that into a
 /// failed scan would cost the user the result they are looking at right
 /// now. A refused database is "do not write", not "no data" (#1143).
-fn remember_scan<T: serde::Serialize>(
+///
+/// The open and the write run on the blocking pool: every caller is an
+/// async command, and doing them inline held a runtime worker for up to
+/// the five-second `busy_timeout` (#1959, the #1090 shape).
+async fn remember_scan<T: serde::Serialize>(
     app: &AppHandle,
     kind: crate::store::scans::ScanKind,
     dirs: &[String],
@@ -1491,14 +1526,30 @@ fn remember_scan<T: serde::Serialize>(
         log::warn!("scan cache: could not serialise a {kind:?} result");
         return;
     };
-    match open_db(&db_path(app)) {
+    let db = db_path(app);
+    let key = scan_key(dirs);
+    // Logged on change (#1966): this runs after every scan, so a broken
+    // database repeated the same line for as long as it stayed broken.
+    off_main_thread(move || match open_db(&db) {
         Ok(conn) => {
-            if let Err(e) = crate::store::scans::save(&conn, kind, &scan_key(dirs), &payload) {
-                log::warn!("scan cache: could not store a {kind:?} result: {e}");
+            if let Err(e) = crate::store::scans::save(&conn, kind, &key, &payload) {
+                crate::log_dedup::log_while!(
+                    warn,
+                    "scan_cache.store",
+                    "scan cache: could not store a {kind:?} result: {e}"
+                );
+            } else {
+                crate::log_dedup::log_cleared!("scan_cache.store", "scan cache: storing again");
             }
+            crate::log_dedup::log_cleared!("scan_cache.open", "scan cache: database open again");
         }
-        Err(e) => log::warn!("scan cache: no database to store a {kind:?} result: {e}"),
-    }
+        Err(e) => crate::log_dedup::log_while!(
+            warn,
+            "scan_cache.open",
+            "scan cache: no database to store a {kind:?} result: {e}"
+        ),
+    })
+    .await
 }
 
 /// Repos and their worktrees, unclassified, WITH what could not be read.
@@ -1522,17 +1573,13 @@ fn remember_scan<T: serde::Serialize>(
 /// unreadable directory labels the list partial rather than blanking it.
 #[tauri::command]
 pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan, String> {
-    let dirs = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app).await?;
+    let cache_scope = discovery_cache_scope(&scope);
     // Blocking filesystem and subprocess work: keep it off the async
     // runtime's worker threads.
-    let excluded = get_discovery_exclusions(app.clone())?;
-    let cache_scope = discovery_cache_scope(&dirs, &excluded);
-    let scanned = dirs.clone();
-    let out = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting_excluding(&scanned, &excluded)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let out = tauri::async_runtime::spawn_blocking(move || scope.scan())
+        .await
+        .map_err(|e| e.to_string())?;
     // Stored so the next cold start paints rows instead of a blank page
     // (#1152). Paths and sizes only -- `Safety` rides along in the
     // payload but `read_cached_scan` is never the source of a removal
@@ -1542,7 +1589,8 @@ pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan
         crate::store::scans::ScanKind::Worktrees,
         &cache_scope,
         &out,
-    );
+    )
+    .await;
     // And in memory, so the file browser can validate a click against
     // this scan instead of walking again (#1952).
     remember_scanned_repos(&cache_scope, &out);
@@ -1831,16 +1879,19 @@ pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, Strin
     // The SAME roots the worktree view scans. A second directory setting
     // would be one more thing to keep in sync, and a user who has told
     // the app where their code lives has already answered this question.
-    let dirs = get_worktree_dirs(app.clone());
+    //
+    // And the same exclusions (#1949): this walk's depth and budget
+    // notices inside an excluded backup are what the exclusion is for.
+    let scope = discovery_scope(&app).await?;
+    let dirs = discovery_cache_scope(&scope);
     // Progress, so the page can say "3 of 4 roots, 142 found" rather
     // than showing an unqualified spinner for a walk it cannot see the
     // end of (#1151). One event per ROOT: per-directory would be 178
     // for a 1.5 s walk, and the number that answers "is it stuck" is
     // how many roots are left.
     let emitter = app.clone();
-    let scanned = dirs.clone();
     let (out, failed) = scan_blocking(move || {
-        crate::artifacts::scan::scan_streaming(&scanned, &mut |p| {
+        crate::artifacts::scan::scan_streaming_excluding(&scope, &mut |p| {
             use tauri::Emitter;
             let _ = emitter.emit("artifact-scan-progress", p);
         })
@@ -1860,7 +1911,7 @@ pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, Strin
     // blank page (#1152). Stored AFTER the failed roots are reported:
     // the cache holds what this scan actually found, and a root that
     // could not be read contributes nothing to it either way.
-    remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out);
+    remember_scan(&app, crate::store::scans::ScanKind::Artifacts, &dirs, &out).await;
     Ok(ArtifactScan {
         artifacts: out,
         failed_roots: failed,
@@ -2110,6 +2161,104 @@ where
     .map_err(|e| e.to_string())
 }
 
+/// Run a command's database work on the blocking pool, and wait for it
+/// without holding the caller's thread (#1959).
+///
+/// Tauri runs a plain `fn` command on the MAIN thread. `open_db` sets a
+/// five-second `busy_timeout`, so a sync command that opens the database
+/// while a background writer holds it freezes the whole window for up to
+/// that long. Every such command is an `async fn` that hands its
+/// unchanged body, kept as `<name>_blocking`, to this.
+///
+/// A panic in `work` is re-raised here rather than turned into a value:
+/// the sync command it replaces would have panicked too, and several of
+/// these commands have no error channel to carry it in.
+/// `no_sync_command_opens_the_database` holds commands to it.
+pub(crate) async fn off_main_thread<T, F>(work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(tauri::Error::JoinError(e)) if e.is_panic() => {
+            std::panic::resume_unwind(e.into_panic())
+        }
+        Err(e) => panic!("database work did not complete: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod off_main_thread_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    /// Poll `fut` exactly once and report whether it finished. Returns
+    /// as soon as the poll does, which is the property under test: the
+    /// caller is handed back its thread rather than held by the work.
+    async fn poll_once<F: Future + Unpin>(fut: &mut F) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx))).await
+    }
+
+    /// The #1959 shape: another connection holds the write lock, and a
+    /// command writes a setting. The sync command did that open and write
+    /// on the caller's (the main) thread, which then sat in `open_db`'s
+    /// five-second `busy_timeout`. Through `off_main_thread` the caller's
+    /// first poll returns Pending WHILE the lock is still held, the write
+    /// runs on another thread, and it lands once the lock is released.
+    ///
+    /// Deterministic without a sleep: the lock is released only after the
+    /// pending poll has been observed and the worker has reported in, and
+    /// the write cannot finish before the release.
+    #[tokio::test]
+    async fn database_work_does_not_hold_the_callers_thread_while_the_file_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headstate.db");
+        let holder = open_db(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let caller = std::thread::current().id();
+        let (started, worker) = std::sync::mpsc::channel();
+        let db = path.clone();
+        let mut write = Box::pin(off_main_thread(move || {
+            started.send(std::thread::current().id()).unwrap();
+            let conn = open_db(&db).map_err(|e| e.to_string())?;
+            settings::set(&conn, settings::keys::POLL_INTERVAL_SECS, &120u64)
+                .map_err(|e| e.to_string())
+        }));
+
+        assert!(
+            poll_once(&mut write).await.is_pending(),
+            "the caller must get its thread back while another connection holds the lock"
+        );
+        let worker = worker.recv().unwrap();
+        assert_ne!(
+            worker, caller,
+            "the database work ran on the caller's thread"
+        );
+
+        holder.execute_batch("COMMIT").unwrap();
+        assert_eq!(write.await, Ok(()));
+        let stored: Option<u64> =
+            settings::get(&holder, settings::keys::POLL_INTERVAL_SECS).unwrap();
+        assert_eq!(
+            stored,
+            Some(120),
+            "the write landed once the lock was released"
+        );
+    }
+
+    /// A panic in the work is the command's panic, not a value: the sync
+    /// commands this replaced would have panicked, and several have no
+    /// error channel to report one in.
+    #[tokio::test]
+    #[should_panic(expected = "store exploded")]
+    async fn a_panic_in_the_work_reaches_the_caller() {
+        off_main_thread::<(), _>(|| panic!("store exploded")).await;
+    }
+}
+
 /// Older companions require numeric sizes; an incomplete measurement fails.
 #[tauri::command]
 pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
@@ -2171,7 +2320,9 @@ pub async fn remove_artifacts(
     app: AppHandle,
     paths: Vec<String>,
 ) -> Result<Vec<crate::artifacts::ArtifactRemoval>, String> {
-    let roots = get_worktree_dirs(app.clone());
+    // Containment roots: the configured roots, never narrowed by the
+    // exclusions, and never a guessed default when they cannot be read.
+    let roots = get_worktree_dirs(app.clone()).await?;
     // DIAGNOSTIC LOGGING (Settings > diagnostic log). This is the
     // BACKEND half of the freeze report: paired with the frontend's
     // `ui remove_artifacts` marks, it separates a slow `remove_dir_all`
@@ -2208,7 +2359,13 @@ pub async fn remove_artifacts(
 pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
     // One budget across every filesystem scan (#1149), held by the
     // walk itself rather than by this future -- see `scan_blocking`.
-    let roots = get_worktree_dirs(app.clone());
+    //
+    // The bare roots, NOT the discovery scope: a deliberate opt-out of the
+    // exclusions (#1949). A venv is orphaned when no project directory
+    // hashes to it, so leaving an excluded folder out of the set would
+    // mark every venv whose project lives there as removable. Exclusions
+    // narrow what is listed; they must never make something look orphaned.
+    let roots = get_worktree_dirs(app.clone()).await?;
     let emitter = app.clone();
     let scanned = roots.clone();
     let out = scan_blocking(move || {
@@ -2236,7 +2393,7 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
     })
     .await?;
     // 9-40 s measured, every cold start, against a blank page (#1152).
-    remember_scan(&app, crate::store::scans::ScanKind::Venvs, &roots, &out);
+    remember_scan(&app, crate::store::scans::ScanKind::Venvs, &roots, &out).await;
     Ok(out)
 }
 
@@ -2316,12 +2473,14 @@ pub async fn remove_venvs(
     // re-verified at delete time, symlinks refused, containment inside
     // Poetry's cache enforced. Those are facts about the path rather
     // than guesses about intent.
-    let prefs = get_ui_prefs(app.clone());
+    let prefs = get_ui_prefs(app.clone()).await;
     let policy = crate::caches::RemovalPolicy {
         allow_stale: true,
         stale_days: crate::poll::stale_venv_days(&prefs),
     };
-    let roots = get_worktree_dirs(app);
+    // The bare roots, for `scan_venvs`' reason: the orphan verdict needs
+    // every project directory, excluded or not (#1949).
+    let roots = get_worktree_dirs(app).await?;
     let out = tauri::async_runtime::spawn_blocking(move || {
         let dirs = crate::caches::project_dirs(&roots);
         crate::caches::remove_venvs(&paths, &dirs, policy)
@@ -2350,7 +2509,12 @@ pub async fn remove_venvs(
 /// moment the branch moves: a verdict about different commits is not a
 /// verdict about these ones.
 #[tauri::command]
-pub fn mark_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
+pub async fn mark_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
+    off_main_thread(move || mark_assessed_blocking(app, worktree_path)).await
+}
+
+/// [`mark_assessed`]'s work, on the caller's thread (#1959).
+fn mark_assessed_blocking(app: AppHandle, worktree_path: String) -> Result<(), String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     let head = crate::worktrees::head_oid(&worktree_path)
         .map_err(|e| format!("could not read the worktree's head: {e}"))?;
@@ -2390,7 +2554,12 @@ fn set_assessed(
 /// path rather than unlocking it, so it needs no confirmation of its
 /// own.
 #[tauri::command]
-pub fn clear_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
+pub async fn clear_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
+    off_main_thread(move || clear_assessed_blocking(app, worktree_path)).await
+}
+
+/// [`clear_assessed`]'s work, on the caller's thread (#1959).
+fn clear_assessed_blocking(app: AppHandle, worktree_path: String) -> Result<(), String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     set_assessed(&conn, &worktree_path, None)
         .map_err(|e| format!("could not clear the assessment: {e}"))
@@ -2407,13 +2576,13 @@ pub fn clear_assessed(app: AppHandle, worktree_path: String) -> Result<(), Strin
 /// runs.
 #[tauri::command]
 pub async fn preview_cleanup(app: AppHandle) -> Result<Vec<crate::cleanup::LedgerEntry>, String> {
-    let roots = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app).await?;
     let db = db_path(&app);
     let now = chrono::Utc::now().to_rfc3339();
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&db).map_err(|e| e.to_string())?;
         let prefs = crate::cleanup::prefs(&conn);
-        let entries = crate::cleanup::propose(&prefs, &roots, &now);
+        let entries = crate::cleanup::propose(&prefs, &scope, &now);
         crate::cleanup::record(&conn, &entries);
         log::info!("cleanup preview: {} entries", entries.len());
         Ok(entries)
@@ -2424,13 +2593,23 @@ pub async fn preview_cleanup(app: AppHandle) -> Result<Vec<crate::cleanup::Ledge
 
 /// The cleanup ledger, newest first.
 #[tauri::command]
-pub fn cleanup_log(app: AppHandle) -> Result<Vec<crate::cleanup::LedgerEntry>, String> {
+pub async fn cleanup_log(app: AppHandle) -> Result<Vec<crate::cleanup::LedgerEntry>, String> {
+    off_main_thread(move || cleanup_log_blocking(app)).await
+}
+
+/// [`cleanup_log`]'s work, on the caller's thread (#1959).
+fn cleanup_log_blocking(app: AppHandle) -> Result<Vec<crate::cleanup::LedgerEntry>, String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     crate::cleanup::recent(&conn, 200).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_cleanup_prefs(app: AppHandle) -> crate::cleanup::CleanupPrefs {
+pub async fn get_cleanup_prefs(app: AppHandle) -> crate::cleanup::CleanupPrefs {
+    off_main_thread(move || get_cleanup_prefs_blocking(app)).await
+}
+
+/// [`get_cleanup_prefs`]'s work, on the caller's thread (#1959).
+fn get_cleanup_prefs_blocking(app: AppHandle) -> crate::cleanup::CleanupPrefs {
     open_db(&db_path(&app))
         .ok()
         .map(|c| crate::cleanup::prefs(&c))
@@ -2438,7 +2617,15 @@ pub fn get_cleanup_prefs(app: AppHandle) -> crate::cleanup::CleanupPrefs {
 }
 
 #[tauri::command]
-pub fn set_cleanup_prefs(
+pub async fn set_cleanup_prefs(
+    app: AppHandle,
+    prefs: crate::cleanup::CleanupPrefs,
+) -> Result<(), String> {
+    off_main_thread(move || set_cleanup_prefs_blocking(app, prefs)).await
+}
+
+/// [`set_cleanup_prefs`]'s work, on the caller's thread (#1959).
+fn set_cleanup_prefs_blocking(
     app: AppHandle,
     prefs: crate::cleanup::CleanupPrefs,
 ) -> Result<(), String> {
@@ -3071,7 +3258,9 @@ pub async fn fetch_refs(path: String) -> Result<String, String> {
 /// check nor a containment check, reachable from a paired peer.
 #[tauri::command]
 pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
-    let roots = get_worktree_dirs(app);
+    // An unreadable setting refuses the removal: containment against a
+    // guessed `~/code` is not containment against what the user chose.
+    let roots = get_worktree_dirs(app).await?;
     let p = path.clone();
     let result =
         tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_orphan(&p, &roots))
@@ -3093,19 +3282,84 @@ pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
 /// Defaults to `~/code` when unset, so the app works with no
 /// configuration on a machine that follows that convention -- and says
 /// what it scanned rather than silently finding nothing.
+///
+/// An `Err` when the setting could not be read (#1956). This used to fold
+/// a database that would not open, a query that failed and a value that
+/// would not decode into "the user configured `~/code`", so a busy
+/// database silently scanned -- and cached, and offered for deletion
+/// containment -- a folder nobody chose. Only an UNSET (or emptied)
+/// setting means the default.
 #[tauri::command]
-pub fn get_worktree_dirs(app: AppHandle) -> Vec<String> {
-    open_db(&db_path(&app))
-        .ok()
-        .and_then(|c| settings::get::<Vec<String>>(&c, settings::keys::WORKTREE_DIRS).ok())
-        .flatten()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(default_worktree_dirs)
+pub async fn get_worktree_dirs(app: AppHandle) -> Result<Vec<String>, String> {
+    // Off the main thread (#1959): the read can wait out busy_timeout.
+    let db = db_path(&app);
+    off_main_thread(move || worktree_dirs_at(&db)).await
+}
+
+fn worktree_dirs_at(db: &std::path::Path) -> Result<Vec<String>, String> {
+    let conn = open_db(db).map_err(settings_database_error)?;
+    read_worktree_dirs(&conn)
+}
+
+fn settings_database_error(e: impl std::fmt::Display) -> String {
+    format!("could not open the settings database: {e}")
+}
+
+fn read_worktree_dirs(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    match settings::get_strict::<Vec<String>>(conn, settings::keys::WORKTREE_DIRS) {
+        Ok(Some(dirs)) if !dirs.is_empty() => Ok(dirs),
+        Ok(_) => Ok(default_worktree_dirs()),
+        Err(e) => Err(format!("could not read the scan folders setting: {e}")),
+    }
+}
+
+fn read_discovery_exclusions(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    settings::get_strict(conn, settings::keys::DISCOVERY_EXCLUSIONS)
+        .map(|value| value.unwrap_or_default())
+        .map_err(|e| format!("could not read the discovery exclusions setting: {e}"))
+}
+
+/// The roots and exclusions every discovery walker scans (#1949, #1956).
+///
+/// The two settings fail differently on purpose. Roots that could not be
+/// read are an `Err`: there is no honest set to scan. Exclusions that
+/// could not be read are NOT -- the roots are real, and scanning them
+/// without exclusions can only visit more -- so the scan runs and says so
+/// (`DiscoveryScope::exclusions_unread`), rather than the page failing
+/// over a filter.
+async fn discovery_scope(app: &AppHandle) -> Result<crate::worktrees::DiscoveryScope, String> {
+    // Off the main thread (#1959), like every other settings read.
+    let db = db_path(app);
+    off_main_thread(move || discovery_scope_at(&db)).await
+}
+
+fn discovery_scope_at(db: &std::path::Path) -> Result<crate::worktrees::DiscoveryScope, String> {
+    let conn = open_db(db).map_err(settings_database_error)?;
+    let roots = read_worktree_dirs(&conn)?;
+    let (exclusions, exclusions_unread) = match read_discovery_exclusions(&conn) {
+        Ok(exclusions) => (exclusions, None),
+        Err(e) => {
+            log::warn!("discovery: {e}; scanning without exclusions");
+            (Vec::new(), Some(e))
+        }
+    };
+    Ok(crate::worktrees::DiscoveryScope {
+        roots,
+        exclusions,
+        exclusions_unread,
+    })
 }
 
 /// Capture policy in the cache identity so an old in-flight scan cannot
 /// overwrite the snapshot used after exclusions change.
-fn discovery_cache_scope(dirs: &[String], exclusions: &[String]) -> Vec<String> {
+///
+/// A scope whose exclusions could not be read keys on the roots alone,
+/// which is exactly what its scan covered.
+fn discovery_cache_scope(scope: &crate::worktrees::DiscoveryScope) -> Vec<String> {
+    discovery_cache_key(&scope.roots, &scope.exclusions)
+}
+
+fn discovery_cache_key(dirs: &[String], exclusions: &[String]) -> Vec<String> {
     let mut scope = dirs.to_vec();
     if !exclusions.is_empty() {
         let mut sorted = exclusions.to_vec();
@@ -3120,11 +3374,14 @@ fn discovery_cache_scope(dirs: &[String], exclusions: &[String]) -> Vec<String> 
 }
 
 #[tauri::command]
-pub fn get_discovery_exclusions(app: AppHandle) -> Result<Vec<String>, String> {
-    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    settings::get_strict(&conn, settings::keys::DISCOVERY_EXCLUSIONS)
-        .map(|value| value.unwrap_or_default())
-        .map_err(|e| e.to_string())
+pub async fn get_discovery_exclusions(app: AppHandle) -> Result<Vec<String>, String> {
+    // Off the main thread (#1959).
+    let db = db_path(&app);
+    off_main_thread(move || {
+        let conn = open_db(&db).map_err(settings_database_error)?;
+        read_discovery_exclusions(&conn)
+    })
+    .await
 }
 
 fn validate_discovery_exclusions(paths: Vec<String>) -> Result<Vec<String>, String> {
@@ -3157,7 +3414,18 @@ fn validate_discovery_exclusions(paths: Vec<String>) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
-pub fn set_discovery_exclusions(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+pub async fn set_discovery_exclusions(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    off_main_thread(move || set_discovery_exclusions_blocking(app, paths)).await
+}
+
+/// [`set_discovery_exclusions`]'s work, on the caller's thread (#1959).
+fn set_discovery_exclusions_blocking(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
     let paths = validate_discovery_exclusions(paths)?;
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &paths)
@@ -3165,14 +3433,20 @@ pub fn set_discovery_exclusions(app: AppHandle, paths: Vec<String>) -> Result<Ve
     // The worktrees scan cache is keyed on roots AND exclusions, so a
     // changed exclusion set already misses; this drops the rows keyed on
     // the old policy, exactly as `set_worktree_dirs` does for the roots
-    // (#1950). Best-effort for the same reason as there.
-    let dirs = get_worktree_dirs(app.clone());
-    if let Err(e) = crate::store::scans::retain_only(
-        &conn,
-        &scan_key(&dirs),
-        &scan_key(&discovery_cache_scope(&dirs, &paths)),
-    ) {
-        log::warn!("scan cache: could not drop entries for the previous exclusions: {e}");
+    // (#1950). Best-effort for the same reason as there -- including when
+    // the roots cannot be read: the setting the user changed is saved,
+    // and an unknown root set is a reason not to tidy, not to fail.
+    match read_worktree_dirs(&conn) {
+        Ok(dirs) => {
+            if let Err(e) = crate::store::scans::retain_only(
+                &conn,
+                &scan_key(&dirs),
+                &scan_key(&discovery_cache_key(&dirs, &paths)),
+            ) {
+                log::warn!("scan cache: could not drop entries for the previous exclusions: {e}");
+            }
+        }
+        Err(e) => log::warn!("scan cache: not tidied after an exclusions change: {e}"),
     }
     Ok(paths)
 }
@@ -3269,17 +3543,19 @@ pub async fn docker_state() -> crate::docker::DockerState {
 /// Resolved against the same directories the worktrees view scans, so a
 /// machine configured once works for both.
 pub async fn docker_images(app: AppHandle) -> Result<Vec<crate::docker::Image>, String> {
-    let dirs = get_worktree_dirs(app);
+    let scope = discovery_scope(&app).await?;
     // The heaviest of these: `scan_dirs_fast` is the same full worktree
     // expansion the Worktrees view pays ~2.6s for, and `classify` then
     // runs git per repository on top of it. Blocking the runtime on
     // that is what froze the app on every switch to this view.
-    tauri::async_runtime::spawn_blocking(move || docker_images_blocking(dirs))
+    tauri::async_runtime::spawn_blocking(move || docker_images_blocking(scope))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>, String> {
+fn docker_images_blocking(
+    scope: crate::worktrees::DiscoveryScope,
+) -> Result<Vec<crate::docker::Image>, String> {
     // EXPANDED into repositories, not passed as scan roots.
     //
     // `classify` resolves a SHA-shaped image tag by running git in each
@@ -3309,7 +3585,7 @@ fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>
     // Not escalated to an `Err`: the images that DID resolve are real,
     // and blanking the Docker page because one directory in `~/code` was
     // unreadable is the trade `ArtifactsPage` explicitly refuses.
-    let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+    let scan = scope.scan();
     if scan.is_partial() {
         log::warn!(
             "docker: {} scan {} could not be read, so image provenance may be \
@@ -4617,10 +4893,22 @@ pub struct ClaudifyCommand {
 }
 
 #[tauri::command]
-pub fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
+pub async fn set_worktree_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
+    off_main_thread(move || set_worktree_dirs_blocking(app, dirs)).await
+}
+
+/// [`set_worktree_dirs`]'s work, on the caller's thread (#1959).
+fn set_worktree_dirs_blocking(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
     let ok = validate_dirs(dirs)?;
-    let worktree_scope = discovery_cache_scope(&ok, &get_discovery_exclusions(app.clone())?);
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    // Unreadable exclusions must not refuse a change to the ROOTS (#1956):
+    // a scan then runs without them and stores under the roots-only key,
+    // which is the key kept here.
+    let exclusions = read_discovery_exclusions(&conn).unwrap_or_else(|e| {
+        log::warn!("discovery: {e}; keeping the roots-only scan cache");
+        Vec::new()
+    });
+    let worktree_scope = discovery_cache_key(&ok, &exclusions);
     settings::set(&conn, settings::keys::WORKTREE_DIRS, &ok).map_err(|e| e.to_string())?;
     // Drop scan caches keyed on the OLD set (#1152). Nothing stale is
     // painted without this -- the key is the whole set, so a changed
@@ -4835,7 +5123,13 @@ pub fn get_poll_interval(state: State<'_, crate::poll::PollInterval>) -> u64 {
 /// Absent means everything on, matching what the app did before this
 /// setting existed -- an upgrade must not silently mute a feature.
 #[tauri::command]
-pub fn get_notify_prefs(app: AppHandle) -> crate::poll::NotifyPrefs {
+pub async fn get_notify_prefs(app: AppHandle) -> crate::poll::NotifyPrefs {
+    off_main_thread(move || load_notify_prefs(app)).await
+}
+
+/// [`get_notify_prefs`]'s work, on the caller's thread (#1959). The
+/// background samplers in `lib.rs` already run off the main thread.
+pub(crate) fn load_notify_prefs(app: AppHandle) -> crate::poll::NotifyPrefs {
     open_db(&db_path(&app))
         .ok()
         .and_then(|c| crate::store::settings::get(&c, settings::keys::NOTIFY_PREFS).ok())
@@ -4845,8 +5139,8 @@ pub fn get_notify_prefs(app: AppHandle) -> crate::poll::NotifyPrefs {
 
 /// Interface preferences.
 #[tauri::command]
-pub fn get_ui_prefs(app: AppHandle) -> crate::poll::UiPrefs {
-    read_ui_prefs(&app)
+pub async fn get_ui_prefs(app: AppHandle) -> crate::poll::UiPrefs {
+    off_main_thread(move || read_ui_prefs(&app)).await
 }
 
 /// Read interface preferences, or the defaults if unreadable.
@@ -4887,7 +5181,16 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 /// Change interface preferences.
 #[tauri::command]
-pub fn set_ui_prefs(
+pub async fn set_ui_prefs(
+    app: AppHandle,
+    prefs: crate::poll::UiPrefs,
+    measurement_capture: Option<bool>,
+) -> Result<Option<crate::measurement::CaptureIdentity>, String> {
+    off_main_thread(move || set_ui_prefs_blocking(app, prefs, measurement_capture)).await
+}
+
+/// [`set_ui_prefs`]'s work, on the caller's thread (#1959).
+fn set_ui_prefs_blocking(
     app: AppHandle,
     prefs: crate::poll::UiPrefs,
     measurement_capture: Option<bool>,
@@ -4916,7 +5219,18 @@ pub fn set_ui_prefs(
 /// up without being nudged. Unlike the poll interval there is nothing
 /// in-memory to update -- the loop is the only reader.
 #[tauri::command]
-pub fn set_notify_prefs(app: AppHandle, prefs: crate::poll::NotifyPrefs) -> Result<(), String> {
+pub async fn set_notify_prefs(
+    app: AppHandle,
+    prefs: crate::poll::NotifyPrefs,
+) -> Result<(), String> {
+    off_main_thread(move || set_notify_prefs_blocking(app, prefs)).await
+}
+
+/// [`set_notify_prefs`]'s work, on the caller's thread (#1959).
+fn set_notify_prefs_blocking(
+    app: AppHandle,
+    prefs: crate::poll::NotifyPrefs,
+) -> Result<(), String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     crate::store::settings::set(&conn, settings::keys::NOTIFY_PREFS, &prefs)
         .map_err(|e| e.to_string())?;
@@ -4938,7 +5252,15 @@ pub fn set_notify_prefs(app: AppHandle, prefs: crate::poll::NotifyPrefs) -> Resu
 /// an hour. Returns the value actually applied, so the UI reflects the
 /// clamp rather than showing a number the backend rejected.
 #[tauri::command]
-pub fn set_poll_interval(
+pub async fn set_poll_interval(app: AppHandle, secs: u64) -> u64 {
+    off_main_thread(move || {
+        set_poll_interval_blocking(app.clone(), secs, app.state(), app.state(), app.state())
+    })
+    .await
+}
+
+/// [`set_poll_interval`]'s work, on the caller's thread (#1959).
+fn set_poll_interval_blocking(
     app: AppHandle,
     secs: u64,
     state: State<'_, crate::poll::PollInterval>,
@@ -4994,8 +5316,13 @@ pub async fn count_reviewing(client: State<'_, GhClient>) -> Result<u64, String>
 /// cannot be made meaningfully faster (see #328), so the only way to
 /// stop the user staring at nothing is to have something to show.
 #[tauri::command]
-pub fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
-    let snapshot = get_source_snapshot(
+pub async fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
+    off_main_thread(move || get_cached_reviewing_blocking(app)).await
+}
+
+/// [`get_cached_reviewing`]'s work, on the caller's thread (#1959).
+fn get_cached_reviewing_blocking(app: AppHandle) -> Result<CachedSnapshot, String> {
+    let snapshot = get_source_snapshot_blocking(
         app,
         crate::identity::Source::default(),
         CachedList::Reviewing,
@@ -5026,12 +5353,17 @@ pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
 }
 
 #[tauri::command]
-pub fn get_gitlab_host(app: AppHandle) -> Result<String, String> {
-    configured_gitlab_host(&app)
+pub async fn get_gitlab_host(app: AppHandle) -> Result<String, String> {
+    off_main_thread(move || configured_gitlab_host(&app)).await
 }
 
 #[tauri::command]
-pub fn set_gitlab_host(
+pub async fn set_gitlab_host(app: AppHandle, host: String) -> Result<String, String> {
+    off_main_thread(move || set_gitlab_host_blocking(app.clone(), host, app.state())).await
+}
+
+/// [`set_gitlab_host`]'s work, on the caller's thread (#1959).
+fn set_gitlab_host_blocking(
     app: AppHandle,
     host: String,
     control: State<'_, Arc<crate::gitlab::poll::Control>>,
@@ -6960,13 +7292,13 @@ pub async fn claude_definitions(
 
     let user = defs::user_root()
         .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
-    let dirs = get_worktree_dirs(app.clone());
+    let scope = discovery_scope(&app).await?;
     // The plugin inventory, read on the blocking pool with everything
     // else. A plugin list we could not read is NOT an error: the user
     // and project scopes are real answers and worth showing, the trade
     // `list_worktrees` states. It surfaces as a `ScopeRefusal` below.
     tauri::async_runtime::spawn_blocking(move || {
-        let (repos, repo_refusals) = defs::project_roots(&dirs);
+        let (repos, repo_refusals) = defs::project_roots(&scope);
         let (installed, plugin_refusal) = installed_plugins();
         let plugins = plugin_roots(installed);
         let roots = defs::roots(Some(user), &repos, &plugins);
@@ -7434,10 +7766,8 @@ pub async fn claude_transcript_find(
 /// canonicalise, so a repository deleted since that scan is refused; a
 /// repository removed from the roots changes the scope and misses.
 async fn scanned_repo_root(app: AppHandle, repo_path: &str) -> Result<std::path::PathBuf, String> {
-    let scope = discovery_cache_scope(
-        &get_worktree_dirs(app.clone()),
-        &get_discovery_exclusions(app.clone())?,
-    );
+    // The same key `list_worktrees` records its scan under.
+    let scope = discovery_cache_scope(&discovery_scope(&app).await?);
     scanned_repo_root_with(scanned_repos(), &scope, repo_path, || async move {
         // `list_worktrees` records its result in `scanned_repos()`.
         let scan = list_worktrees(app).await?;
@@ -7628,24 +7958,25 @@ pub async fn update_all_repositories(
     app: AppHandle,
     expected_paths: Option<Vec<String>>,
 ) -> Result<crate::worktrees::UpdateAllReport, String> {
-    let dirs = get_worktree_dirs(app.clone());
-    let excluded = get_discovery_exclusions(app.clone())?;
+    let scope = discovery_scope(&app).await?;
 
     // The scan first, and on the blocking pool: it walks the scan roots
     // and spawns a `git worktree list` per repository.
-    let scan = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::scan_dirs_fast_reporting_excluding(&dirs, &excluded)
-    })
-    .await
-    .map_err(|e| format!("could not scan for repositories: {e}"))?;
+    let scan = tauri::async_runtime::spawn_blocking(move || scope.scan())
+        .await
+        .map_err(|e| format!("could not scan for repositories: {e}"))?;
 
     // The MAIN CHECKOUT of each repository, which is what the button is
     // about. A repository's other worktrees are branches the user is
     // working on, and pulling them is a different promise entirely.
-    let paths = crate::worktrees::repository_update_paths(&scan.repos);
-    if let Some(expected) = expected_paths {
-        crate::worktrees::validate_update_scope(&expected, &paths)?;
-    }
+    let discovered = crate::worktrees::repository_update_paths(&scan.repos);
+    // The displayed scope against the fresh one (#1954). Never refused as
+    // a whole: the repositories both agree on are updated, and every other
+    // one gets an outcome naming why it was left alone.
+    let (paths, left_alone) = match expected_paths {
+        Some(expected) => crate::worktrees::reconcile_update_scope(&expected, &discovered),
+        None => (discovered, Vec::new()),
+    };
     let unreadable = scan.unreadable;
     let diagnostics = scan.diagnostics;
 
@@ -7655,33 +7986,72 @@ pub async fn update_all_repositories(
     // `index.lock`. It also returns the flag the run reads to stop, so
     // the registry owns both halves -- `apply_updates_in_background`'s
     // shape exactly.
-    let stop = app
-        .state::<crate::repos::runs::UpdateAllRuns>()
-        .start(paths.len())?;
+    //
+    // The claim is a guard (#1947): however this function leaves, the
+    // registry does not stay `Running`.
+    let runs = app.state::<crate::repos::runs::UpdateAllRuns>();
+    let claim = runs.start(&paths)?;
+    let stop = claim.stop_flag();
 
-    let _ = app.emit("update-all-progress", (0usize, paths.len()));
+    let run_total = paths.len();
+    let _ = app.emit("update-all-progress", (0usize, run_total));
 
     let progress_app = app.clone();
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        crate::worktrees::update_all_with(&paths, unreadable, &stop, |done, total| {
-            // Counts only -- never paths. The same rule the two progress
-            // emitters beside this one state in identical terms: a
-            // progress event is not a place to leak what the user is
-            // working on. The repository paths are in the RESULT, where
-            // the user needs them to know where to go.
-            let _ = progress_app.emit("update-all-progress", (done, total));
-            // And into the registry, so a client that was asleep for the
-            // whole run can still ask how far it got.
-            progress_app
-                .state::<crate::repos::runs::UpdateAllRuns>()
-                .progress(done, total);
-        })
+    let run_unreadable = unreadable.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::update_all_observed(
+            &paths,
+            run_unreadable,
+            &stop,
+            |done, total, outcome| {
+                // Into the registry, so a client that was asleep for the
+                // whole run can still ask how far it got -- and so a run
+                // that dies keeps what it already applied (#1947).
+                progress_app
+                    .state::<crate::repos::runs::UpdateAllRuns>()
+                    .outcome_landed(outcome.clone());
+                // Counts only -- never paths. The same rule the two
+                // progress emitters beside this one state in identical
+                // terms: a progress event is not a place to leak what the
+                // user is working on. The repository paths are in the
+                // RESULT, where the user needs them to know where to go.
+                let _ = progress_app.emit("update-all-progress", (done, total));
+            },
+        )
     })
     .await;
-    // Before the `?`: a run that died part-way may still have moved refs.
+    // Before the match: a run that died part-way may still have moved refs
+    // (#1943), so the classify epoch moves whether or not it finished.
     invalidate_classify_passes();
-    let mut report = report.map_err(|e| format!("the update run failed to finish: {e}"))?;
+    let mut report = match joined {
+        Ok(report) => report,
+        Err(e) => {
+            // Partial is not nothing: the registry keeps every outcome the
+            // run recorded before it died, and says how it ended.
+            let failed = claim.failed(
+                format!("the update run failed to finish: {e}"),
+                crate::worktrees::UpdateAllReport {
+                    diagnostics,
+                    outcomes: left_alone,
+                    cancelled: false,
+                    timed_out: false,
+                    unreadable,
+                },
+            );
+            // The run's own outcomes come first; the scope's follow.
+            let attempted = failed
+                .outcomes
+                .iter()
+                .take(run_total)
+                .filter(|o| !matches!(o.result, crate::worktrees::UpdateResult::NotAttempted))
+                .count();
+            return Err(format!(
+                "the update run failed to finish after {attempted} of {run_total} repositories: {e}"
+            ));
+        }
+    };
     report.diagnostics = diagnostics;
+    report.outcomes.extend(left_alone);
 
     let updated = report
         .outcomes
@@ -7710,8 +8080,7 @@ pub async fn update_all_repositories(
 
     // Recorded BEFORE returning, so a phone that slept through the run
     // can read the outcome even though it held no event stream.
-    app.state::<crate::repos::runs::UpdateAllRuns>()
-        .finished(report.clone());
+    claim.finished(report.clone());
     Ok(report)
 }
 
@@ -7843,14 +8212,14 @@ pub async fn claude_config_health(
 ) -> Result<crate::claude::confighealth::Sweep, String> {
     let home = crate::auth::home_dir()
         .ok_or_else(|| "no home directory is set, so ~/.claude could not be read".to_string())?;
-    let dirs = get_worktree_dirs(app);
+    let scope = discovery_scope(&app).await?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        // The census first. `scan_dirs_fast_reporting` returns what it
-        // could not read alongside what it found, and that shortfall is
-        // carried into the sweep rather than dropped (#1025): it is what
-        // makes "38 repositories are clean" honest or not.
-        let scan = crate::worktrees::scan_dirs_fast_reporting(&dirs);
+        // The census first. `DiscoveryScope::scan` returns what it could
+        // not read alongside what it found, and that shortfall is carried
+        // into the sweep rather than dropped (#1025): it is what makes
+        // "38 repositories are clean" honest or not.
+        let scan = scope.scan();
         let repos: Vec<(String, String)> = scan
             .repos
             .iter()
@@ -9063,8 +9432,8 @@ mod tests {
             Some(paths.clone())
         );
         let roots = vec![tmp.path().to_string_lossy().into_owned()];
-        let old_key = scan_key(&discovery_cache_scope(&roots, &[]));
-        let new_key = scan_key(&discovery_cache_scope(&roots, &paths));
+        let old_key = scan_key(&discovery_cache_key(&roots, &[]));
+        let new_key = scan_key(&discovery_cache_key(&roots, &paths));
         assert_ne!(old_key, new_key);
         crate::store::scans::save(
             &conn,
@@ -9080,11 +9449,101 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert_eq!(discovery_cache_scope(&roots, &[]), roots);
+        assert_eq!(discovery_cache_key(&roots, &[]), roots);
         let mut reversed = vec!["b".into(), "a".into()];
-        let scope = discovery_cache_scope(&roots, &reversed);
+        let scope = discovery_cache_key(&roots, &reversed);
         reversed.reverse();
-        assert_eq!(scope, discovery_cache_scope(&roots, &reversed));
+        assert_eq!(scope, discovery_cache_key(&roots, &reversed));
+    }
+
+    /// #1956: a scan-folders setting that could not be read is an error,
+    /// never "the user configured `~/code`". Before, a value written by a
+    /// newer build, a failed query and an unopenable database all became
+    /// the default -- which was then scanned, cached, and used as the
+    /// containment boundary for deletes.
+    #[test]
+    fn an_unreadable_scan_folders_setting_is_an_error_not_the_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("settings.sqlite");
+        let conn = open_db(&db).unwrap();
+        // Unset and emptied are the two states that DO mean the default.
+        assert!(worktree_dirs_at(&db).is_ok());
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &Vec::<String>::new()).unwrap();
+        assert!(worktree_dirs_at(&db).is_ok());
+        let configured = vec![tmp.path().to_string_lossy().into_owned()];
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &configured).unwrap();
+        assert_eq!(worktree_dirs_at(&db).unwrap(), configured);
+
+        // A shape this build cannot decode, as a newer build might write.
+        conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = ?2",
+            [r#"{"roots":["/elsewhere"]}"#, settings::keys::WORKTREE_DIRS],
+        )
+        .unwrap();
+        let err = worktree_dirs_at(&db).expect_err("an undecodable setting is not the default");
+        assert!(err.contains("scan folders"), "{err}");
+        assert!(
+            discovery_scope_at(&db).is_err(),
+            "no honest set of roots to scan"
+        );
+
+        // The settings table itself unreadable.
+        conn.execute("DROP TABLE settings", []).unwrap();
+        assert!(worktree_dirs_at(&db).is_err());
+
+        // A database that cannot be opened at all: its path is a folder.
+        assert!(worktree_dirs_at(tmp.path()).is_err());
+    }
+
+    /// #1956: exclusions that could not be read do not fail discovery.
+    /// The roots were read, and scanning without exclusions can only visit
+    /// more, so the scan runs -- and says it ran without them, as a
+    /// settings failure rather than an unreadable path.
+    #[test]
+    fn unreadable_exclusions_scan_without_them_and_say_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("settings.sqlite");
+        let root = tmp.path().join("code");
+        std::fs::create_dir(&root).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let conn = open_db(&db).unwrap();
+        settings::set(&conn, settings::keys::WORKTREE_DIRS, &roots).unwrap();
+        let excluded = vec![root.join("backup").to_string_lossy().into_owned()];
+        settings::set(&conn, settings::keys::DISCOVERY_EXCLUSIONS, &excluded).unwrap();
+
+        let readable = discovery_scope_at(&db).unwrap();
+        assert_eq!(readable.exclusions, excluded);
+        assert_eq!(readable.exclusions_unread, None);
+        assert!(readable
+            .scan()
+            .diagnostics
+            .iter()
+            .all(|d| d.kind != crate::worktrees::scan::DiscoveryDiagnosticKind::SettingsError));
+
+        conn.execute(
+            "UPDATE settings SET value = 'not json' WHERE key = ?1",
+            [settings::keys::DISCOVERY_EXCLUSIONS],
+        )
+        .unwrap();
+        let scope = discovery_scope_at(&db).expect("unreadable exclusions must not fail the scan");
+        assert_eq!(scope.roots, roots, "the roots that WERE read are kept");
+        assert!(scope.exclusions.is_empty());
+        assert!(scope.exclusions_unread.is_some());
+        // Keyed on exactly what the scan covered: the roots, unexcluded.
+        assert_eq!(discovery_cache_scope(&scope), roots);
+
+        let scan = scope.scan();
+        let said: Vec<_> = scan
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == crate::worktrees::scan::DiscoveryDiagnosticKind::SettingsError)
+            .collect();
+        assert_eq!(said.len(), 1, "{:?}", scan.diagnostics);
+        assert_eq!(said[0].root, roots[0]);
+        assert!(said[0].message.contains("exclusions could not be read"));
+        // A settings failure, not an unreadable path: the safety gates
+        // keyed on `is_partial()` are unchanged.
+        assert!(!scan.is_partial(), "{:?}", scan.unreadable);
     }
 
     #[test]

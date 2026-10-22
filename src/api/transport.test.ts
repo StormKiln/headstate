@@ -646,6 +646,9 @@ const POLL_EVENTS: [string, () => unknown][] = [
         sessionId: "s-1",
       }),
   ],
+  // #1946. Update All's progress; it was never forwarded, so a phone sat
+  // on its first frame for a run of up to ~22 minutes.
+  ["update-all-progress", () => hooks.useUpdateAllProgress(1)],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

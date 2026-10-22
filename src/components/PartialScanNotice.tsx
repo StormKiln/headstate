@@ -46,16 +46,30 @@ import { useId, useState } from "react";
 /// repository lists one row and nothing nested inside it. The scan read
 /// everything it looked at, so this is not a shortfall and not an alert:
 /// it renders as a note BESIDE the banner, and only qualifies the numbers.
+///
+/// # Exclusions that could not be read (#1956)
+///
+/// The scan still ran, over the configured folders and without the
+/// exclusions, so it covered MORE than asked rather than less: nothing is
+/// missing and the counts are not qualified. It is a settings problem, so
+/// it is a note pointing at Settings, never the shortfall banner.
 export function PartialScanNotice(props: Parameters<typeof ShortfallNotice>[0]) {
   const roots = rootBoundaries(props.diagnostics);
+  const settingsUnread = (props.diagnostics ?? []).some((d) => d.kind === "settingsError");
   return (
     <>
       <ShortfallNotice
         {...props}
-        diagnostics={props.diagnostics?.filter((d) => d.kind !== "repositoryBoundary")}
+        diagnostics={props.diagnostics?.filter((d) => d.kind !== "repositoryBoundary" && d.kind !== "settingsError")}
       />
       {roots.length > 0 && (
         <RootBoundaryNote roots={roots} consequence={props.consequence} compact={props.compact} />
+      )}
+      {settingsUnread && (
+        <div role="note" className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
+          <p>Discovery exclusions could not be read, so excluded folders were scanned too.</p>
+          <p className="mt-1">Review them in Settings &gt; Repositories.</p>
+        </div>
       )}
     </>
   );

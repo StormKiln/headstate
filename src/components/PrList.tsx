@@ -23,6 +23,7 @@ export function PrList({
   canWrite = true,
   selectable = false,
   unreachable = false,
+  list = "authored",
 }: {
   prs: PullRequest[];
   hasFilters?: boolean;
@@ -53,6 +54,10 @@ export function PrList({
   /// confident answer to a question the app could not ask. Same rule
   /// the rejected-query and truncated-list cases already follow.
   unreachable?: boolean;
+  /// Which queue this is. The empty state describes the query that was
+  /// answered: To Review asks for review requests, not pull requests
+  /// the user opened (#1929).
+  list?: "authored" | "reviewing";
 }) {
   const { checked, setChecked, cursor, selectedPr } = useFilters();
 
@@ -158,6 +163,14 @@ export function PrList({
               <p className="mt-1">
                 This list is empty because the last refresh failed, so the app
                 does not know what is open.
+              </p>
+            </>
+          ) : list === "reviewing" ? (
+            <>
+              <p className="text-[#e6edf3]">No pull requests await your review.</p>
+              <p className="mt-1">
+                Headstate tracks open pull requests where your review is requested,
+                across every repository you can access.
               </p>
             </>
           ) : (

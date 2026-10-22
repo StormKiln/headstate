@@ -1057,12 +1057,10 @@ async fn call(
         "diagnostic_bundle" => ok(commands::diagnostic_bundle(app.clone()).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state(app.clone()).await),
-        "get_gitlab_host" => res(commands::get_gitlab_host(app.clone())),
-        "get_source_snapshot" => res(commands::get_source_snapshot(
-            app.clone(),
-            a.get("source")?,
-            a.get("list")?,
-        )),
+        "get_gitlab_host" => res(commands::get_gitlab_host(app.clone()).await),
+        "get_source_snapshot" => {
+            res(commands::get_source_snapshot(app.clone(), a.get("source")?, a.get("list")?).await)
+        }
         "refresh_source" => res(commands::refresh_source(
             app.clone(),
             app.state(),
@@ -1071,8 +1069,8 @@ async fn call(
             a.get("requestId")?,
         )
         .await),
-        "get_cached" => res(commands::get_cached(app.clone())),
-        "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
+        "get_cached" => res(commands::get_cached(app.clone()).await),
+        "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone()).await),
         "refresh_now" => {
             res(commands::refresh_now(app.clone(), app.state(), a.get("requestId")?).await)
         }
@@ -1172,8 +1170,8 @@ async fn call(
         "docker_dangling_volumes" => res(commands::docker_dangling_volumes().await),
         "docker_running_containers" => res(commands::docker_running_containers().await),
         "preview_cleanup" => res(commands::preview_cleanup(app.clone()).await),
-        "cleanup_log" => res(commands::cleanup_log(app.clone())),
-        "get_cleanup_prefs" => ok(commands::get_cleanup_prefs(app.clone())),
+        "cleanup_log" => res(commands::cleanup_log(app.clone()).await),
+        "get_cleanup_prefs" => ok(commands::get_cleanup_prefs(app.clone()).await),
         // `async` since #1090: it ran `git rev-parse HEAD` once per
         // assessed worktree inline on this listener's worker.
         "assessed_worktrees" => ok(commands::assessed_worktrees(app.clone()).await),
@@ -1295,9 +1293,9 @@ async fn call(
         }
         "claude_hooks_status" => res(commands::claude_hooks_status()),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
-        "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
-        "get_discovery_exclusions" => res(commands::get_discovery_exclusions(app.clone())),
-        "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
+        "get_worktree_dirs" => res(commands::get_worktree_dirs(app.clone()).await),
+        "get_discovery_exclusions" => res(commands::get_discovery_exclusions(app.clone()).await),
+        "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone()).await),
         "update_run_state" => ok(commands::update_run_state(app.state(), a.get("repoPath")?)),
         "update_all_state" => ok(commands::update_all_state(app.state())),
 
@@ -1407,15 +1405,14 @@ async fn call(
             a.get("enable")?,
         )
         .await),
-        "mark_assessed" => res(commands::mark_assessed(app.clone(), a.get("worktreePath")?)),
-        "clear_assessed" => res(commands::clear_assessed(
-            app.clone(),
-            a.get("worktreePath")?,
-        )),
-        "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?)),
-        "set_ui_prefs" => {
-            res(commands::set_ui_prefs(app.clone(), a.get("prefs")?, None).map(|_| ()))
+        "mark_assessed" => res(commands::mark_assessed(app.clone(), a.get("worktreePath")?).await),
+        "clear_assessed" => {
+            res(commands::clear_assessed(app.clone(), a.get("worktreePath")?).await)
         }
+        "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?).await),
+        "set_ui_prefs" => res(commands::set_ui_prefs(app.clone(), a.get("prefs")?, None)
+            .await
+            .map(|_| ())),
         "apply_updates_in_background" => res(commands::apply_updates_in_background(
             app.clone(),
             app.state(),
@@ -1440,13 +1437,7 @@ async fn call(
         "docker_start" => res(blocking(commands::docker_start).await?),
         "docker_restart" => res(blocking(commands::docker_restart).await?),
         "set_view_needs_github" => legacy_phone_cadence(&a),
-        "set_poll_interval" => ok(commands::set_poll_interval(
-            app.clone(),
-            a.get("secs")?,
-            app.state(),
-            app.state(),
-            app.state(),
-        )),
+        "set_poll_interval" => ok(commands::set_poll_interval(app.clone(), a.get("secs")?).await),
         // `open_update_pr`'s arm went with its row in `SURFACE` (#964).
         // `every_remote_command_has_a_dispatch_arm` reads that table, so
         // the two must move together: a row with no arm fails it, and an
@@ -1737,6 +1728,12 @@ mod tests {
             assert!(
                 admit("update_all_state").is_ok(),
                 "a run whose end a phone cannot read must not be exposed to a phone"
+            );
+            // #1946: the command emits its progress on this event, and a
+            // name missing here never reaches the phone at all.
+            assert!(
+                crate::remote::events::EVENT_NAMES.contains(&"update-all-progress"),
+                "a run whose progress a phone cannot hear leaves it on its first frame"
             );
         }
     }

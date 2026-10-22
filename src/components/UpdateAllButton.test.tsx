@@ -8,10 +8,12 @@ import type { UpdateAllReport, RepoUpdateOutcome } from "@/api/tauri";
 const useUpdateAllRepositories = vi.hoisted(() => vi.fn());
 const useCancelUpdateAll = vi.hoisted(() => vi.fn());
 const useUpdateAllProgress = vi.hoisted(() => vi.fn());
+const useUpdateAllState = vi.hoisted(() => vi.fn());
 vi.mock("@/api/hooks", () => ({
   useUpdateAllRepositories,
   useCancelUpdateAll,
   useUpdateAllProgress,
+  useUpdateAllState,
 }));
 const toastError = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({ toast: { error: toastError } }));
@@ -35,8 +37,10 @@ beforeEach(() => {
   useUpdateAllRepositories.mockReset();
   useCancelUpdateAll.mockReset();
   useUpdateAllProgress.mockReset();
+  useUpdateAllState.mockReset();
   toastError.mockReset();
   useUpdateAllProgress.mockReturnValue(null);
+  useUpdateAllState.mockReturnValue({ data: null, refetch: vi.fn().mockResolvedValue(null) });
   useCancelUpdateAll.mockReturnValue(vi.fn().mockResolvedValue(undefined));
 });
 
@@ -264,4 +268,96 @@ it("distinguishes discovery from repository update progress", async () => {
   expect(screen.getByText("Updating 0 of 2…")).toBeTruthy();
   finish(report());
   await waitFor(() => expect(screen.queryByText("Updating 0 of 2…")).toBeNull());
+});
+
+/// #1946: the run outlives the component that started it. Leaving the page
+/// and coming back, or a phone whose call gave up, must still show the run
+/// the desktop is doing, from the desktop's registry.
+describe("UpdateAllButton reads the desktop's run registry (#1946)", () => {
+  it("shows a run already going on mount, disabled, with its progress and a Stop", () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn());
+    useUpdateAllState.mockReturnValue({
+      data: { state: "running", run: 4, done: 3, total: 10 },
+      refetch: vi.fn(),
+    });
+    render(<UpdateAllButton count={10} />);
+    expect(screen.getByText("Updating 3 of 10…")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Update 10 repositories" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy();
+  });
+
+  it("shows how the last run ended after returning to the page", () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn());
+    useUpdateAllState.mockReturnValue({
+      data: {
+        state: "done",
+        run: 4,
+        report: report({ outcomes: [out("/code/a", { state: "updated", message: "Fast-forward" })] }),
+      },
+      refetch: vi.fn(),
+    });
+    render(<UpdateAllButton count={1} />);
+    expect(screen.getByRole("status").textContent).toBe("Updated 1");
+  });
+
+  it("treats a call that gave up while the desktop carries on as still running, not a failure", async () => {
+    const refetch = vi.fn().mockResolvedValue({ state: "running", run: 5, done: 1, total: 45 });
+    useUpdateAllState.mockReturnValue({ data: null, refetch });
+    useUpdateAllRepositories.mockReturnValue(
+      vi.fn().mockRejectedValue(new Error("the desktop took too long to answer: 120s")),
+    );
+    const { rerender } = render(<UpdateAllButton count={45} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update 45 repositories" }));
+    await waitFor(() => expect(refetch).toHaveBeenCalled());
+    // The registry now answers "running", as the poll would report it.
+    useUpdateAllState.mockReturnValue({ data: { state: "running", run: 5, done: 1, total: 45 }, refetch });
+    rerender(<UpdateAllButton count={45} />);
+    expect(await screen.findByText("Updating 1 of 45…")).toBeTruthy();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("still reports a rejection when nothing is going", async () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn().mockRejectedValue(new Error("could not scan")));
+    render(<UpdateAllButton count={2} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update 2 repositories" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("could not scan"));
+  });
+
+  it("never shows the run already on record as the answer to a click that failed to start", async () => {
+    const before = {
+      state: "done" as const,
+      run: 4,
+      report: report({ outcomes: [out("/code/a", { state: "alreadyLevel" })] }),
+    };
+    useUpdateAllState.mockReturnValue({ data: before, refetch: vi.fn().mockResolvedValue(before) });
+    useUpdateAllRepositories.mockReturnValue(vi.fn().mockRejectedValue(new Error("could not scan")));
+    render(<UpdateAllButton count={1} />);
+    expect(screen.getByRole("status").textContent).toBe("1 already level");
+    fireEvent.click(screen.getByRole("button", { name: "Update 1 repository" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("could not scan"));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  /// #1947: a run that died part-way keeps what it applied and says why.
+  it("shows a run that did not finish with what it applied", () => {
+    useUpdateAllRepositories.mockReturnValue(vi.fn());
+    useUpdateAllState.mockReturnValue({
+      data: {
+        state: "failed",
+        run: 2,
+        reason: "the update run failed to finish: task panicked",
+        report: report({
+          outcomes: [
+            out("/code/a", { state: "updated", message: "Fast-forward" }),
+            out("/code/b", { state: "notAttempted" }),
+          ],
+        }),
+      },
+      refetch: vi.fn(),
+    });
+    render(<UpdateAllButton count={2} />);
+    expect(screen.getByRole("alert").textContent).toMatch(/Did not finish: the update run failed to finish/);
+    expect(screen.getByRole("status").textContent).toBe("Updated 1 · 1 not attempted");
+    expect((screen.getByRole("button", { name: "Update 2 repositories" }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });

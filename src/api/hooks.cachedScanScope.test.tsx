@@ -4,7 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 /// The backend, reduced to what `read_cached_scan` does: it answers for
-/// the CURRENT root set (and, for worktrees, the current exclusions),
+/// the CURRENT root set (and, for worktrees and artifacts, the current exclusions),
 /// because that is what its row key is built from.
 const backend = vi.hoisted(() => ({ dirs: ["/a"], exclusions: [] as string[], reads: 0 }));
 const invoke = vi.hoisted(() =>
@@ -80,9 +80,9 @@ describe("useCachedScan is keyed by the scope it was read for (#1962)", () => {
     expect(backend.reads).toBe(1);
   });
 
-  it("re-reads the worktree scan when the discovery exclusions change", async () => {
+  it.each(["worktrees", "artifacts"] as const)("re-reads the %s scan when the discovery exclusions change", async (kind) => {
     const { qc, wrapper } = harness();
-    const { result } = renderHook(() => useCachedScan<string>("worktrees", true), { wrapper });
+    const { result } = renderHook(() => useCachedScan<string>(kind, true), { wrapper });
     await waitFor(() => expect(result.current?.data).toBe("/a"));
 
     backend.exclusions = ["/a/backup"];

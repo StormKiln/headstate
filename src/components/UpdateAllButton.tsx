@@ -5,6 +5,7 @@ import {
   useCancelUpdateAll,
   useUpdateAllProgress,
   useUpdateAllRepositories,
+  useUpdateAllState,
 } from "@/api/hooks";
 import type { UpdateAllReport, RepoUpdateOutcome } from "@/api/tauri";
 import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
@@ -28,8 +29,9 @@ import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
 /// acting, per repository. The table's currency column was computed when
 /// the table was drawn -- possibly minutes ago, and across 45 rows some
 /// have certainly stopped being true since. The button sends the displayed
-/// scope, never cached verdicts. The desktop rescans and refuses a changed
-/// scope before checking each repository and acting.
+/// scope, never cached verdicts. The desktop rescans and updates only the
+/// repositories that are both displayed and still found, listing every
+/// other one with its reason rather than refusing the rest (#1954).
 ///
 /// # It never says "All" (#1025, #1957)
 ///
@@ -57,27 +59,58 @@ export function UpdateAllButton({
 }) {
   const update = useUpdateAllRepositories();
   const cancel = useCancelUpdateAll();
+  const registry = useUpdateAllState();
   const [runId, setRunId] = useState(0);
   const progress = useUpdateAllProgress(runId);
-  const [running, setRunning] = useState(false);
+  // This mount's own call is in flight.
+  const [inFlight, setInFlight] = useState(false);
+  // What this mount's own call returned. Shown only until the registry
+  // has the same run on record.
   const [report, setReport] = useState<UpdateAllReport | null>(null);
+  // The registry's run that was already on record when this mount last
+  // clicked, so it is never shown as that click's answer.
+  const [onRecord, setOnRecord] = useState<number | null>(null);
+
+  // The desktop's registry is the record of the run (#1946). The run
+  // outlives this component -- the user leaves the page and comes back,
+  // or the phone's call gives up after 120 s while the desktop carries on
+  // -- so whether a run is going, how far it has got and how the last one
+  // ended are read from it, not only from this mount's own call.
+  const recorded = registry.data;
+  const recordedRunning = recorded?.state === "running" ? recorded : null;
+  const running = inFlight || recordedRunning !== null;
+  const recordedEnd =
+    recorded && recorded.state !== "running" && recorded.run !== onRecord ? recorded : null;
+  const shownReport = running ? null : (recordedEnd?.report ?? report);
+  // A run that died keeps what it applied, and says why it ended (#1947).
+  const failure = !running && recordedEnd?.state === "failed" ? recordedEnd.reason : null;
+  const shownProgress =
+    progress ?? (recordedRunning ? { done: recordedRunning.done, total: recordedRunning.total } : null);
 
   const run = () => {
     setRunId((previous) => previous + 1);
-    setRunning(true);
+    setInFlight(true);
     // The previous run's report is cleared on START, not on completion:
     // leaving the last result on screen beside a live progress bar would
     // let a user read a stale summary as this run's answer.
     setReport(null);
+    setOnRecord(recorded && recorded.state !== "running" ? recorded.run : null);
     update(expectedPaths)
       .then(setReport)
-      .catch((e: unknown) => {
-        // The run itself failing -- a refused second run, a scan that
-        // could not start. Distinct from a run that COMPLETED with
-        // failures in it, which is the report above and not a rejection.
+      .catch(async (e: unknown) => {
+        // A rejection is not always the end of the run. The phone's call
+        // gives up after 120 s while the desktop carries on, and a click
+        // is refused while another run is going: ask the registry, and if
+        // a run is going, show it rather than a failure that is not one.
+        const now = await registry.refetch().catch(() => undefined);
+        if (now?.state === "running") return;
+        // The run itself failing -- a scan that could not start, or a run
+        // that died part-way, whose report the registry kept. Distinct
+        // from a run that COMPLETED with failures in it, which is the
+        // report below and not a rejection.
         toast.error(e instanceof Error ? e.message : String(e));
       })
-      .finally(() => setRunning(false));
+      .finally(() => setInFlight(false));
   };
 
   const stop = () => {
@@ -117,8 +150,8 @@ export function UpdateAllButton({
             would be unusable. */}
         <span aria-live="polite" className="text-xs text-[#8b949e]">
           {running
-            ? progress
-              ? `Updating ${progress.done} of ${progress.total}…`
+            ? shownProgress
+              ? `Updating ${shownProgress.done} of ${shownProgress.total}…`
               : "Checking repository scope…"
             : null}
         </span>
@@ -129,7 +162,12 @@ export function UpdateAllButton({
         Fast-forwards only. Repositories with uncommitted changes, on another branch, or that cannot
         fast-forward are skipped and listed.
       </p>
-      {report ? <UpdateAllReportPanel report={report} /> : null}
+      {failure ? (
+        <p role="alert" className="mt-2 text-sm text-[#f85149]">
+          Did not finish: {failure}
+        </p>
+      ) : null}
+      {shownReport ? <UpdateAllReportPanel report={shownReport} /> : null}
     </div>
   );
 }

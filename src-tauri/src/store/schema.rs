@@ -1480,11 +1480,22 @@ pub fn open_db(path: &Path) -> Result<Connection, StoreError> {
     //
     // Non-fatal: a read-only volume or an older SQLite should degrade to
     // the previous behaviour rather than refuse to open the cache.
+    //
+    // Logged on change (#1966): the database is opened per snapshot write,
+    // so a volume that refuses WAL said so on every poll tick.
     if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
-        log::warn!("could not enable WAL: {e}");
+        crate::log_dedup::log_while!(warn, "store.wal", "could not enable WAL: {e}");
+    } else {
+        crate::log_dedup::log_cleared!("store.wal", "WAL enabled again");
     }
     if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
-        log::warn!("could not set busy_timeout: {e}");
+        crate::log_dedup::log_while!(
+            warn,
+            "store.busy_timeout",
+            "could not set busy_timeout: {e}"
+        );
+    } else {
+        crate::log_dedup::log_cleared!("store.busy_timeout", "busy_timeout set again");
     }
     if let Err(e) = migrate(&conn) {
         // LOUD for the future-schema case, whatever the caller does with
