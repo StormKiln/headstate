@@ -187,30 +187,187 @@ pub fn diag_log(line: String) {
     crate::diag!("[diag][ui] {line}");
 }
 
-/// The cached snapshot, so the window paints real content at launch rather
-/// than a spinner. Never talks to GitHub.
+/// The saved authored list as a bare array, for callers that cannot read
+/// a qualification. Never talks to GitHub.
+///
+/// The bare-array contract is kept for wire compatibility: phones from
+/// before 9.0 call this and read the answer as `PullRequest[]`, and the
+/// first frame of `/v1/events` carries the same list. Callers that can
+/// render a qualification read [`get_source_snapshot`] instead, which is
+/// what the frontend and the current companion do.
+///
+/// An array cannot say "old" or "not loaded yet", and an empty array
+/// says "you have no open pull requests". So only a list that can be
+/// presented as current is answered with rows; every other state is an
+/// error naming why (#1997). See [`current_rows`].
 #[tauri::command]
 pub async fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
     off_main_thread(move || get_cached_blocking(app)).await
 }
 
 /// [`get_cached`]'s work, on the caller's thread (#1959).
-pub(crate) fn get_cached_blocking(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+fn get_cached_blocking(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+    get_cached_answer(app)?.map_err(|not_current| not_current.0)
+}
+
+/// Why a saved list cannot be answered as a bare array: a sentence for
+/// the reader. Distinct from an outer `Err`, which means the database
+/// could not be read at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NotCurrent(pub(crate) String);
+
+/// [`get_cached`]'s answer, with "the database could not be read" (outer)
+/// kept apart from "read, but not presentable as current" (inner). The
+/// event stream's opening frame needs the difference: the second is an
+/// ordinary state that sends no frame, not a fault worth a warning.
+pub(crate) fn get_cached_answer(
+    app: AppHandle,
+) -> Result<Result<Vec<PullRequest>, NotCurrent>, String> {
     let snapshot = get_source_snapshot_blocking(
         app,
         crate::identity::Source::default(),
         CachedList::Authored,
     )?;
-    match snapshot.snapshot.data {
-        crate::store::source_cache::SnapshotData::Available {
+    Ok(current_rows(snapshot.snapshot.data))
+}
+
+/// The rows of a saved list only when they can be shown as current.
+///
+/// - Fresh and verified: the rows, including a measured empty list.
+/// - Too old: refused, with its age. Returning `[]` here read as "no pull
+///   requests" (#1997); returning the rows bare would present an
+///   hour-old list as current. A bare array has no third option.
+/// - Never loaded: refused. Absent is not zero.
+/// - Withheld or unreadable: refused, with the reason.
+fn current_rows(
+    data: crate::store::source_cache::SnapshotData,
+) -> Result<Vec<PullRequest>, NotCurrent> {
+    use crate::store::source_cache::SnapshotData;
+    match data {
+        SnapshotData::Available {
             prs,
             stale_secs: None,
             ..
         } => Ok(prs),
-        crate::store::source_cache::SnapshotData::Available { .. }
-        | crate::store::source_cache::SnapshotData::Missing => Ok(vec![]),
-        crate::store::source_cache::SnapshotData::Withheld { reason } => Err(reason),
-        _ => Err("The saved snapshot could not be read.".into()),
+        SnapshotData::Available {
+            stale_secs: Some(age),
+            ..
+        } => Err(NotCurrent(format!(
+            "The saved pull request list is {} old and may no longer be accurate. \
+             Refresh to load the current list.",
+            coarse_age(age)
+        ))),
+        SnapshotData::Missing => Err(NotCurrent(
+            "No pull request list has been loaded yet. Refresh to load it.".into(),
+        )),
+        SnapshotData::Withheld { reason } => Err(NotCurrent(reason)),
+        SnapshotData::Unreadable | SnapshotData::GitLabAvailable { .. } => Err(NotCurrent(
+            "The saved pull request list could not be read. Refresh to load it again.".into(),
+        )),
+    }
+}
+
+/// "3 hours", "2 days": the precision a reader needs to judge a saved list.
+fn coarse_age(secs: i64) -> String {
+    let (n, unit) = match secs.max(0) {
+        s if s < 2 * 60 => (s.max(1), "second"),
+        s if s < 2 * 60 * 60 => (s / 60, "minute"),
+        s if s < 2 * 24 * 60 * 60 => (s / (60 * 60), "hour"),
+        s => (s / (24 * 60 * 60), "day"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod get_cached_tests {
+    use super::{current_rows, NotCurrent};
+    use crate::github::model::PullRequest;
+    use crate::identity::Source;
+    use crate::store::source_cache::{
+        load_qualified_snapshot, save_owned_source_snapshot, Coverage,
+    };
+    use crate::store::CachedList;
+
+    fn row() -> PullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": 7, "title": "fixture", "url": "https://github.com/o/r/pull/7",
+            "repo": "o/r", "author": "alice", "is_draft": false,
+            "head_ref": "topic", "base_ref": "main", "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z", "ci": "pending", "merge": "checking",
+            "review": "review_required", "in_merge_queue": false, "labels": [], "comment_count": 0
+        }))
+        .unwrap()
+    }
+
+    /// `get_cached`'s answer for what is on disk, read the way the
+    /// command reads it: owned by `alice`, viewed as `alice`.
+    fn answer(rows: Option<&[PullRequest]>, age: &str) -> Result<Vec<PullRequest>, NotCurrent> {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+        if let Some(rows) = rows {
+            save_owned_source_snapshot(
+                &conn,
+                &Source::default(),
+                CachedList::Authored,
+                rows,
+                &Coverage::Complete,
+                Some("alice"),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE snapshot SET fetched_at = datetime('now', ?1)",
+                [age],
+            )
+            .unwrap();
+        }
+        let snapshot = load_qualified_snapshot(
+            &conn,
+            &Source::default(),
+            CachedList::Authored,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+        current_rows(snapshot.snapshot.data)
+    }
+
+    /// #1997: a saved list too old to show as current answered `Ok([])`,
+    /// which the phone stored and painted as "no pull requests". It is
+    /// refused instead, with its age -- never an unqualified empty list.
+    #[test]
+    fn a_stale_list_is_refused_with_its_age_not_answered_as_empty() {
+        let got = answer(Some(&[row()]), "-3 hours");
+        let Err(NotCurrent(why)) = got else {
+            panic!("a stale list must not be answered as a bare array: {got:?}");
+        };
+        assert!(why.contains("3 hours old"), "{why}");
+    }
+
+    /// Absent is not zero: a list never loaded is refused, not `[]`.
+    #[test]
+    fn a_list_never_loaded_is_refused_not_answered_as_empty() {
+        let got = answer(None, "");
+        assert!(
+            matches!(&got, Err(NotCurrent(why)) if why.contains("loaded yet")),
+            "{got:?}"
+        );
+    }
+
+    /// The other direction: a current list keeps its rows, and a
+    /// MEASURED empty list is still an empty answer -- zero is zero.
+    #[test]
+    fn a_current_list_is_answered_with_its_rows_including_a_measured_empty_one() {
+        assert_eq!(answer(Some(&[row()]), "-1 minute").unwrap().len(), 1);
+        assert_eq!(answer(Some(&[]), "-1 minute").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn coarse_age_reads_as_a_person_would_say_it() {
+        assert_eq!(super::coarse_age(3601), "60 minutes");
+        assert_eq!(super::coarse_age(3 * 3600 + 5), "3 hours");
+        assert_eq!(super::coarse_age(86_400), "24 hours");
+        assert_eq!(super::coarse_age(3 * 86_400), "3 days");
+        assert_eq!(super::coarse_age(60 * 60 * 48), "2 days");
     }
 }
 
