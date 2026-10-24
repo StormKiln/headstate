@@ -2,7 +2,7 @@ import { DiskUsagePanel } from "./DiskUsagePanel";
 import { isCancelled } from "@/lib/cancelled";
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useMemo, useState } from "react";
-import { HardDrive } from "lucide-react";
+import { HardDrive, RefreshCw } from "lucide-react";
 import type { Artifact, ArtifactKind } from "@/types/pr";
 import {
   useArtifacts,
@@ -45,6 +45,11 @@ function Skeleton({ className = "" }: { className?: string }) {
     />
   );
 }
+
+/// What a size here counts, on hover over the total rather than a
+/// paragraph above the list on every visit.
+const SIZE_HINT =
+  "Logical size: file lengths, not allocated or reclaimable space, and unreadable files are left out. Build output also counts toward worktree sizes, so the two totals overlap.";
 
 /// What rebuilds each kind, shown beside the row.
 ///
@@ -187,6 +192,7 @@ function ArtifactInventory() {
     isError,
     error,
     refetch,
+    isFetching,
   } = useArtifacts(true);
   /// How far the walk has got (#1151). Only while it is running: a
   /// figure left on screen after the scan settles would describe a
@@ -348,6 +354,21 @@ function ArtifactInventory() {
   /// Shown whatever the scan's outcome, because it qualifies the list
   /// the user is looking at: an empty list for a configured directory
   /// reads as an answer about that directory.
+  // One small control, rather than unstyled text above the page. In the
+  // toolbar when there is one, upstream of the spacer and fixed in width,
+  // so it cannot move the Remove buttons (#852).
+  const refreshButton = (
+    <button
+      type="button"
+      onClick={() => void refetch()}
+      disabled={isFetching}
+      aria-label="Refresh discovery and sizes"
+      title="Rescan for build output and measure sizes again"
+      className="tap-target shrink-0 rounded p-1 text-[#8b949e] hover:bg-[#161b22] hover:text-[#e6edf3] disabled:opacity-50"
+    >
+      <RefreshCw aria-hidden className={`h-3.5 w-3.5${isFetching ? " motion-safe:animate-spin" : ""}`} />
+    </button>
+  );
   const failedRootsNotice =
     failedRoots && failedRoots.length > 0 ? (
       <div
@@ -380,7 +401,7 @@ function ArtifactInventory() {
             because "could not scan" invites reading the last number the
             user saw as still true. */}
         <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
-          {allArtifacts.length ? "Refresh failed. Previously discovered output remains visible; measurements may be out of date." : "Nothing was measured, so there is no total — this is not a report that your directories are clean."}
+          {allArtifacts.length ? "Showing the previous scan." : "Nothing was measured, so there is no total — this is not a report that your directories are clean."}
         </p>
       </QueryError>
     ) : null;
@@ -410,9 +431,15 @@ function ArtifactInventory() {
   // its saved scan and its error panel with it.
   if (!isError && artifacts.length === 0 && (!showVenvs || (venvsAnswered && venvCount === 0))) {
     return (
-      <div>{failedRootsNotice}<button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button><p className="p-4 text-sm text-[#8b949e]">
-        No {label} found in {failedRoots?.length ? "the completed portion of the scan" : "the scanned directories"}.
-      </p></div>
+      <div>
+        {failedRootsNotice}
+        <div className="flex items-center justify-between gap-2 p-4">
+          <p className="text-sm text-[#8b949e]">
+            No {label} found in {failedRoots?.length ? "the completed portion of the scan" : "the scanned directories"}.
+          </p>
+          {refreshButton}
+        </div>
+      </div>
     );
   }
 
@@ -426,8 +453,6 @@ function ArtifactInventory() {
           section below is untouched and still renders, which is the whole
           reason this is a panel rather than an early return. */}
       {failedRootsNotice}
-      <button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button>
-      <p className="mb-3 text-xs text-muted-foreground">Logical sizes include file lengths, not allocated or guaranteed reclaimable space. Unreadable files can be omitted. Artifacts also appear in worktree sizes; do not add these totals. Use Disk usage above for allocation and coverage.</p>
       {artifactsError}
       {showArtifacts && (!isError || artifacts.length > 0) ? (
       // Wraps on the phone: six items on one 390px line broke "3
@@ -446,9 +471,9 @@ function ArtifactInventory() {
             answered by the old `pending > 0` test, so the qualifier came
             off a total that was still partial -- and unlike a pending
             batch, a failed one never comes back to correct it. */}
-        <span className="text-[#8b949e]">
-          {sizesComplete ? "" : "last measured, incomplete: "}
-          {formatSize(totalBytes)} logical in this filter
+        <span className="text-[#8b949e]" title={SIZE_HINT}>
+          {sizesComplete ? "" : "at least "}
+          {formatSize(totalBytes)}
         </span>
         {/* Says WHY the total is a floor, which "at least" alone cannot.
             Not a `QueryError`: the scan succeeded and every row on this
@@ -461,8 +486,7 @@ function ArtifactInventory() {
             does not read what the first could not. */}
         {failed > 0 ? (
           <span role="status" className="text-xs text-[#d29922]">
-            {failed} of {total} size {failed === 1 ? "batch" : "batches"} could not be
-            measured completely. Retained figures may be out of date; current totals are unknown
+            {failed} of {total} size {failed === 1 ? "batch" : "batches"} could not be measured
           </span>
         ) : null}
         {/* The measuring advisory has MOVED, to after the Remove buttons
@@ -488,6 +512,7 @@ function ArtifactInventory() {
         </label>
 
         <HelpButton topic="build-artifacts" />
+        {refreshButton}
 
         {/* A SPACER, replacing `ml-auto` on the buttons below (#852).
 
@@ -650,8 +675,8 @@ function ArtifactInventory() {
                 words rather than left to a qualifier on a button. */}
             <p className="mt-3 text-sm text-[#e6edf3]">
               {sizesComplete
-                ? `Selected output contains ${formatSize(selectedBytes)} of measured logical file data.`
-                : `Last measured logical file data: ${formatSize(selectedBytes)}. Some sizes are unavailable or out of date; current total and reclaimed space are unknown.`}{" "}
+                ? `These hold ${formatSize(selectedBytes)}.`
+                : `These hold at least ${formatSize(selectedBytes)}; some sizes could not be measured.`}{" "}
               Everything here is rebuilt by the command shown beside it — the cost is
               the rebuild, not lost work.
             </p>

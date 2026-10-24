@@ -195,7 +195,7 @@ describe("ArtifactsPage", () => {
     state.pending = 2;
     state.total = 5;
     render(<ArtifactsPage />);
-    expect(screen.getByText(/last measured, incomplete:/)).toBeTruthy();
+    expect(screen.getByText(/at least/)).toBeTruthy();
     expect(screen.getByText(/measuring — 3 of 5/)).toBeTruthy();
   });
 
@@ -205,7 +205,7 @@ describe("ArtifactsPage", () => {
     state.pending = 0;
     state.total = 5;
     render(<ArtifactsPage />);
-    expect(screen.queryByText(/last measured, incomplete:/)).toBeNull();
+    expect(screen.queryByText(/at least/)).toBeNull();
     expect(screen.queryByText(/measuring/)).toBeNull();
   });
 
@@ -233,7 +233,7 @@ describe("ArtifactsPage", () => {
     state.sizesFailed = 1;
     render(<ArtifactsPage />);
 
-    expect(screen.getByText(/last measured, incomplete:/)).toBeTruthy();
+    expect(screen.getByText(/at least/)).toBeTruthy();
     // And it says what is missing, which "at least" alone cannot.
     expect(screen.getByText(/could not be measured/)).toBeTruthy();
 
@@ -262,8 +262,8 @@ describe("ArtifactsPage", () => {
     render(<ArtifactsPage />);
 
     fireEvent.click(screen.getByRole("button", { name: /Remove all/ }));
-    expect(screen.getByText(/Last measured logical file data/)).toBeTruthy();
-    expect(screen.getByText(/Some sizes are unavailable/)).toBeTruthy();
+    expect(screen.getByText(/These hold at least/)).toBeTruthy();
+    expect(screen.getByText(/some sizes could not be measured/)).toBeTruthy();
   });
 
   /// A build writing into a directory does not show up in `git status`,
@@ -1010,7 +1010,25 @@ describe("ArtifactsPage while the scan is running", () => {
 it("retains discovered output after refresh fails",()=>{
  state.loading=false;state.failed=true;state.artifacts=[art()];state.failedRoots=[];state.cached=undefined;
  render(<ArtifactsPage/>);
- expect(screen.getByText(/Previously discovered output remains visible/)).toBeTruthy();
+ expect(screen.getByText(/Showing the previous scan/)).toBeTruthy();
  expect(screen.getByRole("checkbox",{name:/Select \/code\/repo\/target/})).toBeTruthy();
  state.failed=false;
+});
+
+/// What is on screen on EVERY visit. A paragraph about how sizes are
+/// measured and an unstyled "Refresh discovery and sizes" line sat above
+/// the list whatever the scan found; a warning states a fact the reader
+/// can act on (`src/CLAUDE.md`), and the rest is on hover over the total.
+describe("standing chrome", () => {
+  it("offers one refresh control and no sizing disclaimer", () => {
+    state.loading = false; state.failed = false; state.failedRoots = []; state.cached = undefined;
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000_000_000]]);
+    state.pending = 0;
+    state.total = 1;
+    render(<ArtifactsPage />);
+    expect(screen.getAllByRole("button", { name: "Refresh discovery and sizes" })).toHaveLength(1);
+    expect(screen.queryByText(/do not add these totals/i)).toBeNull();
+    expect(screen.queryByText(/in this filter/i)).toBeNull();
+  });
 });
