@@ -1,6 +1,5 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { toast } from "sonner";
-import { PartialScanNotice } from "./PartialScanNotice";
 import {
   useCancelUpdateAll,
   useUpdateAllProgress,
@@ -8,7 +7,7 @@ import {
   useUpdateAllState,
 } from "@/api/hooks";
 import type { UpdateAllReport, RepoUpdateOutcome } from "@/api/tauri";
-import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
+import { summarise, updateAllLabel } from "@/lib/updateAll";
 
 /// Bring every repository level with its remote default branch (#1012,
 /// #1014, #1016, #1025).
@@ -41,9 +40,8 @@ import { summarise, tally, updateAllLabel } from "@/lib/updateAll";
 /// lie about scope, and that number is exactly the scope the run is
 /// refused outside of. It stays ENABLED over a partial scan -- disabling
 /// it would let one unreadable directory block updating 42 perfectly good
-/// repositories -- and the completion summary repeats the shortfall, so a
-/// user who dismissed `PartialScanNotice` before clicking still learns
-/// the set was short.
+/// repositories. The shortfall itself is stated once, by the sidebar's
+/// `PartialScanNotice`, and not repeated here.
 ///
 /// There is no `unreadable` prop: the label does not depend on the
 /// shortfall, and a prop documented as qualifying the label while being
@@ -87,6 +85,15 @@ export function UpdateAllButton({
   const shownProgress =
     progress ?? (recordedRunning ? { done: recordedRunning.done, total: recordedRunning.total } : null);
 
+  // Each finished repository re-reads the registry, which names what has
+  // landed, so its row in the table refreshes now rather than when the
+  // whole run ends (`useUpdateAllState` does the refreshing).
+  const landedCount = progress?.done;
+  const refetchRegistry = registry.refetch;
+  useEffect(() => {
+    if (landedCount) void refetchRegistry();
+  }, [landedCount, refetchRegistry]);
+
   const run = () => {
     setRunId((previous) => previous + 1);
     setInFlight(true);
@@ -122,14 +129,20 @@ export function UpdateAllButton({
   return (
     <div className="px-4 py-2">
       <div className="flex flex-wrap items-center gap-2">
+        {/* Fast-forward only, stated beside the button rather than
+            discovered in the report: the label is a promise and this is
+            its scope. The full sentence is on hover; the report lists
+            every repository skipped, with its reason. */}
         <button
           type="button"
           onClick={run}
           disabled={running || count === 0}
+          title="Fast-forwards only. Repositories with uncommitted changes, on another branch, or that cannot fast-forward are skipped and listed."
           className="rounded-md border border-[#30363d] px-3 py-1 text-sm text-[#e6edf3] disabled:opacity-50"
         >
           {updateAllLabel(count)}
         </button>
+        {running ? null : <span className="text-xs text-[#8b949e]">Fast-forward only</span>}
         {/* Cancel appears only while a run is going, and it is the
             difference between a feature and a 22-minute hang: MEASURED,
             45 repositories against unreachable remotes is 45 x the 30s
@@ -156,12 +169,6 @@ export function UpdateAllButton({
             : null}
         </span>
       </div>
-      {/* Fast-forward only, stated on the button rather than discovered
-          in the report. The label is a promise and this is its scope. */}
-      <p className="mt-1 text-xs text-[#8b949e]">
-        Fast-forwards only. Repositories with uncommitted changes, on another branch, or that cannot
-        fast-forward are skipped and listed.
-      </p>
       {failure ? (
         <p role="alert" className="mt-2 text-sm text-[#f85149]">
           Did not finish: {failure}
@@ -179,7 +186,6 @@ export function UpdateAllButton({
 /// knows where to go -- which is the reason paths are in the RESULT and
 /// not in the progress events.
 function UpdateAllReportPanel({ report }: { report: UpdateAllReport }) {
-  const t = tally(report);
   // Failures first, then skips. Already-level and updated rows carry no
   // action, and listing 21 of them above the 3 that need attention would
   // bury the only part worth reading. The counts for those two live in
@@ -200,9 +206,6 @@ function UpdateAllReportPanel({ report }: { report: UpdateAllReport }) {
       {notAttempted.length > 0 ? (
         <OutcomeList title="Not attempted" outcomes={notAttempted} />
       ) : null}
-      {t.unreadable > 0 && (
-        <PartialScanNotice unreadable={report.unreadable} diagnostics={report.diagnostics} consequence="some repositories may be missing." collapsed />
-      )}
     </div>
   );
 }

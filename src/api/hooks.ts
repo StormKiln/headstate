@@ -3792,9 +3792,19 @@ export function useUpdateAllState(): { data: UpdateAllState | null | undefined; 
   });
   const data = query.data;
   const watched = useRef<number | null>(null);
+  // Rows already re-read for the watched run, so each repository's
+  // verdict is refreshed once, as it finishes, rather than every row
+  // waiting for the whole run to end.
+  const refreshed = useRef(new Set<string>());
   useEffect(() => {
     if (data?.state === "running") {
+      if (watched.current !== data.run) refreshed.current = new Set();
       watched.current = data.run;
+      for (const path of data.landed ?? []) {
+        if (refreshed.current.has(path)) continue;
+        refreshed.current.add(path);
+        void qc.invalidateQueries({ queryKey: ["repo-upstream", path] });
+      }
     } else if (data && watched.current === data.run) {
       watched.current = null;
       invalidateUpdatedRepositories(qc);

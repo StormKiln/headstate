@@ -1,6 +1,5 @@
 import { useMemo } from "react";
 import { useRepoUpstreams, useWorktrees } from "@/api/hooks";
-import { PartialScanNotice } from "@/components/PartialScanNotice";
 import { QueryError } from "@/components/QueryError";
 import { errorMessage } from "@/lib/queryErrorMessage";
 import { repoCurrency, repoOverviewRows } from "@/lib/repoOverview";
@@ -78,10 +77,10 @@ import type { WorktreeRepo } from "@/types/pr";
 /// multi-second scan to observe changes it cannot see is cost with no
 /// information behind it.
 export function AllRepositoriesTable() {
-  // `isError` and `refetch` as well as the data (#846) -- and
-  // `unreadable`, which is the whole of #1028's requirement now that the
-  // reporting form exists.
-  const { data, unreadable, diagnostics, isLoading, isError, error, refetch, cached } = useWorktrees();
+  // `isError` and `refetch` as well as the data (#846). A partial scan is
+  // stated once, by the sidebar's `PartialScanNotice` beside this table
+  // (#1028), not repeated above it.
+  const { data, isLoading, isError, error, refetch, cached } = useWorktrees();
 
   const scanned = useMemo(() => repoOverviewRows(data ?? []), [data]);
 
@@ -166,7 +165,7 @@ export function AllRepositoriesTable() {
     return (
       <div className="px-4 py-8 text-center text-sm text-[#8b949e]">
         {/* The diagnosis is hedged where `RepoPickerSidebar`'s was not,
-            and `PartialScanNotice` above may already be saying why. */}
+            and its `PartialScanNotice` may already be saying why. */}
         <p>No repositories found in the scanned folders.</p>
       </div>
     );
@@ -174,15 +173,6 @@ export function AllRepositoriesTable() {
 
   return (
     <div>
-      {/* ABOVE the table, not instead of it: the repositories that did
-          read are real and worth showing. No retry -- an unreadable path
-          is unreadable for a reason a second identical walk will not
-          change (#951, #1028). */}
-      <PartialScanNotice
-        unreadable={unreadable}
-        diagnostics={diagnostics}
-        consequence="this table is a floor rather than a complete census"
-      />
       {/* A VISIBLE heading, not only the caption below (#1015).
           The caption is `sr-only` and names the table for a screen
           reader; a sighted user landing on this view sees a bare table
@@ -193,7 +183,7 @@ export function AllRepositoriesTable() {
       <h2 className="text-sm font-semibold text-[#e6edf3]">All Repositories</h2>
       <RepoCurrencySummary currency={currency} />
       {/* The button belongs HERE, above the rows it acts on, with the
-          notice above saying when the scan fell short (#1025).
+          sidebar's notice saying when the scan fell short (#1025).
           `rows.length` rather than a literal: the label names the number
           it can actually see, never "All" (#1957), and a measured
           figure rendered as a string is correct on the day it is written
@@ -298,31 +288,17 @@ function RepoCurrencySummary({ currency }: { currency: RepoCurrency }) {
   if (currency.pending > 0) {
     return (
       <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
-        Checking {currency.pending} of {currency.total} repositor
-        {currency.total === 1 ? "y" : "ies"} against {currency.total === 1 ? "its" : "their"}{" "}
-        upstream…
+        Checking {currency.pending} of {currency.total}…
       </p>
     );
   }
+  // One line of counts. Each row already says how old its refs are, so
+  // the "as of last fetch" qualifier lives there rather than here.
+  const parts = [`${currency.current} of ${currency.compared} with an upstream are up to date`];
+  if (currency.none > 0) parts.push(`${currency.none} without one`);
+  if (currency.unknown > 0) parts.push(`${currency.unknown} could not be checked`);
   return (
-    <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
-      {currency.current} of {currency.compared} repositories with an upstream are up to date with
-      it, as of each one&rsquo;s last fetch.
-      {currency.none > 0 ? (
-        <>
-          {" "}
-          {currency.none} {currency.none === 1 ? "repository has" : "repositories have"} no
-          upstream to compare against and {currency.none === 1 ? "is" : "are"} not counted here.
-        </>
-      ) : null}
-      {currency.unknown > 0 ? (
-        <>
-          {" "}
-          Could not check {currency.unknown} repositor{currency.unknown === 1 ? "y" : "ies"};{" "}
-          {currency.unknown === 1 ? "it is" : "they are"} not counted here.
-        </>
-      ) : null}
-    </p>
+    <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">{parts.join(" · ")}</p>
   );
 }
 

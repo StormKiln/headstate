@@ -102,17 +102,17 @@ describe("summarise", () => {
     expect(line).not.toContain("could not be reached");
   });
 
-  /// A partial scan must not be presented as "all" (#1025). A user who
-  /// reads only the result still learns the set was short.
-  it("says the census was short when the scan could not read everything", () => {
+  /// The shortfall is stated once, by the sidebar's `PartialScanNotice`,
+  /// so the result line does not repeat it (#1025's scope rule is the
+  /// button label, which never says "All").
+  it("does not repeat the scan shortfall in the result line", () => {
     const line = summarise(
       report({
         outcomes: [out("/a", { state: "updated", message: "ok" })],
         unreadable: ["/work: permission denied"],
       }),
     );
-    expect(line).toContain("Discovery incomplete");
-    expect(line).toContain("some repositories may be missing");
+    expect(line).toBe("Updated 1");
   });
 
   /// A cancelled run says so and still reports what it managed, rather

@@ -112,7 +112,6 @@ export function summarise(report: UpdateAllReport): string {
   let line = parts.join(" · ");
   if (report.cancelled) line = `Stopped. ${line}`;
   else if (report.timedOut) line = `Timed out. ${line}`;
-  if (t.unreadable > 0) line += ". Discovery incomplete; some repositories may be missing";
   return line;
 }
 

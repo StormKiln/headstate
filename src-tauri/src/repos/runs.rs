@@ -55,8 +55,17 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum UpdateAllState {
-    /// Still going. `done` counts finished repositories.
-    Running { run: u64, done: usize, total: usize },
+    /// Still going. `done` counts finished repositories, and `landed`
+    /// names them, so the overview can re-read each row as its repository
+    /// finishes rather than every row at the end. Paths are fine here:
+    /// this is a read the client asks for, as the report is, not a
+    /// progress event.
+    Running {
+        run: u64,
+        done: usize,
+        total: usize,
+        landed: Vec<String>,
+    },
     /// Ended, with the same report the command returns. A client that
     /// missed the event reads it here instead.
     Done {
@@ -183,6 +192,7 @@ impl UpdateAllRuns {
                 run,
                 done: 0,
                 total: paths.len(),
+                landed: Vec::new(),
             },
         });
         Ok(RunClaim {
@@ -203,6 +213,7 @@ impl UpdateAllRuns {
                     run,
                     done: e.applied.len(),
                     total,
+                    landed: e.applied.iter().map(|o| o.path.clone()).collect(),
                 };
             }
         }
@@ -357,14 +368,15 @@ mod tests {
         let runs = UpdateAllRuns::default();
         let claim = runs.start(&paths(1)).expect("start");
         runs.outcome_landed(outcome("repo-0", UpdateResult::AlreadyLevel));
-        assert!(matches!(
-            runs.state(),
+        match runs.state() {
             Some(UpdateAllState::Running {
                 done: 1,
                 total: 1,
+                landed,
                 ..
-            })
-        ));
+            }) => assert_eq!(landed, vec!["repo-0".to_string()]),
+            other => panic!("a running run names what has landed: {other:?}"),
+        }
         claim.finished(report());
         match runs.state() {
             Some(UpdateAllState::Done { report, .. }) => {

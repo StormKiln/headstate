@@ -1180,7 +1180,7 @@ export const wireGraph: WireGraph = {
   {"t":"object","props":[["state",1007,false]]},
   {"t":"literal","v":"notAttempted"},
   {"t":"union","of":[0,1009,1010,1012]},
-  {"t":"object","props":[["state",331,false],["run",37,false],["done",37,false],["total",37,false]]},
+  {"t":"object","props":[["state",331,false],["run",37,false],["done",37,false],["total",37,false],["landed",60,false]]},
   {"t":"object","props":[["state",1011,false],["run",37,false],["report",995,false]]},
   {"t":"literal","v":"done"},
   {"t":"object","props":[["state",81,false],["run",37,false],["reason",10,false],["report",995,false]]},

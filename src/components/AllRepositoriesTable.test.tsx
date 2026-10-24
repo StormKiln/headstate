@@ -164,8 +164,8 @@ describe("AllRepositoriesTable", () => {
       }),
     );
     render(<AllRepositoriesTable />);
-    expect(screen.getByText(/1 of 1 repositories with an upstream are up to date/)).toBeTruthy();
-    expect(screen.getByText(/1 repository has no upstream to compare against/)).toBeTruthy();
+    expect(screen.getByText(/1 of 1 with an upstream are up to date/)).toBeTruthy();
+    expect(screen.getByText(/1 without one/)).toBeTruthy();
   });
 
   /// #1951: while verdicts are still loading the summary says it is
@@ -180,8 +180,8 @@ describe("AllRepositoriesTable", () => {
       }),
     );
     render(<AllRepositoriesTable />);
-    expect(screen.getByText(/Checking 2 of 2 repositories/)).toBeTruthy();
-    expect(screen.queryByText(/no upstream to compare against/)).toBeNull();
+    expect(screen.getByText(/Checking 2 of 2…/)).toBeTruthy();
+    expect(screen.queryByText(/without one/)).toBeNull();
     expect(screen.queryByText(/0 of 0/)).toBeNull();
   });
 
@@ -199,9 +199,9 @@ describe("AllRepositoriesTable", () => {
       verdicts({ "/b": { kind: "unknown", n: "could not list worktrees" } as Upstream }),
     );
     render(<AllRepositoriesTable />);
-    expect(screen.getByText(/1 of 1 repositories with an upstream are up to date/)).toBeTruthy();
-    expect(screen.getByText(/Could not check 1 repository/)).toBeTruthy();
-    expect(screen.queryByText(/no upstream to compare against/)).toBeNull();
+    expect(screen.getByText(/1 of 1 with an upstream are up to date/)).toBeTruthy();
+    expect(screen.getByText(/1 could not be checked/)).toBeTruthy();
+    expect(screen.queryByText(/without one/)).toBeNull();
   });
 
   /// Paired with the test above: with nothing uncompared, the summary
@@ -209,7 +209,7 @@ describe("AllRepositoriesTable", () => {
   it("adds no uncompared caveat when every repository was compared", () => {
     useWorktrees.mockReturnValue(scan());
     render(<AllRepositoriesTable />);
-    expect(screen.queryByText(/no upstream to compare against/)).toBeNull();
+    expect(screen.queryByText(/without one/)).toBeNull();
   });
 
   /// #1026: the ref compared against is the repository's own.
@@ -228,29 +228,14 @@ describe("AllRepositoriesTable", () => {
     expect(screen.queryByText("origin/main")).toBeNull();
   });
 
-  /// #1028: the table is a census, so a short one must say so.
-  it("reports what the scan could not read", () => {
-    useWorktrees.mockReturnValue(
-      scan({ unreadable: ["/code/locked: permission denied"] }),
-    );
-    render(<AllRepositoriesTable />);
-    expect(screen.getByText(/Scan incomplete \(1 notice\)/)).toBeTruthy();
-    expect(screen.getByText("/code/locked: permission denied")).toBeTruthy();
-  });
-
-  /// #1028 / #951: no retry. A second identical walk cannot read what
-  /// the first could not.
-  it("offers no retry on a partial scan", () => {
-    useWorktrees.mockReturnValue(scan({ unreadable: ["/code/locked: denied"] }));
-    render(<AllRepositoriesTable />);
-    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
-  });
-
-  /// Paired with the two above: a complete scan renders no notice.
-  it("renders no partial-scan notice when everything was read", () => {
-    useWorktrees.mockReturnValue(scan());
+  /// #1028's notice is the sidebar's, beside this table. Repeating it
+  /// above the rows put the same banner on screen twice.
+  it("leaves the partial-scan notice to the sidebar, and still renders the rows", () => {
+    useWorktrees.mockReturnValue(scan({ unreadable: ["/code/locked: permission denied"] }));
     render(<AllRepositoriesTable />);
     expect(screen.queryByText(/Scan incomplete/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    expect(screen.getByRole("table")).toBeTruthy();
   });
 
   /// #846: the error arm is reached BEFORE the empty arm. With `data`
@@ -398,9 +383,9 @@ describe("AllRepositoriesTable", () => {
       );
       render(<AllRepositoriesTable />);
       expect(
-        screen.getByText(/1 of 1 repositories with an upstream are up to date/),
+        screen.getByText(/1 of 1 with an upstream are up to date/),
       ).toBeTruthy();
-      expect(screen.getByText(/1 repository has no upstream to compare against/)).toBeTruthy();
+      expect(screen.getByText(/1 without one/)).toBeTruthy();
     });
 
     /// The verdicts are asked for BY PATH, one query per repository. Not

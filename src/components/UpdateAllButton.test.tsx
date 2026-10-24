@@ -180,7 +180,7 @@ describe("UpdateAllButton", () => {
   it("states that it fast-forwards only", () => {
     useUpdateAllRepositories.mockReturnValue(vi.fn());
     render(<UpdateAllButton count={5} />);
-    expect(screen.getByText(/fast-forwards only/i)).not.toBeNull();
+    expect(screen.getByText(/fast-forward only/i)).not.toBeNull();
   });
 
   /// A run that could not START is distinct from a run that completed
@@ -217,7 +217,9 @@ describe("UpdateAllButton", () => {
 
 
 describe("bounded completion details", () => {
-  it("keeps thousands of scan notices collapsed and distinguishes them from update errors", async () => {
+  /// The sidebar states the scan shortfall; the report does not repeat
+  /// it, however many notices the scan carried.
+  it("does not repeat scan notices in the completion report", async () => {
     useUpdateAllRepositories.mockReturnValue(vi.fn().mockResolvedValue(report({
       outcomes: [out("/code/actual", { state: "alreadyLevel" })],
       unreadable: Array.from({ length: 1385 }, (_, i) => `/generated/${i}: discovery depth limit reached`),
@@ -226,10 +228,8 @@ describe("bounded completion details", () => {
     fireEvent.click(screen.getByRole("button", { name: "Update 1 repository" }));
     expect(await screen.findByText(/1 already level/)).toBeTruthy();
     expect(container.querySelectorAll("li")).toHaveLength(0);
-    expect(screen.queryByText(/1385 directories could not be read/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
-    expect(container.querySelectorAll("li").length).toBeLessThanOrEqual(50);
-    expect(screen.getByRole("list", { name: "Scan diagnostics" })).toBeTruthy();
+    expect(screen.queryByText(/Discovery|Scan incomplete/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show details" })).toBeNull();
   });
 
   it("bounds repository outcomes while keeping later failures accessible", async () => {
