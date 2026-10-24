@@ -1,7 +1,7 @@
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
-import { Sparkles } from "lucide-react";
+import { RefreshCw, Sparkles } from "lucide-react";
 import { memo, useMemo, useState } from "react";
 import { sameRowProps } from "@/lib/rowProps";
 import { useStableHandlers } from "@/lib/useStableHandlers";
@@ -114,6 +114,11 @@ function Skeleton({ className = "" }: { className?: string }) {
     />
   );
 }
+
+/// What a size on this page counts, for hovering over a total rather than
+/// a paragraph under it on every visit.
+const SIZE_HINT =
+  "Logical size, including build artifacts, so it overlaps the Artifacts page. Hard links may be counted more than once, and unreadable files are left out.";
 
 /// Why a size cell says "not measured" (#769).
 ///
@@ -1228,6 +1233,7 @@ export function WorktreesPage() {
     isError,
     error,
     refetch,
+    isFetching,
     dataUpdatedAt,
     // What the walk could not read (#951). Every count on this page is
     // taken over what it DID read, so a non-empty list makes each of them
@@ -2036,7 +2042,28 @@ export function WorktreesPage() {
   const sessionList = sessions.list.data?.sessions;
   const occupiedBy = useMemo(() => worktreeSessions(sessionList), [sessionList]);
 
-  const refreshControls = <div className="px-4 py-2 text-xs text-muted-foreground"><button type="button" onClick={() => void refetch()}>Refresh discovery and sizes</button>{isError && repos?.length ? <p role="status">Could not scan for worktrees: {errorMessage(error)}. Previously discovered worktrees remain visible; measurements may be out of date.</p> : null}</div>;
+  // One small control at the right of each view's header, rather than a
+  // line of text above it. A rescan that failed while rows are still on
+  // screen is a fact the reader can act on, so it is stated beneath the
+  // header -- the rows are the previous scan's, not a fresh one.
+  const refreshButton = (
+    <button
+      type="button"
+      onClick={() => void refetch()}
+      disabled={isFetching}
+      aria-label="Refresh discovery and sizes"
+      title="Rescan for worktrees and measure sizes again"
+      className="tap-target shrink-0 rounded p-1 text-[#8b949e] hover:bg-[#161b22] hover:text-[#e6edf3] disabled:opacity-50"
+    >
+      <RefreshCw aria-hidden className={`h-3.5 w-3.5${isFetching ? " motion-safe:animate-spin" : ""}`} />
+    </button>
+  );
+  const rescanFailed =
+    isError && repos?.length ? (
+      <p role="status" className="px-4 py-2 text-xs text-[#d29922]">
+        Could not rescan: {errorMessage(error)}. Showing the previous scan.
+      </p>
+    ) : null;
 
   if (isLoading) {
     // The last scan rather than a blank page on a cold start (#1950,
@@ -2070,7 +2097,7 @@ export function WorktreesPage() {
     if (partial) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
-          {refreshControls}
+          <div className="-mt-8 mb-4 flex justify-end">{refreshButton}</div>
           <p className="text-sm font-semibold text-[#e6edf3]">
             No repositories could be read
           </p>
@@ -2115,7 +2142,7 @@ export function WorktreesPage() {
     if (dirs.length === 0) {
       return (
         <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
-          {refreshControls}
+          <div className="-mt-8 mb-4 flex justify-end">{refreshButton}</div>
           <p className="text-sm font-semibold text-[#e6edf3]">
             Headstate does not know where your repositories are
           </p>
@@ -2128,7 +2155,7 @@ export function WorktreesPage() {
     }
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
-          {refreshControls}
+        <div className="-mt-8 mb-4 flex justify-end">{refreshButton}</div>
         <p className="text-sm font-semibold text-[#e6edf3]">No repositories found</p>
         {/* NAMES them (#952). "Set the directories to scan in Settings"
             without saying which ones are set asks the user to go and
@@ -2161,7 +2188,6 @@ export function WorktreesPage() {
       <>
       {orphanDialog}
       <div className="rounded-md border border-[#30363d]">
-        {refreshControls}
         <div className="border-b border-[#30363d] px-4 py-3">
           {/* # The orphan verdict over an incomplete walk (#951)
 
@@ -2214,13 +2240,16 @@ export function WorktreesPage() {
               evidence that has no bearing on it -- a guard that looks
               careful and is merely in the way, which is how a real guard
               gets disabled later. */}
-          <span className="text-sm font-semibold text-[#e6edf3]">
-            {partial ? "at least " : ""}
-            {orphans.length} orphaned worktree{orphans.length === 1 ? "" : "s"}
-            {/* The most important help in the app: this is the only
-                place it offers a delete having verified nothing. */}
-            <HelpButton topic="orphaned-worktrees" />
-          </span>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-sm font-semibold text-[#e6edf3]">
+              {partial ? "at least " : ""}
+              {orphans.length} orphaned worktree{orphans.length === 1 ? "" : "s"}
+              {/* The most important help in the app: this is the only
+                  place it offers a delete having verified nothing. */}
+              <HelpButton topic="orphaned-worktrees" />
+            </span>
+            {refreshButton}
+          </div>
           {/* Says what these ARE before offering to delete them. The
               row's own reason says nothing can be checked; this says
               why that is, which is what makes the Delete button a
@@ -2232,14 +2261,9 @@ export function WorktreesPage() {
             outright.
           </p>
         </div>
-        {/* Why the header says "at least". The rows below are each real;
-            what the shortfall costs is orphans that were never found, so
-            the paths go here rather than the count being hidden. */}
-        <PartialScanNotice
-          unreadable={unreadable}
-            diagnostics={diagnostics}
-          consequence="there may be more orphans than the rows below."
-        />
+        {/* Why the header says "at least" is the sidebar's
+            `PartialScanNotice`, stated once rather than again here. */}
+        {rescanFailed}
         {orphans.map((wt) => (
           <Row
             key={wt.path}
@@ -2291,7 +2315,6 @@ export function WorktreesPage() {
     const { worktrees, totalBytes, sizesComplete } = rollupRepos(withSizes);
     return (
       <div className="rounded-md border border-[#30363d]">
-        {refreshControls}
         <div className="flex items-baseline justify-between border-b border-[#30363d] px-4 py-3">
           {/* "at least" on a partial scan (#951), for the same reason the
               size total beside it already says it: both numbers were
@@ -2304,20 +2327,21 @@ export function WorktreesPage() {
             {worktrees.length} worktree{worktrees.length === 1 ? "" : "s"} across{" "}
             {repos.length} repositor{repos.length === 1 ? "y" : "ies"}
           </span>
-          <span className="text-xs text-[#8b949e]">
+          <span className="flex items-center gap-2 text-xs text-[#8b949e]">
             {/* "at least" while any size is still unmeasured: a total
                 that silently counts unknowns as zero is a confident
-                wrong answer. */}
-            {sizesComplete ? "" : "last measured, incomplete: "}
-            {formatSize(totalBytes)} logical
+                wrong answer. What a size includes is on hover, not a
+                paragraph on every visit. */}
+            <span title={SIZE_HINT}>
+              {sizesComplete ? "" : "at least "}
+              {formatSize(totalBytes)}
+            </span>
+            {refreshButton}
           </span>
         </div>
-        <p className="px-4 py-2 text-xs text-muted-foreground">Includes build artifacts; overlaps the Artifacts page. Logical sizes may count hard links more than once and omit unreadable files. Reclaimable allocation is unknown.</p>
-        <PartialScanNotice
-          unreadable={unreadable}
-            diagnostics={diagnostics}
-          consequence="the counts and the total above are floors."
-        />
+        {/* The scan shortfall behind the "at least" is the sidebar's
+            `PartialScanNotice`, stated once rather than again here. */}
+        {rescanFailed}
         {/* Sizes arrive one repository at a time, and this says how
             many are still outstanding.
             
@@ -2581,6 +2605,16 @@ export function WorktreesPage() {
         <span className="font-semibold">{selected?.name}</span>
         <span className="text-[#8b949e]">
           {visible.length} worktree{visible.length === 1 ? "" : "s"}
+          {/* The size total beside the count it sums, "at least" until
+              every worktree has been measured. A filter narrows both, and
+              the hidden count below already says so. */}
+          {measured.length > 0 ? (
+            <span title={SIZE_HINT}>
+              {" · "}
+              {sizesComplete ? "" : "at least "}
+              {formatSize(totalBytes)}
+            </span>
+          ) : null}
           {/* A count of a NARROWED list has to say it is narrowed
               (#1140). "12 worktrees" beside a filter that is hiding 40
               is a claim about the repository that is not true. */}
@@ -2684,10 +2718,9 @@ export function WorktreesPage() {
                 and presenting a floor as a total would understate it
                 silently (#846). */}
             {safeCount > 0 && reclaim.bytes > 0 ? (
-              <span className="text-[#8b949e]">
-                {" "}
-                — {reclaim.unmeasured > 0 ? "last measured, incomplete: " : ""}
-                {formatSize(reclaim.bytes)} logical in removable worktrees
+              <span className="ml-1 text-[#8b949e]" title="Disk held by the worktrees that are safe to remove">
+                ({reclaim.unmeasured > 0 ? "at least " : ""}
+                {formatSize(reclaim.bytes)})
               </span>
             ) : null}
             {/* This view deletes directories on the strength of a
@@ -2752,11 +2785,6 @@ export function WorktreesPage() {
 
             Silent at zero. Most repositories have none, and a permanent
             "0 stale registrations" would be furniture. */}
-        {safeKnown && prunableCount > 0 ? (
-          <span className="text-xs text-[#3fb950]">
-            {prunableCount} stale registration{prunableCount === 1 ? "" : "s"} to clear
-          </span>
-        ) : null}
         {/* The action #793 found missing entirely. `git worktree prune`
             appeared in three prose comments in this repository and in no
             argument list anywhere, so the app diagnosed the condition,
@@ -2779,7 +2807,7 @@ export function WorktreesPage() {
             disabled={pruning}
             onClick={() => runPrune()}
             title="Run `git worktree prune` — clears registrations whose directory is already gone. Nothing on disk is deleted."
-            className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22] disabled:opacity-50"
+            className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#3fb950] hover:bg-[#161b22] disabled:opacity-50"
           >
             {pruning
               ? "Pruning…"
@@ -2839,19 +2867,6 @@ export function WorktreesPage() {
             measuring sizes — {visible.length - measured.length} of {visible.length} to go
           </span>
         ) : null}
-        {/* "at least" until every worktree has been measured. Reported
-            here as well as on the rollup, because the per-repo page is
-            where you land after choosing a repo and could not answer
-            "how much is this one holding?". */}
-        {measured.length > 0 ? (
-          <span className="text-xs text-[#8b949e]">
-            {sizesComplete ? "" : "last measured, incomplete: "}
-            {formatSize(totalBytes)} logical in this filter
-          </span>
-        ) : null}
-
-        {refreshControls}
-        <p className="w-full text-xs text-muted-foreground">Logical file sizes include build artifacts and may omit unreadable files. Hard links and shared storage can make reclaimed space smaller. Do not add worktree and artifact totals. Pruning removes stale Git registrations, not build output.</p>
 
         {/* The three columns the row already renders, both ways (#771).
             A `<select>` rather than clickable column headers: this list
@@ -3021,7 +3036,9 @@ export function WorktreesPage() {
         >
           All repositories
         </button>
+        {refreshButton}
       </div>
+      {rescanFailed}
 
       {/* Per worktree, not bulk. Bulk-deleting directories is where a
           wrong predicate becomes unrecoverable at scale, and with 149

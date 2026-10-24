@@ -98,6 +98,7 @@ const state = vi.hoisted(() => ({
 /// How many worktree rows have rendered (#1582), counted through the one
 /// hook every row calls.
 const rowRenders = vi.hoisted(() => ({ count: 0 }));
+const refetchScan = vi.hoisted(() => vi.fn());
 /// What `useAssessment` rejected with, for #1957's error wording.
 const assessment = vi.hoisted(() => ({ error: null as unknown }));
 
@@ -217,7 +218,7 @@ vi.mock("../api/hooks", () => ({
     isLoading: state.isLoading,
     isError: state.isError,
     error: "boom",
-    refetch: vi.fn(),
+    refetch: refetchScan,
     dataUpdatedAt: state.dataUpdatedAt,
     unreadable: state.unreadable,
     // Mirrors the real hook: only while the live scan is pending.
@@ -694,7 +695,9 @@ describe("WorktreesPage", () => {
   it("surfaces a scan failure rather than showing an empty list", () => {
     state.isError = true;
     render(<WorktreesPage />);
-    expect(screen.getByText(/could not scan/i)).toBeTruthy();
+    // Rows from the previous scan are still on screen, so it is a failed
+    // RESCAN, said beneath the header rather than replacing the list.
+    expect(screen.getByText(/could not rescan/i)).toBeTruthy();
   });
 
   // An unconfigured base directory must point at the fix, not read as
@@ -1291,7 +1294,7 @@ describe("WorktreesPage", () => {
       ];
       render(<WorktreesPage />);
       expect(screen.getByText(/2 safe to remove/)).toBeTruthy();
-      expect(screen.getByText(/5(\.0)? ?GB logical in removable worktrees/)).toBeTruthy();
+      expect(screen.getByTitle("Disk held by the worktrees that are safe to remove").textContent).toMatch(/\(5(\.0)? ?GB\)/);
     });
 
     it("does not count a row that is not safe to remove", () => {
@@ -1306,7 +1309,7 @@ describe("WorktreesPage", () => {
       // The dirty row's 9 GB must not be in the figure. Asserted on the
       // figure's own text rather than on the absence of a number, since
       // "1.0 GB" contains "10" once the space is optional.
-      expect(screen.getByText(/logical in removable worktrees/).textContent).not.toMatch(/9|10/);
+      expect(screen.getByTitle("Disk held by the worktrees that are safe to remove").textContent).not.toMatch(/9|10/);
     });
 
     it("says at least when a safe row has no measured size", () => {
@@ -1318,7 +1321,7 @@ describe("WorktreesPage", () => {
         wt({ path: "/code/b", safety: { kind: "safe" }, size_bytes: null }),
       ];
       render(<WorktreesPage />);
-      expect(screen.getByText(/logical in removable worktrees/).textContent).toMatch(/last measured, incomplete:/);
+      expect(screen.getByTitle("Disk held by the worktrees that are safe to remove").textContent).toMatch(/at least/);
     });
 
     it("says nothing when the safe rows hold nothing measurable", () => {
@@ -1326,13 +1329,13 @@ describe("WorktreesPage", () => {
       // as a measurement that came back zero.
       state.classified = [wt({ path: "/code/a", safety: { kind: "safe" }, size_bytes: null })];
       render(<WorktreesPage />);
-      expect(screen.queryByText(/logical in removable worktrees/)).toBeNull();
+      expect(screen.queryByTitle("Disk held by the worktrees that are safe to remove")).toBeNull();
     });
 
     it("says nothing when nothing is safe to remove", () => {
       state.classified = [wt({ safety: { kind: "dirty", detail: 1 }, size_bytes: 9 * 1024 ** 3 })];
       render(<WorktreesPage />);
-      expect(screen.queryByText(/logical in removable worktrees/)).toBeNull();
+      expect(screen.queryByTitle("Disk held by the worktrees that are safe to remove")).toBeNull();
     });
   });
 
@@ -2357,7 +2360,7 @@ describe("WorktreesPage", () => {
       /// reclaiming exactly those is why this page exists. It would also
       /// be the failure `ArtifactsPage` names: refusing what WAS
       /// measured because something else was not.
-      it("still lists the orphans it did find, with the reason it may be short", () => {
+      it("still lists the orphans it did find, and says the count is a floor", () => {
         onTheOrphanSection();
         state.unreadable = [UNREADABLE];
         render(<WorktreesPage />);
@@ -2366,8 +2369,10 @@ describe("WorktreesPage", () => {
         // test is about the row EXISTING rather than about how many times
         // its path is written.
         expect(screen.getAllByText(/veil-coh/).length).toBeGreaterThan(0);
-        expect(screen.getByText(UNREADABLE)).toBeTruthy();
-        expect(screen.getByText(/may be more orphans/i)).toBeTruthy();
+        expect(screen.getByText(/at least/i)).toBeTruthy();
+        // The reason is the sidebar's `PartialScanNotice`, stated once;
+        // the page does not repeat the paths.
+        expect(screen.queryByText(UNREADABLE)).toBeNull();
       });
 
       /// And the delete stays offered. It is safe not because the walk
@@ -2870,7 +2875,7 @@ describe("WorktreesPage", () => {
         view: "worktrees",
       });
       render(<WorktreesPage />);
-      expect(screen.getByText(/last measured, incomplete:/i)).toBeTruthy();
+      expect(screen.getByText(/at least/i)).toBeTruthy();
     });
   });
 
@@ -2898,14 +2903,14 @@ describe("WorktreesPage", () => {
 
     it("sums the sizes it has", () => {
       withSizes([1024, 2048]);
-      expect(screen.getByText(/3\.0 KB logical|3 KB logical/i)).toBeTruthy();
+      expect(screen.getByText(/· 3(\.0)? KB/)).toBeTruthy();
     });
 
     // Counting an unmeasured size as zero would report a confident
     // wrong number, so the total says so instead.
     it("says the total is partial while a size is missing", () => {
       withSizes([1024, null]);
-      expect(screen.getByText(/last measured, incomplete:/i)).toBeTruthy();
+      expect(screen.getByText(/at least/i)).toBeTruthy();
     });
 
     it("drops the qualifier once everything is measured", () => {
@@ -2916,7 +2921,45 @@ describe("WorktreesPage", () => {
     // Nothing measured yet is not "0 bytes" -- it is no answer at all.
     it("shows no total before any size has arrived", () => {
       withSizes([null, null]);
-      expect(screen.queryByText(/logical in this filter/i)).toBeNull();
+      expect(screen.queryByText(/· .*B$/)).toBeNull();
+    });
+  });
+
+  /// What is on screen on EVERY visit. Two paragraphs about how sizes are
+  /// measured, a duplicate of the sidebar's scan notice, and a text-line
+  /// refresh sat above the list whatever the repository's state; a
+  /// warning states a fact the reader can act on (`src/CLAUDE.md`).
+  describe("standing chrome", () => {
+    const onePerRepo = () => {
+      state.repos = [
+        { identity: null, name: "proj", path: "/code/proj", worktrees: [wt({ path: "/w/0", size_bytes: 1024 })] },
+      ];
+    };
+
+    it("offers one refresh control, which rescans", () => {
+      onePerRepo();
+      useFilters.setState({ filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } }, view: "worktrees" });
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh discovery and sizes" }));
+      expect(refetchScan).toHaveBeenCalled();
+    });
+
+    it("puts no sizing disclaimer under the header", () => {
+      onePerRepo();
+      useFilters.setState({ filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } }, view: "worktrees" });
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/build artifacts/i)).toBeNull();
+      expect(screen.queryByText(/in this filter/i)).toBeNull();
+    });
+
+    it("leaves the scan shortfall to the sidebar on the rollup, and keeps the floor", () => {
+      onePerRepo();
+      state.unreadable = ["/code/locked: permission denied"];
+      useFilters.setState({ filtersByView: { ...EMPTY, worktrees: {}, branches: {} }, view: "worktrees" });
+      render(<WorktreesPage />);
+      expect(screen.queryByText("/code/locked: permission denied")).toBeNull();
+      expect(screen.queryByText(/build artifacts/i)).toBeNull();
+      expect(screen.getByText(/at least 1 worktree/i)).toBeTruthy();
     });
   });
 
@@ -3293,10 +3336,10 @@ describe("WorktreesPage", () => {
       ];
       render(<WorktreesPage />);
       expect(screen.getByText(/1 safe to remove/i)).toBeTruthy();
-      // The exact string, anchored: the Prune BUTTON also says "2 stale
-      // registrations", and this assertion is about the count being its
-      // own fact on the line rather than only a label on an action.
-      expect(screen.getByText("2 stale registrations to clear")).toBeTruthy();
+      // The count lives on the Prune button itself: a separate "2 stale
+      // registrations to clear" beside a button saying the same number
+      // was the same fact twice.
+      expect(screen.getByRole("button", { name: "Prune 2 stale registrations" })).toBeTruthy();
     });
 
     /// The two counts read as PEERS (#814).
@@ -3322,7 +3365,7 @@ describe("WorktreesPage", () => {
         prunableWt("/code/b"),
       ];
       render(<WorktreesPage />);
-      const stale = screen.getByText("1 stale registration to clear");
+      const stale = screen.getByRole("button", { name: "Prune 1 stale registration" });
       expect(stale.className).toContain("3fb950");
       expect(screen.getByText(/1 safe to remove/i).className).toContain("3fb950");
       // The regression, named: grey is this page's "nothing to act on".
