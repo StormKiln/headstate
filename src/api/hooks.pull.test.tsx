@@ -129,7 +129,7 @@ describe("useUpdateAllState", () => {
 
   it("reads the registry, and refreshes the repository views when a watched run ends", async () => {
     const states: unknown[] = [
-      { state: "running", run: 3, done: 1, total: 2 },
+      { state: "running", run: 3, done: 1, total: 2, landed: ["/code/a"] },
       { state: "done", run: 3, report: { outcomes: [], cancelled: false, timedOut: false, unreadable: [] } },
     ];
     invoke.mockImplementation((() => Promise.resolve(states.length > 1 ? states.shift() : states[0])) as never);
@@ -149,5 +149,30 @@ describe("useUpdateAllState", () => {
     await waitFor(() => expect(result.current.data).toMatchObject({ state: "done", run: 3 }));
     await waitFor(() => expect(invalidated).toContain("worktrees"));
     expect(invalidated).toContain("repo-upstream");
+  });
+
+  /// Each repository's row refreshes as it finishes, not when the whole
+  /// run ends -- and only once, however often the registry is polled.
+  it("refreshes each landed repository's verdict once, while the run is going", async () => {
+    const states: unknown[] = [
+      { state: "running", run: 4, done: 1, total: 3, landed: ["/code/a"] },
+      { state: "running", run: 4, done: 2, total: 3, landed: ["/code/a", "/code/b"] },
+    ];
+    invoke.mockImplementation((() => Promise.resolve(states.length > 1 ? states.shift() : states[0])) as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const keys: string[] = [];
+    vi.spyOn(qc, "invalidateQueries").mockImplementation((filters) => {
+      keys.push(JSON.stringify((filters as { queryKey?: unknown[] })?.queryKey));
+      return Promise.resolve();
+    });
+    const { result } = renderHook(() => useUpdateAllState(), { wrapper: wrapperFor(qc) });
+    await waitFor(() => expect(keys).toContain(JSON.stringify(["repo-upstream", "/code/a"])));
+    expect(keys).not.toContain(JSON.stringify(["repo-upstream", "/code/b"]));
+    await result.current.refetch();
+    await waitFor(() => expect(keys).toContain(JSON.stringify(["repo-upstream", "/code/b"])));
+    expect(keys.filter((k) => k === JSON.stringify(["repo-upstream", "/code/a"]))).toHaveLength(1);
+    // Not the whole table, and not the scan: those wait for the end.
+    expect(keys).not.toContain(JSON.stringify(["repo-upstream"]));
+    expect(keys).not.toContain(JSON.stringify(["worktrees"]));
   });
 });

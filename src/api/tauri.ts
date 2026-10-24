@@ -1990,7 +1990,7 @@ export const cancelUpdateAll = () => call<void>("cancel_update_all");
 /// was kept by the desktop from what the run recorded, so the repositories
 /// it already fast-forwarded are listed, and the rest are not attempted.
 export type UpdateAllState =
-  | { state: "running"; run: number; done: number; total: number }
+  | { state: "running"; run: number; done: number; total: number; landed: string[] }
   | { state: "done"; run: number; report: UpdateAllReport }
   | { state: "failed"; run: number; reason: string; report: UpdateAllReport };
 
