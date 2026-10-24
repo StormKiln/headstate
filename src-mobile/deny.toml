@@ -39,6 +39,17 @@ ignore = [
   # Revisit when the stronghold plugin moves off them.
   "RUSTSEC-2025-0141",  # bincode 1.x unmaintained
   "RUSTSEC-2024-0436",  # paste unmaintained
+  # crypto-bigint 0.5.5 reaches us only through tauri-plugin-stronghold ->
+  # iota_stronghold -> iota-crypto -> k256 0.13 -> elliptic-curve 0.13.
+  # RUSTSEC-2026-0387 (non-constant-time arithmetic) is fixed only in
+  # >=0.7.6 and no 0.5.x release carries it, so nothing in this lockfile
+  # can move to a fixed version. Exploiting it needs an attacker able to
+  # time the stronghold's secret-key arithmetic on the phone itself.
+  # cargo-deny cannot scope a vulnerability ignore to one version, so this
+  # is by ID; it matches only 0.5.5 because the 0.7 line is locked past
+  # the fix (0.7.7). Accepted 2026-10-24. Revisit when the stronghold
+  # plugin moves off k256 0.13.
+  "RUSTSEC-2026-0387",  # crypto-bigint 0.5.5 via stronghold, no fixed 0.5.x
 ]
 
 [licenses]
