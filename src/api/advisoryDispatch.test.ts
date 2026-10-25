@@ -1,6 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { expect, it, vi } from "vitest";
-import { advisoryDispatch, retireAdvisoryDispatch } from "./advisoryDispatch";
+import { ADVISORY_DEFER_MS, advisoryDispatch, retireAdvisoryDispatch } from "./advisoryDispatch";
+import type { AdvisoryProgress } from "@/types/pr";
 
 it("settles a thousand canceled queued requests while the native command is still unresolved", async () => {
   const qc = new QueryClient();
@@ -85,6 +86,9 @@ it("rejects already-aborted input without dispatch and detaches listeners once w
 });
 
 it("retains the four-cell cursor across exhausted drains and charges only actual current-call admission", async () => {
+  // Fake timers: a deferred reply now holds the strip (`ADVISORY_DEFER_MS`),
+  // and this test is about the cursor, not about waiting out real holds.
+  vi.useFakeTimers();
   const qc = new QueryClient();
   const admitted: string[] = [];
   const invoked: string[] = [];
@@ -93,13 +97,16 @@ it("retains the four-cell cursor across exhausted drains and charges only actual
     // Tail observers enqueue first, just as newly selected queries do at a
     // window boundary. Existing visible queries follow in the same commit.
     const demands = ["tail-stack", "tail-pusher", "visible-stack", "visible-pusher"] as const;
-    await Promise.all(demands.map(key => advisoryDispatch(qc, key, key.endsWith("stack") ? "stack" : "pusher", new AbortController().signal, async () => {
+    const round = Promise.all(demands.map(key => advisoryDispatch(qc, key, key.endsWith("stack") ? "stack" : "pusher", new AbortController().signal, async () => {
       invoked.push(key);
       const allowed = remaining-- > 0;
       if (allowed) admitted.push(key);
       return { outcome: allowed ? "offered" as const : "deferred" as const, admitted: allowed };
     }, { preferred: () => key.startsWith("visible"), current: () => true, progress: value => value })));
+    await vi.runAllTimersAsync();
+    await round;
   }
+  vi.useRealTimers();
   expect(admitted).toEqual(["visible-pusher", "tail-stack", "visible-stack", "tail-pusher", "visible-pusher", "tail-stack", "visible-stack", "tail-pusher"]);
   expect(invoked).toHaveLength(16);
 });
@@ -153,4 +160,72 @@ it("retirement between promise resolution and drain continuation cannot move the
     order.push(key); return { outcome: "offered" as const, admitted: true };
   },{preferred:()=>key.startsWith("visible"),current:()=>true,progress:value=>value})));
   expect(order).toEqual(["visible-pusher", "tail-stack"]);
+});
+
+/// A declined row answers in about a millisecond, so draining on fired every
+/// waiting row into the same spent allowance: 761 local refusals in 71
+/// seconds on a measured desktop, up to 15 in one second.
+const declined: AdvisoryProgress = { outcome: "deferred", admitted: false };
+const strip = (qc: QueryClient, key: string, log: string[], reply: AdvisoryProgress = declined, lane: "stack" | "pusher" | "detail" = "pusher") =>
+  advisoryDispatch(qc, key, lane, new AbortController().signal, async () => { log.push(key); return reply; },
+    { preferred: () => true, current: () => true, progress: value => value });
+
+it("holds strip dispatch after the native allowance declines a row", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient();
+  const invoked: string[] = [];
+  const all = Promise.all(["a", "b", "c"].map(key => strip(qc, key, invoked)));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(invoked).toEqual(["a"]);
+  await vi.advanceTimersByTimeAsync(ADVISORY_DEFER_MS - 1);
+  expect(invoked).toEqual(["a"]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(invoked).toEqual(["a", "b"]);
+  await vi.runAllTimersAsync();
+  await all;
+  expect(invoked).toEqual(["a", "b", "c"]);
+  vi.useRealTimers();
+});
+
+it("does not hold after an admitted row", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient();
+  const invoked: string[] = [];
+  const offered: AdvisoryProgress = { outcome: "offered", admitted: true };
+  const all = Promise.all(["a", "b", "c"].map(key => strip(qc, key, invoked, offered)));
+  await vi.advanceTimersByTimeAsync(0);
+  await all;
+  expect(invoked).toEqual(["a", "b", "c"]);
+  vi.useRealTimers();
+});
+
+it("lets selected detail through a strip hold", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient();
+  const invoked: string[] = [];
+  const waiting = Promise.all(["a", "b"].map(key => strip(qc, key, invoked)));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(invoked).toEqual(["a"]);
+  const detail = strip(qc, "selected", invoked, { outcome: "offered", admitted: true }, "detail");
+  await vi.advanceTimersByTimeAsync(0);
+  await detail;
+  expect(invoked).toEqual(["a", "selected"]);
+  await vi.runAllTimersAsync();
+  await waiting;
+  vi.useRealTimers();
+});
+
+it("releases a strip hold when the owner is retired", async () => {
+  vi.useFakeTimers();
+  const qc = new QueryClient();
+  const invoked: string[] = [];
+  const old = Promise.allSettled(["a", "b"].map(key => strip(qc, key, invoked)));
+  await vi.advanceTimersByTimeAsync(0);
+  retireAdvisoryDispatch(qc);
+  await old;
+  const next = strip(qc, "replacement", invoked, { outcome: "offered", admitted: true });
+  await vi.advanceTimersByTimeAsync(0);
+  await next;
+  expect(invoked).toEqual(["a", "replacement"]);
+  vi.useRealTimers();
 });
