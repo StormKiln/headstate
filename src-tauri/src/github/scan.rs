@@ -114,6 +114,34 @@ impl Drop for ScanCaller {
     }
 }
 
+/// Rows per queue search page, per list.
+///
+/// Every row costs GitHub real time to compute -- `mergeStateStatus` above
+/// all (`query.rs` measures ~125ms per item) -- and GitHub cancels a GraphQL
+/// query at about ten seconds. MEASURED on a reporting desktop, 2026-10-23
+/// to 25, 2,982 review-queue pages at 25 rows: median 8.0s, p90 9.7s, max
+/// 11.4s, and 95 of them came back `504` at 11.03s -- GitHub's own cutoff,
+/// not this app's. That queue spans many other people's repositories, which
+/// the authored list does not: its 289 pages at 25 rows had a median of 7.0s
+/// and one failure. So the review queue reads smaller pages and the authored
+/// list keeps its size; the extra requests cost nothing a 504 did not.
+pub(crate) const fn page_size(list: CachedList) -> u64 {
+    match list {
+        CachedList::Authored => 25,
+        CachedList::Reviewing => 15,
+    }
+}
+
+/// Pages one traversal may read before it reports the ceiling.
+///
+/// The bound is on ROWS -- about a thousand, GitHub's search window -- and
+/// was written as 39 pages when every page held 25. Derived so a smaller page
+/// does not quietly shrink the window: 15-row pages would otherwise stop a
+/// 600-row queue at its ceiling.
+pub(crate) const fn max_pages(list: CachedList) -> u32 {
+    (975 / page_size(list)) as u32
+}
+
 fn predicate(list: CachedList) -> &'static str {
     match list {
         CachedList::Authored => "is:pr is:open author:@me",
@@ -572,7 +600,7 @@ impl GitHubClient {
                     );
                     break;
                 }
-                if state.seen.len() >= 1000 || state.pages >= 39 {
+                if state.seen.len() >= 1000 || state.pages >= max_pages(list) {
                     state.done = true;
                     state.finished_at = Some(now);
                     state.ceiling = true;
@@ -692,7 +720,8 @@ impl GitHubClient {
         })
     }
     async fn scan_page(&self, list: CachedList, after: Option<&str>) -> Result<Value, ClientError> {
-        self.scan_query(predicate(list), 25, after).await
+        self.scan_query(predicate(list), page_size(list), after)
+            .await
     }
     async fn scan_query(
         &self,
@@ -1022,6 +1051,83 @@ mod tests {
         blockers.abort_all();
         while blockers.join_next().await.is_some() {}
     }
+    /// The review queue asks GitHub for pages small enough to finish inside
+    /// its per-query timeout; the authored list keeps its size.
+    #[tokio::test]
+    async fn the_review_queue_reads_smaller_pages_than_the_authored_list() {
+        let server = MockServer::start().await;
+        let members = (1..=40).map(node).collect::<Vec<_>>();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                search_response(&request.body_json().unwrap(), &members)
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        client.fetch_viewer().await.unwrap();
+        for (list, expected) in [(CachedList::Reviewing, 15), (CachedList::Authored, 25)] {
+            let before = server.received_requests().await.unwrap().len();
+            let loaded = Loaded {
+                revision: 0,
+                state: State::default(),
+            };
+            client.advance_scan(list, loaded, &[], 1000).await.unwrap();
+            let firsts = server.received_requests().await.unwrap()[before..]
+                .iter()
+                .map(|r| r.body_json::<Value>().unwrap()["variables"]["first"].as_u64())
+                .collect::<Vec<_>>();
+            assert!(!firsts.is_empty());
+            assert!(
+                firsts.iter().all(|f| *f == Some(expected)),
+                "{list:?} pages asked for {firsts:?}, not {expected}"
+            );
+        }
+    }
+
+    /// The traversal ceiling is a bound on ROWS, roughly GitHub's thousand,
+    /// not on pages: a smaller page must not shrink it.
+    #[test]
+    fn the_page_ceiling_still_covers_about_a_thousand_rows() {
+        for list in [CachedList::Reviewing, CachedList::Authored] {
+            let rows = u64::from(max_pages(list)) * page_size(list);
+            assert!((960..=1000).contains(&rows), "{list:?}: {rows} rows");
+        }
+    }
+
+    /// A 700-row review queue -- well past what the old 39-page ceiling
+    /// would hold at the new page size -- still completes with full coverage.
+    #[tokio::test]
+    async fn a_seven_hundred_row_review_queue_completes_without_the_ceiling() {
+        let server = MockServer::start().await;
+        let members = (1..=700).map(node).collect::<Vec<_>>();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                search_response(&request.body_json().unwrap(), &members)
+            })
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        client.fetch_viewer().await.unwrap();
+        let mut state = State::default();
+        let mut now = 1000;
+        for _ in 0..60 {
+            let loaded = Loaded { revision: 0, state };
+            let result = client
+                .advance_scan(CachedList::Reviewing, loaded, &[], now)
+                .await
+                .unwrap();
+            state = result.scan.unwrap().state;
+            if state.done {
+                break;
+            }
+            now = state.eligible_at;
+        }
+        assert!(state.done, "traversal did not finish");
+        assert!(!state.ceiling, "a 700-row queue hit the ceiling");
+        assert!(state.coverage_valid);
+        assert_eq!(state.seen.len(), 700);
+    }
+
     fn client(server: &MockServer) -> GitHubClient {
         GitHubClient::new(
             octocrab::Octocrab::builder()

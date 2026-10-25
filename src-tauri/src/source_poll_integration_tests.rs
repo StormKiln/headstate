@@ -485,6 +485,10 @@ async fn integrated_inventory_publications_retain_large_owned_progress_through_o
     assert_eq!(artifact, expected);
 }
 
+/// One review-queue page, so fixtures are sized in pages rather than in
+/// a row count that silently assumes one page size.
+const P: usize = crate::github::scan::page_size(CachedList::Reviewing) as usize;
+
 async fn stable_queue(total: usize) -> (MockServer, GitHubClient) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -493,7 +497,9 @@ async fn stable_queue(total: usize) -> (MockServer, GitHubClient) {
             let start = body["variables"]["after"].as_str()
                 .and_then(|s| s.strip_prefix("cursor-"))
                 .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            let end = (start + 25).min(total);
+            // The page the client asked for, as GitHub would serve it.
+            let first = body["variables"]["first"].as_u64().unwrap_or(25) as usize;
+            let end = (start + first).min(total);
             ResponseTemplate::new(200).set_body_json(json!({"data":{
                 "viewer":{"login":"synthetic-viewer"},
                 "authored":{"issueCount":total,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),
@@ -535,7 +541,7 @@ async fn scan_and_publish(
 
 #[tokio::test]
 async fn healthy_terminal_delta_establishes_coverage_without_losing_prior_pages() {
-    let (_server, client) = stable_queue(75).await;
+    let (_server, client) = stable_queue(3 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -545,7 +551,7 @@ async fn healthy_terminal_delta_establishes_coverage_without_losing_prior_pages(
     let rows = saved(&conn);
     assert_eq!(
         rows.len(),
-        75,
+        3 * P,
         "terminal delta cannot replace earlier pages"
     );
     assert_eq!(
@@ -568,7 +574,7 @@ async fn healthy_terminal_delta_establishes_coverage_without_losing_prior_pages(
 
 #[tokio::test]
 async fn cooldown_no_work_preserves_receipt_and_observation_freshness() {
-    let (server, client) = stable_queue(20).await;
+    let (server, client) = stable_queue(P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -587,7 +593,7 @@ async fn cooldown_no_work_preserves_receipt_and_observation_freshness() {
 
 #[tokio::test]
 async fn first_step_does_not_repeat_the_head_page_it_just_observed() {
-    let (server, client) = stable_queue(75).await;
+    let (server, client) = stable_queue(3 * P).await;
     let before = server.received_requests().await.unwrap().len();
     let result = client
         .advance_scan(
@@ -601,7 +607,7 @@ async fn first_step_does_not_repeat_the_head_page_it_just_observed() {
         )
         .await
         .unwrap();
-    assert_eq!(result.prs.len(), 50);
+    assert_eq!(result.prs.len(), 2 * P);
     assert_eq!(
         server.received_requests().await.unwrap().len() - before,
         2,
@@ -611,7 +617,7 @@ async fn first_step_does_not_repeat_the_head_page_it_just_observed() {
 
 #[tokio::test]
 async fn failed_page_is_qualified_and_backoff_preserves_failure_receipt() {
-    let (server, client) = stable_queue(75).await;
+    let (server, client) = stable_queue(3 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -650,7 +656,7 @@ async fn failed_page_is_qualified_and_backoff_preserves_failure_receipt() {
 
 #[tokio::test]
 async fn configured_new_pass_cadence_is_measured_from_completion() {
-    let (server, client) = stable_queue(20).await;
+    let (server, client) = stable_queue(P).await;
     let result = client
         .advance_scan(
             CachedList::Reviewing,
@@ -700,7 +706,7 @@ async fn configured_new_pass_cadence_is_measured_from_completion() {
 
 #[tokio::test]
 async fn successive_large_traversals_keep_evidence_and_bound_requests() {
-    let (server, client) = stable_queue(275).await;
+    let (server, client) = stable_queue(11 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -741,7 +747,7 @@ async fn successive_large_traversals_keep_evidence_and_bound_requests() {
                 );
             }
         }
-        assert_eq!(saved(&conn).len(), 275);
+        assert_eq!(saved(&conn).len(), 11 * P);
         assert_eq!(
             polls.get(&Source::default(), CachedList::Reviewing).phase,
             Phase::Ready
@@ -762,7 +768,7 @@ async fn successive_large_traversals_keep_evidence_and_bound_requests() {
 
 #[tokio::test]
 async fn increasing_configured_interval_delays_an_already_finished_pass() {
-    let (server, client) = stable_queue(20).await;
+    let (server, client) = stable_queue(P).await;
     let result = client
         .advance_scan(
             CachedList::Reviewing,
@@ -796,31 +802,36 @@ async fn increasing_configured_interval_delays_an_already_finished_pass() {
 
 #[tokio::test]
 async fn changed_count_qualifies_coverage_and_missing_member_without_removing_it() {
-    let (_server, client) = stable_queue(75).await;
+    let (_server, client) = stable_queue(3 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
     scan_and_publish(&polls, &conn, &client, 1000).await;
     scan_and_publish(&polls, &conn, &client, 1015).await;
-    let old = saved(&conn).into_iter().find(|r| r.number == 75).unwrap();
-    let (_server, changed) = stable_queue(74).await;
+    let old = saved(&conn)
+        .into_iter()
+        .find(|r| r.number == 3 * P as u64)
+        .unwrap();
+    let (_server, changed) = stable_queue(3 * P - 1).await;
     scan_and_publish(&polls, &conn, &changed, 1200).await;
     assert_eq!(
         polls
             .get(&Source::default(), CachedList::Reviewing)
             .coverage,
-        Some(Coverage::Partial { total: Some(74) })
+        Some(Coverage::Partial {
+            total: Some((3 * P - 1) as u64)
+        })
     );
     scan_and_publish(&polls, &conn, &changed, 1215).await;
     let rows = saved(&conn);
     assert_eq!(
         rows.len(),
-        75,
+        3 * P,
         "non-atomic absence is not authority to remove a member"
     );
     let omitted = rows
         .iter()
-        .find(|r| r.number == 75)
+        .find(|r| r.number == 3 * P as u64)
         .unwrap()
         .observation
         .as_ref()
@@ -839,12 +850,12 @@ async fn changed_count_qualifies_coverage_and_missing_member_without_removing_it
     .unwrap()
     .state;
     assert_eq!(state.candidates.len(), 1);
-    assert_eq!(state.candidates[0].identity.number, 75);
+    assert_eq!(state.candidates[0].identity.number, 3 * P as u64);
 }
 
 #[tokio::test]
 async fn provider_cooldown_refusal_does_not_downgrade_a_saved_receipt() {
-    let (server, client) = stable_queue(20).await;
+    let (server, client) = stable_queue(P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -877,7 +888,7 @@ async fn provider_cooldown_refusal_does_not_downgrade_a_saved_receipt() {
 
 #[tokio::test]
 async fn head_refresh_failure_is_qualified_without_losing_successful_tail_pages() {
-    let (server, client) = stable_queue(275).await;
+    let (server, client) = stable_queue(11 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -888,11 +899,11 @@ async fn head_refresh_failure_is_qualified_without_losing_successful_tail_pages(
         let Some(start)=body["variables"]["after"].as_str().and_then(|s|s.strip_prefix("cursor-")).and_then(|s|s.parse::<usize>().ok()) else {
             return ResponseTemplate::new(503);
         };
-        let end=start+25;
-        ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":275,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{end}")}}}}))
+        let end=start+P;
+        ResponseTemplate::new(200).set_body_json(json!({"data":{"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":11*P,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{end}")}}}}))
     }).mount(&server).await;
     scan_and_publish(&polls, &conn, &client, 1015).await;
-    assert_eq!(saved(&conn).len(), 100);
+    assert_eq!(saved(&conn).len(), 4 * P);
     assert!(matches!(
         polls.get(&Source::default(), CachedList::Reviewing).phase,
         Phase::Retrying | Phase::Failed
@@ -923,7 +934,7 @@ async fn publish_scan_attempt(
 }
 
 async fn coalesced_outcome_is_adopted_once(recovery: bool) {
-    let (server, client) = stable_queue(75).await;
+    let (server, client) = stable_queue(3 * P).await;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::store::migrate(&conn).unwrap();
     let polls = SourcePolls::default();
@@ -1062,7 +1073,7 @@ async fn older_first_coalesced_recovery_clears_failure_without_restamping() {
 
 #[tokio::test]
 async fn file_snapshot_age_survives_reopen_failure_no_work_and_recovers_on_observation() {
-    let (server, client) = stable_queue(75).await;
+    let (server, client) = stable_queue(3 * P).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("age.db");
     let conn = crate::store::open_db(&path).unwrap();
@@ -1100,7 +1111,7 @@ async fn file_snapshot_age_survives_reopen_failure_no_work_and_recovers_on_obser
     let failed = read_age(&conn);
     assert_eq!(failed.0, old.0);
     assert!(failed.1 >= old.1);
-    assert_eq!(failed.2.len(), 50);
+    assert_eq!(failed.2.len(), 2 * P);
     let before = server.received_requests().await.unwrap().len();
     scan_and_publish(&polls, &conn, &client, 1016).await;
     assert_eq!(server.received_requests().await.unwrap().len(), before);
@@ -1110,14 +1121,14 @@ async fn file_snapshot_age_survives_reopen_failure_no_work_and_recovers_on_obser
     assert_eq!(deferred.0, old.0);
     assert!(deferred.1 >= failed.1);
     assert_eq!(deferred.2, failed.2);
-    let (_recovery_server, recovery) = stable_queue(75).await;
+    let (_recovery_server, recovery) = stable_queue(3 * P).await;
     scan_and_publish(&polls, &conn, &recovery, 1100).await;
     drop(conn);
     let conn = crate::store::open_db(&path).unwrap();
     let recovered = read_age(&conn);
     assert_ne!(recovered.0, old.0);
     assert_eq!(recovered.1, None);
-    assert_eq!(recovered.2.len(), 75);
+    assert_eq!(recovered.2.len(), 3 * P);
     for old in failed.2 {
         assert_eq!(
             recovered
@@ -1420,7 +1431,7 @@ async fn continuation_phase_guard_allows_io_after_verified_entry() {
 async fn production_continuation_timer_respects_visibility_and_finishes_durable_passes() {
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     tokio::time::resume();
-    let (server, client) = stable_queue(275).await;
+    let (server, client) = stable_queue(11 * P).await;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("scheduler.sqlite");
     let conn = crate::store::open_db(&path).unwrap();
@@ -1549,7 +1560,7 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
             tokio::time::pause();
             assert!(server.received_requests().await.unwrap().len() - before <= 3);
             if pass > 0 {
-                assert_eq!(saved(&conn).len(), 275);
+                assert_eq!(saved(&conn).len(), 11 * P);
                 assert_eq!(
                     polls
                         .get(&Source::default(), CachedList::Reviewing)
@@ -1559,7 +1570,7 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
             }
         }
         assert!(server.received_requests().await.unwrap().len() - pass_start <= 16);
-        assert_eq!(saved(&conn).len(), 275);
+        assert_eq!(saved(&conn).len(), 11 * P);
         assert_eq!(
             polls
                 .get(&Source::default(), CachedList::Reviewing)
@@ -1572,7 +1583,7 @@ async fn production_continuation_timer_respects_visibility_and_finishes_durable_
                 .map(|row| row.identity())
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            275
+            11 * P
         );
     }
     let before = server.received_requests().await.unwrap().len();
@@ -1634,8 +1645,8 @@ async fn pending_continuation_allows_real_detail_and_review_and_cannot_erase_rec
                 } else if query.contains("search(") {
                     if hold.swap(false, Ordering::SeqCst) { entered.notify_one(); release.notified().await; }
                     let start = body["variables"]["after"].as_str().and_then(|s|s.strip_prefix("cursor-")).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
-                    let end = (start+25).min(275);
-                    json!({"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":275,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":end<275,"endCursor":format!("cursor-{end}")}}})
+                    let end = (start+P).min(11*P);
+                    json!({"viewer":{"login":"synthetic-viewer"},"authored":{"issueCount":11*P,"nodes":(start+1..=end).map(|n|node(n,false)).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":end<11*P,"endCursor":format!("cursor-{end}")}}})
                 } else { json!({"viewer":{"login":"synthetic-viewer"}}) };
                 active.fetch_sub(1, Ordering::SeqCst);
                 axum::Json(json!({"data":data}))
@@ -1674,7 +1685,7 @@ async fn pending_continuation_allows_real_detail_and_review_and_cannot_erase_rec
         .unwrap();
         publish(&polls, &conn, Ok(fetched)).await;
     }
-    assert_eq!(saved(&conn).len(), 275);
+    assert_eq!(saved(&conn).len(), 11 * P);
     let first = fetch_github_step_at(
         path.clone(),
         &client,
