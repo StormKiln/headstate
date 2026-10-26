@@ -1,6 +1,7 @@
 name: CI maintenance
 
-# Only trusted default-branch code executes with cancellation permission.
+# Only trusted default-branch code executes with cancellation and
+# cache-deletion permission (`actions: write`).
 on:
   schedule:
     - cron: '7,17,27,37,47,57 * * * *'
@@ -30,7 +31,7 @@ jobs:
           persist-credentials: false
       - name: Verify cancellation policy
         run: python3 scripts/ci-maintenance.test.py
-      - name: Cancel obsolete queue work and report CI timings
+      - name: Cancel obsolete queue work, prune superseded main caches, report CI timings
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-maintenance.py --apply

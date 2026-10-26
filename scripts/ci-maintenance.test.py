@@ -110,4 +110,52 @@ class Maintenance(unittest.TestCase):
         self.assertEqual(self.m.timing({'status':'queued','started_at':job['started_at'],'steps':[]},
                                        '2026-10-21T20:00:00Z'), (None,None,None))
 
+    def cache(self, id, key, created, ref='refs/heads/main', accessed=None):
+        return dict(id=id, key=key, ref=ref, created_at=created, size_in_bytes=1024**3,
+                    last_accessed_at=accessed or created)
+
+    def test_prune_keeps_newest_main_generation_per_class(self):
+        win_old = self.cache(1, 'v0-rust-platform-Windows_NT-x64-1d7dafcc-aaaaaaaa', '2026-10-20T00:00:00Z',
+                             accessed='2026-10-26T00:00:00Z')
+        win_new = self.cache(2, 'v0-rust-platform-Windows_NT-x64-1d7dafcc-bbbbbbbb', '2026-10-25T00:00:00.5Z')
+        linux = self.cache(3, 'v0-rust-platform-Linux-x64-ade52a28-aaaaaaaa', '2026-10-01T00:00:00Z')
+        stale = self.m.superseded([win_new, linux, win_old], self.m._job_class())
+        # The old generation is deleted even though an open PR read it last.
+        self.assertEqual([c['id'] for c in stale], [1])
+
+    def test_prune_never_touches_other_refs_or_non_rust_caches(self):
+        main = self.cache(1, 'v0-rust-build-Darwin-arm64-00d9be57-aaaaaaaa', '2026-10-20T00:00:00Z')
+        for other in [self.cache(2, main['key'][:-8] + 'bbbbbbbb', '2026-10-25T00:00:00Z', ref='refs/pull/1/merge'),
+                      self.cache(2, main['key'][:-8] + 'bbbbbbbb', '2026-10-25T00:00:00Z',
+                                 ref='refs/heads/refs/tags/v10.11.0'),
+                      self.cache(2, 'node-cache-Linux-x64-yarn-abc', '2026-10-25T00:00:00Z')]:
+            with self.subTest(other=other['ref'] + ' ' + other['key']):
+                self.assertEqual(self.m.superseded([main, other], self.m._job_class()), [])
+
+    def test_prune_refuses_malformed_entries(self):
+        for fields in [dict(id=None), dict(id='1'), dict(created_at=None), dict(created_at='')]:
+            entry = {**self.cache(1, 'v0-rust-lint-native-Darwin-arm64-00d9be57-aaaaaaaa',
+                                  '2026-10-20T00:00:00Z'), **fields}
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                self.m.superseded([entry], self.m._job_class())
+
+    def test_prune_deletes_only_when_applying(self):
+        entries = [self.cache(1, 'v0-rust-test-rust-Darwin-arm64-00d9be57-aaaaaaaa', '2026-10-21T00:00:00Z'),
+                   self.cache(2, 'v0-rust-test-rust-Darwin-arm64-00d9be57-bbbbbbbb', '2026-10-25T00:00:00Z')]
+        class Api:
+            def __init__(self): self.calls = []
+            def pages(self, path, key):
+                self.calls.append(('GET', path))
+                assert key == 'actions_caches', key  # the REST field, as measured
+                return iter(entries)
+            def request(self, method, path):
+                self.calls.append((method, path))
+                return {}
+        for apply, deletes in [(False, []), (True, [('DELETE', '/actions/caches/1')])]:
+            api = Api()
+            with self.subTest(apply=apply):
+                self.assertEqual(len(self.m.prune_caches(api, apply)), 1)
+                self.assertEqual(api.calls[0], ('GET', '/actions/caches?ref=refs%2Fheads%2Fmain'))
+                self.assertEqual([c for c in api.calls if c[0] == 'DELETE'], deletes)
+
 if __name__ == '__main__': unittest.main()

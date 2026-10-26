@@ -59,6 +59,12 @@ class Throughput(unittest.TestCase):
         self.assertIn("node: 'false'",self.jobs['lint-native'])
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}",setup)
 
+    def test_debug_info_is_trimmed_before_the_cache_keys_on_it(self):
+        setup = (ROOT / '.github/actions/setup/action.yml').read_text()
+        trim = setup.find('echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"')
+        self.assertGreater(trim, -1)
+        self.assertLess(trim, setup.index('uses: Swatinem/rust-cache@'))
+
     def test_new_cache_classes_have_bounds(self):
         spec = importlib.util.spec_from_file_location('cache_budget', ROOT / 'scripts/check-cache-budget.py')
         cache = importlib.util.module_from_spec(spec)

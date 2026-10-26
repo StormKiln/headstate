@@ -197,6 +197,28 @@ runs:
     # toolchain input is omitted, so the pin is the single source of
     # truth and a developer's local `rustup` picks up the same version
     # from the same file.
+    # Dev and test builds keep line tables but drop full debug info, so a
+    # failing test's backtrace still names its file and line. Set BEFORE
+    # the cache step: rust-cache hashes CARGO_* variables into its key, so
+    # the cache, the cargo commands and every ref's restore of `main`
+    # agree. Release profiles are untouched, so no shipped build changes.
+    #
+    # MEASURED 2026-10-26 on Darwin, `cargo test --no-run` in src-tauri
+    # from a cold target/: deps/ (what rust-cache keeps) went 4.58 ->
+    # 3.50GiB (-24%), and target/ went 5.12 -> 4.02GiB. Classes that also
+    # hold release artifacts (platform-*, build) shrink by less. Linux and
+    # Windows lay debug info out differently and were not measured
+    # separately. Build time was inconclusive, from one sample each.
+    #
+    # It exists because one generation per class reached 8.76GB of the
+    # 10GB quota (scripts/check-cache-budget.py). The key change writes a
+    # full new generation of every class once, and
+    # scripts/ci-maintenance.py deletes the superseded ones.
+    - name: Trim dev-profile debug info
+      if: inputs.rust == 'true'
+      shell: bash
+      run: echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+
     - name: Record Rust toolchain setup start
       if: inputs.rust == 'true'
       shell: bash
@@ -318,6 +340,11 @@ runs:
         #     state alone, that is when to revisit.
         #   - Adding cache scope, which is what #889 proposed and #895
         #     reverted on exactly this evidence.
+        #
+        # THE PRUNE WAS REVISITED 2026-10-26, when the guard fired on steady
+        # state alone (8.76GB). `scripts/ci-maintenance.py` now deletes a
+        # class's superseded generations on `main` only, after CI completes.
+        # Nothing else is pruned.
         #
         # THE MERGE QUEUE NO LONGER SAVES (#1556). It used to, on the
         # argument that a merge-group run is the last build before a merge

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Default-branch maintenance: obsolete queue runs only; never changes checks."""
+"""Default-branch maintenance: obsolete queue runs and superseded `main` Rust
+caches only; never changes checks."""
 import argparse
 from datetime import datetime
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -43,6 +45,57 @@ def cancel_obsolete(run, repo, request):
         return False
     request('POST', f"/actions/runs/{int(fresh['id'])}/cancel")
     return True
+
+
+# Only `main` writes the Rust cache (save-if in .github/actions/setup), so a
+# dependency bump leaves main holding two generations of every class until
+# GitHub's seven-day idle reclaim: the state that evicts (#901). Steady state
+# alone is now near the 10GB quota, so that window cannot be waited out.
+CACHE_REF = 'refs/heads/main'
+
+
+def _job_class():
+    # One definition of a cache class, shared with the budget guard.
+    path = Path(__file__).with_name('check-cache-budget.py')
+    spec = importlib.util.spec_from_file_location('cache_budget', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.job_class
+
+
+def superseded(caches, job_class):
+    """Older `main` generations of each rust-cache class, never the newest.
+
+    Newest by CREATED, not last accessed: after a bump, open pull requests
+    still on the old lockfile keep restoring the old generation, so
+    "last accessed" would delete the one `main` now needs. The cost of
+    created-order is a lockfile REVERT, where main hits the old key and
+    writes nothing: the old key is then deleted and rebuilt once.
+    """
+    classes = {}
+    for cache in caches:
+        if cache.get('ref') != CACHE_REF:
+            continue
+        cls = job_class(cache.get('key') or '')
+        if cls is None:
+            continue
+        if not isinstance(cache.get('id'), int) or not cache.get('created_at'):
+            raise ValueError('Malformed cache entry; pruning refused')
+        classes.setdefault(cls, []).append(cache)
+    stale = []
+    for entries in classes.values():
+        entries.sort(key=lambda c: (datetime.fromisoformat(c['created_at'].replace('Z', '+00:00')), c['id']))
+        stale += entries[:-1]
+    return stale
+
+
+def prune_caches(api, apply):
+    caches = list(api.pages('/actions/caches?ref=' + urllib.parse.quote(CACHE_REF, safe=''), 'actions_caches'))
+    stale = superseded(caches, _job_class())
+    for cache in stale:
+        if apply:
+            api.request('DELETE', f"/actions/caches/{int(cache['id'])}")
+    return [f"{c['key']} ({c['size_in_bytes'] / 1024**3:.2f}GB, {c['created_at']})" for c in stale]
 
 
 def gate_passed(needs):
@@ -104,7 +157,8 @@ class GitHub:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gate', action='store_true')
-    parser.add_argument('--apply', action='store_true', help='cancel confirmed obsolete CI merge groups')
+    parser.add_argument('--apply', action='store_true',
+                        help='cancel confirmed obsolete CI merge groups and delete superseded main Rust caches')
     args = parser.parse_args()
     if args.gate:
         if not gate_passed(json.loads(os.environ['NEEDS_JSON'])):
@@ -140,7 +194,10 @@ def main():
             name = re.sub(r'[^A-Za-z0-9 _().-]', '_', job.get('name', 'unknown'))
             cells = ' | '.join('unknown' if v is None else str(v) for v in values)
             lines.append(f"| {run['id']} | {name} | {job['status']} | {cells} |")
-    lines += ['', f'Obsolete runs cancelled: {cancelled}', '']
+    pruned = prune_caches(api, args.apply)
+    verb = 'deleted' if args.apply else 'would delete'
+    lines += ['', f'Obsolete runs cancelled: {cancelled}',
+              f'Superseded main Rust caches {verb}: {pruned}', '']
     summary = '\n'.join(lines)
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
