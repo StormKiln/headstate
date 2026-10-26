@@ -207,7 +207,24 @@ TOTAL_BUDGET_GIB = 8.5
 # a Rust cache. The whole steady state went 7.37 -> 7.73GB (+4.9%) in 15
 # days; the fastest classes (Windows, build, test-rust) ~+10%.
 #
-# The rule now: the 2026-09-27 figure plus 20%, rounded UP to 0.1GB. At
+# RE-MEASURED 2026-10-26, a month on, as the rule below predicted: the
+# scheduled run failed on platform-Windows at 2.17GB against 2.0. Again
+# ONE generation per class on `main` (test-rust also held a second, five
+# days idle, which is not the figure used), and again growth across every
+# class rather than one class jumping: platform-Linux +22%, build-Darwin
+# +15%, platform-Windows +33%. What is cached did not change -- the same
+# rust-cache step and cargo commands, now only wrapped by
+# scripts/ci-command.py -- and a second cache root would have roughly
+# doubled a class, not added a third. The lockfile went 679 -> 682 crates
+# plus ~90 lines of version moves. Same rule, re-applied.
+#
+# With one generation each, the steady state is now 8.76GB: past the 8.5GB
+# TOTAL_BUDGET_GIB on its own. That is printed, not enforced, and it is
+# deliberately NOT moved here. The module docstring names steady state
+# alone tripping the total as the evidence for pruning automation, so it
+# is its own decision.
+#
+# The rule now: the latest measured figure plus 20%, rounded UP to 0.1GB. At
 # the fastest measured rate that is about a month of ordinary dependency
 # churn before a ceiling asks to be re-decided, while the step these
 # ceilings exist to catch -- a second cache root or uncleaned targets
@@ -218,16 +235,22 @@ TOTAL_BUDGET_GIB = 8.5
 # peak together, and the total is its own check. These catch ONE class
 # jumping; the total bounds the repository.
 #
-#   class                 2026-09-12  2026-09-27  ceiling
-#   platform-Linux          1.65        1.69        2.1
-#   mobile-android          1.52        1.53        1.9
-#   platform-Windows        1.48        1.64        2.0
-#   build-Darwin            0.86        0.94        1.2
-#   test-rust-Darwin        0.61        0.67        0.9
-#   mobile-ios-Darwin       0.54        0.54        0.7
-#   lint-Darwin             0.40        0.42        0.5
-#   supply-chain-Darwin     0.16        0.16        0.2
-#   test-frontend-Darwin    0.15        0.16        0.2
+#   class                 2026-09-12  2026-09-27  2026-10-26  ceiling
+#   platform-Linux          1.65        1.69        2.06        2.5
+#   mobile-android          1.52        1.53        1.60        2.0
+#   platform-Windows        1.48        1.64        2.17        2.7
+#   build-Darwin            0.86        0.94        1.08        1.3
+#   test-rust-Darwin        0.61        0.67        0.73        0.9
+#   mobile-ios-Darwin       0.54        0.54        0.53        0.7
+#   lint-native-Darwin        -           -         0.42        0.6
+#   supply-chain-Linux        -           -         0.16        0.2
+#   lint-Darwin             0.40        0.42          -         0.5
+#   supply-chain-Darwin     0.16        0.16          -         0.2
+#   test-frontend-Darwin    0.15        0.16          -         0.2
+#
+# lint-native and supply-chain-Linux are #1993's successors to lint and
+# supply-chain. The three classes with no 2026-10-26 figure had no entry
+# on `main` that day and keep their earlier bounds below.
 #
 # The per-class ceilings exist because the TOTAL is not enough on its own:
 # #901's incident was one job class (`platform-Windows`) with two live
@@ -238,14 +261,14 @@ TOTAL_BUDGET_GIB = 8.5
 # even when the total is fine: it means two generations are live, which is
 # the state that evicts.
 CLASS_BUDGET_GIB = {
-    "v0-rust-platform-Linux-x64": 2.1,
-    "v0-rust-mobile-android-Linux-x64": 1.9,
-    "v0-rust-platform-Windows_NT-x64": 2.0,
-    "v0-rust-build-Darwin-arm64": 1.2,
+    "v0-rust-platform-Linux-x64": 2.5,
+    "v0-rust-mobile-android-Linux-x64": 2.0,
+    "v0-rust-platform-Windows_NT-x64": 2.7,
+    "v0-rust-build-Darwin-arm64": 1.3,
     "v0-rust-test-rust-Darwin-arm64": 0.9,
     "v0-rust-mobile-ios-Darwin-arm64": 0.7,
     # CI throughput split: same lint workload; supply-chain now runs on Linux.
-    "v0-rust-lint-native-Darwin-arm64": 0.5,
+    "v0-rust-lint-native-Darwin-arm64": 0.6,
     "v0-rust-supply-chain-Linux-x64": 0.2,
     # Retain old class bounds while main's former caches age out; global quota
     # checks still count both generations, so migration cannot hide eviction.

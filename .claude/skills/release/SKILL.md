@@ -21,13 +21,28 @@ The trap: the default check-runs call returns only the latest attempt per job.
 # WRONG -- latest attempt only; showed all-success on a commit the gate refused
 gh api repos/OWNER/REPO/commits/SHA/check-runs
 
-# RIGHT -- what the gate actually sees
+# RIGHT -- what the gate actually sees: every attempt, minus its ignore-checks
+IGN=$(sed -n 's/^ *ignore-checks: *//p' .github/workflows/release.yml)
 gh api "repos/OWNER/REPO/commits/SHA/check-runs?per_page=100&filter=all" \
-  -q '[.check_runs[]|.conclusion]|group_by(.)|map({(.[0]//"null"):length})|add'
+  -q "[.check_runs[]|select(.name|IN(\"${IGN//,/\",\"}\")|not)|.conclusion]|group_by(.)|map({(.[0]//\"null\"):length})|add"
 ```
 
 Require `{"success": N}` with no other key. `gh pr checks` has the same blind
 spot and is not sufficient.
+
+The gate drops `ignore-checks` by name, so the count must too. The scheduled
+`cache-budget` job attaches to `main`'s head and is ignored. Counting it
+flagged `3701ed8` (v10.11.0) as burned when the gate would pass it. A
+`failure` from an ignored job does not burn the commit. Read that list from
+`release.yml` rather than copying it here, so it cannot drift.
+
+The gate's first step, `scripts/wait-release-ci.py`, separately requires
+every attempt of every `ci.yml` run on the commit to be `success`:
+
+```bash
+gh api "repos/OWNER/REPO/actions/workflows/ci.yml/runs?head_sha=SHA" \
+  -q '.workflow_runs[]|"\(.event) \(.status) \(.conclusion) attempt=\(.run_attempt)"'
+```
 
 This is not hypothetical: v5.20.0 was burned exactly this way. `f497c75` still
 shows `success / failure / success` for `platform (windows-latest)`.
