@@ -80,6 +80,15 @@ reported 7.49GB "within budget" while the repository held 8.88GB. A
 budget that excludes a real consumer keeps passing while CI degrades --
 which is the actual failure this issue describes.
 
+THE CONDITION ABOVE WAS MET on 2026-10-26: one generation per class on
+`main` came to 8.76GB, past TOTAL_BUDGET_GIB on steady state alone. So
+`scripts/ci-maintenance.py` now prunes, but only what this argument left
+room for. It deletes nothing on tags or branches. On `main` it deletes
+only a class's OLDER generations once a newer one exists, so a class is
+never left empty, and it runs after CI completes, from default-branch
+code. The tag-race objection above still holds, and still rules out
+anything wider.
+
 ---- Why this one may skip, when the others may not ----
 
 Unlike every other guard in `lint-deps`, this one needs the network and a
