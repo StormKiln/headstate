@@ -63,7 +63,7 @@ class Throughput(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('cache_budget', ROOT / 'scripts/check-cache-budget.py')
         cache = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cache)
-        self.assertEqual(cache.CLASS_BUDGET_GIB['v0-rust-lint-native-Darwin-arm64'], 0.5)
+        self.assertEqual(cache.CLASS_BUDGET_GIB['v0-rust-lint-native-Darwin-arm64'], 0.6)
         self.assertEqual(cache.CLASS_BUDGET_GIB['v0-rust-supply-chain-Linux-x64'], 0.2)
 
     def test_cleanup_never_executes_untrusted_workflow_source(self):
