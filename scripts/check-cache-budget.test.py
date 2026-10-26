@@ -322,16 +322,35 @@ MEASURED_0927 = [
 ]
 checks("the 2026-09-27 steady state passes the re-decided ceilings", MEASURED_0927, True)
 
-# The rule the ceilings were set by: measured + 20%, rounded UP to 0.1GB.
-# Pinned so a later edit that moves one number without re-measuring shows
-# up here as a disagreement with its own comment.
-for e in MEASURED_0927:
+
+# ---- 2026-10-26's re-measurement ----
+#
+# The scheduled run on 3701ed8 failed: platform-Windows 2.17GB against 2.0.
+# One generation per class on `main`; test-rust's second, five-day-idle
+# generation (0.635GB, -e7d0d643) is left out, as it is not steady state.
+MEASURED_1026 = [
+    entry("v0-rust-platform-Linux-x64-ade52a28-69eedeb1", 2.059),
+    entry("v0-rust-mobile-android-Linux-x64-ade52a28-5fd25bb6", 1.601),
+    entry("v0-rust-platform-Windows_NT-x64-1d7dafcc-97533e93", 2.175),
+    entry("v0-rust-build-Darwin-arm64-00d9be57-69eedeb1", 1.083),
+    entry("v0-rust-test-rust-Darwin-arm64-00d9be57-69eedeb1", 0.728),
+    entry("v0-rust-mobile-ios-Darwin-arm64-00d9be57-5fd25bb6", 0.534),
+    entry("v0-rust-lint-native-Darwin-arm64-00d9be57-69eedeb1", 0.418),
+    entry("v0-rust-supply-chain-Linux-x64-ade52a28-69eedeb1", 0.160),
+]
+checks("the 2026-10-26 steady state passes the re-decided ceilings", MEASURED_1026, True)
+
+# The rule the ceilings were set by: measured + 20%, rounded UP to 0.1GB,
+# against the latest measurement. Pinned so a later edit that moves one
+# number without re-measuring shows up here as a disagreement with its own
+# comment.
+for e in MEASURED_1026:
     cls = guard.job_class(e["key"])
     gb = e["size_in_bytes"] / GB
     want = -(-round(gb * 1.2 * 10, 6) // 1) / 10
     if abs(guard.CLASS_BUDGET_GIB[cls] - want) > 1e-9:
         failures.append(
-            f"`{cls}`'s ceiling is {guard.CLASS_BUDGET_GIB[cls]}GB, but its 2026-09-27 "
+            f"`{cls}`'s ceiling is {guard.CLASS_BUDGET_GIB[cls]}GB, but its 2026-10-26 "
             f"figure {gb:.3f}GB + 20% rounds up to {want}GB"
         )
 
