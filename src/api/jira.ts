@@ -107,8 +107,8 @@ export function issueQuery(key: string) {
 
 /// One key's Jira state, cached per key so the same ticket on a PR row, a
 /// worktree and the Jira page is asked for once.
-export function useJiraIssue(key: string) {
-  return useQuery(issueQuery(key));
+export function useJiraIssue(key: string, enabled = true) {
+  return useQuery({ ...issueQuery(key), enabled });
 }
 
 /// Open issues assigned to the signed-in user (#2038). One search, read

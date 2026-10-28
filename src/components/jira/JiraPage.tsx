@@ -3,23 +3,12 @@ import { driftFor } from "@/lib/jira/drift";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { CATEGORY_TEXT, describe } from "@/lib/jira/describe";
 import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
-import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
-import { useSourceSelection } from "@/store/sourceSelection";
-import type { PrIdentity } from "@/types/identity";
 import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
+import { openInHeadstate } from "./openInHeadstate";
+import { useJiraIssue } from "@/api/jira";
 import { useJiraBoard, type BoardPr } from "./useJiraBoard";
-
-/// Open a pull request in Headstate's own detail view. The source
-/// selection is widened only when it would hide this pull request.
-function openInHeadstate(id: PrIdentity) {
-  const provider = id.source?.provider ?? "github";
-  const sel = useSourceSelection.getState();
-  if (sel.selection !== "both" && sel.selection !== provider) sel.setSelection(provider);
-  useFilters.getState().setView("my-prs");
-  useFilters.getState().selectPr(id);
-}
 
 /// My Jira issues' main panel (#2038): the selected issue and every pull
 /// request, worktree and branch of yours that names it.
@@ -27,6 +16,11 @@ export function JiraPage({ prs }: { prs: readonly BoardPr[] }) {
   const isMobile = useIsMobile();
   const { selected, select } = useJiraView();
   const board = useJiraBoard(prs);
+  // The selected issue is asked for directly: one reached by typing its key
+  // may not be in the tree, and must not read "Loading…" forever.
+  const own = useJiraIssue(selected ?? "", selected !== null && board.jira !== null);
+  const lookup: Lookup = (k) =>
+    k === selected && (own.data || own.isError) ? (own.isError ? "failed" : own.data) : board.lookup(k);
 
   if (selected === null) {
     // On a phone the sidebar is a sheet, so the page is the list.
@@ -45,9 +39,9 @@ export function JiraPage({ prs }: { prs: readonly BoardPr[] }) {
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" /> All issues
         </button>
       ) : null}
-      <IssueHeader k={selected} lookup={board.lookup} site={board.jira?.site ?? null} />
-      <EpicRollUp k={selected} known={known} lookup={board.lookup} />
-      <LinkedWork k={selected} links={board.links.get(selected)} lookup={board.lookup} />
+      <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} />
+      <EpicRollUp k={selected} known={known} lookup={lookup} />
+      <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
     </div>
   );
 }

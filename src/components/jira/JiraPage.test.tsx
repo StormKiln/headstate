@@ -77,9 +77,11 @@ const TODO = issue("ABC-3", { summary: "Not started", status: { name: "To Do", c
 beforeEach(() => {
   connection.mockReset().mockResolvedValue({ state: "logged_in", site: "jira.example.internal", account: null });
   projects.mockReset().mockResolvedValue({ projects: [{ key: "ABC", name: "Alpha" }], error: null });
-  issues.mockReset().mockImplementation((keys) =>
-    Promise.resolve(batch([EPIC, STORY].filter((i) => keys.includes(i.key)))),
-  );
+  // As the desktop answers: asked and not returned is `missing`.
+  issues.mockReset().mockImplementation((keys) => {
+    const found = [EPIC, STORY].filter((i) => keys.includes(i.key));
+    return Promise.resolve(batch(found, { missing: keys.filter((k) => !found.some((i) => i.key === k)) }));
+  });
   assigned.mockReset().mockResolvedValue(batch([TODO]));
   worktrees.data = [];
   useJiraView.setState({ selected: null, filter: "all" });
@@ -160,5 +162,49 @@ describe("My Jira issues", () => {
     expect(screen.getByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /ABC-3/ })).toBeNull();
     await quiet();
+  });
+
+  describe("Go to ticket", () => {
+    const type = async (text: string) => {
+      const box = await screen.findByRole("searchbox", { name: "Go to ticket" });
+      fireEvent.change(box, { target: { value: text } });
+      fireEvent.keyDown(box, { key: "Enter" });
+    };
+
+    it("opens the one pull request that names the key", async () => {
+      useFilters.getState().setView("jira");
+      mount(<JiraBrowser prs={[pr]} />);
+      await type("abc-1");
+      expect(useFilters.getState().view).toBe("my-prs");
+      expect(useFilters.getState().selectedPr).toMatchObject({ number: 7 });
+      await quiet();
+    });
+
+    /// A key nothing of yours names still opens, and resolves -- it must
+    /// not read "Loading…" forever because it is not in the tree.
+    it("opens an issue no pull request names, and resolves it", async () => {
+      mount(
+        <>
+          <JiraBrowser prs={[pr]} />
+          <JiraPage prs={[pr]} />
+        </>,
+      );
+      await type("https://jira.example.internal/browse/ABC-9");
+      expect(useJiraView.getState().selected).toBe("ABC-9");
+      expect(await screen.findByRole("heading", { name: /ABC-9 Cannot view this issue/ })).toBeTruthy();
+      expect(screen.getByText("None of your open pull requests or worktrees names ABC-9.")).toBeTruthy();
+      await quiet();
+    });
+
+    it.each([
+      ["XYZ-1", "XYZ is not one of your Jira projects."],
+      ["hello", "Type a Jira key such as ABC-1, or paste a link to an issue."],
+    ])("explains %j instead of going nowhere", async (text, message) => {
+      mount(<JiraBrowser prs={[pr]} />);
+      await type(text);
+      expect(screen.getByText(message)).toBeTruthy();
+      expect(useJiraView.getState().selected).toBeNull();
+      await quiet();
+    });
   });
 });
