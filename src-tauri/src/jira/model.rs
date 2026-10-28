@@ -112,3 +112,57 @@ pub enum JiraConnection {
         reason: String,
     },
 }
+
+/// Which of the user's lists a pull request came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrRole {
+    Authored,
+    Reviewing,
+}
+
+/// What names a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LinkTarget {
+    /// A pull or merge request from one of the user's lists.
+    Pr {
+        source: crate::identity::Source,
+        role: PrRole,
+        repo: String,
+        number: u64,
+        title: String,
+        url: String,
+        head_ref: String,
+        is_draft: bool,
+    },
+    Worktree {
+        repo: String,
+        path: String,
+        branch: String,
+    },
+    /// A local branch, noted when the Branches page scans its repository.
+    Branch { repo_path: String, branch: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JiraLink {
+    pub key: String,
+    pub found_in: super::keys::FoundIn,
+    /// In the latest read of where it lives. A `Pr` that is not current was
+    /// open earlier and has since left its list: merged or closed, unknown
+    /// which.
+    pub current: bool,
+    pub target: LinkTarget,
+}
+
+/// Every link whose key is in the user's projects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkIndex {
+    pub links: Vec<JiraLink>,
+    /// The dictionary applied, after Settings' exclusions.
+    pub projects: Vec<String>,
+    /// Why the dictionary or the index could not be read, if it could not.
+    /// `links` is then what could be read, which may be nothing.
+    pub error: Option<String>,
+}

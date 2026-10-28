@@ -1,5 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { jiraAssigned, jiraConnection, jiraIssues, jiraProjects } from "./tauri";
+import { useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { jiraAssigned, jiraConnection, jiraIssues, jiraLinks, jiraProjects } from "./tauri";
 import type { JiraIssue } from "../types/jira";
 
 /// --- Jira (epic #2031) --------------------------------------------
@@ -125,4 +126,29 @@ export function useJiraAssigned(enabled: boolean) {
     staleTime: 2 * 60_000,
     refetchInterval: enabled ? 5 * 60_000 : false,
   });
+}
+
+/// Where each key in the user's projects is named, from the desktop's index
+/// (#2035). The desktop rebuilds it only when what feeds it changed, so a
+/// refetch is a cheap read. Polled as a backstop; `useFollowJiraLinks`
+/// refetches as soon as a list it reads from does.
+export function useJiraLinks(enabled: boolean) {
+  return useQuery({
+    queryKey: ["jira-links"],
+    queryFn: () => jiraLinks(),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+/// Refetch the link index when data it is built from has just changed:
+/// pass the `dataUpdatedAt` of the pull request, worktree or branch query
+/// that fed it. The desktop indexes as it stores, so the read that follows
+/// sees the new rows.
+export function useFollowJiraLinks(enabled: boolean, updatedAt: number) {
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (enabled && updatedAt > 0) void qc.invalidateQueries({ queryKey: ["jira-links"] });
+  }, [qc, enabled, updatedAt]);
 }

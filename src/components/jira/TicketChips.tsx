@@ -1,6 +1,7 @@
 import { useJiraIssue } from "@/api/jira";
 import { driftFor } from "@/lib/jira/drift";
-import { keysForBranch, keysForPr, type FoundKey } from "@/lib/jira/keys";
+import type { FoundKey } from "@/lib/jira/keys";
+import { rowId, type RowRef } from "@/lib/jira/links";
 import { TriangleAlert } from "lucide-react";
 import type { JiraStatusCategory } from "@/types/jira";
 import { useFilters } from "@/store/filters";
@@ -20,23 +21,14 @@ const CHIP = "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 p
 
 /// The Jira tickets a pull request, worktree or branch names (#2039).
 ///
-/// Renders nothing unless Jira is on, signed in and its projects are known
-/// -- see `JiraState`. Pass `title` for a pull request; a worktree or local
-/// branch has only `branch`. Pass `openPr` for an OPEN pull request, and a
-/// ticket that disagrees with it (#2042) is marked.
-export function TicketChips({
-  title,
-  branch,
-  openPr,
-}: {
-  title?: string;
-  branch?: string | null;
-  openPr?: { draft: boolean };
-}) {
+/// Renders nothing unless Jira is on, signed in and its links are read --
+/// see `JiraState`. `row` names the pull request, worktree or branch; the
+/// desktop has already found its keys. Pass `openPr` for an OPEN pull
+/// request, and a ticket that disagrees with it (#2042) is marked.
+export function TicketChips({ row, openPr }: { row: RowRef; openPr?: { draft: boolean } }) {
   const jira = useJira();
   if (!jira) return null;
-  const found =
-    title === undefined ? keysForBranch(branch, jira.projects) : keysForPr({ title, head_ref: branch }, jira.projects);
+  const found = jira.links.byRow.get(rowId(row)) ?? [];
   if (found.length === 0) return null;
   return (
     <>
@@ -123,10 +115,10 @@ function TicketChip({ found, openPr }: { found: FoundKey; openPr?: { draft: bool
 /// The drift notices for an open pull request, spelled out (#2042). For the
 /// detail view, where there is room for a sentence; rows carry the marked
 /// chip instead.
-export function TicketDriftNotices({ title, branch, draft }: { title: string; branch: string; draft: boolean }) {
+export function TicketDriftNotices({ prUrl, draft }: { prUrl: string; draft: boolean }) {
   const jira = useJira();
   if (!jira) return null;
-  const found = keysForPr({ title, head_ref: branch }, jira.projects);
+  const found = jira.links.byRow.get(rowId({ prUrl })) ?? [];
   if (found.length === 0) return null;
   return (
     <>

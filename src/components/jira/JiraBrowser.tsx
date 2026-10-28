@@ -1,9 +1,9 @@
-import { useJiraConnection, useJiraProjects } from "@/api/jira";
+import { useJiraConnection, useJiraLinks } from "@/api/jira";
 import { useJiraView, type JiraFilter } from "@/store/jira";
 import { needsAttention } from "@/lib/jira/tree";
 import { GoToTicket } from "./GoToTicket";
 import { JiraTree } from "./JiraTree";
-import { useJiraBoard, type BoardPr } from "./useJiraBoard";
+import { useJiraBoard } from "./useJiraBoard";
 
 const FILTERS: { id: JiraFilter; label: string }[] = [
   { id: "all", label: "All" },
@@ -16,8 +16,8 @@ const SKELETON = <span className="block h-4 w-40 animate-pulse rounded bg-[#2126
 
 /// The filter tabs and the issue tree (#2038). Rendered in the sidebar on
 /// the desktop, and as the page itself on a phone until an issue is picked.
-export function JiraBrowser({ prs }: { prs: readonly BoardPr[] }) {
-  const board = useJiraBoard(prs);
+export function JiraBrowser() {
+  const board = useJiraBoard();
   const { filter, setFilter } = useJiraView();
   if (!board.jira) return <NotReady />;
 
@@ -90,12 +90,12 @@ function Empty({ filter, assignedOk, worktreesLoading }: { filter: JiraFilter; a
 function NotReady() {
   const connection = useJiraConnection(true, 5 * 60_000);
   const signedIn = connection.data?.state === "logged_in";
-  const projects = useJiraProjects(signedIn);
-  if (connection.isPending || (signedIn && projects.isPending)) return SKELETON;
-  if (signedIn && (projects.isError || projects.data?.error)) {
+  const links = useJiraLinks(signedIn);
+  if (connection.isPending || (signedIn && links.isPending)) return SKELETON;
+  if (signedIn && (links.isError || links.data?.error)) {
     return (
       <p className="text-xs text-[#f85149]">
-        Could not list your Jira projects: {projects.data?.error ?? "no answer from acli"}
+        {links.data?.error ?? `Could not read which pull requests name Jira issues: ${String(links.error)}`}
       </p>
     );
   }

@@ -1,19 +1,23 @@
 import { createContext, useContext } from "react";
+import type { LinkMaps } from "@/lib/jira/links";
 
 /// What every Jira surface needs to know, decided once by `JiraProvider`
 /// (epic #2031).
 ///
 /// `null` whenever keys cannot be matched yet -- Jira off, `acli` not
-/// signed in, or the project list not (or not successfully) read. Every
+/// signed in, or the link index not (or not successfully) read. Every
 /// consumer renders NOTHING for `null`: without the project list a
 /// candidate key cannot be told from a look-alike, so showing one would be
 /// a guess.
 export interface JiraState {
-  /// Project keys to match, with the user's exclusions already removed.
+  /// Project keys matched, with the user's exclusions already removed.
   projects: ReadonlySet<string>;
   /// The signed-in site, for building a browse link when Jira's reply
   /// carried none.
   site: string | null;
+  /// Which keys each row names, and what names each key, from the
+  /// desktop's index.
+  links: LinkMaps;
 }
 
 export const JiraContext = createContext<JiraState | null>(null);

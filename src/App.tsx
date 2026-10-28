@@ -3,6 +3,7 @@ import { JiraProvider } from "./components/jira/JiraContext";
 import { capabilityOff } from "./components/viewMenu";
 import { JiraSidebar } from "./components/jira/JiraSidebar";
 import { JiraPage } from "./components/jira/JiraPage";
+import { useFollowJiraLinks } from "./api/jira";
 import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
 import { listen } from "./api/transport";
@@ -13,7 +14,7 @@ import { prIdentity, prKey } from "./lib/prIdentity";
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu } from "lucide-react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   usePullRequests,
@@ -353,10 +354,9 @@ export default function App() {
   // so the two views share every component instead of duplicating them.
   const source = view === "to-review" ? reviewing : prs;
   const gitlabQueue = view === "to-review" ? gitlabReviewing : gitlabAuthored;
-  // What My Jira issues links tickets from: your own open pull requests on
-  // both hosts (#2038). The review queue is not read for it -- it is only
-  // fetched while To review is open, and the page is about your work.
-  const jiraPrs = useMemo(() => [...prs, ...(gitlabAuthored.rows ?? [])], [prs, gitlabAuthored.rows]);
+  // The desktop indexes Jira keys from the pull request lists it stores
+  // (#2035); a new list means the index may have moved.
+  useFollowJiraLinks(prefs?.jira_enabled ?? false, dataUpdatedAt);
   const authoredReceipt = useSourceRefresh("authored");
   const reviewingReceipt = useSourceRefresh("reviewing");
   const githubReceipt = view === "to-review" ? reviewingReceipt : authoredReceipt;
@@ -583,7 +583,7 @@ export default function App() {
     ) : view === "artifacts" ? (
       <ArtifactSidebar reviewingCount={reviewingCount} />
     ) : view === "jira" ? (
-      <JiraSidebar viewCounts={{ "to-review": reviewingCount }} prs={jiraPrs} />
+      <JiraSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : view === "docker" ? (
       <DockerSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : view === "worktrees" || view === "branches" ? (
@@ -969,7 +969,7 @@ export default function App() {
           <ArtifactsPage />
         ) : view === "jira" ? (
           <div className="p-4">
-            <JiraPage prs={jiraPrs} />
+            <JiraPage />
           </div>
         ) : view === "docker" ? (
           <div className="p-4">

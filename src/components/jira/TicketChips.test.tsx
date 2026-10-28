@@ -2,15 +2,15 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, ProjectList } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
-const projects = vi.hoisted(() => vi.fn<() => Promise<ProjectList>>());
+const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
-vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraProjects: projects, jiraIssues: issues }));
+vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraLinks: links, jiraIssues: issues }));
 
 import { JiraProvider } from "./JiraContext";
 import { TicketChips, TicketDriftNotices } from "./TicketChips";
@@ -53,33 +53,56 @@ const batch = (over: Partial<IssueBatch>): IssueBatch => ({
 
 beforeEach(() => {
   connection.mockReset().mockResolvedValue({ state: "logged_in", site: "jira.example.internal", account: null });
-  projects.mockReset().mockResolvedValue({
-    projects: [
-      { key: "ABC", name: "Alpha" },
-      { key: "XY", name: "Ex" },
-    ],
-    error: null,
-  });
+  links.mockReset().mockResolvedValue(index([]));
   issues.mockReset();
 });
 afterEach(cleanup);
 
-const mount = (p: UiPrefs, title: string | undefined, branch: string | null) =>
-  renderWithQuery(
+const URL = "https://github.com/octocat/hello-world/pull/7";
+const ROW = { prUrl: URL };
+
+/// What the desktop's index says the pull request at `URL` names.
+const prLink = (key: string, found_in: "title" | "branch" = "title"): JiraLink => ({
+  key,
+  found_in,
+  current: true,
+  target: {
+    kind: "pr",
+    source: { provider: "github", host: "github.com" },
+    role: "authored",
+    repo: "octocat/hello-world",
+    number: 7,
+    title: "t",
+    url: URL,
+    head_ref: "b",
+    is_draft: false,
+  },
+});
+const index = (found: JiraLink[], over: Partial<LinkIndex> = {}): LinkIndex => ({
+  links: found,
+  projects: ["ABC", "XY"],
+  error: null,
+  ...over,
+});
+
+const mount = (p: UiPrefs, found: JiraLink[]) => {
+  links.mockResolvedValue(index(found));
+  return renderWithQuery(
     <JiraProvider prefs={p}>
-      <TicketChips title={title} branch={branch} />
+      <TicketChips row={ROW} />
     </JiraProvider>,
   );
+};
 
 describe("TicketChips", () => {
   it("renders nothing and asks nothing without a provider", () => {
-    const { container } = render(<TicketChips title="ABC-1 fix" branch="abc-1" />);
+    const { container } = render(<TicketChips row={ROW} />);
     expect(container.textContent).toBe("");
     expect(connection).not.toHaveBeenCalled();
   });
 
   it("asks nothing while Jira is switched off", async () => {
-    const { container } = mount(prefs({ jira_enabled: false }), "ABC-1 fix", null);
+    const { container } = mount(prefs({ jira_enabled: false }), [prLink("ABC-1")]);
     await new Promise((r) => setTimeout(r, 30));
     expect(container.textContent).toBe("");
     expect(connection).not.toHaveBeenCalled();
@@ -89,7 +112,7 @@ describe("TicketChips", () => {
   /// One desktop call for every key on screen, not one per chip.
   it("batches the title's and the branch's keys into one call", async () => {
     issues.mockResolvedValue(batch({ issues: [issue("ABC-1")], missing: ["XY-2"] }));
-    mount(prefs(), "ABC-1: fix login", "feature/xy-2-follow-up");
+    mount(prefs(), [prLink("ABC-1"), prLink("XY-2", "branch")]);
     expect(await screen.findByText("ABC-1 · In Review")).toBeTruthy();
     expect(await screen.findByText("XY-2 · ?")).toBeTruthy();
     expect(issues).toHaveBeenCalledTimes(1);
@@ -98,47 +121,64 @@ describe("TicketChips", () => {
 
   it("says a key the desktop never reached is not checked yet, not missing", async () => {
     issues.mockResolvedValue(batch({ unasked: ["ABC-3"] }));
-    mount(prefs(), "ABC-3 fix", null);
+    mount(prefs(), [prLink("ABC-3")]);
     expect(await screen.findByText("ABC-3 · not checked yet")).toBeTruthy();
   });
 
   it("shows a failed read as a failure", async () => {
     issues.mockRejectedValue("acli did not respond within 20s");
-    mount(prefs(), "ABC-4 fix", null);
+    mount(prefs(), [prLink("ABC-4")]);
     expect(await screen.findByText("ABC-4 · not loaded")).toBeTruthy();
   });
 
   /// Without the project list a key cannot be told from a look-alike.
   it("renders nothing when the project list could not be read", async () => {
-    projects.mockResolvedValue({ projects: [], error: "unauthorized" });
-    const { container } = mount(prefs(), "ABC-5 fix", null);
-    await waitFor(() => expect(projects).toHaveBeenCalled());
+    links.mockResolvedValue(index([], { projects: [], error: "Could not list your Jira projects: unauthorized" }));
+    const { container } = renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips row={ROW} />
+      </JiraProvider>,
+    );
+    await waitFor(() => expect(links).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 30));
     expect(container.textContent).toBe("");
     expect(issues).not.toHaveBeenCalled();
   });
 
-  it("skips excluded projects and look-alikes", async () => {
-    const { container } = mount(prefs({ jira_excluded_projects: ["ABC"] }), "ABC-6 and UTF-8", null);
-    await waitFor(() => expect(projects).toHaveBeenCalled());
+  it("renders nothing for a row the index has no keys for", async () => {
+    links.mockResolvedValue(index([prLink("ABC-6")]));
+    const { container } = renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips row={{ prUrl: "https://github.com/octocat/hello-world/pull/8" }} />
+      </JiraProvider>,
+    );
+    await waitFor(() => expect(links).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 30));
     expect(container.textContent).toBe("");
     expect(issues).not.toHaveBeenCalled();
   });
 
-  it("finds a key in a worktree's branch alone", async () => {
+  it("finds a worktree's keys by its path", async () => {
     issues.mockResolvedValue(batch({ issues: [issue("XY-8", "To Do")] }));
-    mount(prefs(), undefined, "xy-8-spike");
+    links.mockResolvedValue(
+      index([{ key: "XY-8", found_in: "branch", current: true, target: { kind: "worktree", repo: "r", path: "/w/xy-8", branch: "xy-8-spike" } }]),
+    );
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips row={{ worktreePath: "/w/xy-8" }} />
+      </JiraProvider>,
+    );
     expect(await screen.findByText("XY-8 · To Do")).toBeTruthy();
   });
 
   /// #2042: an open pull request whose ticket has not started is marked.
   it("marks a ticket that is still To Do on an open pull request, and says why", async () => {
     issues.mockResolvedValue(batch({ issues: [issue("ABC-7", "Backlog", "new")] }));
+    links.mockResolvedValue(index([prLink("ABC-7")]));
     renderWithQuery(
       <JiraProvider prefs={prefs()}>
-        <TicketChips title="ABC-7 fix" branch={null} openPr={{ draft: false }} />
-        <TicketDriftNotices title="ABC-7 fix" branch="" draft={false} />
+        <TicketChips row={ROW} openPr={{ draft: false }} />
+        <TicketDriftNotices prUrl={URL} draft={false} />
       </JiraProvider>,
     );
     expect(await screen.findByLabelText("Needs attention")).toBeTruthy();
@@ -147,11 +187,17 @@ describe("TicketChips", () => {
 
   it("does not mark a draft, or a row that is not an open pull request", async () => {
     issues.mockResolvedValue(batch({ issues: [issue("ABC-8", "To Do", "new")] }));
+    links.mockResolvedValue(
+      index([
+        prLink("ABC-8"),
+        { key: "ABC-8", found_in: "branch", current: true, target: { kind: "branch", repo_path: "/r", branch: "abc-8-wip" } },
+      ]),
+    );
     renderWithQuery(
       <JiraProvider prefs={prefs()}>
-        <TicketChips title="ABC-8 fix" branch={null} openPr={{ draft: true }} />
-        <TicketChips branch="abc-8-wip" />
-        <TicketDriftNotices title="ABC-8 fix" branch="" draft={true} />
+        <TicketChips row={ROW} openPr={{ draft: true }} />
+        <TicketChips row={{ repoPath: "/r", branch: "abc-8-wip" }} />
+        <TicketDriftNotices prUrl={URL} draft={true} />
       </JiraProvider>,
     );
     expect(await screen.findAllByText("ABC-8 · To Do")).toHaveLength(2);
@@ -161,11 +207,12 @@ describe("TicketChips", () => {
 
   it("opens the issue in My Jira issues, without also opening the row", async () => {
     issues.mockResolvedValue(batch({ issues: [issue("ABC-9")] }));
+    links.mockResolvedValue(index([prLink("ABC-9")]));
     const row = vi.fn();
     renderWithQuery(
       <JiraProvider prefs={prefs()}>
         <div onClick={row}>
-          <TicketChips title="ABC-9 fix" branch={null} />
+          <TicketChips row={ROW} />
         </div>
       </JiraProvider>,
     );

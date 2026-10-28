@@ -17,7 +17,7 @@ import type { TranscriptWatch } from "../types/transcript";
 import { call } from "./transport";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
-import type { IssueBatch, JiraConnection, ProjectList } from "../types/jira";
+import type { IssueBatch, JiraConnection, LinkIndex, ProjectList } from "../types/jira";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -474,6 +474,7 @@ export const jiraConnection = () => call<JiraConnection>("jira_connection");
 export const jiraProjects = () => call<ProjectList>("jira_projects");
 export const jiraIssues = (keys: string[]) => call<IssueBatch>("jira_issues", { keys });
 export const jiraAssigned = () => call<IssueBatch>("jira_assigned");
+export const jiraLinks = () => call<LinkIndex>("jira_links");
 
 /// --- Docker -------------------------------------------------------
 

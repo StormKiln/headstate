@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { IssueState } from "@/api/jira";
 import type { JiraIssue } from "@/types/jira";
-import { NO_EPIC, UNRESOLVED, ancestorKeys, buildTree, epicOf, initiativeOf, linkIndex, rollUp, type Lookup } from "./tree";
+import { NO_EPIC, UNRESOLVED, ancestorKeys, buildTree, epicOf, initiativeOf, rollUp, type Lookup } from "./tree";
 
 const issue = (key: string, level: number | null, parent: string | null = null, category: JiraIssue["status"]["category"] = "new"): IssueState => ({
   state: "found",
@@ -113,25 +113,5 @@ describe("rollUp", () => {
   it("counts only answers it has, and the counts sum to the children", () => {
     const lookup = table({ "A-1": issue("A-1", 0, null, "done"), "A-2": issue("A-2", 0, null, "in_progress") });
     expect(rollUp(["A-1", "A-2", "A-3"], lookup)).toEqual({ new: 0, in_progress: 1, done: 1, unknown: 1 });
-  });
-});
-
-describe("linkIndex", () => {
-  it("indexes pull requests and worktrees by the keys they name", () => {
-    const pr = {
-      source: { provider: "github" as const, host: "github.com" },
-      repo: "octocat/hello-world",
-      number: 7,
-      title: "ABC-1: fix",
-      url: "https://github.com/octocat/hello-world/pull/7",
-      is_draft: false,
-      head_ref: "xy-2-follow-up",
-    };
-    const wt = { repo: "hello-world", path: "/w/abc-1", branch: "abc-1-fix" };
-    const index = linkIndex([pr], [wt], new Set(["ABC", "XY"]));
-    expect([...index.keys()].sort()).toEqual(["ABC-1", "XY-2"]);
-    expect(index.get("ABC-1")?.prs[0].source).toBe("title");
-    expect(index.get("XY-2")?.prs[0].source).toBe("branch");
-    expect(index.get("ABC-1")?.worktrees).toEqual([wt]);
   });
 });
