@@ -1017,7 +1017,9 @@ async fn ci_stalled_fixture_flush_is_bounded_and_does_not_claim_readiness() {
     let flushed = flush_fixture(&r, std::time::Duration::from_millis(20)).await;
     release.send(()).unwrap();
     assert!(!flushed);
-    assert!(flush_fixture(&r, std::time::Duration::from_secs(2)).await);
+    // Recovery only; the bounded refusal above is the proof. Windows CI
+    // runners under load have needed longer than two seconds.
+    assert!(flush_fixture(&r, std::time::Duration::from_secs(30)).await);
 }
 
 #[test]
