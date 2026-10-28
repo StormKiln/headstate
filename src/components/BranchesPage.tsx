@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { TicketChips } from "./jira/TicketChips";
 import { Questionnaire } from "@shadcn/react/questionnaire";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -347,6 +348,7 @@ export function BranchesPage() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="truncate text-[#e6edf3]">{b.name}</span>
+                  <TicketChips branch={b.name} />
                   {/* `gone` is styled apart from the other three
                       (#1139). It used to render as "local", which is the
                       OPPOSITE claim: local means the work exists only on

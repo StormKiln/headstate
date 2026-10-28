@@ -2,7 +2,7 @@
 //! spawns nothing while it is off: a switched-off integration reports
 //! `Disabled` -- "we did not ask" -- never an empty answer (#1050).
 
-use super::model::{JiraConnection, ProjectList};
+use super::model::{IssueBatch, JiraConnection, ProjectList};
 use tauri::AppHandle;
 
 async fn enabled(app: &AppHandle) -> bool {
@@ -32,4 +32,17 @@ pub async fn jira_projects(app: AppHandle) -> Result<ProjectList, String> {
     }
     let bin = super::cli::find_acli().ok_or("acli is not installed")?;
     Ok(super::cli::projects_at(&bin).await)
+}
+
+/// What Jira says about `keys`: found, missing, or never asked.
+///
+/// The frontend batches every visible row's keys into one call, so a page
+/// of pull requests is one `acli` search rather than one per row.
+#[tauri::command]
+pub async fn jira_issues(app: AppHandle, keys: Vec<String>) -> Result<IssueBatch, String> {
+    if !enabled(&app).await {
+        return Err("Jira is switched off".into());
+    }
+    let bin = super::cli::find_acli().ok_or("acli is not installed")?;
+    Ok(super::cli::issues_at(&bin, &keys).await)
 }
