@@ -1,5 +1,6 @@
 import { useJiraConnection, useJiraProjects } from "@/api/jira";
 import { useJiraView, type JiraFilter } from "@/store/jira";
+import { needsAttention } from "@/lib/jira/tree";
 import { JiraTree } from "./JiraTree";
 import { useJiraBoard, type BoardPr } from "./useJiraBoard";
 
@@ -7,6 +8,7 @@ const FILTERS: { id: JiraFilter; label: string }[] = [
   { id: "all", label: "All" },
   { id: "linked", label: "With PRs" },
   { id: "assigned", label: "Assigned" },
+  { id: "attention", label: "Needs attention" },
 ];
 
 const SKELETON = <span className="block h-4 w-40 animate-pulse rounded bg-[#21262d]" aria-label="Loading" />;
@@ -24,8 +26,10 @@ export function JiraBrowser({ prs }: { prs: readonly BoardPr[] }) {
       ? board.linked
       : filter === "assigned"
         ? board.assignedKeys
-        : [...new Set([...board.linked, ...board.assignedKeys])];
-  const wantsAssigned = filter !== "linked";
+        : filter === "attention"
+          ? board.linked.filter((k) => needsAttention(k, board.links, board.lookup))
+          : [...new Set([...board.linked, ...board.assignedKeys])];
+  const wantsAssigned = filter === "all" || filter === "assigned";
   const wantsLinked = filter !== "assigned";
 
   return (
@@ -67,6 +71,9 @@ function Empty({ filter, assignedOk, worktreesLoading }: { filter: JiraFilter; a
   const linkedSettled = !worktreesLoading;
   const say = (text: string) => <p className="text-xs text-[#8b949e]">{text}</p>;
   if (filter === "assigned") return assignedOk ? say("Nothing is assigned to you that is not done.") : null;
+  if (filter === "attention") {
+    return linkedSettled ? say("No open pull request of yours disagrees with its Jira issue.") : null;
+  }
   if (filter === "linked" || !assignedOk) {
     return linkedSettled
       ? say("None of your open pull requests or worktrees name a Jira issue. A key such as ABC-1 in a title or branch name links one.")

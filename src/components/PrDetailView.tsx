@@ -1,5 +1,5 @@
 import { PrFind } from "./PrFind";
-import { TicketChips } from "./jira/TicketChips";
+import { TicketChips, TicketDriftNotices } from "./jira/TicketChips";
 import { commentKeys } from "../lib/commentIdentity";
 import { useReviewAccountGeneration, useReviewOperation, useReleaseCheckedReview } from "../api/reviewOperations";
 import { useDetailActionsDiag } from "@/api/diag";
@@ -599,7 +599,7 @@ function PrDetailIdentity({
             same pull request, and splitting them across two lines was
             half the vertical noise above the fold. */}
         <p data-pr-find-text className="mt-1 flex flex-wrap items-center gap-x-1.5 text-xs text-[#8b949e]">
-          <TicketChips title={pr.title} branch={pr.head_ref} />
+          <TicketChips title={pr.title} branch={pr.head_ref} openPr={pr.state === "OPEN" ? { draft: pr.is_draft } : undefined} />
           <span>
             {pr.author} wants to merge <span className="font-mono">{pr.head_ref}</span> into{" "}
             <span className="font-mono">{pr.base_ref}</span>
@@ -645,6 +645,12 @@ function PrDetailIdentity({
             </>
           ) : null}
         </p>
+        {/* Where this pull request and its Jira ticket disagree (#2042).
+            Open pull requests only: a merged one needs every PR for the
+            ticket to judge, which waits on #2041. */}
+        {pr.state === "OPEN" ? (
+          <TicketDriftNotices title={pr.title} branch={pr.head_ref} draft={pr.is_draft} />
+        ) : null}
       </div>
 
       {!isError && <PrActions pr={pr} mergeEvidence={mergeEvidence} requireStackEvidence conversations={gate.mergeBlocked} />}

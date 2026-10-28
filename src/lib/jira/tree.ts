@@ -6,6 +6,7 @@
 import type { IssueState } from "@/api/jira";
 import type { PrIdentity } from "@/types/identity";
 import type { JiraIssue, JiraStatusCategory } from "@/types/jira";
+import { driftFor } from "./drift";
 import { keysForBranch, keysForPr, type KeySource } from "./keys";
 
 export interface LinkedPr {
@@ -174,4 +175,13 @@ export function rollUp(issues: readonly string[], lookup: Lookup): Record<JiraSt
   const counts: Record<JiraStatusCategory, number> = { new: 0, in_progress: 0, done: 0, unknown: 0 };
   for (const key of issues) counts[found(lookup(key))?.status.category ?? "unknown"]++;
   return counts;
+}
+
+/// Whether an issue disagrees with any open, non-draft pull request that
+/// names it (#2042). An issue not yet answered needs nothing: unknown is
+/// not a disagreement.
+export function needsAttention(key: string, links: ReadonlyMap<string, Links>, lookup: Lookup): boolean {
+  const issue = found(lookup(key));
+  if (!issue) return false;
+  return (links.get(key)?.prs ?? []).some((pr) => driftFor(issue, { draft: pr.is_draft, source: pr.source }) !== null);
 }

@@ -150,4 +150,15 @@ describe("My Jira issues", () => {
     expect(await screen.findByText(/none of your open pull requests or worktrees name one/)).toBeTruthy();
     await quiet();
   });
+
+  it("lists only issues that disagree with an open pull request under Needs attention", async () => {
+    const stale = issue("ABC-1", { parent_key: "ABC-2", status: { name: "To Do", category: "new" } });
+    issues.mockImplementation((keys) => Promise.resolve(batch([EPIC, stale].filter((i) => keys.includes(i.key)))));
+    mount(<JiraBrowser prs={[pr, { ...pr, number: 8, title: "No ticket", head_ref: "chore" }]} />);
+    await screen.findByRole("button", { name: /ABC-1 Summary/ });
+    fireEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    expect(screen.getByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /ABC-3/ })).toBeNull();
+    await quiet();
+  });
 });
