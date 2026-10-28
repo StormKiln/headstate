@@ -3,7 +3,8 @@ import { driftFor } from "@/lib/jira/drift";
 import { keysForBranch, keysForPr, type FoundKey } from "@/lib/jira/keys";
 import { TriangleAlert } from "lucide-react";
 import type { JiraStatusCategory } from "@/types/jira";
-import { ExternalLink } from "../ExternalLink";
+import { useFilters } from "@/store/filters";
+import { useJiraView } from "@/store/jira";
 import { useJira } from "./jiraState";
 
 /// Status colour by Jira's category, never by status name: "In Testing"
@@ -40,24 +41,15 @@ export function TicketChips({
   return (
     <>
       {found.map((f) => (
-        <TicketChip key={f.key} found={f} site={jira.site} openPr={openPr} />
+        <TicketChip key={f.key} found={f} openPr={openPr} />
       ))}
     </>
   );
 }
 
-function TicketChip({
-  found,
-  site,
-  openPr,
-}: {
-  found: FoundKey;
-  site: string | null;
-  openPr?: { draft: boolean };
-}) {
+function TicketChip({ found, openPr }: { found: FoundKey; openPr?: { draft: boolean } }) {
   const q = useJiraIssue(found.key);
   const where = found.source === "title" ? "the title" : "the branch name";
-  const fallback = site ? `https://${site}/browse/${found.key}` : null;
 
   if (q.isPending) {
     return (
@@ -98,7 +90,6 @@ function TicketChip({
     );
   }
   const { issue } = s;
-  const href = issue.url ?? fallback;
   const drift = openPr ? driftFor(issue, { draft: openPr.draft, source: found.source }) : null;
   const label = (
     <>
@@ -108,14 +99,24 @@ function TicketChip({
   );
   const tip = `${drift ? `${drift.message}\n` : ""}${issue.summary}${issue.assignee ? ` — ${issue.assignee}` : ""} (from ${where})`;
   const cls = `${CHIP} ${drift ? "border-[#d29922] text-[#d29922]" : CATEGORY_CLASS[issue.status.category]}`;
-  return href ? (
-    <ExternalLink href={href} title={tip} className={`${cls} hover:bg-[#21262d]`}>
+  // Opens the issue in My Jira issues, which links on to Jira itself. A
+  // button inside a clickable row, so the click stops here.
+  return (
+    <button
+      type="button"
+      title={tip}
+      className={`${cls} hover:bg-[#21262d]`}
+      // Enter on the chip must not also reach the row's own key handler,
+      // as the row's checkbox does.
+      onKeyDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        useJiraView.getState().select(issue.key);
+        useFilters.getState().setView("jira");
+      }}
+    >
       {label}
-    </ExternalLink>
-  ) : (
-    <span title={tip} className={cls}>
-      {label}
-    </span>
+    </button>
   );
 }
 
