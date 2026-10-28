@@ -356,6 +356,7 @@ pub fn run() {
             jira::commands::jira_connection,
             jira::commands::jira_projects,
             jira::commands::jira_issues,
+            jira::commands::jira_assigned,
             disk_inventory::commands::disk_inventory_status,
             disk_inventory::commands::disk_inventory_history,
             disk_inventory::commands::disk_inventory_settings,

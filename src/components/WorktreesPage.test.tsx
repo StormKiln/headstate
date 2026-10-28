@@ -394,7 +394,7 @@ const wt = (over: Partial<Worktree>): Worktree => ({
 const UNREADABLE = "/code/broken: fatal: not a repository";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} } as const;
 
 describe("WorktreesPage on a phone", () => {
   beforeEach(() => {
@@ -923,7 +923,7 @@ describe("WorktreesPage", () => {
     });
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);
@@ -942,7 +942,7 @@ describe("WorktreesPage", () => {
     });
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);

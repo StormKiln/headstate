@@ -5,7 +5,7 @@ import { useFilters } from "@/store/filters";
 import { PR_FIXTURES } from "../fixtures/prs";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} };
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} };
 
 afterEach(() => {
   cleanup();

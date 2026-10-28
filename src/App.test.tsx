@@ -287,7 +287,7 @@ describe("App — priorities strip scoping", () => {
   afterEach(() => {
     unmountBeforeReset();
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
     vi.clearAllMocks();
   });
 
@@ -308,7 +308,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
     renderApp();
 
     // Scope to the strip: the selected repo's PR also appears in the list
@@ -344,7 +344,7 @@ describe("App — priorities strip scoping", () => {
     ]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
     renderApp();
 
     // One pull request in scope, so the denominator is 1 -- not 3.
@@ -382,7 +382,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
     renderApp();
 
     expect(screen.getByText(/Needs your attention \(2\)/)).toBeDefined();
@@ -401,7 +401,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([blocked, ...PR_FIXTURES]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
     renderApp();
 
     const strip = screen.getByText(/Needs your attention/).closest("section");
@@ -485,7 +485,7 @@ describe("opening a pull request from To review", () => {
       view: "to-review",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} },
     });
   });
 
@@ -563,7 +563,7 @@ describe("Ready inventory availability", () => {
     useFilters.setState({
       view: "to-review",
       selectedPr: null,
-      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} },
     });
   });
 
@@ -618,7 +618,7 @@ describe("an incomplete refresh", () => {
       view: "my-prs",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} },
     });
   });
 
@@ -697,12 +697,12 @@ describe("the Claude Code route is gated on the capability", () => {
     unmountBeforeReset();
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true };
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view: "my-prs" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view: "my-prs" } as never);
   });
 
   const at = (view: string) => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} }, view } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} }, view } as never);
     return renderApp();
   };
 

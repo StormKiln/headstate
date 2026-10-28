@@ -473,6 +473,7 @@ export const latestRelease = () => call<string | null>("latest_release");
 export const jiraConnection = () => call<JiraConnection>("jira_connection");
 export const jiraProjects = () => call<ProjectList>("jira_projects");
 export const jiraIssues = (keys: string[]) => call<IssueBatch>("jira_issues", { keys });
+export const jiraAssigned = () => call<IssueBatch>("jira_assigned");
 
 /// --- Docker -------------------------------------------------------
 

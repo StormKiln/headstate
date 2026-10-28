@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { jiraConnection, jiraIssues, jiraProjects } from "./tauri";
+import { jiraAssigned, jiraConnection, jiraIssues, jiraProjects } from "./tauri";
 import type { JiraIssue } from "../types/jira";
 
 /// --- Jira (epic #2031) --------------------------------------------
@@ -92,14 +92,33 @@ export function loadIssue(key: string): Promise<IssueState> {
   });
 }
 
-/// One key's Jira state, cached per key so the same ticket on a PR row, a
-/// worktree and the Jira page is asked for once.
-export function useJiraIssue(key: string) {
-  return useQuery({
+/// The per-key query, shared by `useJiraIssue` and the Jira page's
+/// `useQueries`, so both read and fill the same cache entry.
+export function issueQuery(key: string) {
+  return {
     queryKey: ["jira-issue", key],
     queryFn: () => loadIssue(key),
     staleTime: 2 * 60_000,
     // An unasked key is retried soon; an answered one on the usual cadence.
-    refetchInterval: (q) => (q.state.data?.state === "unasked" ? 30_000 : 5 * 60_000),
+    refetchInterval: (q: { state: { data?: IssueState } }) =>
+      q.state.data?.state === "unasked" ? 30_000 : 5 * 60_000,
+  };
+}
+
+/// One key's Jira state, cached per key so the same ticket on a PR row, a
+/// worktree and the Jira page is asked for once.
+export function useJiraIssue(key: string) {
+  return useQuery(issueQuery(key));
+}
+
+/// Open issues assigned to the signed-in user (#2038). One search, read
+/// only while the Jira page is open.
+export function useJiraAssigned(enabled: boolean) {
+  return useQuery({
+    queryKey: ["jira-assigned"],
+    queryFn: () => jiraAssigned(),
+    enabled,
+    staleTime: 2 * 60_000,
+    refetchInterval: enabled ? 5 * 60_000 : false,
   });
 }

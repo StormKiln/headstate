@@ -1,5 +1,6 @@
-import { Activity, Bot, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, Bot, Container, Eye, FileText, FolderGit2, FolderTree, GitBranch, GitPullRequest, HardDrive, Package, Ticket } from "lucide-react";
 import { type View, viewLabel } from "../store/filters";
+import type { UiPrefs } from "../api/tauri";
 
 /// The view menu's tables: groups, entries and the always-offered set.
 /// Read by `ViewSwitcher.tsx` and `SettingsDialog.tsx`; apart from the
@@ -80,6 +81,7 @@ export type Group = (typeof GROUPS)[number]["id"];
 const VIEW_ENTRIES: { id: View; Icon: typeof GitPullRequest; group: Group }[] = [
   { id: "my-prs", Icon: GitPullRequest, group: "pull-requests" },
   { id: "to-review", Icon: Eye, group: "pull-requests" },
+  { id: "jira", Icon: Ticket, group: "pull-requests" },
   { id: "worktrees", Icon: FolderGit2, group: "repos" },
   { id: "branches", Icon: GitBranch, group: "repos" },
   // Third in the Repos group, after the two views about a checkout's
@@ -128,3 +130,15 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest; grou
 /// do anything: unhideable here means no toggle there, rather than a
 /// control that appears to work and silently does not.
 export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
+
+/// Whether `id` is a view whose CAPABILITY is switched off -- not hidden by
+/// preference, but with no page behind it. Read by `ViewSwitcher` (no menu
+/// entry) and `App` (move off it), so the two cannot disagree. See the
+/// `capabilityOff` note in `ViewSwitcher` for why this overrides both of
+/// that file's escape hatches (#916).
+export function capabilityOff(id: View, prefs: UiPrefs | undefined): boolean {
+  return (
+    (id === "claude-code" && !prefs?.claude_integrations_enabled) ||
+    (id === "jira" && !prefs?.jira_enabled)
+  );
+}

@@ -46,3 +46,18 @@ pub async fn jira_issues(app: AppHandle, keys: Vec<String>) -> Result<IssueBatch
     let bin = super::cli::find_acli().ok_or("acli is not installed")?;
     Ok(super::cli::issues_at(&bin, &keys).await)
 }
+
+/// How many assigned issues one read returns. Past this the page says "at
+/// least" rather than presenting a partial list as the whole.
+const ASSIGNED_LIMIT: usize = 100;
+
+/// Open work assigned to the signed-in user -- including issues with no
+/// pull request yet, which key detection alone can never find.
+#[tauri::command]
+pub async fn jira_assigned(app: AppHandle) -> Result<IssueBatch, String> {
+    if !enabled(&app).await {
+        return Err("Jira is switched off".into());
+    }
+    let bin = super::cli::find_acli().ok_or("acli is not installed")?;
+    Ok(super::cli::assigned_at(&bin, ASSIGNED_LIMIT).await)
+}
