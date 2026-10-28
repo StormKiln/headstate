@@ -36,6 +36,7 @@ const issue = (key: string, status = "In Review", category: JiraIssue["status"][
   status: { name: status, category },
   assignee: null,
   parent_key: null,
+  parent_checked: true,
   project_key: key.split("-")[0],
   url: `https://jira.example.internal/browse/${key}`,
   updated: null,

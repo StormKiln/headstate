@@ -1387,6 +1387,19 @@ const MIGRATIONS: &[&str] = &[
        PRIMARY KEY(path,block)
      );
      CREATE TABLE claude_link_continuation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), path TEXT NOT NULL);",
+    // Jira issues as last read through `acli` (#2032).
+    //
+    // `acli`'s search refuses `parent`, so an issue's epic comes from one
+    // `workitem view` per key. That is a second per key, so the answer is
+    // kept: `parent_read_at` NULL means "never read", which is not "has no
+    // parent", and `parent_key` NULL beside a set `parent_read_at` is.
+    "CREATE TABLE jira_issue (
+        key            TEXT PRIMARY KEY,
+        payload        TEXT NOT NULL,
+        read_at        TEXT NOT NULL,
+        parent_key     TEXT,
+        parent_read_at TEXT
+     );",
 
 ];
 

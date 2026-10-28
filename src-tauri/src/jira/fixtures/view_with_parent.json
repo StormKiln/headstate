@@ -1,0 +1,68 @@
+{
+  "changelog": null,
+  "editmeta": null,
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "fields": {
+    "issuetype": {
+      "avatarId": 10318,
+      "description": "",
+      "entityId": "00000000-0000-0000-0000-000000000000",
+      "hierarchyLevel": 0,
+      "iconUrl": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+      "id": "10003",
+      "name": "Task",
+      "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issuetype/10003",
+      "subtask": false
+    },
+    "parent": {
+      "fields": {
+        "issuetype": {
+          "avatarId": 10307,
+          "description": "Epics track collections of related bugs, stories, and tasks.",
+          "entityId": "00000000-0000-0000-0000-000000000000",
+          "hierarchyLevel": 1,
+          "iconUrl": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10307?size=medium",
+          "id": "10001",
+          "name": "Epic",
+          "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issuetype/10001",
+          "subtask": false
+        },
+        "priority": {
+          "iconUrl": "https://jira-prod-ca-4-3.prod.atl-paas.net/images/icons/priorities/medium_new.svg",
+          "id": "3",
+          "name": "Medium",
+          "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/priority/3"
+        },
+        "status": {
+          "description": "",
+          "iconUrl": "https://jira-prod-ca-4-3.prod.atl-paas.net/images/icons/statuses/generic.png",
+          "id": "10000",
+          "name": "To Do",
+          "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/status/10000",
+          "statusCategory": {
+            "colorName": "blue-gray",
+            "id": 2,
+            "key": "new",
+            "name": "To Do",
+            "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/statuscategory/2"
+          }
+        },
+        "summary": "Login overhaul"
+      },
+      "id": "10000",
+      "key": "SAM-1",
+      "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issue/10000"
+    }
+  },
+  "fieldsToInclude": null,
+  "id": "10003",
+  "key": "SAM-4",
+  "names": null,
+  "operations": null,
+  "properties": null,
+  "renderedFields": null,
+  "schema": null,
+  "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issue/10003",
+  "transitions": null,
+  "versionedRepresentations": null
+}

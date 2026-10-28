@@ -46,6 +46,7 @@ const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
   status: { name: "In Progress", category: "in_progress" },
   assignee: "Dana",
   parent_key: null,
+  parent_checked: true,
   project_key: key.split("-")[0],
   url: `https://jira.example.internal/browse/${key}`,
   updated: null,

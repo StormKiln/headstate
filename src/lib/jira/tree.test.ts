@@ -12,6 +12,7 @@ const issue = (key: string, level: number | null, parent: string | null = null, 
     status: { name: "s", category },
     assignee: null,
     parent_key: parent,
+    parent_checked: true,
     project_key: key.split("-")[0],
     url: null,
     updated: null,
@@ -39,6 +40,12 @@ describe("epicOf", () => {
 
   it("files an epic under itself", () => {
     expect(epicOf("ABC-2", lookup)).toBe("ABC-2");
+  });
+
+  it("does not file an issue whose parent is not read yet under No epic", () => {
+    const unread = issue("ABC-4", 0);
+    if (unread.state === "found") unread.issue.parent_checked = false;
+    expect(epicOf("ABC-4", table({ "ABC-4": unread }))).toBe(UNRESOLVED);
   });
 
   it("uses NO_EPIC only for an issue that has no parent", () => {

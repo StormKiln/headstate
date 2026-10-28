@@ -1,0 +1,29 @@
+{
+  "changelog": null,
+  "editmeta": null,
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "fields": {
+    "issuetype": {
+      "avatarId": 10307,
+      "description": "Epics track collections of related bugs, stories, and tasks.",
+      "entityId": "00000000-0000-0000-0000-000000000000",
+      "hierarchyLevel": 1,
+      "iconUrl": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10307?size=medium",
+      "id": "10001",
+      "name": "Epic",
+      "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issuetype/10001",
+      "subtask": false
+    }
+  },
+  "fieldsToInclude": null,
+  "id": "10000",
+  "key": "SAM-1",
+  "names": null,
+  "operations": null,
+  "properties": null,
+  "renderedFields": null,
+  "schema": null,
+  "self": "https://jira-prod-ca-4-3.prod.atl-paas.net/rest/api/3/issue/10000",
+  "transitions": null,
+  "versionedRepresentations": null
+}
