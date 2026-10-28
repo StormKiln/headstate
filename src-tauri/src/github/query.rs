@@ -768,6 +768,29 @@ pub fn merged_heads_query(n: usize) -> String {
     )
 }
 
+/// Pull requests whose title names one Jira key (#2041).
+///
+/// `$q` is built by `jira::lookup::search_query`: the key as a quoted
+/// phrase, `in:title is:pr`, and the owners the user already works in --
+/// never all of GitHub. `state` and `headRefName` are what the lookup's
+/// rules read: merged-but-not-done needs the state, and the head branch
+/// confirms a key GitHub's phrase match was loose about.
+pub const JIRA_TITLE_SEARCH: &str = r#"
+query($q: String!, $first: Int!) {
+  rateLimit { cost remaining resetAt }
+  search(query: $q, type: ISSUE, first: $first) {
+    issueCount
+    nodes {
+      ... on PullRequest {
+        number title url state isDraft headRefName
+        author { login }
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"#;
+
 /// Small identity/membership probes; variables keep repository and search data out of the document.
 pub fn membership_confirmation_query(count: usize) -> String {
     assert!((1..=4).contains(&count));

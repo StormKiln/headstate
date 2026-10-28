@@ -66,7 +66,12 @@ export type JiraConnection =
 /// Where a key was found in a pull request or branch.
 export type FoundIn = "title" | "branch";
 
-export type PrRole = "authored" | "reviewing";
+/// `searched`: found by searching GitHub for the key (#2041), not from the
+/// user's lists.
+export type PrRole = "authored" | "reviewing" | "searched";
+
+/// Known only for a searched pull request.
+export type PrState = "open" | "merged" | "closed";
 
 /// What names a key, from the desktop's index (`jira/index.rs`).
 export type LinkTarget =
@@ -80,6 +85,8 @@ export type LinkTarget =
       url: string;
       head_ref: string;
       is_draft: boolean;
+      state: PrState | null;
+      author: string | null;
     }
   | { kind: "worktree"; repo: string; path: string; branch: string }
   | { kind: "branch"; repo_path: string; branch: string };
@@ -100,4 +107,17 @@ export interface LinkIndex {
   projects: string[];
   /// Why the project list could not be read; `links` is then empty.
   error: string | null;
+}
+
+/// The GitHub half of a ticket lookup (`jira/lookup.rs`). `not_asked` is
+/// never "found nothing": it says why no search was made.
+export type KeySearch =
+  | { state: "not_asked"; reason: string }
+  | { state: "asked"; at: string; total: number; truncated: boolean }
+  | { state: "failed"; error: string };
+
+export interface KeyLookup {
+  key: string;
+  links: JiraLink[];
+  search: KeySearch;
 }

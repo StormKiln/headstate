@@ -223,3 +223,23 @@ pub async fn jira_assigned(app: AppHandle) -> Result<IssueBatch, String> {
     let db = crate::commands::db_path(&app);
     Ok(super::read::assigned(&bin, &db, site.as_deref(), ASSIGNED_LIMIT).await)
 }
+
+/// Every pull request, worktree and branch that names `key` (#2041): the
+/// database first, then -- when it holds no pull request, or `more` asks --
+/// one GitHub search across the owners the user already works in.
+#[tauri::command]
+pub async fn jira_find(
+    app: AppHandle,
+    key: String,
+    more: bool,
+) -> Result<super::lookup::KeyLookup, String> {
+    if !enabled(&app).await {
+        return Err("Jira is switched off".into());
+    }
+    if !super::cli::is_key(&key) {
+        return Err(format!("{key} is not a Jira key"));
+    }
+    use tauri::Manager;
+    let client = app.state::<crate::commands::GhClient>().0.clone();
+    super::lookup::find(client, &crate::commands::db_path(&app), &key, more).await
+}

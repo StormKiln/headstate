@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { ArrowLeft, TriangleAlert } from "lucide-react";
-import { driftFor } from "@/lib/jira/drift";
+import { driftFor, mergedButNotDone } from "@/lib/jira/drift";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { CATEGORY_TEXT, describe } from "@/lib/jira/describe";
 import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
@@ -7,7 +8,8 @@ import { useJiraView } from "@/store/jira";
 import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
 import { openInHeadstate } from "./openInHeadstate";
-import { useJiraIssue } from "@/api/jira";
+import { useJiraFind, useJiraIssue } from "@/api/jira";
+import type { JiraIssue, KeySearch } from "@/types/jira";
 import { useJiraBoard } from "./useJiraBoard";
 
 /// My Jira issues' main panel (#2038): the selected issue and every pull
@@ -42,6 +44,7 @@ export function JiraPage() {
       <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} />
       <EpicRollUp k={selected} known={known} lookup={lookup} />
       <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
+      <FoundOnGitHub key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />
     </div>
   );
 }
@@ -168,5 +171,89 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
         </section>
       ) : null}
     </div>
+  );
+}
+
+const STATE_TEXT = { open: "open", merged: "merged", closed: "closed without merging" } as const;
+
+/// Pull requests that name the issue beyond the user's own lists (#2041):
+/// teammates', and merged ones. The desktop answers from its database and
+/// searches GitHub only when that holds none -- or when asked to here.
+function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | undefined; lookup: Lookup; on: boolean }) {
+  const [more, setMore] = useState(false);
+  const q = useJiraFind(k, on, more);
+  const s = lookup(k);
+  const issue: JiraIssue | null = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
+  const mine = links?.prs ?? [];
+  const shown = new Set(mine.map((p) => p.url));
+  const found = (q.data?.links ?? []).flatMap((l) =>
+    l.target.kind === "pr" && l.target.role === "searched" && !shown.has(l.target.url) ? [l.target] : [],
+  );
+  const merged = found.filter((p) => p.state === "merged").length;
+  const open = mine.filter((p) => p.current).length + found.filter((p) => p.state === "open").length;
+  const drift = issue && q.data?.search.state === "asked" ? mergedButNotDone(issue, { merged, open }) : null;
+
+  return (
+    <section aria-label="Found on GitHub" className="flex flex-col gap-1">
+      {drift ? (
+        <p role="status" className="flex items-center gap-1.5 text-xs text-[#d29922]">
+          <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {drift.message}
+        </p>
+      ) : null}
+      {found.length > 0 ? (
+        <>
+          <h3 className="text-sm font-medium text-[#e6edf3]">Found on GitHub</h3>
+          <ul className="flex flex-col gap-1">
+            {found.map((p) => (
+              <li
+                key={p.url}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-[#30363d] px-2 py-1.5 text-sm"
+              >
+                <span className="min-w-0 flex-1 truncate text-[#e6edf3]">{p.title}</span>
+                <span className="text-xs text-[#8b949e]">
+                  {p.repo}#{p.number} · {p.state ? STATE_TEXT[p.state] : "state unknown"}
+                  {p.author ? ` · ${p.author}` : ""}
+                </span>
+                <ExternalLink href={p.url} className="text-xs text-[#58a6ff] hover:underline">
+                  Open on GitHub
+                </ExternalLink>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {q.isPending && on ? (
+        <span className="h-4 w-48 animate-pulse rounded bg-[#21262d]" aria-label="Looking on GitHub" />
+      ) : q.isError ? (
+        <p className="text-xs text-[#f85149]">Could not look for other pull requests: {String(q.error)}</p>
+      ) : q.data ? (
+        <SearchLine search={q.data.search} shown={found.length} onSearch={more ? undefined : () => setMore(true)} />
+      ) : null}
+    </section>
+  );
+}
+
+/// What the GitHub half did, in words. "Not asked" never reads as "none".
+function SearchLine({ search, shown, onSearch }: { search: KeySearch; shown: number; onSearch?: () => void }) {
+  const say = (text: string) => <span>{text}</span>;
+  const body =
+    search.state === "failed"
+      ? say(`Searching GitHub failed: ${search.error}`)
+      : search.state === "not_asked"
+        ? say(`GitHub not searched: ${search.reason}.`)
+        : say(
+            `Searched GitHub ${new Date(search.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` +
+              (search.truncated ? ` — ${search.total} matched; only the first were read.` : shown === 0 ? " — nothing else names it." : "."),
+          );
+  return (
+    <p className={`flex flex-wrap items-center gap-2 text-xs ${search.state === "failed" ? "text-[#f85149]" : "text-[#8b949e]"}`}>
+      {body}
+      {onSearch && search.state === "not_asked" && search.reason.startsWith("already known") ? (
+        <button type="button" onClick={onSearch} className="text-[#58a6ff] hover:underline">
+          Search GitHub
+        </button>
+      ) : null}
+    </p>
   );
 }

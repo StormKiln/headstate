@@ -339,7 +339,9 @@ groups those issues under their epics (and initiatives, where your site has
 them), alongside the issues assigned to you that have no pull request yet.
 Selecting one shows its status and every pull request, worktree and branch
 that names it, including pull requests that have since left your list, shown
-as no longer open. A key counts only when its prefix is one of your Jira
+as no longer open. When none of yours names it, Headstate searches GitHub
+for pull requests that do, only across the owners of repositories you already
+work in, and says when a merged one left the ticket behind. A key counts only when its prefix is one of your Jira
 projects, so look-alikes such as `UTF-8` are never linked. Off by default:
 turn it on in **Settings → Jira**. Read-only; Headstate never changes an
 issue.

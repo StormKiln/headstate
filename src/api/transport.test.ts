@@ -159,6 +159,7 @@ const ROWS: Row[] = [
   row(api.jiraIssues, [["ABC-1"]], "jira_issues", { keys: ["ABC-1"] }),
   row(api.jiraAssigned, [], "jira_assigned"),
   row(api.jiraLinks, [], "jira_links"),
+  row(api.jiraFind, ["ABC-1", false], "jira_find", { key: "ABC-1", more: false }),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),
   row(api.dockerImages, [], "docker_images"),

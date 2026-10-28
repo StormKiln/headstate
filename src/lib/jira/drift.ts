@@ -4,17 +4,17 @@
 /// needs no configuration: "In Testing" and "Code Review" are both in
 /// progress, whatever a project calls them.
 ///
-/// Only the rules an OPEN pull request can decide live here. "Merged, but
-/// the ticket did not move" needs every pull request for the ticket,
-/// merged ones included, and Headstate reads open ones only -- asserting
-/// it from that would be a guess. It waits on the reverse lookup (#2041).
+/// `driftFor` holds the rules an OPEN pull request decides. "Merged, but
+/// the ticket did not move" needs to know a pull request MERGED, which only
+/// a GitHub search reports (#2041) -- one that merely left the user's list
+/// may have been closed -- so it is `mergedButNotDone`, fed the lookup.
 
 import type { JiraIssue } from "@/types/jira";
 import type { KeySource } from "./keys";
 
 export interface Drift {
   /// Stable, for tests and for a filter to count by.
-  rule: "open-but-not-started" | "done-but-open";
+  rule: "open-but-not-started" | "done-but-open" | "merged-not-done";
   message: string;
 }
 
@@ -40,4 +40,16 @@ export function driftFor(issue: JiraIssue, pr: { draft: boolean; source: KeySour
     case "unknown":
       return null;
   }
+}
+
+/// A pull request for the ticket merged and none is still open, yet the
+/// ticket is not done (#2042, R2). `merged` and `open` count what the
+/// lookup KNOWS; an unknown category decides nothing.
+export function mergedButNotDone(issue: JiraIssue, known: { merged: number; open: number }): Drift | null {
+  if (known.merged === 0 || known.open > 0) return null;
+  if (issue.status.category !== "new" && issue.status.category !== "in_progress") return null;
+  return {
+    rule: "merged-not-done",
+    message: `A pull request for ${issue.key} has merged, but the ticket is still ${issue.status.name || "open"}.`,
+  };
 }
