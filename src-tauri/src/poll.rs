@@ -336,6 +336,10 @@ pub struct UiPrefs {
     /// integration spawns no `acli` at all.
     #[serde(default)]
     pub jira_enabled: bool,
+    /// Jira project keys NOT to match, for a project whose key collides
+    /// with branch-name noise. Empty means every visible project matches.
+    #[serde(default)]
+    pub jira_excluded_projects: Vec<String>,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -384,6 +388,7 @@ impl Default for UiPrefs {
             battery_low_percent: 0,
             // OFF: asked for, not assumed. See the field.
             jira_enabled: false,
+            jira_excluded_projects: Vec::new(),
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.

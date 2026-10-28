@@ -1,4 +1,5 @@
 import { observationLabel } from "@/lib/rowObservation";
+import { TicketChips } from "./jira/TicketChips";
 import { ExternalLink } from "./ExternalLink";
 import {
   Check,
@@ -399,6 +400,7 @@ export function PrRow({
               unlike the branch pair below, which dense mode drops --
               because this is the disclosure the row exists to make. */}
           {stackedOn === undefined ? null : <StackedChip stackedOn={stackedOn} />}
+          <TicketChips title={pr.title} branch={pr.head_ref} />
           <CiGlyph pr={pr} />
           <ReviewGlyph pr={pr} />
           {(dense ? pr.labels.slice(0, DENSE_LABELS) : pr.labels).map((label) => (

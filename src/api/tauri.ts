@@ -17,7 +17,7 @@ import type { TranscriptWatch } from "../types/transcript";
 import { call } from "./transport";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
-import type { JiraConnection, ProjectList } from "../types/jira";
+import type { IssueBatch, JiraConnection, ProjectList } from "../types/jira";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -192,6 +192,8 @@ export interface UiPrefs {
   /// Whether the Jira integration is switched on (epic #2031). A
   /// CAPABILITY, like `claude_integrations_enabled`; defaults off.
   jira_enabled: boolean;
+  /// Jira project keys not to match. Empty: every visible project matches.
+  jira_excluded_projects: string[];
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
@@ -470,6 +472,7 @@ export const latestRelease = () => call<string | null>("latest_release");
 
 export const jiraConnection = () => call<JiraConnection>("jira_connection");
 export const jiraProjects = () => call<ProjectList>("jira_projects");
+export const jiraIssues = (keys: string[]) => call<IssueBatch>("jira_issues", { keys });
 
 /// --- Docker -------------------------------------------------------
 

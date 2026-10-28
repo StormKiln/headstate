@@ -1,4 +1,5 @@
 import { useMeasurementsEnabled } from "./api/clientMeasurements";
+import { JiraProvider } from "./components/jira/JiraContext";
 import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
 import { listen } from "./api/transport";
@@ -728,6 +729,7 @@ export default function App() {
     <ReviewMeasurementProvider enabled={IS_MOBILE_BUILD ? measurementEnabled : prefs?.diagnostic_logging === true}
       snapshot={githubReceipt} selected={!!filters.repo || !!sourceRepoKey}
       receipt={reviewingQuery.data === reviewingReceipt.prs ? reviewingReceipt.measurementReceipt : undefined}>
+    <JiraProvider prefs={prefs}>
     <div className="flex h-full flex-col bg-[#0d1117] text-[#e6edf3] px-safe">
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
@@ -1112,6 +1114,7 @@ export default function App() {
           window's status rather than the list's. */}
       <StatusBar github={{ list: view === "to-review" ? "reviewing" : "authored", receipt: githubReceipt }} updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
     </div>
+    </JiraProvider>
     </ReviewMeasurementProvider>
   );
 }

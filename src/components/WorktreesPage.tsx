@@ -1,4 +1,5 @@
 import { ActingOnDesktop } from "./ActingOnDesktop";
+import { TicketChips } from "./jira/TicketChips";
 import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
 import { RefreshCw, Sparkles } from "lucide-react";
@@ -351,6 +352,11 @@ function Row({
         ) : (
           <span className="ml-2 text-xs text-[#8b949e]">detached</span>
         )}
+        {wt.branch ? (
+          <span className="ml-2 inline-flex gap-1 align-middle">
+            <TicketChips branch={wt.branch} />
+          </span>
+        ) : null}
         {/* Which agent is working here (#1137).
             The question at the top of this page on a machine running
             ~100 worktrees, and it could not be answered -- while the

@@ -25,6 +25,7 @@ const prefs = (jira_enabled: boolean): UiPrefs => ({
   stale_venv_days: 0,
   battery_low_percent: 0,
   jira_enabled,
+  jira_excluded_projects: [],
 });
 
 beforeEach(() => {
@@ -50,6 +51,19 @@ describe("JiraSettingsPanel", () => {
     renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
     expect(await screen.findByText(`Signed in to ${SITE}.`)).toBeTruthy();
     expect(await screen.findByText("ABC")).toBeTruthy();
+  });
+
+  it("turns a project off and back on", async () => {
+    connection.mockResolvedValue({ state: "logged_in", site: null, account: null });
+    projects.mockResolvedValue({ projects: [{ key: "ABC", name: "Alpha" }], error: null });
+    const setPrefs = vi.fn(() => Promise.resolve());
+    const view = renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={setPrefs} />);
+    fireEvent.click(await screen.findByRole("button", { name: "ABC", pressed: true }));
+    expect(setPrefs).toHaveBeenLastCalledWith(expect.objectContaining({ jira_excluded_projects: ["ABC"] }));
+    view.unmount();
+    renderWithQuery(<JiraSettingsPanel prefs={{ ...prefs(true), jira_excluded_projects: ["ABC"] }} setPrefs={setPrefs} />);
+    fireEvent.click(await screen.findByRole("button", { name: "ABC", pressed: false }));
+    expect(setPrefs).toHaveBeenLastCalledWith(expect.objectContaining({ jira_excluded_projects: [] }));
   });
 
   /// Each state carries its own remedy; none reads as "no projects".

@@ -23,6 +23,7 @@ export function JiraSettingsPanel({
   setPrefs: (prefs: UiPrefs) => Promise<void>;
 }) {
   const enabled = prefs?.jira_enabled ?? false;
+  const excluded = prefs?.jira_excluded_projects ?? [];
   const connection = useJiraConnection(enabled);
   const signedIn = connection.data?.state === "logged_in";
   const projects = useJiraProjects(enabled && signedIn);
@@ -63,20 +64,39 @@ export function JiraSettingsPanel({
               ) : (
                 <>
                   <p className="text-xs text-[#8b949e]">
-                    Keys are matched only for these {projects.data.projects.length} projects, so
+                    Keys are matched only for your {projects.data.projects.length} projects, so
                     look-alikes such as <code className="font-mono">UTF-8</code> are never
-                    linked.
+                    linked. Turn a project off if its key collides with your branch names.
                   </p>
                   <ul className="flex flex-wrap gap-1" aria-label="Jira projects">
-                    {projects.data.projects.map((p) => (
-                      <li
-                        key={p.key}
-                        title={p.name}
-                        className="rounded border border-[#30363d] px-1.5 py-0.5 font-mono text-xs text-[#e6edf3]"
-                      >
-                        {p.key}
-                      </li>
-                    ))}
+                    {projects.data.projects.map((p) => {
+                      const on = !excluded.includes(p.key);
+                      return (
+                        <li key={p.key}>
+                          <button
+                            type="button"
+                            title={p.name}
+                            aria-pressed={on}
+                            onClick={() =>
+                              prefs &&
+                              void setPrefs({
+                                ...prefs,
+                                jira_excluded_projects: on
+                                  ? [...excluded, p.key]
+                                  : excluded.filter((k) => k !== p.key),
+                              })
+                            }
+                            className={`rounded border px-1.5 py-0.5 font-mono text-xs ${
+                              on
+                                ? "border-[#30363d] text-[#e6edf3]"
+                                : "border-dashed border-[#30363d] text-[#8b949e] line-through"
+                            }`}
+                          >
+                            {p.key}
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 </>
               )}
