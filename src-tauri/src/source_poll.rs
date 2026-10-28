@@ -2481,7 +2481,7 @@ mod tests {
         polls.complete(publication, Ok(rows), |_| {});
         assert!(polls.success_publication(&old).await.is_none());
         let path = dir.path().canonicalize().unwrap().join("report.jsonl");
-        recorder.export_to(path.clone()).await.unwrap();
+        crate::measurement::await_writer(recorder.export_to(path.clone())).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(!text.contains("PRIVATE_OWNER"));
         let events: Vec<serde_json::Value> = text

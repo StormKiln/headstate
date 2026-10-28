@@ -5499,7 +5499,7 @@ mod tests {
             .and(body_string_contains("ChecksPage"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_delay(std::time::Duration::from_secs(60))
                     .set_body_json(json!({"data":{}})),
             )
             .mount(&server)
@@ -5509,11 +5509,13 @@ mod tests {
                 .await
                 .with_read_context(super::super::admission::ReadContext::new(
                     super::super::admission::ReadClass::Foreground,
-                    std::time::Duration::from_millis(100),
+                    // Room for the first page on a loaded runner; the
+                    // stalled checks page outlasts it many times over.
+                    std::time::Duration::from_secs(3),
                 ));
         let started = Instant::now();
         let d = client.fetch_pr_detail("acme/alpha", 42).await.unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
         assert_eq!(d.checks.len(), 1);
         assert_eq!(
             d.checks_coverage.unwrap().state,

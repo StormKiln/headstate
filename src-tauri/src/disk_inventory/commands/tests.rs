@@ -11,9 +11,14 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (temp, db, root)
 }
 async fn finished(controller: &Controller) -> Status {
-    tokio::time::timeout(Duration::from_secs(5), controller.hooks.finished.notified())
-        .await
-        .expect("scan publication");
+    // A hang guard, not a measurement: Windows CI runners under load have
+    // taken longer than five seconds to publish a finished scan.
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        controller.hooks.finished.notified(),
+    )
+    .await
+    .expect("scan publication");
     let status = controller.status().unwrap();
     assert!(!status.running);
     status

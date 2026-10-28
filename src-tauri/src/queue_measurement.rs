@@ -113,7 +113,7 @@ mod tests {
         .await;
         assert_eq!(value, Ok(42));
         let path = dir.path().canonicalize().unwrap().join("report.jsonl");
-        recorder.export_to(path.clone()).await.unwrap();
+        crate::measurement::await_writer(recorder.export_to(path.clone())).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("\"operation_class\":\"detail\""));
         assert!(text.contains("\"stage\":\"completed\""));
@@ -155,7 +155,7 @@ mod lifecycle_tests {
         assert!(result.is_err());
         assert!(current().is_none());
         let path = dir.path().canonicalize().unwrap().join("report.jsonl");
-        recorder.export_to(path.clone()).await.unwrap();
+        crate::measurement::await_writer(recorder.export_to(path.clone())).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(!text.contains("PRIVATE_FAILURE"));
         assert!(text.contains("\"outcome\":\"canceled\""));

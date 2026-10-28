@@ -800,6 +800,10 @@ impl Drop for Recorder {
 }
 #[cfg(test)]
 mod tests;
+// Tests elsewhere that export use this too, so a loaded CI runner cannot
+// expire the five-second export deadline under them.
+#[cfg(test)]
+pub(crate) use tests::await_writer;
 
 #[cfg(test)]
 pub(crate) fn preserve_test_export_to(
