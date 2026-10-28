@@ -110,12 +110,13 @@ describe("My Jira issues", () => {
   it("filters to issues with pull requests, and to assigned ones", async () => {
     mount(<JiraBrowser prs={[pr]} />);
     await screen.findByRole("button", { name: /ABC-3 Not started/ });
+    await screen.findByRole("button", { name: /ABC-1 Summary/ });
     fireEvent.click(screen.getByRole("button", { name: "With PRs" }));
     expect(screen.queryByRole("button", { name: /ABC-3/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Assigned" }));
     expect(screen.queryByRole("button", { name: /ABC-1 Summary/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /ABC-3 Not started/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /ABC-3 Not started/ })).toBeTruthy();
     await quiet();
   });
 
@@ -159,7 +160,7 @@ describe("My Jira issues", () => {
     mount(<JiraBrowser prs={[pr, { ...pr, number: 8, title: "No ticket", head_ref: "chore" }]} />);
     await screen.findByRole("button", { name: /ABC-1 Summary/ });
     fireEvent.click(screen.getByRole("button", { name: "Needs attention" }));
-    expect(screen.getByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /ABC-3/ })).toBeNull();
     await quiet();
   });
