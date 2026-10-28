@@ -1,4 +1,5 @@
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, TriangleAlert } from "lucide-react";
+import { driftFor } from "@/lib/jira/drift";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { CATEGORY_TEXT, describe } from "@/lib/jira/describe";
 import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
@@ -46,7 +47,7 @@ export function JiraPage({ prs }: { prs: readonly BoardPr[] }) {
       ) : null}
       <IssueHeader k={selected} lookup={board.lookup} site={board.jira?.site ?? null} />
       <EpicRollUp k={selected} known={known} lookup={board.lookup} />
-      <LinkedWork k={selected} links={board.links.get(selected)} />
+      <LinkedWork k={selected} links={board.links.get(selected)} lookup={board.lookup} />
     </div>
   );
 }
@@ -104,7 +105,9 @@ function EpicRollUp({ k, known, lookup }: { k: string; known: string[]; lookup: 
   );
 }
 
-function LinkedWork({ k, links }: { k: string; links: Links | undefined }) {
+function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined; lookup: Lookup }) {
+  const s = lookup(k);
+  const issue = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
   const prs = links?.prs ?? [];
   const worktrees = links?.worktrees ?? [];
   if (prs.length === 0 && worktrees.length === 0) {
@@ -118,6 +121,7 @@ function LinkedWork({ k, links }: { k: string; links: Links | undefined }) {
           <ul className="flex flex-col gap-1">
             {prs.map((pr) => {
               const gitlab = pr.identity.source?.provider === "gitlab";
+              const drift = issue ? driftFor(issue, { draft: pr.is_draft, source: pr.source }) : null;
               return (
                 <li
                   key={`${pr.identity.repo}#${pr.identity.number}`}
@@ -140,6 +144,12 @@ function LinkedWork({ k, links }: { k: string; links: Links | undefined }) {
                   <ExternalLink href={pr.url} className="text-xs text-[#58a6ff] hover:underline">
                     {gitlab ? "Open on GitLab" : "Open on GitHub"}
                   </ExternalLink>
+                  {drift ? (
+                    <p role="status" className="flex basis-full items-center gap-1.5 text-xs text-[#d29922]">
+                      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      {drift.message}
+                    </p>
+                  ) : null}
                 </li>
               );
             })}

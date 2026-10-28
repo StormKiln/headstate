@@ -11,7 +11,7 @@ const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>()
 vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraProjects: projects, jiraIssues: issues }));
 
 import { JiraProvider } from "./JiraContext";
-import { TicketChips } from "./TicketChips";
+import { TicketChips, TicketDriftNotices } from "./TicketChips";
 
 const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   hidden_views: [],
@@ -27,11 +27,11 @@ const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   ...over,
 });
 
-const issue = (key: string, status = "In Review"): JiraIssue => ({
+const issue = (key: string, status = "In Review", category: JiraIssue["status"]["category"] = "in_progress"): JiraIssue => ({
   key,
   summary: `Summary of ${key}`,
   issue_type: { name: "Story", hierarchy_level: 0 },
-  status: { name: status, category: "in_progress" },
+  status: { name: status, category },
   assignee: null,
   parent_key: null,
   project_key: key.split("-")[0],
@@ -127,5 +127,32 @@ describe("TicketChips", () => {
     issues.mockResolvedValue(batch({ issues: [issue("XY-8", "To Do")] }));
     mount(prefs(), undefined, "xy-8-spike");
     expect(await screen.findByText("XY-8 · To Do")).toBeTruthy();
+  });
+
+  /// #2042: an open pull request whose ticket has not started is marked.
+  it("marks a ticket that is still To Do on an open pull request, and says why", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-7", "Backlog", "new")] }));
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips title="ABC-7 fix" branch={null} openPr={{ draft: false }} />
+        <TicketDriftNotices title="ABC-7 fix" branch="" draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByLabelText("Needs attention")).toBeTruthy();
+    expect(await screen.findByText("This pull request is open, but ABC-7 is still Backlog.")).toBeTruthy();
+  });
+
+  it("does not mark a draft, or a row that is not an open pull request", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-8", "To Do", "new")] }));
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips title="ABC-8 fix" branch={null} openPr={{ draft: true }} />
+        <TicketChips branch="abc-8-wip" />
+        <TicketDriftNotices title="ABC-8 fix" branch="" draft={true} />
+      </JiraProvider>,
+    );
+    expect(await screen.findAllByText("ABC-8 · To Do")).toHaveLength(2);
+    expect(screen.queryByLabelText("Needs attention")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

@@ -1,5 +1,7 @@
 import { useJiraIssue } from "@/api/jira";
+import { driftFor } from "@/lib/jira/drift";
 import { keysForBranch, keysForPr, type FoundKey } from "@/lib/jira/keys";
+import { TriangleAlert } from "lucide-react";
 import type { JiraStatusCategory } from "@/types/jira";
 import { ExternalLink } from "../ExternalLink";
 import { useJira } from "./jiraState";
@@ -19,8 +21,17 @@ const CHIP = "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 p
 ///
 /// Renders nothing unless Jira is on, signed in and its projects are known
 /// -- see `JiraState`. Pass `title` for a pull request; a worktree or local
-/// branch has only `branch`.
-export function TicketChips({ title, branch }: { title?: string; branch?: string | null }) {
+/// branch has only `branch`. Pass `openPr` for an OPEN pull request, and a
+/// ticket that disagrees with it (#2042) is marked.
+export function TicketChips({
+  title,
+  branch,
+  openPr,
+}: {
+  title?: string;
+  branch?: string | null;
+  openPr?: { draft: boolean };
+}) {
   const jira = useJira();
   if (!jira) return null;
   const found =
@@ -29,13 +40,21 @@ export function TicketChips({ title, branch }: { title?: string; branch?: string
   return (
     <>
       {found.map((f) => (
-        <TicketChip key={f.key} found={f} site={jira.site} />
+        <TicketChip key={f.key} found={f} site={jira.site} openPr={openPr} />
       ))}
     </>
   );
 }
 
-function TicketChip({ found, site }: { found: FoundKey; site: string | null }) {
+function TicketChip({
+  found,
+  site,
+  openPr,
+}: {
+  found: FoundKey;
+  site: string | null;
+  openPr?: { draft: boolean };
+}) {
   const q = useJiraIssue(found.key);
   const where = found.source === "title" ? "the title" : "the branch name";
   const fallback = site ? `https://${site}/browse/${found.key}` : null;
@@ -80,13 +99,15 @@ function TicketChip({ found, site }: { found: FoundKey; site: string | null }) {
   }
   const { issue } = s;
   const href = issue.url ?? fallback;
+  const drift = openPr ? driftFor(issue, { draft: openPr.draft, source: found.source }) : null;
   const label = (
     <>
+      {drift ? <TriangleAlert className="h-3 w-3" aria-label="Needs attention" /> : null}
       {issue.key} · {issue.status.name || "no status"}
     </>
   );
-  const tip = `${issue.summary}${issue.assignee ? ` — ${issue.assignee}` : ""} (from ${where})`;
-  const cls = `${CHIP} ${CATEGORY_CLASS[issue.status.category]}`;
+  const tip = `${drift ? `${drift.message}\n` : ""}${issue.summary}${issue.assignee ? ` — ${issue.assignee}` : ""} (from ${where})`;
+  const cls = `${CHIP} ${drift ? "border-[#d29922] text-[#d29922]" : CATEGORY_CLASS[issue.status.category]}`;
   return href ? (
     <ExternalLink href={href} title={tip} className={`${cls} hover:bg-[#21262d]`}>
       {label}
@@ -95,5 +116,35 @@ function TicketChip({ found, site }: { found: FoundKey; site: string | null }) {
     <span title={tip} className={cls}>
       {label}
     </span>
+  );
+}
+
+/// The drift notices for an open pull request, spelled out (#2042). For the
+/// detail view, where there is room for a sentence; rows carry the marked
+/// chip instead.
+export function TicketDriftNotices({ title, branch, draft }: { title: string; branch: string; draft: boolean }) {
+  const jira = useJira();
+  if (!jira) return null;
+  const found = keysForPr({ title, head_ref: branch }, jira.projects);
+  if (found.length === 0) return null;
+  return (
+    <>
+      {found.map((f) => (
+        <DriftNotice key={f.key} found={f} draft={draft} />
+      ))}
+    </>
+  );
+}
+
+function DriftNotice({ found, draft }: { found: FoundKey; draft: boolean }) {
+  const q = useJiraIssue(found.key);
+  const s = q.data;
+  const drift = s?.state === "found" ? driftFor(s.issue, { draft, source: found.source }) : null;
+  if (!drift) return null;
+  return (
+    <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-[#d29922]">
+      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      {drift.message}
+    </p>
   );
 }

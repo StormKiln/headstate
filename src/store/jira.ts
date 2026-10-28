@@ -4,8 +4,9 @@ import { create } from "zustand";
 ///
 /// `linked`: named by one of your pull requests or worktrees. `assigned`:
 /// assigned to you and not done, including work with no pull request yet.
-/// `all` is both.
-export type JiraFilter = "all" | "linked" | "assigned";
+/// `all` is both. `attention`: linked, and disagreeing with one of its open
+/// pull requests (#2042).
+export type JiraFilter = "all" | "linked" | "assigned" | "attention";
 
 interface JiraViewState {
   selected: string | null;
