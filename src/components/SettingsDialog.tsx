@@ -18,6 +18,7 @@ import { PairedDevicesList } from "./PairedDevicesList";
 import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
 import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
 import { JiraSettingsPanel } from "./JiraSettingsPanel";
+import { settingsSections, type SectionId } from "./settingsSections";
 import { GitLabHostPanel } from "./GitLabHostPanel";
 import {
   useAutostart,
@@ -54,31 +55,6 @@ function intervalLabel(secs: number): string {
 /// neither can see `localStorage`. That also means a write can FAIL -- a
 /// path that is not a directory is rejected -- so the error is shown
 /// rather than swallowed.
-/// The left rail's topics, in the order shown.
-///
-/// Grouped by what a setting is ABOUT rather than by which struct it
-/// lives in: "General" holds the poll interval, window behaviour and
-/// keyboard notes, which come from three preference sources and are one
-/// subject to a person.
-const SECTIONS = [
-  { id: "general", label: "General" },
-  { id: "repositories", label: "Repositories" },
-  { id: "gitlab", label: "GitLab" },
-  { id: "notifications", label: "Notifications" },
-  { id: "cleanup", label: "Cleanup" },
-  { id: "phone", label: "Phone" },
-  // Its own topic rather than a row under Views, because the switch is a
-  // CAPABILITY and not a view preference -- and because the section carries
-  // the hook installer, which edits a file outside this app (#915). Placed
-  // before Views so the last entry stays the one that is about nothing but
-  // what is on screen.
-  { id: "claude", label: "Claude Code" },
-  { id: "jira", label: "Jira" },
-  { id: "views", label: "Views" },
-] as const;
-
-type SectionId = (typeof SECTIONS)[number]["id"];
-
 export function SettingsDialog({
   open,
   onOpenChange,
@@ -244,7 +220,7 @@ export function SettingsDialog({
                 : "flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
             }
           >
-            {SECTIONS.filter((s) => (s.id !== "gitlab" && s.id !== "jira") || !IS_MOBILE_BUILD).map((s) => (
+            {settingsSections(IS_MOBILE_BUILD).map((s) => (
               <button
                 key={s.id}
                 type="button"
