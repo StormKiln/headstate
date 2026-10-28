@@ -1,6 +1,7 @@
 import { useJiraConnection, useJiraProjects } from "@/api/jira";
 import { useJiraView, type JiraFilter } from "@/store/jira";
 import { needsAttention } from "@/lib/jira/tree";
+import { GoToTicket } from "./GoToTicket";
 import { JiraTree } from "./JiraTree";
 import { useJiraBoard, type BoardPr } from "./useJiraBoard";
 
@@ -34,7 +35,8 @@ export function JiraBrowser({ prs }: { prs: readonly BoardPr[] }) {
 
   return (
     <div className="flex min-h-0 flex-col gap-2">
-      <div role="group" aria-label="Which issues" className="flex gap-1">
+      <GoToTicket projects={board.jira.projects} links={board.links} />
+      <div role="group" aria-label="Which issues" className="flex flex-wrap gap-1">
         {FILTERS.map((f) => (
           <button
             key={f.id}
