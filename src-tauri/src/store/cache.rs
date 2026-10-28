@@ -292,7 +292,9 @@ mod tests {
     /// The boundary, from both sides.
     #[test]
     fn freshness_is_bounded_at_an_hour() {
-        let now = chrono::Utc::now();
+        // Whole seconds, so `at` loses nothing to the stored format and the
+        // exact boundary can be asserted without racing the clock.
+        let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
         let at = |secs: i64| {
             (now - chrono::Duration::seconds(secs))
                 .format("%Y-%m-%d %H:%M:%S")
@@ -301,6 +303,11 @@ mod tests {
         assert!(is_fresh(&at(60), now), "a minute old is fresh");
         assert!(is_fresh(&at(MAX_SNAPSHOT_AGE_SECS - 5), now));
         assert!(!is_fresh(&at(MAX_SNAPSHOT_AGE_SECS + 5), now));
+        assert!(
+            is_fresh(&at(MAX_SNAPSHOT_AGE_SECS), now),
+            "exactly an hour is fresh"
+        );
+        assert!(!is_fresh(&at(MAX_SNAPSHOT_AGE_SECS + 1), now));
         assert!(!is_fresh(&at(4 * 24 * 3600), now), "four days is not fresh");
     }
 
