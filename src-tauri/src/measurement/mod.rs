@@ -801,8 +801,10 @@ impl Drop for Recorder {
 #[cfg(test)]
 mod tests;
 // Tests elsewhere that export use this too, so a loaded CI runner cannot
-// expire the five-second export deadline under them.
+// expire the five-second export deadline under them. The mobile crate
+// compiles this module without those tests.
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use tests::await_writer;
 
 #[cfg(test)]
