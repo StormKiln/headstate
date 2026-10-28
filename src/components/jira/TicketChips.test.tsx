@@ -1,9 +1,11 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
 import type { IssueBatch, JiraConnection, JiraIssue, ProjectList } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
+import { useFilters } from "@/store/filters";
+import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const projects = vi.hoisted(() => vi.fn<() => Promise<ProjectList>>());
@@ -154,5 +156,21 @@ describe("TicketChips", () => {
     expect(await screen.findAllByText("ABC-8 · To Do")).toHaveLength(2);
     expect(screen.queryByLabelText("Needs attention")).toBeNull();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("opens the issue in My Jira issues, without also opening the row", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-9")] }));
+    const row = vi.fn();
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <div onClick={row}>
+          <TicketChips title="ABC-9 fix" branch={null} />
+        </div>
+      </JiraProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /ABC-9 · In Review/ }));
+    expect(useFilters.getState().view).toBe("jira");
+    expect(useJiraView.getState().selected).toBe("ABC-9");
+    expect(row).not.toHaveBeenCalled();
   });
 });
