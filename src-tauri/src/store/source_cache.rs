@@ -483,7 +483,9 @@ mod tests {
             Some("alice"),
         )
         .unwrap();
-        for age in [3599, 3600, 3601, 86400] {
+        // The exact second is pinned in `cache::freshness_is_bounded_at_an_hour`;
+        // here the read's own clock can tick past it (#2061).
+        for age in [3590, 3610, 86400] {
             let at = (chrono::Utc::now() - chrono::Duration::seconds(age))
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
