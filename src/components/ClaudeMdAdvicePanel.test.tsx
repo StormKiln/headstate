@@ -86,7 +86,7 @@ const EMPTY = {
   "claude-code": {},
 
   repositories: {},
-  "system-health": {},
+  "system-health": {}, jira: {},
 } as const;
 
 const finding = (over: Partial<ClaudeMdAdviceFinding> = {}): ClaudeMdAdviceFinding => ({

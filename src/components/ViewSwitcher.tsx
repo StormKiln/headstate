@@ -5,7 +5,7 @@ import { useUiPrefs } from "../api/hooks";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import { current } from "../lib/ariaCurrent";
 import { useIsMobile } from "../lib/useIsMobile";
-import { ALWAYS_OFFERED, GROUPS, VIEWS } from "./viewMenu";
+import { ALWAYS_OFFERED, GROUPS, VIEWS, capabilityOff } from "./viewMenu";
 
 export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>> }) {
   const { view: storedView, setView } = useFilters();
@@ -45,10 +45,8 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
   // Routing this through `hidden_views` instead would also clobber a real
   // preference -- someone who hid the Claude Code view for their own
   // reasons would lose that the first time the capability toggled.
-  const capabilityOff = (id: View) =>
-    id === "claude-code" && !prefs?.claude_integrations_enabled;
   const offered = VIEWS.filter(({ id }) =>
-    (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(id)) || capabilityOff(id)
+    (IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(id)) || capabilityOff(id, prefs)
       ? false
       : ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
   );

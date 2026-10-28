@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { useFilters } from "./filters";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} };
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} };
 
 beforeEach(() => {
   useFilters.setState({

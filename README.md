@@ -115,6 +115,20 @@ the host and CLI login on the paired desktop when using the iOS companion.
 If the desktop cannot find `glab`, set `HEADSTATE_GLAB` to its full executable
 path and relaunch Headstate, as with `HEADSTATE_GH` below.
 
+### Jira (optional)
+
+Install Atlassian's CLI ([`acli`](https://developer.atlassian.com/cloud/acli/guides/install-acli/))
+on the desktop and sign in, then turn the integration on in
+**Settings → Jira**:
+
+```sh
+acli jira auth login --web
+```
+
+`acli` holds the Jira credential; Headstate stores none and sends none to the
+phone. Jira Cloud only. If the desktop cannot find `acli`, set
+`HEADSTATE_ACLI` to its full path and relaunch Headstate.
+
 ### Building from source on Linux
 
 Releases ship a `.deb` and an `.AppImage`, so building from source is only
@@ -316,6 +330,18 @@ could not tell — and the resumable ones offer the exact `claude --resume`
 command, prefixed with a `cd` to the directory the session ran in, because
 `--resume` adopts the directory it is invoked from. An overview page counts
 what is resurrectable and what is archived because its directory is gone.
+
+**My Jira issues.** For teams that track work in Jira Cloud. A Jira key in a
+pull request's title or branch name — `ABC-1: fix login`,
+`feature/abc-1-fix-login` — links it to that issue, and the issue's status
+shows as a chip on the pull request, worktree and branch rows. This page
+groups those issues under their epics (and initiatives, where your site has
+them), alongside the issues assigned to you that have no pull request yet.
+Selecting one shows its status and every pull request, worktree and branch
+that names it. A key counts only when its prefix is one of your Jira
+projects, so look-alikes such as `UTF-8` are never linked. Off by default:
+turn it on in **Settings → Jira**. Read-only; Headstate never changes an
+issue.
 
 **This is off by default.** Turn it on in Settings, under Claude
 Integrations. It stays off until asked for because the optional session hook

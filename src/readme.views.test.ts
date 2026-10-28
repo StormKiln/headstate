@@ -51,6 +51,7 @@ describe("the README documents every view", () => {
   const HEADING: Record<(typeof ALL_VIEWS)[number], string> = {
     "my-prs": "Pull request list",
     "to-review": "Unresolved conversations",
+    jira: "My Jira issues",
     worktrees: "Worktrees",
     branches: "Branches",
     docker: "Docker",

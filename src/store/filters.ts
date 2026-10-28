@@ -50,6 +50,9 @@ export const ALL_VIEWS = [
   // expected.
   "my-prs",
   "to-review",
+  // Gated by the `jira_enabled` capability, like `claude-code` and for the
+  // same reason it is registered regardless (epic #2031).
+  "jira",
   "worktrees",
   "branches",
   "docker",
@@ -111,6 +114,7 @@ const VIEW_LABELS: Record<View, string> = {
   // its own, so there is one place to change and nothing left to drift.
   "my-prs": "My pull requests",
   "to-review": "To review",
+  jira: "My Jira issues",
   "claude-md": "CLAUDE.md",
   packages: "Package updates",
   artifacts: "Artifacts",
@@ -593,7 +597,7 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   // repository is `repoPath` below, which is deliberately not here --
   // see its comment for why a path is navigation rather than a filter.
   repositories: {},
-  "system-health": {},
+  "system-health": {}, jira: {},
 };
 
 /// Filters and view survive a relaunch.

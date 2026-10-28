@@ -8,7 +8,7 @@ afterEach(() => {
   cleanup();
   useFilters.getState().reset();
   useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {} } });
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {} } });
 });
 
 /// The Reviews trigger rendered `${filters.review}` directly, so choosing
@@ -24,7 +24,7 @@ describe("FilterBar review trigger", () => {
         "to-review": {},
         worktrees: {},
   branches: {},
-        docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {},
+        docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {},
       },
     });
     render(<FilterBar prs={PR_FIXTURES} />);
@@ -39,7 +39,7 @@ describe("FilterBar review trigger", () => {
         "to-review": {},
         worktrees: {},
   branches: {},
-        docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {},
+        docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {},  repositories: {}, "system-health": {}, jira: {},
       },
     });
     render(<FilterBar prs={PR_FIXTURES} />);

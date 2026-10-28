@@ -366,6 +366,9 @@ export function usePollState(): "idle" | "fetching" | "retrying" {
 const VIEW_NEEDS_GITHUB: Record<View, boolean> = {
   "my-prs": true,
   "to-review": true,
+  // Reads the authored list for titles and branch names only -- no CI or
+  // review state -- so the background cadence is enough (epic #2031).
+  jira: false,
   worktrees: false,
   branches: false,
   docker: false,
