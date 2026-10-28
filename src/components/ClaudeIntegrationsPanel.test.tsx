@@ -57,6 +57,7 @@ const PREFS: UiPrefs = {
   terminal_command: "",
   stale_venv_days: 0,
   battery_low_percent: 0,
+  jira_enabled: false,
 };
 
 const setPrefs = vi.fn(() => Promise.resolve());

@@ -329,6 +329,13 @@ pub struct UiPrefs {
     /// the UI keeps them in separate panels; see `health::Battery`.
     #[serde(default)]
     pub battery_low_percent: u32,
+    /// Whether the Jira integration is switched on (epic #2031).
+    ///
+    /// A CAPABILITY, like `claude_integrations_enabled` and for the same
+    /// reasons. Defaults OFF: most users do not use Jira, and a switched-off
+    /// integration spawns no `acli` at all.
+    #[serde(default)]
+    pub jira_enabled: bool,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -375,6 +382,8 @@ impl Default for UiPrefs {
             // 0 is "use the default", not "alert at 0%". See
             // `health::alerts::low_percent`.
             battery_low_percent: 0,
+            // OFF: asked for, not assumed. See the field.
+            jira_enabled: false,
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.

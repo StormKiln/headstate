@@ -7,6 +7,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 /// every other SettingsDialog test renders the DESKTOP layout. Without
 /// this file the phone's list navigation (#650) would ship untested --
 /// and it is the half that changed.
+// Rendered by its own test; it needs a QueryClient this file does not provide.
+vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
 vi.mock("@/lib/useIsMobile", () => ({
   useIsMobile: () => true,
   MOBILE_BREAKPOINT: 768,

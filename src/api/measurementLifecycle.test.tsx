@@ -17,7 +17,7 @@ function Footer(){ useReviewPresentation("checked", "desktop_footer"); return <s
 function Ready(){ const source=useSourceRefresh("reviewing"), {prefs}=useUiPrefs(); return <ReviewMeasurementProvider enabled={prefs?.diagnostic_logging===true} receipt={source.measurementReceipt} selected={false} snapshot={source}><ReadyStrip prs={source.prs??[]} localTools={false}/><Footer/></ReviewMeasurementProvider>; }
 afterEach(()=>{cleanup();seam.call.mockReset();seam.callbacks.clear();});
 it("keeps cached Ready rows across capture transitions, remounts and old/status-only frames without requests",async()=>{
- const qc=new QueryClient({defaultOptions:{queries:{retry:false}}}); qc.setQueryData(["ui-prefs"],{hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:false});
+ const qc=new QueryClient({defaultOptions:{queries:{retry:false}}}); qc.setQueryData(["ui-prefs"],{hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:false});
  useFilters.getState().setFilter("readyMyPushes","show");
  let current=capture;
  seam.call.mockImplementation(async(name)=>name==="set_ui_prefs"?current:name==="get_viewer"?"synthetic":undefined);
@@ -27,16 +27,16 @@ it("keeps cached Ready rows across capture transitions, remounts and old/status-
  let mounted=render(<Ready/>,{wrapper});
  const emit=(revision:number,receipt_revision:number,measurement_receipt=token,prs:typeof rows|null=rows)=>act(()=>{for(const cb of seam.callbacks)cb({payload:{source:{provider:"github",host:"github.com"},list:"reviewing",session:"desktop",revision,receipt_revision,measurement_receipt,prs,phase:"ready",error:null,coverage:"complete"}});});
  await act(async()=>{}); emit(1,1);
- await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true});});
+ await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:true});});
  emit(2,2);
  act(()=>{for(const cb of seam.callbacks)cb({payload:{source:{provider:"github",host:"github.com"},list:"authored",session:"desktop",revision:2,receipt_revision:2,measurement_receipt:token,prs:rows,phase:"ready",error:null,coverage:"complete"}});});
  expect(authored.result.current.measurementReceipt).toEqual(token);
  const events=()=>seam.call.mock.calls.filter(c=>c[0]==="measurement_client_events").flatMap(c=>c[1].batch);
  await waitFor(()=>expect(events().at(-1)?.receipt).toEqual(token));
- await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:false});});
+ await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:false});});
  mounted.unmount(); const count=events().length;
  current={...capture,capture:2};
- await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true});});
+ await act(async()=>{await prefs.result.current.set({hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:true});});
  mounted=render(<Ready/>,{wrapper});
  await waitFor(()=>expect(events().length).toBeGreaterThan(count));
  expect(authored.result.current.prs).toBe(rows); expect(authored.result.current.measurementReceipt).toBeUndefined();
@@ -50,7 +50,7 @@ it("keeps cached Ready rows across capture transitions, remounts and old/status-
  mounted.unmount();qc.clear();
 });
 it("publishes no capture on a failed save and fences late successful acknowledgments",async()=>{
- const qc=new QueryClient({defaultOptions:{queries:{retry:false}}}); const initial={hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true};
+ const qc=new QueryClient({defaultOptions:{queries:{retry:false}}}); const initial={hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:true};
  qc.setQueryData(["ui-prefs"],initial);
  const pending:Array<{resolve:(v:unknown)=>void,reject:(e:Error)=>void}>=[];
  seam.call.mockImplementation((name)=>name==="set_ui_prefs"?new Promise((resolve,reject)=>pending.push({resolve,reject})):Promise.resolve(undefined));
@@ -73,7 +73,7 @@ it("publishes no capture on a failed save and fences late successful acknowledgm
 });
 it.each(["success-first", "failure-first"] as const)("publishes the earlier successful preference save when the newer request fails (%s)",async order=>{
  const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
- const initial={hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,diagnostic_logging:true};
+ const initial={hidden_views:[],close_hides_to_tray:true,announce_updates:false,claude_integrations_enabled:false,terminal_command:"",stale_venv_days:0,battery_low_percent:0,jira_enabled:false,diagnostic_logging:true};
  const saved={...initial,close_hides_to_tray:false};
  qc.setQueryData(["ui-prefs"],initial);
  const pending:Array<{resolve:(v:unknown)=>void,reject:(e:Error)=>void}>=[];
