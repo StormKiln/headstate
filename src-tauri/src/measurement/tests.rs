@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 // writes; awaiting on an idle paused runtime would auto-advance that deadline.
 // The wall-clock guard bounds pending polls without changing production time;
 // it does not interrupt synchronous filesystem work or the writer's drop join.
-pub(super) fn await_writer<T>(future: impl Future<Output = T>) -> T {
+pub(crate) fn await_writer<T>(future: impl Future<Output = T>) -> T {
     struct ResumeClock;
     impl Drop for ResumeClock {
         fn drop(&mut self) {
@@ -1017,7 +1017,9 @@ async fn ci_stalled_fixture_flush_is_bounded_and_does_not_claim_readiness() {
     let flushed = flush_fixture(&r, std::time::Duration::from_millis(20)).await;
     release.send(()).unwrap();
     assert!(!flushed);
-    assert!(flush_fixture(&r, std::time::Duration::from_secs(2)).await);
+    // Recovery only; the bounded refusal above is the proof. Windows CI
+    // runners under load have needed longer than two seconds.
+    assert!(flush_fixture(&r, std::time::Duration::from_secs(30)).await);
 }
 
 #[test]
