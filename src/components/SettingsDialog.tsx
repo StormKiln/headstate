@@ -17,6 +17,7 @@ import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
 import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
+import { JiraSettingsPanel } from "./JiraSettingsPanel";
 import { GitLabHostPanel } from "./GitLabHostPanel";
 import {
   useAutostart,
@@ -72,6 +73,7 @@ const SECTIONS = [
   // before Views so the last entry stays the one that is about nothing but
   // what is on screen.
   { id: "claude", label: "Claude Code" },
+  { id: "jira", label: "Jira" },
   { id: "views", label: "Views" },
 ] as const;
 
@@ -242,7 +244,7 @@ export function SettingsDialog({
                 : "flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
             }
           >
-            {SECTIONS.filter((s) => s.id !== "gitlab" || !IS_MOBILE_BUILD).map((s) => (
+            {SECTIONS.filter((s) => (s.id !== "gitlab" && s.id !== "jira") || !IS_MOBILE_BUILD).map((s) => (
               <button
                 key={s.id}
                 type="button"
@@ -999,6 +1001,13 @@ export function SettingsDialog({
             <div className={section === "claude" ? "" : "hidden"}>
               <ClaudeIntegrationsPanel prefs={ui} setPrefs={setUi} />
             </div>
+            {/* Desktop only, like GitLab: `acli` runs on the desktop and the
+                phone holds no Jira credential (#2047). */}
+            {IS_MOBILE_BUILD ? null : (
+              <div className={section === "jira" ? "" : "hidden"}>
+                <JiraSettingsPanel prefs={ui} setPrefs={setUi} />
+              </div>
+            )}
             {/* Rendered always, hidden with CSS -- never unmounted and
                 never the `hidden` ATTRIBUTE.
                 Unmounting loses a control's state on every tab switch.

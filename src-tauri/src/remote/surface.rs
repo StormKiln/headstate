@@ -159,6 +159,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
     ("scan_artifacts_report", Class::Read),
+    // Read: Jira is asked through the desktop's `acli`; the phone holds
+    // no Jira credential (#2047).
+    ("jira_connection", Class::Read),
+    ("jira_projects", Class::Read),
     ("disk_inventory_status", Class::Read),
     ("disk_inventory_history", Class::Read),
     ("disk_inventory_settings", Class::Read),
@@ -1137,6 +1141,8 @@ async fn call(
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
         "scan_artifacts_report" => res(commands::scan_artifacts_report(app.clone()).await),
+        "jira_connection" => ok(crate::jira::commands::jira_connection(app.clone()).await),
+        "jira_projects" => res(crate::jira::commands::jira_projects(app.clone()).await),
         "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
         "disk_inventory_history" => {
             res(crate::disk_inventory::commands::disk_inventory_history(app.clone()).await)

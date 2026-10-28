@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const setRemote = vi.fn<(enabled: boolean) => Promise<void>>(() => Promise.resolve());
 const remoteState = { enabled: false };
 
+// Rendered by its own test; it needs a QueryClient this file does not provide.
+vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
 vi.mock("../api/hooks", () => ({
   // #1154. Undefined renders nothing, which is what these tests assume:
   // a failed probe must not draw "not found" for every tool.

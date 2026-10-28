@@ -154,6 +154,8 @@ const ROWS: Row[] = [
     runId: 7,
   }),
   row(api.latestRelease, [], "latest_release"),
+  row(api.jiraConnection, [], "jira_connection"),
+  row(api.jiraProjects, [], "jira_projects"),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),
   row(api.dockerImages, [], "docker_images"),

@@ -17,6 +17,7 @@ import type { TranscriptWatch } from "../types/transcript";
 import { call } from "./transport";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
+import type { JiraConnection, ProjectList } from "../types/jira";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -188,6 +189,9 @@ export interface UiPrefs {
   ///
   /// This is CHARGE, not capacity. See `HealthBattery`.
   battery_low_percent: number;
+  /// Whether the Jira integration is switched on (epic #2031). A
+  /// CAPABILITY, like `claude_integrations_enabled`; defaults off.
+  jira_enabled: boolean;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
@@ -461,6 +465,11 @@ export const removeWorktrees = (repoPath: string, worktreePaths: string[], runId
 /// updates: a user on a version with a launch-blocking bug otherwise has
 /// no way to learn a fix exists.
 export const latestRelease = () => call<string | null>("latest_release");
+
+/// --- Jira ---------------------------------------------------------
+
+export const jiraConnection = () => call<JiraConnection>("jira_connection");
+export const jiraProjects = () => call<ProjectList>("jira_projects");
 
 /// --- Docker -------------------------------------------------------
 

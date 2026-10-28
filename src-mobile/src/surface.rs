@@ -100,6 +100,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("list_branches", Class::Read),
     ("scan_artifacts", Class::Read),
     ("scan_artifacts_report", Class::Read),
+    // Read: Jira is asked through the desktop's `acli`; the phone holds
+    // no Jira credential (#2047).
+    ("jira_connection", Class::Read),
+    ("jira_projects", Class::Read),
     ("disk_inventory_status", Class::Read),
     ("disk_inventory_history", Class::Read),
     ("disk_inventory_settings", Class::Read),

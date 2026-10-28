@@ -23,6 +23,7 @@ pub mod identity;
 #[cfg(test)]
 mod invariants;
 pub mod inventory;
+pub mod jira;
 mod log_dedup;
 mod markdown_export;
 pub mod measurement;
@@ -352,6 +353,8 @@ pub fn run() {
             commands::comment_on_pr,
             commands::scan_artifacts,
             commands::scan_artifacts_report,
+            jira::commands::jira_connection,
+            jira::commands::jira_projects,
             disk_inventory::commands::disk_inventory_status,
             disk_inventory::commands::disk_inventory_history,
             disk_inventory::commands::disk_inventory_settings,
