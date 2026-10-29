@@ -1,5 +1,20 @@
 /// Keyboard shortcuts for the main window.
 ///
+/// The whole list, which is also where they are documented:
+///
+/// | Keys             | Does                                            |
+/// | ---------------- | ----------------------------------------------- |
+/// | Cmd/Ctrl+R       | refresh the pull request list                   |
+/// | Cmd/Ctrl+F, `/`  | focus the visible search box                    |
+/// | Cmd/Ctrl+J       | Go to ticket: jump to a Jira key's work (#2040) |
+/// | `j`/`k`, arrows  | move the cursor through the visible list        |
+/// | Enter            | open the row under the cursor                   |
+/// | `x`              | check the row under the cursor                  |
+/// | Escape           | hide to the tray (desktop)                      |
+///
+/// Cmd/Ctrl+K is left free on purpose: it is the convention for a general
+/// command palette, which Go to ticket is not.
+///
 /// The app had zero keyboard affordances: no shortcuts, no accelerators,
 /// and no Escape-to-hide, so every action required the mouse. These three
 /// are the cheapest meaningful wins and need no backend change --
@@ -18,6 +33,8 @@ export interface ShortcutHandlers {
   onOpen: () => void;
   /// Check or uncheck the row under the cursor, for a bulk action.
   onToggleSelect: () => void;
+  /// Open Go to ticket from any page (#2040).
+  onGoToTicket: () => void;
 }
 
 /// Whether a dialog or sheet is currently open.
@@ -93,6 +110,13 @@ export function shortcutFor(
   // Tauri window does not provide.
   if (mod && !e.altKey && e.key.toLowerCase() === "f") {
     return "onFocusSearch";
+  }
+
+  // Go to ticket, from any page and even from inside a field -- like
+  // Cmd/Ctrl+F, the modifier means it is never typed text. "J" for Jira.
+  // Not over another dialog: one modal at a time.
+  if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "j") {
+    return hasOpenOverlay() ? null : "onGoToTicket";
   }
 
   // "/" focuses search, the convention on GitHub itself -- but only when

@@ -3,6 +3,8 @@ import { JiraProvider } from "./components/jira/JiraContext";
 import { capabilityOff } from "./components/viewMenu";
 import { JiraSidebar } from "./components/jira/JiraSidebar";
 import { JiraPage } from "./components/jira/JiraPage";
+import { GoToTicketDialog, GoToTicketEntry } from "./components/jira/GoToTicketDialog";
+import { useGoToTicket } from "./store/goToTicket";
 import { useFollowJiraLinks } from "./api/jira";
 import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
@@ -416,6 +418,10 @@ export default function App() {
         // all do something sensible there -- it is only this branch
         // that cannot work.
         if (IS_DESKTOP_BUILD) void getCurrentWindow().hide();
+      } else if (action === "onGoToTicket") {
+        // From any view (#2040). The dialog itself says when Jira is not
+        // ready, rather than the keys silently doing nothing.
+        useGoToTicket.getState().setOpen(true);
       } else if (action === "onFocusSearch") {
         // The VISIBLE search box, not the document's first (#953).
         //
@@ -752,6 +758,9 @@ export default function App() {
           of mind, and `ConnectionBanner` was the only component in the
           app reading the connection state at all. */}
       <StaleRibbon />
+      {/* Go to ticket (#2040): one dialog for every view, opened by
+          Cmd/Ctrl+J or the header's button. */}
+      <GoToTicketDialog />
       {/* #1486: a tapped session notification opens its transcript, and
           other sessions' transitions toast while the app is open. The
           companion's own commands, so the phone build only. */}
@@ -837,7 +846,8 @@ export default function App() {
               </select>
             </label>
           ) : null}
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-2">
+            <GoToTicketEntry compact={isMobile} />
             {/* The wizard only understands GitHub pull requests and the
                 GitHub repository filter. A GitLab or Both list can retain
                 cached GitHub rows, but must not offer those hidden rows

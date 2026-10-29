@@ -12,6 +12,7 @@ import { useJiraFind, useJiraIssue } from "@/api/jira";
 import type { JiraIssue, KeySearch } from "@/types/jira";
 import { useJiraBoard } from "./useJiraBoard";
 import { useJira } from "./jiraState";
+import { searchWords } from "@/lib/jira/ticketWork";
 
 /// My Jira issues' main panel (#2038): the selected issue and every pull
 /// request, worktree and branch of yours that names it.
@@ -45,7 +46,7 @@ export function JiraPage() {
       <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} />
       <EpicRollUp k={selected} known={known} lookup={lookup} />
       <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
-      <FoundOnGitHub key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />
+      <FoundBySearching key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />
     </div>
   );
 }
@@ -133,8 +134,8 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
                     {pr.identity.repo}
                     {gitlab ? "!" : "#"}
                     {pr.identity.number}
-                    {pr.current ? (pr.is_draft ? " · draft" : "") : " · no longer open"} · from the{" "}
-                    {pr.source === "title" ? "title" : "branch"}
+                    {pr.current ? (pr.is_draft ? " · draft" : "") : " · no longer open"} ·{" "}
+                    <span className="font-mono">{pr.branch}</span> · key in the {pr.source === "title" ? "title" : "branch"}
                   </span>
                   <button
                     type="button"
@@ -178,10 +179,13 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
 
 const STATE_TEXT = { open: "open", merged: "merged", closed: "closed without merging" } as const;
 
+const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
 /// Pull requests that name the issue beyond the user's own lists (#2041):
-/// teammates', and merged ones. The desktop answers from its database and
-/// searches GitHub only when that holds none -- or when asked to here.
-function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | undefined; lookup: Lookup; on: boolean }) {
+/// teammates', and merged ones, on GitHub and GitLab. The desktop answers
+/// from its database and searches only when that holds none -- or when
+/// asked to here -- and says what each search covered (#2040).
+function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | undefined; lookup: Lookup; on: boolean }) {
   const [more, setMore] = useState(false);
   const expectations = useJira()?.expectations;
   const q = useJiraFind(k, on, more);
@@ -194,10 +198,13 @@ function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | und
   );
   const merged = found.filter((p) => p.state === "merged").length;
   const open = mine.filter((p) => p.current).length + found.filter((p) => p.state === "open").length;
-  const drift = issue && q.data?.search.state === "asked" ? mergedButNotDone(issue, { merged, open }, expectations) : null;
+  const asked = q.data?.search.state === "asked" || q.data?.gitlab?.state === "asked";
+  const drift = issue && asked ? mergedButNotDone(issue, { merged, open }, expectations) : null;
+  const halves = q.data ? ([["GitHub", q.data.search], ["GitLab", q.data.gitlab]] as const) : [];
+  const onSearch = more ? undefined : () => setMore(true);
 
   return (
-    <section aria-label="Found on GitHub" className="flex flex-col gap-1">
+    <section aria-label="Found by searching" className="flex flex-col gap-1">
       {drift ? (
         <p role="status" className="flex items-center gap-1.5 text-xs text-[#d29922]">
           <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -206,55 +213,82 @@ function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | und
       ) : null}
       {found.length > 0 ? (
         <>
-          <h3 className="text-sm font-medium text-[#e6edf3]">Found on GitHub</h3>
+          <h3 className="text-sm font-medium text-[#e6edf3]">Found by searching</h3>
           <ul className="flex flex-col gap-1">
-            {found.map((p) => (
-              <li
-                key={p.url}
-                className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-[#30363d] px-2 py-1.5 text-sm"
-              >
-                <span className="min-w-0 flex-1 truncate text-[#e6edf3]">{p.title}</span>
-                <span className="text-xs text-[#8b949e]">
-                  {p.repo}#{p.number} · {p.state ? STATE_TEXT[p.state] : "state unknown"}
-                  {p.author ? ` · ${p.author}` : ""}
-                </span>
-                <ExternalLink href={p.url} className="text-xs text-[#58a6ff] hover:underline">
-                  Open on GitHub
-                </ExternalLink>
-              </li>
-            ))}
+            {found.map((p) => {
+              const gitlab = p.source.provider === "gitlab";
+              return (
+                <li
+                  key={p.url}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-[#30363d] px-2 py-1.5 text-sm"
+                >
+                  <span className="min-w-0 flex-1 truncate text-[#e6edf3]">{p.title}</span>
+                  <span className="text-xs text-[#8b949e]">
+                    {p.repo}
+                    {gitlab ? "!" : "#"}
+                    {p.number} · {p.state ? STATE_TEXT[p.state] : "state unknown"}
+                    {p.is_draft && p.state === "open" ? " · draft" : ""}
+                    {p.author ? ` · ${p.author}` : ""} · <span className="font-mono">{p.head_ref}</span>
+                  </span>
+                  <ExternalLink href={p.url} className="text-xs text-[#58a6ff] hover:underline">
+                    {gitlab ? "Open on GitLab" : "Open on GitHub"}
+                  </ExternalLink>
+                </li>
+              );
+            })}
           </ul>
         </>
       ) : null}
       {q.isPending && on ? (
-        <span className="h-4 w-48 animate-pulse rounded bg-[#21262d]" aria-label="Looking on GitHub" />
+        // Pending: a skeleton AND words, so it never reads as an answer.
+        <p role="status" className="flex items-center gap-2 text-xs text-[#8b949e]">
+          <span className="h-3 w-24 animate-pulse rounded bg-[#21262d]" aria-hidden="true" />
+          {mine.length === 0 ? `Searching for pull requests that name ${k}…` : `Checking what else names ${k}…`}
+        </p>
       ) : q.isError ? (
         <p className="text-xs text-[#f85149]">Could not look for other pull requests: {String(q.error)}</p>
-      ) : q.data ? (
-        <SearchLine search={q.data.search} shown={found.length} onSearch={more ? undefined : () => setMore(true)} />
-      ) : null}
+      ) : (
+        halves.map(([provider, search]) =>
+          search ? (
+            <SearchLine
+              key={provider}
+              provider={provider}
+              search={search}
+              k={k}
+              shown={found.filter((p) => (p.source.provider === "gitlab") === (provider === "GitLab")).length}
+              mine={mine.length}
+              onSearch={onSearch}
+            />
+          ) : null,
+        )
+      )}
     </section>
   );
 }
 
-/// What the GitHub half did, in words. "Not asked" never reads as "none".
-function SearchLine({ search, shown, onSearch }: { search: KeySearch; shown: number; onSearch?: () => void }) {
-  const say = (text: string) => <span>{text}</span>;
-  const body =
-    search.state === "failed"
-      ? say(`Searching GitHub failed: ${search.error}`)
-      : search.state === "not_asked"
-        ? say(`GitHub not searched: ${search.reason}.`)
-        : say(
-            `Searched GitHub ${new Date(search.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` +
-              (search.truncated ? ` — ${search.total} matched; only the first were read.` : shown === 0 ? " — nothing else names it." : "."),
-          );
+/// What one provider's search did, in words (`searchWords`). "Not asked"
+/// never reads as "none", and "none" names what was searched.
+function SearchLine({
+  provider,
+  search,
+  k,
+  shown,
+  mine,
+  onSearch,
+}: {
+  provider: "GitHub" | "GitLab";
+  search: KeySearch;
+  k: string;
+  shown: number;
+  mine: number;
+  onSearch?: () => void;
+}) {
   return (
     <p className={`flex flex-wrap items-center gap-2 text-xs ${search.state === "failed" ? "text-[#f85149]" : "text-[#8b949e]"}`}>
-      {body}
+      <span>{searchWords(provider, search, k, { shown, mine, time })}</span>
       {onSearch && search.state === "not_asked" && search.reason.startsWith("already known") ? (
         <button type="button" onClick={onSearch} className="text-[#58a6ff] hover:underline">
-          Search GitHub
+          Search {provider}
         </button>
       ) : null}
     </p>

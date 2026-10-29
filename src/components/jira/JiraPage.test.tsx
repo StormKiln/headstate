@@ -99,7 +99,7 @@ beforeEach(() => {
     return Promise.resolve(batch(found, { missing: keys.filter((k) => !found.some((i) => i.key === k)) }));
   });
   assigned.mockReset().mockResolvedValue(batch([TODO]));
-  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" } }));
+  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" }, gitlab: null }));
   worktrees.data = [];
   useJiraView.setState({ selected: null, filter: "all" });
 });
@@ -142,7 +142,7 @@ describe("My Jira issues", () => {
     mount(<JiraPage />);
     expect(await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ })).toBeTruthy();
     const prs = screen.getByRole("region", { name: "Pull requests" });
-    expect(within(prs).getByText(/from the title/)).toBeTruthy();
+    expect(within(prs).getByText(/key in the title/)).toBeTruthy();
     fireEvent.click(within(prs).getByRole("button", { name: "Open in Headstate" }));
     expect(useFilters.getState().view).toBe("my-prs");
     expect(useFilters.getState().selectedPr).toMatchObject({ repo: "octocat/hello-world", number: 7 });
@@ -210,11 +210,12 @@ describe("My Jira issues", () => {
           target: { ...(prLink().target as Extract<JiraLink["target"], { kind: "pr" }>), role: "searched", number: 9, url: "https://github.com/octocat/hello-world/pull/9", state: "merged", author: "dana" },
         },
       ],
-      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, truncated: false },
+      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, read: 1, truncated: false, scope: ["octocat"], unsearched: [] },
+      gitlab: null,
     });
     useJiraView.setState({ selected: "ABC-1" });
     mount(<JiraPage />);
-    const region = await screen.findByRole("region", { name: "Found on GitHub" });
+    const region = await screen.findByRole("region", { name: "Found by searching" });
     expect(await within(region).findByText(/octocat\/hello-world#9 · merged · dana/)).toBeTruthy();
     expect(await within(region).findByText("A pull request for ABC-1 has merged, but the ticket is still In Progress.")).toBeTruthy();
     await quiet();

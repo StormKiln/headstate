@@ -254,7 +254,8 @@ pub async fn jira_assigned(app: AppHandle) -> Result<IssueBatch, String> {
 
 /// Every pull request, worktree and branch that names `key` (#2041): the
 /// database first, then -- when it holds no pull request, or `more` asks --
-/// one GitHub search across the owners the user already works in.
+/// one GitHub search across the owners the user already works in, and one
+/// GitLab search per project in the user's merge-request lists (#2040).
 #[tauri::command]
 pub async fn jira_find(
     app: AppHandle,
@@ -269,5 +270,6 @@ pub async fn jira_find(
     }
     use tauri::Manager;
     let client = app.state::<crate::commands::GhClient>().0.clone();
-    super::lookup::find(client, &crate::commands::db_path(&app), &key, more).await
+    let glab = crate::gitlab::auth::find_glab();
+    super::lookup::find(client, glab, &crate::commands::db_path(&app), &key, more).await
 }

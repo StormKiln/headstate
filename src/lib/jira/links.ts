@@ -46,6 +46,7 @@ export function linkMaps(links: readonly JiraLink[]): LinkMaps {
         title: t.title,
         url: t.url,
         is_draft: t.is_draft,
+        branch: t.head_ref,
         source: link.found_in,
         current: link.current,
       });
