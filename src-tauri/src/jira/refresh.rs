@@ -110,6 +110,15 @@ fn linked_keys(db: &Path, excluded: &HashSet<String>) -> Result<Vec<String>, Str
         .map(|l| l.key)
         .collect();
     keys.dedup();
+    // And the tickets an own pull request recently left its list for: a
+    // merge may have left them behind (#2043), and a stale status must not
+    // decide that it did.
+    let since = (chrono::Utc::now() - super::alerts::recent()).to_rfc3339();
+    for k in super::index::recently_left(&conn, &projects, &since).map_err(|e| e.to_string())? {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
     Ok(keys)
 }
 
@@ -160,6 +169,9 @@ pub async fn pass(t: &Transport, db: &Path, site: Option<&str>, excluded: HashSe
 
 /// One turn of the loop, recorded on `task`. `locate` runs only when Jira
 /// is on: switched off, nothing is looked for and nothing is spawned.
+/// Returns what to do next, whether the task crossed into degraded, and
+/// whether the pass read Jira -- the only kind of pass whose statuses may
+/// decide a notification (#2043).
 pub async fn turn(
     task: &Task,
     on: bool,
@@ -167,10 +179,10 @@ pub async fn turn(
     db: &Path,
     site: Option<&str>,
     excluded: HashSet<String>,
-) -> (Next, bool) {
+) -> (Next, bool, bool) {
     if !on {
         task.park();
-        return (Next::Park, false);
+        return (Next::Park, false, false);
     }
     let error = match locate() {
         Ok(t) => pass(&t, db, site, excluded).await.error,
@@ -188,7 +200,42 @@ pub async fn turn(
             task.tick(wait);
         }
     }
-    (next, crossed)
+    (next, crossed, error.is_none())
+}
+
+/// Announce drift first observed as fact (#2043), after a pass. Only a
+/// pass that read Jira observes anything: a failed one's statuses may be
+/// old, so it is neither a baseline nor news.
+async fn drift_notices(
+    app: &tauri::AppHandle,
+    db: &Path,
+    prefs: &crate::poll::UiPrefs,
+    read: bool,
+    observer: &mut super::alerts::Observer,
+) {
+    use crate::poll::{notify_breakage, read_notify_prefs, NoticeKind};
+    use tauri::Manager;
+    let notify = read_notify_prefs(app).await;
+    if !notify.wants(NoticeKind::JiraNotStarted) {
+        *observer = super::alerts::Observer::default();
+        return;
+    }
+    if !read {
+        return;
+    }
+    let client = app.state::<crate::commands::GhClient>().0.clone();
+    let glab = crate::gitlab::auth::find_glab();
+    match super::alerts::sweep(client, glab, db, prefs, observer).await {
+        Ok(first) => {
+            for f in first {
+                let b = f.breakage();
+                if notify.wants(b.kind) {
+                    notify_breakage(app, &b);
+                }
+            }
+        }
+        Err(e) => log::info!("jira: drift notices skipped: {e}"),
+    }
 }
 
 /// Start once at desktop setup.
@@ -198,6 +245,10 @@ pub fn spawn(app: tauri::AppHandle) {
         // A rate limit outlives a switch off and on: the wait Jira asked
         // for is kept until it is over.
         let mut hold: Option<tokio::time::Instant> = None;
+        // What the drift notifier has already seen (#2043). Reset whenever
+        // the notification is off, so switching it on does not announce
+        // what was already true.
+        let mut observer = super::alerts::Observer::default();
         loop {
             let a = app.clone();
             let prefs =
@@ -213,8 +264,8 @@ pub fn spawn(app: tauri::AppHandle) {
             }
             let db = crate::commands::db_path(&app);
             let site = super::commands::site(&app).await;
-            let excluded = prefs.jira_excluded_projects.into_iter().collect();
-            let (next, crossed) = turn(
+            let excluded = prefs.jira_excluded_projects.iter().cloned().collect();
+            let (next, crossed, read) = turn(
                 &JIRA_REFRESH,
                 on,
                 Transport::locate,
@@ -224,6 +275,9 @@ pub fn spawn(app: tauri::AppHandle) {
             )
             .await;
             announce_degraded(&app, &JIRA_REFRESH, crossed);
+            if on {
+                drift_notices(&app, &db, &prefs, read, &mut observer).await;
+            }
             match next {
                 Next::Park => WAKE.notified().await,
                 Next::Wait { wait, retrying } => {
@@ -294,7 +348,7 @@ mod tests {
     async fn switched_off_it_parks_and_looks_for_nothing() {
         let task = Task::new("t");
         let dir = tempfile::tempdir().unwrap();
-        let (next, crossed) = turn(
+        let (next, crossed, _) = turn(
             &task,
             false,
             || panic!("located while switched off"),
@@ -366,7 +420,7 @@ mod against_acli {
         let db = indexed(dir.path());
         let t = answering(dir.path());
         let task = Task::new("t");
-        let (next, _) = turn(&task, true, || Ok(t), &db, None, HashSet::new()).await;
+        let (next, _, _) = turn(&task, true, || Ok(t), &db, None, HashSet::new()).await;
         assert_eq!(
             next,
             Next::Wait {
@@ -418,7 +472,7 @@ mod against_acli {
             "echo 'HTTP 429 Too Many Requests; Retry-After: 120' >&2; exit 1",
         );
         let task = Task::new("t");
-        let (next, _) = turn(&task, true, || Ok(t), &db, None, HashSet::new()).await;
+        let (next, _, _) = turn(&task, true, || Ok(t), &db, None, HashSet::new()).await;
         assert_eq!(
             next,
             Next::Wait {

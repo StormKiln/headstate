@@ -2,8 +2,19 @@ import { describe, expect, it, vi } from "vitest";
 import { connectNotificationNavigation } from "./notificationNavigation";
 import { useFilters } from "@/store/filters";
 import { useSourceSelection } from "@/store/sourceSelection";
+import { useJiraView } from "@/store/jira";
 
 describe("notification navigation", () => {
+  /// #2043: a Jira drift notice opens its issue in My Jira issues.
+  it("opens the issue a Jira drift notice names", async () => {
+    useFilters.getState().setView("my-prs");
+    useJiraView.setState({ selected: null });
+    const target = { source: { provider: "github" as const, host: "github.com" }, repo: "octocat/hello-world", number: 7, jira_key: "ABC-1" };
+    const disconnect = await connectNotificationNavigation(async () => () => {}, async () => target);
+    expect(useFilters.getState().view).toBe("jira");
+    expect(useJiraView.getState().selected).toBe("ABC-1");
+    disconnect();
+  });
   it("subscribes before draining a startup click, switches provider and leaves local views", async () => {
     const order: string[] = [];
     useFilters.getState().setView("claude-code");

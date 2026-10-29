@@ -283,6 +283,9 @@ export interface NotifyPrefs {
   /// interrupted by it without having first asked the app to watch their
   /// Claude sessions. `poll.rs`'s field doc argues it.
   claude_crashed: boolean;
+  /// Notify when a pull request and its Jira issue first disagree as a
+  /// fact (#2043): open while To Do, or merged and not moved. Default off.
+  jira_drift: boolean;
 }
 
 export const getNotifyPrefs = () => call<NotifyPrefs>("get_notify_prefs");
@@ -2318,8 +2321,14 @@ export type StackAsk = PrIdentity & { head_oid?: string; base_ref?: string };
 export const getReadyStacks = (rows: StackAsk[], selected = false) =>
   call<(PrIdentity & { advisory_progress?: import("../types/pr").AdvisoryProgress; stack: PrStack; head_oid?: string; base_ref?: string; valid_for_ms?: number; last_known_stack?: { value: PrStack; age_ms: number } })[]>("get_ready_stacks", { rows, ...(selected ? { selected: true } : {}) });
 
+/// Where a notification click goes: the pull request, or for a Jira drift
+/// notice (#2043) the issue it names. Mirrors
+/// `notification_navigation::Target`, whose issue key is absent, not null,
+/// when there is none.
+export type NotificationTarget = PrIdentity & { jira_key?: string };
+
 /** Desktop notification clicks wait here until the app shell mounts. */
-export const takeNotificationPr = () => call<PrIdentity | null>("take_notification_pr");
+export const takeNotificationPr = () => call<NotificationTarget | null>("take_notification_pr");
 
 /// Client-local native Markdown export on both desktop and companion.
 export const MARKDOWN_EXPORT_BYTES = 8 * 1024 * 1024;

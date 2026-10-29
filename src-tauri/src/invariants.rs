@@ -2786,6 +2786,103 @@ mod tests {
         );
     }
 
+    /// The Jira drift notifier (#2043) is called, gated, and announces
+    /// FIRST observations only -- the same shape as the crash notifier
+    /// above, for the same defects: an alert that is implemented and
+    /// never called, or one that announces a standing state on every pass.
+    #[test]
+    fn the_jira_drift_notifier_is_wired_and_reads_first_observations() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let code = |rel: &str| -> String {
+            let path = manifest.join(rel);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"))
+                .replace("\r\n", "\n");
+            production(&path, &src)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The body of `fn name` up to the next top-level `fn`.
+        let body = |src: &str, name: &str, rel: &str| -> String {
+            let start = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{rel}: `fn {name}` is gone; if #2043 was reverted, remove this guard deliberately"));
+            let rest = &src[start + 1..];
+            // The NEAREST next item, whichever way it is declared.
+            let end = [
+                "\nfn ",
+                "\npub fn ",
+                "\nasync fn ",
+                "\npub async fn ",
+                "\npub(crate) fn ",
+            ]
+            .iter()
+            .filter_map(|p| rest.find(p))
+            .min()
+            .unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        let refresh = code("src/jira/refresh.rs");
+        let spawn = body(&refresh, "spawn", "src/jira/refresh.rs");
+        let gate = spawn
+            .split_once("if on {")
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| {
+                panic!(
+                    "src/jira/refresh.rs: `spawn` must call the drift notifier inside \
+                 `if on {{` -- Jira switched off must not notify"
+                )
+            });
+        assert!(
+            gate[..gate.len().min(200)].contains("drift_notices("),
+            "src/jira/refresh.rs: `drift_notices` is not called from the refresh \
+             loop's `if on {{` arm: the notifier is implemented and dead"
+        );
+        let notices = body(&refresh, "drift_notices", "src/jira/refresh.rs");
+        for (needle, why) in [
+            (
+                "notify_breakage(",
+                "it must send through `poll::notify_breakage`",
+            ),
+            (
+                "NoticeKind::JiraNotStarted",
+                "it must be gated on its own preference",
+            ),
+            (
+                "alerts::sweep(",
+                "it must announce what `alerts::sweep` returns",
+            ),
+            (
+                "if !read",
+                "a pass that did not read Jira must observe nothing",
+            ),
+        ] {
+            assert!(
+                notices.contains(needle),
+                "src/jira/refresh.rs `drift_notices`: {why} (`{needle}` not found)"
+            );
+        }
+        for raw in ["open_facts(", "merged_facts("] {
+            assert!(
+                !notices.contains(raw),
+                "src/jira/refresh.rs `drift_notices` calls `{raw}` directly: that is \
+                 what is TRUE, not what is NEW, and would announce it every pass"
+            );
+        }
+
+        let alerts = code("src/jira/alerts.rs");
+        let sweep = body(&alerts, "sweep", "src/jira/alerts.rs");
+        assert!(
+            sweep.contains("Ok(observer.first_observations("),
+            "src/jira/alerts.rs `sweep` must return `observer.first_observations(..)`, \
+             the pairs first seen true -- not every fact it found"
+        );
+    }
+
     /// Every registered command is REACHABLE from the desktop (#947).
     ///
     /// `claude_poll_live` shipped in #927 registered in `generate_handler!`,

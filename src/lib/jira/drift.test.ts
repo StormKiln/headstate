@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JiraIssue, JiraLink, JiraStatusCategory, KeySearch } from "@/types/jira";
+import facts from "../../../src-tauri/src/jira/fixtures/drift_facts.json";
 import { afterMerge, driftFor, knownPrs, lookupComplete, type ExpectationMap, type KnownPr, type PrFate } from "./drift";
 
 const issue = (category: JiraStatusCategory, name: string): JiraIssue => ({
@@ -212,5 +213,29 @@ describe("knownPrs", () => {
 
   it("skips worktrees and branches", () => {
     expect(knownPrs([{ key: "ABC-1", found_in: "branch", current: true, target: { kind: "worktree", repo: "r", path: "/p", branch: "b" } }])).toEqual([]);
+  });
+});
+
+/// The facts table shared with the desktop's notifier
+/// (`src-tauri/src/jira/drift.rs`, #2043): what the page warns about as a
+/// fact is exactly what may be announced.
+describe("facts shared with the desktop", () => {
+  interface Case { name: string; category: JiraStatusCategory; status: string; expectations?: ExpectationMap; fact: boolean }
+  const table = facts as unknown as {
+    r1: (Case & { draft: boolean })[];
+    r2: (Case & { prs: { fate: PrFate; merged_at?: string }[]; complete: boolean; now: string; grace_mins: number })[];
+  };
+  it.each(table.r1)("R1 $name", (c) => {
+    const d = driftFor(issue(c.category, c.status), { draft: c.draft, source: "title" }, c.expectations);
+    expect(d?.rule === "open-but-not-started").toBe(c.fact);
+  });
+  it.each(table.r2)("R2 $name", (c) => {
+    const prs = c.prs.map((p, i) => ({ url: `u${i}`, fate: p.fate, draft: false, merged_at: p.merged_at ?? null, source: "title" as const }));
+    const v = afterMerge(issue(c.category, c.status), prs, c.complete, {
+      expectations: c.expectations,
+      now: new Date(c.now),
+      graceMins: c.grace_mins,
+    });
+    expect(v?.rule === "merged-not-done" && v.level === "fact").toBe(c.fact);
   });
 });

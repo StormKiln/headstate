@@ -1,0 +1,108 @@
+{
+  "_comment": "Which drift states are FACTS (#2042, #2043). Read by src-tauri/src/jira/drift.rs and src/lib/jira/drift.test.ts, so the notifier and the page agree.",
+  "r1": [
+    { "name": "open, ticket to do", "category": "new", "status": "To Do", "draft": false, "fact": true },
+    { "name": "draft", "category": "new", "status": "To Do", "draft": true, "fact": false },
+    { "name": "in progress", "category": "in_progress", "status": "In Progress", "draft": false, "fact": false },
+    { "name": "done is R4, not R1", "category": "done", "status": "Done", "draft": false, "fact": false },
+    { "name": "unknown category", "category": "unknown", "status": "Odd", "draft": false, "fact": false },
+    {
+      "name": "the project expects to do while open",
+      "category": "new",
+      "status": "Backlog",
+      "draft": false,
+      "expectations": { "ABC": { "on_open": { "kind": "category", "category": "new" } } },
+      "fact": false
+    },
+    {
+      "name": "named expectation, still to do",
+      "category": "new",
+      "status": "To Do",
+      "draft": false,
+      "expectations": { "ABC": { "on_open": { "kind": "status", "name": "In Review" } } },
+      "fact": true
+    }
+  ],
+  "r2": [
+    {
+      "name": "merged an hour ago, ticket in progress",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": true
+    },
+    {
+      "name": "merged and closed",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }, { "fate": "closed" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": true
+    },
+    {
+      "name": "ticket done",
+      "category": "done", "status": "Done",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "partial lookup is qualified, not fact",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }],
+      "complete": false, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "a pull request's fate unknown",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }, { "fate": "unknown" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "another still open is R3",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }, { "fate": "open" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "within the grace period",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:50:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "the grace counts from the latest merge",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T09:00:00Z" }, { "fate": "merged", "merged_at": "2026-01-02T11:55:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "no grace",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:59:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 0, "fact": true
+    },
+    {
+      "name": "merge time not reported",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "merged" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "unknown category",
+      "category": "unknown", "status": "Odd",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "closed only is R5, not R2",
+      "category": "in_progress", "status": "In Review",
+      "prs": [{ "fate": "closed" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15, "fact": false
+    },
+    {
+      "name": "named on-merged status not reached",
+      "category": "done", "status": "Done",
+      "prs": [{ "fate": "merged", "merged_at": "2026-01-02T11:00:00Z" }],
+      "complete": true, "now": "2026-01-02T12:00:00Z", "grace_mins": 15,
+      "expectations": { "ABC": { "on_merged": { "kind": "status", "name": "Released" } } },
+      "fact": true
+    }
+  ]
+}
