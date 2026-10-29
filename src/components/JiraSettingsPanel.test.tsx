@@ -114,7 +114,7 @@ describe("JiraSettingsPanel", () => {
     view.unmount();
 
     version.mockClear();
-    connection.mockResolvedValue({ state: "not_installed" });
+    connection.mockResolvedValue({ state: "not_installed", searched: [] });
     renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
     expect(await screen.findByText(/acli is not installed/)).toBeTruthy();
     expect(version).not.toHaveBeenCalled();
@@ -129,7 +129,7 @@ describe("JiraSettingsPanel", () => {
   });
 
   it("turns ticket chips on pull request rows off", async () => {
-    connection.mockResolvedValue({ state: "not_installed" });
+    connection.mockResolvedValue({ state: "not_installed", searched: [] });
     const setPrefs = vi.fn(() => Promise.resolve());
     renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={setPrefs} />);
     const box = screen.getByRole("checkbox", { name: "Show tickets on pull request rows" });

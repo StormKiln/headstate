@@ -183,7 +183,7 @@ export interface ProjectStatuses {
   statuses: JiraStatus[];
   /// The read hit its limit; older issues were not looked at.
   truncated: boolean;
-  error: string | null;
+  error: JiraError | null;
 }
 
 /// A category a ticket can be expected to be in. Not `unknown`: that is

@@ -1125,7 +1125,7 @@ export const wireGraph: WireGraph = {
   {"t":"object","props":[["state",81,false],["error",10,false]]},
   {"t":"union","of":[0,940,941,943]},
   {"t":"object","props":[["links",923,false],["projects",60,false],["error",905,false]]},
-  {"t":"object","props":[["project",10,false],["statuses",947,false],["truncated",41,false],["error",9,false]]},
+  {"t":"object","props":[["project",10,false],["statuses",947,false],["truncated",41,false],["error",905,false]]},
   {"t":"array","item":903},
   {"t":"object","props":[["projects",949,false],["error",905,false]]},
   {"t":"array","item":950},

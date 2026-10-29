@@ -675,10 +675,10 @@ echo '[{ok}]'"#
 
     #[tokio::test]
     async fn a_failed_status_read_is_an_error_not_an_empty_list() {
-        let (_d, acli) = fake("echo 'unauthorized' >&2; exit 1");
+        let (_d, acli) = fake("echo 'something broke' >&2; exit 1");
         let got = acli.project_statuses("ABC", 10).await;
         assert!(got.statuses.is_empty());
-        assert_eq!(got.error, Some(JiraError::failed("unauthorized")));
+        assert_eq!(got.error, Some(JiraError::failed("something broke")));
     }
 
     #[tokio::test]
