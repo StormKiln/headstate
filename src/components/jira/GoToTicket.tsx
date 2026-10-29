@@ -101,7 +101,7 @@ export function GoToTicketButton({ onClick, compact }: { onClick: () => void; co
       <Ticket className="h-3.5 w-3.5" aria-hidden="true" />
       {compact ? null : (
         <>
-          Go to ticket <kbd className="font-sans text-[10px] text-[#6e7681]">{GO_TO_KEYS}</kbd>
+          Go to ticket <kbd className="font-sans text-[10px] text-[#8b949e]">{GO_TO_KEYS}</kbd>
         </>
       )}
     </button>
