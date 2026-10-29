@@ -40,6 +40,10 @@ pub(crate) fn await_writer<T>(future: impl Future<Output = T>) -> T {
         std::thread::park_timeout(remaining);
     }
 }
+/// How long a test waits for another thread to say it has entered a held
+/// section. A hang guard, not a measurement: Windows CI runners under load
+/// have taken longer than two seconds (#2061).
+const ENTERED: std::time::Duration = std::time::Duration::from_secs(30);
 struct TestClock(AtomicU64, AtomicU64);
 impl Clock for TestClock {
     fn now(&self) -> (u64, u64) {
@@ -327,8 +331,7 @@ fn pause(r: &Recorder) -> std::sync::mpsc::Sender<()> {
             release: held,
         })
         .unwrap();
-    wait.recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    wait.recv_timeout(ENTERED).unwrap();
     release
 }
 #[tokio::test]
@@ -789,8 +792,7 @@ fn fix1_inflight_aggregate_reserves_its_slot_during_refusal_and_merges_concurren
                 held.recv().unwrap();
             })
         });
-        wait.recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
+        wait.recv_timeout(ENTERED).unwrap();
         r.aggregate(AggregateDelta {
             metric: AggregateKind::Candidates,
             count: 1,
@@ -891,8 +893,7 @@ async fn fix1_concurrent_success_keeps_only_new_delta_deferred_and_reuses_comple
                 held.recv().unwrap();
             })
         });
-        wait.recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
+        wait.recv_timeout(ENTERED).unwrap();
         r.aggregate(AggregateDelta { count: 4, ..delta });
         release.send(()).unwrap();
     });
