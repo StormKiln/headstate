@@ -7,9 +7,10 @@
 //! answer is kept for hours.
 
 use super::model::JiraIssue;
-use crate::store::StoreError;
+use crate::store::{settings, StoreError};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// One issue as stored.
@@ -22,12 +23,33 @@ pub struct Cached {
 }
 
 impl Cached {
-    /// The issue with the stored parent applied, as the UI sees it.
+    /// The issue with the stored parent and its age applied, as the UI
+    /// sees it.
     pub fn resolved(&self) -> JiraIssue {
         let mut issue = self.issue.clone();
         issue.parent_checked = self.parent_read_at.is_some();
+        issue.read_at = Some(self.read_at.to_rfc3339());
         issue
     }
+}
+
+/// The last assigned list that was read in full (#2036): which keys, and
+/// when. A failed search is answered from this, marked stale, rather
+/// than with the error alone. The issues themselves are in `jira_issue`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignedList {
+    pub keys: Vec<String>,
+    pub truncated: bool,
+    pub read_at: DateTime<Utc>,
+}
+
+pub fn save_assigned(conn: &Connection, list: &AssignedList) -> Result<(), StoreError> {
+    settings::set(conn, settings::keys::JIRA_ASSIGNED, list)
+}
+
+/// `None`: no assigned list has ever been read. Not "nothing assigned".
+pub fn load_assigned(conn: &Connection) -> Result<Option<AssignedList>, StoreError> {
+    settings::get(conn, settings::keys::JIRA_ASSIGNED)
 }
 
 fn when(s: &str) -> Option<DateTime<Utc>> {
@@ -142,6 +164,8 @@ mod tests {
             project_key: "ABC".into(),
             url: None,
             updated: None,
+            read_at: None,
+            stale: false,
         }
     }
 
@@ -172,6 +196,29 @@ mod tests {
         let got = load(&conn, &["ABC-1".into()]).unwrap()["ABC-1"].resolved();
         assert_eq!(got.parent_key.as_deref(), Some("ABC-2"));
         assert_eq!(got.status.category, StatusCategory::Done);
+    }
+
+    #[test]
+    fn a_served_row_says_when_it_was_read() {
+        let conn = db();
+        let now = Utc::now();
+        save_read(&conn, &[issue("ABC-1")], now).unwrap();
+        let got = load(&conn, &["ABC-1".into()]).unwrap()["ABC-1"].resolved();
+        assert_eq!(got.read_at, Some(now.to_rfc3339()));
+        assert!(!got.stale);
+    }
+
+    #[test]
+    fn the_assigned_list_is_absent_until_read() {
+        let conn = db();
+        assert_eq!(load_assigned(&conn).unwrap(), None);
+        let list = AssignedList {
+            keys: vec!["ABC-1".into()],
+            truncated: false,
+            read_at: Utc::now(),
+        };
+        save_assigned(&conn, &list).unwrap();
+        assert_eq!(load_assigned(&conn).unwrap(), Some(list));
     }
 
     #[test]

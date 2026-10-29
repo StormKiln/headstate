@@ -46,6 +46,13 @@ export interface JiraIssue {
   /// Never filled through `acli`, whose search refuses the field: `null`
   /// is "not read", never "never updated".
   updated: string | null;
+  /// When this status was read from Jira, RFC 3339 (#2036). Absent or
+  /// `null` is "not known" -- never rendered as an age. Optional only so
+  /// hand-built fixtures need not spell it.
+  read_at?: string | null;
+  /// Served from the desktop's cache because the read that should have
+  /// refreshed it failed (#2036).
+  stale?: boolean;
 }
 
 export interface JiraProject {
@@ -86,6 +93,10 @@ export interface IssueBatch {
   /// Why the read is incomplete; set alongside whatever it did find.
   error: JiraError | null;
   truncated: boolean;
+  /// For a search: when the list itself was read (#2036). With `error`
+  /// set, the list shown is the last one read, served stale; `null` there
+  /// means no list was ever read. Optional for hand-built fixtures.
+  list_read_at?: string | null;
 }
 
 export type JiraConnection =

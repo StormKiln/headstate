@@ -1092,6 +1092,9 @@ pub fn run() {
                 focused.clone(),
                 interval.clone(),
             );
+            // Jira statuses into the cache every ten minutes, window open
+            // or not (#2036). Parks, spawning nothing, while Jira is off.
+            jira::refresh::spawn(handle.clone());
 
             if let Some(client) = gh_client {
                 // WHICH account, not just that there is one. A reported

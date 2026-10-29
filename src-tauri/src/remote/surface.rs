@@ -1150,7 +1150,12 @@ async fn call(
         "scan_artifacts_report" => res(commands::scan_artifacts_report(app.clone()).await),
         "jira_connection" => ok(crate::jira::commands::jira_connection(app.clone()).await),
         "jira_projects" => res(crate::jira::commands::jira_projects(app.clone()).await),
-        "jira_issues" => res(crate::jira::commands::jira_issues(app.clone(), a.get("keys")?).await),
+        "jira_issues" => {
+            res(
+                crate::jira::commands::jira_issues(app.clone(), a.get("keys")?, a.get("fresh")?)
+                    .await,
+            )
+        }
         "jira_assigned" => res(crate::jira::commands::jira_assigned(app.clone()).await),
         "jira_links" => res(crate::jira::commands::jira_links(app.clone()).await),
         "jira_find" => {

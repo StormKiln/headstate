@@ -1,6 +1,9 @@
 import { describeJiraError, failureOf, useJiraConnection, useJiraLinks } from "@/api/jira";
 import { useJiraView, type JiraFilter } from "@/store/jira";
 import { needsAttention } from "@/lib/jira/tree";
+import { readAge } from "@/lib/jira/age";
+import { useNow } from "@/lib/readyAge";
+import type { IssueBatch, JiraError } from "@/types/jira";
 import { GoToTicket } from "./GoToTicket";
 import { JiraTree } from "./JiraTree";
 import { useJiraBoard } from "./useJiraBoard";
@@ -19,6 +22,7 @@ const SKELETON = <span className="block h-4 w-40 animate-pulse rounded bg-[#2126
 export function JiraBrowser() {
   const board = useJiraBoard();
   const { filter, setFilter } = useJiraView();
+  const now = useNow(30_000);
   if (!board.jira) return <NotReady />;
 
   const assignedOk = board.assigned.isSuccess && board.assigned.data.error === null;
@@ -50,13 +54,15 @@ export function JiraBrowser() {
         ))}
       </div>
       {wantsAssigned && board.assigned.isPending ? SKELETON : null}
-      {wantsAssigned && (board.assigned.isError || board.assigned.data?.error) ? (
-        <p className="text-xs text-[#f85149]">
-          {board.assigned.data && board.assigned.data.issues.length > 0
-            ? "Some of the issues assigned to you could not be read: "
-            : "Could not read the issues assigned to you: "}
-          {describeJiraError(board.assigned.data?.error ?? failureOf(board.assigned.error))}
-        </p>
+      {wantsAssigned ? (
+        <AssignedProblem
+          data={board.assigned.data}
+          // The latest attempt's failure: a rejected refetch outranks the
+          // error the data it kept was carrying.
+          error={board.assigned.isError ? failureOf(board.assigned.error) : (board.assigned.data?.error ?? null)}
+          rejected={board.assigned.isError}
+          now={now}
+        />
       ) : null}
       {wantsAssigned && assignedOk && board.assigned.data?.truncated ? (
         <p className="text-xs text-[#8b949e]">Showing the {board.assignedKeys.length} most recently updated assigned issues; there are more.</p>
@@ -68,6 +74,42 @@ export function JiraBrowser() {
         <Empty filter={filter} assignedOk={assignedOk} worktreesLoading={board.worktreesLoading} />
       )}
     </div>
+  );
+}
+
+/// What went wrong reading the assigned list, said once (#2036). A list
+/// already on screen -- kept from before a failed refetch, or the last one
+/// the desktop read -- is said to be old, with its age when that is
+/// known; the error alone is for when there is no list at all.
+function AssignedProblem({
+  data,
+  error,
+  rejected,
+  now,
+}: {
+  data: IssueBatch | undefined;
+  error: JiraError | null;
+  rejected: boolean;
+  now: Date;
+}) {
+  if (!error) return null;
+  const why = describeJiraError(error);
+  const shown = (data?.issues.length ?? 0) > 0;
+  // An old list: the desktop served its last one, or this side kept it.
+  const old = shown && (rejected || data?.issues.some((i) => i.stale) === true);
+  if (old) {
+    const age = readAge(data?.list_read_at, now);
+    return (
+      <p role="status" className="text-xs text-[#d29922]">
+        {`Showing the issues assigned to you as ${age ?? "last read"}. The latest read failed: ${why}`}
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-[#f85149]">
+      {shown ? "Some of the issues assigned to you could not be read: " : "Could not read the issues assigned to you: "}
+      {why}
+    </p>
   );
 }
 

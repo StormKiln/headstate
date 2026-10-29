@@ -156,7 +156,7 @@ const ROWS: Row[] = [
   row(api.latestRelease, [], "latest_release"),
   row(api.jiraConnection, [], "jira_connection"),
   row(api.jiraProjects, [], "jira_projects"),
-  row(api.jiraIssues, [["ABC-1"]], "jira_issues", { keys: ["ABC-1"] }),
+  row(api.jiraIssues, [["ABC-1"], true], "jira_issues", { keys: ["ABC-1"], fresh: true }),
   row(api.jiraAssigned, [], "jira_assigned"),
   row(api.jiraLinks, [], "jira_links"),
   row(api.jiraFind, ["ABC-1", false], "jira_find", { key: "ABC-1", more: false }),

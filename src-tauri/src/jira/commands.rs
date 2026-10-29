@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use tauri::AppHandle;
 
-async fn enabled(app: &AppHandle) -> bool {
+pub(super) async fn enabled(app: &AppHandle) -> bool {
     let app = app.clone();
     crate::commands::off_main_thread(move || crate::commands::read_ui_prefs(&app).jira_enabled)
         .await
@@ -26,7 +26,7 @@ async fn enabled(app: &AppHandle) -> bool {
 
 /// The transport, or why none will be asked. `locate` runs only when Jira
 /// is on, so a switched-off app never even looks for `acli`.
-fn gate(
+pub(super) fn gate(
     enabled: bool,
     locate: impl FnOnce() -> Result<Transport, JiraError>,
 ) -> Result<Transport, JiraError> {
@@ -38,7 +38,7 @@ fn gate(
 
 /// The site `acli` last named, for browse links. `None` until a
 /// connection check has seen one.
-async fn site(app: &AppHandle) -> Option<String> {
+pub(super) async fn site(app: &AppHandle) -> Option<String> {
     let db = crate::commands::db_path(app);
     crate::commands::off_main_thread(move || {
         open_db(&db).ok().and_then(|c| {
@@ -253,12 +253,19 @@ pub async fn note_branches(app: &AppHandle, repo_path: &str, branches: &[crate::
 /// Rejects only when nothing could be asked (off, or no `acli`). A read
 /// that was rate limited, timed out or refused part-way is `Ok`, with what
 /// it found and the reason in `error`.
+///
+/// `fresh` reads every key from Jira whatever the cache holds, for an
+/// issue being opened (#2036). Still a read: it changes nothing in Jira.
 #[tauri::command]
-pub async fn jira_issues(app: AppHandle, keys: Vec<String>) -> Result<IssueBatch, JiraError> {
+pub async fn jira_issues(
+    app: AppHandle,
+    keys: Vec<String>,
+    fresh: bool,
+) -> Result<IssueBatch, JiraError> {
     let t = gate(enabled(&app).await, Transport::locate);
     let site = site(&app).await;
     let db = crate::commands::db_path(&app);
-    issues_with(t, &db, site.as_deref(), &keys).await
+    issues_with(t, &db, site.as_deref(), &keys, fresh).await
 }
 
 async fn issues_with(
@@ -266,13 +273,14 @@ async fn issues_with(
     db: &Path,
     site: Option<&str>,
     keys: &[String],
+    fresh: bool,
 ) -> Result<IssueBatch, JiraError> {
-    Ok(super::read::issues(&t?, db, site, keys).await)
+    Ok(super::read::issues(&t?, db, site, keys, fresh).await)
 }
 
 /// How many assigned issues one read returns. Past this the page says "at
 /// least" rather than presenting a partial list as the whole.
-const ASSIGNED_LIMIT: usize = 100;
+pub(super) const ASSIGNED_LIMIT: usize = 100;
 
 /// Open work assigned to the signed-in user -- including issues with no
 /// pull request yet, which key detection alone can never find.
@@ -418,7 +426,8 @@ echo '[]'
         );
         vec![
             projects_with(t()).await.err(),
-            issues_with(t(), &db, None, &keys).await.err(),
+            issues_with(t(), &db, None, &keys, false).await.err(),
+            issues_with(t(), &db, None, &keys, true).await.err(),
             assigned_with(t(), &db, None).await.err(),
         ]
     }

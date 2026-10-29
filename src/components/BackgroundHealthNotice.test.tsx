@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { BackgroundHealthNotice } from "./BackgroundHealthNotice";
+import { BackgroundHealthNotice, BackgroundTaskStates } from "./BackgroundHealthNotice";
 import type { TaskHealth } from "@/api/tauri";
 
 const NOW = 1_700_000_000_000;
@@ -169,5 +169,38 @@ describe("BackgroundHealthNotice", () => {
       />,
     );
     expect(screen.getByText(text)).toBeTruthy();
+  });
+});
+
+describe("BackgroundTaskStates (#2036)", () => {
+  it("says nothing while every loop runs on its own cadence", () => {
+    const { container } = render(<BackgroundTaskStates tasks={[task(), task({ task: "jira-refresh" })]} />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("says a loop told to wait is retrying, not stuck", () => {
+    render(<BackgroundTaskStates tasks={[task({ task: "jira-refresh", retry_at_ms: NOW + 120_000 })]} />);
+    expect(screen.getByText(/^Jira status refresh is retrying: it was asked to wait, and will try again at /)).toBeTruthy();
+  });
+
+  it("says Jira's refresh is off when parked, but not every unconfigured source", () => {
+    render(
+      <BackgroundTaskStates
+        tasks={[task({ task: "jira-refresh", parked: true }), task({ task: "gitlab-poll", parked: true })]}
+      />,
+    );
+    expect(screen.getByText("Jira status refresh is off: it is switched off in Settings.")).toBeTruthy();
+    expect(screen.queryByText(/GitLab/)).toBeNull();
+  });
+
+  it("names the Jira refresh in a degraded notice", () => {
+    render(
+      <BackgroundHealthNotice
+        tasks={[task({ task: "jira-refresh", consecutive_failures: 2, degraded: true, last_error: "acli is not signed in" })]}
+        now={NOW}
+      />,
+    );
+    expect(screen.getByText("Jira status refresh has failed 2 times in a row.")).toBeTruthy();
+    expect(screen.getByText(/Jira statuses may be out of date\./)).toBeTruthy();
   });
 });

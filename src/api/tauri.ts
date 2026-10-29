@@ -479,7 +479,8 @@ export const latestRelease = () => call<string | null>("latest_release");
 
 export const jiraConnection = () => call<JiraConnection>("jira_connection");
 export const jiraProjects = () => call<ProjectList>("jira_projects");
-export const jiraIssues = (keys: string[]) => call<IssueBatch>("jira_issues", { keys });
+/// `fresh` reads past the desktop's cache, for an issue being opened (#2036).
+export const jiraIssues = (keys: string[], fresh = false) => call<IssueBatch>("jira_issues", { keys, fresh });
 export const jiraAssigned = () => call<IssueBatch>("jira_assigned");
 export const jiraLinks = () => call<LinkIndex>("jira_links");
 export const jiraFind = (key: string, more: boolean) => call<KeyLookup>("jira_find", { key, more });
@@ -1057,8 +1058,8 @@ export const backgroundPanicked = () => call<boolean>("background_panicked");
 /// One background loop's recent history (#1145).
 export interface TaskHealth {
   /// A stable identifier: `health-sampler`, `claude-live`, `claude-index`,
-  /// `github-poll`, `github-continuation`, `gitlab-poll` or
-  /// `claude-activity`.
+  /// `github-poll`, `github-continuation`, `gitlab-poll`,
+  /// `claude-activity` or `jira-refresh`.
   task: string;
   /// Failures since the last success. Zero means it is working now.
   consecutive_failures: number;
@@ -1093,6 +1094,12 @@ export interface TaskHealth {
   /// Carried rather than re-derived, so the page and any future
   /// notifier cannot disagree about what counts.
   degraded: boolean;
+  /// Waiting on purpose with no deadline: its source is switched off or
+  /// not set up (#2036). Optional for a desktop that predates it.
+  parked?: boolean;
+  /// Epoch ms at which it tries again after being told to wait -- a rate
+  /// limit (#2036). `null` on its ordinary cadence, never "retry now".
+  retry_at_ms?: number | null;
 }
 
 /// Whether the background loops are still doing their job.
