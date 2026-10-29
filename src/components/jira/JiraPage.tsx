@@ -9,6 +9,7 @@ import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
 import { JiraTransition } from "./JiraTransition";
 import { openInHeadstate } from "./openInHeadstate";
+import { StartWork } from "./StartWork";
 import { describeJiraError, failureOf, keptOrFailed, useJiraFind, useJiraIssueFresh } from "@/api/jira";
 import { freshnessNote } from "@/lib/jira/age";
 import { useNow } from "@/lib/readyAge";
@@ -52,6 +53,15 @@ export function JiraPage() {
   }
 
   const known = [...new Set([...board.linked, ...board.assignedKeys])];
+  // Start work (#2045): offered for an issue assigned to you that no pull
+  // request of yours names yet. A worktree or branch that already names it
+  // does not hide the offer: a second one, in another repository, is real.
+  const held = lookup(selected);
+  const startable =
+    held !== undefined && held !== "failed" && held.state === "found" && board.assignedKeys.includes(selected) &&
+    (board.links.get(selected)?.prs.length ?? 0) === 0
+      ? held.issue
+      : null;
   return (
     <div className="flex max-w-3xl flex-col gap-4">
       {isMobile ? (
@@ -66,6 +76,7 @@ export function JiraPage() {
         failed={ownFailed}
         on={board.jira !== null}
       />
+      {startable ? <StartWork issue={startable} /> : null}
       <EpicRollUp k={selected} known={known} lookup={lookup} />
       <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
       <FoundBySearching key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />

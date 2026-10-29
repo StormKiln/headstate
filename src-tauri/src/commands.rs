@@ -3371,6 +3371,77 @@ pub async fn fetch_refs(path: String) -> Result<String, String> {
     result
 }
 
+/// What "Start work" would run for a ticket (#2045), and whether it may.
+///
+/// Read-only: it resolves the base, derives the worktree's directory and
+/// checks every refusal, and runs nothing that writes. The confirmation
+/// renders exactly the argv this returns.
+///
+/// `repo_path` must be a repository the last scan listed
+/// ([`scanned_repo_root`]): the phone can call this, and a caller-supplied
+/// path is not a repository the user chose to track.
+#[tauri::command]
+pub async fn start_work_plan(
+    app: AppHandle,
+    repo_path: String,
+    branch: String,
+    mode: crate::worktrees::start::StartMode,
+) -> Result<crate::worktrees::start::StartPlan, String> {
+    scanned_repo_root(app, &repo_path).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::start::plan(std::path::Path::new(&repo_path), &branch, mode)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Create the branch, or the worktree on it, that [`start_work_plan`]
+/// showed (#2045). `shown` is the argv the confirmation displayed; if the
+/// plan made now differs, nothing runs.
+///
+/// The one command that CREATES a worktree. It deletes nothing and moves
+/// no existing ref, and every refusal is re-checked here rather than
+/// trusted from the dialog. The worktree's directory is derived on the
+/// desktop from the repository, never taken from the caller.
+///
+/// Moving the ticket to In Progress (#2044) is deliberately not here: this
+/// is a git operation, and a failed Jira write must not read as a failed
+/// branch. The frontend asks for the transition after this succeeds.
+#[tauri::command]
+pub async fn start_work(
+    app: AppHandle,
+    repo_path: String,
+    branch: String,
+    mode: crate::worktrees::start::StartMode,
+    shown: Vec<String>,
+) -> Result<crate::worktrees::start::Started, String> {
+    scanned_repo_root(app, &repo_path).await?;
+    let repo = repo_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::worktrees::start::start(std::path::Path::new(&repo), &branch, mode, &shown)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // A new ref: no pass already running may answer for this repository.
+    invalidate_classify_passes();
+    match &result {
+        Ok(s) => log::info!(
+            "started work on a new {} in {}",
+            if s.worktree_path.is_some() {
+                "worktree"
+            } else {
+                "branch"
+            },
+            crate::redact::redact(&repo_path)
+        ),
+        Err(e) => log::warn!(
+            "refused to start work in {}: {e}",
+            crate::redact::redact(&repo_path)
+        ),
+    }
+    result
+}
+
 /// Delete an orphaned worktree directory.
 ///
 /// Separate from `remove_worktree` because git cannot do it: the

@@ -210,6 +210,9 @@ export interface UiPrefs {
   /// them on PR rows only; the PR's own page, worktree rows and branch
   /// rows keep theirs.
   jira_chips_on_prs: boolean;
+  /// How "Start work" names a ticket's branch (#2045), with `{key}` and
+  /// `{summary}` placeholders. Empty: the default, `{key}-{summary}`.
+  jira_branch_template: string;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
@@ -900,6 +903,53 @@ export const pullCheckout = (path: string) => call<string>("pull_checkout", { pa
 /// on stdout when there was nothing new. A caller must phrase its own
 /// success line rather than showing this.
 export const fetchRefs = (path: string) => call<string>("fetch_refs", { path });
+
+/// A new worktree on a new branch, or just the branch (#2045).
+export type StartMode = "worktree" | "branch";
+
+/// Why "Start work" cannot run; mirrors `worktrees::start::StartRefusal`.
+export type StartRefusal =
+  | { state: "invalid_branch"; detail: string }
+  | { state: "branch_exists"; branch: string }
+  | { state: "remote_branch_exists"; branch: string }
+  | { state: "path_exists"; path: string }
+  | { state: "path_registered"; path: string }
+  | { state: "no_base"; base: string }
+  | { state: "could_not_check"; detail: string };
+
+/// What "Start work" would run, exactly, and whether it may.
+export interface StartPlan {
+  mode: StartMode;
+  branch: string;
+  /// The directory git runs in.
+  cwd: string;
+  program: string;
+  args: string[];
+  /// What the branch starts from; null when it could not be resolved.
+  base: string | null;
+  worktree_path: string | null;
+  /// The Jira keys detection reads in the branch name. Empty: the branch
+  /// will not link to its ticket.
+  keys: string[];
+  refusal: StartRefusal | null;
+}
+
+/// What git reports after the work was started.
+export interface Started {
+  branch: string;
+  head: string;
+  worktree_path: string | null;
+}
+
+/// Read-only: the plan, with every refusal checked now. The repository
+/// must be one the desktop's scan listed.
+export const startWorkPlan = (repoPath: string, branch: string, mode: StartMode) =>
+  call<StartPlan>("start_work_plan", { repoPath, branch, mode });
+
+/// Create it. `shown` is the argv the confirmation displayed: if the plan
+/// made now differs, the desktop runs nothing.
+export const startWork = (repoPath: string, branch: string, mode: StartMode, shown: string[]) =>
+  call<Started>("start_work", { repoPath, branch, mode, shown });
 
 /// Delete an orphaned worktree directory.
 ///

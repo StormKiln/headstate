@@ -738,6 +738,26 @@ pub const SURFACE: &[(&str, Class)] = &[
     // the alternative -- pull, to find out whether you needed to pull --
     // is worst, because the phone cannot then fix a conflict.
     ("fetch_refs", Class::Write),
+    // Start work from a Jira ticket (#2045). The plan is Read: it checks
+    // refs and paths and writes nothing.
+    //
+    // `start_work` is WRITE, not Local, and not Destructive. It creates a
+    // branch and, for a worktree, a directory that did not exist; it
+    // deletes nothing, moves no existing ref and touches no existing
+    // working tree, and it refuses whenever the branch or the directory
+    // is already there -- so no step-up signature.
+    //
+    // The case for Local is that a phone cannot see the desktop's disk,
+    // so it cannot choose where a worktree goes. It is not asked to: the
+    // repository must be one the desktop's own scan listed, and the
+    // directory is derived ON THE DESKTOP as a sibling of it. The phone
+    // supplies a repository from the desktop's list, a branch name git
+    // validates, and the argv it was shown -- which must match what the
+    // desktop would run now, or nothing runs. Every refusal is the same
+    // whoever calls. And the phone can act on the answer: the worktree
+    // is waiting at the desk, its ticket already linked.
+    ("start_work_plan", Class::Read),
+    ("start_work", Class::Write),
     ("docker_start", Class::Write),
     ("docker_restart", Class::Write),
     // Preferences, not machine capabilities: they live in the
@@ -1476,6 +1496,21 @@ async fn call(
         }
         "cancel_update_all" => res(commands::cancel_update_all(app.state())),
         "fetch_refs" => res(commands::fetch_refs(a.get("path")?).await),
+        "start_work_plan" => res(commands::start_work_plan(
+            app.clone(),
+            a.get("repoPath")?,
+            a.get("branch")?,
+            a.get("mode")?,
+        )
+        .await),
+        "start_work" => res(commands::start_work(
+            app.clone(),
+            a.get("repoPath")?,
+            a.get("branch")?,
+            a.get("mode")?,
+            a.get("shown")?,
+        )
+        .await),
         // Shell out like the other sync Docker commands, so a slow
         // engine start does not stall the listener for everyone else.
         "docker_start" => res(blocking(commands::docker_start).await?),

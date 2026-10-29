@@ -325,6 +325,8 @@ pub fn run() {
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,
+            commands::start_work_plan,
+            commands::start_work,
             commands::remove_orphan,
             commands::get_cached,
             commands::refresh_now,

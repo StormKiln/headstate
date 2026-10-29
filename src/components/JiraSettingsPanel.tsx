@@ -12,6 +12,7 @@ import {
 import type { ExpectedCategory, JiraConnection, StatusExpectation, StatusExpectations } from "@/types/jira";
 import { copyText } from "@/lib/clipboard";
 import { DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
+import { branchName, DEFAULT_BRANCH_TEMPLATE, templateHasKey } from "@/lib/jira/branchName";
 import { ArgvPreview } from "./ArgvPreview";
 import { ExternalLink } from "./ExternalLink";
 
@@ -80,6 +81,7 @@ export function JiraSettingsPanel({
           <p className="text-xs text-[#8b949e]">
             A pull request&apos;s own page, and worktree and branch rows, show their tickets either way.
           </p>
+          {prefs ? <BranchTemplate key={prefs.jira_branch_template} prefs={prefs} setPrefs={setPrefs} /> : null}
           {signedIn ? (
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium">Projects</span>
@@ -140,6 +142,43 @@ export function JiraSettingsPanel({
           ) : null}
         </>
       ) : null}
+    </div>
+  );
+}
+
+/// How "Start work" names a branch (#2045). Saved when the field loses
+/// focus, not per keystroke; the proposal stays editable in the dialog.
+function BranchTemplate({ prefs, setPrefs }: { prefs: UiPrefs; setPrefs: (prefs: UiPrefs) => Promise<void> }) {
+  const [draft, setDraft] = useState(prefs.jira_branch_template);
+  const example = branchName(draft, "ABC-1", "Fix login redirect");
+  const save = () => {
+    if (draft.trim() !== prefs.jira_branch_template) void setPrefs({ ...prefs, jira_branch_template: draft.trim() });
+  };
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="flex flex-col gap-1 text-sm">
+        Branch name for Start work
+        <input
+          value={draft}
+          placeholder={DEFAULT_BRANCH_TEMPLATE}
+          spellCheck={false}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={save}
+          onKeyDown={(e) => e.key === "Enter" && save()}
+          className="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-xs text-[#e6edf3]"
+        />
+      </label>
+      <p className="text-xs text-[#8b949e]">
+        <code className="font-mono">{"{key}"}</code> is the key in lower case,{" "}
+        <code className="font-mono">{"{KEY}"}</code> as Jira writes it, and{" "}
+        <code className="font-mono">{"{summary}"}</code> the summary as words joined by hyphens. ABC-1 &ldquo;Fix
+        login redirect&rdquo; becomes <code className="font-mono">{example}</code>.
+      </p>
+      {templateHasKey(draft) ? null : (
+        <p role="status" className="text-xs text-[#d29922]">
+          Without the key, a branch named this way will not link to its ticket.
+        </p>
+      )}
     </div>
   );
 }

@@ -272,6 +272,17 @@ const ROWS: Row[] = [
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),
+  row(api.startWorkPlan, [repoPath, "abc-1-x", "worktree"], "start_work_plan", {
+    repoPath,
+    branch: "abc-1-x",
+    mode: "worktree",
+  }),
+  row(api.startWork, [repoPath, "abc-1-x", "branch", ["branch"]], "start_work", {
+    repoPath,
+    branch: "abc-1-x",
+    mode: "branch",
+    shown: ["branch"],
+  }),
   row(api.removeOrphan, [path], "remove_orphan", { path }),
   row(api.removeWorktree, [repoPath, worktreePath], "remove_worktree", { repoPath, worktreePath }),
   row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs, reviewing: false }),
