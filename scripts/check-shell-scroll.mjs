@@ -97,7 +97,17 @@ function geometry() {
     /settings/i.test(b.getAttribute("aria-label") ?? ""),
   );
   const r = settings?.getBoundingClientRect();
+  // #2071: the page header is one row inside `main`, which scrolls, so a
+  // control pushed past the right edge widens nothing above and the
+  // document checks miss it. Measure the header's own controls.
+  const header = document.querySelector("main > header");
+  const clipped = header
+    ? [...header.querySelectorAll("button, select, h1")]
+        .filter((el) => el.getBoundingClientRect().right > innerWidth + 0.5)
+        .map((el) => `${(el.getAttribute("aria-label") || el.textContent || el.tagName).trim()} right at ${Math.round(el.getBoundingClientRect().right)}`)
+    : [];
   return {
+    clipped,
     top: se.scrollTop,
     left: se.scrollLeft,
     sh: se.scrollHeight,
@@ -114,6 +124,7 @@ function judge(where, g) {
   if (g.top !== 0 || g.left !== 0) bad.push(`document scrolled to ${g.left},${g.top}`);
   if (g.sh > g.ih) bad.push(`document ${g.sh}px tall in a ${g.ih}px window`);
   if (g.sw > g.iw) bad.push(`document ${g.sw}px wide in a ${g.iw}px window`);
+  for (const c of g.clipped) bad.push(`header: ${c}, window ${g.iw}`);
   if (g.settingsBottom === null) bad.push("no Settings button");
   else if (g.settingsBottom > g.ih) bad.push(`Settings button bottom at ${g.settingsBottom}, window ${g.ih}`);
   if (bad.length) failures.push(`${where}: ${bad.join("; ")}`);
