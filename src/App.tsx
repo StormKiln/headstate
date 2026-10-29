@@ -829,7 +829,9 @@ export default function App() {
           <h1 className="text-sm font-semibold">{viewLabel(view)}</h1>
           {(view === "my-prs" || view === "to-review") ? (
             <label className="ml-3 flex items-center gap-2 text-xs text-[#8b949e]">
-              Source
+              {/* Visible on the desktop only: a phone's header has no room
+                  for it (#2071), and the select's aria-label names it. */}
+              {isMobile ? null : "Source"}
               <select
                 aria-label="Source"
                 value={selection}
@@ -855,7 +857,7 @@ export default function App() {
             {view === "my-prs" && selection !== "gitlab" && !authoredSavedOwner ? (
               // scopedRepo skips the wizard's "which repositories?" step:
               // selecting a repo in the sidebar already answers it.
-              <NudgeWizard prs={source} scopedRepo={filters.repo} />
+              <NudgeWizard prs={source} scopedRepo={filters.repo} compact={isMobile} />
             ) : null}
           </div>
         </header>

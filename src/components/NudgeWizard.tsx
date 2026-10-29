@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { UserPlus } from "lucide-react";
 import { copyText } from "../lib/clipboard";
 import type { PullRequest } from "@/types/pr";
 import { applyFilters, type Filters } from "@/lib/derive";
@@ -42,6 +43,7 @@ interface RepoSelection {
 export function NudgeWizard({
   prs,
   scopedRepo,
+  compact = false,
 }: {
   prs: PullRequest[];
   /// The repo currently selected in the sidebar, if any. When set, the repo
@@ -49,6 +51,9 @@ export function NudgeWizard({
   /// to that page, and asking again is a question they have already
   /// answered. `undefined` means "All repositories" and the step appears.
   scopedRepo?: string;
+  /// A phone's header has no room for the label (#2071): an icon, named
+  /// for screen readers and by its tooltip, as Go to ticket does.
+  compact?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // Skipping the repo step means the wizard opens on step 1, and `Back`
@@ -127,7 +132,13 @@ export function NudgeWizard({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger
         render={
-          <Button size="sm">Request reviews</Button>
+          compact ? (
+            <Button size="icon-sm" variant="ghost" className="tap-target" aria-label="Request reviews" title="Request reviews">
+              <UserPlus aria-hidden="true" />
+            </Button>
+          ) : (
+            <Button size="sm">Request reviews</Button>
+          )
         }
       />
       <DialogContent className="max-w-2xl">

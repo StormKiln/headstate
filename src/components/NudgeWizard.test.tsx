@@ -20,6 +20,16 @@ describe("NudgeWizard", () => {
     expect(screen.getByText(/Which repositories/i)).toBeDefined();
   });
 
+  /// #2071: on a phone the trigger is an icon, so its name must come from
+  /// the label, not visible text.
+  it("opens from the compact trigger, named for screen readers", () => {
+    render(<NudgeWizard prs={PR_FIXTURES} compact />);
+    const trigger = screen.getByRole("button", { name: "Request reviews" });
+    expect(trigger.textContent).toBe("");
+    fireEvent.click(trigger);
+    expect(screen.getByText(/Which repositories/i)).toBeDefined();
+  });
+
   /// The generated text gets pasted into team channels, so the user must
   /// see the exact output before it leaves the app.
   it("shows a live preview of the exact output text", () => {
