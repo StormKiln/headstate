@@ -101,7 +101,7 @@ beforeEach(() => {
     return Promise.resolve(batch(found, { missing: keys.filter((k) => !found.some((i) => i.key === k)) }));
   });
   assigned.mockReset().mockResolvedValue(batch([TODO]));
-  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" } }));
+  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" }, gitlab: null }));
   worktrees.data = [];
   useJiraView.setState({ selected: null, filter: "all" });
 });

@@ -247,3 +247,36 @@ describe("bare letters never fire while typing (#953)", () => {
     expect(shortcutFor(key("x", {}, div))).toBe("onToggleSelect");
   });
 });
+
+/// Go to ticket (#2040): reachable from anywhere, including from inside a
+/// field, on each platform's own modifier -- and never over another dialog.
+describe("Go to ticket shortcut", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("is Cmd+J on macOS and Ctrl+J elsewhere, and only that", () => {
+    expect(shortcutFor(key("j", { metaKey: true }), true)).toBe("onGoToTicket");
+    expect(shortcutFor(key("J", { metaKey: true }), true)).toBe("onGoToTicket");
+    expect(shortcutFor(key("j", { ctrlKey: true }), false)).toBe("onGoToTicket");
+    expect(shortcutFor(key("j", { ctrlKey: true }), true)).toBeNull();
+    expect(shortcutFor(key("j", { metaKey: true }), false)).toBeNull();
+    expect(shortcutFor(key("j", { metaKey: true, shiftKey: true }), true)).toBeNull();
+    expect(shortcutFor(key("j", { metaKey: true, altKey: true }), true)).toBeNull();
+  });
+
+  it("works from inside a text field", () => {
+    const input = document.createElement("input");
+    expect(shortcutFor(key("j", { metaKey: true }, input), true)).toBe("onGoToTicket");
+  });
+
+  it("does not open over another dialog", () => {
+    document.body.innerHTML = '<div role="dialog" data-open></div>';
+    expect(shortcutFor(key("j", { metaKey: true }), true)).toBeNull();
+  });
+
+  /// Cmd/Ctrl+K stays free for a general command palette.
+  it("leaves Cmd+K alone", () => {
+    expect(shortcutFor(key("k", { metaKey: true }), true)).toBeNull();
+  });
+});

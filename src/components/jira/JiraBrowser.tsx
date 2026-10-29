@@ -35,7 +35,7 @@ export function JiraBrowser() {
 
   return (
     <div className="flex min-h-0 flex-col gap-2">
-      <GoToTicket projects={board.jira.projects} links={board.links} />
+      <GoToTicket projects={board.jira.projects} links={board.links} site={board.jira.site} />
       <div role="group" aria-label="Which issues" className="flex flex-wrap gap-1">
         {FILTERS.map((f) => (
           <button

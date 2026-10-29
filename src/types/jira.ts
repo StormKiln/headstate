@@ -109,17 +109,36 @@ export interface LinkIndex {
   error: string | null;
 }
 
-/// The GitHub half of a ticket lookup (`jira/lookup.rs`). `not_asked` is
-/// never "found nothing": it says why no search was made.
+/// One provider's half of a ticket lookup (`jira/lookup.rs`). `not_asked`
+/// is never "found nothing": it says why no search was made.
+///
+/// `asked` says what it covered: `scope` is the GitHub owners, or GitLab
+/// projects as `host/path`, that were searched; `unsearched` the
+/// candidates left out (past the cap, or a project that did not answer).
+/// `total` is what the provider counted and `read` how many results were
+/// read; `truncated` when more matched than were read -- with `total ===
+/// read` when the provider did not count, which is then only a floor.
 export type KeySearch =
   | { state: "not_asked"; reason: string }
-  | { state: "asked"; at: string; total: number; truncated: boolean }
+  | {
+      state: "asked";
+      at: string;
+      total: number;
+      read: number;
+      truncated: boolean;
+      scope: string[];
+      unsearched: string[];
+    }
   | { state: "failed"; error: string };
 
 export interface KeyLookup {
   key: string;
   links: JiraLink[];
+  /// The GitHub half.
   search: KeySearch;
+  /// The GitLab half; `null` when the user has no GitLab lists, so there
+  /// was nothing of theirs to search.
+  gitlab: KeySearch | null;
 }
 
 /// The statuses seen in one project's recent issues (`jira_project_statuses`).

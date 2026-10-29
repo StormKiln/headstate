@@ -14,6 +14,8 @@ export interface LinkedPr {
   title: string;
   url: string;
   is_draft: boolean;
+  /// The pull request's head branch.
+  branch: string;
   source: KeySource;
   /// Still in the user's open list. `false`: it was open earlier and has
   /// left -- merged or closed, unknown which.

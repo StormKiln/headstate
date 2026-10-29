@@ -1428,6 +1428,24 @@ const MIGRATIONS: &[&str] = &[
         total       INTEGER NOT NULL,
         read        INTEGER NOT NULL
      );",
+    // One search per key AND provider (#2040): GitHub and GitLab are
+    // searched, cooled down and stored apart, and each row keeps what it
+    // spanned -- the owners or projects asked (`scope`) and those that were
+    // not (`unsearched`), as JSON arrays -- so a repeat answer from the
+    // database still says what "nothing found" covers. The old table held
+    // fifteen-minute cooldowns only; dropping it costs one search.
+    "DROP TABLE jira_search;
+     CREATE TABLE jira_key_search (
+        key         TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        searched_at TEXT NOT NULL,
+        total       INTEGER NOT NULL,
+        read        INTEGER NOT NULL,
+        truncated   INTEGER NOT NULL,
+        scope       TEXT NOT NULL,
+        unsearched  TEXT NOT NULL,
+        PRIMARY KEY (key, provider)
+     );",
 
 ];
 

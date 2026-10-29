@@ -40,7 +40,10 @@ describe("list navigation", () => {
   // A modifier means the combination belongs to the platform or to
   // another shortcut, not to list navigation.
   it("ignores them when a modifier is held", () => {
-    expect(shortcutFor(ev({ key: "j", metaKey: true }), true)).toBeNull();
+    // Cmd+J is Go to ticket (#2040), never the cursor; Ctrl+J on macOS is
+    // neither.
+    expect(shortcutFor(ev({ key: "j", metaKey: true }), true)).toBe("onGoToTicket");
+    expect(shortcutFor(ev({ key: "j", ctrlKey: true }), true)).toBeNull();
     expect(shortcutFor(ev({ key: "x", ctrlKey: true }), false)).toBeNull();
     expect(shortcutFor(ev({ key: "j", altKey: true }))).toBeNull();
   });

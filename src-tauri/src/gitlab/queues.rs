@@ -1,6 +1,7 @@
 //! Bounded GitLab merge-request lists. `glab` owns credentials; neither
 //! the credential nor raw CLI diagnostics leave this module.
 mod scan;
+pub mod search;
 use crate::{
     github::model::{CiState, Label, ReviewState},
     identity::{PrIdentity, Provider, Source},
