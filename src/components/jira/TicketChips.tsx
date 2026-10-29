@@ -1,8 +1,9 @@
 import { describeJiraError, failureOf, useJiraIssue } from "@/api/jira";
+import { freshnessNote } from "@/lib/jira/age";
 import { driftFor, type ExpectationMap } from "@/lib/jira/drift";
 import type { FoundKey } from "@/lib/jira/keys";
 import { rowId, type RowRef } from "@/lib/jira/links";
-import { TriangleAlert } from "lucide-react";
+import { History, TriangleAlert } from "lucide-react";
 import type { JiraStatusCategory } from "@/types/jira";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
@@ -60,6 +61,9 @@ function TicketChip({
 }) {
   const q = useJiraIssue(found.key);
   const where = found.source === "title" ? "the title" : "the branch name";
+  // The time the tooltip measures age against: when this answer arrived
+  // or last failed, not the render clock. A refetch moves it.
+  const asOf = new Date(Math.max(q.dataUpdatedAt, q.errorUpdatedAt));
 
   if (q.isPending) {
     return (
@@ -69,7 +73,10 @@ function TicketChip({
       </span>
     );
   }
-  if (q.isError) {
+  // An answer already on screen stays when a refetch fails (#2036): the
+  // failure is said in the tooltip, and "not loaded" is only for a key
+  // that never had an answer.
+  if (q.data === undefined) {
     return (
       <span
         className={`${CHIP} border-[#f85149] text-[#f85149]`}
@@ -104,14 +111,18 @@ function TicketChip({
   }
   const { issue } = s;
   const drift = openPr ? driftFor(issue, { draft: openPr.draft, source: found.source }, expectations) : null;
+  const failed = q.isError ? describeJiraError(failureOf(q.error)) : null;
+  const stale = issue.stale === true || failed !== null;
   const label = (
     <>
       {drift ? <TriangleAlert className="h-3 w-3" aria-label="Needs attention" /> : null}
+      {stale ? <History className="h-3 w-3" aria-label="Not current" /> : null}
       {issue.key} · {issue.status.name || "no status"}
     </>
   );
-  const tip = `${drift ? `${drift.message}\n` : ""}${issue.summary}${issue.assignee ? ` — ${issue.assignee}` : ""} (from ${where})`;
-  const cls = `${CHIP} ${drift ? "border-[#d29922] text-[#d29922]" : CATEGORY_CLASS[issue.status.category]}`;
+  const fresh = freshnessNote(issue, asOf, failed);
+  const tip = `${drift ? `${drift.message}\n` : ""}${issue.summary}${issue.assignee ? ` — ${issue.assignee}` : ""} (from ${where})${fresh ? `\n${fresh}` : ""}`;
+  const cls = `${CHIP} ${drift ? "border-[#d29922] text-[#d29922]" : CATEGORY_CLASS[issue.status.category]}${stale ? " border-dashed" : ""}`;
   // Opens the issue in My Jira issues, which links on to Jira itself. A
   // button inside a clickable row, so the click stops here.
   return (

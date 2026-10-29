@@ -164,6 +164,37 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 /// page of chips refetching cannot spend a limit already exhausted.
 let coolOff: { until: number; why: JiraError } | null = null;
 
+/// The last issue each key was found as. A key not asked because of a
+/// rate limit is answered with this, marked stale, rather than turning an
+/// answer already on screen into "not checked yet" (#2036).
+const lastFound = new Map<string, JiraIssue>();
+
+/// What a key was not asked about for `why` reads as: its last answer,
+/// stale, when there is one.
+function notAsked(key: string, why: JiraError | null): IssueState {
+  const last = lastFound.get(key);
+  return last ? { state: "found", issue: { ...last, stale: true } } : { state: "unasked", why };
+}
+
+/// One key's state from a desktop reply.
+function stateIn(key: string, reply: IssueBatch, found: Map<string, JiraIssue>, missing: Set<string>): IssueState {
+  const issue = found.get(key);
+  if (issue) {
+    lastFound.set(key, issue);
+    return { state: "found", issue };
+  }
+  if (missing.has(key)) return { state: "missing" };
+  // Neither returned nor reported missing: the desktop did not reach it.
+  // Never "missing" -- that would claim Jira answered.
+  return notAsked(key, reply.error);
+}
+
+/// Remember a reply's rate limit, if it carried one.
+function noteLimit(reply: IssueBatch) {
+  const wait = rateLimitWaitMs(reply.error);
+  coolOff = wait !== null && reply.error ? { until: Date.now() + wait, why: reply.error } : null;
+}
+
 async function flush() {
   timer = null;
   const batch = waiting;
@@ -173,24 +204,16 @@ async function flush() {
     const chunk = keys.slice(i, i + CHUNK);
     if (coolOff && Date.now() < coolOff.until) {
       const why = coolOff.why;
-      for (const key of chunk) for (const w of batch.get(key) ?? []) w.resolve({ state: "unasked", why });
+      for (const key of chunk) for (const w of batch.get(key) ?? []) w.resolve(notAsked(key, why));
       continue;
     }
     try {
       const reply: IssueBatch = await typed(() => jiraIssues(chunk));
-      const wait = rateLimitWaitMs(reply.error);
-      coolOff = wait !== null && reply.error ? { until: Date.now() + wait, why: reply.error } : null;
+      noteLimit(reply);
       const found = new Map(reply.issues.map((issue) => [issue.key, issue]));
       const missing = new Set(reply.missing);
       for (const key of chunk) {
-        const issue = found.get(key);
-        const state: IssueState = issue
-          ? { state: "found", issue }
-          : missing.has(key)
-            ? { state: "missing" }
-            : // Neither returned nor reported missing: the desktop did not
-              // reach it. Never "missing" -- that would claim Jira answered.
-              { state: "unasked", why: reply.error };
+        const state = stateIn(key, reply, found, missing);
         for (const w of batch.get(key) ?? []) w.resolve(state);
       }
     } catch (e) {
@@ -233,6 +256,47 @@ export function issueQuery(key: string) {
 /// worktree and the Jira page is asked for once.
 export function useJiraIssue(key: string, enabled = true) {
   return useQuery({ ...issueQuery(key), enabled });
+}
+
+/// Read one key past every cache -- the desktop's minute and this side's
+/// `staleTime` -- for an issue being opened (#2036). Not while Jira is
+/// rate limiting: then the last answer, marked stale, is what there is.
+export async function loadIssueFresh(key: string): Promise<IssueState> {
+  if (coolOff && Date.now() < coolOff.until) return notAsked(key, coolOff.why);
+  const reply = await typed(() => jiraIssues([key], true));
+  noteLimit(reply);
+  return stateIn(key, reply, new Map(reply.issues.map((i) => [i.key, i])), new Set(reply.missing));
+}
+
+/// The issue being opened, read fresh each time it is opened. A found
+/// answer also fills the per-key cache, so its chips agree at once.
+export function useJiraIssueFresh(key: string, enabled: boolean) {
+  const qc = useQueryClient();
+  return useQuery({
+    queryKey: ["jira-issue-fresh", key],
+    queryFn: async () => {
+      const state = await loadIssueFresh(key);
+      if (state.state === "found" && !state.issue.stale) qc.setQueryData(["jira-issue", key], state);
+      return state;
+    },
+    enabled: enabled && key !== "",
+    staleTime: 0,
+    gcTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+}
+
+/// A query's answer with a failed refetch taken into account: data already
+/// loaded is kept, marked stale, rather than replaced by the failure
+/// (#2036). `"failed"` only when there is no answer at all.
+export function keptOrFailed(
+  data: IssueState | undefined,
+  isError: boolean,
+): IssueState | "failed" | undefined {
+  if (data === undefined) return isError ? "failed" : undefined;
+  if (isError && data.state === "found") return { state: "found", issue: { ...data.issue, stale: true } };
+  return data;
 }
 
 /// Open issues assigned to the signed-in user (#2038). One search, read

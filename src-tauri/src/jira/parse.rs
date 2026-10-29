@@ -79,6 +79,9 @@ fn issue(v: &Value) -> Option<JiraIssue> {
         parent_key: s("/parent/key"),
         // Set by the reader that knows whether `parent` was asked for.
         parent_checked: false,
+        // Set by the cache, which knows when.
+        read_at: None,
+        stale: false,
         project_key: s("/project/key")
             .or_else(|| key.split_once('-').map(|(p, _)| p.to_string()))
             .unwrap_or_default(),

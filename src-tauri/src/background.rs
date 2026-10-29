@@ -116,6 +116,13 @@ pub struct TaskHealth {
     /// Carried rather than re-derived at each call site, so the page and
     /// any future notifier cannot come to disagree about what counts.
     pub degraded: bool,
+    /// Waiting with no deadline, on purpose: its source is switched off
+    /// or not set up (#2036). Not a stall, and not a failure.
+    pub parked: bool,
+    /// Epoch ms at which the loop will try again after being told to
+    /// wait -- a rate limit's `Retry-After` (#2036). `None` when it is on
+    /// its ordinary cadence, which is not "retry now".
+    pub retry_at_ms: Option<u64>,
 }
 
 /// How far past its own declared cadence a cycle may run before the loop
@@ -168,6 +175,10 @@ pub struct Task {
     /// Monotonic ms ([`mono_ms`]) by which the next cycle should have
     /// finished; 0 means no deadline (not started, or parked).
     due_mono_ms: AtomicU64,
+    /// Whether the loop last waited parked rather than on a deadline.
+    parked: std::sync::atomic::AtomicBool,
+    /// Wall-clock ms of the next try after a told-to-wait; 0 means none.
+    retry_at_ms: AtomicU64,
 }
 
 impl Task {
@@ -180,6 +191,8 @@ impl Task {
             last_error: Mutex::new(None),
             last_tick_ms: AtomicU64::new(0),
             due_mono_ms: AtomicU64::new(0),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            retry_at_ms: AtomicU64::new(0),
         }
     }
 
@@ -196,6 +209,17 @@ impl Task {
             .saturating_add(STALL_GRACE.as_millis() as u64);
         // `max(1)`: 0 is the no-deadline sentinel.
         self.due_mono_ms.store(due.max(1), Ordering::Relaxed);
+        self.parked.store(false, Ordering::Relaxed);
+        self.retry_at_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// As [`Task::tick`], for a wait the loop was TOLD to take -- a rate
+    /// limit -- rather than its own cadence. The page says "retrying at"
+    /// rather than leaving the reader to guess why nothing moved.
+    pub fn retry_in(&self, wait: std::time::Duration) {
+        self.tick(wait);
+        let at = now_ms().saturating_add(wait.as_millis() as u64);
+        self.retry_at_ms.store(at.max(1), Ordering::Relaxed);
     }
 
     /// The loop is about to wait with no deadline, on purpose -- its
@@ -204,6 +228,8 @@ impl Task {
     /// Cleared by the next [`Task::tick`].
     pub fn park(&self) {
         self.due_mono_ms.store(0, Ordering::Relaxed);
+        self.parked.store(true, Ordering::Relaxed);
+        self.retry_at_ms.store(0, Ordering::Relaxed);
     }
 
     /// Record one cycle made of several pieces of work.
@@ -268,6 +294,7 @@ impl Task {
         let tick = self.last_tick_ms.load(Ordering::Relaxed);
         let due = self.due_mono_ms.load(Ordering::Relaxed);
         let stalled = due != 0 && mono_now > due;
+        let retry_at = self.retry_at_ms.load(Ordering::Relaxed);
         TaskHealth {
             task: self.name.to_string(),
             consecutive_failures: consecutive,
@@ -278,6 +305,8 @@ impl Task {
             last_tick_ms: (tick != 0).then_some(tick),
             stalled,
             degraded: consecutive >= FAILURES_BEFORE_DEGRADED || stalled,
+            parked: self.parked.load(Ordering::Relaxed),
+            retry_at_ms: (retry_at != 0).then_some(retry_at),
         }
     }
 }
@@ -365,9 +394,13 @@ pub static GITLAB_POLL: Task = Task::new("gitlab-poll");
 /// The one-second Claude session activity nudge (#1477, #1937).
 pub static CLAUDE_ACTIVITY: Task = Task::new("claude-activity");
 
+/// The Jira status refresh (#2036): linked and assigned issues into the
+/// cache every ten minutes, window open or not. Parked while Jira is off.
+pub static JIRA_REFRESH: Task = Task::new("jira-refresh");
+
 /// Every tracked task, for the command.
 ///
-/// Still a fixed list rather than a registry, now of seven: every
+/// Still a fixed list rather than a registry, now of eight: every
 /// long-running loop, plus the transcript indexer that rides on the live
 /// pass and fails independently of it. A registry would let a loop
 /// register itself and so make the list correct by construction -- but
@@ -385,6 +418,7 @@ pub fn snapshot_all() -> Vec<TaskHealth> {
         GITHUB_CONTINUATION.snapshot(),
         GITLAB_POLL.snapshot(),
         CLAUDE_ACTIVITY.snapshot(),
+        JIRA_REFRESH.snapshot(),
     ]
 }
 
@@ -599,8 +633,10 @@ mod tests {
         // Seven since #1937: the GitHub poll, the queue continuation
         // clock, the GitLab poll and the Claude activity nudge were
         // untracked, so the page said "healthy" while PR polling stopped.
+        //
+        // Eight since #2036: the Jira status refresh.
         let all = snapshot_all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         let names: Vec<&str> = all.iter().map(|t| t.task.as_str()).collect();
         for name in [
             "health-sampler",
@@ -610,6 +646,7 @@ mod tests {
             "github-continuation",
             "gitlab-poll",
             "claude-activity",
+            "jira-refresh",
         ] {
             assert!(names.contains(&name), "{name} missing from {names:?}");
         }
@@ -641,11 +678,32 @@ mod tests {
     fn a_parked_loop_is_not_stalled() {
         let t = task();
         t.tick(std::time::Duration::from_secs(1));
+        assert!(!t.snapshot().parked);
         t.park();
         assert!(!t.snapshot_at(u64::MAX).stalled);
+        assert!(t.snapshot().parked, "and says it is parked");
         // The next cycle re-arms the deadline.
         t.tick(std::time::Duration::from_secs(1));
         assert!(t.snapshot_at(u64::MAX).stalled);
+    }
+
+    #[test]
+    fn a_told_to_wait_loop_says_when_it_retries_until_its_next_cycle() {
+        let t = task();
+        assert_eq!(t.snapshot().retry_at_ms, None, "not told to wait");
+        let before = now_ms();
+        t.retry_in(std::time::Duration::from_secs(90));
+        let at = t.snapshot().retry_at_ms.expect("retrying");
+        assert!(at >= before + 90_000, "{at}");
+        assert!(!t.snapshot().parked);
+        // The wait plus grace is still the deadline: not stalled early.
+        let due = t.due_mono_ms.load(Ordering::Relaxed);
+        assert!(!t.snapshot_at(due).stalled);
+        t.tick(std::time::Duration::from_secs(1));
+        assert_eq!(t.snapshot().retry_at_ms, None, "the ordinary cadence again");
+        t.retry_in(std::time::Duration::from_secs(1));
+        t.park();
+        assert_eq!(t.snapshot().retry_at_ms, None, "parked is not retrying");
     }
 
     #[test]

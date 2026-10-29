@@ -69,6 +69,15 @@ pub struct JiraIssue {
     /// for it fails the whole call. Kept for a transport that can (#2048);
     /// `None` is "not read", never "never updated".
     pub updated: Option<String>,
+    /// When this status was read from Jira, RFC 3339 (#2036). Set by the
+    /// cache on every issue it sends; `None` only for an issue that has
+    /// not been through it, and never rendered as an age.
+    #[serde(default)]
+    pub read_at: Option<String>,
+    /// Served from the cache because the read that should have refreshed
+    /// it failed (#2036). `read_at` then says how old the answer is.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +115,11 @@ pub struct IssueBatch {
     /// For a search rather than a key list: whether the result hit its
     /// limit, so the UI says "at least N" rather than N.
     pub truncated: bool,
+    /// For a search: when the LIST itself was read, RFC 3339 (#2036).
+    /// With `error` set, the list is the last one that was read, served
+    /// stale; `None` there means no list has ever been read.
+    #[serde(default)]
+    pub list_read_at: Option<String>,
 }
 
 /// Why a Jira read did not happen, or did not finish (#2033).

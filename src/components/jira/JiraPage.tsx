@@ -8,7 +8,9 @@ import { useJiraView } from "@/store/jira";
 import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
 import { openInHeadstate } from "./openInHeadstate";
-import { describeJiraError, failureOf, useJiraFind, useJiraIssue } from "@/api/jira";
+import { describeJiraError, failureOf, keptOrFailed, useJiraFind, useJiraIssueFresh } from "@/api/jira";
+import { freshnessNote } from "@/lib/jira/age";
+import { useNow } from "@/lib/readyAge";
 import type { JiraIssue, KeySearch } from "@/types/jira";
 import { useJiraBoard } from "./useJiraBoard";
 import { useJira } from "./jiraState";
@@ -20,11 +22,24 @@ export function JiraPage() {
   const isMobile = useIsMobile();
   const { selected, select } = useJiraView();
   const board = useJiraBoard();
-  // The selected issue is asked for directly: one reached by typing its key
-  // may not be in the tree, and must not read "Loading…" forever.
-  const own = useJiraIssue(selected ?? "", selected !== null && board.jira !== null);
-  const lookup: Lookup = (k) =>
-    k === selected && (own.data || own.isError) ? (own.isError ? "failed" : own.data) : board.lookup(k);
+  // The selected issue is asked for directly, and fresh each time it is
+  // opened (#2036): one reached by typing its key may not be in the tree,
+  // and must not read "Loading…" forever; one already in it must not show
+  // a status minutes old as the latest. Until the fresh read answers, or
+  // when it fails, whatever the board already holds is shown.
+  const own = useJiraIssueFresh(selected ?? "", selected !== null && board.jira !== null);
+  const ownFailed = own.isError ? describeJiraError(failureOf(own.error)) : null;
+  const lookup: Lookup = (k) => {
+    if (k !== selected) return board.lookup(k);
+    const fresh = own.data;
+    if (fresh && fresh.state !== "unasked") return keptOrFailed(fresh, own.isError);
+    // Not answered fresh (yet, or at all): what the board holds, marked
+    // stale if the fresh read failed.
+    const held = board.lookup(k);
+    if (held !== undefined && held !== "failed" && held.state !== "unasked") return keptOrFailed(held, own.isError);
+    if (fresh) return fresh;
+    return own.isError ? "failed" : held;
+  };
 
   if (selected === null) {
     // On a phone the sidebar is a sheet, so the page is the list.
@@ -43,7 +58,7 @@ export function JiraPage() {
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" /> All issues
         </button>
       ) : null}
-      <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} />
+      <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} failed={ownFailed} />
       <EpicRollUp k={selected} known={known} lookup={lookup} />
       <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
       <FoundBySearching key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />
@@ -51,8 +66,9 @@ export function JiraPage() {
   );
 }
 
-function IssueHeader({ k, lookup, site }: { k: string; lookup: Lookup; site: string | null }) {
+function IssueHeader({ k, lookup, site, failed }: { k: string; lookup: Lookup; site: string | null; failed: string | null }) {
   const { select } = useJiraView();
+  const now = useNow(30_000);
   const s = lookup(k);
   const d = describe(k, lookup);
   const issue = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
@@ -81,7 +97,23 @@ function IssueHeader({ k, lookup, site }: { k: string; lookup: Lookup; site: str
           </ExternalLink>
         ) : null}
       </div>
+      <Freshness issue={issue} now={now} failed={failed} />
     </div>
+  );
+}
+
+/// How old the status shown is, and whether it is an old answer kept
+/// because the latest read failed (#2036). Nothing when the age is not
+/// known and nothing failed.
+function Freshness({ issue, now, failed }: { issue: JiraIssue | null; now: Date; failed: string | null }) {
+  if (!issue) return null;
+  const note = freshnessNote(issue, now, failed);
+  if (!note) return null;
+  const stale = issue.stale === true || failed !== null;
+  return (
+    <p role={stale ? "status" : undefined} className={`text-xs ${stale ? "text-[#d29922]" : "text-[#8b949e]"}`}>
+      {note}
+    </p>
   );
 }
 

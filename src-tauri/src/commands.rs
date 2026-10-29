@@ -5326,8 +5326,15 @@ fn set_ui_prefs_blocking(
     measurement_capture: Option<bool>,
 ) -> Result<Option<crate::measurement::CaptureIdentity>, String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    let was_jira = read_ui_prefs(&app).jira_enabled;
     crate::store::settings::set(&conn, settings::keys::UI_PREFS, &prefs)
         .map_err(|e| e.to_string())?;
+    // Jira switched on or off: the background refresh starts or parks now,
+    // not at the end of a ten-minute wait (#2036). Only on a change, so
+    // every other preference saved does not set off a Jira pass.
+    if was_jira != prefs.jira_enabled {
+        crate::jira::refresh::wake();
+    }
     // Applied immediately rather than at the next launch. Someone who
     // just ticked the box to capture a problem should get the log for
     // the problem they are currently reproducing, not the next one.

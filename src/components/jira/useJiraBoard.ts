@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
-import { issueQuery, useFollowJiraLinks, useJiraAssigned, type IssueState } from "@/api/jira";
+import { issueQuery, keptOrFailed, useFollowJiraLinks, useJiraAssigned, type IssueState } from "@/api/jira";
 import { useWorktrees } from "@/api/hooks";
 import { ancestorKeys, type Links, type Lookup } from "@/lib/jira/tree";
 import type { JiraIssue } from "@/types/jira";
@@ -25,7 +25,13 @@ export function useJiraBoard() {
 
   const links: ReadonlyMap<string, Links> = jira?.links.byKey ?? EMPTY_LINKS;
   const linked = useMemo(() => [...links.keys()], [links]);
-  const assignedIssues = assigned.data?.issues ?? EMPTY;
+  // A refetch that failed keeps the list it had, marked stale (#2036).
+  const assignedFailed = assigned.isError;
+  const assignedData = assigned.data?.issues ?? EMPTY;
+  const assignedIssues = useMemo(
+    () => (assignedFailed ? assignedData.map((i: JiraIssue) => ({ ...i, stale: true })) : assignedData),
+    [assignedData, assignedFailed],
+  );
   const assignedKeys = useMemo(() => assignedIssues.map((i: JiraIssue) => i.key), [assignedIssues]);
   const assignedMap = useMemo(() => new Map(assignedIssues.map((i: JiraIssue) => [i.key, i])), [assignedIssues]);
 
@@ -40,8 +46,7 @@ export function useJiraBoard() {
   };
   const cached: Lookup = (key) => {
     const st = qc.getQueryState<IssueState>(["jira-issue", key]);
-    if (st?.status === "error") return "failed";
-    return st?.data ?? fromAssigned(key);
+    return keptOrFailed(st?.data, st?.status === "error") ?? fromAssigned(key);
   };
   const ancestors = on ? ancestorKeys([...linked, ...assignedKeys], cached) : EMPTY;
   const queried = [...new Set([...linked, ...ancestors])];
@@ -50,8 +55,10 @@ export function useJiraBoard() {
   const lookup: Lookup = (key) => {
     const i = queried.indexOf(key);
     const r = i >= 0 ? results[i] : undefined;
-    if (r?.isError) return "failed";
-    return r?.data ?? fromAssigned(key);
+    // Data already loaded outlives a failed refetch; "failed" is for a key
+    // with no answer at all -- and the assigned list may still have one.
+    const kept = keptOrFailed(r?.data, r?.isError ?? false);
+    return kept === "failed" ? (fromAssigned(key) ?? kept) : (kept ?? fromAssigned(key));
   };
 
   return {

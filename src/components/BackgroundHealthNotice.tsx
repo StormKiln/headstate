@@ -21,6 +21,8 @@ function label(task: string): string {
       return "GitLab merge request polling";
     case "claude-activity":
       return "Live Claude Code session activity";
+    case "jira-refresh":
+      return "Jira status refresh";
     default:
       // Not "Unknown task": a loop added later with no case here should
       // still be reportable, and its key is more useful than a shrug.
@@ -44,6 +46,8 @@ function consequence(task: string): string {
       return "A long pull request list may stay partly loaded.";
     case "claude-activity":
       return "Running sessions may be slow to show new activity.";
+    case "jira-refresh":
+      return "Jira statuses may be out of date.";
     default:
       return "Data it maintains may be out of date.";
   }
@@ -56,6 +60,36 @@ function ago(ms: number, now: number): string {
   if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
   const hours = Math.floor(mins / 60);
   return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+}
+
+/// Loops whose parking means a switch the user turned off, so "off" is
+/// worth saying. Others park while their source is not set up at all,
+/// which a line on this page for every user would only repeat.
+const SWITCHED = new Set(["jira-refresh"]);
+
+/// Background loops that are deliberately not running right now (#2036):
+/// waiting out a rate limit, or switched off. Neither is a failure, and
+/// neither is a stall; without this line both read as "nothing is
+/// happening and nobody said why".
+export function BackgroundTaskStates({ tasks }: { tasks: TaskHealth[] | undefined }) {
+  const lines = (tasks ?? []).flatMap((t) => {
+    if (t.retry_at_ms != null) {
+      const at = new Date(t.retry_at_ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      return [{ task: t.task, text: `${label(t.task)} is retrying: it was asked to wait, and will try again at ${at}.` }];
+    }
+    if (t.parked === true && SWITCHED.has(t.task)) {
+      return [{ task: t.task, text: `${label(t.task)} is off: it is switched off in Settings.` }];
+    }
+    return [];
+  });
+  if (lines.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-0.5 text-xs text-[#8b949e]">
+      {lines.map((l) => (
+        <p key={l.task}>{l.text}</p>
+      ))}
+    </div>
+  );
 }
 
 /// What a degraded background loop means for what is on screen (#1145).

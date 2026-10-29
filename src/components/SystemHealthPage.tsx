@@ -51,7 +51,7 @@ import type {
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { LogPanel } from "./LogPanel";
-import { BackgroundHealthNotice } from "./BackgroundHealthNotice";
+import { BackgroundHealthNotice, BackgroundTaskStates } from "./BackgroundHealthNotice";
 import { copyText } from "@/lib/clipboard";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
@@ -1087,6 +1087,7 @@ export function SystemHealthPage() {
           reader has to meet that fact before the verdicts it qualifies
           (#1145). Renders nothing while the loops are working. */}
       <BackgroundHealthNotice tasks={background.data} now={renderedAt} />
+      <BackgroundTaskStates tasks={background.data} />
       <HealthConditions
         alerts={alerts.data}
         failed={alerts.isError}

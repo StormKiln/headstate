@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UiPrefs } from "@/api/tauri";
 import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
+import { createQueryClient } from "@/api/queryClient";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
 
@@ -265,6 +267,62 @@ describe("TicketChips", () => {
       </JiraProvider>,
     );
     expect(await screen.findByText("This pull request is open, but ABC-6 is In Progress, not In Review.")).toBeTruthy();
+  });
+
+  /// #2036: how old a status is, in its tooltip -- and nothing when the
+  /// desktop did not say. Absent is not zero.
+  it("says how old a status is, and says nothing when that is not known", async () => {
+    const readAt = new Date(Date.now() - 2 * 60_000).toISOString();
+    issues.mockResolvedValue(batch({ issues: [{ ...issue("ABC-2"), read_at: readAt }, issue("XY-2")] }));
+    links.mockResolvedValue(index([prLink("ABC-2"), prLink("XY-2")]));
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips row={ROW} />
+      </JiraProvider>,
+    );
+    const aged = await screen.findByRole("button", { name: /ABC-2 · In Review/ });
+    expect(aged.getAttribute("title")).toMatch(/Status read 2 minutes ago\.$/);
+    const unknown = await screen.findByRole("button", { name: /XY-2 · In Review/ });
+    expect(unknown.getAttribute("title")).not.toMatch(/read|ago/);
+    expect(screen.queryByLabelText("Not current")).toBeNull();
+  });
+
+  /// #2036: a row the desktop served from its cache after a failed read
+  /// is marked, with the age of the answer shown.
+  it("marks a status served stale by the desktop", async () => {
+    const readAt = new Date(Date.now() - 9 * 60_000).toISOString();
+    issues.mockResolvedValue(batch({ issues: [{ ...issue("ABC-3"), read_at: readAt, stale: true }], error: { state: "timed_out", secs: 20 } }));
+    links.mockResolvedValue(index([prLink("ABC-3")]));
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketChips row={ROW} />
+      </JiraProvider>,
+    );
+    const chip = await screen.findByRole("button", { name: /ABC-3 · In Review/ });
+    expect(screen.getByLabelText("Not current")).toBeTruthy();
+    expect(chip.getAttribute("title")).toMatch(/Shown as read 9 minutes ago: the latest read failed\./);
+  });
+
+  /// #2036: a refetch that rejects keeps the status already shown, marked,
+  /// instead of turning it into "not loaded".
+  it("keeps a loaded status when a refetch fails", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-4")] }));
+    links.mockResolvedValue(index([prLink("ABC-4")]));
+    const client = createQueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <JiraProvider prefs={prefs()}>
+          <TicketChips row={ROW} />
+        </JiraProvider>
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("button", { name: /ABC-4 · In Review/ });
+    issues.mockRejectedValue(new Error("acli exploded"));
+    await client.refetchQueries({ queryKey: ["jira-issue", "ABC-4"] });
+    await waitFor(() => expect(screen.getByLabelText("Not current")).toBeTruthy());
+    const chip = screen.getByRole("button", { name: /ABC-4 · In Review/ });
+    expect(chip.getAttribute("title")).toMatch(/the latest read failed \(acli exploded\)/);
+    expect(screen.queryByText(/not loaded/)).toBeNull();
   });
 
   it("opens the issue in My Jira issues, without also opening the row", async () => {

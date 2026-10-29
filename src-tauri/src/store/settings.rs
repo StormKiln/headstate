@@ -113,6 +113,10 @@ pub mod keys {
     /// What the pull-request part of the Jira index was last built from,
     /// so an unchanged database is not re-read (#2035).
     pub const JIRA_INDEX_FINGERPRINT: &str = "jira_index_fingerprint";
+    /// The last assigned-issue list read in full, as a JSON
+    /// `jira::cache::AssignedList` (#2036): the fallback for a failed
+    /// search. Absent until one has been read.
+    pub const JIRA_ASSIGNED: &str = "jira_assigned";
 
     /// Automatic cleanup preferences (#382).
     pub const CLEANUP_PREFS: &str = "cleanup_prefs";

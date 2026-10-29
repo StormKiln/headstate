@@ -1,4 +1,6 @@
-import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createQueryClient } from "@/api/queryClient";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
@@ -10,7 +12,7 @@ import { useJiraView } from "@/store/jira";
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
 const find = vi.hoisted(() => vi.fn<(key: string, more: boolean) => Promise<KeyLookup>>());
-const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
+const issues = vi.hoisted(() => vi.fn<(keys: string[], fresh?: boolean) => Promise<IssueBatch>>());
 const assigned = vi.hoisted(() => vi.fn<() => Promise<IssueBatch>>());
 const worktrees = vi.hoisted(() => ({ data: [] as unknown[], isPending: false }));
 vi.mock("@/api/tauri", () => ({
@@ -228,6 +230,91 @@ describe("My Jira issues", () => {
     await quiet();
     expect(find).toHaveBeenCalledWith("ABC-1", true);
     expect(find).toHaveBeenCalledWith("ABC-1", false);
+  });
+
+  describe("freshness (#2036)", () => {
+    const ago = (mins: number) => new Date(Date.now() - mins * 60_000).toISOString();
+
+    it("reads an opened issue fresh, past every cache, and says how old it is", async () => {
+      issues.mockImplementation((keys, fresh) =>
+        Promise.resolve(batch(fresh ? [{ ...STORY, read_at: ago(0) }] : [EPIC, STORY].filter((i) => keys.includes(i.key)))),
+      );
+      useJiraView.setState({ selected: "ABC-1" });
+      mount(<JiraPage />);
+      expect(await screen.findByText("Status read just now.")).toBeTruthy();
+      expect(issues).toHaveBeenCalledWith(["ABC-1"], true);
+      await quiet();
+    });
+
+    it("says nothing about age when the desktop did not say when it read", async () => {
+      useJiraView.setState({ selected: "ABC-1" });
+      mount(<JiraPage />);
+      await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ });
+      await quiet();
+      expect(screen.queryByText(/read .*ago|read just now/)).toBeNull();
+    });
+
+    it("keeps what the board holds when the fresh read fails, and says so", async () => {
+      issues.mockImplementation((keys, fresh) =>
+        fresh
+          ? Promise.reject(new Error("acli exploded"))
+          : Promise.resolve(batch([EPIC, { ...STORY, read_at: ago(12.5) }].filter((i) => keys.includes(i.key)))),
+      );
+      useJiraView.setState({ selected: "ABC-1" });
+      mount(
+        <>
+          <JiraBrowser />
+          <JiraPage />
+        </>,
+      );
+      expect(await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ })).toBeTruthy();
+      expect(
+        await screen.findByText("Shown as read 12 minutes ago: the latest read failed (acli exploded)."),
+      ).toBeTruthy();
+      expect(screen.queryByText(/Could not load/)).toBeNull();
+      await quiet();
+    });
+
+    it("shows the last assigned list, with its age, when the search fails", async () => {
+      assigned.mockResolvedValue(
+        batch([{ ...TODO, stale: true }], {
+          error: { state: "rate_limited", retry_after_secs: 30 },
+          list_read_at: ago(20),
+        }),
+      );
+      mount(<JiraBrowser />);
+      expect(await screen.findByRole("button", { name: /ABC-3 Not started/ })).toBeTruthy();
+      expect(
+        await screen.findByText(/^Showing the issues assigned to you as read 20 minutes ago\. The latest read failed: Jira is limiting/),
+      ).toBeTruthy();
+      await quiet();
+    });
+
+    it("keeps the assigned list when a refetch rejects", async () => {
+      const client = createQueryClient();
+      render(
+        <QueryClientProvider client={client}>
+          <JiraProvider prefs={prefs}>
+            <JiraBrowser />
+          </JiraProvider>
+        </QueryClientProvider>,
+      );
+      await screen.findByRole("button", { name: /ABC-3 Not started/ });
+      assigned.mockRejectedValue(new Error("desktop went away"));
+      await act(() => client.refetchQueries({ queryKey: ["jira-assigned"] }));
+      await waitFor(() =>
+        expect(screen.getByText(/^Showing the issues assigned to you as last read\. The latest read failed: desktop went away/)).toBeTruthy(),
+      );
+      expect(screen.getByRole("button", { name: /ABC-3 Not started/ })).toBeTruthy();
+      await quiet();
+    });
+
+    it("says only the error when no assigned list was ever read", async () => {
+      assigned.mockResolvedValue(batch([], { error: { state: "timed_out", secs: 20 } }));
+      mount(<JiraBrowser />);
+      expect(await screen.findByText(/^Could not read the issues assigned to you: acli did not answer within 20s/)).toBeTruthy();
+      await quiet();
+    });
   });
 
   describe("Go to ticket", () => {
