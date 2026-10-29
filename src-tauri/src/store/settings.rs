@@ -106,6 +106,13 @@ pub mod keys {
     /// The Jira site `acli` last said it was signed in to, as a JSON
     /// string hostname. Builds browse links; never a credential.
     pub const JIRA_SITE: &str = "jira_site";
+    /// The signed-in user's Jira project keys, as a JSON array: the
+    /// dictionary that tells a key from a look-alike. Absent until first
+    /// read; refreshed whenever Settings › Jira lists projects.
+    pub const JIRA_PROJECTS: &str = "jira_projects";
+    /// What the pull-request part of the Jira index was last built from,
+    /// so an unchanged database is not re-read (#2035).
+    pub const JIRA_INDEX_FINGERPRINT: &str = "jira_index_fingerprint";
 
     /// Automatic cleanup preferences (#382).
     pub const CLEANUP_PREFS: &str = "cleanup_prefs";

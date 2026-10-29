@@ -1723,6 +1723,8 @@ pub async fn list_worktrees(app: AppHandle) -> Result<crate::worktrees::RepoScan
     // And in memory, so the file browser can validate a click against
     // this scan instead of walking again (#1952).
     remember_scanned_repos(&cache_scope, &out);
+    // And in the Jira index, when Jira is on (#2035).
+    crate::jira::commands::note_worktrees(&app, &out).await;
     Ok(out)
 }
 
@@ -10310,7 +10312,8 @@ pub async fn list_branches(
     app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::branches::Branch>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let (handle, path) = (app.clone(), repo_path.clone());
+    let branches = tauri::async_runtime::spawn_blocking(move || {
         let emitter = BranchScanEmitter {
             app,
             repo: repo_path.clone(),
@@ -10318,7 +10321,10 @@ pub async fn list_branches(
         crate::branches::scan_cached_with_progress(std::path::Path::new(&repo_path), &emitter)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    // Noted in the Jira index, when Jira is on (#2035).
+    crate::jira::commands::note_branches(&handle, &path, &branches).await;
+    Ok(branches)
 }
 
 /// The event name a branch DELETION reports its progress under.

@@ -1,5 +1,6 @@
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { TicketChips } from "./jira/TicketChips";
+import { FollowJiraLinks } from "./jira/FollowJiraLinks";
 import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
 import { RefreshCw, Sparkles } from "lucide-react";
@@ -354,7 +355,7 @@ function Row({
         )}
         {wt.branch ? (
           <span className="ml-2 inline-flex gap-1 align-middle">
-            <TicketChips branch={wt.branch} />
+            <TicketChips row={{ worktreePath: wt.path }} />
           </span>
         ) : null}
         {/* Which agent is working here (#1137).
@@ -2192,6 +2193,7 @@ export function WorktreesPage() {
       .filter((w) => isOrphaned(w.safety));
     return (
       <>
+        <FollowJiraLinks updatedAt={dataUpdatedAt} />
       {orphanDialog}
       <div className="rounded-md border border-[#30363d]">
         <div className="border-b border-[#30363d] px-4 py-3">
@@ -2321,6 +2323,7 @@ export function WorktreesPage() {
     const { worktrees, totalBytes, sizesComplete } = rollupRepos(withSizes);
     return (
       <div className="rounded-md border border-[#30363d]">
+        <FollowJiraLinks updatedAt={dataUpdatedAt} />
         <div className="flex items-baseline justify-between border-b border-[#30363d] px-4 py-3">
           {/* "at least" on a partial scan (#951), for the same reason the
               size total beside it already says it: both numbers were
@@ -2607,6 +2610,7 @@ export function WorktreesPage() {
 
   return (
     <div className="flex flex-col gap-3">
+      <FollowJiraLinks updatedAt={dataUpdatedAt} />
       <div className="flex flex-wrap items-baseline gap-3 text-sm">
         <span className="font-semibold">{selected?.name}</span>
         <span className="text-[#8b949e]">

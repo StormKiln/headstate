@@ -7,7 +7,7 @@ import type { IssueState } from "@/api/jira";
 import type { PrIdentity } from "@/types/identity";
 import type { JiraIssue, JiraStatusCategory } from "@/types/jira";
 import { driftFor } from "./drift";
-import { keysForBranch, keysForPr, type KeySource } from "./keys";
+import type { KeySource } from "./keys";
 
 export interface LinkedPr {
   identity: PrIdentity;
@@ -15,6 +15,9 @@ export interface LinkedPr {
   url: string;
   is_draft: boolean;
   source: KeySource;
+  /// Still in the user's open list. `false`: it was open earlier and has
+  /// left -- merged or closed, unknown which.
+  current: boolean;
 }
 
 export interface LinkedWorktree {
@@ -26,37 +29,6 @@ export interface LinkedWorktree {
 export interface Links {
   prs: LinkedPr[];
   worktrees: LinkedWorktree[];
-}
-
-type PrLike = PrIdentity & { title: string; url: string; is_draft: boolean; head_ref: string };
-
-/// Every key named by these pull requests and worktrees, with what names it.
-export function linkIndex(
-  prs: readonly PrLike[],
-  worktrees: readonly LinkedWorktree[],
-  projects: ReadonlySet<string>,
-): Map<string, Links> {
-  const index = new Map<string, Links>();
-  const at = (key: string) => {
-    let links = index.get(key);
-    if (!links) index.set(key, (links = { prs: [], worktrees: [] }));
-    return links;
-  };
-  for (const pr of prs) {
-    for (const f of keysForPr(pr, projects)) {
-      at(f.key).prs.push({
-        identity: { source: pr.source, repo: pr.repo, number: pr.number },
-        title: pr.title,
-        url: pr.url,
-        is_draft: pr.is_draft,
-        source: f.source,
-      });
-    }
-  }
-  for (const wt of worktrees) {
-    for (const f of keysForBranch(wt.branch, projects)) at(f.key).worktrees.push(wt);
-  }
-  return index;
 }
 
 /// A lookup into the per-key cache. `undefined` is "not answered yet".
@@ -181,9 +153,12 @@ export function rollUp(issues: readonly string[], lookup: Lookup): Record<JiraSt
 
 /// Whether an issue disagrees with any open, non-draft pull request that
 /// names it (#2042). An issue not yet answered needs nothing: unknown is
-/// not a disagreement.
+/// not a disagreement. A pull request no longer in the open list is not
+/// open, so it decides nothing here.
 export function needsAttention(key: string, links: ReadonlyMap<string, Links>, lookup: Lookup): boolean {
   const issue = found(lookup(key));
   if (!issue) return false;
-  return (links.get(key)?.prs ?? []).some((pr) => driftFor(issue, { draft: pr.is_draft, source: pr.source }) !== null);
+  return (links.get(key)?.prs ?? []).some(
+    (pr) => pr.current && driftFor(issue, { draft: pr.is_draft, source: pr.source }) !== null,
+  );
 }

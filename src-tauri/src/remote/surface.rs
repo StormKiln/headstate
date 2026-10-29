@@ -165,6 +165,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_projects", Class::Read),
     ("jira_issues", Class::Read),
     ("jira_assigned", Class::Read),
+    ("jira_links", Class::Read),
     ("disk_inventory_status", Class::Read),
     ("disk_inventory_history", Class::Read),
     ("disk_inventory_settings", Class::Read),
@@ -1147,6 +1148,7 @@ async fn call(
         "jira_projects" => res(crate::jira::commands::jira_projects(app.clone()).await),
         "jira_issues" => res(crate::jira::commands::jira_issues(app.clone(), a.get("keys")?).await),
         "jira_assigned" => res(crate::jira::commands::jira_assigned(app.clone()).await),
+        "jira_links" => res(crate::jira::commands::jira_links(app.clone()).await),
         "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
         "disk_inventory_history" => {
             res(crate::disk_inventory::commands::disk_inventory_history(app.clone()).await)

@@ -1400,6 +1400,25 @@ const MIGRATIONS: &[&str] = &[
         parent_key     TEXT,
         parent_read_at TEXT
      );",
+    // Where each Jira key is named (#2035, #2041): pull requests, merged
+    // pull requests, worktrees and local branches, read from what this
+    // database already holds or noted as each is scanned.
+    //
+    // Keys are CANDIDATES; the project dictionary is applied on read, so
+    // turning a project off never needs this rebuilt. `current` is 0 for a
+    // pull request seen open earlier and absent from the latest list --
+    // merged or closed, it does not say which -- kept so a ticket can still
+    // find it without asking GitHub.
+    "CREATE TABLE jira_link (
+        key      TEXT NOT NULL,
+        kind     TEXT NOT NULL,
+        ref      TEXT NOT NULL,
+        current  INTEGER NOT NULL,
+        payload  TEXT NOT NULL,
+        seen_at  TEXT NOT NULL,
+        PRIMARY KEY (kind, ref, key)
+     );
+     CREATE INDEX jira_link_by_key ON jira_link (key);",
 
 ];
 

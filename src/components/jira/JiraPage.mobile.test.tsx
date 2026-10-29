@@ -2,18 +2,18 @@ import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, ProjectList } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
-const projects = vi.hoisted(() => vi.fn<() => Promise<ProjectList>>());
+const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
 const assigned = vi.hoisted(() => vi.fn<() => Promise<IssueBatch>>());
 const worktrees = vi.hoisted(() => ({ data: [] as unknown[], isPending: false }));
 vi.mock("@/api/tauri", () => ({
   jiraConnection: connection,
-  jiraProjects: projects,
+  jiraLinks: links,
   jiraIssues: issues,
   jiraAssigned: assigned,
 }));
@@ -22,7 +22,6 @@ vi.mock("@/lib/useIsMobile", () => ({ useIsMobile: () => true }));
 
 import { JiraProvider } from "./JiraContext";
 import { JiraPage } from "./JiraPage";
-import type { BoardPr } from "./useJiraBoard";
 
 const prefs: UiPrefs = {
   hidden_views: [],
@@ -59,14 +58,28 @@ const batch = (found: JiraIssue[], over: Partial<IssueBatch> = {}): IssueBatch =
   ...over,
 });
 
-const pr: BoardPr = {
-  source: { provider: "github", host: "github.com" },
-  repo: "octocat/hello-world",
-  number: 7,
-  title: "ABC-1: fix login",
-  url: "https://github.com/octocat/hello-world/pull/7",
-  is_draft: false,
-  head_ref: "abc-1-fix-login",
+/// As the desktop's index reports it: pull request #7 names ABC-1.
+const INDEX: LinkIndex = {
+  links: [
+    {
+      key: "ABC-1",
+      found_in: "title",
+      current: true,
+      target: {
+        kind: "pr",
+        source: { provider: "github", host: "github.com" },
+        role: "authored",
+        repo: "octocat/hello-world",
+        number: 7,
+        title: "ABC-1: fix login",
+        url: "https://github.com/octocat/hello-world/pull/7",
+        head_ref: "abc-1-fix-login",
+        is_draft: false,
+      },
+    },
+  ],
+  projects: ["ABC"],
+  error: null,
 };
 
 const EPIC = issue("ABC-2", { summary: "Login epic", issue_type: { name: "Epic", hierarchy_level: 1 } });
@@ -75,7 +88,7 @@ const TODO = issue("ABC-3", { summary: "Not started", status: { name: "To Do", c
 
 beforeEach(() => {
   connection.mockReset().mockResolvedValue({ state: "logged_in", site: "jira.example.internal", account: null });
-  projects.mockReset().mockResolvedValue({ projects: [{ key: "ABC", name: "Alpha" }], error: null });
+  links.mockReset().mockResolvedValue(INDEX);
   // As the desktop answers: asked and not returned is `missing`.
   issues.mockReset().mockImplementation((keys) => {
     const found = [EPIC, STORY].filter((i) => keys.includes(i.key));
@@ -99,7 +112,7 @@ const mount = (ui: React.ReactNode) => renderWithQuery(<JiraProvider prefs={pref
 /// an issue is picked, and offers a way back (#2047).
 describe("My Jira issues on a phone", () => {
   it("is the list until an issue is picked, then the issue with a way back", async () => {
-    mount(<JiraPage prs={[pr]} />);
+    mount(<JiraPage />);
     fireEvent.click(await screen.findByRole("button", { name: /ABC-1 Summary of ABC-1/ }));
     expect(await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "All issues" }));

@@ -1,5 +1,7 @@
 /// Jira, as `src-tauri/src/jira/model.rs` reports it (epic #2031).
 
+import type { Source } from "./identity";
+
 /// Jira's own grouping of every status in every workflow. `unknown` is a
 /// real state and never a stand-in for `new`: a category that did not come
 /// back must not read as "To Do".
@@ -60,3 +62,42 @@ export type JiraConnection =
   | { state: "not_logged_in"; detail: string }
   | { state: "logged_in"; site: string | null; account: string | null }
   | { state: "cannot_tell"; reason: string };
+
+/// Where a key was found in a pull request or branch.
+export type FoundIn = "title" | "branch";
+
+export type PrRole = "authored" | "reviewing";
+
+/// What names a key, from the desktop's index (`jira/index.rs`).
+export type LinkTarget =
+  | {
+      kind: "pr";
+      source: Source;
+      role: PrRole;
+      repo: string;
+      number: number;
+      title: string;
+      url: string;
+      head_ref: string;
+      is_draft: boolean;
+    }
+  | { kind: "worktree"; repo: string; path: string; branch: string }
+  | { kind: "branch"; repo_path: string; branch: string };
+
+export interface JiraLink {
+  key: string;
+  found_in: FoundIn;
+  /// In the latest read of where it lives. A pull request that is not
+  /// current was open earlier and has left its list: merged or closed,
+  /// unknown which.
+  current: boolean;
+  target: LinkTarget;
+}
+
+/// Every link whose key is in the user's projects, less exclusions.
+export interface LinkIndex {
+  links: JiraLink[];
+  projects: string[];
+  /// Why the project list could not be read; `links` is then empty.
+  error: string | null;
+}

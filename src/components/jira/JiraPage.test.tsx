@@ -2,19 +2,19 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, ProjectList } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
-const projects = vi.hoisted(() => vi.fn<() => Promise<ProjectList>>());
+const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
 const assigned = vi.hoisted(() => vi.fn<() => Promise<IssueBatch>>());
 const worktrees = vi.hoisted(() => ({ data: [] as unknown[], isPending: false }));
 vi.mock("@/api/tauri", () => ({
   jiraConnection: connection,
-  jiraProjects: projects,
+  jiraLinks: links,
   jiraIssues: issues,
   jiraAssigned: assigned,
 }));
@@ -24,7 +24,6 @@ vi.mock("@/lib/useIsMobile", () => ({ useIsMobile: () => false }));
 import { JiraProvider } from "./JiraContext";
 import { JiraBrowser } from "./JiraBrowser";
 import { JiraPage } from "./JiraPage";
-import type { BoardPr } from "./useJiraBoard";
 
 const prefs: UiPrefs = {
   hidden_views: [],
@@ -61,15 +60,25 @@ const batch = (found: JiraIssue[], over: Partial<IssueBatch> = {}): IssueBatch =
   ...over,
 });
 
-const pr: BoardPr = {
-  source: { provider: "github", host: "github.com" },
-  repo: "octocat/hello-world",
-  number: 7,
-  title: "ABC-1: fix login",
-  url: "https://github.com/octocat/hello-world/pull/7",
-  is_draft: false,
-  head_ref: "abc-1-fix-login",
-};
+/// A link as the desktop's index reports it: pull request #7 names ABC-1
+/// in its title.
+const prLink = (key = "ABC-1", number = 7): JiraLink => ({
+  key,
+  found_in: "title",
+  current: true,
+  target: {
+    kind: "pr",
+    source: { provider: "github", host: "github.com" },
+    role: "authored",
+    repo: "octocat/hello-world",
+    number,
+    title: `${key}: fix login`,
+    url: `https://github.com/octocat/hello-world/pull/${number}`,
+    head_ref: "abc-1-fix-login",
+    is_draft: false,
+  },
+});
+const index = (found: JiraLink[]): LinkIndex => ({ links: found, projects: ["ABC"], error: null });
 
 const EPIC = issue("ABC-2", { summary: "Login epic", issue_type: { name: "Epic", hierarchy_level: 1 } });
 const STORY = issue("ABC-1", { parent_key: "ABC-2" });
@@ -77,7 +86,7 @@ const TODO = issue("ABC-3", { summary: "Not started", status: { name: "To Do", c
 
 beforeEach(() => {
   connection.mockReset().mockResolvedValue({ state: "logged_in", site: "jira.example.internal", account: null });
-  projects.mockReset().mockResolvedValue({ projects: [{ key: "ABC", name: "Alpha" }], error: null });
+  links.mockReset().mockResolvedValue(index([prLink()]));
   // As the desktop answers: asked and not returned is `missing`.
   issues.mockReset().mockImplementation((keys) => {
     const found = [EPIC, STORY].filter((i) => keys.includes(i.key));
@@ -99,7 +108,7 @@ const mount = (ui: React.ReactNode) => renderWithQuery(<JiraProvider prefs={pref
 
 describe("My Jira issues", () => {
   it("groups a linked story under its epic, beside assigned work with no pull request", async () => {
-    mount(<JiraBrowser prs={[pr]} />);
+    mount(<JiraBrowser />);
     const epic = await screen.findByRole("button", { name: /ABC-2 Login epic/ });
     expect(epic).toBeTruthy();
     expect(await screen.findByRole("button", { name: /ABC-1 Summary of ABC-1/ })).toBeTruthy();
@@ -109,7 +118,7 @@ describe("My Jira issues", () => {
   });
 
   it("filters to issues with pull requests, and to assigned ones", async () => {
-    mount(<JiraBrowser prs={[pr]} />);
+    mount(<JiraBrowser />);
     await screen.findByRole("button", { name: /ABC-3 Not started/ });
     await screen.findByRole("button", { name: /ABC-1 Summary/ });
     fireEvent.click(screen.getByRole("button", { name: "With PRs" }));
@@ -123,7 +132,7 @@ describe("My Jira issues", () => {
 
   it("shows a selected issue's pull requests and opens one in Headstate", async () => {
     useJiraView.setState({ selected: "ABC-1" });
-    mount(<JiraPage prs={[pr]} />);
+    mount(<JiraPage />);
     expect(await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ })).toBeTruthy();
     const prs = screen.getByRole("region", { name: "Pull requests" });
     expect(within(prs).getByText(/from the title/)).toBeTruthy();
@@ -135,14 +144,14 @@ describe("My Jira issues", () => {
 
   it("says plainly when nothing of yours names the selected issue", async () => {
     useJiraView.setState({ selected: "ABC-3" });
-    mount(<JiraPage prs={[pr]} />);
-    expect(await screen.findByText("None of your open pull requests or worktrees names ABC-3.")).toBeTruthy();
+    mount(<JiraPage />);
+    expect(await screen.findByText("None of your pull requests or worktrees names ABC-3.")).toBeTruthy();
     await quiet();
   });
 
   it("explains, rather than lists nothing, when Jira is not connected", async () => {
     connection.mockResolvedValue({ state: "not_logged_in", detail: "" });
-    mount(<JiraBrowser prs={[pr]} />);
+    mount(<JiraBrowser />);
     expect(await screen.findByText(/Jira is not connected/)).toBeTruthy();
     expect(issues).not.toHaveBeenCalled();
     await quiet();
@@ -150,7 +159,8 @@ describe("My Jira issues", () => {
 
   it("explains how linking works when no key is found and nothing is assigned", async () => {
     assigned.mockResolvedValue(batch([]));
-    mount(<JiraBrowser prs={[{ ...pr, title: "Fix login", head_ref: "fix-login" }]} />);
+    links.mockResolvedValue(index([]));
+    mount(<JiraBrowser />);
     expect(await screen.findByText(/none of your open pull requests or worktrees name one/)).toBeTruthy();
     await quiet();
   });
@@ -158,11 +168,25 @@ describe("My Jira issues", () => {
   it("lists only issues that disagree with an open pull request under Needs attention", async () => {
     const stale = issue("ABC-1", { parent_key: "ABC-2", status: { name: "To Do", category: "new" } });
     issues.mockImplementation((keys) => Promise.resolve(batch([EPIC, stale].filter((i) => keys.includes(i.key)))));
-    mount(<JiraBrowser prs={[pr, { ...pr, number: 8, title: "No ticket", head_ref: "chore" }]} />);
+    mount(<JiraBrowser />);
     await screen.findByRole("button", { name: /ABC-1 Summary/ });
     fireEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(await screen.findByRole("button", { name: /ABC-1 Summary/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /ABC-3/ })).toBeNull();
+    await quiet();
+  });
+
+  /// Kept by the desktop after it leaves the open list (#2041): listed,
+  /// said to be no longer open, and never a drift warning.
+  it("lists a pull request that has left the open list as no longer open", async () => {
+    const stale = issue("ABC-1", { status: { name: "To Do", category: "new" } });
+    issues.mockImplementation((keys) => Promise.resolve(batch([stale].filter((i) => keys.includes(i.key)))));
+    links.mockResolvedValue(index([{ ...prLink(), current: false }]));
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    const prs = await screen.findByRole("region", { name: "Pull requests" });
+    expect(within(prs).getByText(/no longer open/)).toBeTruthy();
+    expect(within(prs).queryByRole("status")).toBeNull();
     await quiet();
   });
 
@@ -175,7 +199,7 @@ describe("My Jira issues", () => {
 
     it("opens the one pull request that names the key", async () => {
       useFilters.getState().setView("jira");
-      mount(<JiraBrowser prs={[pr]} />);
+      mount(<JiraBrowser />);
       await type("abc-1");
       expect(useFilters.getState().view).toBe("my-prs");
       expect(useFilters.getState().selectedPr).toMatchObject({ number: 7 });
@@ -187,14 +211,14 @@ describe("My Jira issues", () => {
     it("opens an issue no pull request names, and resolves it", async () => {
       mount(
         <>
-          <JiraBrowser prs={[pr]} />
-          <JiraPage prs={[pr]} />
+          <JiraBrowser />
+          <JiraPage />
         </>,
       );
       await type("https://jira.example.internal/browse/ABC-9");
       expect(useJiraView.getState().selected).toBe("ABC-9");
       expect(await screen.findByRole("heading", { name: /ABC-9 Cannot view this issue/ })).toBeTruthy();
-      expect(screen.getByText("None of your open pull requests or worktrees names ABC-9.")).toBeTruthy();
+      expect(screen.getByText("None of your pull requests or worktrees names ABC-9.")).toBeTruthy();
       await quiet();
     });
 
@@ -202,7 +226,7 @@ describe("My Jira issues", () => {
       ["XYZ-1", "XYZ is not one of your Jira projects."],
       ["hello", "Type a Jira key such as ABC-1, or paste a link to an issue."],
     ])("explains %j instead of going nowhere", async (text, message) => {
-      mount(<JiraBrowser prs={[pr]} />);
+      mount(<JiraBrowser />);
       await type(text);
       expect(screen.getByText(message)).toBeTruthy();
       expect(useJiraView.getState().selected).toBeNull();

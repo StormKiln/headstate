@@ -8,14 +8,14 @@ import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
 import { openInHeadstate } from "./openInHeadstate";
 import { useJiraIssue } from "@/api/jira";
-import { useJiraBoard, type BoardPr } from "./useJiraBoard";
+import { useJiraBoard } from "./useJiraBoard";
 
 /// My Jira issues' main panel (#2038): the selected issue and every pull
 /// request, worktree and branch of yours that names it.
-export function JiraPage({ prs }: { prs: readonly BoardPr[] }) {
+export function JiraPage() {
   const isMobile = useIsMobile();
   const { selected, select } = useJiraView();
-  const board = useJiraBoard(prs);
+  const board = useJiraBoard();
   // The selected issue is asked for directly: one reached by typing its key
   // may not be in the tree, and must not read "Loading…" forever.
   const own = useJiraIssue(selected ?? "", selected !== null && board.jira !== null);
@@ -25,7 +25,7 @@ export function JiraPage({ prs }: { prs: readonly BoardPr[] }) {
   if (selected === null) {
     // On a phone the sidebar is a sheet, so the page is the list.
     return isMobile ? (
-      <JiraBrowser prs={prs} />
+      <JiraBrowser />
     ) : (
       <p className="text-sm text-[#8b949e]">Select an issue to see its pull requests and worktrees.</p>
     );
@@ -105,7 +105,7 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
   const prs = links?.prs ?? [];
   const worktrees = links?.worktrees ?? [];
   if (prs.length === 0 && worktrees.length === 0) {
-    return <p className="text-sm text-[#8b949e]">None of your open pull requests or worktrees names {k}.</p>;
+    return <p className="text-sm text-[#8b949e]">None of your pull requests or worktrees names {k}.</p>;
   }
   return (
     <div className="flex flex-col gap-3">
@@ -115,7 +115,9 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
           <ul className="flex flex-col gap-1">
             {prs.map((pr) => {
               const gitlab = pr.identity.source?.provider === "gitlab";
-              const drift = issue ? driftFor(issue, { draft: pr.is_draft, source: pr.source }) : null;
+              // A pull request that has left the open list is not open:
+              // what it says about the ticket waits on #2041.
+              const drift = issue && pr.current ? driftFor(issue, { draft: pr.is_draft, source: pr.source }) : null;
               return (
                 <li
                   key={`${pr.identity.repo}#${pr.identity.number}`}
@@ -126,7 +128,8 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
                     {pr.identity.repo}
                     {gitlab ? "!" : "#"}
                     {pr.identity.number}
-                    {pr.is_draft ? " · draft" : ""} · from the {pr.source === "title" ? "title" : "branch"}
+                    {pr.current ? (pr.is_draft ? " · draft" : "") : " · no longer open"} · from the{" "}
+                    {pr.source === "title" ? "title" : "branch"}
                   </span>
                   <button
                     type="button"

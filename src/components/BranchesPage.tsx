@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { TicketChips } from "./jira/TicketChips";
+import { FollowJiraLinks } from "./jira/FollowJiraLinks";
 import { Questionnaire } from "@shadcn/react/questionnaire";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -26,7 +27,7 @@ function ago(iso: string): string {
 
 export function BranchesPage() {
   const { repo } = useActiveFilters();
-  const { data, isLoading, error } = useBranches(repo ?? undefined);
+  const { data, isLoading, error, dataUpdatedAt } = useBranches(repo ?? undefined);
   // The scan in flight, for the COLD visit. The query is still the
   // authority — `data` replaces these rows the moment it resolves, and
   // nothing streamed ever reaches the delete path.
@@ -162,6 +163,7 @@ export function BranchesPage() {
 
   return (
     <div className="space-y-3 text-sm">
+      <FollowJiraLinks updatedAt={dataUpdatedAt} />
       <p className="text-[#8b949e]">
         {branches.length} branch{branches.length === 1 ? "" : "es"} · {deletable.length} merged
       </p>
@@ -348,7 +350,7 @@ export function BranchesPage() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="truncate text-[#e6edf3]">{b.name}</span>
-                  <TicketChips branch={b.name} />
+                  {repo ? <TicketChips row={{ repoPath: repo, branch: b.name }} /> : null}
                   {/* `gone` is styled apart from the other three
                       (#1139). It used to render as "local", which is the
                       OPPOSITE claim: local means the work exists only on

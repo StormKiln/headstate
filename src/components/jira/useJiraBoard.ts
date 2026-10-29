@@ -1,33 +1,29 @@
 import { useMemo } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
-import { issueQuery, useJiraAssigned, type IssueState } from "@/api/jira";
+import { issueQuery, useFollowJiraLinks, useJiraAssigned, type IssueState } from "@/api/jira";
 import { useWorktrees } from "@/api/hooks";
-import { ancestorKeys, linkIndex, type LinkedWorktree, type Lookup } from "@/lib/jira/tree";
-import type { PrIdentity } from "@/types/identity";
+import { ancestorKeys, type Links, type Lookup } from "@/lib/jira/tree";
 import type { JiraIssue } from "@/types/jira";
 import { useJira } from "./jiraState";
 
-export type BoardPr = PrIdentity & { title: string; url: string; is_draft: boolean; head_ref: string };
-
 const EMPTY: never[] = [];
+const EMPTY_LINKS: ReadonlyMap<string, Links> = new Map();
 
 /// Everything My Jira issues renders, for its sidebar and its main panel
 /// alike (#2038). Both call this; the per-key cache makes the second call
 /// free.
-export function useJiraBoard(prs: readonly BoardPr[]) {
+///
+/// What names each key comes from the desktop's index. The worktree scan
+/// is still started here: the desktop indexes worktrees as it scans them,
+/// so this page keeps that index current.
+export function useJiraBoard() {
   const jira = useJira();
   const on = jira !== null;
   const worktrees = useWorktrees(on);
+  useFollowJiraLinks(on, worktrees.dataUpdatedAt);
   const assigned = useJiraAssigned(on);
 
-  const wts = useMemo<LinkedWorktree[]>(
-    () =>
-      (worktrees.data ?? []).flatMap((r) =>
-        r.worktrees.filter((w) => w.branch).map((w) => ({ repo: r.name, path: w.path, branch: w.branch })),
-      ),
-    [worktrees.data],
-  );
-  const links = useMemo(() => (jira ? linkIndex(prs, wts, jira.projects) : new Map()), [jira, prs, wts]);
+  const links: ReadonlyMap<string, Links> = jira?.links.byKey ?? EMPTY_LINKS;
   const linked = useMemo(() => [...links.keys()], [links]);
   const assignedIssues = assigned.data?.issues ?? EMPTY;
   const assignedKeys = useMemo(() => assignedIssues.map((i: JiraIssue) => i.key), [assignedIssues]);
