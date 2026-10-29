@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- My Jira issues on a phone (#2047). NOT part of the app: built only by
+     `vite.harness-jira.config.ts` with VITE_TARGET=mobile, for
+     `make jira-mobile-screenshots`. It mounts the real `App` with the
+     companion's IPC mocked from synthetic data. Same `<html>`/viewport as
+     `index.html`, without the splash. -->
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Jira on a phone harness</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/harness/jiraMobile.tsx"></script>
+  </body>
+</html>
