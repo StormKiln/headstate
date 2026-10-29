@@ -17,6 +17,8 @@ const pr = (key: string, found_in: "title" | "branch", over: Partial<Extract<Jir
     url: "https://github.com/octocat/hello-world/pull/7",
     head_ref: "xy-2-follow-up",
     is_draft: false,
+    state: null,
+    author: null,
     ...over,
   },
 });

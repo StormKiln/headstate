@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JiraIssue, JiraStatusCategory } from "@/types/jira";
-import { driftFor } from "./drift";
+import { driftFor, mergedButNotDone } from "./drift";
 
 const issue = (category: JiraStatusCategory, name: string): JiraIssue => ({
   key: "ABC-1",
@@ -35,5 +35,24 @@ describe("driftFor", () => {
   it("never flags a draft", () => {
     expect(driftFor(issue("new", "To Do"), { draft: true, source: "title" })).toBeNull();
     expect(driftFor(issue("done", "Done"), { draft: true, source: "title" })).toBeNull();
+  });
+});
+
+describe("mergedButNotDone", () => {
+  it("flags a ticket left behind by its merged pull request", () => {
+    expect(mergedButNotDone(issue("in_progress", "In Review"), { merged: 1, open: 0 })?.message).toBe(
+      "A pull request for ABC-1 has merged, but the ticket is still In Review.",
+    );
+  });
+
+  it.each<[JiraStatusCategory, { merged: number; open: number }]>([
+    ["done", { merged: 1, open: 0 }],
+    // Absent is not zero.
+    ["unknown", { merged: 1, open: 0 }],
+    // Work continues in another pull request.
+    ["in_progress", { merged: 1, open: 1 }],
+    ["new", { merged: 0, open: 0 }],
+  ])("does not flag %s with %j", (category, known) => {
+    expect(mergedButNotDone(issue(category, "x"), known)).toBeNull();
   });
 });

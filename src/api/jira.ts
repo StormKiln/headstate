@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { jiraAssigned, jiraConnection, jiraIssues, jiraLinks, jiraProjects } from "./tauri";
+import { jiraAssigned, jiraConnection, jiraFind, jiraIssues, jiraLinks, jiraProjects } from "./tauri";
 import type { JiraIssue } from "../types/jira";
 
 /// --- Jira (epic #2031) --------------------------------------------
@@ -151,4 +151,16 @@ export function useFollowJiraLinks(enabled: boolean, updatedAt: number) {
   useEffect(() => {
     if (enabled && updatedAt > 0) void qc.invalidateQueries({ queryKey: ["jira-links"] });
   }, [qc, enabled, updatedAt]);
+}
+
+/// Every pull request that names `key`, for the issue panel (#2041). The
+/// desktop answers from its database and searches GitHub only when that
+/// holds no pull request for the key, or `more` asks for a search.
+export function useJiraFind(key: string, enabled: boolean, more: boolean) {
+  return useQuery({
+    queryKey: ["jira-find", key, more],
+    queryFn: () => jiraFind(key, more),
+    enabled: enabled && key !== "",
+    staleTime: 60_000,
+  });
 }

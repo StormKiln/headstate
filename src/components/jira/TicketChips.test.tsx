@@ -76,6 +76,8 @@ const prLink = (key: string, found_in: "title" | "branch" = "title"): JiraLink =
     url: URL,
     head_ref: "b",
     is_draft: false,
+    state: null,
+    author: null,
   },
 });
 const index = (found: JiraLink[], over: Partial<LinkIndex> = {}): LinkIndex => ({

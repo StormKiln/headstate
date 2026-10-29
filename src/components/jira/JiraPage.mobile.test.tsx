@@ -2,18 +2,20 @@ import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, LinkIndex } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, KeyLookup, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
+const find = vi.hoisted(() => vi.fn<(key: string, more: boolean) => Promise<KeyLookup>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
 const assigned = vi.hoisted(() => vi.fn<() => Promise<IssueBatch>>());
 const worktrees = vi.hoisted(() => ({ data: [] as unknown[], isPending: false }));
 vi.mock("@/api/tauri", () => ({
   jiraConnection: connection,
   jiraLinks: links,
+  jiraFind: find,
   jiraIssues: issues,
   jiraAssigned: assigned,
 }));
@@ -75,6 +77,8 @@ const INDEX: LinkIndex = {
         url: "https://github.com/octocat/hello-world/pull/7",
         head_ref: "abc-1-fix-login",
         is_draft: false,
+        state: null,
+        author: null,
       },
     },
   ],
@@ -95,6 +99,7 @@ beforeEach(() => {
     return Promise.resolve(batch(found, { missing: keys.filter((k) => !found.some((i) => i.key === k)) }));
   });
   assigned.mockReset().mockResolvedValue(batch([TODO]));
+  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" } }));
   worktrees.data = [];
   useJiraView.setState({ selected: null, filter: "all" });
 });

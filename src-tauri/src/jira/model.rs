@@ -119,6 +119,19 @@ pub enum JiraConnection {
 pub enum PrRole {
     Authored,
     Reviewing,
+    /// Found by searching GitHub for the key (#2041): not in the user's
+    /// lists, and perhaps not theirs at all.
+    Searched,
+}
+
+/// A pull request's state, where it is known. Pull requests from the
+/// user's lists are open by being listed and carry none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
 }
 
 /// What names a key.
@@ -135,6 +148,11 @@ pub enum LinkTarget {
         url: String,
         head_ref: String,
         is_draft: bool,
+        /// Known only for a searched pull request.
+        #[serde(default)]
+        state: Option<PrState>,
+        #[serde(default)]
+        author: Option<String>,
     },
     Worktree {
         repo: String,

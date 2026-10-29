@@ -23,6 +23,12 @@ use std::collections::HashSet;
 
 fn kind(t: &LinkTarget) -> &'static str {
     match t {
+        // Apart from "pr", so a search never overwrites the row a list
+        // wrote for the same pull request, or the reverse.
+        LinkTarget::Pr {
+            role: PrRole::Searched,
+            ..
+        } => "searched",
         LinkTarget::Pr { .. } => "pr",
         LinkTarget::Worktree { .. } => "worktree",
         LinkTarget::Branch { .. } => "branch",
@@ -53,6 +59,11 @@ fn put(tx: &Transaction, link: &JiraLink, now: &str) -> Result<(), StoreError> {
         ],
     )?;
     Ok(())
+}
+
+/// Store `links` as current, in the caller's transaction.
+pub fn put_all(tx: &Transaction, links: &[JiraLink], now: &str) -> Result<(), StoreError> {
+    links.iter().try_for_each(|l| put(tx, l, now))
 }
 
 /// Links for one target, one per key it names.
@@ -130,6 +141,8 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
                             url: pr.url,
                             head_ref: pr.head_ref,
                             is_draft: pr.is_draft,
+                            state: None,
+                            author: Some(pr.author),
                         },
                     )
                 })
@@ -148,6 +161,8 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
                             url: mr.url,
                             head_ref: mr.head_ref,
                             is_draft: mr.is_draft,
+                            state: None,
+                            author: Some(mr.author),
                         },
                     )
                 })
@@ -160,6 +175,7 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
         let role = match role {
             PrRole::Authored => "authored",
             PrRole::Reviewing => "reviewing",
+            PrRole::Searched => "searched",
         };
         let provider = serde_json::to_value(source.provider)?;
         tx.execute(

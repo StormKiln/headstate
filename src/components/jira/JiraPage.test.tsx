@@ -2,19 +2,21 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, KeyLookup, LinkIndex } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
+const find = vi.hoisted(() => vi.fn<(key: string, more: boolean) => Promise<KeyLookup>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
 const assigned = vi.hoisted(() => vi.fn<() => Promise<IssueBatch>>());
 const worktrees = vi.hoisted(() => ({ data: [] as unknown[], isPending: false }));
 vi.mock("@/api/tauri", () => ({
   jiraConnection: connection,
   jiraLinks: links,
+  jiraFind: find,
   jiraIssues: issues,
   jiraAssigned: assigned,
 }));
@@ -76,6 +78,8 @@ const prLink = (key = "ABC-1", number = 7): JiraLink => ({
     url: `https://github.com/octocat/hello-world/pull/${number}`,
     head_ref: "abc-1-fix-login",
     is_draft: false,
+    state: null,
+    author: null,
   },
 });
 const index = (found: JiraLink[]): LinkIndex => ({ links: found, projects: ["ABC"], error: null });
@@ -93,6 +97,7 @@ beforeEach(() => {
     return Promise.resolve(batch(found, { missing: keys.filter((k) => !found.some((i) => i.key === k)) }));
   });
   assigned.mockReset().mockResolvedValue(batch([TODO]));
+  find.mockReset().mockImplementation((key) => Promise.resolve({ key, links: [], search: { state: "not_asked", reason: "already known from your pull requests" } }));
   worktrees.data = [];
   useJiraView.setState({ selected: null, filter: "all" });
 });
@@ -188,6 +193,38 @@ describe("My Jira issues", () => {
     expect(within(prs).getByText(/no longer open/)).toBeTruthy();
     expect(within(prs).queryByRole("status")).toBeNull();
     await quiet();
+  });
+
+  /// #2041: a teammate's merged pull request, found by the desktop, and
+  /// the ticket it left behind (#2042 R2).
+  it("lists a merged pull request found on GitHub, and says the ticket did not move", async () => {
+    links.mockResolvedValue(index([]));
+    find.mockResolvedValue({
+      key: "ABC-1",
+      links: [
+        {
+          ...prLink(),
+          current: false,
+          target: { ...(prLink().target as Extract<JiraLink["target"], { kind: "pr" }>), role: "searched", number: 9, url: "https://github.com/octocat/hello-world/pull/9", state: "merged", author: "dana" },
+        },
+      ],
+      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, truncated: false },
+    });
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    const region = await screen.findByRole("region", { name: "Found on GitHub" });
+    expect(await within(region).findByText(/octocat\/hello-world#9 · merged · dana/)).toBeTruthy();
+    expect(await within(region).findByText("A pull request for ABC-1 has merged, but the ticket is still In Progress.")).toBeTruthy();
+    await quiet();
+  });
+
+  it("searches GitHub only when asked, once the database already knew", async () => {
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Search GitHub" }));
+    await quiet();
+    expect(find).toHaveBeenCalledWith("ABC-1", true);
+    expect(find).toHaveBeenCalledWith("ABC-1", false);
   });
 
   describe("Go to ticket", () => {

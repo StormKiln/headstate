@@ -20,6 +20,7 @@ pub mod cli;
 pub mod commands;
 pub mod index;
 pub mod keys;
+pub mod lookup;
 pub mod model;
 pub mod parse;
 pub mod read;

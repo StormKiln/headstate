@@ -1419,6 +1419,15 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (kind, ref, key)
      );
      CREATE INDEX jira_link_by_key ON jira_link (key);",
+    // When each Jira key was last searched for on GitHub (#2041), and what
+    // GitHub counted, so a repeat look within the cooldown is answered
+    // from `jira_link` and still says how complete that answer was.
+    "CREATE TABLE jira_search (
+        key         TEXT PRIMARY KEY,
+        searched_at TEXT NOT NULL,
+        total       INTEGER NOT NULL,
+        read        INTEGER NOT NULL
+     );",
 
 ];
 

@@ -1961,6 +1961,27 @@ impl GitHubClient {
         Ok(v)
     }
 
+    /// One search for pull requests naming a Jira key (#2041), raw.
+    ///
+    /// The query string, the reserve check and the rule for what the answer
+    /// may mean live in `jira::lookup`, the only caller. Metered into
+    /// `budget` before anything is read out of the answer.
+    pub async fn jira_title_search(
+        &self,
+        q: &str,
+        first: usize,
+        budget: &crate::github::budget::Budget,
+    ) -> Result<serde_json::Value, ClientError> {
+        let v = self
+            .graphql_partial_ok(&json!({
+                "query": super::query::JIRA_TITLE_SEARCH,
+                "variables": { "q": q, "first": first },
+            }))
+            .await?;
+        budget.record(&v);
+        Ok(v)
+    }
+
     /// The authored search as one bounded read, outside the scan.
     ///
     /// Not a production path: the poll loop and the refresh command read
@@ -5864,6 +5885,13 @@ mod tests {
             (
                 "merged_heads",
                 "`worktrees::github::map_merged_heads` reads a refused alias as unanswered",
+            ),
+            // One search node. `jira::lookup::map_search` refuses a reply
+            // with no `search` object rather than reading it as "no pull
+            // requests", and the UI says "searched" only for an answer.
+            (
+                "jira_title_search",
+                "`jira::lookup::map_search` refuses a reply without a search object",
             ),
             // The machinery itself, not a caller of it.
             ("graphql_partial_ok", "the helper itself"),
