@@ -9,6 +9,7 @@ const issue = (category: JiraStatusCategory, name: string): JiraIssue => ({
   status: { name, category },
   assignee: null,
   parent_key: null,
+  parent_checked: true,
   project_key: "ABC",
   url: null,
   updated: null,

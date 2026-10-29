@@ -42,10 +42,18 @@ pub struct JiraIssue {
     pub status: JiraStatus,
     pub assignee: Option<String>,
     /// The parent's key: an epic for a story, an initiative for an epic.
+    /// Meaningful only when `parent_checked`.
     pub parent_key: Option<String>,
+    /// Whether the parent has been read. `acli`'s search cannot return
+    /// parents, so they are read one `workitem view` at a time and may not
+    /// have been yet: `parent_key: None` with this false is "not known",
+    /// never "has no epic".
+    #[serde(default)]
+    pub parent_checked: bool,
     pub project_key: String,
-    /// The browse URL, derived from the API `self` link. `None` when the
-    /// response carried no link to derive it from.
+    /// The browse URL on the signed-in site. `None` when the site is not
+    /// known: the API's `self` link names an internal Atlassian host, not
+    /// the site, so it cannot be used (#2032).
     pub url: Option<String>,
     pub updated: Option<String>,
 }
@@ -72,7 +80,7 @@ pub struct ProjectList {
 /// `issues` came back, `missing` were asked and Jira did not return them
 /// (not found, or hidden from this user -- Jira does not say which), and
 /// `unasked` were never sent because the call budget ran out first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueBatch {
     pub issues: Vec<JiraIssue>,
     pub missing: Vec<String>,

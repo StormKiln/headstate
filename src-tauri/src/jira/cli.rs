@@ -24,8 +24,11 @@ const BATCH: usize = 50;
 /// rest marked `unasked`, never a request that runs for minutes.
 const MAX_CALLS: usize = 12;
 
-/// The fields every issue read asks for, and nothing else.
-const FIELDS: &str = "key,summary,status,issuetype,assignee,parent,project,updated";
+/// The fields every search asks for. `acli` 1.3 refuses `parent`,
+/// `project`, `updated` and `created` in a search ("field 'parent' is not
+/// allowed", #2032), and one refused field fails the whole call, so these
+/// are the ones it allows. Parents come from [`parent_at`].
+const FIELDS: &str = "summary,status,issuetype,assignee";
 
 #[cfg(target_os = "macos")]
 const FALLBACK_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
@@ -135,6 +138,28 @@ async fn search(bin: &Path, jql: &str, limit: usize) -> Result<Vec<JiraIssue>, S
     )
     .await?;
     parse::issues(&raw)
+}
+
+/// The parent of `key`, by `workitem view`, which -- unlike search -- may
+/// ask for it. One call per key; the caller keeps the answer.
+pub async fn parent_at(bin: &Path, key: &str) -> Result<Option<String>, String> {
+    if !is_key(key) {
+        return Err(format!("{key} is not a Jira key"));
+    }
+    let raw = run_ok(
+        bin,
+        &[
+            "jira",
+            "workitem",
+            "view",
+            key,
+            "--fields",
+            "parent,issuetype",
+            "--json",
+        ],
+    )
+    .await?;
+    parse::parent(&raw)
 }
 
 /// What Jira says about `keys`.

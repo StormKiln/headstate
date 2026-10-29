@@ -89,8 +89,8 @@ export function ancestorKeys(keys: readonly string[], lookup: Lookup): string[] 
 
 /// Group ids that are not issue keys.
 export const NO_EPIC = "no-epic";
-/// Issues whose own answer has not arrived, or did not: their parent is
-/// unknown, so they cannot honestly be filed under "No epic".
+/// Issues whose own answer, or whose parent, has not arrived: their epic
+/// is unknown, so they cannot honestly be filed under "No epic".
 export const UNRESOLVED = "unresolved";
 
 /// The epic an issue belongs under: the nearest ancestor that is an epic
@@ -104,6 +104,8 @@ export function epicOf(key: string, lookup: Lookup): string {
   const start = found(lookup(key));
   if (!start) return UNRESOLVED;
   if ((start.issue_type.hierarchy_level ?? 0) >= 1) return start.key;
+  // Parent not read yet: filing it under "No epic" would be a guess.
+  if (!start.parent_checked) return UNRESOLVED;
   let cur = start;
   for (let d = 0; d < MAX_DEPTH; d++) {
     const p = cur.parent_key;

@@ -103,6 +103,9 @@ pub mod keys {
     /// Interface preferences, as a JSON `UiPrefs`. Absent means the
     /// defaults, which are what the app did before this key existed.
     pub const UI_PREFS: &str = "ui_prefs";
+    /// The Jira site `acli` last said it was signed in to, as a JSON
+    /// string hostname. Builds browse links; never a credential.
+    pub const JIRA_SITE: &str = "jira_site";
 
     /// Automatic cleanup preferences (#382).
     pub const CLEANUP_PREFS: &str = "cleanup_prefs";

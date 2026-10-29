@@ -9,16 +9,17 @@
 //! module is only ever handed keys that were already found, and answers what
 //! Jira says about them.
 //!
-//! The JSON shapes in [`parse`] follow Jira Cloud's REST v3 issue and project
-//! objects, which is what `acli --json` is documented to wrap. They are NOT
-//! yet verified against a live `acli` (#2032), so every reader is tolerant: a
-//! field that is missing reads as absent, never as a default that looks like
-//! data.
+//! The JSON shapes in [`parse`] are Jira Cloud's REST v3 objects, checked
+//! against a live `acli` 1.3.39 (#2032; fixtures in `fixtures/`). Every
+//! reader stays tolerant: a field that is missing reads as absent, never as
+//! a default that looks like data.
 
+pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod model;
 pub mod parse;
+pub mod read;
 
 pub use model::{
     IssueBatch, JiraConnection, JiraIssue, JiraIssueType, JiraProject, JiraStatus, ProjectList,

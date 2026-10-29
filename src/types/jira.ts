@@ -22,8 +22,14 @@ export interface JiraIssue {
   issue_type: JiraIssueType;
   status: JiraStatus;
   assignee: string | null;
+  /// Meaningful only when `parent_checked`.
   parent_key: string | null;
+  /// Whether the parent has been read. `acli`'s search cannot return
+  /// parents, so the desktop reads them a few at a time: `parent_key: null`
+  /// with this false is "not known yet", never "has no epic".
+  parent_checked: boolean;
   project_key: string;
+  /// On the signed-in site; `null` until the site is known.
   url: string | null;
   updated: string | null;
 }

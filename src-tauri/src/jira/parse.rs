@@ -35,13 +35,20 @@ fn category(status: &Value) -> StatusCategory {
     }
 }
 
-/// `https://<site>/rest/api/3/issue/10001` -> the site's
-/// browse URL for `key`. Only an https origin is trusted to build a link.
-fn browse_url(self_link: Option<&str>, key: &str) -> Option<String> {
-    let link = self_link?;
-    let rest = link.strip_prefix("https://")?;
-    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
-    Some(format!("https://{host}/browse/{key}"))
+/// The browse URL for `key` on `site`, the host `auth status` names.
+///
+/// Not derived from the API's `self` link: through `acli` that names an
+/// internal Atlassian host (`jira-prod-*.prod.atl-paas.net`), not the
+/// user's site, so a link built from it does not open (#2032). Only a
+/// plain hostname is trusted to build a link.
+pub fn browse_url(site: Option<&str>, key: &str) -> Option<String> {
+    let site = site?;
+    let plain = !site.is_empty()
+        && site.contains('.')
+        && site
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    plain.then(|| format!("https://{site}/browse/{key}"))
 }
 
 fn issue(v: &Value) -> Option<JiraIssue> {
@@ -68,10 +75,12 @@ fn issue(v: &Value) -> Option<JiraIssue> {
         },
         assignee: s("/assignee/displayName"),
         parent_key: s("/parent/key"),
+        // Set by the reader that knows whether `parent` was asked for.
+        parent_checked: false,
         project_key: s("/project/key")
             .or_else(|| key.split_once('-').map(|(p, _)| p.to_string()))
             .unwrap_or_default(),
-        url: browse_url(v.get("self").and_then(Value::as_str), &key),
+        url: None,
         updated: s("/updated"),
         key,
     })
@@ -87,6 +96,26 @@ pub fn issues(raw: &str) -> Result<Vec<JiraIssue>, String> {
     issue(&v)
         .map(|i| vec![i])
         .ok_or_else(|| "Jira reply held no work items".to_string())
+}
+
+/// The parent named by `workitem view --fields parent,issuetype --json`.
+///
+/// `Ok(None)` is an answer: the issue has no parent, and Jira omits the
+/// field. It is only trusted from a reply that is visibly an issue -- a
+/// key and a `fields` object -- because asked for `parent` alone, an issue
+/// with none comes back as a bare `null`, indistinguishable from nothing.
+pub fn parent(raw: &str) -> Result<Option<String>, String> {
+    let v: Value = serde_json::from_str(raw).map_err(|e| format!("unreadable Jira reply: {e}"))?;
+    let fields = v
+        .get("key")
+        .and_then(Value::as_str)
+        .and(v.get("fields"))
+        .filter(|f| f.is_object())
+        .ok_or("Jira reply held no work item")?;
+    Ok(fields
+        .pointer("/parent/key")
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 /// Projects from `project list --json`.
@@ -197,10 +226,7 @@ mod tests {
             assert_eq!(i.status.name, "In Review");
             assert_eq!(i.parent_key.as_deref(), Some("ABC-2"));
             assert_eq!(i.issue_type.hierarchy_level, Some(0));
-            assert_eq!(
-                i.url.as_deref(),
-                Some(format!("https://{}/browse/ABC-1", site()).as_str())
-            );
+            assert_eq!(i.url, None, "the self link is not the site");
         }
     }
 
@@ -216,12 +242,49 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_http_self_link_builds_no_url() {
-        let raw = format!(
-            r#"{{"key": "ABC-4", "self": "http://{}/x", "fields": {{}}}}"#,
-            site()
+    fn browse_urls_come_from_the_site_and_only_a_plain_host() {
+        assert_eq!(
+            browse_url(Some(&site()), "ABC-4").as_deref(),
+            Some(format!("https://{}/browse/ABC-4", site()).as_str())
         );
-        assert_eq!(issues(&raw).unwrap()[0].url, None);
+        for bad in ["", "evil.example/x?", "a b.net", "localhost"] {
+            assert_eq!(browse_url(Some(bad), "ABC-4"), None, "{bad}");
+        }
+        assert_eq!(browse_url(None, "ABC-4"), None);
+    }
+
+    /// Replies captured from a live `acli` 1.3.39 on a test site (#2032),
+    /// with account ids, names and emails replaced.
+    const LIVE_SEARCH: &str = include_str!("fixtures/search.json");
+    const LIVE_VIEW_PARENT: &str = include_str!("fixtures/view_with_parent.json");
+    const LIVE_VIEW_NO_PARENT: &str = include_str!("fixtures/view_without_parent.json");
+
+    #[test]
+    fn reads_a_live_search_reply() {
+        let got = issues(LIVE_SEARCH).unwrap();
+        let by = |k: &str| got.iter().find(|i| i.key == k).unwrap();
+        assert_eq!(got.len(), 2);
+        let epic = by("SAM-1");
+        assert_eq!(epic.issue_type.name, "Epic");
+        assert_eq!(epic.issue_type.hierarchy_level, Some(1));
+        assert_eq!(epic.status.category, StatusCategory::New);
+        let task = by("SAM-4");
+        assert_eq!(task.issue_type.hierarchy_level, Some(0));
+        assert_eq!(task.assignee.as_deref(), Some("Dana Example"));
+        assert_eq!(task.project_key, "SAM", "search cannot return project");
+        // Search refuses `parent`: nothing here says whether there is one.
+        assert_eq!(task.parent_key, None);
+        assert!(!task.parent_checked);
+        assert_eq!(task.url, None);
+    }
+
+    #[test]
+    fn reads_parents_from_live_view_replies() {
+        assert_eq!(parent(LIVE_VIEW_PARENT).unwrap().as_deref(), Some("SAM-1"));
+        assert_eq!(parent(LIVE_VIEW_NO_PARENT).unwrap(), None);
+        // What `--fields parent` alone returns for an issue with none.
+        assert!(parent("null").is_err());
+        assert!(parent("{}").is_err());
     }
 
     #[test]

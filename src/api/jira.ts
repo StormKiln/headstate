@@ -99,9 +99,13 @@ export function issueQuery(key: string) {
     queryKey: ["jira-issue", key],
     queryFn: () => loadIssue(key),
     staleTime: 2 * 60_000,
-    // An unasked key is retried soon; an answered one on the usual cadence.
-    refetchInterval: (q: { state: { data?: IssueState } }) =>
-      q.state.data?.state === "unasked" ? 30_000 : 5 * 60_000,
+    // An unasked key, or one whose parent is not read yet, is asked again
+    // soon; an answered one on the usual cadence.
+    refetchInterval: (q: { state: { data?: IssueState } }) => {
+      const d = q.state.data;
+      const pending = d?.state === "unasked" || (d?.state === "found" && !d.issue.parent_checked);
+      return pending ? 30_000 : 5 * 60_000;
+    },
   };
 }
 

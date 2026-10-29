@@ -1066,7 +1066,7 @@ export const wireGraph: WireGraph = {
   {"t":"object","props":[["key",10,false],["title",10,false],["body",10,false],["pid",92,false]]},
   {"t":"object","props":[["issues",890,false],["missing",60,false],["unasked",60,false],["error",9,false],["truncated",41,false]]},
   {"t":"array","item":891},
-  {"t":"object","props":[["key",10,false],["summary",10,false],["issue_type",892,false],["status",893,false],["assignee",9,false],["parent_key",9,false],["project_key",10,false],["url",9,false],["updated",9,false]]},
+  {"t":"object","props":[["key",10,false],["summary",10,false],["issue_type",892,false],["status",893,false],["assignee",9,false],["parent_key",9,false],["parent_checked",41,false],["project_key",10,false],["url",9,false],["updated",9,false]]},
   {"t":"object","props":[["name",10,false],["hierarchy_level",92,false]]},
   {"t":"object","props":[["name",10,false],["category",894,false]]},
   {"t":"union","of":[57,151,895,896]},

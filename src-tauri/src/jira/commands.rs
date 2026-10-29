@@ -3,6 +3,7 @@
 //! `Disabled` -- "we did not ask" -- never an empty answer (#1050).
 
 use super::model::{IssueBatch, JiraConnection, ProjectList};
+use crate::store::{open_db, settings};
 use tauri::AppHandle;
 
 async fn enabled(app: &AppHandle) -> bool {
@@ -11,16 +12,45 @@ async fn enabled(app: &AppHandle) -> bool {
         .await
 }
 
+/// The site `acli` last named, for browse links. `None` until a
+/// connection check has seen one.
+async fn site(app: &AppHandle) -> Option<String> {
+    let db = crate::commands::db_path(app);
+    crate::commands::off_main_thread(move || {
+        open_db(&db).ok().and_then(|c| {
+            settings::get::<String>(&c, settings::keys::JIRA_SITE)
+                .ok()
+                .flatten()
+        })
+    })
+    .await
+}
+
 /// Whether Jira can be asked anything, and if not, what to do about it.
 #[tauri::command]
 pub async fn jira_connection(app: AppHandle) -> JiraConnection {
     if !enabled(&app).await {
         return JiraConnection::Disabled;
     }
-    match super::cli::find_acli() {
-        Some(bin) => super::cli::connection_at(&bin).await,
-        None => JiraConnection::NotInstalled,
+    let Some(bin) = super::cli::find_acli() else {
+        return JiraConnection::NotInstalled;
+    };
+    let got = super::cli::connection_at(&bin).await;
+    if let JiraConnection::LoggedIn {
+        site: Some(site), ..
+    } = &got
+    {
+        let (db, site) = (crate::commands::db_path(&app), site.clone());
+        crate::commands::off_main_thread(move || {
+            if let Err(e) =
+                open_db(&db).and_then(|c| settings::set(&c, settings::keys::JIRA_SITE, &site))
+            {
+                log::warn!("jira: could not remember the site: {e}");
+            }
+        })
+        .await;
     }
+    got
 }
 
 /// Every project the signed-in user can see: the dictionary that tells a
@@ -37,14 +67,18 @@ pub async fn jira_projects(app: AppHandle) -> Result<ProjectList, String> {
 /// What Jira says about `keys`: found, missing, or never asked.
 ///
 /// The frontend batches every visible row's keys into one call, so a page
-/// of pull requests is one `acli` search rather than one per row.
+/// of pull requests is one `acli` search rather than one per row. Answers
+/// are kept in the database (`read.rs`), so a repeat within a minute spawns
+/// nothing and a parent is read once, not on every refresh.
 #[tauri::command]
 pub async fn jira_issues(app: AppHandle, keys: Vec<String>) -> Result<IssueBatch, String> {
     if !enabled(&app).await {
         return Err("Jira is switched off".into());
     }
     let bin = super::cli::find_acli().ok_or("acli is not installed")?;
-    Ok(super::cli::issues_at(&bin, &keys).await)
+    let site = site(&app).await;
+    let db = crate::commands::db_path(&app);
+    Ok(super::read::issues(&bin, &db, site.as_deref(), &keys).await)
 }
 
 /// How many assigned issues one read returns. Past this the page says "at
@@ -59,5 +93,7 @@ pub async fn jira_assigned(app: AppHandle) -> Result<IssueBatch, String> {
         return Err("Jira is switched off".into());
     }
     let bin = super::cli::find_acli().ok_or("acli is not installed")?;
-    Ok(super::cli::assigned_at(&bin, ASSIGNED_LIMIT).await)
+    let site = site(&app).await;
+    let db = crate::commands::db_path(&app);
+    Ok(super::read::assigned(&bin, &db, site.as_deref(), ASSIGNED_LIMIT).await)
 }
