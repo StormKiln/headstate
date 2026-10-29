@@ -782,7 +782,7 @@ query($q: String!, $first: Int!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url state isDraft headRefName
+        number title url state isDraft headRefName mergedAt
         author { login }
         repository { nameWithOwner }
       }

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ArrowLeft, TriangleAlert } from "lucide-react";
-import { driftFor, mergedButNotDone } from "@/lib/jira/drift";
+import { afterMerge, driftFor, knownPrs, lookupComplete, type Verdict } from "@/lib/jira/drift";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { CATEGORY_TEXT, describe } from "@/lib/jira/describe";
 import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
@@ -186,7 +186,7 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
             {prs.map((pr) => {
               const gitlab = pr.identity.source?.provider === "gitlab";
               // A pull request that has left the open list is not open:
-              // what it says about the ticket waits on #2041.
+              // what it says about the ticket is the lookup's, below.
               const drift = issue && pr.current ? driftFor(issue, { draft: pr.is_draft, source: pr.source }, expectations) : null;
               return (
                 <li
@@ -251,7 +251,8 @@ const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "nume
 /// asked to here -- and says what each search covered (#2040).
 function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | undefined; lookup: Lookup; on: boolean }) {
   const [more, setMore] = useState(false);
-  const expectations = useJira()?.expectations;
+  const jira = useJira();
+  const now = useNow(30_000);
   const q = useJiraFind(k, on, more);
   const s = lookup(k);
   const issue: JiraIssue | null = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
@@ -260,21 +261,23 @@ function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | 
   const found = (q.data?.links ?? []).flatMap((l) =>
     l.target.kind === "pr" && l.target.role === "searched" && !shown.has(l.target.url) ? [l.target] : [],
   );
-  const merged = found.filter((p) => p.state === "merged").length;
-  const open = mine.filter((p) => p.current).length + found.filter((p) => p.state === "open").length;
-  const asked = q.data?.search.state === "asked" || q.data?.gitlab?.state === "asked";
-  const drift = issue && asked ? mergedButNotDone(issue, { merged, open }, expectations) : null;
+  // Merged, closed and some-merged (#2042) are decided from the lookup
+  // alone, which holds the user's own pull requests too, and say how much
+  // of it is known. Nothing until it answers: pending is not "none".
+  const verdict =
+    issue && q.data
+      ? afterMerge(issue, knownPrs(q.data.links), lookupComplete(q.data), {
+          expectations: jira?.expectations,
+          now,
+          graceMins: jira?.mergeGraceMins,
+        })
+      : null;
   const halves = q.data ? ([["GitHub", q.data.search], ["GitLab", q.data.gitlab]] as const) : [];
   const onSearch = more ? undefined : () => setMore(true);
 
   return (
     <section aria-label="Found by searching" className="flex flex-col gap-1">
-      {drift ? (
-        <p role="status" className="flex items-center gap-1.5 text-xs text-[#d29922]">
-          <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-          {drift.message}
-        </p>
-      ) : null}
+      {verdict ? <VerdictLine verdict={verdict} /> : null}
       {found.length > 0 ? (
         <>
           <h3 className="text-sm font-medium text-[#e6edf3]">Found by searching</h3>
@@ -329,6 +332,24 @@ function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | 
         )
       )}
     </section>
+  );
+}
+
+/// One verdict from `afterMerge`. Only a fact is a warning; a qualified,
+/// waiting or progress line is plain text that says what it is.
+function VerdictLine({ verdict }: { verdict: Verdict }) {
+  if (verdict.level === "fact") {
+    return (
+      <p role="status" className="flex items-center gap-1.5 text-xs text-[#d29922]">
+        <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        {verdict.message}
+      </p>
+    );
+  }
+  return (
+    <p role="status" className="text-xs text-[#8b949e]">
+      {verdict.message}
+    </p>
   );
 }
 

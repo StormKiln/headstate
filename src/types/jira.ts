@@ -130,6 +130,9 @@ export type LinkTarget =
       is_draft: boolean;
       state: PrState | null;
       author: string | null;
+      /// When it merged, as the search reported it (#2042); only for a
+      /// searched pull request that merged. `null` is "not reported".
+      merged_at?: string | null;
     }
   | { kind: "worktree"; repo: string; path: string; branch: string }
   | { kind: "branch"; repo_path: string; branch: string };

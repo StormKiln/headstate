@@ -241,6 +241,11 @@ pub enum LinkTarget {
         state: Option<PrState>,
         #[serde(default)]
         author: Option<String>,
+        /// When it merged, RFC 3339, as the search reported it (#2042).
+        /// Known only for a searched pull request that merged; `None` is
+        /// "not reported", never "not merged" -- `state` says that.
+        #[serde(default)]
+        merged_at: Option<String>,
     },
     Worktree {
         repo: String,

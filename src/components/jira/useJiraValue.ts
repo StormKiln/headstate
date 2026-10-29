@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { UiPrefs } from "@/api/tauri";
 import { useJiraConnection, useJiraLinks } from "@/api/jira";
-import type { ExpectationMap } from "@/lib/jira/drift";
+import { DEFAULT_MERGE_GRACE_MINS, type ExpectationMap } from "@/lib/jira/drift";
 import { linkMaps } from "@/lib/jira/links";
 import { noTicketIndex, type NoTicketIndex } from "@/lib/jira/noTicket";
 import type { JiraState } from "./jiraState";
@@ -25,6 +25,7 @@ export function useJiraValue(prefs: UiPrefs | undefined): JiraState | null {
   const expectations = prefs?.jira_status_expectations ?? NO_EXPECTATIONS;
   const chipsOnPrRows = prefs?.jira_chips_on_prs ?? true;
   const branchTemplate = prefs?.jira_branch_template ?? "";
+  const mergeGraceMins = prefs?.jira_merge_grace_mins ?? DEFAULT_MERGE_GRACE_MINS;
   const noTicketOn = prefs?.jira_no_ticket_marker ?? false;
   return useMemo<JiraState | null>(() => {
     if (!enabled || !signedIn || !links.data || links.data.error !== null) return null;
@@ -35,9 +36,10 @@ export function useJiraValue(prefs: UiPrefs | undefined): JiraState | null {
       expectations,
       chipsOnPrRows,
       branchTemplate,
+      mergeGraceMins,
       noTicket: noTicketOn ? noTicketIndex(links.data) : null,
     };
-  }, [enabled, signedIn, links.data, site, expectations, chipsOnPrRows, branchTemplate, noTicketOn]);
+  }, [enabled, signedIn, links.data, site, expectations, chipsOnPrRows, branchTemplate, mergeGraceMins, noTicketOn]);
 }
 
 /// The "no ticket" index for a component that renders the provider rather

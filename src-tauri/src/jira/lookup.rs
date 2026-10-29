@@ -300,6 +300,11 @@ pub fn map_search(v: &Value, key: &str) -> Result<(Vec<JiraLink>, u64, u64), Str
                     .pointer("/author/login")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                merged_at: n
+                    .get("mergedAt")
+                    .and_then(Value::as_str)
+                    .filter(|_| state == PrState::Merged)
+                    .map(str::to_string),
             },
         });
     }
@@ -356,6 +361,11 @@ pub fn map_gitlab_rows(rows: &[Value], key: &str, host: &str) -> Vec<JiraLink> {
                     author: v
                         .pointer("/author/username")
                         .and_then(Value::as_str)
+                        .map(str::to_string),
+                    merged_at: v
+                        .get("merged_at")
+                        .and_then(Value::as_str)
+                        .filter(|_| state == PrState::Merged)
                         .map(str::to_string),
                 },
             })
@@ -624,10 +634,36 @@ async fn read_held(db: PathBuf, key: String) -> Result<Held, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Whether one of the user's own pull requests has left its list and no
+/// search has said what became of it: merged, closed, or still open with
+/// the user no longer on it. The database cannot answer that, so it does
+/// not count as "already known" (#2042).
+fn state_unknown(links: &[JiraLink]) -> bool {
+    let searched: std::collections::HashSet<&str> = links
+        .iter()
+        .filter_map(|l| match &l.target {
+            LinkTarget::Pr {
+                role: PrRole::Searched,
+                url,
+                state: Some(_),
+                ..
+            } => Some(url.as_str()),
+            _ => None,
+        })
+        .collect();
+    links.iter().any(|l| match &l.target {
+        LinkTarget::Pr { role, url, .. } if *role != PrRole::Searched => {
+            !l.current && !searched.contains(url.as_str())
+        }
+        _ => false,
+    })
+}
+
 /// Every pull request, worktree and branch that names `key`.
 ///
 /// The database first. GitHub and GitLab are searched only when it holds
-/// no pull request for the key, or `more` asks for one anyway -- each at
+/// no pull request for the key, when one of the user's own has left its
+/// list with its fate unknown, or `more` asks for one anyway -- each at
 /// most once per [`SEARCH_TTL`], whose results are already stored. `glab`
 /// is the GitLab CLI, when installed.
 pub async fn find(
@@ -643,7 +679,7 @@ pub async fn find(
         .links
         .iter()
         .any(|l| matches!(l.target, LinkTarget::Pr { .. }));
-    if has_pr && !more {
+    if has_pr && !more && !state_unknown(&held.links) {
         let gitlab = (held.gitlab_scope != GitLabScope::Unused).then(|| Search::NotAsked {
             reason: ALREADY_KNOWN.into(),
         });
@@ -897,6 +933,76 @@ mod tests {
         let got = find(None, None, &path, "ABC-1", true).await.unwrap();
         assert_eq!(got.links.len(), 1);
         assert_eq!(got.search, s.as_search());
+    }
+
+    /// The merge time is what the grace period (#2042) counts from; it is
+    /// kept only for a merged pull request, and absent when not reported.
+    #[test]
+    fn a_merged_result_keeps_when_it_merged() {
+        let mut merged = node(1, "ABC-1: fix", "MERGED");
+        merged["mergedAt"] = "2026-01-02T03:04:05Z".into();
+        let mut open = node(2, "ABC-1 more", "OPEN");
+        open["mergedAt"] = "2026-01-02T03:04:05Z".into();
+        let (links, _, _) = map_search(
+            &reply(serde_json::json!([
+                merged,
+                open,
+                node(3, "ABC-1 again", "MERGED")
+            ])),
+            "ABC-1",
+        )
+        .unwrap();
+        let at: Vec<Option<&str>> = links
+            .iter()
+            .map(|l| match &l.target {
+                LinkTarget::Pr { merged_at, .. } => merged_at.as_deref(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(at, [Some("2026-01-02T03:04:05Z"), None, None]);
+
+        let mut mr_merged = mr(4, "ABC-1 tidy", "merged");
+        mr_merged["merged_at"] = "2026-01-02T03:04:05Z".into();
+        let gl = map_gitlab_rows(&[mr_merged], "ABC-1", "gitlab.example.test");
+        assert!(matches!(
+            &gl[0].target,
+            LinkTarget::Pr { merged_at: Some(t), .. } if t == "2026-01-02T03:04:05Z"
+        ));
+    }
+
+    /// One of the user's own pull requests left its list: the database
+    /// cannot say whether it merged, so "already known" is not true of it.
+    #[test]
+    fn an_own_pull_request_that_left_its_list_is_not_already_known() {
+        let own = |current: bool| JiraLink {
+            key: "ABC-1".into(),
+            found_in: super::super::keys::FoundIn::Title,
+            current,
+            target: LinkTarget::Pr {
+                source: Source::default(),
+                role: PrRole::Authored,
+                repo: "octocat/hello-world".into(),
+                number: 1,
+                title: "ABC-1: fix".into(),
+                url: "https://github.com/octocat/hello-world/pull/1".into(),
+                head_ref: "x".into(),
+                is_draft: false,
+                state: None,
+                author: None,
+                merged_at: None,
+            },
+        };
+        assert!(!state_unknown(&[own(true)]), "still listed: open");
+        assert!(state_unknown(&[own(false)]));
+        let (found, _, _) = map_search(
+            &reply(serde_json::json!([node(1, "ABC-1: fix", "MERGED")])),
+            "ABC-1",
+        )
+        .unwrap();
+        assert!(
+            !state_unknown(&[own(false), found[0].clone()]),
+            "a search said what became of it"
+        );
     }
 
     #[test]

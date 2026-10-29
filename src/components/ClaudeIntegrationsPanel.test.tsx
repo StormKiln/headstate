@@ -63,6 +63,7 @@ const PREFS: UiPrefs = {
   jira_chips_on_prs: true,
   jira_branch_template: "",
   jira_no_ticket_marker: false,
+  jira_merge_grace_mins: 15,
 };
 
 const setPrefs = vi.fn(() => Promise.resolve());

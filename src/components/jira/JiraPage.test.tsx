@@ -44,6 +44,7 @@ const prefs: UiPrefs = {
   jira_chips_on_prs: true,
   jira_branch_template: "",
   jira_no_ticket_marker: false,
+  jira_merge_grace_mins: 15,
 };
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
@@ -239,7 +240,7 @@ describe("My Jira issues", () => {
         {
           ...prLink(),
           current: false,
-          target: { ...(prLink().target as Extract<JiraLink["target"], { kind: "pr" }>), role: "searched", number: 9, url: "https://github.com/octocat/hello-world/pull/9", state: "merged", author: "dana" },
+          target: { ...(prLink().target as Extract<JiraLink["target"], { kind: "pr" }>), role: "searched", number: 9, url: "https://github.com/octocat/hello-world/pull/9", state: "merged", author: "dana", merged_at: "2026-10-28T11:00:00Z" },
         },
       ],
       search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, read: 1, truncated: false, scope: ["octocat"], unsearched: [] },
@@ -250,6 +251,50 @@ describe("My Jira issues", () => {
     const region = await screen.findByRole("region", { name: "Found by searching" });
     expect(await within(region).findByText(/octocat\/hello-world#9 · merged · dana/)).toBeTruthy();
     expect(await within(region).findByText("A pull request for ABC-1 has merged, but the ticket is still In Progress.")).toBeTruthy();
+    await quiet();
+  });
+
+  const searchedPr = (over: Partial<Extract<JiraLink["target"], { kind: "pr" }>>): JiraLink => ({
+    ...prLink(),
+    current: false,
+    target: { ...(prLink().target as Extract<JiraLink["target"], { kind: "pr" }>), role: "searched", ...over },
+  });
+
+  /// #2042: the user's own pull request left its list, and the search says
+  /// it merged. Merged knowledge comes from the lookup, not the list.
+  it("knows your own pull request merged from the search, and warns once nothing is left unchecked", async () => {
+    links.mockResolvedValue(index([{ ...prLink(), current: false }]));
+    find.mockResolvedValue({
+      key: "ABC-1",
+      links: [{ ...prLink(), current: false }, searchedPr({ state: "merged", merged_at: "2026-10-28T11:00:00Z" })],
+      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, read: 1, truncated: false, scope: ["octocat"], unsearched: [] },
+      gitlab: null,
+    });
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    const region = await screen.findByRole("region", { name: "Found by searching" });
+    expect(await within(region).findByText("A pull request for ABC-1 has merged, but the ticket is still In Progress.")).toBeTruthy();
+    await quiet();
+  });
+
+  /// Qualify, or suppress: a search that left owners out cannot say every
+  /// pull request merged, so the line says what was not checked and is no
+  /// warning.
+  it("qualifies a merge when the search was partial", async () => {
+    links.mockResolvedValue(index([]));
+    find.mockResolvedValue({
+      key: "ABC-1",
+      links: [searchedPr({ state: "merged", merged_at: "2026-10-28T11:00:00Z" })],
+      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, read: 1, truncated: false, scope: ["octocat"], unsearched: ["acme"] },
+      gitlab: null,
+    });
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    const region = await screen.findByRole("region", { name: "Found by searching" });
+    const line = await within(region).findByText(
+      "A pull request for ABC-1 has merged and the ticket is still In Progress; other pull requests for ABC-1 were not checked.",
+    );
+    expect(line.querySelector("svg")).toBeNull();
     await quiet();
   });
 
