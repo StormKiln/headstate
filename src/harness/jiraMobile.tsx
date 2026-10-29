@@ -152,7 +152,7 @@ const DESKTOP: Record<string, (args: Record<string, unknown>) => unknown> = {
   jira_issues: (a) => batch(a.keys as string[]),
   jira_find: (a): KeyLookup => {
     const key = a.key as string;
-    return { key, links: LINKS.filter((l) => l.key === key), search: { state: "not_asked", reason: "already known from your pull requests" } };
+    return { key, links: LINKS.filter((l) => l.key === key), search: { state: "not_asked", reason: "already known from your pull requests" }, gitlab: null };
   },
 };
 
