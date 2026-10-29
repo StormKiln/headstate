@@ -1003,8 +1003,9 @@ fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
         .map_err(|e| RemoteError::Command(CommandError::classify(e.to_string())))
 }
 
-/// A command's `Result<T, String>`, as the webview would receive it. A typed
-/// rejection such as `JiraError` crosses as its `Display` text.
+/// A command's `Result<T, String>`, as the webview would receive it. Any
+/// other rejection type crosses as its `Display` text; a `JiraError` goes
+/// through [`jira_res`] instead, which keeps the type.
 ///
 /// The single place a command's own rejection becomes a `RemoteError`,
 /// which is why classifying here covers all 103 dispatch arms without
@@ -1012,6 +1013,17 @@ fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
 fn res<T: Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Result<Value, RemoteError> {
     result
         .map_err(|m| RemoteError::Command(CommandError::classify(m.to_string())))
+        .and_then(ok)
+}
+
+/// A Jira command's `Result<T, JiraError>`. As [`res`], and the typed
+/// reason travels too, so the phone recovers the state rather than
+/// reading every reason but "not asked" as a failure (#2047).
+fn jira_res<T: Serialize>(
+    result: Result<T, crate::jira::model::JiraError>,
+) -> Result<Value, RemoteError> {
+    result
+        .map_err(|e| RemoteError::Command(CommandError::jira(e)))
         .and_then(ok)
 }
 
@@ -1149,22 +1161,21 @@ async fn call(
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
         "scan_artifacts_report" => res(commands::scan_artifacts_report(app.clone()).await),
         "jira_connection" => ok(crate::jira::commands::jira_connection(app.clone()).await),
-        "jira_projects" => res(crate::jira::commands::jira_projects(app.clone()).await),
-        "jira_issues" => {
-            res(
-                crate::jira::commands::jira_issues(app.clone(), a.get("keys")?, a.get("fresh")?)
-                    .await,
-            )
+        "jira_projects" => jira_res(crate::jira::commands::jira_projects(app.clone()).await),
+        "jira_issues" => jira_res(
+            crate::jira::commands::jira_issues(app.clone(), a.get("keys")?, a.get("fresh")?).await,
+        ),
+        "jira_assigned" => jira_res(crate::jira::commands::jira_assigned(app.clone()).await),
+        "jira_links" => jira_res(crate::jira::commands::jira_links(app.clone()).await),
+        "jira_find" => jira_res(
+            crate::jira::commands::jira_find(app.clone(), a.get("key")?, a.get("more")?).await,
+        ),
+        "jira_acli_version" => {
+            jira_res(crate::jira::commands::jira_acli_version(app.clone()).await)
         }
-        "jira_assigned" => res(crate::jira::commands::jira_assigned(app.clone()).await),
-        "jira_links" => res(crate::jira::commands::jira_links(app.clone()).await),
-        "jira_find" => {
-            res(crate::jira::commands::jira_find(app.clone(), a.get("key")?, a.get("more")?).await)
-        }
-        "jira_acli_version" => res(crate::jira::commands::jira_acli_version(app.clone()).await),
-        "jira_project_statuses" => {
-            res(crate::jira::commands::jira_project_statuses(app.clone(), a.get("project")?).await)
-        }
+        "jira_project_statuses" => jira_res(
+            crate::jira::commands::jira_project_statuses(app.clone(), a.get("project")?).await,
+        ),
         "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
         "disk_inventory_history" => {
             res(crate::disk_inventory::commands::disk_inventory_history(app.clone()).await)
@@ -1979,6 +1990,39 @@ mod tests {
             res(Ok::<_, String>(("a".to_string(), 1u64))),
             Ok(json!(["a", 1]))
         );
+    }
+
+    /// A Jira command rejected over the relay keeps its typed reason
+    /// (#2047): the object the desktop's webview receives, beside its
+    /// `Display` text as before.
+    #[test]
+    fn a_jira_rejection_crosses_with_its_typed_reason() {
+        use crate::jira::model::JiraError;
+        let reason = JiraError::NotInstalled {
+            searched: vec!["/opt/acli".into()],
+        };
+        let Err(RemoteError::Command(e)) = jira_res::<()>(Err(reason.clone())) else {
+            panic!("a Jira rejection must be a command error");
+        };
+        assert_eq!(e.message, reason.to_string());
+        assert_eq!(e.jira, Some(reason));
+        assert_eq!(jira_res(Ok(1u8)), Ok(json!(1)));
+    }
+
+    /// Every Jira arm that can reject uses `jira_res`. One left on `res`
+    /// would send its reason as text alone, and the phone would read a
+    /// rate limit as a failure.
+    #[test]
+    fn every_jira_dispatch_arm_keeps_its_typed_reason() {
+        let src = include_str!("surface.rs");
+        let from = src.find("\"jira_connection\" => ok(").unwrap();
+        let to = from + src[from..].find("\"disk_inventory_status\" =>").unwrap();
+        let arms = &src[from..to];
+        assert!(
+            !arms.contains(" res("),
+            "a Jira dispatch arm uses `res`, which drops the typed reason"
+        );
+        assert_eq!(arms.matches("jira_res(").count(), 7);
     }
 
     /// The two superseded update commands are off the wire (#964).

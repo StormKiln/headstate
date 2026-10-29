@@ -26,7 +26,8 @@ describe("Jira failures (#2033)", () => {
   it("reads the desktop's typed rejection, and the phone's text one", () => {
     expect(failureOf({ state: "timed_out", secs: 20 })).toEqual({ state: "timed_out", secs: 20 });
     expect(failureOf(new JiraFailure({ state: "not_logged_in" }))).toEqual({ state: "not_logged_in" });
-    // Through the phone a rejection is text: only "not asked" survives, by its marker.
+    // Text alone (a desktop older than #2047, through the phone): only
+    // "not asked" survives, by its marker. `jira.remote.test.ts` has the rest.
     expect(failureOf(new Error(`${NOT_ASKED} Jira is switched off, so it was not asked`))).toEqual({
       state: "not_asked",
     });

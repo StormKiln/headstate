@@ -45,6 +45,8 @@ dist
 dist-harness
 # The Worktrees harness build (#1582): `make bench-worktrees-browser`.
 dist-harness-worktrees
+# The Jira-on-a-phone harness build (#2047): `make jira-mobile-screenshots`.
+dist-harness-jira
 target
 .tools/workflow/
 src-tauri/target

@@ -195,6 +195,17 @@ check-shell-scroll:
 	yarn vite build -c vite.harness.config.ts
 	node scripts/check-shell-scroll.mjs
 
+# My Jira issues on a phone, as PNGs in docs/screenshots/jira/ (#2047):
+# the real App built for the phone (VITE_TARGET=mobile), the companion
+# mocked from synthetic data (src/harness/jiraMobile.tsx), Chromium at
+# 390x844. Regenerates documentation; not a check, not in CI. Needs
+# `yarn playwright install chromium` once. Fails if the page asked for
+# something the harness does not answer, so a shot is never of an error.
+.PHONY: jira-mobile-screenshots
+jira-mobile-screenshots:
+	VITE_TARGET=mobile yarn vite build -c vite.harness-jira.config.ts
+	node scripts/jira-mobile-screenshots.mjs
+
 # The Worktrees page in a browser (#1582): builds the harness page
 # (vite.harness-worktrees.config.ts, into dist-harness-worktrees), mounts
 # the real WorktreesPage over a generated repository of N worktrees and
