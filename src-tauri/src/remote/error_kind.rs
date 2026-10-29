@@ -97,6 +97,16 @@ pub enum ErrorKind {
 pub struct CommandError {
     pub kind: ErrorKind,
     pub message: String,
+    /// A Jira command's typed reason, beside its prose (#2047).
+    ///
+    /// The desktop's webview receives a `JiraError` as the object itself;
+    /// a phone received only `message`, so every reason but "not asked"
+    /// (which has a marker) arrived as `failed`. This carries the object.
+    /// Absent on every other command and omitted from the JSON when
+    /// absent, so a non-Jira rejection's body is unchanged. A companion
+    /// that predates it reads `message` and ignores this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira: Option<crate::jira::model::JiraError>,
 }
 
 impl CommandError {
@@ -120,7 +130,20 @@ impl CommandError {
         } else {
             ErrorKind::Other
         };
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            jira: None,
+        }
+    }
+
+    /// A Jira command's rejection: its `Display` text classified as any
+    /// other, with the typed reason alongside.
+    pub fn jira(e: crate::jira::model::JiraError) -> Self {
+        Self {
+            jira: Some(e.clone()),
+            ..Self::classify(e.to_string())
+        }
     }
 }
 
@@ -166,6 +189,36 @@ mod tests {
     fn the_marker_elsewhere_in_the_message_is_not_a_declined_request() {
         let quoted = format!("the command replied with {NOT_ASKED}");
         assert_eq!(CommandError::classify(quoted).kind, ErrorKind::Other);
+    }
+
+    /// A Jira rejection carries its reason as the object the webview
+    /// would have received, and keeps its prose as `message`.
+    #[test]
+    fn a_jira_rejection_carries_its_typed_reason() {
+        use crate::jira::model::JiraError;
+        let e = CommandError::jira(JiraError::RateLimited {
+            retry_after_secs: Some(30),
+        });
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(wire["kind"], "other");
+        assert_eq!(wire["message"], e.message.as_str());
+        assert_eq!(
+            wire["jira"],
+            serde_json::json!({ "state": "rate_limited", "retry_after_secs": 30 })
+        );
+        // Not asked keeps its marker classification as well.
+        assert_eq!(
+            CommandError::jira(JiraError::NotAsked).kind,
+            ErrorKind::NotAsked
+        );
+    }
+
+    /// Every other rejection's body is byte-for-byte what it was: no
+    /// `jira` key, not even `null`.
+    #[test]
+    fn a_plain_rejection_has_no_jira_key() {
+        let wire = serde_json::to_string(&CommandError::classify("boom")).unwrap();
+        assert_eq!(wire, r#"{"kind":"other","message":"boom"}"#);
     }
 
     #[test]

@@ -8,6 +8,8 @@ import artifactsRs from "../../src-tauri/src/artifacts/mod.rs?raw";
 import cleanupRs from "../../src-tauri/src/cleanup.rs?raw";
 import alertsRs from "../../src-tauri/src/health/alerts.rs?raw";
 import companionRs from "../../src-mobile/src/companion.rs?raw";
+import mobileClientRs from "../../src-mobile/src/client.rs?raw";
+import { JIRA_REASON } from "@/api/jira";
 import errorKindRs from "../../src-tauri/src/remote/error_kind.rs?raw";
 import eventsRs from "../../src-tauri/src/remote/events.rs?raw";
 import { ACTIVE_SECS } from "@/components/ArtifactsPage";
@@ -222,6 +224,16 @@ describe("the health gap rule", () => {
 describe("the biometric cancel marker", () => {
   it("is the exact string the companion rejects with", () => {
     expect(CANCELLED).toBe(rustStrConst(companionRs, "CANCELLED", "src-mobile/src/companion.rs"));
+  });
+});
+
+/// The Jira reason marker (#2047): the companion puts it before a Jira
+/// command's typed reason, and `failureOf` reads it. A mismatch would not
+/// fail loudly -- every rate limit, timeout and lost sign-in on the phone
+/// would quietly read as a failure with a line of JSON for its text.
+describe("the Jira reason marker", () => {
+  it("is the exact string the companion writes", () => {
+    expect(JIRA_REASON).toBe(rustStrConst(mobileClientRs, "JIRA_REASON", "src-mobile/src/client.rs"));
   });
 });
 

@@ -961,11 +961,32 @@ async fn ok_status(resp: reqwest::Response) -> Result<reqwest::Response, ClientE
     })
 }
 
-/// The desktop's refusal as one line: a JSON body's `error` or
-/// `message` string if it has one, else the body, else the status.
+/// The marker a rejection carries when the desktop sent a Jira command's
+/// typed reason (#2047): this, then `{"reason": <JiraError>, "message":
+/// <the desktop's sentence>}` as JSON. The sentence rides along so a
+/// state this build has never heard of still reads. A Tauri command's
+/// error crosses to the webview as a `String`, so the object travels as
+/// text after a marker, as [`crate::companion::CANCELLED`] does.
+///
+/// The frontend's copy is `JIRA_REASON` in `src/api/jira.ts`, asserted
+/// equal by `src/lib/mirroredConstants.test.ts`.
+pub const JIRA_REASON: &str = "headstate:jira-reason ";
+
+/// The desktop's refusal as one line: a Jira command's typed reason
+/// behind [`JIRA_REASON`] when the desktop sent one, else a JSON body's
+/// `error` or `message` string if it has one, else the body, else the
+/// status.
+///
+/// A desktop that predates the `jira` key sends `message` alone, which
+/// the webview reads as a failure with that text: the old behaviour.
 fn status_message(status: u16, body: &str) -> String {
     let body = body.trim();
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(body) {
+        if let Some(reason @ Value::Object(_)) = map.get("jira") {
+            let message = map.get("message").cloned().unwrap_or(Value::Null);
+            let marked = serde_json::json!({ "reason": reason, "message": message });
+            return format!("{JIRA_REASON}{marked}");
+        }
         for key in ["error", "message"] {
             if let Some(Value::String(s)) = map.get(key) {
                 return s.clone();
@@ -1132,6 +1153,39 @@ mod tests {
         // And an ordinary one degrades to exactly its old text.
         assert_eq!(
             status_message(500, r#"{"kind":"other","message":"boom"}"#),
+            "boom"
+        );
+    }
+
+    /// A Jira rejection's typed reason reaches the webview behind its
+    /// marker (#2047), as the JSON the desktop sent; one without it is
+    /// read exactly as before.
+    #[test]
+    fn a_jira_rejection_keeps_its_typed_reason() {
+        let limited = r#"{"kind":"other","message":"Jira is rate limiting requests; retry after 30s","jira":{"state":"rate_limited","retry_after_secs":30}}"#;
+        let line = status_message(500, limited);
+        let json = line
+            .strip_prefix(JIRA_REASON)
+            .expect("the reason is behind its marker");
+        assert_eq!(
+            serde_json::from_str::<Value>(json).unwrap(),
+            serde_json::json!({
+                "reason": { "state": "rate_limited", "retry_after_secs": 30 },
+                "message": "Jira is rate limiting requests; retry after 30s",
+            })
+        );
+
+        // An older desktop: the message, as before.
+        assert_eq!(
+            status_message(
+                500,
+                r#"{"kind":"other","message":"acli did not answer within 20s"}"#
+            ),
+            "acli did not answer within 20s"
+        );
+        // A `jira` key that is not an object is not a reason.
+        assert_eq!(
+            status_message(500, r#"{"kind":"other","message":"boom","jira":null}"#),
             "boom"
         );
     }

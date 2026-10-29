@@ -35,16 +35,47 @@ export class JiraFailure extends Error {
   }
 }
 
+/// The marker the phone's companion puts before a Jira command's typed
+/// reason (#2047). JSON follows: `{"reason": JiraError, "message": text}`.
+/// Must match `JIRA_REASON` in `src-mobile/src/client.rs`;
+/// `mirroredConstants.test.ts` asserts it.
+export const JIRA_REASON = "headstate:jira-reason ";
+
+/// Whether `e` is a `JiraError` this build knows.
+function isJiraError(e: unknown): e is JiraError {
+  return typeof e === "object" && e !== null && "state" in e && STATES.has((e as JiraError).state);
+}
+
+/// What follows `JIRA_REASON`: the typed reason when it holds a state this
+/// build knows, else `failed` with the desktop's own sentence. `null` when
+/// the text is not marked or what follows is not the expected JSON.
+function markedReason(text: string): JiraError | null {
+  if (!text.startsWith(JIRA_REASON)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.slice(JIRA_REASON.length));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const { reason, message } = parsed as { reason?: unknown; message?: unknown };
+  if (isJiraError(reason)) return reason;
+  // A state added on a newer desktop: its sentence still reads.
+  return typeof message === "string" ? { state: "failed", detail: message } : null;
+}
+
 /// The typed reason inside any rejection. On the desktop a Jira command
-/// rejects with the `JiraError` object itself; through the phone's
-/// transport a rejection arrives as text, where only "not asked" survives
-/// (by its marker) and anything else is `failed` with that text verbatim.
+/// rejects with the `JiraError` object itself. Through the phone's
+/// transport a rejection arrives as text: the reason as JSON behind
+/// `JIRA_REASON` from a desktop that sends it, or, from one that does not,
+/// the prose alone, where only "not asked" survives (by its marker) and
+/// anything else is `failed` with that text verbatim.
 export function failureOf(e: unknown): JiraError {
   if (e instanceof JiraFailure) return e.reason;
-  if (typeof e === "object" && e !== null && "state" in e && STATES.has((e as JiraError).state)) {
-    return e as JiraError;
-  }
+  if (isJiraError(e)) return e;
   const text = e instanceof Error ? e.message : String(e);
+  const marked = markedReason(text);
+  if (marked) return marked;
   if (text.startsWith(NOT_ASKED)) return { state: "not_asked" };
   return { state: "failed", detail: text };
 }
