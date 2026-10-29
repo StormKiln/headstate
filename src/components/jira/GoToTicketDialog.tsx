@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useJiraFind } from "@/api/jira";
+import { describeJiraError, failureOf, useJiraFind } from "@/api/jira";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { searchWords, ticketWork, type WorkRow } from "@/lib/jira/ticketWork";
 import { useFilters } from "@/store/filters";
@@ -100,7 +100,7 @@ function Results({ k, jira, close }: { k: string; jira: JiraState; close: () => 
           {(local?.prs.length ?? 0) === 0 ? searching : `Checking what else names ${k}…`}
         </p>
       ) : q.isError ? (
-        <p className="text-xs text-[#f85149]">Could not look for pull requests that name {k}: {String(q.error)}</p>
+        <p className="text-xs text-[#f85149]">Could not look for pull requests that name {k}: {describeJiraError(failureOf(q.error))}</p>
       ) : (
         <div className="flex flex-col gap-1 text-xs">
           {halves.map(([provider, s]) =>

@@ -64,7 +64,9 @@ fn issue(v: &Value) -> Option<JiraIssue> {
                 .pointer("/issuetype/hierarchyLevel")
                 .and_then(Value::as_i64)
                 .and_then(|n| i32::try_from(n).ok()),
+            icon_url: s("/issuetype/iconUrl"),
         },
+        id: v.get("id").and_then(Value::as_str).map(str::to_string),
         status: JiraStatus {
             name: status
                 .get("name")
@@ -137,6 +139,23 @@ pub fn projects(raw: &str) -> Result<Vec<JiraProject>, String> {
         .collect())
 }
 
+/// Whether `acli`'s text says the user is not signed in. Shared by
+/// `auth status` and by every other call's failure, so a search that fails
+/// for want of a login reads as signed out, not as a missing issue.
+pub fn says_logged_out(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "not logged in",
+        "not authenticated",
+        "no account",
+        "unauthorized",
+        "please log in",
+        "acli jira auth login",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
 /// `acli jira auth status`, which has no `--json`.
 ///
 /// Read conservatively: only a successful exit naming a site counts as
@@ -154,16 +173,7 @@ pub fn auth_status(success: bool, stdout: &str, stderr: &str) -> JiraConnection 
         })
         .find(|w| w.ends_with(".atlassian.net"))
         .map(str::to_string);
-    let logged_out = [
-        "not logged in",
-        "not authenticated",
-        "no account",
-        "unauthorized",
-        "please log in",
-        "acli jira auth login",
-    ]
-    .iter()
-    .any(|p| lower.contains(p));
+    let logged_out = says_logged_out(&lower);
     if success && !logged_out {
         let account = text
             .split_whitespace()
@@ -328,6 +338,19 @@ mod tests {
         let task = by("SAM-4");
         assert_eq!(task.issue_type.hierarchy_level, Some(0));
         assert_eq!(task.assignee.as_deref(), Some("Dana Example"));
+        // Neither is in `FIELDS`; acli returns both anyway (#2033).
+        assert_eq!(task.id.as_deref(), Some("10003"));
+        assert_eq!(epic.id.as_deref(), Some("10000"));
+        let icon = task.issue_type.icon_url.as_deref().unwrap();
+        assert!(
+            icon.ends_with("/issuetype/avatar/10318?size=medium"),
+            "{icon}"
+        );
+        assert!(epic.issue_type.icon_url.is_some());
+        assert_eq!(
+            task.updated, None,
+            "search refuses `updated`, so none came back"
+        );
         assert_eq!(task.project_key, "SAM", "search cannot return project");
         // Search refuses `parent`: nothing here says whether there is one.
         assert_eq!(task.parent_key, None);

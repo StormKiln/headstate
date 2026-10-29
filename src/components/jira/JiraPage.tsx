@@ -8,7 +8,7 @@ import { useJiraView } from "@/store/jira";
 import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
 import { openInHeadstate } from "./openInHeadstate";
-import { useJiraFind, useJiraIssue } from "@/api/jira";
+import { describeJiraError, failureOf, useJiraFind, useJiraIssue } from "@/api/jira";
 import type { JiraIssue, KeySearch } from "@/types/jira";
 import { useJiraBoard } from "./useJiraBoard";
 import { useJira } from "./jiraState";
@@ -246,7 +246,9 @@ function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | 
           {mine.length === 0 ? `Searching for pull requests that name ${k}…` : `Checking what else names ${k}…`}
         </p>
       ) : q.isError ? (
-        <p className="text-xs text-[#f85149]">Could not look for other pull requests: {String(q.error)}</p>
+        <p className="text-xs text-[#f85149]">
+          Could not look for other pull requests: {describeJiraError(failureOf(q.error))}
+        </p>
       ) : (
         halves.map(([provider, search]) =>
           search ? (

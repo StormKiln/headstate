@@ -1,7 +1,14 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import type { UiPrefs } from "@/api/tauri";
-import { useJiraAcliVersion, useJiraConnection, useJiraProjects, useJiraProjectStatuses } from "@/api/jira";
+import {
+  describeJiraError,
+  failureOf,
+  useJiraAcliVersion,
+  useJiraConnection,
+  useJiraProjects,
+  useJiraProjectStatuses,
+} from "@/api/jira";
 import type { ExpectedCategory, JiraConnection, StatusExpectation, StatusExpectations } from "@/types/jira";
 import { copyText } from "@/lib/clipboard";
 import { DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
@@ -80,7 +87,8 @@ export function JiraSettingsPanel({
                 <span className="h-4 w-40 animate-pulse rounded bg-[#21262d]" aria-label="Loading projects" />
               ) : projects.isError || projects.data?.error ? (
                 <p className="text-xs text-[#f85149]">
-                  Could not list your Jira projects: {projects.data?.error ?? "no answer from acli"}
+                  Could not list your Jira projects:{" "}
+                  {describeJiraError(projects.data?.error ?? failureOf(projects.error))}
                 </p>
               ) : (
                 <>
@@ -167,6 +175,11 @@ function ConnectionStatus({
             Install Atlassian&apos;s CLI
           </ExternalLink>
           , then sign in.
+          {connection.searched.length > 0 ? (
+            <span className="block text-[#8b949e]">
+              Looked in {connection.searched.join(", ")}. If it is elsewhere, set HEADSTATE_ACLI to its path.
+            </span>
+          ) : null}
         </p>
       );
     case "not_logged_in":
@@ -211,7 +224,7 @@ function AcliVersion({ asked }: { asked: boolean }) {
     return <span className="h-3 w-32 animate-pulse rounded bg-[#21262d]" aria-label="Reading the acli version" />;
   }
   if (version.isError) {
-    return <p className="text-xs text-[#8b949e]">Could not read the acli version: {String(version.error)}</p>;
+    return <p className="text-xs text-[#8b949e]">Could not read the acli version: {describeJiraError(failureOf(version.error))}</p>;
   }
   return <p className="text-xs text-[#8b949e]">acli {version.data}</p>;
 }
@@ -309,8 +322,8 @@ function ProjectExpectations({
         <span className="h-3 w-48 animate-pulse rounded bg-[#21262d]" aria-label={`Reading ${project}'s statuses`} />
       ) : seen.isError || seen.data?.error ? (
         <p className="text-xs text-[#f85149]">
-          Could not read the statuses in {project}&apos;s issues: {seen.data?.error ?? String(seen.error)}. The
-          three categories still apply.
+          The three categories still apply. Could not read the statuses in {project}&apos;s issues:{" "}
+          {describeJiraError(seen.data?.error ?? failureOf(seen.error))}
         </p>
       ) : seen.data.truncated ? (
         <p className="text-xs text-[#8b949e]">

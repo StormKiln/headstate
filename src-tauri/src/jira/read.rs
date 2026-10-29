@@ -6,10 +6,14 @@
 //! [`PARENT_TTL`]. At most [`PARENT_BUDGET`] parents are read per call; the
 //! rest go out with `parent_checked: false`, which the page shows as "not
 //! loaded yet" and asks again for shortly.
+//!
+//! A read that ends early -- rate limited, timed out, signed out -- reads
+//! no parents at all: the next call would meet the same refusal.
 
 use super::cache::{self, Cached};
 use super::cli;
-use super::model::{IssueBatch, JiraIssue};
+use super::model::{IssueBatch, JiraError, JiraIssue};
+use super::transport::Transport;
 use crate::store::{open_db, StoreError};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
@@ -41,7 +45,7 @@ where
 }
 
 /// What Jira says about `keys`, from the cache where it is fresh.
-pub async fn issues(bin: &Path, db: &Path, site: Option<&str>, keys: &[String]) -> IssueBatch {
+pub async fn issues(t: &Transport, db: &Path, site: Option<&str>, keys: &[String]) -> IssueBatch {
     let mut wanted: Vec<String> = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
     for k in keys {
@@ -68,7 +72,7 @@ pub async fn issues(bin: &Path, db: &Path, site: Option<&str>, keys: &[String]) 
     let mut batch = if stale.is_empty() {
         IssueBatch::default()
     } else {
-        cli::issues_at(bin, &stale).await
+        t.issues(&stale).await
     };
     batch.missing.extend(invalid);
     remember_reads(db, &batch.issues, now).await;
@@ -87,23 +91,27 @@ pub async fn issues(bin: &Path, db: &Path, site: Option<&str>, keys: &[String]) 
         rows.push(fresh_row(issue, prior, now));
     }
     // A read that FAILED is not "Jira returned nothing": a key it left
-    // missing is answered from the last read instead (#1044).
+    // missing, or never reached because a rate limit or timeout ended it,
+    // is answered from the last read instead (#1044). An old answer is
+    // still an answer; no answer at all stays missing or unasked.
     if batch.error.is_some() {
-        batch.missing.retain(|k| match cached.remove(k) {
+        let mut from_cache = |k: &String| match cached.remove(k) {
             Some(c) => {
                 rows.push(c);
                 false
             }
             None => true,
-        });
+        };
+        batch.missing.retain(&mut from_cache);
+        batch.unasked.retain(&mut from_cache);
     }
-    batch.issues = finish(bin, db, site, rows).await;
+    finish_batch(t, db, site, rows, &mut batch).await;
     batch
 }
 
 /// Open work assigned to the signed-in user, with parents as for `issues`.
-pub async fn assigned(bin: &Path, db: &Path, site: Option<&str>, limit: usize) -> IssueBatch {
-    let mut batch = cli::assigned_at(bin, limit).await;
+pub async fn assigned(t: &Transport, db: &Path, site: Option<&str>, limit: usize) -> IssueBatch {
+    let mut batch = t.assigned(limit).await;
     let now = Utc::now();
     remember_reads(db, &batch.issues, now).await;
     let keys: Vec<String> = batch.issues.iter().map(|i| i.key.clone()).collect();
@@ -117,8 +125,26 @@ pub async fn assigned(bin: &Path, db: &Path, site: Option<&str>, limit: usize) -
             fresh_row(issue, prior, now)
         })
         .collect();
-    batch.issues = finish(bin, db, site, rows).await;
+    finish_batch(t, db, site, rows, &mut batch).await;
     batch
+}
+
+/// Fill `batch.issues` from `rows`, reading parents unless the read has
+/// already been ended. A parent read that ends it is reported on the
+/// batch, unless the batch already carries a reason.
+async fn finish_batch(
+    t: &Transport,
+    db: &Path,
+    site: Option<&str>,
+    rows: Vec<Cached>,
+    batch: &mut IssueBatch,
+) {
+    let may_call = !batch.error.as_ref().is_some_and(JiraError::ends_the_read);
+    let (issues, ended) = finish(t, db, site, rows, may_call).await;
+    batch.issues = issues;
+    if let Some(e) = ended {
+        batch.error.get_or_insert(e);
+    }
 }
 
 /// A status just read, carrying the parent the cache already holds.
@@ -145,27 +171,33 @@ async fn remember_reads(db: &Path, issues: &[JiraIssue], now: DateTime<Utc>) {
 }
 
 /// Read the parents that are unknown or old, within the budget, then turn
-/// rows into what the UI is sent.
+/// rows into what the UI is sent. With `may_call` false no parent is read.
+/// Returns the failure that ended the parent reads, if one did.
 async fn finish(
-    bin: &Path,
+    t: &Transport,
     db: &Path,
     site: Option<&str>,
     mut rows: Vec<Cached>,
-) -> Vec<JiraIssue> {
+    may_call: bool,
+) -> (Vec<JiraIssue>, Option<JiraError>) {
     let now = Utc::now();
+    let mut ended: Option<JiraError> = None;
     let mut due: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].parent_read_at.is_none_or(|t| now - t >= PARENT_TTL))
         .collect();
     // Never-read first: an old answer is still an answer.
     due.sort_by_key(|&i| rows[i].parent_read_at.is_some());
-    due.truncate(PARENT_BUDGET);
+    due.truncate(if may_call { PARENT_BUDGET } else { 0 });
 
     for chunk in due.chunks(PARENT_PARALLEL) {
+        if ended.is_some() {
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for &i in chunk {
-            let bin = bin.to_path_buf();
+            let t = t.clone();
             let key = rows[i].issue.key.clone();
-            set.spawn(async move { (i, cli::parent_at(&bin, &key).await) });
+            set.spawn(async move { (i, t.parent(&key).await) });
         }
         let mut read: Vec<(String, Option<String>)> = Vec::new();
         while let Some(Ok((i, got))) = set.join_next().await {
@@ -176,7 +208,12 @@ async fn finish(
                     read.push((rows[i].issue.key.clone(), parent));
                 }
                 // Left unchecked, and asked again next time.
-                Err(e) => log::debug!("jira: parent of {} not read: {e}", rows[i].issue.key),
+                Err(e) => {
+                    log::debug!("jira: parent of {} not read: {e}", rows[i].issue.key);
+                    if e.ends_the_read() {
+                        ended.get_or_insert(e);
+                    }
+                }
             }
         }
         if !read.is_empty() {
@@ -190,24 +227,26 @@ async fn finish(
             }
         }
     }
-    rows.iter()
+    let issues = rows
+        .iter()
         .map(|c| {
             let mut issue = c.resolved();
             issue.url = super::parse::browse_url(site, &issue.key);
             issue
         })
-        .collect()
+        .collect();
+    (issues, ended)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::jira::cli::Acli;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     /// A stand-in `acli`: search answers from `search`, view from `view`,
     /// and every call is appended to `calls` so a test can count them.
-    fn fake(dir: &Path, search: &str, view: &str) -> PathBuf {
+    fn fake(dir: &Path, search: &str, view: &str) -> Transport {
         let bin = dir.join("acli");
         let calls = dir.join("calls");
         std::fs::write(
@@ -219,7 +258,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        bin
+        Transport::Acli(Acli::new(bin))
     }
 
     fn calls(dir: &Path, what: &str) -> usize {
@@ -287,6 +326,7 @@ mod tests {
         std::fs::write(&broken, "#!/bin/sh\necho 'network down' >&2; exit 1\n").unwrap();
         std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o700)).unwrap();
 
+        let broken = Transport::Acli(Acli::new(broken));
         let got = issues(&broken, &db, None, &["ABC-1".into()]).await;
         assert_eq!(got.issues.len(), 1, "partial is not nothing");
         assert!(got.missing.is_empty());
@@ -307,5 +347,57 @@ mod tests {
         .await;
         assert_eq!(got.missing, ["abc-1) OR (x"]);
         assert_eq!(calls(dir.path(), "search"), 0);
+    }
+
+    /// A rate-limited read keeps what the cache knew, leaves what it never
+    /// knew unasked, and spends nothing on parents: the next call would be
+    /// refused too (#2033).
+    #[tokio::test]
+    async fn a_rate_limited_read_answers_from_the_cache_and_reads_no_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        issues(&fake(dir.path(), ONE, VIEW), &db, None, &["ABC-1".into()]).await;
+        let old = (Utc::now() - Duration::minutes(5)).to_rfc3339();
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "UPDATE jira_issue SET read_at = ?1, parent_read_at = ?1",
+                [&old],
+            )
+            .unwrap();
+        // Make the parent due again, so only the rate limit can stop it.
+        open_db(&db)
+            .unwrap()
+            .execute("UPDATE jira_issue SET parent_read_at = NULL", [])
+            .unwrap();
+        let limited_dir = tempfile::tempdir().unwrap();
+        let limited = limited_dir.path().join("acli");
+        std::fs::write(
+            &limited,
+            format!(
+                "#!/bin/sh\necho \"$3\" >> '{}'\necho 'HTTP 429 Too Many Requests' >&2; exit 1\n",
+                limited_dir.path().join("calls").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&limited, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let limited = Transport::Acli(Acli::new(limited));
+
+        let got = issues(&limited, &db, None, &["ABC-1".into(), "ABC-3".into()]).await;
+        assert_eq!(
+            got.error,
+            Some(JiraError::RateLimited {
+                retry_after_secs: None
+            })
+        );
+        assert_eq!(got.issues.len(), 1, "the cached answer still stands");
+        assert_eq!(got.unasked, ["ABC-3"], "never known, never asked");
+        assert!(got.missing.is_empty());
+        assert_eq!(calls(limited_dir.path(), "search"), 1);
+        assert_eq!(
+            calls(limited_dir.path(), "view"),
+            0,
+            "no parent read after a rate limit"
+        );
     }
 }

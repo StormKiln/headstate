@@ -1003,14 +1003,15 @@ fn ok<T: Serialize>(value: T) -> Result<Value, RemoteError> {
         .map_err(|e| RemoteError::Command(CommandError::classify(e.to_string())))
 }
 
-/// A command's `Result<T, String>`, as the webview would receive it.
+/// A command's `Result<T, String>`, as the webview would receive it. A typed
+/// rejection such as `JiraError` crosses as its `Display` text.
 ///
 /// The single place a command's own rejection becomes a `RemoteError`,
 /// which is why classifying here covers all 103 dispatch arms without
 /// touching one command signature (#1202).
-fn res<T: Serialize>(result: Result<T, String>) -> Result<Value, RemoteError> {
+fn res<T: Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Result<Value, RemoteError> {
     result
-        .map_err(|m| RemoteError::Command(CommandError::classify(m)))
+        .map_err(|m| RemoteError::Command(CommandError::classify(m.to_string())))
         .and_then(ok)
 }
 
@@ -1969,7 +1970,10 @@ mod tests {
                 commands::AUTH_ERR
             )))
         );
-        assert_eq!(res(Ok(("a".to_string(), 1u64))), Ok(json!(["a", 1])));
+        assert_eq!(
+            res(Ok::<_, String>(("a".to_string(), 1u64))),
+            Ok(json!(["a", 1]))
+        );
     }
 
     /// The two superseded update commands are off the wire (#964).

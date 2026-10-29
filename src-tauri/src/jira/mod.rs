@@ -24,8 +24,9 @@ pub mod lookup;
 pub mod model;
 pub mod parse;
 pub mod read;
+pub mod transport;
 
 pub use model::{
-    IssueBatch, JiraConnection, JiraIssue, JiraIssueType, JiraProject, JiraStatus, ProjectList,
-    StatusCategory,
+    IssueBatch, JiraConnection, JiraError, JiraIssue, JiraIssueType, JiraProject, JiraStatus,
+    ProjectList, StatusCategory,
 };

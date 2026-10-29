@@ -190,7 +190,7 @@ pub mod test_home {
 /// winget and Scoop install under the user's profile, so the path depends
 /// on who is logged in. Empty on non-Windows, where the constants above
 /// already cover the realistic locations.
-fn user_fallback_dirs() -> Vec<String> {
+pub(crate) fn user_fallback_dirs() -> Vec<String> {
     if !cfg!(windows) {
         return Vec::new();
     }

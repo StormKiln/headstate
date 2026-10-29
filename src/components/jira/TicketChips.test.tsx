@@ -129,6 +129,22 @@ describe("TicketChips", () => {
     expect(await screen.findByText("ABC-3 · not checked yet")).toBeTruthy();
   });
 
+  /// A rate limit is not a failure and not "missing": the chip says so,
+  /// and its title says when Headstate will ask again.
+  it("shows a rate-limited key as unasked, with when it will be retried", async () => {
+    // The loader holds off for the limit's length after this reply. Pin
+    // the clock so the hold ends, for later tests, when it is restored.
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      issues.mockResolvedValue(batch({ unasked: ["ABC-5"], error: { state: "rate_limited", retry_after_secs: 42 } }));
+      mount(prefs(), [prLink("ABC-5")]);
+      const chip = await screen.findByText("ABC-5 · rate limited");
+      expect(chip.getAttribute("title")).toMatch(/not been checked yet\. .*ask again in 42s/);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("shows a failed read as a failure", async () => {
     issues.mockRejectedValue("acli did not respond within 20s");
     mount(prefs(), [prLink("ABC-4")]);
@@ -137,7 +153,7 @@ describe("TicketChips", () => {
 
   /// Without the project list a key cannot be told from a look-alike.
   it("renders nothing when the project list could not be read", async () => {
-    links.mockResolvedValue(index([], { projects: [], error: "Could not list your Jira projects: unauthorized" }));
+    links.mockResolvedValue(index([], { projects: [], error: { state: "failed", detail: "unauthorized" } }));
     const { container } = renderWithQuery(
       <JiraProvider prefs={prefs()}>
         <TicketChips row={ROW} />
