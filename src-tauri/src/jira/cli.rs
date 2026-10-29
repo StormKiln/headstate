@@ -365,6 +365,26 @@ impl Acli {
         out
     }
 
+    /// Issues matching what a person typed (#2046), newest first: the key
+    /// itself when the text is one, otherwise Jira's text search. Nothing
+    /// is asked for text with no word in it.
+    pub async fn search_text(&self, text: &str, limit: usize) -> IssueBatch {
+        let Some(jql) = text_jql(text) else {
+            return IssueBatch::default();
+        };
+        match self.search(&jql, limit).await {
+            Ok(issues) => IssueBatch {
+                truncated: issues.len() >= limit,
+                issues,
+                ..IssueBatch::default()
+            },
+            Err(e) => IssueBatch {
+                error: Some(e),
+                ..IssueBatch::default()
+            },
+        }
+    }
+
     /// Open work assigned to the signed-in user, newest first.
     pub async fn assigned(&self, limit: usize) -> IssueBatch {
         let jql = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
@@ -380,6 +400,30 @@ impl Acli {
             },
         }
     }
+}
+
+/// The JQL for a typed search, or `None` when there is nothing to search
+/// for. A key is looked up as a key. Anything else becomes words for
+/// `text ~`: only letters, digits, `-`, `_` and `.` are kept, so no quote,
+/// backslash or Lucene operator reaches the query -- a quote inside
+/// `text ~ "..."` is a parse error in live `acli`, not a search.
+pub fn text_jql(text: &str) -> Option<String> {
+    let t = text.trim();
+    let upper = t.to_ascii_uppercase();
+    if is_key(&upper) {
+        return Some(format!("key = {upper}"));
+    }
+    let words: Vec<&str> = t
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "text ~ \"{}\" ORDER BY updated DESC",
+        words.join(" ")
+    ))
 }
 
 /// What a failed call means, from what `acli` printed.
@@ -678,6 +722,32 @@ mod tests {
 
     fn keys(n: usize) -> Vec<String> {
         (1..=n).map(|n| format!("ABC-{n}")).collect()
+    }
+
+    /// #2046: a typed key is a key lookup; other text keeps only its words,
+    /// so nothing typed can reach JQL as syntax.
+    #[test]
+    fn typed_text_becomes_safe_jql() {
+        assert_eq!(text_jql(" abc-1 ").as_deref(), Some("key = ABC-1"));
+        assert_eq!(
+            text_jql(r#"login "fix" \ (x) OR*"#).as_deref(),
+            Some(r#"text ~ "login fix x OR" ORDER BY updated DESC"#)
+        );
+        assert_eq!(text_jql("  "), None);
+        assert_eq!(text_jql("\"*\""), None);
+    }
+
+    #[tokio::test]
+    async fn a_text_search_with_no_words_asks_nothing() {
+        let log = tempfile::tempdir().unwrap();
+        let calls = log.path().join("calls");
+        let (_d, acli) = fake(&format!("echo x >> '{}'; echo '[]'", calls.display()));
+        let got = acli.search_text(" \" ", 20).await;
+        assert!(got.issues.is_empty() && got.error.is_none());
+        assert!(!calls.exists(), "acli was asked about no words");
+        // Proves the stand-in records: a real word is asked.
+        acli.search_text("login", 20).await;
+        assert!(calls.exists());
     }
 
     #[tokio::test]

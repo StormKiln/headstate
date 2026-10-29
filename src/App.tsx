@@ -1,5 +1,7 @@
 import { useMeasurementsEnabled } from "./api/clientMeasurements";
 import { JiraProvider } from "./components/jira/JiraContext";
+import { useNoTicketIndex } from "./components/jira/useJiraValue";
+import { filterNoTicket } from "./lib/jira/noTicket";
 import { capabilityOff } from "./components/viewMenu";
 import { JiraSidebar } from "./components/jira/JiraSidebar";
 import { JiraPage } from "./components/jira/JiraPage";
@@ -380,7 +382,14 @@ export default function App() {
     : isError ? sourceBanner(authoredErrorText, authoredNotAsked)
     : pollError !== null ? sourceBanner(pollError, false) : null;
   const githubCoverage = githubReceipt.coverage ?? "unknown";
-  const visible = sortPrs(applyFilters(source, filters), filters.sort);
+  // "No ticket" (#2046) needs the Jira index, so it is applied here rather
+  // than in `applyFilters`, to My PRs only, and only while Settings › Jira
+  // offers it. Pull requests the index has not read yet are left out and
+  // counted, never shown as having no ticket.
+  const noTicketIx = useNoTicketIndex(prefs);
+  const filtered = applyFilters(source, filters);
+  const noTicket = view === "my-prs" && noTicketIx !== null && filters.noTicketOnly === true ? filterNoTicket(filtered, noTicketIx) : null;
+  const visible = sortPrs(noTicket ? noTicket.shown : filtered, filters.sort);
 
   // A cursor past the end of a newly-filtered list points at nothing.
   // Clamping here rather than in the key handler means it is correct for
@@ -1054,6 +1063,11 @@ export default function App() {
             {(view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner) ? <p role="status" className="mb-3 text-xs text-[#d29922]">Saved snapshot for {view === "my-prs" ? authoredSavedOwner : reviewingSavedOwner} from the paired desktop. Current account unverified; read-only.</p> : null}
             {view === "my-prs" && authoredStaleSecs != null ? <p className="mb-3 text-xs text-[#d29922]">Showing a saved list from {relativeSeconds(authoredStaleSecs)}.</p> : null}
             <FilterBar prs={source} />
+            {noTicket && noTicket.pending > 0 ? (
+              <p role="status" className="mb-3 text-xs text-[#8b949e]">
+                {noTicket.pending} more not checked for a ticket yet, so not shown.
+              </p>
+            ) : null}
             {/* Fed the UNFILTERED list on purpose: selection is keyed by
                 repo#number, so narrowing a filter after selecting must
                 not shrink the batch out from under the user. */}

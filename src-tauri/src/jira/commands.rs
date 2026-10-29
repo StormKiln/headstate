@@ -181,10 +181,12 @@ pub async fn jira_links(app: AppHandle) -> Result<LinkIndex, JiraError> {
         .filter(|p| !excluded.contains(p))
         .collect();
     let dict = dictionary.clone();
-    let links = crate::commands::off_main_thread(move || {
+    let (links, checked) = crate::commands::off_main_thread(move || {
         let mut conn = open_db(&db)?;
+        // Before the rebuild: see `checked_authored`.
+        let checked = super::index::checked_authored(&conn)?;
         super::index::refresh_prs(&mut conn)?;
-        super::index::load(&conn, &dict)
+        Ok::<_, crate::store::StoreError>((super::index::load(&conn, &dict)?, checked))
     })
     .await
     .map_err(|e| JiraError::failed(e.to_string()))?;
@@ -194,6 +196,7 @@ pub async fn jira_links(app: AppHandle) -> Result<LinkIndex, JiraError> {
         links,
         projects,
         error,
+        checked,
     })
 }
 
@@ -350,6 +353,31 @@ async fn assigned_with(
     Ok(super::read::assigned(&t?, db, site, ASSIGNED_LIMIT).await)
 }
 
+/// How many issues a typed search returns: enough to pick from, and the
+/// UI says "at least" when it is reached.
+pub(super) const SEARCH_LIMIT: usize = 20;
+
+/// Issues matching what the user typed, for choosing a ticket to link to a
+/// pull request (#2046). A read: it changes nothing in Jira.
+#[tauri::command]
+pub async fn jira_search(app: AppHandle, text: String) -> Result<IssueBatch, JiraError> {
+    let t = gate(enabled(&app).await, Transport::locate);
+    let site = site(&app).await;
+    search_with(t, site.as_deref(), &text).await
+}
+
+async fn search_with(
+    t: Result<Transport, JiraError>,
+    site: Option<&str>,
+    text: &str,
+) -> Result<IssueBatch, JiraError> {
+    let mut batch = t?.search_text(text, SEARCH_LIMIT).await;
+    for issue in &mut batch.issues {
+        issue.url = super::parse::browse_url(site, &issue.key);
+    }
+    Ok(batch)
+}
+
 /// Every pull request, worktree and branch that names `key` (#2041): the
 /// database first, then -- when it holds no pull request, or `more` asks --
 /// one GitHub search across the owners the user already works in, and one
@@ -480,6 +508,7 @@ echo '[]'
             issues_with(t(), &db, None, &keys, true).await.err(),
             assigned_with(t(), &db, None).await.err(),
             transition_with(t(), &db, None, "ABC-1", "Done").await.err(),
+            search_with(t(), None, "login").await.err(),
         ]
     }
 
@@ -502,8 +531,8 @@ echo '[]'
         let got = every_command(true, dir.path()).await;
         assert!(got.iter().all(Option::is_none), "{got:?}");
         assert!(
-            calls(dir.path()) >= 4,
-            "connection, projects, issues, assigned"
+            calls(dir.path()) >= 5,
+            "connection, projects, issues, assigned, search"
         );
     }
 }

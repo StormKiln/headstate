@@ -36,6 +36,7 @@ const prefs = (jira_enabled: boolean): UiPrefs => ({
   jira_status_expectations: {},
   jira_chips_on_prs: true,
   jira_branch_template: "",
+  jira_no_ticket_marker: false,
 });
 
 beforeEach(() => {
@@ -137,6 +138,17 @@ describe("JiraSettingsPanel", () => {
     expect((box as HTMLInputElement).checked).toBe(true);
     fireEvent.click(box);
     expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_chips_on_prs: false }));
+  });
+
+  /// #2046: off by default, and asked for here.
+  it("turns the no-ticket marker on", async () => {
+    connection.mockResolvedValue({ state: "not_installed", searched: [] });
+    const setPrefs = vi.fn(() => Promise.resolve());
+    renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={setPrefs} />);
+    const box = screen.getByRole("checkbox", { name: "Mark my pull requests that name no ticket" });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(box);
+    expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_no_ticket_marker: true }));
   });
 
   describe("status expectations", () => {

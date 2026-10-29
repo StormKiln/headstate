@@ -106,6 +106,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_projects", Class::Read),
     ("jira_issues", Class::Read),
     ("jira_assigned", Class::Read),
+    ("jira_search", Class::Read),
     ("jira_links", Class::Read),
     ("jira_find", Class::Read),
     ("jira_acli_version", Class::Read),
@@ -409,6 +410,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_transition", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
+    ("set_pr_title", Class::Write),
     // Merge or queue a native GitHub stack through the async merge API
     // (#1468).
     //

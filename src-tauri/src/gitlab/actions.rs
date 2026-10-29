@@ -35,6 +35,10 @@ pub enum Action {
     RetryCi,
     EnableAutoMerge,
     DisableAutoMerge,
+    /// Set the MR's title to `body` (#2046), for linking a Jira ticket by
+    /// its key. Only over `expected_title`: a title changed on GitLab since
+    /// the row was read is never overwritten.
+    SetTitle,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +74,9 @@ pub struct ActionRequest {
     pub expected_head: Option<String>,
     pub body: Option<String>,
     pub discussion_id: Option<String>,
+    /// The title the row showed, for `SetTitle`.
+    #[serde(default)]
+    pub expected_title: Option<String>,
 }
 
 /// Unverified is deliberately a resolved receipt, not a retryable error. The
@@ -394,6 +401,11 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
             opened && yes(p, "canMerge") && auto == Some(true),
             "Canceling auto-merge requires active auto-merge and merge permission.",
         ),
+        (
+            Action::SetTitle,
+            opened && mutable,
+            "Changing the title requires an open MR and update permission.",
+        ),
     ]
     .into_iter()
     .map(|(action, allowed, reason)| Capability {
@@ -632,6 +644,24 @@ fn prepare(base: &str, request: &ActionRequest, context: &Context) -> Result<Wri
     } else {
         None
     };
+    let title = if request.action == Action::SetTitle {
+        let title = request
+            .body
+            .as_deref()
+            .filter(|t| !t.trim().is_empty() && t.chars().count() <= 255)
+            .ok_or("A title of 1–255 characters is required.")?;
+        if request.expected_title.is_none()
+            || context.raw["title"].as_str() != request.expected_title.as_deref()
+        {
+            return Err(
+                "The MR title changed on GitLab or was not supplied. Refresh before changing it."
+                    .into(),
+            );
+        }
+        Some(title)
+    } else {
+        None
+    };
     let discussion = if matches!(
         request.action,
         Action::Reply | Action::Resolve | Action::Unresolve
@@ -704,6 +734,7 @@ fn prepare(base: &str, request: &ActionRequest, context: &Context) -> Result<Wri
             format!("{base}/cancel_merge_when_pipeline_succeeds"),
             json!({}),
         ),
+        Action::SetTitle => ("PUT", base.into(), json!({ "title": title })),
     };
     Ok(Write {
         method,
@@ -918,6 +949,9 @@ async fn verify(
                 Action::Reopen => v["state"].as_str() == Some("opened"),
                 Action::Draft => v["draft"].as_bool() == Some(true),
                 Action::Ready => v["draft"].as_bool() == Some(false),
+                Action::SetTitle => {
+                    v["title"].as_str().is_some() && v["title"].as_str() == request.body.as_deref()
+                }
                 _ => false,
             })
         }
@@ -970,6 +1004,7 @@ mod tests {
             expected_head: Some("old-head".into()),
             body: Some("Please review this change.".into()),
             discussion_id: Some(THREAD.into()),
+            expected_title: Some("Review".into()),
         }
     }
 
@@ -1510,6 +1545,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             Action::Rebase,
             Action::EnableAutoMerge,
             Action::DisableAutoMerge,
+            Action::SetTitle,
         ] {
             let mut r = raw();
             let mut p = permissions();
@@ -1555,6 +1591,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                         Action::Reopen => r["state"] = json!("opened"),
                         Action::Draft => r["draft"] = json!(true),
                         Action::Ready => r["draft"] = json!(false),
+                        Action::SetTitle => r["title"] = json!(req.body),
                         _ => unreachable!(),
                     }
                     steps.push(read(format!("{BASE}?include_rebase_in_progress=true"), r.clone()));

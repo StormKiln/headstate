@@ -14,7 +14,7 @@
 //! the day it is switched on.
 
 use super::keys::{keys_for_pr, keys_in, FoundIn};
-use super::model::{JiraLink, LinkTarget, PrRole};
+use super::model::{CheckedPr, JiraLink, LinkTarget, PrRole};
 use crate::identity::{Provider, Source};
 use crate::store::source_cache::{load_source_snapshot, SnapshotData};
 use crate::store::{settings, CachedList, StoreError};
@@ -192,6 +192,43 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
     settings::set(&tx, settings::keys::JIRA_INDEX_FINGERPRINT, &print)?;
     tx.commit()?;
     Ok(true)
+}
+
+/// The open pull requests in every readable authored list, as stored
+/// (#2046). Read BEFORE [`refresh_prs`] by a caller that wants both: the
+/// links are then at least as new as this, so a pull request listed here
+/// cannot be missing a key a newer list gave it.
+///
+/// A list that could not be read contributes nothing, so its pull requests
+/// stay "not looked at" rather than becoming "names no ticket".
+pub fn checked_authored(conn: &Connection) -> Result<Vec<CheckedPr>, StoreError> {
+    let sources: Vec<(String, String)> = conn
+        .prepare("SELECT provider, host FROM snapshot WHERE id = 1")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut out = Vec::new();
+    for (provider, host) in sources {
+        let Ok(provider) = serde_json::from_value::<Provider>(provider.into()) else {
+            continue;
+        };
+        let source = Source { provider, host };
+        match load_source_snapshot(conn, &source, CachedList::Authored)?.data {
+            SnapshotData::Available { prs, .. } => out.extend(prs.into_iter().map(|p| CheckedPr {
+                url: p.url,
+                title: p.title,
+                head_ref: p.head_ref,
+            })),
+            SnapshotData::GitLabAvailable { mrs, .. } => {
+                out.extend(mrs.into_iter().map(|m| CheckedPr {
+                    url: m.url,
+                    title: m.title,
+                    head_ref: m.head_ref,
+                }))
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Replace one repository's worktree links with what a scan just found.
@@ -390,6 +427,21 @@ mod tests {
         assert!(got.iter().all(|l| l.key != "UTF-8"));
         let only_abc: HashSet<String> = ["ABC".to_string()].into();
         assert_eq!(keys(&load(&conn, &only_abc).unwrap()), [("ABC-1", true)]);
+    }
+
+    /// #2046: every authored pull request the index read is listed, with
+    /// or without a key, as it was read -- the frontend tells "names no
+    /// ticket" from "not looked at yet" by it.
+    #[test]
+    fn checked_lists_every_authored_pr_as_read() {
+        let conn = db();
+        assert!(checked_authored(&conn).unwrap().is_empty());
+        save(&conn, &[pr(1, "ABC-1 fix", "x"), pr(2, "No key", "y")]);
+        let got = checked_authored(&conn).unwrap();
+        let titles: Vec<&str> = got.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["ABC-1 fix", "No key"]);
+        assert_eq!(got[1].head_ref, "y");
+        assert!(got[1].url.ends_with("/pull/2"));
     }
 
     #[test]

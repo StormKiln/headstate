@@ -213,6 +213,9 @@ export interface UiPrefs {
   /// How "Start work" names a ticket's branch (#2045), with `{key}` and
   /// `{summary}` placeholders. Empty: the default, `{key}-{summary}`.
   jira_branch_template: string;
+  /// Whether the user's open pull requests that name no ticket are marked
+  /// "no ticket", with a filter in My PRs (#2046). Default false.
+  jira_no_ticket_marker: boolean;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
@@ -495,6 +498,8 @@ export const jiraProjects = () => call<ProjectList>("jira_projects");
 export const jiraIssues = (keys: string[], fresh = false) => call<IssueBatch>("jira_issues", { keys, fresh });
 export const jiraAssigned = () => call<IssueBatch>("jira_assigned");
 export const jiraLinks = () => call<LinkIndex>("jira_links");
+/// Issues matching typed text (#2046): the key itself, or Jira's text search.
+export const jiraSearch = (text: string) => call<IssueBatch>("jira_search", { text });
 export const jiraFind = (key: string, more: boolean) => call<KeyLookup>("jira_find", { key, more });
 export const jiraAcliVersion = () => call<string>("jira_acli_version");
 export const jiraProjectStatuses = (project: string) =>
@@ -760,6 +765,19 @@ export const claudeProposeStop = (sessionIds: string[]) =>
 /// a session on a Mac it is not sitting at.
 export const claudeStopSession = (sessionId: string) =>
   call<ClaudeStopOutcome>("claude_stop_session", { sessionId });
+
+/// How a title change ended (#2046); mirrors `github::mutate::TitleOutcome`.
+/// Only `written` is confirmed: `unconfirmed` may or may not have landed.
+export type TitleOutcome =
+  | { state: "written"; title: string }
+  | { state: "unconfirmed"; title: string | null }
+  | { state: "changed"; title: string }
+  | { state: "already_set" };
+
+/// Set a GitHub pull request's title, only over `expectedTitle` -- the one
+/// the row showed -- and read back after (#2046).
+export const setPrTitle = (id: string, repo: string, number: number, expectedTitle: string, title: string) =>
+  call<TitleOutcome>("set_pr_title", { id, repo, number, expectedTitle, title });
 
 /// Merge a pull request when its checks pass, or cancel that.
 ///

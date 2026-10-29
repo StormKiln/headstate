@@ -586,6 +586,7 @@ mod tests {
             expected_head: row.head_oid.clone(),
             body: None,
             discussion_id: None,
+            expected_title: None,
         };
         let mut receipt = Receipt {
             session: None,

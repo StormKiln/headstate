@@ -140,6 +140,56 @@ const UPDATE_BRANCH_DOC: &str = "mutation($id: ID!, $oid: GitObjectID!) { \
      updatePullRequestBranch(input: { pullRequestId: $id, expectedHeadOid: $oid }) \
      { clientMutationId } }";
 
+/// Change a pull request's title (#2046), for linking a Jira ticket by
+/// putting its key in front. The title, never the branch: renaming a
+/// pushed branch closes the GitHub pull request.
+const UPDATE_TITLE_DOC: &str = "mutation($id: ID!, $title: String!) { \
+     updatePullRequest(input: { pullRequestId: $id, title: $title }) \
+     { pullRequest { title } } }";
+
+/// The title as GitHub has it now: read before the write, so a title
+/// changed on GitHub since the list was read is not overwritten, and
+/// again after it, so what is shown is what GitHub reports. A read that
+/// serves a write, kept beside it.
+const TITLE_READ_DOC: &str = "query($id: ID!) { node(id: $id) { ... on PullRequest { title } } }";
+
+/// How a title change ended. Serialized for the UI, which says each one
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TitleOutcome {
+    /// Written, and read back as `title`.
+    Written { title: String },
+    /// Written, but the read-back failed or showed something else: GitHub
+    /// may or may not hold the new title. `title` is what it showed, if
+    /// it answered.
+    Unconfirmed { title: Option<String> },
+    /// Not written: GitHub's title is no longer the one the row showed.
+    Changed { title: String },
+    /// Not written: GitHub's title is already the one asked for.
+    AlreadySet,
+}
+
+/// Whether to write, from the title GitHub has now: `None` to go ahead,
+/// or why not.
+pub(crate) fn title_precheck(now: &str, expected: &str, wanted: &str) -> Option<TitleOutcome> {
+    if now == wanted {
+        Some(TitleOutcome::AlreadySet)
+    } else if now != expected {
+        Some(TitleOutcome::Changed { title: now.into() })
+    } else {
+        None
+    }
+}
+
+/// What a write ended as, from the read after it.
+pub(crate) fn title_after(read: Option<String>, wanted: &str) -> TitleOutcome {
+    match read {
+        Some(t) if t == wanted => TitleOutcome::Written { title: t },
+        other => TitleOutcome::Unconfirmed { title: other },
+    }
+}
+
 /// A review verdict.
 ///
 /// Separate from `PrAction` on purpose: every `PrAction` sends the
@@ -860,6 +910,39 @@ impl GitHubClient {
         .await
     }
 
+    /// The title GitHub has now; see `TITLE_READ_DOC`.
+    async fn read_title(&self, id: &str) -> Result<String, ClientError> {
+        let v = self
+            .graphql_partial_ok(&json!({ "query": TITLE_READ_DOC, "variables": { "id": id } }))
+            .await?;
+        v["node"]["title"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ClientError::Graphql("GitHub did not return this pull request's title.".into())
+            })
+    }
+
+    /// Set a pull request's title to `title`, if GitHub's is still
+    /// `expected` (#2046). Re-reads it after, and reports what it read.
+    pub async fn set_title(
+        &self,
+        id: &str,
+        expected: &str,
+        title: &str,
+    ) -> Result<TitleOutcome, ClientError> {
+        let now = self.read_title(id).await?;
+        if let Some(stop) = title_precheck(&now, expected, title) {
+            return Ok(stop);
+        }
+        self.graphql_mutation_data(&json!({
+            "query": UPDATE_TITLE_DOC,
+            "variables": { "id": id, "title": title }
+        }))
+        .await?;
+        Ok(title_after(self.read_title(id).await.ok(), title))
+    }
+
     pub async fn update_pr_branch(&self, id: &str, expected_head: &str) -> Result<(), ClientError> {
         self.graphql_mutation(&json!({
             "query": UPDATE_BRANCH_DOC,
@@ -1284,5 +1367,54 @@ mod tests {
             "the OID must actually be passed to the mutation"
         );
         assert!(doc.contains("updatePullRequestBranch"));
+    }
+
+    /// #2046: the title write sends the title and asks for it back, and the
+    /// read names the node -- never the branch.
+    #[test]
+    fn title_documents_carry_what_they_need() {
+        assert!(UPDATE_TITLE_DOC
+            .contains("updatePullRequest(input: { pullRequestId: $id, title: $title })"));
+        assert!(UPDATE_TITLE_DOC.contains("pullRequest { title }"));
+        assert!(
+            !UPDATE_TITLE_DOC.contains("headRef"),
+            "the branch is never renamed"
+        );
+        assert!(TITLE_READ_DOC.contains("node(id: $id) { ... on PullRequest { title } }"));
+    }
+
+    #[test]
+    fn a_title_is_written_only_over_the_one_the_row_showed() {
+        assert_eq!(title_precheck("fix", "fix", "ABC-1: fix"), None);
+        assert_eq!(
+            title_precheck("ABC-1: fix", "fix", "ABC-1: fix"),
+            Some(TitleOutcome::AlreadySet)
+        );
+        assert_eq!(
+            title_precheck("fix it", "fix", "ABC-1: fix"),
+            Some(TitleOutcome::Changed {
+                title: "fix it".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_write_is_confirmed_only_by_reading_it_back() {
+        assert_eq!(
+            title_after(Some("ABC-1: fix".into()), "ABC-1: fix"),
+            TitleOutcome::Written {
+                title: "ABC-1: fix".into()
+            }
+        );
+        assert_eq!(
+            title_after(None, "ABC-1: fix"),
+            TitleOutcome::Unconfirmed { title: None }
+        );
+        assert_eq!(
+            title_after(Some("other".into()), "ABC-1: fix"),
+            TitleOutcome::Unconfirmed {
+                title: Some("other".into())
+            }
+        );
     }
 }

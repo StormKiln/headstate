@@ -1,7 +1,7 @@
 import type { PrIdentity } from "./identity";
 import type { SourceCoverage } from "../api/tauri";
 
-export type GitLabAction = "approve" | "request_changes" | "enqueue_train" | "comment" | "reply" | "resolve" | "unresolve" | "merge" | "close" | "reopen" | "draft" | "ready" | "rebase" | "retry_ci" | "enable_auto_merge" | "disable_auto_merge";
+export type GitLabAction = "approve" | "request_changes" | "enqueue_train" | "comment" | "reply" | "resolve" | "unresolve" | "merge" | "close" | "reopen" | "draft" | "ready" | "rebase" | "retry_ci" | "enable_auto_merge" | "disable_auto_merge" | "set_title";
 
 export interface GitLabCapabilities {
   viewer?: string | null;
@@ -19,6 +19,8 @@ export interface GitLabActionRequest {
   expected_head: string | null;
   body?: string;
   discussion_id?: string;
+  /// The title the row showed, for `set_title` (#2046).
+  expected_title?: string;
 }
 
 export interface GitLabReceipt {

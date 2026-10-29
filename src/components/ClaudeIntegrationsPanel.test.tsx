@@ -62,6 +62,7 @@ const PREFS: UiPrefs = {
   jira_status_expectations: {},
   jira_chips_on_prs: true,
   jira_branch_template: "",
+  jira_no_ticket_marker: false,
 };
 
 const setPrefs = vi.fn(() => Promise.resolve());
