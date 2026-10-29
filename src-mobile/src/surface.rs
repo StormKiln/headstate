@@ -405,6 +405,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("unresolve_thread", Class::Write),
     ("reply_to_thread", Class::Write),
     ("rerun_checks", Class::Write),
+    // Move a Jira issue to another status (#2044): the one Jira write.
+    ("jira_transition", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
     // Merge or queue a native GitHub stack through the async merge API

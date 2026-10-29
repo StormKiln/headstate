@@ -213,3 +213,28 @@ export interface StatusExpectations {
   on_open?: StatusExpectation | null;
   on_merged?: StatusExpectation | null;
 }
+
+/// What `acli` said about one transition (#2044), before anything was read
+/// again. Mirrors `jira::model::TransitionReply`. Never the outcome on its
+/// own: where the issue is now is `TransitionResult.after`.
+///
+/// `refused` carries Jira's reason verbatim: a move the workflow does not
+/// allow from here, a required field, a validator, or an issue not yours
+/// to see. `unknown` is "whether Jira moved it is not known": timed out
+/// (and may have written), failed, or a reply this build does not read.
+export type TransitionReply =
+  | { state: "accepted"; message: string }
+  | { state: "refused"; reason: string }
+  | { state: "unknown"; error: JiraError };
+
+/// Mirrors `jira::model::TransitionResult`.
+export interface TransitionResult {
+  key: string;
+  /// What was asked for -- never shown as where the issue is.
+  requested: string;
+  reply: TransitionReply;
+  /// Read fresh from Jira after the call. `null` when that read failed:
+  /// then nothing is claimed about where the issue is.
+  after: JiraIssue | null;
+  reread_error: JiraError | null;
+}

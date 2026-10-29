@@ -1,8 +1,10 @@
 //! Jira Cloud, read through Atlassian's `acli` (epic #2031).
 //!
 //! `acli` holds the credential, exactly as `gh` and `glab` do for the two
-//! code hosts: Headstate never sees a Jira token. Everything here is a READ;
-//! the first release is read-only by decision on #2031.
+//! code hosts: Headstate never sees a Jira token. Everything here is a READ
+//! except one: [`commands::jira_transition`] moves an issue to another
+//! status (#2044), only when the user confirms the exact argv, and reports
+//! the status Jira holds afterwards rather than the one asked for.
 //!
 //! Key detection is here too ([`keys`]), feeding an index kept in the
 //! database ([`index`]): built from the pull requests, merged history,

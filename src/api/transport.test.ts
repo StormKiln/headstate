@@ -162,6 +162,7 @@ const ROWS: Row[] = [
   row(api.jiraFind, ["ABC-1", false], "jira_find", { key: "ABC-1", more: false }),
   row(api.jiraAcliVersion, [], "jira_acli_version"),
   row(api.jiraProjectStatuses, ["ABC"], "jira_project_statuses", { project: "ABC" }),
+  row(api.jiraTransition, ["ABC-1", "In Review"], "jira_transition", { key: "ABC-1", status: "In Review" }),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),
   row(api.dockerImages, [], "docker_images"),
