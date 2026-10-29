@@ -11,6 +11,7 @@ import { openInHeadstate } from "./openInHeadstate";
 import { useJiraFind, useJiraIssue } from "@/api/jira";
 import type { JiraIssue, KeySearch } from "@/types/jira";
 import { useJiraBoard } from "./useJiraBoard";
+import { useJira } from "./jiraState";
 
 /// My Jira issues' main panel (#2038): the selected issue and every pull
 /// request, worktree and branch of yours that names it.
@@ -103,6 +104,7 @@ function EpicRollUp({ k, known, lookup }: { k: string; known: string[]; lookup: 
 }
 
 function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined; lookup: Lookup }) {
+  const expectations = useJira()?.expectations;
   const s = lookup(k);
   const issue = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
   const prs = links?.prs ?? [];
@@ -120,7 +122,7 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
               const gitlab = pr.identity.source?.provider === "gitlab";
               // A pull request that has left the open list is not open:
               // what it says about the ticket waits on #2041.
-              const drift = issue && pr.current ? driftFor(issue, { draft: pr.is_draft, source: pr.source }) : null;
+              const drift = issue && pr.current ? driftFor(issue, { draft: pr.is_draft, source: pr.source }, expectations) : null;
               return (
                 <li
                   key={`${pr.identity.repo}#${pr.identity.number}`}
@@ -181,6 +183,7 @@ const STATE_TEXT = { open: "open", merged: "merged", closed: "closed without mer
 /// searches GitHub only when that holds none -- or when asked to here.
 function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | undefined; lookup: Lookup; on: boolean }) {
   const [more, setMore] = useState(false);
+  const expectations = useJira()?.expectations;
   const q = useJiraFind(k, on, more);
   const s = lookup(k);
   const issue: JiraIssue | null = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
@@ -191,7 +194,7 @@ function FoundOnGitHub({ k, links, lookup, on }: { k: string; links: Links | und
   );
   const merged = found.filter((p) => p.state === "merged").length;
   const open = mine.filter((p) => p.current).length + found.filter((p) => p.state === "open").length;
-  const drift = issue && q.data?.search.state === "asked" ? mergedButNotDone(issue, { merged, open }) : null;
+  const drift = issue && q.data?.search.state === "asked" ? mergedButNotDone(issue, { merged, open }, expectations) : null;
 
   return (
     <section aria-label="Found on GitHub" className="flex flex-col gap-1">

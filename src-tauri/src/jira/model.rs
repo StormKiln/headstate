@@ -184,3 +184,52 @@ pub struct LinkIndex {
     /// `links` is then what could be read, which may be nothing.
     pub error: Option<String>,
 }
+
+/// The statuses seen in one project's issues (#2034).
+///
+/// `acli` 1.3.39 has no command that lists a workflow's statuses, so these
+/// are read from the project's most recently updated issues: a status no
+/// issue currently holds is not here. The UI says so ("seen in"), and
+/// always offers the three categories besides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectStatuses {
+    pub project: String,
+    /// Distinct by name and category, in the order first seen.
+    pub statuses: Vec<JiraStatus>,
+    /// Whether the read hit its limit, so older issues -- and statuses only
+    /// they hold -- were not looked at.
+    pub truncated: bool,
+    /// Why the read failed, if it did. `statuses` is then empty: not "this
+    /// project has none".
+    pub error: Option<String>,
+}
+
+/// A status category a user can expect: [`StatusCategory`] without
+/// `Unknown`, which is something Jira reports, never something to want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedCategory {
+    New,
+    InProgress,
+    Done,
+}
+
+/// What a ticket's status should be at one point in a pull request's life.
+/// A category matches any status in it; a named status matches by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StatusExpectation {
+    Category { category: ExpectedCategory },
+    Status { name: String },
+}
+
+/// One project's expectations. `None` is "not set": the drift rules then
+/// use the defaults (in progress while open, done once merged), which are
+/// exactly what they did before this setting existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusExpectations {
+    #[serde(default)]
+    pub on_open: Option<StatusExpectation>,
+    #[serde(default)]
+    pub on_merged: Option<StatusExpectation>,
+}

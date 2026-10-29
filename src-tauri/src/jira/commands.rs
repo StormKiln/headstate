@@ -2,7 +2,7 @@
 //! spawns nothing while it is off: a switched-off integration reports
 //! `Disabled` -- "we did not ask" -- never an empty answer (#1050).
 
-use super::model::{IssueBatch, JiraConnection, LinkIndex, ProjectList};
+use super::model::{IssueBatch, JiraConnection, LinkIndex, ProjectList, ProjectStatuses};
 use crate::store::{open_db, settings};
 use std::collections::HashSet;
 use tauri::AppHandle;
@@ -67,6 +67,34 @@ pub async fn jira_projects(app: AppHandle) -> Result<ProjectList, String> {
         remember_projects(&app, list.projects.iter().map(|p| p.key.clone()).collect()).await;
     }
     Ok(list)
+}
+
+/// The installed `acli`'s version, for Settings › Jira's Connection
+/// section. Asked only while Jira is on: `tools/version.rs` deliberately
+/// does not report `acli`, because that would spawn it while Jira is off
+/// (#2033).
+#[tauri::command]
+pub async fn jira_acli_version(app: AppHandle) -> Result<String, String> {
+    if !enabled(&app).await {
+        return Err("Jira is switched off".into());
+    }
+    let bin = super::cli::find_acli().ok_or("acli is not installed")?;
+    super::cli::version_at(&bin).await
+}
+
+/// The statuses seen in `project`'s recent issues, to choose a status
+/// expectation from (#2034). `acli` has no command that lists a workflow's
+/// statuses, so this is a sample, and says so when it hit its limit.
+#[tauri::command]
+pub async fn jira_project_statuses(
+    app: AppHandle,
+    project: String,
+) -> Result<ProjectStatuses, String> {
+    if !enabled(&app).await {
+        return Err("Jira is switched off".into());
+    }
+    let bin = super::cli::find_acli().ok_or("acli is not installed")?;
+    Ok(super::cli::project_statuses_at(&bin, &project, super::cli::STATUS_SAMPLE).await)
 }
 
 /// Keep the dictionary, so the index can be read without asking Jira.

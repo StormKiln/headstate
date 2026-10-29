@@ -14,7 +14,7 @@ import { GROUPS, VIEWS } from "./viewMenu";
 /// capability tests below keep asserting against it exactly as they did
 /// before this mock existed. The grouping tests set it to exercise
 /// `hidden_views`, which is the route an ordinary user takes.
-let uiPrefs: { hidden_views: string[]; claude_integrations_enabled: boolean } | undefined;
+let uiPrefs: { hidden_views: string[]; claude_integrations_enabled: boolean; jira_enabled?: boolean } | undefined;
 
 vi.mock("../api/hooks", () => ({
   useUiPrefs: () => ({ prefs: uiPrefs, set: () => Promise.resolve() }),
@@ -257,6 +257,28 @@ describe("ViewSwitcher grouping", () => {
     expect(screen.queryByRole("menuitem", { name: /worktrees/i })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /^repositories$/i })).toBeNull();
     expect(screen.getByRole("group", { name: /^builds$/i })).toBeTruthy();
+  });
+
+  /// The Jira capability gate (#2034): no menu entry while Jira is off,
+  /// and one once it is on. Asserted both ways, so a menu that never
+  /// offered Jira would fail as surely as one that always did.
+  it("offers My Jira issues only while Jira is switched on", () => {
+    const jira = VIEWS.find((v) => v.id === "jira");
+    expect(jira).toBeDefined();
+    const name = new RegExp(`^${jira!.label}$`, "i");
+
+    uiPrefs = { hidden_views: [], claude_integrations_enabled: true, jira_enabled: false };
+    const off = render(<ViewSwitcher />);
+    fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
+    expect(screen.queryByRole("menuitem", { name })).toBeNull();
+    // Not passing because the menu failed to open.
+    expect(screen.getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
+    off.unmount();
+
+    uiPrefs = { hidden_views: [], claude_integrations_enabled: true, jira_enabled: true };
+    render(<ViewSwitcher />);
+    fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));
+    expect(screen.getByRole("menuitem", { name })).toBeTruthy();
   });
 
   /// The same rule via the capability, and the AI group specifically --

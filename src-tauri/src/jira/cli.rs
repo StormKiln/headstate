@@ -6,7 +6,7 @@
 //! search returning a few hundred issues overflows the pipe buffer, the
 //! child blocks on write, and the wait never ends.
 
-use super::model::{IssueBatch, JiraConnection, JiraIssue, ProjectList};
+use super::model::{IssueBatch, JiraConnection, JiraIssue, ProjectList, ProjectStatuses};
 use super::parse;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -108,6 +108,63 @@ pub async fn projects_at(bin: &Path) -> ProjectList {
             error: Some(e),
         },
     }
+}
+
+/// The installed `acli`'s version, from `acli --version`.
+pub async fn version_at(bin: &Path) -> Result<String, String> {
+    let raw = run_ok(bin, &["--version"]).await?;
+    parse::acli_version(&raw).ok_or_else(|| {
+        format!(
+            "acli --version said: {}",
+            raw.trim().chars().take(200).collect::<String>()
+        )
+    })
+}
+
+/// How many issues a status read looks at: the most recently updated, so
+/// the statuses a project's work moves through now are the ones seen.
+pub const STATUS_SAMPLE: usize = 100;
+
+/// Whether `project` has the shape of a Jira project key: the part of
+/// [`is_key`] before the dash. It is interpolated into JQL.
+pub fn is_project_key(project: &str) -> bool {
+    is_key(&format!("{project}-1"))
+}
+
+/// The statuses seen in `project`'s most recently updated issues.
+///
+/// `acli` 1.3.39 has no command that lists a workflow's statuses (#2034),
+/// so this samples issues and collects what they hold.
+pub async fn project_statuses_at(bin: &Path, project: &str, limit: usize) -> ProjectStatuses {
+    let mut out = ProjectStatuses {
+        project: project.to_string(),
+        statuses: Vec::new(),
+        truncated: false,
+        error: None,
+    };
+    if !is_project_key(project) {
+        out.error = Some(format!("{project} is not a Jira project key"));
+        return out;
+    }
+    let jql = format!("project = {project} ORDER BY updated DESC");
+    let n = limit.to_string();
+    let read = run_ok(
+        bin,
+        &[
+            "jira", "workitem", "search", "--jql", &jql, "--fields", "status", "--limit", &n,
+            "--json",
+        ],
+    )
+    .await
+    .and_then(|raw| Ok((parse::issues(&raw)?.len(), parse::distinct_statuses(&raw)?)));
+    match read {
+        Ok((count, statuses)) => {
+            out.truncated = count >= limit;
+            out.statuses = statuses;
+        }
+        Err(e) => out.error = Some(e),
+    }
+    out
 }
 
 /// Whether `key` has the shape of a Jira key. Keys reach this from the
@@ -355,6 +412,40 @@ echo '[{ok}]'"#
             connection_at(&bin).await,
             JiraConnection::NotLoggedIn { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn project_statuses_are_collected_and_say_when_truncated() {
+        let (_d, bin) = fake(&format!("echo '[{},{}]'", issue("ABC-1"), issue("ABC-2")));
+        let got = project_statuses_at(&bin, "ABC", 2).await;
+        assert_eq!(got.statuses.len(), 1, "two issues, one status");
+        assert!(got.truncated);
+        assert_eq!(got.error, None);
+        assert!(!project_statuses_at(&bin, "ABC", 3).await.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_bad_project_key_never_reaches_jql() {
+        let (_d, bin) = fake("echo injected; exit 3");
+        let got = project_statuses_at(&bin, "ABC OR x", 10).await;
+        assert!(got.statuses.is_empty());
+        assert!(got.error.unwrap().contains("not a Jira project key"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_read_is_an_error_not_an_empty_list() {
+        let (_d, bin) = fake("echo 'unauthorized' >&2; exit 1");
+        let got = project_statuses_at(&bin, "ABC", 10).await;
+        assert!(got.statuses.is_empty());
+        assert_eq!(got.error.as_deref(), Some("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn the_version_comes_from_acli_itself() {
+        let (_d, bin) = fake("echo 'acli version 1.3.39-stable'");
+        assert_eq!(version_at(&bin).await.as_deref(), Ok("1.3.39-stable"));
+        let (_d2, odd) = fake("echo 'hello'");
+        assert!(version_at(&odd).await.unwrap_err().contains("hello"));
     }
 
     #[tokio::test]

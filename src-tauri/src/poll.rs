@@ -340,6 +340,19 @@ pub struct UiPrefs {
     /// with branch-name noise. Empty means every visible project matches.
     #[serde(default)]
     pub jira_excluded_projects: Vec<String>,
+    /// What a project's tickets should say while a pull request is open
+    /// and once it has merged, by project key (#2034). A project with no
+    /// entry -- or an entry with a side unset -- takes the defaults the
+    /// drift rules always used: in progress while open, done once merged.
+    #[serde(default)]
+    pub jira_status_expectations:
+        std::collections::BTreeMap<String, crate::jira::model::StatusExpectations>,
+    /// Whether pull-request rows show ticket chips. Defaults ON: the
+    /// chips are what the integration is for. Off hides them from PR rows
+    /// only; the pull request's own page, worktree rows and branch rows
+    /// keep theirs.
+    #[serde(default = "default_true")]
+    pub jira_chips_on_prs: bool,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -389,6 +402,9 @@ impl Default for UiPrefs {
             // OFF: asked for, not assumed. See the field.
             jira_enabled: false,
             jira_excluded_projects: Vec::new(),
+            // Empty: every project uses the drift rules' defaults.
+            jira_status_expectations: std::collections::BTreeMap::new(),
+            jira_chips_on_prs: true,
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.
@@ -1953,6 +1969,62 @@ mod tests {
         assert_eq!(p.hidden_views, vec!["docker"]);
         assert!(!p.close_hides_to_tray, "the stored choice must survive");
         assert!(p.announce_updates, "a missing field takes the default");
+    }
+
+    /// Every Jira preference survives a write and a read (#2034), in the
+    /// wire shape the frontend sends.
+    #[test]
+    fn jira_prefs_round_trip() {
+        use crate::jira::model::{ExpectedCategory, StatusExpectation, StatusExpectations};
+        let json = r#"{"hidden_views":[],"close_hides_to_tray":true,
+            "jira_enabled":true,"jira_excluded_projects":["XY"],
+            "jira_chips_on_prs":false,
+            "jira_status_expectations":{"ABC":{
+                "on_open":{"kind":"status","name":"In Review"},
+                "on_merged":{"kind":"category","category":"done"}}}}"#;
+        let p: UiPrefs = serde_json::from_str(json).unwrap();
+        assert!(p.jira_enabled);
+        assert_eq!(p.jira_excluded_projects, ["XY"]);
+        assert!(!p.jira_chips_on_prs);
+        assert_eq!(
+            p.jira_status_expectations["ABC"],
+            StatusExpectations {
+                on_open: Some(StatusExpectation::Status {
+                    name: "In Review".into()
+                }),
+                on_merged: Some(StatusExpectation::Category {
+                    category: ExpectedCategory::Done
+                }),
+            }
+        );
+        let back: UiPrefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// A row stored before the Jira fields existed takes their defaults:
+    /// chips ON, no expectations (so drift behaves as it always did), and
+    /// a project entry with one side set leaves the other unset.
+    #[test]
+    fn jira_prefs_missing_fields_take_the_defaults() {
+        let p: UiPrefs =
+            serde_json::from_str(r#"{"hidden_views":[],"close_hides_to_tray":true}"#).unwrap();
+        assert!(!p.jira_enabled);
+        assert!(p.jira_chips_on_prs, "a missing field must not hide chips");
+        assert!(p.jira_status_expectations.is_empty());
+        assert_eq!(
+            p,
+            UiPrefs {
+                hidden_views: Vec::new(),
+                ..UiPrefs::default()
+            }
+        );
+
+        let half: UiPrefs = serde_json::from_str(
+            r#"{"hidden_views":[],"close_hides_to_tray":true,
+                "jira_status_expectations":{"ABC":{"on_open":{"kind":"category","category":"new"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(half.jira_status_expectations["ABC"].on_merged, None);
     }
 
     /// Hidden views are a list of ids, not a bool per view, so a build

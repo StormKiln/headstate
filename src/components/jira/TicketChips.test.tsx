@@ -13,7 +13,7 @@ const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>()
 vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraLinks: links, jiraIssues: issues }));
 
 import { JiraProvider } from "./JiraContext";
-import { TicketChips, TicketDriftNotices } from "./TicketChips";
+import { PrRowTicketChips, TicketChips, TicketDriftNotices } from "./TicketChips";
 
 const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   hidden_views: [],
@@ -26,6 +26,8 @@ const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   battery_low_percent: 0,
   jira_enabled: true,
   jira_excluded_projects: [],
+  jira_status_expectations: {},
+  jira_chips_on_prs: true,
   ...over,
 });
 
@@ -205,6 +207,48 @@ describe("TicketChips", () => {
     expect(await screen.findAllByText("ABC-8 · To Do")).toHaveLength(2);
     expect(screen.queryByLabelText("Needs attention")).toBeNull();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  /// Settings › Jira › "Show tickets on pull request rows" (#2034).
+  it("shows chips on PR rows by default, and none when switched off -- other rows keep theirs", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-5")] }));
+    links.mockResolvedValue(
+      index([
+        prLink("ABC-5"),
+        { key: "ABC-5", found_in: "branch", current: true, target: { kind: "branch", repo_path: "/r", branch: "abc-5-x" } },
+      ]),
+    );
+    const view = renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <PrRowTicketChips prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByText("ABC-5 · In Review")).toBeTruthy();
+    view.unmount();
+
+    renderWithQuery(
+      <JiraProvider prefs={prefs({ jira_chips_on_prs: false })}>
+        <div data-testid="pr-row">
+          <PrRowTicketChips prUrl={URL} draft={false} />
+        </div>
+        <TicketChips row={{ repoPath: "/r", branch: "abc-5-x" }} />
+        <TicketDriftNotices prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByText("ABC-5 · In Review")).toBeTruthy();
+    expect(screen.getByTestId("pr-row").textContent).toBe("");
+  });
+
+  /// The project's expectation from Settings reaches the chip (#2034).
+  it("marks a ticket against its project's status expectation", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-6", "In Progress")] }));
+    links.mockResolvedValue(index([prLink("ABC-6")]));
+    renderWithQuery(
+      <JiraProvider prefs={prefs({ jira_status_expectations: { ABC: { on_open: { kind: "status", name: "In Review" } } } })}>
+        <TicketDriftNotices prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByText("This pull request is open, but ABC-6 is In Progress, not In Review.")).toBeTruthy();
   });
 
   it("opens the issue in My Jira issues, without also opening the row", async () => {

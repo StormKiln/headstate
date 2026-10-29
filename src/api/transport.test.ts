@@ -160,6 +160,8 @@ const ROWS: Row[] = [
   row(api.jiraAssigned, [], "jira_assigned"),
   row(api.jiraLinks, [], "jira_links"),
   row(api.jiraFind, ["ABC-1", false], "jira_find", { key: "ABC-1", more: false }),
+  row(api.jiraAcliVersion, [], "jira_acli_version"),
+  row(api.jiraProjectStatuses, ["ABC"], "jira_project_statuses", { project: "ABC" }),
   row(api.dockerState, [], "docker_state"),
   row(api.dockerBuilds, [], "docker_builds"),
   row(api.dockerImages, [], "docker_images"),

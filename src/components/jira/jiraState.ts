@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import type { ExpectationMap } from "@/lib/jira/drift";
 import type { LinkMaps } from "@/lib/jira/links";
 
 /// What every Jira surface needs to know, decided once by `JiraProvider`
@@ -18,6 +19,10 @@ export interface JiraState {
   /// Which keys each row names, and what names each key, from the
   /// desktop's index.
   links: LinkMaps;
+  /// Settings' per-project status expectations, for the drift rules.
+  expectations: ExpectationMap;
+  /// Whether pull-request rows show ticket chips (Settings › Jira).
+  chipsOnPrRows: boolean;
 }
 
 export const JiraContext = createContext<JiraState | null>(null);

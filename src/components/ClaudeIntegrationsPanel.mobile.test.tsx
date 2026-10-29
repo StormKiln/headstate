@@ -87,6 +87,8 @@ const PREFS: UiPrefs = {
   battery_low_percent: 0,
   jira_enabled: false,
   jira_excluded_projects: [],
+  jira_status_expectations: {},
+  jira_chips_on_prs: true,
 };
 
 const MALFORMED: ClaudeHooksStatus = {

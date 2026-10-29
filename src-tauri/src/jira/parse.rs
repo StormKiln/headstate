@@ -183,9 +183,66 @@ pub fn auth_status(success: bool, stdout: &str, stderr: &str) -> JiraConnection 
     }
 }
 
+/// The distinct statuses held by the issues of one `workitem search
+/// --fields status --json`, in the order first seen. A status whose name
+/// did not come back is left out: an empty name is not a status anyone
+/// can choose.
+pub fn distinct_statuses(raw: &str) -> Result<Vec<JiraStatus>, String> {
+    let mut out: Vec<JiraStatus> = Vec::new();
+    for s in issues(raw)?.into_iter().map(|i| i.status) {
+        if !s.name.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// The version from `acli --version`, which prints e.g.
+/// `acli version 1.3.39-stable`. `None` when the line is not that shape.
+pub fn acli_version(stdout: &str) -> Option<String> {
+    let line = stdout.lines().find(|l| !l.trim().is_empty())?.trim();
+    let rest = line.strip_prefix("acli version ")?.trim();
+    (!rest.is_empty() && !rest.contains(char::is_whitespace)).then(|| rest.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statuses_are_distinct_by_name_and_category() {
+        let raw = r#"[
+          {"key":"ABC-1","fields":{"status":{"name":"To Do","statusCategory":{"key":"new"}}}},
+          {"key":"ABC-2","fields":{"status":{"name":"In Review","statusCategory":{"key":"indeterminate"}}}},
+          {"key":"ABC-3","fields":{"status":{"name":"To Do","statusCategory":{"key":"new"}}}},
+          {"key":"ABC-4","fields":{"status":{"statusCategory":{"key":"done"}}}}
+        ]"#;
+        let got = distinct_statuses(raw).unwrap();
+        assert_eq!(
+            got,
+            [
+                JiraStatus {
+                    name: "To Do".into(),
+                    category: StatusCategory::New
+                },
+                JiraStatus {
+                    name: "In Review".into(),
+                    category: StatusCategory::InProgress
+                },
+            ]
+        );
+        assert!(distinct_statuses("not json").is_err());
+    }
+
+    #[test]
+    fn the_version_is_read_from_the_live_shape() {
+        assert_eq!(
+            acli_version("acli version 1.3.39-stable\n").as_deref(),
+            Some("1.3.39-stable")
+        );
+        assert_eq!(acli_version(""), None);
+        assert_eq!(acli_version("something else entirely"), None);
+    }
 
     /// Assembled at runtime: `scripts/check-privacy.sh` rejects any literal
     /// `<name>.atlassian.net` in committed text, synthetic or not.
