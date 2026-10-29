@@ -17,7 +17,7 @@ import type { TranscriptWatch } from "../types/transcript";
 import { call } from "./transport";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
-import type { IssueBatch, JiraConnection, KeyLookup, LinkIndex, ProjectList } from "../types/jira";
+import type { IssueBatch, JiraConnection, KeyLookup, LinkIndex, ProjectList, ProjectStatuses, StatusExpectations } from "../types/jira";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -194,6 +194,13 @@ export interface UiPrefs {
   jira_enabled: boolean;
   /// Jira project keys not to match. Empty: every visible project matches.
   jira_excluded_projects: string[];
+  /// Per project key, what its tickets should say while a pull request is
+  /// open and once it merged (#2034). Absent: the drift rules' defaults.
+  jira_status_expectations: Record<string, StatusExpectations>;
+  /// Whether pull-request rows show ticket chips. Default true. Off hides
+  /// them on PR rows only; the PR's own page, worktree rows and branch
+  /// rows keep theirs.
+  jira_chips_on_prs: boolean;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
@@ -476,6 +483,9 @@ export const jiraIssues = (keys: string[]) => call<IssueBatch>("jira_issues", { 
 export const jiraAssigned = () => call<IssueBatch>("jira_assigned");
 export const jiraLinks = () => call<LinkIndex>("jira_links");
 export const jiraFind = (key: string, more: boolean) => call<KeyLookup>("jira_find", { key, more });
+export const jiraAcliVersion = () => call<string>("jira_acli_version");
+export const jiraProjectStatuses = (project: string) =>
+  call<ProjectStatuses>("jira_project_statuses", { project });
 
 /// --- Docker -------------------------------------------------------
 

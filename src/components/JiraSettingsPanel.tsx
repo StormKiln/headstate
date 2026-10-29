@@ -1,12 +1,16 @@
+import { useState } from "react";
 import { toast } from "sonner";
 import type { UiPrefs } from "@/api/tauri";
-import { useJiraConnection, useJiraProjects } from "@/api/jira";
-import type { JiraConnection } from "@/types/jira";
+import { useJiraAcliVersion, useJiraConnection, useJiraProjects, useJiraProjectStatuses } from "@/api/jira";
+import type { ExpectedCategory, JiraConnection, StatusExpectation, StatusExpectations } from "@/types/jira";
 import { copyText } from "@/lib/clipboard";
+import { DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
+import { ArgvPreview } from "./ArgvPreview";
 import { ExternalLink } from "./ExternalLink";
 
 const INSTALL_URL = "https://developer.atlassian.com/cloud/acli/guides/install-acli/";
-const LOGIN = "acli jira auth login --web";
+const LOGIN_ARGV = ["acli", "jira", "auth", "login", "--web"];
+const LOGIN = LOGIN_ARGV.join(" ");
 
 /// Settings › Jira (#2034, epic #2031).
 ///
@@ -26,6 +30,11 @@ export function JiraSettingsPanel({
   const excluded = prefs?.jira_excluded_projects ?? [];
   const connection = useJiraConnection(enabled);
   const signedIn = connection.data?.state === "logged_in";
+  // Installed, as far as the connection check has said: asking the
+  // version of an acli that is not there, or before Jira is on, would be
+  // a spawn for nothing.
+  const state = connection.data?.state;
+  const installed = enabled && (state === "logged_in" || state === "not_logged_in" || state === "cannot_tell");
   const projects = useJiraProjects(enabled && signedIn);
 
   return (
@@ -52,6 +61,18 @@ export function JiraSettingsPanel({
             loading={connection.isPending}
             failed={connection.isError}
           />
+          <AcliVersion asked={installed} />
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={prefs?.jira_chips_on_prs ?? true}
+              onChange={() => prefs && void setPrefs({ ...prefs, jira_chips_on_prs: !prefs.jira_chips_on_prs })}
+            />
+            Show tickets on pull request rows
+          </label>
+          <p className="text-xs text-[#8b949e]">
+            A pull request&apos;s own page, and worktree and branch rows, show their tickets either way.
+          </p>
           {signedIn ? (
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium">Projects</span>
@@ -98,6 +119,13 @@ export function JiraSettingsPanel({
                       );
                     })}
                   </ul>
+                  {prefs ? (
+                    <StatusExpectationsEditor
+                      projects={projects.data.projects.map((p) => p.key).filter((k) => !excluded.includes(k))}
+                      prefs={prefs}
+                      setPrefs={setPrefs}
+                    />
+                  ) : null}
                 </>
               )}
             </div>
@@ -145,20 +173,20 @@ function ConnectionStatus({
       return (
         <div className="flex flex-col gap-1 text-xs text-[#d29922]">
           <span>acli is installed but not signed in. Run this in a terminal:</span>
-          <span className="flex items-center gap-2">
-            <code className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 font-mono text-[#e6edf3]">
-              {LOGIN}
-            </code>
+          <div className="flex items-start gap-2">
+            <div aria-label="Sign-in command" className="min-w-0 flex-1">
+              <ArgvPreview program={LOGIN_ARGV[0]} args={LOGIN_ARGV.slice(1)} />
+            </div>
             <button
               type="button"
-              className="rounded border border-[#30363d] px-1.5 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
+              className="mt-1 rounded border border-[#30363d] px-1.5 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
               onClick={() =>
                 void copyText(LOGIN).then((err) => (err ? toast.error(err) : toast.success("Copied")))
               }
             >
               Copy
             </button>
-          </span>
+          </div>
         </div>
       );
     case "cannot_tell":
@@ -172,4 +200,157 @@ function ConnectionStatus({
       // caught up; the next poll answers.
       return <span className="h-4 w-48 animate-pulse rounded bg-[#21262d]" aria-label="Checking acli" />;
   }
+}
+
+/// The installed acli's version. Not asked until the connection check has
+/// found acli; renders nothing until then.
+function AcliVersion({ asked }: { asked: boolean }) {
+  const version = useJiraAcliVersion(asked);
+  if (!asked) return null;
+  if (version.isPending) {
+    return <span className="h-3 w-32 animate-pulse rounded bg-[#21262d]" aria-label="Reading the acli version" />;
+  }
+  if (version.isError) {
+    return <p className="text-xs text-[#8b949e]">Could not read the acli version: {String(version.error)}</p>;
+  }
+  return <p className="text-xs text-[#8b949e]">acli {version.data}</p>;
+}
+
+const CATEGORIES: ExpectedCategory[] = ["new", "in_progress", "done"];
+
+/// A `<select>` value for an expectation; "" is "not set".
+function encode(e: StatusExpectation | null | undefined): string {
+  if (!e) return "";
+  return e.kind === "category" ? `category:${e.category}` : `status:${e.name}`;
+}
+
+function decode(v: string): StatusExpectation | null {
+  if (v.startsWith("category:")) return { kind: "category", category: v.slice(9) as ExpectedCategory };
+  if (v.startsWith("status:")) return { kind: "status", name: v.slice(7) };
+  return null;
+}
+
+/// Per-project status expectations (#2034): what a ticket should say while
+/// its pull request is open, and once it merged. Unset, the drift rules use
+/// their defaults. A project's statuses are read only once it is chosen.
+function StatusExpectationsEditor({
+  projects,
+  prefs,
+  setPrefs,
+}: {
+  projects: string[];
+  prefs: UiPrefs;
+  setPrefs: (prefs: UiPrefs) => Promise<void>;
+}) {
+  const [project, setProject] = useState("");
+  const all = prefs.jira_status_expectations ?? {};
+  const set = (side: keyof StatusExpectations, value: StatusExpectation | null) => {
+    const next: StatusExpectations = { ...all[project], [side]: value };
+    const rest = Object.fromEntries(Object.entries(all).filter(([k]) => k !== project));
+    void setPrefs({
+      ...prefs,
+      // An entry with nothing set is dropped, so the map holds only choices.
+      jira_status_expectations: next.on_open || next.on_merged ? { ...rest, [project]: next } : rest,
+    });
+  };
+  if (projects.length === 0) return null;
+  return (
+    <div className="mt-2 flex flex-col gap-1">
+      <span className="text-sm font-medium">Status expectations</span>
+      <p className="text-xs text-[#8b949e]">
+        A ticket is flagged when it disagrees with its pull request. By default that means in progress while the
+        pull request is open, and done once it merged.
+      </p>
+      <label className="flex items-center gap-2 text-xs">
+        Project
+        <select
+          value={project}
+          onChange={(e) => setProject(e.target.value)}
+          className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 font-mono text-xs text-[#e6edf3]"
+        >
+          <option value="">Choose a project</option>
+          {projects.map((k) => (
+            <option key={k} value={k}>
+              {k}
+              {all[k] ? " (set)" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      {project ? (
+        <ProjectExpectations
+          project={project}
+          current={all[project] ?? {}}
+          onChange={set}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ProjectExpectations({
+  project,
+  current,
+  onChange,
+}: {
+  project: string;
+  current: StatusExpectations;
+  onChange: (side: keyof StatusExpectations, value: StatusExpectation | null) => void;
+}) {
+  const seen = useJiraProjectStatuses(project, true);
+  const names = [...new Set((seen.data?.statuses ?? []).map((s) => s.name))];
+  const sides: [keyof StatusExpectations, string, StatusExpectation][] = [
+    ["on_open", "While a pull request is open", DEFAULT_ON_OPEN],
+    ["on_merged", "Once it has merged", DEFAULT_ON_MERGED],
+  ];
+  return (
+    <div className="flex flex-col gap-1">
+      {seen.isPending ? (
+        <span className="h-3 w-48 animate-pulse rounded bg-[#21262d]" aria-label={`Reading ${project}'s statuses`} />
+      ) : seen.isError || seen.data?.error ? (
+        <p className="text-xs text-[#f85149]">
+          Could not read the statuses in {project}&apos;s issues: {seen.data?.error ?? String(seen.error)}. The
+          three categories still apply.
+        </p>
+      ) : seen.data.truncated ? (
+        <p className="text-xs text-[#8b949e]">
+          Statuses are those seen in {project}&apos;s most recently updated issues; older issues were not read.
+        </p>
+      ) : null}
+      {sides.map(([side, label, fallback]) => {
+        const value = current[side] ?? null;
+        // A chosen status no recent issue holds is still offered, so the
+        // select shows what is stored rather than silently another value.
+        const extra = value?.kind === "status" && !names.includes(value.name) ? [value.name] : [];
+        return (
+          <label key={side} className="flex flex-wrap items-center gap-2 text-xs">
+            {label}
+            <select
+              value={encode(value)}
+              onChange={(e) => onChange(side, decode(e.target.value))}
+              className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
+            >
+              <option value="">Default ({expectationLabel(fallback)})</option>
+              <optgroup label="Categories">
+                {CATEGORIES.map((c) => (
+                  <option key={c} value={encode({ kind: "category", category: c })}>
+                    {expectationLabel({ kind: "category", category: c })}
+                  </option>
+                ))}
+              </optgroup>
+              {names.length + extra.length > 0 ? (
+                <optgroup label={`Statuses seen in ${project}'s issues`}>
+                  {[...names, ...extra].map((n) => (
+                    <option key={n} value={encode({ kind: "status", name: n })}>
+                      {n}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+            </select>
+          </label>
+        );
+      })}
+    </div>
+  );
 }

@@ -108,6 +108,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_assigned", Class::Read),
     ("jira_links", Class::Read),
     ("jira_find", Class::Read),
+    ("jira_acli_version", Class::Read),
+    ("jira_project_statuses", Class::Read),
     ("disk_inventory_status", Class::Read),
     ("disk_inventory_history", Class::Read),
     ("disk_inventory_settings", Class::Read),

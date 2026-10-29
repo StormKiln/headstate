@@ -1,5 +1,5 @@
 import { useJiraIssue } from "@/api/jira";
-import { driftFor } from "@/lib/jira/drift";
+import { driftFor, type ExpectationMap } from "@/lib/jira/drift";
 import type { FoundKey } from "@/lib/jira/keys";
 import { rowId, type RowRef } from "@/lib/jira/links";
 import { TriangleAlert } from "lucide-react";
@@ -33,13 +33,31 @@ export function TicketChips({ row, openPr }: { row: RowRef; openPr?: { draft: bo
   return (
     <>
       {found.map((f) => (
-        <TicketChip key={f.key} found={f} openPr={openPr} />
+        <TicketChip key={f.key} found={f} openPr={openPr} expectations={jira.expectations} />
       ))}
     </>
   );
 }
 
-function TicketChip({ found, openPr }: { found: FoundKey; openPr?: { draft: boolean } }) {
+/// `TicketChips` for a pull-request ROW, honouring Settings › Jira's "Show
+/// on pull request rows". Off hides PR rows' chips only: the pull request's
+/// own page keeps its chips and drift notices, and worktree and branch rows
+/// keep theirs -- there the chip is the only sign of the ticket.
+export function PrRowTicketChips({ prUrl, draft }: { prUrl: string; draft: boolean }) {
+  const jira = useJira();
+  if (!jira?.chipsOnPrRows) return null;
+  return <TicketChips row={{ prUrl }} openPr={{ draft }} />;
+}
+
+function TicketChip({
+  found,
+  openPr,
+  expectations,
+}: {
+  found: FoundKey;
+  openPr?: { draft: boolean };
+  expectations: ExpectationMap;
+}) {
   const q = useJiraIssue(found.key);
   const where = found.source === "title" ? "the title" : "the branch name";
 
@@ -82,7 +100,7 @@ function TicketChip({ found, openPr }: { found: FoundKey; openPr?: { draft: bool
     );
   }
   const { issue } = s;
-  const drift = openPr ? driftFor(issue, { draft: openPr.draft, source: found.source }) : null;
+  const drift = openPr ? driftFor(issue, { draft: openPr.draft, source: found.source }, expectations) : null;
   const label = (
     <>
       {drift ? <TriangleAlert className="h-3 w-3" aria-label="Needs attention" /> : null}
@@ -123,16 +141,16 @@ export function TicketDriftNotices({ prUrl, draft }: { prUrl: string; draft: boo
   return (
     <>
       {found.map((f) => (
-        <DriftNotice key={f.key} found={f} draft={draft} />
+        <DriftNotice key={f.key} found={f} draft={draft} expectations={jira.expectations} />
       ))}
     </>
   );
 }
 
-function DriftNotice({ found, draft }: { found: FoundKey; draft: boolean }) {
+function DriftNotice({ found, draft, expectations }: { found: FoundKey; draft: boolean; expectations: ExpectationMap }) {
   const q = useJiraIssue(found.key);
   const s = q.data;
-  const drift = s?.state === "found" ? driftFor(s.issue, { draft, source: found.source }) : null;
+  const drift = s?.state === "found" ? driftFor(s.issue, { draft, source: found.source }, expectations) : null;
   if (!drift) return null;
   return (
     <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-[#d29922]">

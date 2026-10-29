@@ -6,7 +6,7 @@
 import type { IssueState } from "@/api/jira";
 import type { PrIdentity } from "@/types/identity";
 import type { JiraIssue, JiraStatusCategory } from "@/types/jira";
-import { driftFor } from "./drift";
+import { driftFor, type ExpectationMap } from "./drift";
 import type { KeySource } from "./keys";
 
 export interface LinkedPr {
@@ -155,10 +155,15 @@ export function rollUp(issues: readonly string[], lookup: Lookup): Record<JiraSt
 /// names it (#2042). An issue not yet answered needs nothing: unknown is
 /// not a disagreement. A pull request no longer in the open list is not
 /// open, so it decides nothing here.
-export function needsAttention(key: string, links: ReadonlyMap<string, Links>, lookup: Lookup): boolean {
+export function needsAttention(
+  key: string,
+  links: ReadonlyMap<string, Links>,
+  lookup: Lookup,
+  expectations?: ExpectationMap,
+): boolean {
   const issue = found(lookup(key));
   if (!issue) return false;
   return (links.get(key)?.prs ?? []).some(
-    (pr) => pr.current && driftFor(issue, { draft: pr.is_draft, source: pr.source }) !== null,
+    (pr) => pr.current && driftFor(issue, { draft: pr.is_draft, source: pr.source }, expectations) !== null,
   );
 }

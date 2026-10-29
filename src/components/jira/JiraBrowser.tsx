@@ -28,7 +28,7 @@ export function JiraBrowser() {
       : filter === "assigned"
         ? board.assignedKeys
         : filter === "attention"
-          ? board.linked.filter((k) => needsAttention(k, board.links, board.lookup))
+          ? board.linked.filter((k) => needsAttention(k, board.links, board.lookup, board.jira?.expectations))
           : [...new Set([...board.linked, ...board.assignedKeys])];
   const wantsAssigned = filter === "all" || filter === "assigned";
   const wantsLinked = filter !== "assigned";

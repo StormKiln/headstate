@@ -121,3 +121,32 @@ export interface KeyLookup {
   links: JiraLink[];
   search: KeySearch;
 }
+
+/// The statuses seen in one project's recent issues (`jira_project_statuses`).
+/// `acli` cannot list a workflow's statuses, so this is a sample: a status
+/// no recent issue holds is not here. `error` set means the read failed,
+/// never that the project has no statuses.
+export interface ProjectStatuses {
+  project: string;
+  statuses: JiraStatus[];
+  /// The read hit its limit; older issues were not looked at.
+  truncated: boolean;
+  error: string | null;
+}
+
+/// A category a ticket can be expected to be in. Not `unknown`: that is
+/// something Jira reports, never something to want.
+export type ExpectedCategory = Exclude<JiraStatusCategory, "unknown">;
+
+/// What a ticket's status should be. A category matches any status in it;
+/// a named status matches by name. Mirrors `jira::model::StatusExpectation`.
+export type StatusExpectation =
+  | { kind: "category"; category: ExpectedCategory }
+  | { kind: "status"; name: string };
+
+/// One project's expectations. `null` (or absent) is "not set": the drift
+/// rules use in progress while open and done once merged.
+export interface StatusExpectations {
+  on_open?: StatusExpectation | null;
+  on_merged?: StatusExpectation | null;
+}

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { jiraAssigned, jiraConnection, jiraFind, jiraIssues, jiraLinks, jiraProjects } from "./tauri";
+import { jiraAcliVersion, jiraAssigned, jiraConnection, jiraFind, jiraIssues, jiraLinks, jiraProjects, jiraProjectStatuses } from "./tauri";
 import type { JiraIssue } from "../types/jira";
 
 /// --- Jira (epic #2031) --------------------------------------------
@@ -29,6 +29,28 @@ export function useJiraProjects(enabled: boolean) {
   return useQuery({
     queryKey: ["jira-projects"],
     queryFn: () => jiraProjects(),
+    enabled,
+    staleTime: 10 * 60_000,
+  });
+}
+
+/// The installed `acli`'s version. Asked only while Jira is on and `acli`
+/// is installed: off, nothing spawns (#2033).
+export function useJiraAcliVersion(enabled: boolean) {
+  return useQuery({
+    queryKey: ["jira-acli-version"],
+    queryFn: () => jiraAcliVersion(),
+    enabled,
+    staleTime: 10 * 60_000,
+  });
+}
+
+/// The statuses seen in `project`'s recent issues, for choosing an
+/// expectation. Asked only when that project's editor is open.
+export function useJiraProjectStatuses(project: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["jira-project-statuses", project],
+    queryFn: () => jiraProjectStatuses(project),
     enabled,
     staleTime: 10 * 60_000,
   });
