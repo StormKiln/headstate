@@ -15,8 +15,6 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 
 /// How long a status read stands before it is read again.
 const FRESH: Duration = Duration::seconds(60);
@@ -205,6 +203,7 @@ async fn finish(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     /// A stand-in `acli`: search answers from `search`, view from `view`,
     /// and every call is appended to `calls` so a test can count them.
