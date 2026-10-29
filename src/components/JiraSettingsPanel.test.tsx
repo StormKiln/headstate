@@ -81,7 +81,8 @@ describe("JiraSettingsPanel", () => {
 
   /// Each state carries its own remedy; none reads as "no projects".
   it.each<[JiraConnection, RegExp]>([
-    [{ state: "not_installed" }, /acli is not installed/],
+    [{ state: "not_installed", searched: ["/opt/homebrew/bin"] }, /acli is not installed/],
+    [{ state: "not_installed", searched: ["/opt/homebrew/bin"] }, /Looked in \/opt\/homebrew\/bin/],
     [{ state: "not_logged_in", detail: "x" }, /not signed in/],
     [{ state: "cannot_tell", reason: "odd output" }, /It said: odd output/],
   ])("explains %o without listing projects", async (state, text) => {
@@ -191,7 +192,7 @@ describe("JiraSettingsPanel", () => {
 
     it("says when the statuses could not be read, and still offers the categories", async () => {
       signedIn();
-      statuses.mockResolvedValue({ project: "ABC", statuses: [], truncated: false, error: "unauthorized" });
+      statuses.mockResolvedValue({ project: "ABC", statuses: [], truncated: false, error: { state: "failed", detail: "unauthorized" } });
       renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
       fireEvent.change(await screen.findByRole("combobox", { name: "Project" }), { target: { value: "ABC" } });
       expect(await screen.findByText(/Could not read the statuses in ABC's issues: unauthorized/)).toBeTruthy();
@@ -201,8 +202,16 @@ describe("JiraSettingsPanel", () => {
 
   it("says when the project list could not be read rather than showing none", async () => {
     connection.mockResolvedValue({ state: "logged_in", site: null, account: null });
-    projects.mockResolvedValue({ projects: [], error: "unauthorized" });
+    projects.mockResolvedValue({ projects: [], error: { state: "failed", detail: "unauthorized" } });
     renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
     expect(await screen.findByText(/Could not list your Jira projects: unauthorized/)).toBeTruthy();
+  });
+
+  /// A rate limit says when it will be asked again, and is not "no projects".
+  it("says when a rate-limited project list will be asked again", async () => {
+    connection.mockResolvedValue({ state: "logged_in", site: null, account: null });
+    projects.mockResolvedValue({ projects: [], error: { state: "rate_limited", retry_after_secs: 30 } });
+    renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
+    expect(await screen.findByText(/limiting how often it is asked\. Headstate will ask again in 30s/)).toBeTruthy();
   });
 });

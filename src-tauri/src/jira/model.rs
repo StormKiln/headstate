@@ -32,11 +32,20 @@ pub struct JiraIssueType {
     /// -1 sub-task, 0 standard, 1 epic, 2+ initiative and above. `None` when
     /// the site did not say, which older company-managed projects may not.
     pub hierarchy_level: Option<i32>,
+    /// The type's icon, as Jira links it. Through `acli` this names an
+    /// internal Atlassian host (#2032), which may need a session to load,
+    /// so a consumer must treat a failed load as "no icon", not an error.
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JiraIssue {
     pub key: String,
+    /// Jira's numeric id, as a string. Stable across a key change (an issue
+    /// moved to another project keeps it); `None` when the reply had none.
+    #[serde(default)]
+    pub id: Option<String>,
     pub summary: String,
     pub issue_type: JiraIssueType,
     pub status: JiraStatus,
@@ -55,6 +64,10 @@ pub struct JiraIssue {
     /// known: the API's `self` link names an internal Atlassian host, not
     /// the site, so it cannot be used (#2032).
     pub url: Option<String>,
+    /// Never filled through `acli` 1.3: its search refuses `updated`
+    /// ("field 'updated' is not allowed", re-checked on #2033), and asking
+    /// for it fails the whole call. Kept for a transport that can (#2048);
+    /// `None` is "not read", never "never updated".
     pub updated: Option<String>,
 }
 
@@ -70,7 +83,7 @@ pub struct ProjectList {
     pub projects: Vec<JiraProject>,
     /// Set when the list could not be read. `projects` is then whatever was
     /// read before the failure, which for one call is nothing.
-    pub error: Option<String>,
+    pub error: Option<JiraError>,
 }
 
 /// The answer for one set of requested keys.
@@ -85,12 +98,69 @@ pub struct IssueBatch {
     pub issues: Vec<JiraIssue>,
     pub missing: Vec<String>,
     pub unasked: Vec<String>,
-    /// The first failure met, if any. A batch can carry issues AND an error:
-    /// partial is not nothing (#1044).
-    pub error: Option<String>,
+    /// Why the read is incomplete, if it is. A batch can carry issues AND
+    /// an error: partial is not nothing (#1044). A failure that ends the
+    /// read -- rate limited, timed out, signed out -- wins over an earlier
+    /// per-batch refusal, because it is the one that says what to do.
+    pub error: Option<JiraError>,
     /// For a search rather than a key list: whether the result hit its
     /// limit, so the UI says "at least N" rather than N.
     pub truncated: bool,
+}
+
+/// Why a Jira read did not happen, or did not finish (#2033).
+///
+/// One enum for every command and every partial answer, so each state
+/// renders distinctly (root CLAUDE.md): `NotAsked` is "we did not ask"
+/// and must never read as "Jira did not answer" or "nothing found"
+/// (#1050); `RateLimited`, `TimedOut` and `NotLoggedIn` end a read
+/// part-way, and what they leave is `unasked`, not `missing`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JiraError {
+    /// The capability switch is off: nothing was asked, nothing spawned.
+    /// `Display` leads with [`crate::commands::NOT_ASKED`] so the mobile
+    /// companion, which receives a rejection as text, still tells it apart.
+    #[error(
+        "{} Jira is switched off, so it was not asked",
+        crate::commands::NOT_ASKED
+    )]
+    NotAsked,
+    #[error("acli is not installed: looked in {}; set HEADSTATE_ACLI to its path", searched.join(", "))]
+    NotInstalled { searched: Vec<String> },
+    #[error("acli is not signed in to Jira: run `acli jira auth login --web`")]
+    NotLoggedIn,
+    /// Jira refused for rate. `retry_after_secs` is what it asked for, when
+    /// it said; `None` is "did not say", not "retry now". Detected from
+    /// `acli`'s text and unverified against a live 429 (#2033).
+    #[error("Jira is rate limiting requests{}", retry_text(*retry_after_secs))]
+    RateLimited { retry_after_secs: Option<u64> },
+    #[error("acli did not answer within {secs}s")]
+    TimedOut { secs: u64 },
+    #[error("{detail}")]
+    Failed { detail: String },
+}
+
+fn retry_text(secs: Option<u64>) -> String {
+    match secs {
+        Some(s) => format!("; retry after {s}s"),
+        None => "; it did not say when to retry".into(),
+    }
+}
+
+impl JiraError {
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+        }
+    }
+
+    /// Whether this failure ends a read: the next call would meet it too,
+    /// so what is left goes back `unasked` rather than being tried. Only a
+    /// plain `Failed` -- one query Jira refused -- is worth narrowing.
+    pub fn ends_the_read(&self) -> bool {
+        !matches!(self, Self::Failed { .. })
+    }
 }
 
 /// Whether Jira can be asked anything, and if not, why.
@@ -99,7 +169,11 @@ pub struct IssueBatch {
 pub enum JiraConnection {
     /// The capability switch is off. Nothing was asked (#1050).
     Disabled,
-    NotInstalled,
+    /// `acli` was not found. `searched` names every place looked in, so
+    /// the reader can tell a missing install from one in an odd place.
+    NotInstalled {
+        searched: Vec<String>,
+    },
     NotLoggedIn {
         detail: String,
     },
@@ -180,9 +254,9 @@ pub struct LinkIndex {
     pub links: Vec<JiraLink>,
     /// The dictionary applied, after Settings' exclusions.
     pub projects: Vec<String>,
-    /// Why the dictionary or the index could not be read, if it could not.
-    /// `links` is then what could be read, which may be nothing.
-    pub error: Option<String>,
+    /// Why the project list -- the dictionary -- could not be read, if it
+    /// could not. `links` is then what could be read, which may be nothing.
+    pub error: Option<JiraError>,
 }
 
 /// The statuses seen in one project's issues (#2034).
@@ -201,7 +275,7 @@ pub struct ProjectStatuses {
     pub truncated: bool,
     /// Why the read failed, if it did. `statuses` is then empty: not "this
     /// project has none".
-    pub error: Option<String>,
+    pub error: Option<JiraError>,
 }
 
 /// A status category a user can expect: [`StatusCategory`] without

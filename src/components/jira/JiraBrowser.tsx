@@ -1,4 +1,4 @@
-import { useJiraConnection, useJiraLinks } from "@/api/jira";
+import { describeJiraError, failureOf, useJiraConnection, useJiraLinks } from "@/api/jira";
 import { useJiraView, type JiraFilter } from "@/store/jira";
 import { needsAttention } from "@/lib/jira/tree";
 import { GoToTicket } from "./GoToTicket";
@@ -52,7 +52,10 @@ export function JiraBrowser() {
       {wantsAssigned && board.assigned.isPending ? SKELETON : null}
       {wantsAssigned && (board.assigned.isError || board.assigned.data?.error) ? (
         <p className="text-xs text-[#f85149]">
-          Could not read the issues assigned to you: {board.assigned.data?.error ?? String(board.assigned.error)}
+          {board.assigned.data && board.assigned.data.issues.length > 0
+            ? "Some of the issues assigned to you could not be read: "
+            : "Could not read the issues assigned to you: "}
+          {describeJiraError(board.assigned.data?.error ?? failureOf(board.assigned.error))}
         </p>
       ) : null}
       {wantsAssigned && assignedOk && board.assigned.data?.truncated ? (
@@ -95,7 +98,9 @@ function NotReady() {
   if (signedIn && (links.isError || links.data?.error)) {
     return (
       <p className="text-xs text-[#f85149]">
-        {links.data?.error ?? `Could not read which pull requests name Jira issues: ${String(links.error)}`}
+        {links.data?.error
+          ? `Could not list your Jira projects: ${describeJiraError(links.data.error)}`
+          : `Could not read which pull requests name Jira issues: ${describeJiraError(failureOf(links.error))}`}
       </p>
     );
   }

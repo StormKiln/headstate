@@ -1,4 +1,4 @@
-import { useJiraIssue } from "@/api/jira";
+import { describeJiraError, failureOf, useJiraIssue } from "@/api/jira";
 import { driftFor, type ExpectationMap } from "@/lib/jira/drift";
 import type { FoundKey } from "@/lib/jira/keys";
 import { rowId, type RowRef } from "@/lib/jira/links";
@@ -73,7 +73,7 @@ function TicketChip({
     return (
       <span
         className={`${CHIP} border-[#f85149] text-[#f85149]`}
-        title={`Could not ask Jira about ${found.key}: ${String(q.error)}`}
+        title={`Could not ask Jira about ${found.key}: ${describeJiraError(failureOf(q.error))}`}
       >
         {found.key} · not loaded
       </span>
@@ -81,9 +81,12 @@ function TicketChip({
   }
   const s = q.data;
   if (s.state === "unasked") {
+    // Not checked is not "not found": say what stopped the check, if
+    // something did, and when it will be tried again.
+    const why = s.why ? ` ${describeJiraError(s.why)}` : "";
     return (
-      <span className={`${CHIP} border-[#30363d] text-[#8b949e]`} title={`${found.key} has not been checked yet`}>
-        {found.key} · not checked yet
+      <span className={`${CHIP} border-[#30363d] text-[#8b949e]`} title={`${found.key} has not been checked yet.${why}`}>
+        {found.key} · {s.why?.state === "rate_limited" ? "rate limited" : "not checked yet"}
       </span>
     );
   }

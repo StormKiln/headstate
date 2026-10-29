@@ -12,14 +12,24 @@ export interface JiraStatus {
   category: JiraStatusCategory;
 }
 
+/// Mirrors `jira::model::JiraIssueType`.
 export interface JiraIssueType {
   name: string;
   /// -1 sub-task, 0 standard, 1 epic, 2+ initiative and above.
   hierarchy_level: number | null;
+  /// Through `acli` this names an internal Atlassian host that may not
+  /// load without a session: a failed load is "no icon", not an error.
+  /// Optional only so hand-built fixtures need not spell it; the desktop
+  /// always sends it, `null` when Jira did not.
+  icon_url?: string | null;
 }
 
+/// Mirrors `jira::model::JiraIssue`.
 export interface JiraIssue {
   key: string;
+  /// Jira's numeric id, which survives a key change. Optional only so
+  /// hand-built fixtures need not spell it; the desktop always sends it.
+  id?: string | null;
   summary: string;
   issue_type: JiraIssueType;
   status: JiraStatus;
@@ -33,6 +43,8 @@ export interface JiraIssue {
   project_key: string;
   /// On the signed-in site; `null` until the site is known.
   url: string | null;
+  /// Never filled through `acli`, whose search refuses the field: `null`
+  /// is "not read", never "never updated".
   updated: string | null;
 }
 
@@ -41,24 +53,44 @@ export interface JiraProject {
   name: string;
 }
 
+/// Why a Jira read did not happen, or did not finish (`JiraError` in
+/// `jira/model.rs`; its wire spelling is pinned by
+/// `every_error_state_has_its_wire_spelling` in `jira/commands.rs`).
+///
+/// `not_asked` is "we did not ask" -- Jira is switched off -- and never
+/// "Jira did not answer" or "nothing found" (#1050). `rate_limited`,
+/// `timed_out` and `not_logged_in` ended a read part-way; what they left
+/// is `unasked`, not `missing`. `retry_after_secs: null` is "Jira did not
+/// say when", not "retry now".
+export type JiraError =
+  | { state: "not_asked" }
+  | { state: "not_installed"; searched: string[] }
+  | { state: "not_logged_in" }
+  | { state: "rate_limited"; retry_after_secs: number | null }
+  | { state: "timed_out"; secs: number }
+  | { state: "failed"; detail: string };
+
+/// Mirrors `jira::model::ProjectList`.
 export interface ProjectList {
   projects: JiraProject[];
-  error: string | null;
+  error: JiraError | null;
 }
 
 /// Per key: found (`issues`), asked and not returned (`missing`), or never
-/// asked because the call budget ran out (`unasked`).
+/// asked because the call budget ran out or the read was ended early
+/// (`unasked`). Mirrors `jira::model::IssueBatch`.
 export interface IssueBatch {
   issues: JiraIssue[];
   missing: string[];
   unasked: string[];
-  error: string | null;
+  /// Why the read is incomplete; set alongside whatever it did find.
+  error: JiraError | null;
   truncated: boolean;
 }
 
 export type JiraConnection =
   | { state: "disabled" }
-  | { state: "not_installed" }
+  | { state: "not_installed"; searched: string[] }
   | { state: "not_logged_in"; detail: string }
   | { state: "logged_in"; site: string | null; account: string | null }
   | { state: "cannot_tell"; reason: string };
@@ -102,11 +134,12 @@ export interface JiraLink {
 }
 
 /// Every link whose key is in the user's projects, less exclusions.
+/// Mirrors `jira::model::LinkIndex`.
 export interface LinkIndex {
   links: JiraLink[];
   projects: string[];
   /// Why the project list could not be read; `links` is then empty.
-  error: string | null;
+  error: JiraError | null;
 }
 
 /// One provider's half of a ticket lookup (`jira/lookup.rs`). `not_asked`

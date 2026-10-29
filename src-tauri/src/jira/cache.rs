@@ -125,10 +125,12 @@ mod tests {
     fn issue(key: &str) -> JiraIssue {
         JiraIssue {
             key: key.into(),
+            id: None,
             summary: "s".into(),
             issue_type: JiraIssueType {
                 name: "Task".into(),
                 hierarchy_level: Some(0),
+                icon_url: None,
             },
             status: JiraStatus {
                 name: "To Do".into(),
