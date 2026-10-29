@@ -7,7 +7,7 @@
 //! child blocks on write, and the wait never ends.
 
 use super::model::{
-    IssueBatch, JiraConnection, JiraError, JiraIssue, ProjectList, ProjectStatuses,
+    IssueBatch, JiraConnection, JiraError, JiraIssue, ProjectList, ProjectStatuses, TransitionReply,
 };
 use super::parse;
 use std::path::PathBuf;
@@ -266,6 +266,41 @@ impl Acli {
         parse::parent(&raw).map_err(JiraError::failed)
     }
 
+    /// Move `key` to `status` (#2044): the first Jira WRITE.
+    ///
+    /// `acli` 1.3.39 transitions by status NAME and has no way to list the
+    /// transitions an issue's current status allows (`workitem view`
+    /// returns `transitions: null` whatever is asked, and no other command
+    /// lists a workflow), so a move the workflow forbids is found out by
+    /// asking: Jira refuses it, and that refusal is [`TransitionReply::Refused`].
+    ///
+    /// The reply is read from the JSON whatever the exit code, because a
+    /// refusal exits 0. `Err` only when nothing was sent: the arguments
+    /// were refused here, or `acli` could not be started.
+    pub async fn transition(&self, key: &str, status: &str) -> Result<TransitionReply, JiraError> {
+        let args = transition_args(key, status)?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = match self.run(&args).await {
+            Ok(out) => out,
+            Err(e @ JiraError::NotInstalled { .. }) => return Err(e),
+            // Killed at the deadline: the write may have landed first.
+            Err(e) => return Ok(TransitionReply::Unknown { error: e }),
+        };
+        Ok(match parse::transition_result(&out.stdout, key) {
+            Some(Ok(message)) => TransitionReply::Accepted { message },
+            Some(Err(reason)) => TransitionReply::Refused { reason },
+            None if !out.success => TransitionReply::Unknown {
+                error: failure(&out.stdout, &out.stderr),
+            },
+            None => TransitionReply::Unknown {
+                error: JiraError::failed(format!(
+                    "acli's reply did not say whether {key} moved: {}",
+                    out.stdout.trim().chars().take(200).collect::<String>()
+                )),
+            },
+        })
+    }
+
     /// What Jira says about `keys`.
     ///
     /// Batched `key in (...)` searches. A batch that fails is split in half
@@ -410,6 +445,48 @@ fn retry_after(lower: &str) -> Option<u64> {
         })
 }
 
+/// The arguments of one transition, after `acli`. The desktop shows these
+/// before it runs them (`ArgvPreview`), built by `transitionArgv` in
+/// `src/lib/jira/transition.ts`; both sides assert the same literal, so a
+/// change to one that is not made to the other fails a test.
+///
+/// `--yes` because there is no terminal to answer `acli`'s own prompt:
+/// the confirmation is Headstate's, with this argv on screen.
+pub fn transition_args(key: &str, status: &str) -> Result<Vec<String>, JiraError> {
+    if !is_key(key) {
+        return Err(JiraError::failed(format!("{key} is not a Jira key")));
+    }
+    if !is_status_name(status) {
+        return Err(JiraError::failed(format!(
+            "\"{status}\" is not a status name Headstate will send"
+        )));
+    }
+    Ok([
+        "jira",
+        "workitem",
+        "transition",
+        "--key",
+        key,
+        "--status",
+        status,
+        "--yes",
+        "--json",
+    ]
+    .map(str::to_string)
+    .to_vec())
+}
+
+/// Whether `status` can be sent as a status name: not blank, no control
+/// characters, not so long it cannot be one, and not starting with `-`,
+/// which `acli` could read as a flag rather than as the value.
+pub fn is_status_name(status: &str) -> bool {
+    !status.trim().is_empty()
+        && status == status.trim()
+        && status.chars().count() <= 255
+        && !status.starts_with('-')
+        && !status.chars().any(char::is_control)
+}
+
 /// How many issues a status read looks at: the most recently updated, so
 /// the statuses a project's work moves through now are the ones seen.
 pub const STATUS_SAMPLE: usize = 100;
@@ -525,6 +602,31 @@ mod pure_tests {
             "{searched:?}"
         );
         assert_eq!(searched.last().unwrap(), fallback);
+    }
+
+    #[test]
+    fn transition_argv_is_the_literal_the_preview_shows() {
+        // The same literal is asserted by `transition.test.ts` against
+        // `transitionArgv`, which builds the preview.
+        assert_eq!(
+            transition_args("ABC-1", "In Review").unwrap(),
+            [
+                "jira",
+                "workitem",
+                "transition",
+                "--key",
+                "ABC-1",
+                "--status",
+                "In Review",
+                "--yes",
+                "--json"
+            ]
+        );
+        assert!(is_status_name("In Review"));
+        assert!(is_status_name("À faire"));
+        for bad in ["", " ", "-x", "Done ", "a\tb", &"x".repeat(256)] {
+            assert!(!is_status_name(bad), "{bad:?}");
+        }
     }
 
     #[test]
@@ -814,5 +916,96 @@ echo '[{ok}]'"#
         assert_eq!(got.unasked, keys(2));
         assert!(got.missing.is_empty());
         assert_eq!(acli.assigned(5).await.error, Some(JiraError::NotLoggedIn));
+    }
+
+    /// What `acli` 1.3.39 printed for a refused move on a live site
+    /// (#2044), key replaced: FAILURE, and exit status 0.
+    const REFUSED: &str = r#"{
+  "results": [
+    {
+      "status": "FAILURE",
+      "message": "No allowed transitions found for given status",
+      "id": "ABC-1"
+    }
+  ],
+  "totalCount": 1,
+  "successCount": 0
+}"#;
+
+    #[tokio::test]
+    async fn a_refused_transition_that_exits_zero_is_refused_not_accepted() {
+        let (_d, acli) = fake(&format!("cat <<'JSON'\n{REFUSED}\nJSON\nexit 0"));
+        assert_eq!(
+            acli.transition("ABC-1", "In Review").await,
+            Ok(TransitionReply::Refused {
+                reason: "No allowed transitions found for given status".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_sends_exactly_the_argv_the_preview_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let (_d, acli) = fake(&format!(
+            "for a in \"$@\"; do echo \"$a\" >> '{}'; done\necho '{{\"results\":[{{\"status\":\"SUCCESS\",\"message\":\"Work item ABC-1 has been successfully transitioned to In Review\",\"id\":\"ABC-1\"}}],\"totalCount\":1,\"successCount\":1}}'",
+            calls.display()
+        ));
+        let got = acli.transition("ABC-1", "In Review").await;
+        assert_eq!(
+            got,
+            Ok(TransitionReply::Accepted {
+                message: "Work item ABC-1 has been successfully transitioned to In Review".into()
+            })
+        );
+        let sent: Vec<String> = std::fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(sent, transition_args("ABC-1", "In Review").unwrap());
+    }
+
+    /// A reply that does not say, from a call that failed, is not known --
+    /// never refused, never accepted. And a timeout may have written.
+    #[tokio::test]
+    async fn a_transition_whose_reply_does_not_say_is_unknown() {
+        let (_d, acli) = fake("echo 'boom' >&2; exit 1");
+        assert_eq!(
+            acli.transition("ABC-1", "Done").await,
+            Ok(TransitionReply::Unknown {
+                error: JiraError::failed("boom")
+            })
+        );
+        let (_d, acli) = fake("echo 'done, probably'");
+        assert!(matches!(
+            acli.transition("ABC-1", "Done").await,
+            Ok(TransitionReply::Unknown { .. })
+        ));
+        let (d, _) = fake("sleep 5");
+        let slow = Acli::with_timeout(d.path().join("acli"), Duration::from_millis(200));
+        assert_eq!(
+            slow.transition("ABC-1", "Done").await,
+            Ok(TransitionReply::Unknown {
+                error: JiraError::TimedOut { secs: 1 }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_key_or_status_is_never_sent() {
+        let (_d, acli) = fake("echo called >&2; exit 1");
+        for (k, s) in [
+            ("abc-1", "Done"),
+            ("ABC-1", ""),
+            ("ABC-1", "--jql"),
+            ("ABC-1", " Done"),
+            ("ABC-1", "Do\nne"),
+        ] {
+            assert!(
+                matches!(acli.transition(k, s).await, Err(JiraError::Failed { .. })),
+                "{k} {s:?}"
+            );
+        }
     }
 }

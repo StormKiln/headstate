@@ -11,6 +11,7 @@
 
 use super::model::{
     IssueBatch, JiraConnection, JiraError, LinkIndex, ProjectList, ProjectStatuses,
+    TransitionResult,
 };
 use super::transport::Transport;
 use crate::store::{open_db, settings};
@@ -278,6 +279,55 @@ async fn issues_with(
     Ok(super::read::issues(&t?, db, site, keys, fresh).await)
 }
 
+/// Move `key` to the status named `status`, then read it again (#2044).
+///
+/// The first Jira WRITE, and visible to the user's whole team, so the
+/// frontend runs it only after showing the exact argv and being told to.
+/// Rejects only when nothing was sent: Jira off, no `acli`, or a key or
+/// status refused before it could be. Everything after the call is in the
+/// result -- including a refusal, and a reply that did not say -- and the
+/// issue is always read again, past the cache, so what is shown is the
+/// status Jira reports and the cache holds it too.
+#[tauri::command]
+pub async fn jira_transition(
+    app: AppHandle,
+    key: String,
+    status: String,
+) -> Result<TransitionResult, JiraError> {
+    let t = gate(enabled(&app).await, Transport::locate);
+    let site = site(&app).await;
+    let db = crate::commands::db_path(&app);
+    transition_with(t, &db, site.as_deref(), &key, &status).await
+}
+
+async fn transition_with(
+    t: Result<Transport, JiraError>,
+    db: &Path,
+    site: Option<&str>,
+    key: &str,
+    status: &str,
+) -> Result<TransitionResult, JiraError> {
+    let t = t?;
+    let reply = t.transition(key, status).await?;
+    let mut batch = super::read::issues(&t, db, site, &[key.to_string()], true).await;
+    // A read that failed is answered from the cache, marked stale: that
+    // is the status from BEFORE the move, and must not be shown as after.
+    let after = batch.issues.drain(..).find(|i| i.key == key && !i.stale);
+    let reread_error = match &after {
+        Some(_) => None,
+        None => Some(batch.error.take().unwrap_or_else(|| {
+            JiraError::failed(format!("Jira did not return {key} when it was read again"))
+        })),
+    };
+    Ok(TransitionResult {
+        key: key.to_string(),
+        requested: status.to_string(),
+        reply,
+        after,
+        reread_error,
+    })
+}
+
 /// How many assigned issues one read returns. Past this the page says "at
 /// least" rather than presenting a partial list as the whole.
 pub(super) const ASSIGNED_LIMIT: usize = 100;
@@ -429,6 +479,7 @@ echo '[]'
             issues_with(t(), &db, None, &keys, false).await.err(),
             issues_with(t(), &db, None, &keys, true).await.err(),
             assigned_with(t(), &db, None).await.err(),
+            transition_with(t(), &db, None, "ABC-1", "Done").await.err(),
         ]
     }
 
@@ -454,5 +505,158 @@ echo '[]'
             calls(dir.path()) >= 4,
             "connection, projects, issues, assigned"
         );
+    }
+}
+
+/// A transition reports what Jira holds afterwards, read past the cache,
+/// and leaves the cache holding it (#2044).
+#[cfg(all(test, unix))]
+mod transition {
+    use super::*;
+    use crate::jira::cli::Acli;
+    use crate::jira::model::TransitionReply;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stand-in `acli`: `transition` prints `reply`; a search prints the
+    /// issue in the status held in the file `status`, or fails when that
+    /// file says `fail`. Every call is appended to `calls`.
+    fn fake(dir: &Path, reply: &str) -> Transport {
+        let bin = dir.join("acli");
+        let status = dir.join("status");
+        let calls = dir.join("calls");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> '{calls}'
+case "$*" in
+  *"workitem transition"*) cat <<'JSON'
+{reply}
+JSON
+  ;;
+  *"workitem search"*)
+    s=$(cat '{status}')
+    if [ "$s" = fail ]; then echo 'Error: connection reset' >&2; exit 1; fi
+    echo "[{{\"key\":\"ABC-1\",\"fields\":{{\"summary\":\"s\",\"status\":{{\"name\":\"$s\",\"statusCategory\":{{\"key\":\"indeterminate\"}}}}}}}}]"
+  ;;
+  *"workitem view"*) echo '{{"key":"ABC-1","fields":{{}}}}' ;;
+esac
+"#,
+                calls = calls.display(),
+                status = status.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Transport::Acli(Acli::new(bin))
+    }
+
+    fn set_status(dir: &Path, s: &str) {
+        std::fs::write(dir.join("status"), s).unwrap();
+    }
+
+    fn calls(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    const MOVED: &str = r#"{"results":[{"status":"SUCCESS","message":"Work item ABC-1 has been successfully transitioned to In Review","id":"ABC-1"}],"totalCount":1,"successCount":1}"#;
+
+    #[tokio::test]
+    async fn the_status_shown_is_the_one_jira_reports_and_the_cache_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let t = fake(dir.path(), MOVED);
+        // Jira's automation, say, put it somewhere other than asked.
+        set_status(dir.path(), "In Testing");
+        let got = transition_with(Ok(t.clone()), &db, None, "ABC-1", "In Review")
+            .await
+            .unwrap();
+        assert!(matches!(got.reply, TransitionReply::Accepted { .. }));
+        assert_eq!(got.requested, "In Review");
+        assert_eq!(got.after.unwrap().status.name, "In Testing");
+        assert_eq!(got.reread_error, None);
+
+        // The cache now holds it: a cached read spawns nothing.
+        let before = calls(dir.path());
+        let cached = crate::jira::read::issues(&t, &db, None, &["ABC-1".into()], false).await;
+        assert_eq!(calls(dir.path()), before, "answered from the cache");
+        assert_eq!(cached.issues[0].status.name, "In Testing");
+    }
+
+    /// A re-read that fails is served from the cache, stale -- the status
+    /// from before the move. That must never come back as `after`.
+    #[tokio::test]
+    async fn a_failed_reread_claims_nothing_about_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let t = fake(dir.path(), MOVED);
+        set_status(dir.path(), "To Do");
+        crate::jira::read::issues(&t, &db, None, &["ABC-1".into()], true).await;
+        set_status(dir.path(), "fail");
+        let got = transition_with(Ok(t), &db, None, "ABC-1", "In Review")
+            .await
+            .unwrap();
+        assert!(matches!(got.reply, TransitionReply::Accepted { .. }));
+        assert_eq!(got.after, None, "the stale To Do must not be shown");
+        assert_eq!(
+            got.reread_error,
+            Some(JiraError::failed("Error: connection reset"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_carries_jiras_reason_and_the_status_it_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let refused = r#"{"results":[{"status":"FAILURE","message":"Resolution is required.","id":"ABC-1"}],"totalCount":1,"successCount":0}"#;
+        let t = fake(dir.path(), refused);
+        set_status(dir.path(), "To Do");
+        let got = transition_with(Ok(t), &db, None, "ABC-1", "Done")
+            .await
+            .unwrap();
+        assert_eq!(
+            got.reply,
+            TransitionReply::Refused {
+                reason: "Resolution is required.".into()
+            }
+        );
+        assert_eq!(got.after.unwrap().status.name, "To Do");
+    }
+
+    /// Against the real `acli` and whatever site it is signed in to: a
+    /// WRITE. Run by hand only, against a test site, naming the issue and
+    /// status in the environment so neither is committed:
+    ///
+    /// `HEADSTATE_LIVE_JIRA_KEY=… HEADSTATE_LIVE_JIRA_STATUS=… cargo test
+    /// --lib live_transition -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "writes to a live Jira site"]
+    async fn live_transition() {
+        let key = std::env::var("HEADSTATE_LIVE_JIRA_KEY").expect("HEADSTATE_LIVE_JIRA_KEY");
+        let status =
+            std::env::var("HEADSTATE_LIVE_JIRA_STATUS").expect("HEADSTATE_LIVE_JIRA_STATUS");
+        let dir = tempfile::tempdir().unwrap();
+        let got = transition_with(
+            Transport::locate(),
+            &dir.path().join("t.db"),
+            None,
+            &key,
+            &status,
+        )
+        .await;
+        println!("{got:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_status_rejects_and_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let t = fake(dir.path(), MOVED);
+        let got = transition_with(Ok(t), &db, None, "ABC-1", "--jql").await;
+        assert!(matches!(got, Err(JiraError::Failed { .. })), "{got:?}");
+        assert_eq!(calls(dir.path()), 0);
     }
 }

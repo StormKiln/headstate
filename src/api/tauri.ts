@@ -17,7 +17,16 @@ import type { TranscriptWatch } from "../types/transcript";
 import { call } from "./transport";
 import type { PrIdentity, Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
-import type { IssueBatch, JiraConnection, KeyLookup, LinkIndex, ProjectList, ProjectStatuses, StatusExpectations } from "../types/jira";
+import type {
+  IssueBatch,
+  JiraConnection,
+  KeyLookup,
+  LinkIndex,
+  ProjectList,
+  ProjectStatuses,
+  StatusExpectations,
+  TransitionResult,
+} from "../types/jira";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -487,6 +496,10 @@ export const jiraFind = (key: string, more: boolean) => call<KeyLookup>("jira_fi
 export const jiraAcliVersion = () => call<string>("jira_acli_version");
 export const jiraProjectStatuses = (project: string) =>
   call<ProjectStatuses>("jira_project_statuses", { project });
+/// The one Jira WRITE (#2044): move `key` to the status named `status`.
+/// Run only after the user has confirmed the argv `transitionArgv` builds.
+export const jiraTransition = (key: string, status: string) =>
+  call<TransitionResult>("jira_transition", { key, status });
 
 /// --- Docker -------------------------------------------------------
 

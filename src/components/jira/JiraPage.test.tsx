@@ -151,6 +151,16 @@ describe("My Jira issues", () => {
     await quiet();
   });
 
+  /// The panel hosts the transition control (#2044); it sends nothing
+  /// until a status is chosen and the argv confirmed.
+  it("offers to move the selected issue", async () => {
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    await screen.findByRole("heading", { name: /ABC-1 Summary of ABC-1/ });
+    expect(await screen.findByRole("button", { name: "Move to…" })).toBeTruthy();
+    await quiet();
+  });
+
   it("says plainly when nothing of yours names the selected issue", async () => {
     useJiraView.setState({ selected: "ABC-3" });
     mount(<JiraPage />);

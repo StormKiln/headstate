@@ -7,7 +7,9 @@
 //! `Send` without boxing every future.
 
 use super::cli::Acli;
-use super::model::{IssueBatch, JiraConnection, JiraError, ProjectList, ProjectStatuses};
+use super::model::{
+    IssueBatch, JiraConnection, JiraError, ProjectList, ProjectStatuses, TransitionReply,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
@@ -57,6 +59,14 @@ impl Transport {
     pub async fn project_statuses(&self, project: &str, limit: usize) -> ProjectStatuses {
         match self {
             Self::Acli(a) => a.project_statuses(project, limit).await,
+        }
+    }
+
+    /// Move `key` to the status named `status`; see [`Acli::transition`].
+    /// The one write here (#2044).
+    pub async fn transition(&self, key: &str, status: &str) -> Result<TransitionReply, JiraError> {
+        match self {
+            Self::Acli(a) => a.transition(key, status).await,
         }
     }
 

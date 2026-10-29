@@ -620,6 +620,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("unresolve_thread", Class::Write),
     ("reply_to_thread", Class::Write),
     ("rerun_checks", Class::Write),
+    // Move a Jira issue to another status (#2044): the one Jira write.
+    // Changes Jira, not the desktop, and deletes nothing.
+    ("jira_transition", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
     // Merge or queue a native GitHub stack through the async merge API
@@ -1175,6 +1178,10 @@ async fn call(
         }
         "jira_project_statuses" => jira_res(
             crate::jira::commands::jira_project_statuses(app.clone(), a.get("project")?).await,
+        ),
+        "jira_transition" => jira_res(
+            crate::jira::commands::jira_transition(app.clone(), a.get("key")?, a.get("status")?)
+                .await,
         ),
         "disk_inventory_status" => res(crate::disk_inventory::commands::disk_inventory_status()),
         "disk_inventory_history" => {
@@ -2022,7 +2029,7 @@ mod tests {
             !arms.contains(" res("),
             "a Jira dispatch arm uses `res`, which drops the typed reason"
         );
-        assert_eq!(arms.matches("jira_res(").count(), 7);
+        assert_eq!(arms.matches("jira_res(").count(), 8);
     }
 
     /// The two superseded update commands are off the wire (#964).

@@ -321,3 +321,40 @@ pub struct StatusExpectations {
     #[serde(default)]
     pub on_merged: Option<StatusExpectation>,
 }
+
+/// What `acli` said about one transition (#2044), before anything is
+/// re-read. Never the outcome on its own: Jira may run automation on the
+/// move, or `acli` may report success for a move that left the status
+/// where it was, so what the issue holds now is in
+/// [`TransitionResult::after`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TransitionReply {
+    /// `acli` reported `SUCCESS` for the key. Its message, verbatim.
+    Accepted { message: String },
+    /// `acli` reported `FAILURE` for the key: Jira's reason, verbatim --
+    /// a move the workflow does not allow from here, a required field, a
+    /// validator, or an issue this user cannot see. `acli` 1.3.39 exits 0
+    /// for this, so it is read from the reply, never from the exit code.
+    Refused { reason: String },
+    /// Whether Jira moved it is not known: the call timed out (and may
+    /// have been written before it was killed), failed, or printed a reply
+    /// this build does not read. The re-read says where it is.
+    Unknown { error: JiraError },
+}
+
+/// One transition and what Jira reports after it (#2044).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionResult {
+    pub key: String,
+    /// The status asked for. Shown only as what was asked, never as where
+    /// the issue is.
+    pub requested: String,
+    pub reply: TransitionReply,
+    /// The issue read fresh from Jira after the call, which also updated
+    /// the cache. `None` when that read failed or did not return the key:
+    /// then `reread_error` says why, and nothing is claimed about where
+    /// the issue is now. Never an answer from the cache.
+    pub after: Option<JiraIssue>,
+    pub reread_error: Option<JiraError>,
+}

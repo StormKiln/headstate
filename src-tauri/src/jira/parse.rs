@@ -218,9 +218,91 @@ pub fn acli_version(stdout: &str) -> Option<String> {
     (!rest.is_empty() && !rest.contains(char::is_whitespace)).then(|| rest.to_string())
 }
 
+/// One key's line in `acli jira workitem transition --json`, as `acli`
+/// 1.3.39 prints it (#2044, recorded live):
+///
+/// ```json
+/// {"results":[{"status":"FAILURE","message":"No allowed transitions found for given status","id":"ABC-1"}],
+///  "totalCount":1,"successCount":0}
+/// ```
+///
+/// `Some(Ok(message))` for `SUCCESS`, `Some(Err(reason))` for `FAILURE`.
+/// `None` when the reply is not that shape, names no such key, or holds a
+/// status this build does not know: the caller must then say neither.
+pub fn transition_result(raw: &str, key: &str) -> Option<Result<String, String>> {
+    let v: Value = serde_json::from_str(raw.trim()).ok()?;
+    let row = v
+        .get("results")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("id").and_then(Value::as_str) == Some(key))?;
+    let message = row
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    match row.get("status").and_then(Value::as_str)? {
+        "SUCCESS" => Some(Ok(message)),
+        "FAILURE" => Some(Err(if message.is_empty() {
+            "Jira refused the move without saying why".into()
+        } else {
+            message
+        })),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shapes `acli` 1.3.39 printed against a live site (#2044), keys
+    /// replaced. A refusal exits 0, so this is the only place it shows.
+    #[test]
+    fn a_transition_reply_is_read_per_key() {
+        let refused = r#"{
+  "results": [
+    {
+      "status": "FAILURE",
+      "message": "No allowed transitions found for given status",
+      "id": "ABC-1"
+    }
+  ],
+  "totalCount": 1,
+  "successCount": 0
+}"#;
+        assert_eq!(
+            transition_result(refused, "ABC-1"),
+            Some(Err("No allowed transitions found for given status".into()))
+        );
+        let hidden = r#"{"results":[{"status":"FAILURE","message":"Issue does not exist or you do not have permission to see it.","id":"ABC-1"}],"totalCount":1,"successCount":0}"#;
+        assert!(
+            matches!(transition_result(hidden, "ABC-1"), Some(Err(r)) if r.contains("permission"))
+        );
+        let moved = r#"{"results":[{"status":"SUCCESS","message":"Work item ABC-1 has been successfully transitioned to In Progress","id":"ABC-1"}],"totalCount":1,"successCount":1}"#;
+        assert_eq!(
+            transition_result(moved, "ABC-1"),
+            Some(Ok(
+                "Work item ABC-1 has been successfully transitioned to In Progress".into()
+            ))
+        );
+        // Another key's line, an unknown status word, or not JSON at all
+        // says nothing about this key.
+        assert_eq!(transition_result(moved, "XY-2"), None);
+        assert_eq!(
+            transition_result(r#"{"results":[{"status":"QUEUED","id":"ABC-1"}]}"#, "ABC-1"),
+            None
+        );
+        assert_eq!(transition_result("✓ Success: ABC-1", "ABC-1"), None);
+        assert_eq!(
+            transition_result(
+                r#"{"results":[{"status":"FAILURE","id":"ABC-1"}]}"#,
+                "ABC-1"
+            ),
+            Some(Err("Jira refused the move without saying why".into()))
+        );
+    }
 
     #[test]
     fn statuses_are_distinct_by_name_and_category() {

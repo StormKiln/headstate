@@ -1,7 +1,17 @@
 import { useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { jiraAcliVersion, jiraAssigned, jiraConnection, jiraFind, jiraIssues, jiraLinks, jiraProjects, jiraProjectStatuses } from "./tauri";
-import type { IssueBatch, JiraError, JiraIssue } from "../types/jira";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  jiraAcliVersion,
+  jiraAssigned,
+  jiraConnection,
+  jiraFind,
+  jiraIssues,
+  jiraLinks,
+  jiraProjects,
+  jiraProjectStatuses,
+  jiraTransition,
+} from "./tauri";
+import type { IssueBatch, JiraError, JiraIssue, TransitionResult } from "../types/jira";
 import { NOT_ASKED } from "../lib/notAsked";
 
 /// --- Jira (epic #2031) --------------------------------------------
@@ -315,6 +325,35 @@ export function useJiraIssueFresh(key: string, enabled: boolean) {
     gcTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: false,
+  });
+}
+
+/// Move a Jira issue to another status (#2044), the one Jira write.
+///
+/// Call `mutate({ key, status })` only after the user has confirmed the
+/// argv `transitionArgv` builds. Rejects (with a `JiraFailure`) only when
+/// the desktop sent nothing it could report on -- Jira off, no `acli`, a
+/// status it refused -- or the call never came back. Anything else,
+/// refusals included, resolves with a `TransitionResult`; read it through
+/// `transitionOutcome`, never by `requested`.
+///
+/// On success the issue as Jira reported it after the move replaces what
+/// every Jira surface holds for it, so a chip, the sidebar and the panel
+/// agree at once; the assigned list is read again, since a move to Done
+/// takes an issue off it.
+export function useJiraTransition() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ key, status }: { key: string; status: string }) => typed(() => jiraTransition(key, status)),
+    onSuccess: (r: TransitionResult) => {
+      if (r.after) {
+        const state: IssueState = { state: "found", issue: r.after };
+        lastFound.set(r.key, r.after);
+        qc.setQueryData(["jira-issue", r.key], state);
+        qc.setQueryData(["jira-issue-fresh", r.key], state);
+      }
+      void qc.invalidateQueries({ queryKey: ["jira-assigned"] });
+    },
   });
 }
 

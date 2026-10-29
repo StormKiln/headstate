@@ -7,6 +7,7 @@ import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
 import { useJiraView } from "@/store/jira";
 import { ExternalLink } from "../ExternalLink";
 import { JiraBrowser } from "./JiraBrowser";
+import { JiraTransition } from "./JiraTransition";
 import { openInHeadstate } from "./openInHeadstate";
 import { describeJiraError, failureOf, keptOrFailed, useJiraFind, useJiraIssueFresh } from "@/api/jira";
 import { freshnessNote } from "@/lib/jira/age";
@@ -58,7 +59,13 @@ export function JiraPage() {
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" /> All issues
         </button>
       ) : null}
-      <IssueHeader k={selected} lookup={lookup} site={board.jira?.site ?? null} failed={ownFailed} />
+      <IssueHeader
+        k={selected}
+        lookup={lookup}
+        site={board.jira?.site ?? null}
+        failed={ownFailed}
+        on={board.jira !== null}
+      />
       <EpicRollUp k={selected} known={known} lookup={lookup} />
       <LinkedWork k={selected} links={board.links.get(selected)} lookup={lookup} />
       <FoundBySearching key={selected} k={selected} links={board.links.get(selected)} lookup={lookup} on={board.jira !== null} />
@@ -66,7 +73,20 @@ export function JiraPage() {
   );
 }
 
-function IssueHeader({ k, lookup, site, failed }: { k: string; lookup: Lookup; site: string | null; failed: string | null }) {
+function IssueHeader({
+  k,
+  lookup,
+  site,
+  failed,
+  on,
+}: {
+  k: string;
+  lookup: Lookup;
+  site: string | null;
+  failed: string | null;
+  /// Jira is on and keys can be matched: the only time a move is offered.
+  on: boolean;
+}) {
   const { select } = useJiraView();
   const now = useNow(30_000);
   const s = lookup(k);
@@ -98,6 +118,7 @@ function IssueHeader({ k, lookup, site, failed }: { k: string; lookup: Lookup; s
         ) : null}
       </div>
       <Freshness issue={issue} now={now} failed={failed} />
+      {issue && on ? <JiraTransition key={k} issue={issue} site={site} /> : null}
     </div>
   );
 }

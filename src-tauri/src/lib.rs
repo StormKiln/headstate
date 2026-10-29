@@ -361,6 +361,7 @@ pub fn run() {
             jira::commands::jira_find,
             jira::commands::jira_acli_version,
             jira::commands::jira_project_statuses,
+            jira::commands::jira_transition,
             disk_inventory::commands::disk_inventory_status,
             disk_inventory::commands::disk_inventory_history,
             disk_inventory::commands::disk_inventory_settings,
