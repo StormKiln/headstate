@@ -150,6 +150,8 @@ describe("JiraSettingsPanel", () => {
     expect((box as HTMLInputElement).checked).toBe(false);
     fireEvent.click(box);
     expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_no_ticket_marker: true }));
+  });
+
   /// #2042: R2's grace period. Committed on blur, so a half-typed value
   /// is never stored, and nonsense is not stored at all.
   it("sets how long to wait after a merge", async () => {
