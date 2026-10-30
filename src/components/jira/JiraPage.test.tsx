@@ -116,7 +116,7 @@ afterEach(cleanup);
 /// test's mocks.
 const quiet = () => act(() => new Promise((r) => setTimeout(r, 60)));
 
-const mount = (ui: React.ReactNode) => renderWithQuery(<JiraProvider prefs={prefs}>{ui}</JiraProvider>);
+const mount = (ui: React.ReactNode, p: UiPrefs = prefs) => renderWithQuery(<JiraProvider prefs={p}>{ui}</JiraProvider>);
 
 describe("My Jira issues", () => {
   it("groups a linked story under its epic, beside assigned work with no pull request", async () => {
@@ -251,6 +251,40 @@ describe("My Jira issues", () => {
     const region = await screen.findByRole("region", { name: "Found by searching" });
     expect(await within(region).findByText(/octocat\/hello-world#9 · merged · dana/)).toBeTruthy();
     expect(await within(region).findByText("A pull request for ABC-1 has merged, but the ticket is still In Progress.")).toBeTruthy();
+    // The default expectation is a category: no status is named for the
+    // reader, who is pointed at the header's chooser.
+    expect(within(region).getByText("ABC expects any Done status here. Choose one with Move to… above.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Move ABC-1 to/ })).toBeNull();
+    await quiet();
+  });
+
+  /// #2042's fix action: a named on-merged expectation is the target.
+  it("offers to move a merged ticket to the project's named on-merged status", async () => {
+    links.mockResolvedValue(index([{ ...prLink(), current: false }]));
+    find.mockResolvedValue({
+      key: "ABC-1",
+      links: [{ ...prLink(), current: false }, searchedPr({ state: "merged", merged_at: "2026-10-28T11:00:00Z" })],
+      search: { state: "asked", at: "2026-10-28T12:00:00Z", total: 1, read: 1, truncated: false, scope: ["octocat"], unsearched: [] },
+      gitlab: null,
+    });
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />, { ...prefs, jira_status_expectations: { ABC: { on_merged: { kind: "status", name: "Closed" } } } });
+    const region = await screen.findByRole("region", { name: "Found by searching" });
+    fireEvent.click(await within(region).findByRole("button", { name: "Move ABC-1 to Closed" }));
+    expect(within(region).getByLabelText("Command to run").textContent).toContain("--statusClosed");
+    await quiet();
+  });
+
+  /// R1 on the ticket's page: once, for the open pull request that raises it.
+  it("offers to move a To Do ticket with an open pull request to the named on-open status", async () => {
+    issues.mockImplementation((keys) =>
+      Promise.resolve(batch([issue("ABC-1", { status: { name: "To Do", category: "new" } })].filter((i) => keys.includes(i.key)))),
+    );
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />, { ...prefs, jira_status_expectations: { ABC: { on_open: { kind: "status", name: "In Review" } } } });
+    const region = await screen.findByRole("region", { name: "Pull requests" });
+    expect(await within(region).findByText("This pull request is open, but ABC-1 is still To Do.")).toBeTruthy();
+    expect(within(region).getAllByRole("button", { name: "Move ABC-1 to In Review" })).toHaveLength(1);
     await quiet();
   });
 
@@ -295,6 +329,9 @@ describe("My Jira issues", () => {
       "A pull request for ABC-1 has merged and the ticket is still In Progress; other pull requests for ABC-1 were not checked.",
     );
     expect(line.querySelector("svg")).toBeNull();
+    // Qualified is not a statement to act on: no move offered for it.
+    expect(within(region).queryByText(/expects/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Move ABC-1 to/ })).toBeNull();
     await quiet();
   });
 

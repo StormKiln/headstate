@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UiPrefs } from "@/api/tauri";
-import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex } from "@/types/jira";
+import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, LinkIndex, TransitionResult } from "@/types/jira";
 import { renderWithQuery } from "@/test-utils";
 import { createQueryClient } from "@/api/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
@@ -12,7 +12,8 @@ import { useJiraView } from "@/store/jira";
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
 const issues = vi.hoisted(() => vi.fn<(keys: string[]) => Promise<IssueBatch>>());
-vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraLinks: links, jiraIssues: issues }));
+const transition = vi.hoisted(() => vi.fn<(key: string, status: string) => Promise<TransitionResult>>());
+vi.mock("@/api/tauri", () => ({ jiraConnection: connection, jiraLinks: links, jiraIssues: issues, jiraTransition: transition }));
 
 import { JiraProvider } from "./JiraContext";
 import { PrRowTicketChips, TicketChips, TicketDriftNotices } from "./TicketChips";
@@ -208,6 +209,61 @@ describe("TicketChips", () => {
     );
     expect(await screen.findByLabelText("Needs attention")).toBeTruthy();
     expect(await screen.findByText("This pull request is open, but ABC-7 is still Backlog.")).toBeTruthy();
+  });
+
+  /// #2042's fix action: a named on-open expectation is the target.
+  it("offers to move a To Do ticket to the project's named on-open status, and keeps the outcome after the drift clears", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-7", "To Do", "new")] }));
+    links.mockResolvedValue(index([prLink("ABC-7")]));
+    const p = prefs({ jira_status_expectations: { ABC: { on_open: { kind: "status", name: "In Review" } } } });
+    renderWithQuery(
+      <JiraProvider prefs={p}>
+        <TicketDriftNotices prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Move ABC-7 to In Review" }));
+    // Straight to the confirmation, with the argv; nothing has run yet.
+    expect(screen.getByLabelText("Command to run").textContent).toContain("--statusIn Review");
+    expect(transition).not.toHaveBeenCalled();
+    transition.mockResolvedValue({
+      key: "ABC-7",
+      requested: "In Review",
+      reply: { state: "accepted", message: "ok" },
+      after: issue("ABC-7", "In Review"),
+      reread_error: null,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Move to In Review" }));
+    await waitFor(() => expect(transition).toHaveBeenCalledWith("ABC-7", "In Review"));
+    // The re-read clears the drift; what Jira said stays until dismissed.
+    expect(await screen.findByText("Jira now reports ABC-7 as In Review.")).toBeTruthy();
+    expect(screen.queryByText(/still To Do/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("button", { name: /Move/ })).toBeNull();
+  });
+
+  it("lets the reader choose when the expectation is a category, and names no status for them", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-7", "To Do", "new")] }));
+    links.mockResolvedValue(index([prLink("ABC-7")]));
+    renderWithQuery(
+      <JiraProvider prefs={prefs()}>
+        <TicketDriftNotices prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByText("ABC expects any In Progress status here. Choose the status to move ABC-7 to.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Move to…" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Move ABC-7 to/ })).toBeNull();
+  });
+
+  it("offers no move for a ticket that is done while its pull request is open", async () => {
+    issues.mockResolvedValue(batch({ issues: [issue("ABC-7", "Done", "done")] }));
+    links.mockResolvedValue(index([prLink("ABC-7")]));
+    renderWithQuery(
+      <JiraProvider prefs={prefs({ jira_status_expectations: { ABC: { on_open: { kind: "status", name: "In Review" } } } })}>
+        <TicketDriftNotices prUrl={URL} draft={false} />
+      </JiraProvider>,
+    );
+    expect(await screen.findByText("ABC-7 is Done, but this pull request is still open.")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("does not mark a draft, or a row that is not an open pull request", async () => {

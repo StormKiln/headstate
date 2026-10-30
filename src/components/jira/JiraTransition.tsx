@@ -37,6 +37,7 @@ export function JiraTransition({
   site,
   target,
   onDone,
+  onClose,
 }: {
   issue: JiraIssue;
   /// The signed-in site, for "Open in Jira" when the issue carries no URL.
@@ -45,6 +46,8 @@ export function JiraTransition({
   target?: string;
   /// Called with what Jira reported once the move has been tried.
   onDone?: (r: TransitionResult) => void;
+  /// Called when the reader dismisses it -- Cancel, or Done after a move.
+  onClose?: () => void;
 }) {
   const [step, setStep] = useState<"idle" | "choosing" | { confirm: string }>("idle");
   const move = useJiraTransition();
@@ -52,6 +55,7 @@ export function JiraTransition({
   const reset = () => {
     move.reset();
     setStep("idle");
+    onClose?.();
   };
 
   if (move.isSuccess) {

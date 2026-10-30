@@ -254,3 +254,40 @@ export function afterMerge(
   }
   return null;
 }
+
+/// The move that would settle a drift, as far as Headstate can name one
+/// (#2042, #2045). A NAMED expectation is a status to move to. A CATEGORY
+/// is not: "any In Progress status" is many statuses, and acli cannot list
+/// which ones the workflow allows from here, so the reader chooses
+/// (`choose`) -- a status name is never made up from a category.
+export type Fix = { kind: "move"; status: string } | { kind: "choose"; expected: string };
+
+function toward(e: StatusExpectation): Fix {
+  return e.kind === "status" ? { kind: "move", status: e.name } : { kind: "choose", expected: expectationLabel(e) };
+}
+
+/// The fix an open pull request's drift offers: only R1 -- open, ticket
+/// still To Do -- toward the project's on-open expectation. R4 (done but
+/// open) is not fixed by moving the ticket, and the rest are not raised as
+/// a plain fact about a status to move to.
+export function fixForDrift(issue: JiraIssue, drift: Drift, expectations?: ExpectationMap): Fix | null {
+  return drift.rule === "open-but-not-started" ? toward(expectationsFor(issue, expectations).on_open) : null;
+}
+
+/// The fix a verdict offers: only R2 raised as FACT -- every pull request
+/// accounted for, merged, past the grace period -- toward the on-merged
+/// expectation. A qualified, waiting or progress verdict is not a
+/// statement to act on, so it offers nothing.
+export function fixForVerdict(issue: JiraIssue, verdict: Verdict, expectations?: ExpectationMap): Fix | null {
+  return verdict.rule === "merged-not-done" && verdict.level === "fact"
+    ? toward(expectationsFor(issue, expectations).on_merged)
+    : null;
+}
+
+/// Start work's optional move (#2045): toward the on-open expectation, or
+/// nothing when the ticket already meets it -- or when its status did not
+/// come back, so whether it does cannot be told.
+export function startFix(issue: JiraIssue, expectations?: ExpectationMap): Fix | null {
+  const e = expectationsFor(issue, expectations).on_open;
+  return meets(issue.status, e) === false ? toward(e) : null;
+}

@@ -3,7 +3,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { GitBranchPlus } from "lucide-react";
 import { startWork, startWorkPlan, type StartMode, type StartPlan, type StartRefusal, type Started } from "@/api/tauri";
 import { useWorktrees } from "@/api/hooks";
+import { describeJiraError, failureOf, useJiraProjectStatuses, useJiraTransition } from "@/api/jira";
 import { branchName } from "@/lib/jira/branchName";
+import { startFix, type Fix } from "@/lib/jira/drift";
+import { TRANSITION_PROGRAM, candidateStatuses, isStatusName, transitionArgv, transitionOutcome } from "@/lib/jira/transition";
 import { errorMessage } from "@/lib/queryErrorMessage";
 import type { JiraIssue } from "@/types/jira";
 import { ActingOnDesktop } from "../ActingOnDesktop";
@@ -17,9 +20,10 @@ import { useJira } from "./jiraState";
 ///
 /// The desktop plans and the dialog shows that plan -- the exact argv, the
 /// base and the directory -- before anything runs; the desktop runs only
-/// that argv, re-checked. `onStarted` is the seam for #2044's "Move to In
-/// Progress": run the transition there, after git has succeeded, so a
-/// failed Jira write never reads as a failed branch.
+/// that argv, re-checked. An opt-in "Also move ABC-1 to In Progress"
+/// (#2044) is confirmed in the same dialog, its argv beside git's, and runs
+/// only after git has succeeded, so a failed Jira write never reads as a
+/// failed branch. `onStarted` fires once git has.
 export function StartWork({ issue, onStarted }: { issue: JiraIssue; onStarted?: (s: Started) => void }) {
   const [open, setOpen] = useState(false);
   return (
@@ -60,7 +64,16 @@ function StartWorkDialog({
   onStarted?: (s: Started) => void;
 }) {
   const qc = useQueryClient();
-  const template = useJira()?.branchTemplate ?? "";
+  const jira = useJira();
+  const template = jira?.branchTemplate ?? "";
+  // The move offered alongside (#2045): toward the project's on-open
+  // expectation, never by default, and only while Jira is on.
+  const fix = jira ? startFix(issue, jira.expectations) : null;
+  const [alsoMove, setAlsoMove] = useState(false);
+  const [typedStatus, setTypedStatus] = useState("");
+  const moveTo = fix?.kind === "move" ? fix.status : typedStatus.trim();
+  const move = alsoMove && fix && isStatusName(moveTo) ? moveTo : null;
+  const transition = useJiraTransition();
   const scan = useWorktrees(true);
   const repos = scan.data ?? [];
   const [repo, setRepo] = useState("");
@@ -84,6 +97,8 @@ function StartWorkDialog({
   // runnable: a plan for the previous name must not be confirmable.
   const current = plan.data && plan.data.branch === branch.trim() && plan.data.mode === mode ? plan.data : null;
 
+  // `move` is fixed by this render: what was confirmed is what runs once
+  // git is done, and nothing runs if git fails.
   const run = (p: StartPlan) => {
     setRunning(true);
     setFailed(null);
@@ -96,6 +111,7 @@ function StartWorkDialog({
         void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
         void qc.invalidateQueries({ queryKey: ["branches", repo] });
         void qc.invalidateQueries({ queryKey: ["jira-links"] });
+        if (move) transition.mutate({ key: issue.key, status: move });
         onStarted?.(s);
       })
       .catch((e: unknown) => {
@@ -114,7 +130,10 @@ function StartWorkDialog({
         <ActingOnDesktop />
         <p className="mt-1 truncate text-sm text-[#8b949e]">{issue.summary}</p>
         {started ? (
-          <StartedNote started={started} />
+          <>
+            <StartedNote started={started} />
+            <MoveNote k={issue.key} m={transition} />
+          </>
         ) : (
           <div className="mt-3 flex flex-col gap-3">
             <label className="flex flex-col gap-1 text-xs text-[#8b949e]">
@@ -158,15 +177,22 @@ function StartWorkDialog({
                 className={`${INPUT} font-mono`}
               />
             </label>
-            {/* #2044: the "Move to In Progress" checkbox belongs here,
-                unchecked unless the user opts in; its write runs from
-                `onStarted`, after git has succeeded. */}
+            {fix ? (
+              <MoveChoice
+                issue={issue}
+                fix={fix}
+                checked={alsoMove}
+                onChecked={setAlsoMove}
+                typed={typedStatus}
+                onTyped={setTypedStatus}
+              />
+            ) : null}
             {repo === "" ? null : plan.isError ? (
               <p className="text-xs text-[#f85149]">
                 Could not check this: {errorMessage(plan.error) ?? "the desktop did not say why"}
               </p>
             ) : current ? (
-              <PlanView plan={current} k={issue.key} />
+              <PlanView plan={current} k={issue.key} move={move} />
             ) : settled !== "" ? (
               <span className="h-16 w-full animate-pulse rounded bg-[#21262d]" aria-label="Checking" />
             ) : null}
@@ -184,7 +210,7 @@ function StartWorkDialog({
           {started ? null : (
             <button
               type="button"
-              disabled={!current || current.refusal !== null || running}
+              disabled={!current || current.refusal !== null || running || (alsoMove && move === null)}
               onClick={() => current && run(current)}
               className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
             >
@@ -197,7 +223,91 @@ function StartWorkDialog({
   );
 }
 
-function PlanView({ plan, k }: { plan: StartPlan; k: string }) {
+/// "Also move ABC-1 to …": unchecked unless the reader opts in. A named
+/// on-open expectation is the status; a category is not one status, so
+/// the reader names it, helped by the statuses seen in the project.
+function MoveChoice({
+  issue,
+  fix,
+  checked,
+  onChecked,
+  typed,
+  onTyped,
+}: {
+  issue: JiraIssue;
+  fix: Fix;
+  checked: boolean;
+  onChecked: (v: boolean) => void;
+  typed: string;
+  onTyped: (v: string) => void;
+}) {
+  const choose = fix.kind === "choose";
+  const seen = useJiraProjectStatuses(issue.project_key, checked && choose);
+  const options = candidateStatuses(seen.data?.statuses ?? [], issue.status.name || null);
+  const listId = `start-move-${issue.key}`;
+  return (
+    <div className="flex flex-col gap-1 text-xs text-[#8b949e]">
+      <label className="flex items-center gap-1.5 text-sm text-[#e6edf3]">
+        <input type="checkbox" checked={checked} onChange={(e) => onChecked(e.target.checked)} />
+        {fix.kind === "move" ? `Also move ${issue.key} to ${fix.status}` : `Also move ${issue.key} in Jira`}
+      </label>
+      {checked && fix.kind === "choose" ? (
+        <>
+          <p>
+            {issue.project_key} expects {fix.expected} here. Headstate cannot see which moves its workflow allows from{" "}
+            {issue.status.name || "this status"}, and Jira refuses one it does not allow.
+          </p>
+          <label className="flex flex-col gap-1">
+            Move to
+            <input
+              value={typed}
+              onChange={(e) => onTyped(e.target.value)}
+              list={listId}
+              placeholder="as Jira names it"
+              className={INPUT}
+            />
+            <datalist id={listId}>
+              {options.map((o) => (
+                <option key={o.name} value={o.name} />
+              ))}
+            </datalist>
+          </label>
+          {isStatusName(typed.trim()) ? null : <p>Name the status to move {issue.key} to, or untick the box.</p>}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+const MOVE_TONE = { ok: "text-[#3fb950]", warn: "text-[#d29922]", fail: "text-[#f85149]" } as const;
+
+/// What the move after git came to: the status Jira reports when read
+/// again, or Jira's own reason for refusing.
+function MoveNote({ k, m }: { k: string; m: ReturnType<typeof useJiraTransition> }) {
+  if (m.isIdle) return null;
+  if (m.isPending) {
+    return (
+      <p role="status" className="mt-2 text-sm text-[#8b949e]">
+        Moving {k} in Jira…
+      </p>
+    );
+  }
+  if (m.isError) {
+    return (
+      <p role="alert" className="mt-2 text-sm text-[#f85149]">
+        Could not move {k}: {describeJiraError(failureOf(m.error))}
+      </p>
+    );
+  }
+  const o = transitionOutcome(m.data);
+  return (
+    <p role="status" className={`mt-2 text-sm ${MOVE_TONE[o.tone]}`}>
+      {o.text}
+    </p>
+  );
+}
+
+function PlanView({ plan, k, move }: { plan: StartPlan; k: string; move: string | null }) {
   const links = plan.keys.includes(k);
   return (
     <div className="flex flex-col gap-1 text-xs text-[#8b949e]">
@@ -222,6 +332,14 @@ function PlanView({ plan, k }: { plan: StartPlan; k: string }) {
         Runs in <span className="break-all font-mono">{plan.cwd}</span>:
       </span>
       <ArgvPreview program={plan.program} args={plan.args} />
+      {move ? (
+        <>
+          <span>Then, only if that succeeds, in Jira:</span>
+          <div aria-label="Jira command to run">
+            <ArgvPreview program={TRANSITION_PROGRAM} args={transitionArgv(k, move)} />
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }

@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
-import type { JiraIssue, JiraLink, JiraStatusCategory, KeySearch } from "@/types/jira";
+import type { JiraIssue, JiraLink, JiraStatusCategory, KeySearch, StatusExpectation } from "@/types/jira";
+import {
+  afterMerge,
+  driftFor,
+  fixForDrift,
+  fixForVerdict,
+  knownPrs,
+  lookupComplete,
+  startFix,
+  type ExpectationMap,
+  type KnownPr,
+  type PrFate,
+  type Verdict,
+} from "./drift";
 import facts from "../../../src-tauri/src/jira/fixtures/drift_facts.json";
-import { afterMerge, driftFor, knownPrs, lookupComplete, type ExpectationMap, type KnownPr, type PrFate } from "./drift";
 
 const issue = (category: JiraStatusCategory, name: string): JiraIssue => ({
   key: "ABC-1",
@@ -237,5 +249,82 @@ describe("facts shared with the desktop", () => {
       graceMins: c.grace_mins,
     });
     expect(v?.rule === "merged-not-done" && v.level === "fact").toBe(c.fact);
+  });
+});
+
+/// The fix a drift offers (#2042, #2045): a named expectation is a status
+/// to move to; a category is the reader's choice, never a made-up name.
+describe("fixes", () => {
+  const pr = { draft: false, source: "title" as const };
+  const todo = issue("new", "To Do");
+  const onOpen = (e: StatusExpectation): ExpectationMap => ({ ABC: { on_open: e } });
+  const onMerged = (e: StatusExpectation): ExpectationMap => ({ ABC: { on_merged: e } });
+  const verdict = (level: Verdict["level"], rule: Verdict["rule"] = "merged-not-done"): Verdict => ({
+    rule,
+    level,
+    message: "m",
+  });
+
+  it("R1 moves to a named on-open status, and lets the reader choose for a category", () => {
+    const named = onOpen({ kind: "status", name: "In Review" });
+    expect(fixForDrift(todo, driftFor(todo, pr, named)!, named)).toEqual({ kind: "move", status: "In Review" });
+    // No expectation set: the default is a category, so no status is named.
+    expect(fixForDrift(todo, driftFor(todo, pr)!)).toEqual({ kind: "choose", expected: "any In Progress status" });
+    const doing = onOpen({ kind: "category", category: "in_progress" });
+    expect(fixForDrift(todo, driftFor(todo, pr, doing)!, doing)?.kind).toBe("choose");
+  });
+
+  it("R4 and an off-expectation in-progress status offer nothing", () => {
+    const done = issue("done", "Done");
+    expect(fixForDrift(done, driftFor(done, pr)!)).toBeNull();
+    const named = onOpen({ kind: "status", name: "In Review" });
+    const doing = issue("in_progress", "In Progress");
+    expect(fixForDrift(doing, driftFor(doing, pr, named)!, named)).toBeNull();
+  });
+
+  it("R2 as fact moves to a named on-merged status, or the reader chooses", () => {
+    const review = issue("in_progress", "In Review");
+    const named = onMerged({ kind: "status", name: "Closed" });
+    expect(fixForVerdict(review, verdict("fact"), named)).toEqual({ kind: "move", status: "Closed" });
+    expect(fixForVerdict(review, verdict("fact"))).toEqual({ kind: "choose", expected: "any Done status" });
+  });
+
+  it("a qualified, waiting or progress verdict, or R5, offers nothing", () => {
+    const review = issue("in_progress", "In Review");
+    const named = onMerged({ kind: "status", name: "Closed" });
+    for (const level of ["qualified", "waiting", "progress"] as const) {
+      expect(fixForVerdict(review, verdict(level), named)).toBeNull();
+    }
+    expect(fixForVerdict(review, verdict("fact", "closed-not-merged"), named)).toBeNull();
+  });
+
+  it("the real afterMerge verdicts: fact gets the fix, partial does not", () => {
+    const review = issue("in_progress", "In Review");
+    const named = onMerged({ kind: "status", name: "Closed" });
+    const merged: KnownPr = {
+      url: "u",
+      fate: "merged",
+      draft: false,
+      merged_at: "2026-01-01T00:00:00Z",
+      source: "title",
+    };
+    const now = new Date("2026-01-02T00:00:00Z");
+    const fact = afterMerge(review, [merged], true, { expectations: named, now })!;
+    expect(fact.level).toBe("fact");
+    expect(fixForVerdict(review, fact, named)).toEqual({ kind: "move", status: "Closed" });
+    const partial = afterMerge(review, [merged], false, { expectations: named, now })!;
+    expect(partial.level).toBe("qualified");
+    expect(fixForVerdict(review, partial, named)).toBeNull();
+  });
+
+  it("start work offers the on-open move only while the ticket does not meet it", () => {
+    expect(startFix(todo)).toEqual({ kind: "choose", expected: "any In Progress status" });
+    expect(startFix(todo, onOpen({ kind: "status", name: "In Progress" }))).toEqual({
+      kind: "move",
+      status: "In Progress",
+    });
+    expect(startFix(issue("in_progress", "In Progress"))).toBeNull();
+    // Whether an unreported category meets it cannot be told: no offer.
+    expect(startFix(issue("unknown", "Odd"))).toBeNull();
   });
 });

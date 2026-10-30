@@ -1,12 +1,13 @@
 import { describeJiraError, failureOf, useJiraIssue } from "@/api/jira";
 import { freshnessNote } from "@/lib/jira/age";
-import { driftFor, type ExpectationMap } from "@/lib/jira/drift";
+import { driftFor, fixForDrift, type ExpectationMap } from "@/lib/jira/drift";
 import type { FoundKey } from "@/lib/jira/keys";
 import { rowId, type RowRef } from "@/lib/jira/links";
 import { History, TriangleAlert } from "lucide-react";
 import type { JiraStatusCategory } from "@/types/jira";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
+import { DriftFix } from "./DriftFix";
 import { useJira } from "./jiraState";
 
 /// Status colour by Jira's category, never by status name: "In Testing"
@@ -155,21 +156,41 @@ export function TicketDriftNotices({ prUrl, draft }: { prUrl: string; draft: boo
   return (
     <>
       {found.map((f) => (
-        <DriftNotice key={f.key} found={f} draft={draft} expectations={jira.expectations} />
+        <DriftNotice key={f.key} found={f} draft={draft} expectations={jira.expectations} site={jira.site} />
       ))}
     </>
   );
 }
 
-function DriftNotice({ found, draft, expectations }: { found: FoundKey; draft: boolean; expectations: ExpectationMap }) {
+function DriftNotice({
+  found,
+  draft,
+  expectations,
+  site,
+}: {
+  found: FoundKey;
+  draft: boolean;
+  expectations: ExpectationMap;
+  site: string | null;
+}) {
   const q = useJiraIssue(found.key);
   const s = q.data;
-  const drift = s?.state === "found" ? driftFor(s.issue, { draft, source: found.source }, expectations) : null;
-  if (!drift) return null;
+  if (s?.state !== "found") return null;
+  const drift = driftFor(s.issue, { draft, source: found.source }, expectations);
+  // Mounted with no drift too: a move the reader started keeps showing
+  // what Jira did after it clears the drift.
+  const fix = drift ? fixForDrift(s.issue, drift, expectations) : null;
   return (
-    <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-[#d29922]">
-      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      {drift.message}
-    </p>
+    <>
+      {drift ? (
+        <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-[#d29922]">
+          <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {drift.message}
+        </p>
+      ) : null}
+      <div className="mt-1 empty:hidden">
+        <DriftFix issue={s.issue} site={site} fix={fix} />
+      </div>
+    </>
   );
 }
