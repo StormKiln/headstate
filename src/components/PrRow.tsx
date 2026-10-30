@@ -1,5 +1,6 @@
 import { observationLabel } from "@/lib/rowObservation";
 import { PrRowTicketChips } from "./jira/TicketChips";
+import { NoTicketMarker } from "./jira/NoTicket";
 import { ExternalLink } from "./ExternalLink";
 import {
   Check,
@@ -401,6 +402,9 @@ export function PrRow({
               because this is the disclosure the row exists to make. */}
           {stackedOn === undefined ? null : <StackedChip stackedOn={stackedOn} />}
           <PrRowTicketChips prUrl={pr.url} draft={pr.is_draft} />
+          {/* Renders only for the user's own pull requests the Jira index
+              read and found no key in (#2046). */}
+          <NoTicketMarker row={pr} target={{ kind: "github", id: pr.id, repo: pr.repo, number: pr.number }} />
           <CiGlyph pr={pr} />
           <ReviewGlyph pr={pr} />
           {(dense ? pr.labels.slice(0, DENSE_LABELS) : pr.labels).map((label) => (

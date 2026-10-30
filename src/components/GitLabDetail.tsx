@@ -17,6 +17,7 @@ const LABEL: Record<GitLabAction, string> = {
   approve: "Approve", comment: "Post comment", reply: "Reply", resolve: "Resolve discussion", unresolve: "Reopen discussion",
   merge: "Merge MR", close: "Close MR", reopen: "Reopen MR", draft: "Mark draft", ready: "Mark ready",
   rebase: "Rebase source branch", retry_ci: "Retry failed CI", enable_auto_merge: "Enable auto-merge", disable_auto_merge: "Cancel auto-merge",
+  set_title: "Change title",
 };
 const BUTTON = "rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d] disabled:opacity-40";
 const PRIMARY: GitLabAction[] = ["approve", "request_changes", "enqueue_train", "merge", "close", "reopen", "draft", "ready", "rebase", "retry_ci", "enable_auto_merge", "disable_auto_merge"];

@@ -360,6 +360,11 @@ pub struct UiPrefs {
     /// reads as "not set" rather than as an empty template.
     #[serde(default)]
     pub jira_branch_template: String,
+    /// Whether open pull requests of the user's that name no ticket are
+    /// marked "no ticket", with a filter for them in My PRs (#2046).
+    /// Defaults OFF: many repositories legitimately take untracked work.
+    #[serde(default)]
+    pub jira_no_ticket_marker: bool,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -414,6 +419,8 @@ impl Default for UiPrefs {
             jira_chips_on_prs: true,
             // Empty: the default template. See the field.
             jira_branch_template: String::new(),
+            // OFF: see the field.
+            jira_no_ticket_marker: false,
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.
@@ -1987,7 +1994,7 @@ mod tests {
         use crate::jira::model::{ExpectedCategory, StatusExpectation, StatusExpectations};
         let json = r#"{"hidden_views":[],"close_hides_to_tray":true,
             "jira_enabled":true,"jira_excluded_projects":["XY"],
-            "jira_chips_on_prs":false,
+            "jira_chips_on_prs":false,"jira_no_ticket_marker":true,
             "jira_status_expectations":{"ABC":{
                 "on_open":{"kind":"status","name":"In Review"},
                 "on_merged":{"kind":"category","category":"done"}}}}"#;
@@ -1995,6 +2002,7 @@ mod tests {
         assert!(p.jira_enabled);
         assert_eq!(p.jira_excluded_projects, ["XY"]);
         assert!(!p.jira_chips_on_prs);
+        assert!(p.jira_no_ticket_marker);
         assert_eq!(
             p.jira_status_expectations["ABC"],
             StatusExpectations {
@@ -2019,6 +2027,10 @@ mod tests {
             serde_json::from_str(r#"{"hidden_views":[],"close_hides_to_tray":true}"#).unwrap();
         assert!(!p.jira_enabled);
         assert!(p.jira_chips_on_prs, "a missing field must not hide chips");
+        assert!(
+            !p.jira_no_ticket_marker,
+            "the no-ticket marker is asked for"
+        );
         assert!(p.jira_status_expectations.is_empty());
         assert_eq!(
             p,

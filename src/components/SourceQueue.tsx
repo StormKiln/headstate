@@ -11,6 +11,7 @@ import { useSourceSelection } from "../store/sourceSelection";
 import { prIdentity, prKey } from "../lib/prIdentity";
 import { current } from "../lib/ariaCurrent";
 import { PrRow } from "./PrRow";
+import { NoTicketMarker } from "./jira/NoTicket";
 import { ViewSwitcher } from "./ViewSwitcher";
 import { ExternalLink } from "./ExternalLink";
 import { PrDetailNavigation } from "./PrDetailNavigation";
@@ -79,7 +80,7 @@ function GitLabRow({ mr, parent, onOpen, opened, cursored }: { mr: MergeRequest;
   return (
     <div role="button" tabIndex={0} aria-current={current(opened)} onClick={onOpen} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }} className={`cursor-pointer border-b border-[#30363d] px-4 ${density === "dense" ? "py-1.5" : "py-3"} hover:bg-[#161b22] ${cursored ? "ring-2 ring-inset ring-[#1f6feb]" : ""}`}>
       <div className="text-xs text-[#8b949e]">GitLab · {mr.source.host} · {mr.repo}</div>
-      <div className="mt-1 font-semibold">{mr.title} {observationLabel(mr) && <span className="text-xs text-amber-400">{observationLabel(mr)}</span>} <span className="text-xs font-normal text-[#8b949e]">!{mr.number}</span></div>
+      <div className="mt-1 font-semibold">{mr.title} {observationLabel(mr) && <span className="text-xs text-amber-400">{observationLabel(mr)}</span>} <span className="text-xs font-normal text-[#8b949e]">!{mr.number}</span> <NoTicketMarker row={mr} target={{ kind: "gitlab", identity: { source: mr.source, repo: mr.repo, number: mr.number }, viewer: mr.viewer ?? null, head: mr.head_oid }} /></div>
       <div className="mt-1 text-xs text-[#8b949e]">
         {mr.is_draft ? "Draft · " : ""}{mr.author} · {mr.head_ref} → {mr.base_ref}
         {mr.ci === null ? " · CI unknown" : ` · CI ${mr.ci}`}

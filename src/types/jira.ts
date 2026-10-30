@@ -151,6 +151,17 @@ export interface LinkIndex {
   projects: string[];
   /// Why the project list could not be read; `links` is then empty.
   error: JiraError | null;
+  /// The user's open pull requests the index looked at, as it saw them
+  /// (#2046). Optional: an older desktop sends none, and then no pull
+  /// request is known to name no ticket.
+  checked?: CheckedPr[];
+}
+
+/// One open, authored pull request as the index read it.
+export interface CheckedPr {
+  url: string;
+  title: string;
+  head_ref: string;
 }
 
 /// One provider's half of a ticket lookup (`jira/lookup.rs`). `not_asked`

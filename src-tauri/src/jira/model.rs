@@ -271,6 +271,21 @@ pub struct LinkIndex {
     /// Why the project list -- the dictionary -- could not be read, if it
     /// could not. `links` is then what could be read, which may be nothing.
     pub error: Option<JiraError>,
+    /// The user's open pull requests the index has looked at, as it saw
+    /// them (#2046). A pull request here with no current link names no
+    /// ticket; one NOT here, or here under a different title or branch than
+    /// a row now shows, has not been looked at yet -- which is not "has no
+    /// ticket".
+    #[serde(default)]
+    pub checked: Vec<CheckedPr>,
+}
+
+/// One open, authored pull request as the index read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedPr {
+    pub url: String,
+    pub title: String,
+    pub head_ref: String,
 }
 
 /// The statuses seen in one project's issues (#2034).

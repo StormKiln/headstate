@@ -48,6 +48,13 @@ impl Transport {
         }
     }
 
+    /// Issues matching typed text; see [`Acli::search_text`].
+    pub async fn search_text(&self, text: &str, limit: usize) -> IssueBatch {
+        match self {
+            Self::Acli(a) => a.search_text(text, limit).await,
+        }
+    }
+
     pub async fn version(&self) -> Result<String, JiraError> {
         match self {
             Self::Acli(a) => a.version().await,

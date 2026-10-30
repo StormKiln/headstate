@@ -5,6 +5,7 @@ import { useActiveFilters, useFilters } from "@/store/filters";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { useIsMobile } from "@/lib/useIsMobile";
+import { useJira } from "@/components/jira/jiraState";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -52,6 +53,11 @@ const SORT_OPTIONS: { value: NonNullable<Filters["sort"]>; label: string }[] = [
 export function FilterBar({ prs }: { prs: Pick<PullRequest, "labels">[] }) {
   const filters = useActiveFilters();
   const { setFilter, reset, density, setDensity } = useFilters();
+  // My PRs only, and only while Settings › Jira's "no ticket" marker is on
+  // and the index is read (#2046).
+  const view = useFilters((s) => s.view);
+  const jira = useJira();
+  const noTicketOffered = view === "my-prs" && (jira?.noTicket ?? null) !== null;
   const labels = [...new Set(prs.flatMap((pr) => pr.labels.map((l) => l.name)))].sort();
 
   const toggleLabel = (key: "includeLabels" | "excludeLabels", name: string) => {
@@ -209,6 +215,16 @@ export function FilterBar({ prs }: { prs: Pick<PullRequest, "labels">[] }) {
       >
         In merge queue
       </Button>
+
+      {noTicketOffered ? (
+        <Button
+          variant={filters.noTicketOnly ? "secondary" : "ghost"}
+          size="sm"
+          onClick={() => setFilter("noTicketOnly", filters.noTicketOnly ? undefined : true)}
+        >
+          No ticket
+        </Button>
+      ) : null}
 
       <DropdownMenu>
         <DropdownMenuTrigger

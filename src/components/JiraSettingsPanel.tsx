@@ -82,6 +82,18 @@ export function JiraSettingsPanel({
             A pull request&apos;s own page, and worktree and branch rows, show their tickets either way.
           </p>
           {prefs ? <BranchTemplate key={prefs.jira_branch_template} prefs={prefs} setPrefs={setPrefs} /> : null}
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={prefs?.jira_no_ticket_marker ?? false}
+              onChange={() => prefs && void setPrefs({ ...prefs, jira_no_ticket_marker: !prefs.jira_no_ticket_marker })}
+            />
+            Mark my pull requests that name no ticket
+          </label>
+          <p className="text-xs text-[#8b949e]">
+            Adds a &ldquo;no ticket&rdquo; marker, a No ticket filter in My PRs, and a way to link a ticket by putting its key at
+            the start of the title.
+          </p>
           {signedIn ? (
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium">Projects</span>

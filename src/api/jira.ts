@@ -9,6 +9,7 @@ import {
   jiraLinks,
   jiraProjects,
   jiraProjectStatuses,
+  jiraSearch,
   jiraTransition,
 } from "./tauri";
 import type { IssueBatch, JiraError, JiraIssue, TransitionResult } from "../types/jira";
@@ -380,6 +381,18 @@ export function useJiraAssigned(enabled: boolean) {
     // Never sooner than a rate limit asked for.
     refetchInterval: (q: { state: { data?: IssueBatch } }) =>
       enabled ? Math.max(5 * 60_000, rateLimitWaitMs(q.state.data?.error) ?? 0) : false,
+  });
+}
+
+/// Issues matching what the user typed, for linking a ticket (#2046). Asked
+/// only while the picker is open and the text has something in it.
+export function useJiraSearch(text: string, enabled: boolean) {
+  const t = text.trim();
+  return useQuery({
+    queryKey: ["jira-search", t],
+    queryFn: () => typed(() => jiraSearch(t)),
+    enabled: enabled && t !== "",
+    staleTime: 60_000,
   });
 }
 

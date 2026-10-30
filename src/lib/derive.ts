@@ -24,6 +24,10 @@ export interface Filters {
   inMergeQueueOnly?: boolean;
   awaitingReviewOnly?: boolean;
   readyToQueueOnly?: boolean;
+  /// Only the user's open pull requests known to name no Jira ticket
+  /// (#2046). Applied by the shell, not `applyFilters`: it needs the Jira
+  /// index, and is ignored while Settings › Jira's marker is off.
+  noTicketOnly?: boolean;
   sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
   /// How the "Ready for review" strip on the To Review page is ordered
   /// (#1277). Defaults to `"oldest-opened"` when absent.
@@ -446,7 +450,8 @@ export function hasActiveFilters(f: Filters): boolean {
       f.staleOnly ||
       f.inMergeQueueOnly ||
       f.awaitingReviewOnly ||
-      f.readyToQueueOnly,
+      f.readyToQueueOnly ||
+      f.noTicketOnly,
   );
 }
 

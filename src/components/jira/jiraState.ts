@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 import type { ExpectationMap } from "@/lib/jira/drift";
 import type { LinkMaps } from "@/lib/jira/links";
+import type { NoTicketIndex } from "@/lib/jira/noTicket";
 
 /// What every Jira surface needs to know, decided once by `JiraProvider`
 /// (epic #2031).
@@ -26,6 +27,10 @@ export interface JiraState {
   /// Settings › Jira's branch-name template for Start work (#2045);
   /// empty is the default.
   branchTemplate: string;
+  /// What the index knows about the user's pull requests naming no
+  /// ticket (#2046), or `null` when Settings › Jira's "no ticket" marker
+  /// is off -- then nothing is marked and the filter is not offered.
+  noTicket: NoTicketIndex | null;
 }
 
 export const JiraContext = createContext<JiraState | null>(null);

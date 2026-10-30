@@ -165,6 +165,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_projects", Class::Read),
     ("jira_issues", Class::Read),
     ("jira_assigned", Class::Read),
+    ("jira_search", Class::Read),
     ("jira_links", Class::Read),
     ("jira_find", Class::Read),
     ("jira_acli_version", Class::Read),
@@ -625,6 +626,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("jira_transition", Class::Write),
     ("update_pr_branch", Class::Write),
     ("set_auto_merge", Class::Write),
+    // Changes a pull request's title on GitHub (#2046): a write.
+    ("set_pr_title", Class::Write),
     // Merge or queue a native GitHub stack through the async merge API
     // (#1468).
     //
@@ -1189,6 +1192,9 @@ async fn call(
             crate::jira::commands::jira_issues(app.clone(), a.get("keys")?, a.get("fresh")?).await,
         ),
         "jira_assigned" => jira_res(crate::jira::commands::jira_assigned(app.clone()).await),
+        "jira_search" => {
+            jira_res(crate::jira::commands::jira_search(app.clone(), a.get("text")?).await)
+        }
         "jira_links" => jira_res(crate::jira::commands::jira_links(app.clone()).await),
         "jira_find" => jira_res(
             crate::jira::commands::jira_find(app.clone(), a.get("key")?, a.get("more")?).await,
@@ -1457,6 +1463,16 @@ async fn call(
             a.get("number")?,
             a.get("action")?,
             a.get("expectedHead")?,
+        )
+        .await),
+        "set_pr_title" => res(commands::set_pr_title(
+            app.state(),
+            app.state(),
+            a.get("id")?,
+            a.get("repo")?,
+            a.get("number")?,
+            a.get("expectedTitle")?,
+            a.get("title")?,
         )
         .await),
         "set_auto_merge" => res(commands::set_auto_merge(
@@ -2064,7 +2080,7 @@ mod tests {
             !arms.contains(" res("),
             "a Jira dispatch arm uses `res`, which drops the typed reason"
         );
-        assert_eq!(arms.matches("jira_res(").count(), 8);
+        assert_eq!(arms.matches("jira_res(").count(), 9);
     }
 
     /// The two superseded update commands are off the wire (#964).

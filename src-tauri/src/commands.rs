@@ -1303,6 +1303,35 @@ pub async fn update_pr_branch(
     }
 }
 
+/// Set a pull request's title, for linking a Jira ticket by its key
+/// (#2046). `expected_title` is the title the row showed: GitHub's is read
+/// first and nothing is written if it has changed since, and it is read
+/// again after, so the answer is what GitHub reports rather than what was
+/// sent. The title only -- renaming a pushed branch closes the pull request.
+#[tauri::command]
+pub async fn set_pr_title(
+    client: State<'_, GhClient>,
+    waker: State<'_, crate::poll::Waker>,
+    id: String,
+    repo: String,
+    number: u64,
+    expected_title: String,
+    title: String,
+) -> Result<crate::github::mutate::TitleOutcome, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    match client.set_title(&id, &expected_title, &title).await {
+        Ok(outcome) => {
+            log::info!("{repo}#{number} title change: {outcome:?}");
+            waker.0.notify_one();
+            Ok(outcome)
+        }
+        Err(e) => {
+            log::warn!("{repo}#{number} title could not be changed: {e}");
+            Err(e.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 /// Merge this pull request when its checks pass.
 ///
