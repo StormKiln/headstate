@@ -21,6 +21,7 @@ import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
 import { IS_MOBILE_BUILD } from "../lib/target";
 import { SettingsDialog } from "./SettingsDialog";
+import { useSettingsDialog } from "@/store/settingsDialog";
 import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
 import type { SourceSelection } from "../store/sourceSelection";
@@ -152,7 +153,9 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
   } as const;
   const showReceipt = !["panicked", "authUnavailable", "authUnknown"].includes(status);
   const { seconds, set } = usePollInterval();
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsSection = useSettingsDialog((s) => s.section);
+  const openSettings = useSettingsDialog((s) => s.open);
+  const closeSettings = useSettingsDialog((s) => s.close);
   // The poll cadence is the desktop's setting, and Settings > General
   // carries it too. On a phone-width bar it is the one thing that can
   // go: with it, "Up to date" and the timestamp each broke onto two
@@ -390,7 +393,7 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
 
       <button
         type="button"
-        onClick={() => setSettingsOpen(true)}
+        onClick={() => openSettings()}
         aria-label="Settings"
         title="Settings"
         className="tap-target flex items-center justify-center rounded hover:bg-[#161b22]"
@@ -398,7 +401,17 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "
         <Settings className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
 
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      {/* Mounted only while open, and keyed by topic, so a request for a
+          topic -- the menu bar's Settings…, a page's "Open Jira settings" --
+          lands on that topic even when Settings is already showing another. */}
+      {settingsSection ? (
+        <SettingsDialog
+          key={settingsSection}
+          open
+          onOpenChange={(open) => { if (!open) closeSettings(); }}
+          initialSection={settingsSection}
+        />
+      ) : null}
     </div>
     </>
   );

@@ -8,6 +8,7 @@ import type { IssueBatch, JiraConnection, JiraIssue, JiraLink, KeyLookup, LinkIn
 import { renderWithQuery } from "@/test-utils";
 import { useFilters } from "@/store/filters";
 import { useJiraView } from "@/store/jira";
+import { useSettingsDialog } from "@/store/settingsDialog";
 
 const connection = vi.hoisted(() => vi.fn<() => Promise<JiraConnection>>());
 const links = vi.hoisted(() => vi.fn<() => Promise<LinkIndex>>());
@@ -194,6 +195,16 @@ describe("My Jira issues", () => {
     mount(<JiraBrowser />);
     expect(await screen.findByText(/Jira is not connected/)).toBeTruthy();
     expect(issues).not.toHaveBeenCalled();
+    await quiet();
+  });
+
+  /// The way to sign in is one click away, not a menu path to follow (#2085).
+  it("opens Settings at Jira from the not-connected notice", async () => {
+    connection.mockResolvedValue({ state: "not_installed", searched: [] });
+    useSettingsDialog.setState({ section: null });
+    mount(<JiraBrowser />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Jira settings" }));
+    expect(useSettingsDialog.getState().section).toBe("jira");
     await quiet();
   });
 

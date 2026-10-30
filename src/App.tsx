@@ -7,6 +7,7 @@ import { JiraSidebar } from "./components/jira/JiraSidebar";
 import { JiraPage } from "./components/jira/JiraPage";
 import { GoToTicketDialog, GoToTicketEntry } from "./components/jira/GoToTicketDialog";
 import { useGoToTicket } from "./store/goToTicket";
+import { useSettingsMenu } from "./api/settingsMenu";
 import { useFollowJiraLinks } from "./api/jira";
 import { ReviewMeasurementProvider } from "./api/reviewMeasurement";
 import { connectNotificationNavigation } from "./lib/notificationNavigation";
@@ -169,6 +170,7 @@ export default function App() {
     return () => { disposed = true; controller.abort(); stop?.(); };
   }, []);
   useGitLabInvalidation();
+  useSettingsMenu();
   const selection = useSourceSelection((s) => s.selection);
   const setSelection = useSourceSelection((s) => s.setSelection);
   const sourceRepoKey = useSourceSelection((s) => s.repoKey);
