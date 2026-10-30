@@ -30,6 +30,7 @@ const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   jira_excluded_projects: [],
   jira_status_expectations: {},
   jira_chips_on_prs: true,
+  jira_branch_template: "",
   ...over,
 });
 

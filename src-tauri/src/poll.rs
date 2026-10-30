@@ -353,6 +353,13 @@ pub struct UiPrefs {
     /// keep theirs.
     #[serde(default = "default_true")]
     pub jira_chips_on_prs: bool,
+    /// How "Start work" names a ticket's branch (#2045): `{key}` and
+    /// `{summary}` placeholders, filled in by the frontend, and the result
+    /// is editable before anything runs. Empty means the default,
+    /// `{key}-{summary}`, so a stored row from before this field existed
+    /// reads as "not set" rather than as an empty template.
+    #[serde(default)]
+    pub jira_branch_template: String,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -405,6 +412,8 @@ impl Default for UiPrefs {
             // Empty: every project uses the drift rules' defaults.
             jira_status_expectations: std::collections::BTreeMap::new(),
             jira_chips_on_prs: true,
+            // Empty: the default template. See the field.
+            jira_branch_template: String::new(),
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.

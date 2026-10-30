@@ -42,6 +42,7 @@ const prefs: UiPrefs = {
   jira_excluded_projects: [],
   jira_status_expectations: {},
   jira_chips_on_prs: true,
+  jira_branch_template: "",
 };
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
@@ -165,6 +166,24 @@ describe("My Jira issues", () => {
     useJiraView.setState({ selected: "ABC-3" });
     mount(<JiraPage />);
     expect(await screen.findByText("None of your pull requests or worktrees names ABC-3.")).toBeTruthy();
+    await quiet();
+  });
+
+  /// #2045: offered for assigned work with no pull request, and only there.
+  it("offers Start work for an assigned issue with no pull request", async () => {
+    issues.mockImplementation((keys) => Promise.resolve(batch([EPIC, STORY, TODO].filter((i) => keys.includes(i.key)))));
+    useJiraView.setState({ selected: "ABC-3" });
+    mount(<JiraPage />);
+    expect(await screen.findByRole("button", { name: "Start work" })).toBeTruthy();
+    await quiet();
+  });
+
+  it("does not offer Start work once a pull request names the issue", async () => {
+    assigned.mockResolvedValue(batch([TODO, STORY]));
+    useJiraView.setState({ selected: "ABC-1" });
+    mount(<JiraPage />);
+    expect(await screen.findByRole("region", { name: "Pull requests" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Start work" })).toBeNull();
     await quiet();
   });
 

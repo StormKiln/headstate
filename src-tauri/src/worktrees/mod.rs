@@ -18,6 +18,9 @@ mod assess;
 pub mod github;
 mod model;
 pub(crate) mod scan;
+/// Starting work from a Jira ticket (#2045): the one place a worktree is
+/// CREATED.
+pub mod start;
 /// Submodule state per worktree (#1138).
 pub mod submodule;
 mod update;

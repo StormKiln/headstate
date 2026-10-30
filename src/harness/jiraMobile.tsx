@@ -126,6 +126,7 @@ const PREFS = {
   jira_excluded_projects: [],
   jira_status_expectations: {},
   jira_chips_on_prs: true,
+  jira_branch_template: "",
 };
 
 /// The desktop's answers, by command, as `remote_call` forwards them.

@@ -23,6 +23,9 @@ export interface JiraState {
   expectations: ExpectationMap;
   /// Whether pull-request rows show ticket chips (Settings › Jira).
   chipsOnPrRows: boolean;
+  /// Settings › Jira's branch-name template for Start work (#2045);
+  /// empty is the default.
+  branchTemplate: string;
 }
 
 export const JiraContext = createContext<JiraState | null>(null);

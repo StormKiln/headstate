@@ -12046,7 +12046,7 @@ pub fn remove_worktrees_with_progress(
 /// stripped and the result lowercased on Windows for the third. A path
 /// that cannot be canonicalised falls back to its raw form rather than
 /// erroring, so a missing target stays comparable.
-fn canonical_key(p: &Path) -> String {
+pub(super) fn canonical_key(p: &Path) -> String {
     let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let s = resolved.to_string_lossy().into_owned();
 

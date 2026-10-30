@@ -23,6 +23,7 @@ export function JiraProvider({ prefs, children }: { prefs: UiPrefs | undefined; 
   const site = connection.data?.state === "logged_in" ? connection.data.site : null;
   const expectations = prefs?.jira_status_expectations ?? NO_EXPECTATIONS;
   const chipsOnPrRows = prefs?.jira_chips_on_prs ?? true;
+  const branchTemplate = prefs?.jira_branch_template ?? "";
   const value = useMemo<JiraState | null>(() => {
     if (!enabled || !signedIn || !links.data || links.data.error !== null) return null;
     return {
@@ -31,7 +32,8 @@ export function JiraProvider({ prefs, children }: { prefs: UiPrefs | undefined; 
       links: linkMaps(links.data.links),
       expectations,
       chipsOnPrRows,
+      branchTemplate,
     };
-  }, [enabled, signedIn, links.data, site, expectations, chipsOnPrRows]);
+  }, [enabled, signedIn, links.data, site, expectations, chipsOnPrRows, branchTemplate]);
   return <JiraContext.Provider value={value}>{children}</JiraContext.Provider>;
 }

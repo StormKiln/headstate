@@ -464,6 +464,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // carries no step-up signature. See the desktop table for the full
     // argument.
     ("fetch_refs", Class::Write),
+    // Start work from a Jira ticket (#2045). Write: it creates a branch
+    // and a directory that did not exist and deletes nothing. The desktop
+    // derives where the worktree goes, so the phone chooses nothing on a
+    // disk it cannot see. See the desktop table for the full argument.
+    ("start_work_plan", Class::Read),
+    ("start_work", Class::Write),
     ("docker_start", Class::Write),
     ("docker_restart", Class::Write),
     // Preferences, not machine capabilities: they live in the
