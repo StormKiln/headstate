@@ -31,6 +31,8 @@ export interface JiraState {
   /// ticket (#2046), or `null` when Settings › Jira's "no ticket" marker
   /// is off -- then nothing is marked and the filter is not offered.
   noTicket: NoTicketIndex | null;
+  /// Minutes after a merge before "merged, ticket not moved" is raised.
+  mergeGraceMins: number;
 }
 
 export const JiraContext = createContext<JiraState | null>(null);

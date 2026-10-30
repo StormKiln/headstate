@@ -37,6 +37,7 @@ const prefs = (jira_enabled: boolean): UiPrefs => ({
   jira_chips_on_prs: true,
   jira_branch_template: "",
   jira_no_ticket_marker: false,
+  jira_merge_grace_mins: 15,
 });
 
 beforeEach(() => {
@@ -149,6 +150,24 @@ describe("JiraSettingsPanel", () => {
     expect((box as HTMLInputElement).checked).toBe(false);
     fireEvent.click(box);
     expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_no_ticket_marker: true }));
+  });
+
+  /// #2042: R2's grace period. Committed on blur, so a half-typed value
+  /// is never stored, and nonsense is not stored at all.
+  it("sets how long to wait after a merge", async () => {
+    connection.mockResolvedValue({ state: "not_installed", searched: [] });
+    const setPrefs = vi.fn(() => Promise.resolve());
+    renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={setPrefs} />);
+    const input = screen.getByRole("spinbutton", { name: "Minutes to wait after a merge" }) as HTMLInputElement;
+    expect(input.value).toBe("15");
+    fireEvent.change(input, { target: { value: "30" } });
+    expect(setPrefs).not.toHaveBeenCalled();
+    fireEvent.blur(input);
+    expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_merge_grace_mins: 30 }));
+    setPrefs.mockClear();
+    fireEvent.change(input, { target: { value: "-4" } });
+    fireEvent.blur(input);
+    expect(setPrefs).not.toHaveBeenCalled();
   });
 
   describe("status expectations", () => {

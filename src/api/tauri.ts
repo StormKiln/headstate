@@ -216,6 +216,9 @@ export interface UiPrefs {
   /// Whether the user's open pull requests that name no ticket are marked
   /// "no ticket", with a filter in My PRs (#2046). Default false.
   jira_no_ticket_marker: boolean;
+  /// Minutes after a merge before "merged, but the ticket did not move"
+  /// is raised (#2042). Default 15; 0 is no wait.
+  jira_merge_grace_mins: number;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");

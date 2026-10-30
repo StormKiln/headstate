@@ -143,6 +143,7 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
                             is_draft: pr.is_draft,
                             state: None,
                             author: Some(pr.author),
+                            merged_at: None,
                         },
                     )
                 })
@@ -163,6 +164,7 @@ pub fn refresh_prs(conn: &mut Connection) -> Result<bool, StoreError> {
                             is_draft: mr.is_draft,
                             state: None,
                             author: Some(mr.author),
+                            merged_at: None,
                         },
                     )
                 })

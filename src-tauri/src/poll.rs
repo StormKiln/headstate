@@ -365,6 +365,19 @@ pub struct UiPrefs {
     /// Defaults OFF: many repositories legitimately take untracked work.
     #[serde(default)]
     pub jira_no_ticket_marker: bool,
+    /// Minutes after a pull request merges before "merged, but the ticket
+    /// did not move" is raised (#2042, R2), so an automation that moves
+    /// the ticket on merge gets to run first. Zero is "no wait", not
+    /// "never": it is the only value with no default meaning to collide.
+    #[serde(default = "default_merge_grace_mins")]
+    pub jira_merge_grace_mins: u32,
+}
+
+/// The default wait after a merge before R2 is raised (#2042).
+pub const DEFAULT_MERGE_GRACE_MINS: u32 = 15;
+
+fn default_merge_grace_mins() -> u32 {
+    DEFAULT_MERGE_GRACE_MINS
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -421,6 +434,7 @@ impl Default for UiPrefs {
             jira_branch_template: String::new(),
             // OFF: see the field.
             jira_no_ticket_marker: false,
+            jira_merge_grace_mins: DEFAULT_MERGE_GRACE_MINS,
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.
@@ -2032,6 +2046,10 @@ mod tests {
             "the no-ticket marker is asked for"
         );
         assert!(p.jira_status_expectations.is_empty());
+        assert_eq!(
+            p.jira_merge_grace_mins, 15,
+            "missing is the default wait, not none"
+        );
         assert_eq!(
             p,
             UiPrefs {

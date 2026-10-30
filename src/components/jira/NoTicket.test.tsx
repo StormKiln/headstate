@@ -43,6 +43,7 @@ const prefs = (over: Partial<UiPrefs> = {}): UiPrefs => ({
   jira_chips_on_prs: true,
   jira_branch_template: "",
   jira_no_ticket_marker: true,
+  jira_merge_grace_mins: 15,
   ...over,
 });
 

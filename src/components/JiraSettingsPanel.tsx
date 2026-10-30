@@ -11,7 +11,7 @@ import {
 } from "@/api/jira";
 import type { ExpectedCategory, JiraConnection, StatusExpectation, StatusExpectations } from "@/types/jira";
 import { copyText } from "@/lib/clipboard";
-import { DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
+import { DEFAULT_MERGE_GRACE_MINS, DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
 import { branchName, DEFAULT_BRANCH_TEMPLATE, templateHasKey } from "@/lib/jira/branchName";
 import { ArgvPreview } from "./ArgvPreview";
 import { ExternalLink } from "./ExternalLink";
@@ -94,6 +94,7 @@ export function JiraSettingsPanel({
             Adds a &ldquo;no ticket&rdquo; marker, a No ticket filter in My PRs, and a way to link a ticket by putting its key at
             the start of the title.
           </p>
+          {prefs ? <MergeGrace prefs={prefs} setPrefs={setPrefs} /> : null}
           {signedIn ? (
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium">Projects</span>
@@ -278,6 +279,37 @@ function AcliVersion({ asked }: { asked: boolean }) {
     return <p className="text-xs text-[#8b949e]">Could not read the acli version: {describeJiraError(failureOf(version.error))}</p>;
   }
   return <p className="text-xs text-[#8b949e]">acli {version.data}</p>;
+}
+
+/// How long after a merge before "merged, but the ticket did not move" is
+/// raised (#2042), so an automation that moves tickets on merge runs first.
+/// Committed on blur, so typing "30" never stores "3" on the way.
+function MergeGrace({ prefs, setPrefs }: { prefs: UiPrefs; setPrefs: (prefs: UiPrefs) => Promise<void> }) {
+  const stored = prefs.jira_merge_grace_mins ?? DEFAULT_MERGE_GRACE_MINS;
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const n = Number.parseInt(draft, 10);
+    setDraft(null);
+    if (Number.isFinite(n) && n >= 0 && n <= 1440 && n !== stored) void setPrefs({ ...prefs, jira_merge_grace_mins: n });
+  };
+  return (
+    <label className="flex flex-wrap items-center gap-2 text-sm">
+      Wait
+      <input
+        type="number"
+        min={0}
+        max={1440}
+        value={draft ?? String(stored)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => e.key === "Enter" && commit()}
+        aria-label="Minutes to wait after a merge"
+        className="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
+      />
+      minutes after a merge before flagging a ticket that did not move
+    </label>
+  );
 }
 
 const CATEGORIES: ExpectedCategory[] = ["new", "in_progress", "done"];
