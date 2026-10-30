@@ -2080,7 +2080,7 @@ mod tests {
             !arms.contains(" res("),
             "a Jira dispatch arm uses `res`, which drops the typed reason"
         );
-        assert_eq!(arms.matches("jira_res(").count(), 8);
+        assert_eq!(arms.matches("jira_res(").count(), 9);
     }
 
     /// The two superseded update commands are off the wire (#964).
