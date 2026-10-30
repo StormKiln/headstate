@@ -203,7 +203,7 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
                   key={`${pr.identity.repo}#${pr.identity.number}`}
                   className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-[#30363d] px-2 py-1.5 text-sm"
                 >
-                  <span className="min-w-0 flex-1 truncate text-[#e6edf3]">{pr.title}</span>
+                  <span className="min-w-0 flex-1 basis-48 truncate text-[#e6edf3]">{pr.title}</span>
                   <span className="text-xs text-[#8b949e]">
                     {pr.identity.repo}
                     {gitlab ? "!" : "#"}
@@ -308,7 +308,7 @@ function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | 
                   key={p.url}
                   className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-[#30363d] px-2 py-1.5 text-sm"
                 >
-                  <span className="min-w-0 flex-1 truncate text-[#e6edf3]">{p.title}</span>
+                  <span className="min-w-0 flex-1 basis-48 truncate text-[#e6edf3]">{p.title}</span>
                   <span className="text-xs text-[#8b949e]">
                     {p.repo}
                     {gitlab ? "!" : "#"}
