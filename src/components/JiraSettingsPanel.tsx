@@ -15,6 +15,7 @@ import { DEFAULT_MERGE_GRACE_MINS, DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectati
 import { branchName, DEFAULT_BRANCH_TEMPLATE, templateHasKey } from "@/lib/jira/branchName";
 import { ArgvPreview } from "./ArgvPreview";
 import { ExternalLink } from "./ExternalLink";
+import { HelpButton } from "./HelpButton";
 
 const INSTALL_URL = "https://developer.atlassian.com/cloud/acli/guides/install-acli/";
 const LOGIN_ARGV = ["acli", "jira", "auth", "login", "--web"];
@@ -47,7 +48,10 @@ export function JiraSettingsPanel({
 
   return (
     <div className="mt-5 flex flex-col gap-2">
-      <span className="text-sm font-medium">Jira</span>
+      <span className="text-sm font-medium">
+        Jira
+        <HelpButton topic="jira" />
+      </span>
       <label className="flex items-center gap-2 text-sm">
         <input
           type="checkbox"

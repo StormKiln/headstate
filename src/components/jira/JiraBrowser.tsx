@@ -4,6 +4,7 @@ import { needsAttention } from "@/lib/jira/tree";
 import { readAge } from "@/lib/jira/age";
 import { useNow } from "@/lib/readyAge";
 import type { IssueBatch, JiraError } from "@/types/jira";
+import { HelpButton } from "../HelpButton";
 import { GoToTicket } from "./GoToTicket";
 import { JiraTree } from "./JiraTree";
 import { useJiraBoard } from "./useJiraBoard";
@@ -40,18 +41,21 @@ export function JiraBrowser() {
   return (
     <div className="flex min-h-0 flex-col gap-2">
       <GoToTicket projects={board.jira.projects} links={board.links} site={board.jira.site} />
-      <div role="group" aria-label="Which issues" className="flex flex-wrap gap-1">
-        {FILTERS.map((f) => (
-          <button
-            key={f.id}
-            type="button"
-            aria-pressed={filter === f.id}
-            onClick={() => setFilter(f.id)}
-            className="rounded px-2 py-0.5 text-xs text-[#8b949e] hover:bg-[#21262d] aria-pressed:bg-[#21262d] aria-pressed:text-[#e6edf3]"
-          >
-            {f.label}
-          </button>
-        ))}
+      <div className="flex items-center">
+        <div role="group" aria-label="Which issues" className="flex flex-wrap gap-1">
+          {FILTERS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              aria-pressed={filter === f.id}
+              onClick={() => setFilter(f.id)}
+              className="rounded px-2 py-0.5 text-xs text-[#8b949e] hover:bg-[#21262d] aria-pressed:bg-[#21262d] aria-pressed:text-[#e6edf3]"
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <HelpButton topic="jira" />
       </div>
       {wantsAssigned && board.assigned.isPending ? SKELETON : null}
       {wantsAssigned ? (

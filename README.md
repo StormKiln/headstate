@@ -129,6 +129,20 @@ acli jira auth login --web
 phone. Jira Cloud only. If the desktop cannot find `acli`, set
 `HEADSTATE_ACLI` to its full path and relaunch Headstate.
 
+Headstate then finds Jira keys in pull request titles (`ABC-1: fix login`)
+and branch names (`feature/abc-1-fix-login`), matched against the projects
+`acli` can see; a project can be switched off in Settings → Jira if its key
+collides with your branch names. Settings → Jira also holds the status a
+project should be in while a pull request is open and after it merges, for
+workflows where that is not simply In Progress and Done. See **My Jira
+issues** below for what it shows.
+
+| My Jira issues | A merged pull request, ticket not moved | Chip on a pull request row |
+|---|---|---|
+| ![My Jira issues on a phone](docs/screenshots/jira/jira-list.png) | ![Merged, not moved](docs/screenshots/jira/jira-merged.png) | ![Ticket chip](docs/screenshots/jira/pr-row-chip.png) |
+
+The screenshots use synthetic data (`make jira-mobile-screenshots`).
+
 ### Building from source on Linux
 
 Releases ship a `.deb` and an `.AppImage`, so building from source is only
@@ -341,10 +355,22 @@ Selecting one shows its status and every pull request, worktree and branch
 that names it, including pull requests that have since left your list, shown
 as no longer open. When none of yours names it, Headstate searches GitHub
 for pull requests that do, only across the owners of repositories you already
-work in, and says when a merged one left the ticket behind. A key counts only when its prefix is one of your Jira
-projects, so look-alikes such as `UTF-8` are never linked. Off by default:
-turn it on in **Settings → Jira**. Read-only; Headstate never changes an
-issue.
+work in. A key counts only when its prefix is one of your Jira projects, so
+look-alikes such as `UTF-8` are never linked. **Cmd+J** (Ctrl+J elsewhere)
+goes to a ticket by key or link from any page. Off by default: turn it on in
+**Settings → Jira**.
+
+It says when a pull request and its issue disagree: an open pull request
+whose issue is still To Do, an issue marked Done while its pull request is
+open, a merged pull request whose issue did not move, a closed one whose
+issue is still in progress. A merge gets a grace period (15 minutes by
+default) before it counts, and when the search behind a verdict was partial,
+the verdict says so instead of warning. It can move an issue, start a branch
+or worktree from one, and put a ticket's key in a pull request's title; each
+shows the exact command first, runs only when you confirm, and reports what
+Jira, git, GitHub or GitLab says afterwards. It never moves an issue on its own and never
+renames a branch. On the phone, reads and changes are relayed to the paired
+desktop. The help button on the page has the details.
 
 **This is off by default.** Turn it on in Settings, under Claude
 Integrations. It stays off until asked for because the optional session hook

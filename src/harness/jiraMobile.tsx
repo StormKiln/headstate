@@ -20,6 +20,7 @@
 /// - `view`: the `View` to open (`jira`, `my-prs`).
 /// - `state`: JSON merged into the filter store.
 /// - `select`: a Jira key to open in My Jira issues.
+/// - `filter`: My Jira issues' filter (`all`, `linked`, `assigned`, `attention`).
 ///
 /// A command with no answer here REJECTS. `window.__jira.unanswered`
 /// names each one, so the driver can say what the page asked for that the
@@ -36,9 +37,9 @@ import { ErrorBoundary } from "../components/ErrorBoundary";
 import { PR_FIXTURES } from "../fixtures/prs";
 import "../index.css";
 import { useFilters, type View } from "../store/filters";
-import { useJiraView } from "../store/jira";
+import { useJiraView, type JiraFilter } from "../store/jira";
 import { REQUIRED_PROTOCOL_VERSION } from "../lib/protocol";
-import type { IssueBatch, JiraIssue, JiraLink, KeyLookup, LinkIndex } from "../types/jira";
+import type { IssueBatch, JiraIssue, JiraLink, KeyLookup, KeySearch, LinkIndex, PrState } from "../types/jira";
 import type { PullRequest } from "../types/pr";
 import "sonner/dist/styles.css";
 
@@ -62,35 +63,74 @@ const issue = (key: string, over: Partial<JiraIssue>): JiraIssue => ({
   ...over,
 });
 
+/// One of each drift state the page can show, so the screenshots and the
+/// demo cover them all (#2049):
+///
+/// | Key   | Ticket      | Pull requests                        | Shown             |
+/// |-------|-------------|--------------------------------------|-------------------|
+/// | ABC-2 | In Review   | #42 open, #40 merged (searched)      | R3: 1 of 2 merged |
+/// | ABC-3 | In Progress | #41 yours, left your list; merged    | R2, as a fact     |
+/// | ABC-4 | To Do       | spoon-knife #7 open                  | R1                |
+/// | ABC-5 | Done        | #43 open                             | R4                |
+/// | ABC-6 | In Progress | #39 merged; the search was truncated | R2, qualified     |
+/// | ABC-7 | In Review   | #38 merged four minutes ago          | R2, grace period  |
+/// | XY-2  | In Progress | #37 closed without merging           | R5                |
+/// | XY-1  | To Do       | none; assigned to you                | Start work        |
+///
+/// ABC-9 is an initiative over both epics, ABC-1 and XY-3.
+const INITIATIVE = issue("ABC-9", {
+  summary: "Make sign-in dependable",
+  issue_type: { name: "Initiative", hierarchy_level: 2 },
+  assignee: "Robin Example",
+});
 const EPIC = issue("ABC-1", {
   summary: "Sign-in that survives a network change",
   issue_type: { name: "Epic", hierarchy_level: 1 },
   assignee: "Robin Example",
+  parent_key: "ABC-9",
+});
+const EPIC_XY = issue("XY-3", {
+  summary: "Release tooling",
+  issue_type: { name: "Epic", hierarchy_level: 1 },
+  assignee: "Robin Example",
+  parent_key: "ABC-9",
 });
 const ISSUES: JiraIssue[] = [
+  INITIATIVE,
   EPIC,
+  EPIC_XY,
   issue("ABC-2", { summary: "Retry the fetch client on a dropped connection", status: { name: "In Review", category: "in_progress" }, parent_key: "ABC-1" }),
   issue("ABC-3", { summary: "Keep the session across a Wi-Fi to cellular handover", parent_key: "ABC-1" }),
   issue("ABC-4", { summary: "Explain a lost sign-in in words", status: { name: "To Do", category: "new" }, parent_key: "ABC-1" }),
   issue("ABC-5", { summary: "Fix the flaky timezone test", issue_type: { name: "Bug", hierarchy_level: 0 }, status: { name: "Done", category: "done" } }),
-  issue("XY-1", { summary: "Tidy the release notes template", status: { name: "To Do", category: "new" }, read_at: ago(9), stale: true }),
+  issue("ABC-6", { summary: "Refresh the token before it expires", parent_key: "ABC-1" }),
+  issue("ABC-7", { summary: "Show when the session was last renewed", status: { name: "In Review", category: "in_progress" }, parent_key: "ABC-1" }),
+  issue("XY-1", { summary: "Tidy the release notes template", status: { name: "To Do", category: "new" }, parent_key: "XY-3", read_at: ago(9), stale: true }),
+  issue("XY-2", { summary: "Sign release builds in CI", parent_key: "XY-3" }),
 ];
 const byKey = new Map(ISSUES.map((i) => [i.key, i]));
 
-/// The `octocat` fixture pull requests, retitled to name tickets.
+/// The `octocat` fixture pull requests, retitled to name tickets. #43 is
+/// made ready for review, so its Done ticket disagrees with it (R4).
 const TITLES: Record<number, string> = {
   42: "ABC-2: Add retry to the fetch client",
   43: "ABC-5: Fix flaky timezone test",
+  7: "ABC-4: Explain a lost sign-in in words",
 };
-const PRS: PullRequest[] = PR_FIXTURES.map((pr) => ({ ...pr, title: TITLES[pr.number] ?? pr.title }));
+const PRS: PullRequest[] = PR_FIXTURES.map((pr) => ({
+  ...pr,
+  title: TITLES[pr.number] ?? pr.title,
+  is_draft: pr.number === 43 ? false : pr.is_draft,
+}));
 
+const GITHUB = { provider: "github", host: "github.com" } as const;
 const prLink = (key: string, pr: PullRequest): JiraLink => ({
   key,
   found_in: "title",
   current: true,
   target: {
     kind: "pr",
-    source: { provider: "github", host: "github.com" },
+    source: GITHUB,
     role: "authored",
     repo: pr.repo,
     number: pr.number,
@@ -102,11 +142,71 @@ const prLink = (key: string, pr: PullRequest): JiraLink => ({
     author: pr.author,
   },
 });
-const LINKS: JiraLink[] = PRS.flatMap((pr) => {
-  const key = /^([A-Z]+-\d+):/.exec(pr.title)?.[1];
-  return key ? [prLink(key, pr)] : [];
+
+/// A pull request in `octocat/hello-world` that is not in the open list:
+/// one a search found, or one of yours that has left the list.
+const elsewhere = (
+  key: string,
+  number: number,
+  title: string,
+  over: { role: "authored" | "searched"; state: PrState | null; merged_at?: string; author?: string },
+): JiraLink => ({
+  key,
+  found_in: "title",
+  current: false,
+  target: {
+    kind: "pr",
+    source: GITHUB,
+    role: over.role,
+    repo: "octocat/hello-world",
+    number,
+    title: `${key}: ${title}`,
+    url: `https://github.com/octocat/hello-world/pull/${number}`,
+    head_ref: `${key.toLowerCase()}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+    is_draft: false,
+    state: over.state,
+    author: over.author ?? "octocat",
+    merged_at: over.merged_at ?? null,
+  },
 });
+
+const LINKS: JiraLink[] = [
+  ...PRS.flatMap((pr) => {
+    const key = /^([A-Z]+-\d+):/.exec(pr.title)?.[1];
+    return key ? [prLink(key, pr)] : [];
+  }),
+  // Yours, opened earlier and since gone from your open list. The index
+  // cannot tell merged from closed; the search below says which.
+  elsewhere("ABC-3", 41, "Keep the session on a network change", { role: "authored", state: null }),
+];
 const INDEX: LinkIndex = { links: LINKS, projects: ["ABC", "XY"], error: null };
+
+/// What `jira_find`'s GitHub search found, per key.
+const SEARCHED: JiraLink[] = [
+  elsewhere("ABC-2", 40, "Retry idempotent requests only", { role: "searched", state: "merged", merged_at: ago(300), author: "robin-example" }),
+  elsewhere("ABC-3", 41, "Keep the session on a network change", { role: "searched", state: "merged", merged_at: ago(120) }),
+  elsewhere("ABC-6", 39, "Refresh the token early", { role: "searched", state: "merged", merged_at: ago(200), author: "robin-example" }),
+  elsewhere("ABC-7", 38, "Show the last renewal time", { role: "searched", state: "merged", merged_at: ago(4) }),
+  elsewhere("XY-2", 37, "Sign builds with the release key", { role: "searched", state: "closed" }),
+];
+
+/// A search that covered everything it set out to, except ABC-6's, which
+/// matched more than it read. A key with nothing searched is answered from
+/// the index, as the desktop does.
+const searchOf = (key: string): KeySearch => {
+  const hits = SEARCHED.filter((l) => l.key === key).length;
+  if (hits === 0) return { state: "not_asked", reason: "already known from your pull requests" };
+  const truncated = key === "ABC-6";
+  return {
+    state: "asked",
+    at: ago(2),
+    total: truncated ? 25 : hits,
+    read: truncated ? 20 : hits,
+    truncated,
+    scope: ["octocat"],
+    unsearched: [],
+  };
+};
 
 const batch = (keys: string[]): IssueBatch => {
   const found = keys.flatMap((k) => byKey.get(k) ?? []);
@@ -155,7 +255,7 @@ const DESKTOP: Record<string, (args: Record<string, unknown>) => unknown> = {
   jira_issues: (a) => batch(a.keys as string[]),
   jira_find: (a): KeyLookup => {
     const key = a.key as string;
-    return { key, links: LINKS.filter((l) => l.key === key), search: { state: "not_asked", reason: "already known from your pull requests" }, gitlab: null };
+    return { key, links: [...LINKS, ...SEARCHED].filter((l) => l.key === key), search: searchOf(key), gitlab: null };
   },
 };
 
@@ -225,6 +325,8 @@ const view = (params.get("view") ?? "jira") as View;
 useFilters.setState({ view, ...(JSON.parse(params.get("state") ?? "{}") as object) });
 const select = params.get("select");
 if (select) useJiraView.getState().select(select);
+const filter = params.get("filter") as JiraFilter | null;
+if (filter) useJiraView.getState().setFilter(filter);
 
 createRoot(document.getElementById("root") as HTMLElement).render(
   <StrictMode>

@@ -31,11 +31,29 @@ try {
 }
 mkdirSync(OUT, { recursive: true });
 
-/// [file, query, what must be on screen before the shot].
+/// [file, query, what must be on screen before the shot]: a role and name,
+/// or a text. The drift shots wait for the drift sentence itself, so a
+/// page that rendered but did not reach its verdict fails rather than
+/// saving a picture of the wrong thing. The states are tabled in
+/// `src/harness/jiraMobile.tsx`.
 const SHOTS = [
   ["jira-list.png", "view=jira", { role: "button", name: /ABC-2 Retry the fetch client/ }],
-  ["jira-detail.png", "view=jira&select=ABC-2", { role: "heading", name: /ABC-2 Retry the fetch client/ }],
+  ["jira-attention.png", "view=jira&filter=attention", { role: "button", name: /ABC-4 Explain a lost sign-in/ }],
+  // R3: some merged, some open.
+  ["jira-detail.png", "view=jira&select=ABC-2", { text: /1 of 2 pull requests for ABC-2 merged/ }],
+  // R1: an open pull request, the ticket still To Do.
+  ["jira-not-started.png", "view=jira&select=ABC-4", { text: /ABC-4 is still To Do/ }],
+  // R2 as a fact: every pull request accounted for, the grace period over.
+  ["jira-merged.png", "view=jira&select=ABC-3", { text: /has merged, but the ticket is still In Progress/ }],
+  // R2 qualified: the search matched more than it read.
+  ["jira-merged-partial.png", "view=jira&select=ABC-6", { text: /other pull requests for ABC-6 were not checked/ }],
+  // R2 within the grace period.
+  ["jira-merged-waiting.png", "view=jira&select=ABC-7", { text: /merged 4 minutes ago/ }],
+  // R5: closed without merging.
+  ["jira-closed.png", "view=jira&select=XY-2", { text: /was closed without merging/ }],
   ["pr-row-chip.png", "view=my-prs", { role: "button", name: /ABC-2 · In Review/ }],
+  // R4 on the chip itself (amber, with a warning icon), further down the list.
+  ["pr-row-drift.png", "view=my-prs", { role: "button", name: /ABC-5 · Done/, scroll: true }],
 ];
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
@@ -62,13 +80,19 @@ try {
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto(`http://127.0.0.1:${port}/harness/jira-mobile.html?${query}`);
+    const wanted = expected.text
+      ? page.getByText(expected.text)
+      : page.getByRole(expected.role, { name: expected.name });
     try {
-      await page.getByRole(expected.role, { name: expected.name }).first().waitFor({ timeout: 10_000 });
+      await wanted.first().waitFor({ timeout: 10_000 });
     } catch {
-      failures.push(`${file}: no ${expected.role} named ${expected.name} on screen`);
+      failures.push(
+        `${file}: ${expected.text ? `no text ${expected.text}` : `no ${expected.role} named ${expected.name}`} on screen`,
+      );
     }
     // Chips and parents arrive in later rounds over the mocked relay.
     await page.waitForTimeout(1500);
+    if (expected.scroll) await wanted.first().scrollIntoViewIfNeeded().catch(() => {});
     const unanswered = await page.evaluate(() => window.__jira?.unanswered ?? []);
     if (unanswered.length) failures.push(`${file}: the harness did not answer ${unanswered.join(", ")}`);
     if (errors.length) failures.push(`${file}: ${errors.join("; ")}`);
