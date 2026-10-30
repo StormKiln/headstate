@@ -17,9 +17,11 @@
 //! reader stays tolerant: a field that is missing reads as absent, never as
 //! a default that looks like data.
 
+pub mod alerts;
 pub mod cache;
 pub mod cli;
 pub mod commands;
+pub mod drift;
 pub mod index;
 pub mod keys;
 pub mod lookup;

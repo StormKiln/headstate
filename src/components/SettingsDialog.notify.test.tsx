@@ -146,6 +146,17 @@ describe("the new-PR and health categories (#789)", () => {
     };
   });
 
+  /// #2043: off unless asked for. A stored preference without the field
+  /// reads as off, matching the Rust default.
+  it("offers Jira drift notifications, off by default", async () => {
+    show();
+    await settle();
+    const box = screen.getByRole("checkbox", { name: /its jira issue disagree/i });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(box);
+    expect(setPrefs).toHaveBeenCalledWith(expect.objectContaining({ jira_drift: true }));
+  });
+
   it("offers a toggle for a pull request appearing", async () => {
     show();
     await settle();

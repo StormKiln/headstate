@@ -1,13 +1,14 @@
 import { safeUnlisten } from "@/api/unlisten";
 import { useFilters } from "@/store/filters";
 import { useSourceSelection } from "@/store/sourceSelection";
-import type { PrIdentity } from "@/types/identity";
+import { useJiraView } from "@/store/jira";
+import type { NotificationTarget } from "@/api/tauri";
 
 // Subscribe before draining: a click arriving before React mounts remains in
 // Rust, and one arriving during listener registration cannot fall in a gap.
 export async function connectNotificationNavigation(
   subscribe: (wake: () => void) => Promise<() => void>,
-  take: () => Promise<PrIdentity | null>,
+  take: () => Promise<NotificationTarget | null>,
   signal?: AbortSignal,
 ): Promise<() => void> {
   let active = !signal?.aborted;
@@ -20,6 +21,13 @@ export async function connectNotificationNavigation(
       // Once taken, route even if React tears this effect down while IPC
       // resolves. The destination is app state, not a mounted component.
       if (!target) return;
+      // A Jira drift notice (#2043) is about the issue: open it in My Jira
+      // issues, where the pull request is one click away.
+      if (target.jira_key) {
+        useFilters.getState().setView("jira");
+        useJiraView.getState().select(target.jira_key);
+        return;
+      }
       useSourceSelection.getState().setSelection(target.source?.provider ?? "github");
       useFilters.getState().setView("my-prs");
       useFilters.getState().selectPr(target);

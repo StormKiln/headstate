@@ -333,6 +333,27 @@ pub fn load(conn: &Connection, projects: &HashSet<String>) -> Result<Vec<JiraLin
     Ok(links)
 }
 
+/// Keys named by one of the user's OWN pull requests that left its list
+/// since `since` (RFC 3339), whose project is in `projects`: the tickets a
+/// merge may just have left behind (#2043). `seen_at` is when the pull
+/// request was last seen listed, so this is "listed until recently".
+pub fn recently_left(
+    conn: &Connection,
+    projects: &HashSet<String>,
+    since: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut keys: Vec<String> = conn
+        .prepare(
+            "SELECT key FROM jira_link WHERE kind = 'pr' AND current = 0
+               AND json_extract(payload, '$.target.role') = 'authored' AND seen_at >= ?1
+             GROUP BY key ORDER BY MAX(seen_at) DESC",
+        )?
+        .query_map([since], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    keys.retain(|k| projects.contains(project(k)));
+    Ok(keys)
+}
+
 /// Every stored link naming `key`, whatever its project. For a jump to a
 /// ticket the user typed, where the dictionary has already been checked.
 pub fn for_key(conn: &Connection, key: &str) -> Result<Vec<JiraLink>, StoreError> {
@@ -466,6 +487,31 @@ mod tests {
         assert_eq!(
             keys(&load(&conn, &all()).unwrap()),
             [("ABC-1", false), ("ABC-2", true)]
+        );
+    }
+
+    #[test]
+    fn recently_left_names_own_pull_requests_that_left_since() {
+        let mut conn = db();
+        save(&conn, &[pr(1, "ABC-1", "x"), pr(2, "ABC-2", "y")]);
+        refresh_prs(&mut conn).unwrap();
+        save(&conn, &[pr(2, "ABC-2", "y")]);
+        refresh_prs(&mut conn).unwrap();
+        assert_eq!(
+            recently_left(&conn, &all(), "2000-01-01T00:00:00Z").unwrap(),
+            ["ABC-1"],
+            "still listed is not left"
+        );
+        assert!(
+            recently_left(&conn, &all(), "2999-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty(),
+            "left before `since` is not recent"
+        );
+        assert!(
+            recently_left(&conn, &HashSet::new(), "2000-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
         );
     }
 

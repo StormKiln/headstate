@@ -92,7 +92,7 @@ fn has_checking(prs: &[PullRequest]) -> bool {
 /// Failure is logged and swallowed: a notification is an affordance, and
 /// losing one must never take down polling. macOS 10.14+ clicks carry the complete
 /// provider-qualified identity through the native notification delegate.
-fn notify_breakage(app: &AppHandle, b: &Breakage) {
+pub(crate) fn notify_breakage(app: &AppHandle, b: &Breakage) {
     use tauri_plugin_notification::NotificationExt;
 
     let body = format!(
@@ -107,10 +107,13 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
         crate::notification_navigation::notify(
             &b.title,
             &body,
-            &crate::identity::PrIdentity {
-                source: b.source.clone(),
-                repo: b.repo.clone(),
-                number: b.number,
+            &crate::notification_navigation::Target {
+                pr: crate::identity::PrIdentity {
+                    source: b.source.clone(),
+                    repo: b.repo.clone(),
+                    number: b.number,
+                },
+                jira_key: b.jira_key.clone(),
             },
         );
         return;
@@ -167,7 +170,7 @@ pub(crate) fn notification_allowed(app: &AppHandle) -> bool {
     }
 }
 
-/// A newly-broken PR worth interrupting the user for.
+/// A pull request worth interrupting the user for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Breakage {
     pub source: Source,
@@ -175,10 +178,18 @@ pub struct Breakage {
     pub repo: String,
     pub number: u64,
     pub url: String,
-    pub kind: BreakageKind,
+    pub kind: NoticeKind,
+    /// The Jira issue the notice is about, for a drift notice (#2043): a
+    /// click opens it in My Jira issues rather than the pull request.
+    pub jira_key: Option<String>,
 }
 
-/// What broke.
+/// What happened to the pull request.
+///
+/// Called `BreakageKind` until a fifth kind arrived (#2043), as the
+/// `Appeared` doc had asked: two of the four were already not breakage.
+/// The name never reached the wire -- `NotifyPrefs` stores one bool per
+/// kind under its own field name -- so the rename migrates nothing.
 ///
 /// A type rather than the prose string it used to be, so the settings
 /// filter matches on the KIND and cannot drift from display wording. A
@@ -186,48 +197,45 @@ pub struct Breakage {
 /// and comparing on "has merge conflicts" would break the moment that
 /// sentence is reworded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BreakageKind {
+pub enum NoticeKind {
     CiFailed,
     Conflicted,
     /// A pull request awaiting YOUR review became ready to pick up.
     ///
-    /// The odd one out: this is good news, where the other two are
-    /// breakage. The type keeps its name because renaming it touches
-    /// every call site for no behavioural gain -- but a third variant
-    /// that is not a breakage is exactly the sort of thing that makes a
-    /// name wrong, so it is called out here rather than left to be
-    /// discovered.
+    /// Good news, where the two above are breakage.
     ReadyToReview,
     /// A pull request that was not in the previous tick's list (#789).
-    ///
-    /// The FOURTH variant in a type called `BreakageKind`, which by now
-    /// makes the name plainly wrong -- two of the four are not breakage.
-    /// Still not renamed, for the reason `ReadyToReview` gives: the name
-    /// appears at every call site and on the wire in `NotifyPrefs`, and
-    /// a rename buys nothing behavioural while touching the settings
-    /// struct users have stored values for. If a fifth arrives, rename
-    /// it then and migrate the preference keys in the same change.
     Appeared,
+    /// Your open pull request names a Jira issue still in To Do (#2043,
+    /// rule R1 of #2042). Raised only as a fact, on first observation.
+    JiraNotStarted,
+    /// Your pull request merged, every pull request for the issue is
+    /// accounted for, the grace period is over, and the issue has not
+    /// moved (#2043, rule R2). Never for a qualified "not checked" state.
+    JiraNotMoved,
 }
 
-impl BreakageKind {
+impl NoticeKind {
     /// The notification body. Reads after "owner/repo#123 ...".
     pub fn reason(self) -> &'static str {
         match self {
-            BreakageKind::CiFailed => "CI is failing",
-            BreakageKind::Conflicted => "has merge conflicts",
-            BreakageKind::ReadyToReview => "is ready for your review",
-            BreakageKind::Appeared => "just appeared",
+            NoticeKind::CiFailed => "CI is failing",
+            NoticeKind::Conflicted => "has merge conflicts",
+            NoticeKind::ReadyToReview => "is ready for your review",
+            NoticeKind::Appeared => "just appeared",
+            NoticeKind::JiraNotStarted => "is open, but its Jira issue is still To Do",
+            NoticeKind::JiraNotMoved => "merged, but its Jira issue has not moved",
         }
     }
 
     /// Whether the user wants to hear about this one.
     pub fn enabled_by(self, prefs: &NotifyPrefs) -> bool {
         match self {
-            BreakageKind::CiFailed => prefs.ci_failed,
-            BreakageKind::Conflicted => prefs.conflicted,
-            BreakageKind::ReadyToReview => prefs.ready_to_review,
-            BreakageKind::Appeared => prefs.new_pr,
+            NoticeKind::CiFailed => prefs.ci_failed,
+            NoticeKind::Conflicted => prefs.conflicted,
+            NoticeKind::ReadyToReview => prefs.ready_to_review,
+            NoticeKind::Appeared => prefs.new_pr,
+            NoticeKind::JiraNotStarted | NoticeKind::JiraNotMoved => prefs.jira_drift,
         }
     }
 }
@@ -529,6 +537,15 @@ pub struct NotifyPrefs {
     /// `enabled`, still covers it like everything else.
     #[serde(default = "default_true")]
     pub claude_crashed: bool,
+    /// Notify when a pull request and its Jira issue first disagree as a
+    /// matter of fact (#2043): R1 and R2 of #2042.
+    ///
+    /// OFF by default, unlike `claude_crashed`: the Jira integration being
+    /// on is not the same as asking to be interrupted about tickets, and
+    /// when it is on this also spends a GitHub search per recently merged
+    /// ticket to make R2 knowable at all.
+    #[serde(default)]
+    pub jira_drift: bool,
 }
 
 impl Default for NotifyPrefs {
@@ -548,13 +565,15 @@ impl Default for NotifyPrefs {
             // the Claude Code integration on, which defaults off, so
             // nobody is interrupted about something they never asked for.
             claude_crashed: true,
+            // OFF: see the field.
+            jira_drift: false,
         }
     }
 }
 
 impl NotifyPrefs {
     /// Whether this breakage should interrupt the user.
-    pub fn wants(&self, kind: BreakageKind) -> bool {
+    pub fn wants(&self, kind: NoticeKind) -> bool {
         self.enabled && kind.enabled_by(self)
     }
 
@@ -653,7 +672,8 @@ pub fn newly_ready(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Bre
             repo: pr.repo.clone(),
             number: pr.number,
             url: pr.url.clone(),
-            kind: BreakageKind::ReadyToReview,
+            kind: NoticeKind::ReadyToReview,
+            jira_key: None,
         })
         .collect()
 }
@@ -697,7 +717,8 @@ pub fn newly_appeared(previous: &[PullRequest], current: &[PullRequest]) -> Vec<
             repo: pr.repo.clone(),
             number: pr.number,
             url: pr.url.clone(),
-            kind: BreakageKind::Appeared,
+            kind: NoticeKind::Appeared,
+            jira_key: None,
         })
         .collect()
 }
@@ -708,9 +729,9 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
         .filter_map(|pr| {
             let was = previous.iter().find(|p| p.identity() == pr.identity())?;
             let kind = if pr.ci == CiState::Failure && was.ci != CiState::Failure {
-                BreakageKind::CiFailed
+                NoticeKind::CiFailed
             } else if pr.merge == MergeState::Conflicted && was.merge != MergeState::Conflicted {
-                BreakageKind::Conflicted
+                NoticeKind::Conflicted
             } else {
                 return None;
             };
@@ -721,6 +742,7 @@ pub fn newly_broken(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Br
                 number: pr.number,
                 url: pr.url.clone(),
                 kind,
+                jira_key: None,
             })
         })
         .collect()
@@ -781,7 +803,7 @@ pub(crate) fn announce_against(
 /// comment one screen up already worries that "a foreground query can be
 /// what makes the foreground query look slow"; this is the half of that
 /// which was measurable and unnecessary.
-async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
+pub(crate) async fn read_notify_prefs(app: &AppHandle) -> NotifyPrefs {
     let Ok(dir) = crate::commands::profile_dir(app) else {
         return NotifyPrefs::default();
     };
@@ -2085,8 +2107,8 @@ mod tests {
     fn notifications_default_to_on() {
         let d = NotifyPrefs::default();
         assert!(d.enabled && d.ci_failed && d.conflicted);
-        assert!(d.wants(BreakageKind::CiFailed));
-        assert!(d.wants(BreakageKind::Conflicted));
+        assert!(d.wants(NoticeKind::CiFailed));
+        assert!(d.wants(NoticeKind::Conflicted));
     }
 
     /// The master switch silences everything without discarding the
@@ -2098,10 +2120,10 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        assert!(!p.wants(BreakageKind::CiFailed));
-        assert!(!p.wants(BreakageKind::Conflicted));
+        assert!(!p.wants(NoticeKind::CiFailed));
+        assert!(!p.wants(NoticeKind::Conflicted));
         // Good news is silenced by the master switch too.
-        assert!(!p.wants(BreakageKind::ReadyToReview));
+        assert!(!p.wants(NoticeKind::ReadyToReview));
         // The choices survive: flipping `enabled` back is enough.
         assert!(p.ci_failed && p.conflicted && p.ready_to_review);
     }
@@ -2115,24 +2137,24 @@ mod tests {
             conflicted: false,
             ..Default::default()
         };
-        assert!(no_conflicts.wants(BreakageKind::CiFailed));
-        assert!(!no_conflicts.wants(BreakageKind::Conflicted));
-        assert!(no_conflicts.wants(BreakageKind::ReadyToReview));
+        assert!(no_conflicts.wants(NoticeKind::CiFailed));
+        assert!(!no_conflicts.wants(NoticeKind::Conflicted));
+        assert!(no_conflicts.wants(NoticeKind::ReadyToReview));
 
         let no_ci = NotifyPrefs {
             ci_failed: false,
             ..Default::default()
         };
-        assert!(!no_ci.wants(BreakageKind::CiFailed));
-        assert!(no_ci.wants(BreakageKind::Conflicted));
+        assert!(!no_ci.wants(NoticeKind::CiFailed));
+        assert!(no_ci.wants(NoticeKind::Conflicted));
 
         // And the new kind is independent of both.
         let no_ready = NotifyPrefs {
             ready_to_review: false,
             ..Default::default()
         };
-        assert!(!no_ready.wants(BreakageKind::ReadyToReview));
-        assert!(no_ready.wants(BreakageKind::CiFailed));
+        assert!(!no_ready.wants(NoticeKind::ReadyToReview));
+        assert!(no_ready.wants(NoticeKind::CiFailed));
     }
 
     /// The kind drives the filter; the prose is only display. Asserting
@@ -2140,9 +2162,9 @@ mod tests {
     /// changing which notifications a user receives.
     #[test]
     fn kind_carries_the_wording_but_the_filter_matches_the_kind() {
-        assert_eq!(BreakageKind::CiFailed.reason(), "CI is failing");
-        assert_eq!(BreakageKind::Conflicted.reason(), "has merge conflicts");
-        assert_ne!(BreakageKind::CiFailed, BreakageKind::Conflicted);
+        assert_eq!(NoticeKind::CiFailed.reason(), "CI is failing");
+        assert_eq!(NoticeKind::Conflicted.reason(), "has merge conflicts");
+        assert_ne!(NoticeKind::CiFailed, NoticeKind::Conflicted);
     }
 
     use super::*;
@@ -2812,7 +2834,7 @@ mod tests {
         fn a_brand_new_ready_pull_request_notifies() {
             let out = newly_ready(&[], &[ready(1)]);
             assert_eq!(out.len(), 1, "an unseen ready PR must notify");
-            assert_eq!(out[0].kind, BreakageKind::ReadyToReview);
+            assert_eq!(out[0].kind, NoticeKind::ReadyToReview);
         }
 
         /// And it must not re-announce on every tick afterwards.
@@ -2898,7 +2920,7 @@ mod tests {
             let out = newly_appeared(&[open(1)], &[open(1), open(2)]);
             assert_eq!(out.len(), 1, "{out:?}");
             assert_eq!(out[0].number, 2);
-            assert_eq!(out[0].kind, BreakageKind::Appeared);
+            assert_eq!(out[0].kind, NoticeKind::Appeared);
             assert_eq!(out[0].kind.reason(), "just appeared");
         }
 
@@ -3033,7 +3055,7 @@ mod tests {
                 newly_ready,
             );
             assert_eq!(out.len(), 1, "{out:?}");
-            assert_eq!(out[0].kind, BreakageKind::ReadyToReview);
+            assert_eq!(out[0].kind, NoticeKind::ReadyToReview);
             assert_eq!(out[0].number, 2);
         }
 
@@ -3069,12 +3091,12 @@ mod tests {
                 new_pr: false,
                 ..Default::default()
             };
-            assert!(!off.wants(BreakageKind::Appeared));
+            assert!(!off.wants(NoticeKind::Appeared));
             assert!(
-                off.wants(BreakageKind::CiFailed),
+                off.wants(NoticeKind::CiFailed),
                 "turning one category off must not touch another"
             );
-            assert!(NotifyPrefs::default().wants(BreakageKind::Appeared));
+            assert!(NotifyPrefs::default().wants(NoticeKind::Appeared));
         }
     }
 
@@ -3249,6 +3271,28 @@ mod tests {
                 "and the choice survives a round trip"
             );
         }
+
+        /// #2043: Jira drift notices are OFF unless asked for, a stored
+        /// preference from before the field decodes with it off, and the
+        /// gate covers both drift kinds under the master switch.
+        #[test]
+        fn jira_drift_notices_are_off_unless_asked_for() {
+            let stored = r#"{"enabled":true,"ci_failed":true,"conflicted":true}"#;
+            let p: NotifyPrefs = serde_json::from_str(stored).unwrap();
+            assert!(!p.jira_drift);
+            assert!(!NotifyPrefs::default().jira_drift);
+            assert!(!p.wants(NoticeKind::JiraNotStarted));
+            let on = NotifyPrefs {
+                jira_drift: true,
+                ..Default::default()
+            };
+            assert!(on.wants(NoticeKind::JiraNotStarted) && on.wants(NoticeKind::JiraNotMoved));
+            let muted = NotifyPrefs {
+                enabled: false,
+                ..on
+            };
+            assert!(!muted.wants(NoticeKind::JiraNotMoved));
+        }
     }
 
     fn pr_full(repo: &str, number: u64, ci: CiState, merge: MergeState) -> PullRequest {
@@ -3311,7 +3355,7 @@ mod tests {
         assert_eq!(b.len(), 1);
         // The KIND, not the prose: the kind is what the notification
         // filter matches on, and the wording is asserted separately.
-        assert_eq!(b[0].kind, BreakageKind::CiFailed);
+        assert_eq!(b[0].kind, NoticeKind::CiFailed);
         assert!(b[0].url.ends_with("/pull/1"), "must be clickable");
     }
 
@@ -3331,7 +3375,7 @@ mod tests {
         )];
         assert_eq!(
             newly_broken(&before, &after)[0].kind,
-            BreakageKind::Conflicted
+            NoticeKind::Conflicted
         );
     }
 

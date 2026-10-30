@@ -688,6 +688,21 @@ export function SettingsDialog({
               A session that stopped without ending cleanly — announced once, when it is first
               noticed. Only while the Claude Code integration above is on.
             </p>
+            {/* #2043. OFF by default -- see `NotifyPrefs::jira_drift`. */}
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={!(prefs?.enabled ?? true)}
+                checked={prefs?.jira_drift ?? false}
+                onChange={() => prefs && void setPrefs({ ...prefs, jira_drift: !prefs.jira_drift })}
+              />
+              A pull request and its Jira issue disagree
+            </label>
+            <p className="text-xs text-[#8b949e]">
+              Your pull request is open but its issue is still To Do, or it merged and the issue has not
+              moved. Announced once, when it is first true for certain — never for an issue whose other pull
+              requests could not all be checked. Only while Jira is linked.
+            </p>
           </div>
           {/* A number, not a checkbox, because the only question worth
               asking about LOW CHARGE is WHEN: everyone wants to know
