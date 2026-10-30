@@ -650,6 +650,20 @@ in your lists; on GitLab, up to five of the projects in your lists. A
 teammate's pull request that names the key only in its branch, in a
 repository you have no list for, is not found.
 
+**A notification, if you want one.** Off by default: Settings ›
+Notifications, *A pull request and its Jira issue disagree*. It covers
+your own pull requests only, for the first notice in the table and for
+a merge the issue did not follow — and only once that is certain:
+never for a "not checked" line, and not inside the grace period. Each
+pull request and issue is announced once, and nothing already true
+when the app started or when you turned it on is announced. Clicking
+it opens the issue.
+
+Those same two, the open pull request on a To Do issue and the certain
+merge, offer the fix on the page. If Status expectations
+names the status the project wants, the button reads *Move ABC-1 to In
+Review*; otherwise you choose the status.
+
 ### What Headstate can change, and how
 
 Each of these shows the exact command or request first and runs only
@@ -667,7 +681,9 @@ what Jira, git, GitHub or GitLab reports, not what it asked for.
   repository, named from the key and summary — the pattern is set in
   Settings › Jira. It starts from the default branch as last fetched;
   nothing is fetched, and a branch or path that already exists is
-  refused.
+  refused. *Also move ABC-1* (unticked by default) moves the issue as
+  well; the move is shown in the same confirmation and runs only if git
+  succeeded.
 - **Link a ticket** to a pull request that names none. Turn on *Mark my
   pull requests that name no ticket* in Settings › Jira, then use the
   *no ticket* marker on the row. It puts the key at the start of the
