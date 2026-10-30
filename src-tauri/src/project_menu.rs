@@ -1,14 +1,16 @@
 //! Extend Tauri's standard menus without losing native editing/window items.
 #[cfg(not(target_os = "macos"))]
-use tauri::menu::{AboutMetadata, PredefinedMenuItem};
-use tauri::menu::{Menu, MenuItem, MenuItemKind};
+use tauri::menu::AboutMetadata;
 #[cfg(target_os = "linux")]
-use tauri::{menu::WINDOW_SUBMENU_ID, Manager};
+use tauri::menu::WINDOW_SUBMENU_ID;
+use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
+use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(not(target_os = "macos"))]
 const REPOSITORY: &str = "https://github.com/StormKiln/headstate";
 const ISSUES: &str = "https://github.com/StormKiln/headstate/issues";
+const SETTINGS: &str = "project-settings";
 
 #[cfg(any(target_os = "linux", test))]
 const LINUX_WINDOW_ITEMS: [(&str, &str); 3] = [
@@ -73,6 +75,7 @@ impl WindowActions for tauri::WebviewWindow {
 
 pub fn setup(app: &tauri::AppHandle) -> tauri::Result<()> {
     let menu = Menu::default(app)?;
+    add_settings(app, &menu)?;
     for item in menu.items()? {
         if let MenuItemKind::Submenu(submenu) = item {
             #[cfg(target_os = "linux")]
@@ -123,6 +126,16 @@ pub fn setup(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
     app.set_menu(menu)?;
     app.on_menu_event(|app, event| match event.id().as_ref() {
+        SETTINGS => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            if let Err(error) = app.emit_to("main", "open-settings", ()) {
+                log::warn!("could not open Settings: {error}");
+            }
+        }
         "project-issues" => {
             if let Err(error) = app.opener().open_url(ISSUES, None::<&str>) {
                 log::warn!("could not open project issues: {error}");
@@ -146,6 +159,32 @@ pub fn setup(app: &tauri::AppHandle) -> tauri::Result<()> {
     });
     Ok(())
 }
+/// Settings… under ⌘, / Ctrl+, (#2084): in the app menu on macOS, after
+/// About, where every Mac app keeps it; first in File on Windows, and in
+/// Edit on Linux, which has no File menu.
+fn add_settings(app: &tauri::AppHandle, menu: &Menu<tauri::Wry>) -> tauri::Result<()> {
+    let item = MenuItem::with_id(app, SETTINGS, "Settings…", true, Some("CmdOrCtrl+,"))?;
+    let (host, at) = if cfg!(target_os = "macos") {
+        (None, 2)
+    } else if cfg!(target_os = "linux") {
+        (Some("Edit"), 0)
+    } else {
+        (Some("File"), 0)
+    };
+    for entry in menu.items()? {
+        let MenuItemKind::Submenu(submenu) = entry else {
+            continue;
+        };
+        // On macOS the first submenu is the app menu, titled by the app.
+        if host.is_none_or(|title| submenu.text().is_ok_and(|t| t == title)) {
+            submenu.insert(&item, at)?;
+            submenu.insert(&PredefinedMenuItem::separator(app)?, at + 1)?;
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn about_metadata(app: &tauri::AppHandle) -> AboutMetadata<'static> {
     AboutMetadata {

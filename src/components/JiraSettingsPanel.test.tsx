@@ -95,18 +95,14 @@ describe("JiraSettingsPanel", () => {
     expect(projects).not.toHaveBeenCalled();
   });
 
-  /// The fix goes through ArgvPreview: one box per argv word.
-  it("shows the sign-in command word by word, and copies it whole", async () => {
+  /// One line the user types, not one box per word (#2086).
+  it("shows the sign-in command as one line", async () => {
     connection.mockResolvedValue({ state: "not_logged_in", detail: "x" });
     renderWithQuery(<JiraSettingsPanel prefs={prefs(true)} setPrefs={vi.fn()} />);
     const box = await screen.findByLabelText("Sign-in command");
-    expect([...box.querySelectorAll("code")].map((c) => c.textContent)).toEqual([
-      "acli",
-      "jira",
-      "auth",
-      "login",
-      "--web",
-    ]);
+    expect(box.tagName).toBe("CODE");
+    expect(box.textContent).toBe("acli jira auth login --web");
+    expect(box.querySelectorAll("code")).toHaveLength(0);
   });
 
   it("names the acli version once acli is found, and never asks while it is missing", async () => {

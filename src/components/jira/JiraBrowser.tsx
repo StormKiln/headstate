@@ -5,6 +5,8 @@ import { readAge } from "@/lib/jira/age";
 import { useNow } from "@/lib/readyAge";
 import type { IssueBatch, JiraError } from "@/types/jira";
 import { HelpButton } from "../HelpButton";
+import { IS_MOBILE_BUILD } from "@/lib/target";
+import { useSettingsDialog } from "@/store/settingsDialog";
 import { GoToTicket } from "./GoToTicket";
 import { JiraTree } from "./JiraTree";
 import { useJiraBoard } from "./useJiraBoard";
@@ -151,5 +153,27 @@ function NotReady() {
     );
   }
   if (connection.isError) return <p className="text-xs text-[#f85149]">Could not ask the desktop about Jira.</p>;
-  return <p className="text-xs text-[#d29922]">Jira is not connected. Open Settings → Jira to sign in.</p>;
+  return <NotConnected />;
+}
+
+/// Settings › Jira is where signing in is explained, so say so with a way
+/// there (#2085). The phone's Settings has no Jira topic (#2047): Jira is
+/// signed in on the desktop.
+function NotConnected() {
+  const openSettings = useSettingsDialog((s) => s.open);
+  if (IS_MOBILE_BUILD) {
+    return <p className="text-xs text-[#d29922]">Jira is not connected. Sign in on the desktop, in Settings → Jira.</p>;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-[#d29922]">
+      <span>Jira is not connected.</span>
+      <button
+        type="button"
+        onClick={() => openSettings("jira")}
+        className="rounded border border-[#30363d] px-1.5 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
+      >
+        Open Jira settings
+      </button>
+    </div>
+  );
 }

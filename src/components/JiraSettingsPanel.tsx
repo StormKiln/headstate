@@ -13,13 +13,15 @@ import type { ExpectedCategory, JiraConnection, StatusExpectation, StatusExpecta
 import { copyText } from "@/lib/clipboard";
 import { DEFAULT_MERGE_GRACE_MINS, DEFAULT_ON_MERGED, DEFAULT_ON_OPEN, expectationLabel } from "@/lib/jira/drift";
 import { branchName, DEFAULT_BRANCH_TEMPLATE, templateHasKey } from "@/lib/jira/branchName";
-import { ArgvPreview } from "./ArgvPreview";
 import { ExternalLink } from "./ExternalLink";
 import { HelpButton } from "./HelpButton";
 
 const INSTALL_URL = "https://developer.atlassian.com/cloud/acli/guides/install-acli/";
-const LOGIN_ARGV = ["acli", "jira", "auth", "login", "--web"];
-const LOGIN = LOGIN_ARGV.join(" ");
+/// Shown as one line, not through `ArgvPreview` (#2086): that component boxes
+/// each word to show where an argv Headstate RUNS splits. This is a fixed
+/// command the user types themselves, and one word per row made it read as
+/// five commands.
+const LOGIN = "acli jira auth login --web";
 
 /// Settings › Jira (#2034, epic #2031).
 ///
@@ -243,9 +245,12 @@ function ConnectionStatus({
         <div className="flex flex-col gap-1 text-xs text-[#d29922]">
           <span>acli is installed but not signed in. Run this in a terminal:</span>
           <div className="flex items-start gap-2">
-            <div aria-label="Sign-in command" className="min-w-0 flex-1">
-              <ArgvPreview program={LOGIN_ARGV[0]} args={LOGIN_ARGV.slice(1)} />
-            </div>
+            <code
+              aria-label="Sign-in command"
+              className="mt-1 min-w-0 flex-1 break-words rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 font-mono text-[11px] text-[#e6edf3]"
+            >
+              {LOGIN}
+            </code>
             <button
               type="button"
               className="mt-1 rounded border border-[#30363d] px-1.5 py-0.5 text-[#e6edf3] hover:bg-[#21262d]"
