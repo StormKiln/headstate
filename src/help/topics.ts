@@ -572,6 +572,131 @@ Shortening it costs very little. The reason not to set it very low is
 latency on GitHub's side, not the budget.`,
   },
 
+  jira: {
+    title: "Jira in Headstate",
+    body: `Headstate links your pull requests, worktrees and branches to the Jira
+issues they name, shows each issue's status beside them, and says when
+a pull request and its issue disagree about where the work is. It is
+off by default. Jira Cloud only.
+
+### Setting it up
+
+On the desktop, install Atlassian's CLI, \`acli\`, and sign in:
+
+\`\`\`sh
+acli jira auth login --web
+\`\`\`
+
+Then turn on **Settings › Jira**. The panel shows whether \`acli\` was
+found and is signed in, and lists the project keys it will match. If
+Headstate cannot find \`acli\`, set \`HEADSTATE_ACLI\` to its full path
+and relaunch.
+
+### How a key is found
+
+A key counts when it is in a pull request's **title** or a **branch
+name**:
+
+- titles match upper case only: \`ABC-1: fix login\`, \`[ABC-1]\`
+- branch names match any case: \`feature/abc-1-fix-login\`
+- worktrees and local branches are read by their branch name
+
+A key counts only when its prefix is **one of your Jira projects**, so
+look-alikes such as \`UTF-8\` or \`GPT-4\` are never linked. Click a
+project key in Settings › Jira to stop matching it, for a project whose
+key collides with your branch names. The chip's tooltip says whether
+the key came from the title or the branch.
+
+### When a pull request and its issue disagree
+
+These are decided by Jira's status **category** (To Do, In Progress,
+Done), so "In Review" or "In Testing" count as in progress with no
+setup. Under **Status expectations** in Settings › Jira you can name
+the status a project should be in while a pull request is open, or
+after it merges.
+
+| Notice | When |
+| --- | --- |
+| *This pull request is open, but ABC-1 is still To Do.* | an open, non-draft pull request names an issue in the To Do category |
+| *ABC-1 is Done, but this pull request is still open.* | the issue is in the Done category while a pull request for it is open |
+| *A pull request for ABC-1 has merged, but the ticket is still In Progress.* | every pull request for the issue is closed or merged, at least one merged, and the issue did not move |
+| *A pull request for ABC-1 was closed without merging, and the ticket is still In Progress.* | every pull request for the issue was closed without merging |
+| *1 of 3 pull requests for ABC-1 merged.* | some merged and some are still open. Progress, not a warning |
+
+A draft pull request raises nothing, and neither does a status whose
+category Jira did not report.
+
+The first two show on pull request rows (the chip turns amber), on the
+pull request's page, and on the issue in **My Jira issues**; the
+**Needs attention** filter lists them. The last three show only on the
+issue's page, because they need every pull request for the issue,
+merged ones included, and that takes a search.
+
+**After a merge, Headstate waits** before saying the issue did not
+move: 15 minutes by default, set in Settings › Jira (0 for no wait).
+Until then the line says how long ago it merged. A Jira automation
+that moves issues on merge gets its chance first.
+
+**"Not checked" means the search was partial.** When a search read
+fewer pull requests than matched, or could not reach every repository,
+or could not tell what became of one of yours, the line says so —
+*"…; other pull requests for ABC-1 were not checked"* — and is shown as
+plain text, not a warning. A count from a partial search reads "at
+least 3".
+
+The search reads pull request **titles** only, and only where you
+already work: on GitHub, repositories owned by up to five of the owners
+in your lists; on GitLab, up to five of the projects in your lists. A
+teammate's pull request that names the key only in its branch, in a
+repository you have no list for, is not found.
+
+### What Headstate can change, and how
+
+Each of these shows the exact command or request first and runs only
+after you confirm. Afterwards Headstate reads the result back and shows
+what Jira, git, GitHub or GitLab reports, not what it asked for.
+
+- **Move an issue** (*Move to…* on the issue). Runs
+  \`acli jira workitem transition --key ABC-1 --status "In Review" --yes --json\`.
+  \`acli\` cannot list the moves a workflow allows, so the choices are
+  the statuses seen in the project's recent issues, plus any name you
+  type. Jira refuses a move its workflow does not allow, and Headstate
+  shows Jira's reason.
+- **Start work** (on an issue assigned to you that none of your pull
+  requests names). Creates a branch, or a worktree beside the
+  repository, named from the key and summary — the pattern is set in
+  Settings › Jira. It starts from the default branch as last fetched;
+  nothing is fetched, and a branch or path that already exists is
+  refused.
+- **Link a ticket** to a pull request that names none. Turn on *Mark my
+  pull requests that name no ticket* in Settings › Jira, then use the
+  *no ticket* marker on the row. It puts the key at the start of the
+  title (\`ABC-1: <title>\`).
+
+### What it never does
+
+- **It never moves an issue on its own.** Every move is one you
+  confirmed.
+- **It never renames a branch.** Linking a ticket changes the title
+  only.
+- **It never holds your Jira credential.** \`acli\` keeps the sign-in,
+  as \`gh\` and \`glab\` do for GitHub and GitLab; Headstate runs it and
+  reads what it prints.
+
+### On the phone
+
+My Jira issues, the chips and Go to ticket work on the phone. The phone
+holds no Jira credential: every read and every change is relayed to the
+paired desktop and run with that desktop's \`acli\`, and a confirmation
+names the desktop it runs on. **Settings › Jira is desktop-only.**
+
+### Going to a ticket
+
+**Cmd+J** (Ctrl+J on Windows and Linux), or the *Go to ticket* button
+in the header, opens a box from any page. Type a key or paste a Jira link. One pull
+request that names it opens directly; several give you a choice; none
+starts a search and says what it covered.`,
+  },
 } as const satisfies Record<string, HelpTopic>;
 
 /// Every valid topic id. A call site passing anything else fails to
