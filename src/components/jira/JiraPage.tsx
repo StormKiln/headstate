@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { ArrowLeft, TriangleAlert } from "lucide-react";
-import { afterMerge, driftFor, knownPrs, lookupComplete, type Verdict } from "@/lib/jira/drift";
+import { afterMerge, driftFor, fixForDrift, fixForVerdict, knownPrs, lookupComplete, type Verdict } from "@/lib/jira/drift";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { CATEGORY_TEXT, describe } from "@/lib/jira/describe";
 import { epicOf, rollUp, type Links, type Lookup } from "@/lib/jira/tree";
 import { useJiraView } from "@/store/jira";
 import { ExternalLink } from "../ExternalLink";
+import { DriftFix } from "./DriftFix";
 import { JiraBrowser } from "./JiraBrowser";
 import { JiraTransition } from "./JiraTransition";
 import { openInHeadstate } from "./openInHeadstate";
@@ -169,11 +170,20 @@ function EpicRollUp({ k, known, lookup }: { k: string; known: string[]; lookup: 
 }
 
 function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined; lookup: Lookup }) {
-  const expectations = useJira()?.expectations;
+  const jira = useJira();
+  const expectations = jira?.expectations;
   const s = lookup(k);
   const issue = s !== undefined && s !== "failed" && s.state === "found" ? s.issue : null;
   const prs = links?.prs ?? [];
   const worktrees = links?.worktrees ?? [];
+  // R1's fix (#2042), once for the ticket however many open pull requests
+  // raise it.
+  const fix = issue
+    ? (prs
+        .map((pr) => (pr.current ? driftFor(issue, { draft: pr.is_draft, source: pr.source }, expectations) : null))
+        .map((d) => (d ? fixForDrift(issue, d, expectations) : null))
+        .find((f) => f !== null) ?? null)
+    : null;
   if (prs.length === 0 && worktrees.length === 0) {
     return <p className="text-sm text-[#8b949e]">None of your pull requests or worktrees names {k}.</p>;
   }
@@ -221,6 +231,7 @@ function LinkedWork({ k, links, lookup }: { k: string; links: Links | undefined;
               );
             })}
           </ul>
+          {issue && jira ? <DriftFix issue={issue} site={jira.site} fix={fix} pickerAbove /> : null}
         </section>
       ) : null}
       {worktrees.length > 0 ? (
@@ -278,6 +289,14 @@ function FoundBySearching({ k, links, lookup, on }: { k: string; links: Links | 
   return (
     <section aria-label="Found by searching" className="flex flex-col gap-1">
       {verdict ? <VerdictLine verdict={verdict} /> : null}
+      {issue && jira ? (
+        <DriftFix
+          issue={issue}
+          site={jira.site}
+          fix={verdict ? fixForVerdict(issue, verdict, jira.expectations) : null}
+          pickerAbove
+        />
+      ) : null}
       {found.length > 0 ? (
         <>
           <h3 className="text-sm font-medium text-[#e6edf3]">Found by searching</h3>
