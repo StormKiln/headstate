@@ -4465,4 +4465,72 @@ describe("WorktreesPage selection", () => {
     await waitFor(() => expect(toastError).toHaveBeenCalled());
     expect([...useFilters.getState().checked].sort()).toEqual(["/code/b", "/code/c"]);
   });
+
+  /// A selection of rows that are NOT safe used to be offered, confirmed
+  /// and then refused row by row by the gated removal. It now says which
+  /// are not safe and why, asks once, and removes them past the gate.
+  describe("with rows that are not marked safe", () => {
+    beforeEach(() => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" } }),
+        wt({ path: "/code/b", safety: { kind: "dirty", detail: 2 } }),
+        wt({ path: "/code/c", safety: { kind: "never_pushed" } }),
+      ];
+      forceFn.mockClear();
+      removeManyFn.mockClear();
+    });
+
+    it("names them with their reasons and asks before enabling removal", () => {
+      removeAllThreeOpen();
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText(/2 are not marked safe to remove/)).toBeTruthy();
+      const go = within(dialog).getByRole("button", { name: /Remove 3 worktrees/ });
+      expect((go as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(within(dialog).getByRole("checkbox", { name: /not marked safe anyway/ }));
+      expect((go as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("sends the safe row through the gate and the others past it", async () => {
+      removeManyFn.mockImplementationOnce((_r, paths, onRemoved) => {
+        for (const p of paths) onRemoved?.(p);
+        return Promise.resolve(paths.map((path: string) => ({ path, error: null })));
+      });
+      forceFn.mockResolvedValue(undefined);
+      removeAllThreeOpen();
+      const dialog = screen.getByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("checkbox", { name: /not marked safe anyway/ }));
+      fireEvent.click(within(dialog).getByRole("button", { name: /Remove 3 worktrees/ }));
+
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Removed 3 worktrees"));
+      expect(removeManyFn.mock.calls[0][1]).toEqual(["/code/a"]);
+      expect((forceFn.mock.calls as unknown as [string, string][]).map((c) => c[1])).toEqual(["/code/b", "/code/c"]);
+      expect(useFilters.getState().checked).toEqual([]);
+    });
+
+    it("never sends a locked row, and says why", () => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" } }),
+        wt({ path: "/code/b", safety: { kind: "dirty", detail: 2 } }),
+        wt({
+          path: "/code/c",
+          safety: {
+            kind: "locked",
+            detail: { reason: "", underlying: { kind: "safe" }, age_days: null },
+          } as never,
+        }),
+      ];
+      removeAllThreeOpen();
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText(/1 will NOT be removed/)).toBeTruthy();
+      expect(within(dialog).getByText(/unlock it first/)).toBeTruthy();
+      expect(within(dialog).getByRole("button", { name: /Remove 2 worktrees/ })).toBeTruthy();
+    });
+  });
+
+  const removeAllThreeOpen = () => {
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select c/ }), { shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Remove 3 selected/ }));
+  };
 });

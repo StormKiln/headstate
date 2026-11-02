@@ -2202,8 +2202,60 @@ pub fn remove_orphan(path: &str, roots: &[String]) -> Result<(), String> {
         );
     }
 
-    std::fs::remove_dir_all(&canon).map_err(|e| format!("could not remove: {e}"))
+    // Retried once after making read-only directories writable: Go's
+    // module cache is 0555 by design, and nothing inside such a directory
+    // can be unlinked. See `make_dirs_writable`.
+    match std::fs::remove_dir_all(&canon) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_dirs_writable(&canon);
+            std::fs::remove_dir_all(&canon)
+        }
+        other => other,
+    }
+    .map_err(|e| format!("could not remove: {e}"))
 }
+
+/// Give the owner read, write and search on every directory under
+/// `dir`, `dir` included, where any of the three is missing.
+///
+/// Some tools write directories without the owner-write bit on purpose
+/// -- Go's module cache is the common one (its entries are 0555) -- and
+/// nothing inside such a directory can be unlinked, so a recursive
+/// delete fails with "Permission denied" partway through. Called only
+/// on a directory already decided to be deleted whole, and only after a
+/// first attempt failed for permissions, so a tree that deletes normally
+/// is never touched.
+///
+/// Never follows a symlink: `symlink_metadata` and `DirEntry::file_type`
+/// both describe the link itself, and only real directories are
+/// descended into, so a link inside the tree cannot carry the change
+/// anywhere outside it. Best-effort -- a directory owned by someone else
+/// cannot be changed and is left for the delete to report.
+#[cfg(unix)]
+fn make_dirs_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            make_dirs_writable(&entry.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_dirs_writable(_dir: &Path) {}
 
 /// The dead `gitdir` a worktree points at, when its parent is gone.
 ///
@@ -4350,6 +4402,19 @@ fn collect_bounded_excluding(
             break;
         }
     }
+}
+
+/// A Go-module-cache-shaped tree under `base`: `.tools/gomodcache/
+/// mod@v1/` holding a file, with the module directory 0555 as Go leaves
+/// it. Returns that read-only directory.
+#[cfg(all(test, unix))]
+fn read_only_tree(base: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let ro = base.join(".tools").join("gomodcache").join("mod@v1");
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::write(ro.join("go.mod"), b"module example.invalid/m\n").unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    ro
 }
 
 #[cfg(test)]
@@ -6892,6 +6957,18 @@ prunable gitdir file points to non-existent location
         run_in(&repo, &["merge", "-q", "--ff-only", "done"]);
         run_in(&repo, &["push", "-q", "origin", "main"]);
 
+        // An ignored Go module cache, whose directories are 0555. git
+        // deregistered such a worktree, failed to delete the cache with
+        // "Permission denied" and left the directory behind as an
+        // orphan, while the click was reported as a failure.
+        #[cfg(unix)]
+        {
+            let exclude = repo.join(".git").join("info").join("exclude");
+            std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+            std::fs::write(&exclude, ".tools/\n").unwrap();
+            read_only_tree(&wt);
+        }
+
         assert!(wt.is_dir());
         remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
             .expect("a merged, clean, pushed worktree must be removable");
@@ -7368,6 +7445,78 @@ prunable gitdir file points to non-existent location
             "git must be the refuser: {err}"
         );
         assert!(wt.is_dir(), "the locked directory must survive");
+    }
+
+    /// Finishing a half-done removal is bounded by git's own record: the
+    /// tree's dead administrative entry must have been one of THIS
+    /// repository's. A pointer into any other repository is refused and
+    /// the directory left alone.
+    #[test]
+    fn finishing_a_removal_requires_this_repositorys_entry() {
+        let (_t, repo, _wt) = repo_with_worktree("unused");
+        let base = repo.parent().unwrap();
+
+        let foreign = base.join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let pointer = format!(
+            "gitdir: {}\n",
+            base.join("elsewhere")
+                .join(".git")
+                .join("worktrees")
+                .join("x")
+                .display()
+        );
+        std::fs::write(foreign.join(".git"), &pointer).unwrap();
+        assert!(finish_half_removed(&repo, &foreign, Some(&pointer)).is_err());
+        assert!(foreign.is_dir(), "a foreign tree must be left alone");
+
+        let ours = base.join("ours");
+        std::fs::create_dir_all(&ours).unwrap();
+        let pointer = format!(
+            "gitdir: {}\n",
+            repo.join(".git").join("worktrees").join("gone").display()
+        );
+        std::fs::write(ours.join(".git"), &pointer).unwrap();
+        assert!(
+            finish_half_removed(&repo, &ours, Some("gitdir: something else\n")).is_err(),
+            "a pointer that changed since the call is not git's half-done removal"
+        );
+        assert!(ours.is_dir());
+        finish_half_removed(&repo, &ours, Some(&pointer)).expect("this repository's own entry");
+        assert!(!ours.exists());
+    }
+
+    /// The same through the override, which is what a selection of
+    /// not-safe rows goes through.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_removes_a_worktree_holding_a_read_only_directory() {
+        let (_t, repo, wt) = repo_with_worktree("with-cache");
+        commit_in(&wt, "the work");
+        read_only_tree(&wt);
+
+        remove_worktree_forced(repo.to_str().unwrap(), &wt.to_string_lossy())
+            .expect("a read-only directory inside must not fail the removal");
+        assert!(!wt.exists());
+    }
+
+    /// A LOCKED worktree with a read-only directory is still refused and
+    /// left whole: git refuses before deleting anything, its
+    /// administrative entry survives, and so nothing is "finished".
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_is_not_finished_by_force() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, repo, wt) = repo_with_worktree("held");
+        let ro = read_only_tree(&wt);
+        git_ok(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+
+        remove_worktree_forced(repo.to_str().unwrap(), &wt.to_string_lossy())
+            .expect_err("a lock must still refuse");
+        let mode = std::fs::metadata(&ro).unwrap().permissions().mode();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(wt.join(".git").is_file(), "the tree must be intact");
+        assert_eq!(mode & 0o777, 0o555, "and its permissions untouched");
     }
 
     /// The override permits a known-unsafe SAFETY state. It does not
@@ -11319,6 +11468,43 @@ mod live {
             }
         }
 
+        /// An orphan holding a read-only directory -- what a half-failed
+        /// `git worktree remove` leaves behind when the tree had a Go
+        /// module cache in it -- is still removable.
+        #[cfg(unix)]
+        #[test]
+        fn removes_an_orphan_holding_a_read_only_directory() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let wt = orphaned_worktree(tmp.path());
+            let ro = read_only_tree(&wt);
+            remove_orphan(&wt.to_string_lossy(), &roots(tmp.path()))
+                .expect("a read-only directory inside must not block removal");
+            assert!(!wt.exists(), "the directory must be gone");
+            assert!(!ro.exists());
+        }
+
+        /// The widening never escapes the tree: a symlink inside it to
+        /// a read-only directory elsewhere is deleted as a link, and
+        /// the target keeps its mode.
+        #[cfg(unix)]
+        #[test]
+        fn read_only_widening_does_not_follow_symlinks() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let wt = orphaned_worktree(tmp.path());
+            read_only_tree(&wt);
+            let outside = tempfile::TempDir::new().unwrap();
+            let target = read_only_tree(outside.path());
+            std::os::unix::fs::symlink(&target, wt.join("link")).unwrap();
+
+            remove_orphan(&wt.to_string_lossy(), &roots(tmp.path())).unwrap();
+
+            assert!(!wt.exists());
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(mode & 0o777, 0o555, "the link's target must be untouched");
+        }
+
         /// Every scan root for a `remove_orphan` test: the temp dir the
         /// fixture was built in, which is where `collect_inner` would
         /// have found the orphan.
@@ -12216,9 +12402,99 @@ fn remove_inner(
     // could be relative or flag-shaped, and the gate above already
     // matched this record.
     args.extend(["--", wt.path.as_str()]);
-    git(repo, &args)
-        .map(|_| ())
-        .map_err(|e| format!("git refused: {e}"))
+    let admin_before = std::fs::read_to_string(Path::new(&wt.path).join(".git")).ok();
+    match git(repo, &args) {
+        Ok(_) => Ok(()),
+        Err(e) => finish_half_removed(repo, Path::new(&wt.path), admin_before.as_deref())
+            .map_err(|()| format!("git refused: {e}")),
+    }
+}
+
+/// Complete a removal git started and could not finish.
+///
+/// `git worktree remove` deletes the working tree, then its own
+/// administrative entry -- and when the delete hits a directory it may
+/// not write into (a Go module cache is 0555 by design) it deletes the
+/// entry ANYWAY and exits non-zero. What is left is a half-deleted
+/// directory whose `.git` points at nothing: an orphan, with the row
+/// gone from the next scan and the click reported as a failure. That was
+/// the whole of "remove fails with permission denied, then the worktree
+/// disappears a few minutes later", and the leftover then failed again
+/// as an orphan for the same reason.
+///
+/// Finishes the delete ONLY when git has demonstrably committed to it:
+/// the tree's `.git` still names exactly the administrative entry it
+/// named before the call, and that entry is now gone. Any other failure
+/// -- git refused outright, so its entry is intact -- is returned
+/// untouched as `Err(())` for the caller's own message.
+///
+/// The same two checks as every other recursive delete here (#854):
+/// never a symlink, and inside a boundary this code did not take from
+/// the request -- here, the dead administrative entry must lie inside
+/// THIS repository's `worktrees` directory, which is git's own record
+/// that the tree belonged to it.
+fn finish_half_removed(repo: &Path, dir: &Path, admin_before: Option<&str>) -> Result<(), ()> {
+    let Some(before) = admin_before else {
+        return Err(());
+    };
+    // 1. Never a symlink, checked before anything resolves through one.
+    let meta = std::fs::symlink_metadata(dir).map_err(|_| ())?;
+    if meta.is_symlink() || !meta.is_dir() {
+        return Err(());
+    }
+    let canon = dir.canonicalize().map_err(|_| ())?;
+
+    // 2. git deregistered exactly the entry this tree named before the
+    //    call, and that entry was one of this repository's.
+    let now = std::fs::read_to_string(canon.join(".git")).map_err(|_| ())?;
+    if now != before {
+        return Err(());
+    }
+    let Some(dead) = orphan_gitdir(&canon) else {
+        return Err(());
+    };
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(|_| ())?;
+    let boundary = Path::new(common.trim())
+        .canonicalize()
+        .map_err(|_| ())?
+        .join("worktrees");
+    if !canonical_existing_prefix(Path::new(&dead)).starts_with(&boundary) {
+        return Err(());
+    }
+
+    log::warn!("git deregistered a worktree but could not delete it; finishing the delete");
+    match std::fs::remove_dir_all(&canon) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_dirs_writable(&canon);
+            std::fs::remove_dir_all(&canon)
+        }
+        other => other,
+    }
+    .map_err(|_| ())
+}
+
+/// `p` with its longest EXISTING prefix canonicalised and the missing
+/// rest re-appended, so a path that no longer exists still compares
+/// against canonical boundaries (on macOS `/var` is `/private/var`).
+fn canonical_existing_prefix(p: &Path) -> std::path::PathBuf {
+    let mut missing = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return missing.iter().rev().fold(c, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// Clear a worktree's lock.

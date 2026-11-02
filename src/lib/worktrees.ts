@@ -61,6 +61,57 @@ export function isSafe(s: Safety): boolean {
   );
 }
 
+/// Why a not-safe row cannot be removed from a selection at all, or
+/// null when the user may remove it past the gate after confirming.
+///
+/// The forced route relaxes the safety verdict and nothing else, so the
+/// rows it would still fail on are named here instead of being sent and
+/// coming back refused: a lock is another process's claim and needs its
+/// own confirmation (`unlock_worktree`), a prunable row has no directory
+/// to remove, and a row still being checked has no verdict yet to
+/// override.
+export function selectionBlocker(s: Safety): string | null {
+  switch (s.kind) {
+    case "main_checkout":
+      return "the repository's main checkout";
+    case "locked":
+      return "locked — unlock it first";
+    case "prunable":
+      return "its directory is already gone — use Prune";
+    case "orphaned":
+      return "orphaned — remove it from the orphaned list";
+    case "pending":
+      return "still being checked";
+    default:
+      return null;
+  }
+}
+
+/// A selection split by what removing it takes (#1140 follow-up).
+///
+/// `safe` rows go through the gated removal; `forced` rows need the
+/// user's explicit confirmation and go past the gate; `blocked` rows are
+/// not sent at all, each with the reason.
+export function partitionSelection<T extends { safety: Safety }>(rows: T[]): {
+  safe: T[];
+  forced: T[];
+  blocked: { row: T; why: string }[];
+} {
+  const safe: T[] = [];
+  const forced: T[] = [];
+  const blocked: { row: T; why: string }[] = [];
+  for (const row of rows) {
+    if (isSafe(row.safety)) {
+      safe.push(row);
+      continue;
+    }
+    const why = selectionBlocker(row.safety);
+    if (why === null) forced.push(row);
+    else blocked.push({ row, why });
+  }
+  return { safe, forced, blocked };
+}
+
 /// How long ago a lock was taken, as prose, or null if unknown.
 ///
 /// Whole days, because that is the resolution the decision needs:

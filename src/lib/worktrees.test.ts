@@ -32,6 +32,8 @@ import {
   sortWorktrees,
   totalSize,
   WORKTREE_SORT_LABELS,
+  partitionSelection,
+  selectionBlocker,
 } from "./worktrees";
 
 /// A lock for tests that care only about some of its fields.
@@ -1394,5 +1396,36 @@ describe("the Safety wire contract", () => {
     const text = safetyReason(future);
     expect(text).toBe("unrecognised state: some_future_state");
     expect(text).not.toContain("[object Object]");
+  });
+});
+
+describe("partitionSelection", () => {
+  const variants = JSON.parse(safetyFixture) as Safety[];
+  const row = (safety: Safety) => ({ path: `/w/${safety.kind}`, safety });
+
+  it("routes every Safety variant to exactly one bucket", () => {
+    const rows = variants.map(row);
+    const { safe, forced, blocked } = partitionSelection(rows);
+    expect(safe.length + forced.length + blocked.length).toBe(rows.length);
+    for (const r of safe) expect(isSafe(r.safety)).toBe(true);
+    for (const r of forced) expect(isSafe(r.safety)).toBe(false);
+  });
+
+  it("offers the not-safe verdicts a human can override", () => {
+    for (const kind of ["dirty", "unpushed", "never_pushed", "unmerged", "empty", "in_progress", "unknown"]) {
+      const v = variants.find((s) => s.kind === kind);
+      expect(v, kind).toBeDefined();
+      expect(partitionSelection([row(v!)]).forced, kind).toHaveLength(1);
+    }
+  });
+
+  it("never sends what the forced route would still refuse", () => {
+    for (const kind of ["main_checkout", "locked", "prunable", "orphaned", "pending"]) {
+      const v = variants.find((s) => s.kind === kind);
+      expect(v, kind).toBeDefined();
+      const { blocked, forced, safe } = partitionSelection([row(v!)]);
+      expect(forced.length + safe.length, kind).toBe(0);
+      expect(blocked[0].why, kind).toBe(selectionBlocker(v!));
+    }
   });
 });
