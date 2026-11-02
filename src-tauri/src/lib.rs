@@ -24,6 +24,7 @@ pub mod identity;
 mod invariants;
 pub mod inventory;
 pub mod jira;
+pub mod linux_webkit;
 mod log_dedup;
 mod markdown_export;
 pub mod measurement;
@@ -246,6 +247,12 @@ fn notify_claude_crash(app: &tauri::AppHandle, crashed: &crate::claude::crash::C
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // FIRST: before any thread spawns (`set_var` races concurrent env
+    // reads) and before WebKitGTK initialises (it reads these once).
+    // Under WSL, WebKit's GPU paths abort the process; see linux_webkit.
+    #[cfg(target_os = "linux")]
+    linux_webkit::apply();
+
     // Before anything builds a TLS config. Two rustls providers are
     // compiled in (see Cargo.toml), and without an installed default the
     // first `ClientConfig::builder()` in any dependency panics.
@@ -532,6 +539,9 @@ pub fn run() {
             let diagnostics = crate::commands::read_ui_prefs(&handle).diagnostic_logging;
             crate::diag::set_enabled(diagnostics);
             crate::measurement_desktop::set_enabled(diagnostics);
+
+            // The logger did not exist when run() applied these.
+            crate::linux_webkit::log_applied();
 
             // `read_token` shells out via `std::process::Command`, which
             // blocks -- fine here, because `setup` is a plain synchronous

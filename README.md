@@ -219,6 +219,39 @@ cleared once before it will launch:
 xattr -dr com.apple.quarantine /Applications/Headstate.app
 ```
 
+### If the Linux window is black, or the app aborts on start
+
+Seen under WSL2 (WSLg), and possible in some VMs and on hosts without
+DRI3. The terminal shows something like:
+
+```
+libEGL warning: DRI3 error: Could not get DRI3 device
+Couldn't open libGLESv2.so.2: libGLESv2.so.2: cannot open shared object file: No such file or directory
+Aborted (core dumped)
+```
+
+Two separate things, and you may need both:
+
+1. **Install the host's GL libraries.** `libGLESv2.so.2` and `libEGL.so.1`
+   come from your distribution, not from the AppImage, because they must
+   match your graphics driver. On Debian or Ubuntu:
+
+   ```
+   sudo apt install libgles2 libegl1 libgl1-mesa-dri
+   ```
+
+   On Fedora, `sudo dnf install libglvnd-gles libglvnd-egl mesa-dri-drivers`.
+
+2. **Turn off WebKit's GPU paths.** Under WSL, Headstate does this itself
+   and logs that it did. Elsewhere, launch it with:
+
+   ```
+   WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 ./Headstate_*.AppImage
+   ```
+
+   A value you set yourself is never overridden, so setting either variable
+   to `0` turns the automatic WSL behaviour off.
+
 ### If Headstate says it cannot find `gh`
 
 A GUI application does not inherit your shell's `PATH` — on a clean Mac it
