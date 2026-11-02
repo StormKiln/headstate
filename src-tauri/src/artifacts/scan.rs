@@ -1134,7 +1134,9 @@ mod coverage_tests {
     #[test]
     fn many_subfolders_past_the_depth_limit_are_one_notice() {
         let tmp = tempfile::tempdir().unwrap();
-        let deep = tmp.path().join("a/b/c/d/e");
+        let deep = ["a", "b", "c", "d", "e"]
+            .iter()
+            .fold(tmp.path().to_path_buf(), |p, c| p.join(c));
         for name in ["one", "two", "three", "four"] {
             fs::create_dir_all(deep.join(name)).unwrap();
         }
@@ -1176,7 +1178,9 @@ mod coverage_tests {
         let venv = tmp.path().join("project/.venv");
         fs::create_dir_all(venv.join("lib/python3/site-packages/pkg/sub")).unwrap();
         fs::write(venv.join("pyvenv.cfg"), "home = /x").unwrap();
-        let unread = tmp.path().join("project/app/plugins/one/permissions");
+        let unread = ["project", "app", "plugins", "one", "permissions"]
+            .iter()
+            .fold(tmp.path().to_path_buf(), |p, c| p.join(c));
         fs::create_dir_all(unread.join("generated")).unwrap();
         let (_, failed) = scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
         assert_eq!(
