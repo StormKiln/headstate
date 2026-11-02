@@ -1,8 +1,8 @@
-import { ExternalLink } from "./ExternalLink";
+import { openExternal } from "./ExternalLink";
 import { useWritesPaused } from "@/lib/useWritesPaused";
 import { copyText } from "../lib/clipboard";
 import { Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { actionFailure } from "@/lib/notAskedRemedy";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -14,6 +14,20 @@ import type { PullRequest } from "../types/pr";
 import { PrClaudifyDialogs, PrClaudifyMenuItem } from "./PrClaudify";
 import type { PrClaudifyDialog } from "./claudifyStart";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+
+/// A menu row. `data-highlighted` is the keyboard (and pointer)
+/// highlight: focus moves item to item on the arrow keys, so hover alone
+/// would leave a keyboard user with no visible position. Disabled items
+/// keep pointer events so their `title` -- the reason -- still shows.
+const ITEM =
+  "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d] data-highlighted:bg-[#21262d] data-disabled:pointer-events-auto data-disabled:text-[#8b949e] data-disabled:opacity-50 data-disabled:hover:bg-transparent";
 
 /// Why a row-level action is unavailable, or null when offered.
 ///
@@ -96,27 +110,10 @@ export function PrKebab({
   const act = useActOnPr();
   const updateBranch = useUpdatePrBranch();
   const setAuto = useSetAutoMerge();
-  const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<PrActionName | null>(null);
   // Held here rather than in the menu item: the menu closes on click,
   // and the dialog must outlive it.
   const [claudify, setClaudify] = useState<PrClaudifyDialog | null>(null);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    const onClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("mousedown", onClick);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onClick);
-    };
-  }, [open]);
-
   const run = (action: PrActionName) => {
     act(pr.id, pr.repo, pr.number, action).then(
       () => {
@@ -157,22 +154,27 @@ export function PrKebab({
       : ["merge", "enqueue", "draft", "close"];
 
   return (
-    <div ref={ref} className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
-      <button
-        type="button"
-        aria-label={`Actions for #${pr.number}`}
-        aria-expanded={open}
-        aria-haspopup="menu"
-        onClick={() => setOpen((o) => !o)}
-        className="rounded p-1 text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
-      >
-        <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-      </button>
+    // The wrapper only stops the click reaching the row. React bubbles
+    // synthetic events through a portal along the COMPONENT tree, so this
+    // still catches clicks on the portalled items below.
+    <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          aria-label={`Actions for #${pr.number}`}
+          className="rounded p-1 text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
+        >
+          <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+        </DropdownMenuTrigger>
 
-      {open ? (
-        <div
-          role="menu"
-          className="absolute right-0 top-full z-20 mt-1 w-56 rounded border border-[#30363d] bg-[#161b22] p-1 shadow-lg"
+        {/* Portalled and collision-aware. It used to be `absolute
+            top-full` inside the row, so a row near the bottom of a
+            clipping list opened its menu past the list's edge and the
+            actions were cut off -- the same defect as the worktree row's
+            menu (#2088). At the body nothing can clip it, and it flips
+            above the button when there is no room below. */}
+        <DropdownMenuContent
+          align="end"
+          className="w-56 rounded border border-[#30363d] bg-[#161b22] p-1 text-[#e6edf3] shadow-lg ring-0"
         >
           {canWrite
             ? writes.map((action) => {
@@ -181,26 +183,21 @@ export function PrKebab({
                 // obstacle, and fixing it would not help.
                 const why = paused ?? unavailable(pr, action, stackedOn);
                 return (
-                  <button
+                  <DropdownMenuItem
                     key={action}
-                    type="button"
-                    role="menuitem"
                     disabled={why !== null}
                     title={why ?? LABEL[action]}
+                    nativeButton
+                    render={<button type="button" />}
                     onClick={() => {
-                      setOpen(false);
                       // Close confirms; everything else applies now.
                       if (action === "close") setPending(action);
                       else run(action);
                     }}
-                    className={`flex w-full items-center rounded px-2 py-1.5 text-left text-sm ${
-                      why
-                        ? "text-[#8b949e] disabled:opacity-50"
-                        : "text-[#e6edf3] hover:bg-[#21262d]"
-                    }`}
+                    className={ITEM}
                   >
                     {LABEL[action]}
-                  </button>
+                  </DropdownMenuItem>
                 );
               })
             : null}
@@ -214,11 +211,9 @@ export function PrKebab({
               running -- which is exactly "merge it the moment CI is
               green", and the only way to say so was to leave the app. */}
           {canWrite && pr.merge_status === "unstable" && !pr.is_draft ? (
-            <button
-              type="button"
-              role="menuitem"
+            <DropdownMenuItem
+              className={ITEM}
               onClick={() => {
-                setOpen(false);
                 setAuto(pr.id, pr.repo, pr.number, pr.head_oid, true).then(
                   () => toast.success(`${pr.repo}#${pr.number} will merge when green`),
                   (e: unknown) =>
@@ -227,18 +222,15 @@ export function PrKebab({
                     }),
                 );
               }}
-              className="flex w-full items-center rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
             >
               Merge when green
-            </button>
+            </DropdownMenuItem>
           ) : null}
 
           {canWrite && pr.merge_status === "behind" ? (
-            <button
-              type="button"
-              role="menuitem"
+            <DropdownMenuItem
+              className={ITEM}
               onClick={() => {
-                setOpen(false);
                 updateBranch(pr.id, pr.repo, pr.number, pr.head_oid).then(
                   () => toast.success(`${pr.repo}#${pr.number} updated from base`),
                   (e: unknown) =>
@@ -247,28 +239,25 @@ export function PrKebab({
                     }),
                 );
               }}
-              className="flex w-full items-center rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
             >
               Update branch
-            </button>
+            </DropdownMenuItem>
           ) : null}
 
-          {canWrite ? <div className="my-1 border-t border-[#30363d]" /> : null}
+          {canWrite ? <DropdownMenuSeparator className="mx-0 my-1 bg-[#30363d]" /> : null}
 
           {/* Claudify (#1455). Mounted only while the menu is open, so
               rendering a list of rows does not start a worktree scan. */}
           <PrClaudifyMenuItem
             pr={pr}
+            className={ITEM}
             onPick={(d) => {
-              setOpen(false);
               if (d !== null) setClaudify(d);
             }}
           />
-          <button
-            type="button"
-            role="menuitem"
+          <DropdownMenuItem
+            className={ITEM}
             onClick={() => {
-              setOpen(false);
               void copyText(pr.head_ref).then((failure) =>
                 failure === null
                   ? toast.success("Branch name copied")
@@ -277,22 +266,16 @@ export function PrKebab({
                     }),
               );
             }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
           >
             <Copy className="h-3.5 w-3.5" aria-hidden="true" />
             Copy branch name
-          </button>
-          <ExternalLink
-            role="menuitem"
-            href={pr.url}
-            onClick={() => setOpen(false)}
-            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm text-[#e6edf3] hover:bg-[#21262d]"
-          >
+          </DropdownMenuItem>
+          <DropdownMenuItem className={ITEM} onClick={() => openExternal(pr.url)}>
             <ExternalLinkIcon className="h-3.5 w-3.5" aria-hidden="true" />
             View on GitHub
-          </ExternalLink>
-        </div>
-      ) : null}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       {pending ? (
         <Dialog open onOpenChange={(o) => !o && setPending(null)}>

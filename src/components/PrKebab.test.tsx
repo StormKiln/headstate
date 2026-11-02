@@ -7,6 +7,11 @@ import { renderWithQuery as render } from "@/test-utils";
 import type { PrActionName } from "@/api/tauri";
 import type { PullRequest } from "@/types/pr";
 
+/// A disabled menu item is `aria-disabled`, not natively `disabled`: the
+/// menu keeps it focusable so its reason (the `title`) stays reachable.
+const isDisabled = (el: Element) => el.getAttribute("aria-disabled") === "true";
+
+
 type Act = (id: string, repo: string, number: number, action: PrActionName) => Promise<void>;
 const act = vi.fn<Act>(() => Promise.resolve());
 type Upd = (id: string, repo: string, number: number, head: string) => Promise<void>;
@@ -95,7 +100,7 @@ describe("PrKebab", () => {
     // visible-but-dead. Either way the reason must be discoverable.
     const item = screen.queryByRole("menuitem", { name: "Merge" });
     if (item) {
-      expect((item as HTMLButtonElement).disabled).toBe(true);
+      expect(isDisabled(item)).toBe(true);
       expect(item.getAttribute("title")).toMatch(reason);
       fireEvent.click(item);
       expect(act).not.toHaveBeenCalled();
@@ -105,20 +110,20 @@ describe("PrKebab", () => {
   it("offers the draft transition matching the PR's current state", () => {
     render(<PrKebab pr={pr({ is_draft: true })} />);
     open();
-    expect((screen.getByRole("menuitem", { name: "Mark ready for review" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(isDisabled(screen.getByRole("menuitem", { name: "Mark ready for review" }))).toBe(false);
     expect(screen.queryByRole("menuitem", { name: "Convert to draft" })).toBeNull();
   });
 
   it("offers leaving the merge queue only when the PR is in it", () => {
     const { unmount } = render(<PrKebab pr={pr({ in_merge_queue: true })} />);
     open();
-    expect((screen.getByRole("menuitem", { name: "Remove from merge queue" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(isDisabled(screen.getByRole("menuitem", { name: "Remove from merge queue" }))).toBe(false);
     expect(screen.queryByRole("menuitem", { name: "Add to merge queue" })).toBeNull();
     unmount();
 
     render(<PrKebab pr={pr()} />);
     open();
-    expect((screen.getByRole("menuitem", { name: "Add to merge queue" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(isDisabled(screen.getByRole("menuitem", { name: "Add to merge queue" }))).toBe(false);
   });
 
   // The review view: merging or closing someone else's PR is not yours to
@@ -322,5 +327,43 @@ describe("undo", () => {
     await waitFor(() =>
       expect(act).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), "ready"),
     );
+  });
+});
+
+/// The menu was cut off by a clipping list: it opened `absolute top-full`
+/// inside the row, so on a row near the bottom the actions ran past the
+/// list's edge (the same defect as the worktree row's menu, #2088). jsdom
+/// has no layout, so the flip cannot be measured; the structural fix can.
+describe("PrKebab is not clipped by its container", () => {
+  const renderInClippingList = () => {
+    const onRowClick = vi.fn();
+    render(
+      <div data-testid="list" style={{ overflow: "hidden", height: 24 }}>
+        <div onClick={onRowClick}>
+          <PrKebab pr={pr()} />
+        </div>
+      </div>,
+    );
+    open();
+    return { onRowClick };
+  };
+
+  it("renders the menu outside the overflow container (a portal)", () => {
+    renderInClippingList();
+    const menu = screen.getByRole("menu");
+    expect(screen.getByTestId("list").contains(menu)).toBe(false);
+    expect(document.body.contains(menu)).toBe(true);
+  });
+
+  it("keeps an item click from reaching the row behind the portal", () => {
+    const { onRowClick } = renderInClippingList();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Copy branch name/ }));
+    expect(onRowClick).not.toHaveBeenCalled();
+  });
+
+  it("closes on Escape", async () => {
+    renderInClippingList();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
   });
 });

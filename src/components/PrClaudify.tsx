@@ -23,6 +23,8 @@ import {
 import { LaunchTermsPicker } from "./LaunchTermsPicker";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import { DropdownMenuItem } from "./ui/dropdown-menu";
+import { cn } from "@/lib/utils";
 
 /// Claudify for a pull request (#1455).
 ///
@@ -141,9 +143,12 @@ export function PrClaudifyButton({
 export function PrClaudifyMenuItem({
   pr,
   onPick,
+  className,
 }: {
   pr: PullRequest;
   onPick: (dialog: PrClaudifyDialog | null) => void;
+  /// The host menu's item styling; the Claudify tint is applied on top.
+  className?: string;
 }) {
   const state = usePrClaudify(pr);
   const { checkout } = state;
@@ -151,20 +156,18 @@ export function PrClaudifyMenuItem({
   const claudify = checkout.kind === "found" || checkout.kind === "pending";
 
   return (
-    <button
-      type="button"
-      role="menuitem"
+    <DropdownMenuItem
       disabled={checkout.kind === "pending"}
       title={reason ?? undefined}
+      nativeButton
+      render={<button type="button" />}
       onClick={() => {
-        // Close the menu first; a dialog -- opened now, or after the
-        // phone's round trip -- arrives through the same callback.
+        // The menu closes itself on click; a dialog -- opened now, or
+        // after the phone's round trip -- arrives through the callback.
         onPick(null);
         activate(pr, state, onPick);
       }}
-      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-[#21262d] disabled:opacity-50 ${
-        claudify ? "text-[#a371f7]" : "text-[#e6edf3]"
-      }`}
+      className={cn(className, claudify ? "text-[#a371f7]" : "text-[#e6edf3]")}
     >
       {claudify ? (
         <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
@@ -179,7 +182,7 @@ export function PrClaudifyMenuItem({
           </span>
         ) : null}
       </span>
-    </button>
+    </DropdownMenuItem>
   );
 }
 
