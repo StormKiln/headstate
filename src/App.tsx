@@ -1056,6 +1056,7 @@ export default function App() {
               canWriteGitHub={view === "my-prs" && !authoredSavedOwner}
               onOpen={selectPr}
               onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refreshGitHubFromGesture())}
+              gitlabAuthBlocked={!gitlabHost.isError && gitlabQueue.authBlocked}
               onRefreshGitLab={() => { if (gitlabHost.isError) void gitlabHost.refetch(); else void gitlabQueue.refresh(); }}
             />
           </div>

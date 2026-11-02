@@ -45,6 +45,13 @@ pub fn validate(input: &str) -> Result<String, HostError> {
 }
 
 pub fn read_host(conn: &Connection) -> Result<String, HostError> {
+    read_host_setting(conn).map(|(host, _)| host)
+}
+
+/// The host to use and whether it was saved in Settings. `false` means none
+/// was saved and [`DEFAULT`] stands in -- a check against it says nothing
+/// about a self-hosted server glab may be signed in to.
+pub fn read_host_setting(conn: &Connection) -> Result<(String, bool), HostError> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -56,9 +63,11 @@ pub fn read_host(conn: &Connection) -> Result<String, HostError> {
     match raw {
         Some(raw) => {
             let value: String = serde_json::from_str(&raw).map_err(|_| HostError::InvalidSaved)?;
-            validate(&value).map_err(|_| HostError::InvalidSaved)
+            validate(&value)
+                .map(|host| (host, true))
+                .map_err(|_| HostError::InvalidSaved)
         }
-        None => Ok(DEFAULT.into()),
+        None => Ok((DEFAULT.into(), false)),
     }
 }
 
@@ -147,6 +156,8 @@ mod tests {
         {
             let conn = crate::store::open_db(&path).unwrap();
             assert_eq!(read_host(&conn), Ok(DEFAULT.into()));
+            // Unsaved: the default is checked, and the caller can say so.
+            assert_eq!(read_host_setting(&conn), Ok((DEFAULT.into(), false)));
             assert_eq!(
                 write_host(&conn, "GITLAB.Example"),
                 Ok("gitlab.example".into())
@@ -156,6 +167,10 @@ mod tests {
         }
         let conn = crate::store::open_db(&path).unwrap();
         assert_eq!(read_host(&conn), Ok("gitlab.example".into()));
+        assert_eq!(
+            read_host_setting(&conn),
+            Ok(("gitlab.example".into(), true))
+        );
         assert_eq!(
             write_host(&conn, "https://wrong.example"),
             Err(HostError::Invalid)
