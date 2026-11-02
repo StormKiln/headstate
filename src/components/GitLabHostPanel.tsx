@@ -1,27 +1,13 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getGitLabHost, setGitLabHost } from "@/api/gitlabHost";
+import { useQuery } from "@tanstack/react-query";
+import { getGitLabHost } from "@/api/gitlabHost";
+import { useSaveGitLabHost } from "@/api/gitlabAuth";
 
 export function GitLabHostPanel() {
-  const queryClient = useQueryClient();
   const host = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
   const [draft, setDraft] = useState<string | null>(null);
   const value = draft ?? host.data ?? "";
-  const save = useMutation({
-    mutationFn: setGitLabHost,
-    onSuccess: async (saved) => {
-      setDraft(null);
-      queryClient.setQueryData(["gitlab-host"], saved);
-      // Reset active observers as well as cached receipts. removeQueries
-      // alone leaves a mounted AuthGate displaying the previous host's
-      // result indefinitely. A reset clears that result and refetches.
-      const matchesGitLab = ({ queryKey }: { queryKey: readonly unknown[] }) =>
-        queryKey[0] !== "gitlab-host" && queryKey.some((part) => typeof part === "string" && part.startsWith("gitlab"));
-      await queryClient.cancelQueries({ predicate: matchesGitLab });
-      await queryClient.resetQueries({ predicate: matchesGitLab });
-      queryClient.removeQueries({ predicate: (query) => matchesGitLab(query) && !query.isActive() });
-    },
-  });
+  const save = useSaveGitLabHost(() => setDraft(null));
 
   return (
     <div className="mt-5 flex flex-col gap-2">

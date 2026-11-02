@@ -7,6 +7,10 @@ use std::time::Duration;
 
 pub const HOST: &str = super::host::DEFAULT;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// `glab auth status` contacts every host it holds a login for.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Status output is a few lines per host; anything past this is not parsed.
+const STATUS_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +30,13 @@ pub struct AuthState {
     pub ok: bool,
     pub issue: Option<AuthIssue>,
     pub message: String,
+    /// Whether `host` was saved in Settings. `false` means no host was saved
+    /// and the default was checked -- the case a self-hosted user hits first.
+    pub configured: bool,
+    /// Hosts `glab auth status` reported a login for, read only after the
+    /// check could not verify `host`. `None` is "not read, or could not be
+    /// read", never "signed in nowhere".
+    pub signed_in_hosts: Option<Vec<String>>,
 }
 
 impl AuthState {
@@ -36,7 +47,13 @@ impl AuthState {
             ok: true,
             issue: None,
             message: String::new(),
+            configured: true,
+            signed_in_hosts: None,
         }
+    }
+
+    pub fn invalid_host() -> Self {
+        Self::failed("", AuthIssue::InvalidHost)
     }
 
     fn failed(host: &str, issue: AuthIssue) -> Self {
@@ -53,8 +70,121 @@ impl AuthState {
             ok: false,
             issue: Some(issue),
             message,
+            configured: true,
+            signed_in_hosts: None,
         }
     }
+
+    /// Name the host actually checked and why, and any other host glab is
+    /// signed in to. Retrying the same host cannot fix a host mismatch, so
+    /// the remedy is the setting, not `glab auth status`.
+    fn qualified(mut self, configured: bool, signed_in: Option<Vec<String>>) -> Self {
+        self.configured = configured;
+        if self.issue != Some(AuthIssue::Unverified) {
+            return self;
+        }
+        let host = self.host.clone();
+        let others: Vec<String> = signed_in
+            .iter()
+            .flatten()
+            .filter(|h| **h != host)
+            .cloned()
+            .collect();
+        let mut message = format!("GitLab authentication for {host} could not be verified.");
+        if !configured {
+            message.push_str(&format!(
+                " No GitLab host is saved in Settings, so {host}, the default, was checked."
+            ));
+        }
+        if others.is_empty() {
+            message.push_str(&format!(" Run `glab auth status --hostname {host}` on the desktop running Headstate; sign in again there if the credential expired."));
+        } else {
+            message.push_str(&format!(
+                " glab on the desktop is signed in to {}. Save that host in Settings on the desktop.",
+                others.join(", ")
+            ));
+        }
+        self.message = message;
+        self.signed_in_hosts = signed_in;
+        self
+    }
+}
+
+/// Hosts named by `Logged in to <host> as ...` lines. glab prints its status
+/// to stderr, with CRLF line endings on Windows; both streams are read and
+/// every candidate must pass [`super::host::validate`] before it is returned.
+fn parse_signed_in_hosts(output: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in output.lines() {
+        let line = strip_ansi(line);
+        let Some((_, rest)) = line.split_once("Logged in to ") else {
+            continue;
+        };
+        let Some(candidate) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(host) = super::host::validate(candidate) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Ask glab which hosts it holds a login for. Only validated hostnames leave
+/// this function; the CLI's output (paths, usernames) is never forwarded.
+/// `GITLAB_HOST` is removed so an ambient value cannot narrow the listing.
+async fn signed_in_hosts(program: &std::path::Path, timeout: Duration) -> Option<Vec<String>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    #[cfg(all(test, unix))]
+    let mut command = super::test_support::command(program)
+        .unwrap_or_else(|| tokio::process::Command::new(program));
+    #[cfg(not(all(test, unix)))]
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(["auth", "status"])
+        .env_remove("GITLAB_HOST")
+        .env_remove("GITLAB_API_HOST")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let work = async {
+        let mut child = command.spawn().ok()?;
+        let mut stdout = child.stdout.take()?.take(STATUS_MAX_BYTES);
+        let mut stderr = child.stderr.take()?.take(STATUS_MAX_BYTES);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err),);
+        a.ok()?;
+        b.ok()?;
+        // glab exits non-zero when ANY host fails, so its status is not a
+        // verdict on the others; the parsed lines are.
+        let _ = child.kill().await;
+        out.push(b'\n');
+        out.extend_from_slice(&err);
+        let hosts = parse_signed_in_hosts(&String::from_utf8_lossy(&out));
+        (!hosts.is_empty()).then_some(hosts)
+    };
+    tokio::time::timeout(timeout, work).await.ok().flatten()
 }
 
 /// Resolve the same binary for auth and tool diagnostics. An explicit
@@ -91,19 +221,37 @@ pub fn find_glab() -> Option<PathBuf> {
 /// Default-host probe retained for callers and tests. No ambient git remote
 /// or GITLAB_HOST may silently change the host being checked.
 pub async fn check() -> AuthState {
-    check_host(HOST).await
+    check_host(HOST, false).await
 }
 
 /// Check only the persisted, validated host supplied by the caller. Successful
 /// auth alone does not prove that this server exposes the GitLab API.
-pub async fn check_host(host: &str) -> AuthState {
+/// `configured` says whether the host was saved in Settings or defaulted;
+/// the failure message names the host checked either way.
+pub async fn check_host(host: &str, configured: bool) -> AuthState {
     let Ok(host) = super::host::validate(host) else {
         return AuthState::failed("", AuthIssue::InvalidHost);
     };
     let Some(glab) = find_glab() else {
-        return AuthState::failed(&host, AuthIssue::MissingCli);
+        return AuthState::failed(&host, AuthIssue::MissingCli).qualified(configured, None);
     };
-    check_with_program(&glab, &host, PROBE_TIMEOUT).await
+    check_reporting(&glab, &host, configured, PROBE_TIMEOUT, STATUS_TIMEOUT).await
+}
+
+async fn check_reporting(
+    glab: &std::path::Path,
+    host: &str,
+    configured: bool,
+    timeout: Duration,
+    status_timeout: Duration,
+) -> AuthState {
+    let state = check_with_program(glab, host, timeout).await;
+    let signed_in = if state.issue == Some(AuthIssue::Unverified) {
+        signed_in_hosts(glab, status_timeout).await
+    } else {
+        None
+    };
+    state.qualified(configured, signed_in)
 }
 
 async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duration) -> AuthState {
@@ -431,5 +579,115 @@ printf 'HTTP/2 200\n\n{"username":"octocat","diagnostic":"SENSITIVE"}'"#,
         ).await;
         assert!(state.ok);
         assert_eq!(state.host, "gitlab.example");
+    }
+
+    /// glab's own status, as Windows prints it: to stderr, CRLF-terminated,
+    /// with a config path and a username on the same line as the host.
+    const WINDOWS_STATUS: &str = "gitlab.com\r\n  x gitlab.com: api call failed: GET https://gitlab.com/api/v4/user: 401 {message: 401 Unauthorized}\r\ngitlab.example.com\r\n  \u{2713} Logged in to gitlab.example.com as \u{1b}[1mfixture\u{1b}[0m (C:\\Users\\fixture\\AppData\\Roaming\\glab-cli\\config.yml)\r\n  \u{2713} Token: **************************\r\n";
+
+    #[test]
+    fn signed_in_hosts_parse_from_crlf_stderr_and_drop_everything_else() {
+        assert_eq!(
+            parse_signed_in_hosts(WINDOWS_STATUS),
+            vec!["gitlab.example.com".to_string()]
+        );
+        // Colour codes around the host, and a host that fails validation.
+        assert_eq!(
+            parse_signed_in_hosts(
+                "\u{1b}[32m\u{2713}\u{1b}[0m Logged in to \u{1b}[1mGitLab.Example.COM\u{1b}[0m as a\n\u{2713} Logged in to https://bad.example/x as b\n\u{2713} Logged in to gitlab.example.com as c\r\n"
+            ),
+            vec!["gitlab.example.com".to_string()]
+        );
+        assert!(parse_signed_in_hosts("No GitLab instances are authenticated.\r\n").is_empty());
+    }
+
+    #[cfg(unix)]
+    async fn reporting_with(script: &str, host: &str, configured: bool) -> AuthState {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::gitlab::test_support::scripted(
+            &program,
+            check_reporting(
+                &program,
+                host,
+                configured,
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+            ),
+        )
+        .await
+    }
+
+    /// The reported defect: no host saved, glab signed in only to a
+    /// self-hosted server. The default is checked and refused, and the
+    /// message must say that was the default and name the host glab knows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsaved_host_failure_names_the_default_and_the_signed_in_host() {
+        let script = format!(
+            r#"if test "$1 $2" = "auth status"; then
+  test -z "$GITLAB_HOST" || exit 3
+  printf '{}' >&2
+  exit 1
+fi
+exit 1"#,
+            WINDOWS_STATUS
+                .replace('\\', "\\\\")
+                .replace('%', "%%")
+                .replace('\r', "\\r")
+                .replace('\n', "\\n")
+                .replace('\u{1b}', "\\033")
+        );
+        let state = reporting_with(&script, "gitlab.com", false).await;
+        assert!(!state.ok);
+        assert_eq!(state.issue, Some(AuthIssue::Unverified));
+        assert_eq!(state.host, "gitlab.com");
+        assert!(!state.configured);
+        assert_eq!(
+            state.signed_in_hosts,
+            Some(vec!["gitlab.example.com".to_string()])
+        );
+        assert!(
+            state
+                .message
+                .contains("gitlab.com, the default, was checked"),
+            "{}",
+            state.message
+        );
+        assert!(state.message.contains("signed in to gitlab.example.com"));
+        let wire = serde_json::to_string(&state).unwrap();
+        assert!(
+            !wire.contains("fixture"),
+            "CLI output crossed the wire: {wire}"
+        );
+        assert!(wire.contains("\"signedInHosts\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_host_failure_without_other_logins_keeps_the_status_remedy() {
+        let state = reporting_with("exit 1", "gitlab.example.com", true).await;
+        assert!(state.configured);
+        assert_eq!(state.signed_in_hosts, None);
+        assert!(!state.message.contains("default"));
+        assert!(state
+            .message
+            .contains("glab auth status --hostname gitlab.example.com"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_status_listing_is_bounded_and_reads_as_unknown() {
+        let state = reporting_with(
+            r#"test "$1 $2" = "auth status" && { touch "$0.timeout"; exec sleep 60; }; exit 1"#,
+            "gitlab.com",
+            false,
+        )
+        .await;
+        assert_eq!(state.issue, Some(AuthIssue::Unverified));
+        assert_eq!(state.signed_in_hosts, None);
     }
 }

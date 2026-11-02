@@ -28,6 +28,9 @@ import { useRowCursor } from "../lib/useRowCursor";
 import { GitLabDetail } from "./GitLabDetail";
 import { GitLabBulkActions } from "./GitLabBulkActions";
 import { getGitLabDetail } from "../api/tauri";
+import { useGitLabAuthCheck } from "../api/gitlabAuth";
+import { GitLabAuthRemedy } from "./GitLabAuthRemedy";
+import { gitlabHostLine } from "../lib/gitlabAuthRemedy";
 
 function coverageMessage(provider: string, coverage: SourceCoverage | null, count: number): string | null {
   if (coverage === null || coverage === "unknown") return `${provider} could not confirm whether this list is complete.`;
@@ -127,6 +130,7 @@ export function SourceQueue({
   githubCoverage, gitlabCoverage, onOpen, onRefreshGitHub, onRefreshGitLab,
   githubStaleSecs, gitlabStaleSecs,
   canWriteGitHub, githubNotAsked = null, githubRemedy = githubNotAsked ?? "retry",
+  gitlabAuthBlocked = false,
 }: {
   selection: SourceSelection;
   github: PullRequest[];
@@ -145,6 +149,10 @@ export function SourceQueue({
   /// send the same refused token, so it offers sign-in instead (#2008).
   githubRemedy?: NotAskedRemedy;
   gitlabError: string | null;
+  /// `gitlabError` is a request never sent because the sign-in is not
+  /// verified. The queue's own refresh cannot change that; the sign-in
+  /// check's remedy can.
+  gitlabAuthBlocked?: boolean;
   githubCoverage: SourceCoverage | null;
   gitlabCoverage: SourceCoverage | null;
   githubStaleSecs: number | null;
@@ -164,6 +172,8 @@ export function SourceQueue({
   const selectedPr = useFilters((s) => s.selectedPr);
   const cursor = useFilters((s) => s.cursor);
   const setCursor = useFilters((s) => s.setCursor);
+  const gitlabAuthCheck = useGitLabAuthCheck();
+  const gitlabAuth = gitlabAuthCheck?.data;
   const rows = useMemo(() => combinedRows(github, gitlab ?? [], selection, repoKey, query, filters), [github, gitlab, selection, repoKey, query, filters]);
   const githubRows = rows.flatMap(row => row.kind === "github" ? [row.value] : []);
   const stacked = deriveStacked(githubRows);
@@ -191,18 +201,18 @@ export function SourceQueue({
     if (cursor !== null && cursor >= rows.length) setCursor(rows.length > 0 ? rows.length - 1 : null);
   }, [cursor, rows.length, setCursor]);
   const sources = [
-    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.filter((row) => row.observation?.state !== "retained").length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub, notAsked: githubNotAsked, remedy: githubRemedy }]),
+    ...(selection === "gitlab" ? [] : [{ name: "GitHub", rows: (githubLoading || githubError) && github.length === 0 ? undefined : github.filter((row) => row.observation?.state !== "retained").length, loading: githubLoading, error: githubError, coverage: githubCoverage, staleSecs: githubStaleSecs, retry: onRefreshGitHub, notAsked: githubNotAsked, remedy: githubRemedy, auth: false }]),
     // GitLab keeps its retry for every failure, a refused credential
     // included: glab reads its credential on each request, so after
     // `glab auth login` -- which the error itself names -- a retry works.
-    { name: "GitLab", rows: gitlab?.filter((row) => row.observation?.state !== "retained").length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab, notAsked: null, remedy: "retry" as NotAskedRemedy },
+    { name: "GitLab", rows: gitlab?.filter((row) => row.observation?.state !== "retained").length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab, notAsked: null, remedy: "retry" as NotAskedRemedy, auth: gitlabAuthBlocked },
   ];
   return <div className="space-y-3">
-    <p className="text-xs text-[#8b949e]">GitLab queues use the host configured in Settings on the desktop.</p>
+    <p className="text-xs text-[#8b949e]">{gitlabHostLine(gitlabAuth?.host, gitlabAuth?.configured)}</p>
     {sources.map((source) => <div key={source.name}>
-      {source.error ? <div role={source.notAsked ? "status" : "alert"} className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
+      {source.error ? <div role={source.notAsked || source.auth ? "status" : "alert"} className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
         {source.name}: {source.error}{source.remedy === "sign-in" ? `. ${signInRemedy(IS_MOBILE_BUILD)}` : ""}{source.rows !== undefined ? " Saved rows remain visible." : ""}
-        {source.remedy === "retry" ? <button type="button" onClick={source.retry} className="ml-2 underline">Retry</button> : null}
+        {source.auth ? (gitlabAuthCheck ? <GitLabAuthRemedy auth={gitlabAuthCheck} /> : null) : source.remedy === "retry" ? <button type="button" onClick={source.retry} className="ml-2 underline">Retry</button> : null}
       </div> : source.loading && source.rows === undefined ? <p role="status" className="text-sm text-[#8b949e]">Loading {source.name}…</p> : null}
       {source.rows !== undefined && source.coverage !== "complete" ? <p role="status" className="mt-1 text-xs text-[#d29922]">{coverageMessage(source.name, source.coverage, source.rows)}</p> : null}
       {source.rows !== undefined && source.staleSecs !== null ? <p role="status" className="mt-1 text-xs text-[#d29922]">{source.staleSecs === "unknown" ? `${source.name} saved list age could not be confirmed.` : `${source.name} is showing a saved list from ${relativeSeconds(source.staleSecs)}.`}</p> : null}

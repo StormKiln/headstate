@@ -70,6 +70,8 @@ export function useGitLabQueue(list: SourceList, selected: boolean, host = "gitl
     };
   }, [client, enabled, host, list, model, publish, refresh, source, viewer]);
 
-  if (viewer === null) return { rows: undefined, coverage: null, staleSecs: null, loading: false, refreshing: false, error: "GitLab account has not been verified.", refresh };
-  return { ...(state.source === source && state.list === list && state.model === model ? state.snapshot : model.snapshot()), refresh };
+  // Not a failed request: none was sent. `authBlocked` tells the queue to
+  // offer the sign-in check's remedy, because `refresh` is a no-op here.
+  if (viewer === null) return { rows: undefined, coverage: null, staleSecs: null, loading: false, refreshing: false, error: "Not requested: the GitLab sign-in is not verified.", refresh, authBlocked: true };
+  return { ...(state.source === source && state.list === list && state.model === model ? state.snapshot : model.snapshot()), refresh, authBlocked: false };
 }

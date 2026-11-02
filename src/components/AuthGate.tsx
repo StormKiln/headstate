@@ -3,14 +3,15 @@ import { useFilters, viewLabel } from "../store/filters";
 import { useEffect, type ReactNode } from "react";
 import { clearPollError, usePollError, useStoreError, useUiPrefs } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
-import { getAuthState, getGitLabAuthState } from "../api/tauri";
+import { getAuthState } from "../api/tauri";
 import { useConnectionState } from "@/api/connection";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 import { commandError } from "@/lib/errorKind";
 import { GitHubAuthProvider, GitLabViewerProvider } from "@/api/authAvailability";
 import { useSourceSelection } from "@/store/sourceSelection";
-import { getGitLabHost } from "@/api/gitlabHost";
+import { GitLabAuthProvider, useGitLabAuth } from "@/api/gitlabAuth";
+import { GitLabAuthRemedy } from "./GitLabAuthRemedy";
 
 /// Reports provider authentication without hiding local views. GitHub's
 /// startup state and the configured GitLab host's bounded CLI check have separate queries.
@@ -44,15 +45,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // count the desktop had under TanStack's old default.
     retry: IS_MOBILE_BUILD ? false : 3,
   });
-  const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
-  const gitlab = useQuery({
-    queryKey: ["gitlab-auth", gitlabHost.data ?? "invalid"],
-    queryFn: getGitLabAuthState,
-    staleTime: 60_000,
-    refetchInterval: selection === "github" ? false : 60_000,
-    retry: false,
-    enabled: selection !== "github" && (gitlabHost.isSuccess || gitlabHost.isError),
-  });
+  const gitlab = useGitLabAuth();
   const pollError = usePollError();
   // Classified ONCE (#1230). Three call sites used to ask `isNotAsked`
   // the same question about the same value, and the prose was rendered
@@ -130,17 +123,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // `get_cached` is the one read the companion serves from its stored
   // snapshot, so there is genuinely something to show. Where there is
   // not, `PrList` renders its own empty state, which is honest too.
-  if (offline) return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
+  if (offline) return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}><GitLabAuthProvider value={gitlab}>{children}</GitLabAuthProvider></GitLabViewerProvider>}</GitHubAuthProvider>;
 
   if (isLoading) return null;
   if (data !== undefined) {
     return (
+      <GitLabAuthProvider value={gitlab}>
       <GitHubAuthProvider available={data.ok}>
       <GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>
       <div className="flex h-full flex-col">
         {selection !== "github" && (gitlab.error || gitlab.data && !gitlab.data.ok) ? <div role="alert" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
           {gitlab.data?.message || "GitLab account could not be verified. Check desktop authentication and connectivity."}
-          <button type="button" className="ml-2 underline" onClick={() => void gitlab.refetch()}>Retry GitLab authentication</button>
+          <GitLabAuthRemedy auth={gitlab} />
         </div> : null}
         {!data.ok && selection !== "gitlab" && (
           <div role="status" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
@@ -256,10 +250,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
       </div>
       </GitLabViewerProvider>
       </GitHubAuthProvider>
+      </GitLabAuthProvider>
     );
   }
 
   // A failed IPC check says nothing about either provider's credential.
   // Keep local and GitLab views available while the connection layer reports it.
-  return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}>{children}</GitLabViewerProvider>}</GitHubAuthProvider>;
+  return <GitHubAuthProvider available={null}>{<GitLabViewerProvider viewer={gitlab.data?.ok ? gitlab.data.viewer ?? null : null}><GitLabAuthProvider value={gitlab}>{children}</GitLabAuthProvider></GitLabViewerProvider>}</GitHubAuthProvider>;
 }

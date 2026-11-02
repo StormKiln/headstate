@@ -101,8 +101,14 @@ export interface GitLabAuthState {
   viewer?: string | null;
   host: string;
   ok: boolean;
-  issue: "missingCli" | "unverified" | "timedOut" | null;
+  issue: "missingCli" | "unverified" | "timedOut" | "apiUnavailable" | "invalidHost" | null;
   message: string;
+  /// False when no host is saved in Settings and the default was checked.
+  /// Optional: a desktop older than the phone does not send it.
+  configured?: boolean;
+  /// Hosts glab reports a login for, read after a failed check. Absent or
+  /// null is "not read", never "signed in nowhere".
+  signedInHosts?: string[] | null;
 }
 
 /// The cached snapshot. Never talks to GitHub. Returns `[]` both when

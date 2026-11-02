@@ -5597,15 +5597,12 @@ fn set_gitlab_host_blocking(
 /// The CLI retains the credential; only a fixed status and host cross IPC.
 #[tauri::command]
 pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthState {
-    match configured_gitlab_host(&app) {
-        Ok(host) => crate::gitlab::auth::check_host(&host).await,
-        Err(_) => crate::gitlab::auth::AuthState {
-            host: String::new(),
-            viewer: None,
-            ok: false,
-            issue: Some(crate::gitlab::auth::AuthIssue::InvalidHost),
-            message: "The configured GitLab host is invalid. Enter a DNS hostname in Settings before using GitLab.".into(),
-        },
+    let setting = open_db(&db_path(&app))
+        .map_err(|_| crate::gitlab::host::HostError::Storage)
+        .and_then(|conn| crate::gitlab::host::read_host_setting(&conn));
+    match setting {
+        Ok((host, configured)) => crate::gitlab::auth::check_host(&host, configured).await,
+        Err(_) => crate::gitlab::auth::AuthState::invalid_host(),
     }
 }
 
