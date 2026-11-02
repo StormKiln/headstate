@@ -84,6 +84,9 @@ describe("useWorktreeDirs on a Save that changes both settings", () => {
       await result.current.setExclusions(["/code/archive"], { rescan: false });
       await result.current.set(["/code", "/work"]);
     });
+    // The rescan runs after `set` resolves, so it is awaited here.
+    await waitFor(() => expect(scans).toBe(2));
+    await new Promise((r) => setTimeout(r, 20));
     expect(scans).toBe(2);
   });
 });
@@ -122,5 +125,58 @@ describe("useWorktreeSizes", () => {
     });
     await waitFor(() => expect(result.current.isFetching).toBe(false));
     expect(Number.isFinite(result.current.dataUpdatedAt)).toBe(true);
+  });
+});
+
+/// The user report: Save in Settings hung for 10+ s. `set` awaited every
+/// active scan (the venv walk alone has measured 9 s) and then every size
+/// before it resolved, and Save awaited `set`. The setting is persisted
+/// when the command resolves; the rescan belongs to the scans' own queries.
+describe("useWorktreeDirs.set does not wait for the rescan", () => {
+  it("resolves once the folders are saved, with the rescan still running", async () => {
+    const qc = fresh();
+    let finishScan!: (v: unknown) => void;
+    let scans = 0;
+    invoke.mockImplementation((cmd, args) => {
+      if (cmd === "set_worktree_dirs") return Promise.resolve((args as { dirs: string[] }).dirs);
+      return Promise.resolve([]);
+    });
+    const { result } = renderHook(
+      () => {
+        useQuery({
+          queryKey: ["worktrees"],
+          queryFn: () => {
+            scans += 1;
+            return scans === 1
+              ? Promise.resolve({ repos: [], unreadable: [] })
+              : new Promise((resolve) => { finishScan = resolve; });
+          },
+        });
+        return useWorktreeDirs();
+      },
+      { wrapper: wrapper(qc) },
+    );
+    await waitFor(() => expect(scans).toBe(1));
+
+    let applied: string[] | undefined;
+    await act(async () => {
+      applied = await result.current.set(["/code"]);
+    });
+    // Saved and resolved while the rescan it started is still in flight.
+    expect(applied).toEqual(["/code"]);
+    expect(qc.getQueryData(["worktree-dirs"])).toEqual(["/code"]);
+    expect(scans).toBe(2);
+    expect(qc.getQueryState(["worktrees"])?.fetchStatus).toBe("fetching");
+
+    await act(async () => finishScan({ repos: [{ path: "/code/app" }], unreadable: [] }));
+    await waitFor(() => expect(qc.getQueryData(["worktrees"])).toEqual({ repos: [{ path: "/code/app" }], unreadable: [] }));
+  });
+
+  it("still rejects when the folders are refused", async () => {
+    invoke.mockImplementation((cmd) =>
+      cmd === "set_worktree_dirs" ? Promise.reject("not a directory: /nope") : Promise.resolve([]),
+    );
+    const { result } = renderHook(() => useWorktreeDirs(), { wrapper: wrapper(fresh()) });
+    await expect(result.current.set(["/nope"])).rejects.toBe("not a directory: /nope");
   });
 });

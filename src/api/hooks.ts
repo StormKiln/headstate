@@ -4371,6 +4371,15 @@ export function usePruneCache() {
     });
 }
 
+/// The scans a change of scan roots makes stale, refetched in order: the
+/// sizes are of the members the scans find, so they follow the scans.
+/// `refetchQueries` does not reject by default; each query records its
+/// own failure.
+async function rescanAfterRootsChange(qc: QueryClient): Promise<void> {
+  await Promise.all(["worktrees", "artifacts", "venvs", "disk-inventory", "cached-scan"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
+  await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
+}
+
 /// Directories scanned for git checkouts, and a way to change them.
 ///
 /// The mutation can FAIL -- a path that is not a directory is rejected by
@@ -4409,7 +4418,10 @@ export function useWorktreeDirs() {
       // Stale, not refetched: the caller's next step rescans.
       await qc.invalidateQueries({ queryKey: ["worktrees"], refetchType: "none" });
     } else {
-      await qc.resetQueries({ queryKey: ["worktrees"] });
+      // Reset now, rescan in the background: the setting is saved once
+      // `setDiscoveryExclusions` resolved, and awaiting the walk kept
+      // Settings' Save pending for the whole scan.
+      void qc.resetQueries({ queryKey: ["worktrees"] });
     }
     return applied;
   };
@@ -4424,8 +4436,13 @@ export function useWorktreeDirs() {
       await Promise.all(keys.map((key) => qc.cancelQueries({ queryKey: [key] })));
       await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key], refetchType: "none" })));
       qc.setQueryData(["worktree-dirs"], applied);
-      await Promise.all(["worktrees", "artifacts", "venvs", "disk-inventory", "cached-scan"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
-      await Promise.all(["worktree-sizes", "artifact-sizes", "venv-sizes"].map((key) => qc.refetchQueries({ queryKey: [key], type: "active" }, { cancelRefetch: false })));
+      // The rescan runs in the BACKGROUND. The setting is persisted once
+      // `setWorktreeDirs` resolves; awaiting every active scan here (the
+      // venv walk alone has measured 9 s) and then every size after it
+      // held Settings' Save pending, with no feedback, for 10 s and more.
+      // Each query carries its own pending and error state, which is
+      // where a slow or failed rescan belongs -- not on the Save.
+      void rescanAfterRootsChange(qc);
       return applied;
     });
   // `dirs` is `undefined` until the setting has been READ (#1995): pending

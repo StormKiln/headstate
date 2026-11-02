@@ -135,12 +135,56 @@ describe("SettingsDialog", () => {
   // a typo must surface rather than appearing to succeed.
   it("shows the backend's error instead of closing", async () => {
     setDirs.mockImplementationOnce(() => Promise.reject("not a directory: /nope"));
-    open();
+    const onOpenChange = vi.fn();
+    render(<SettingsDialog open onOpenChange={onOpenChange} />);
+    fireEvent.change(screen.getByLabelText(/directories to scan/i), { target: { value: "/nope" } });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     expect(await screen.findByRole("alert")).toHaveProperty(
       "textContent",
-      "not a directory: /nope",
+      "Settings were not saved: not a directory: /nope",
     );
+    expect(onOpenChange).not.toHaveBeenCalled();
+    // Save is offered again: the user can correct the folder and retry.
+    expect(screen.getByRole("button", { name: /^save$/i })).toHaveProperty("disabled", false);
+  });
+
+  /// The user report: Save from General hung for 10+ s with no change to
+  /// the button. Nothing on General is saved by Save (each control saves
+  /// as it changes), yet Save wrote the scan folders back unchanged, and
+  /// that write awaited a rescan of every root.
+  it("an untouched Save writes nothing and closes at once", async () => {
+    setDirs.mockClear();
+    setExclusions.mockClear();
+    const onOpenChange = vi.fn();
+    render(<SettingsDialog open onOpenChange={onOpenChange} />);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(setDirs).not.toHaveBeenCalled();
+    expect(setExclusions).not.toHaveBeenCalled();
+  });
+
+  it("does not rewrite folders edited back to their saved value", async () => {
+    setDirs.mockClear();
+    open();
+    fireEvent.change(screen.getByLabelText(/directories to scan/i), { target: { value: " /Users/x/code \n" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^save$/i })).toHaveProperty("disabled", false));
+    expect(setDirs).not.toHaveBeenCalled();
+  });
+
+  it("shows Saving… and disables Save while the save is pending", async () => {
+    let finish!: (d: string[]) => void;
+    setDirs.mockImplementationOnce(() => new Promise<string[]>((resolve) => { finish = resolve; }));
+    const onOpenChange = vi.fn();
+    render(<SettingsDialog open onOpenChange={onOpenChange} />);
+    fireEvent.change(screen.getByLabelText(/directories to scan/i), { target: { value: "/a" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    const busy = await screen.findByRole("button", { name: "Saving…" });
+    expect(busy).toHaveProperty("disabled", true);
+    expect(busy.getAttribute("aria-busy")).toBe("true");
+    expect(onOpenChange).not.toHaveBeenCalled();
+    finish(["/a"]);
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
   it("changes the poll interval", () => {
