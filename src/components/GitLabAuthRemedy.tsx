@@ -30,7 +30,7 @@ export function GitLabAuthRemedy({ auth }: { auth: GitLabAuthCheck }) {
         </button>
       ) : null}
       {!checking && checkedAt > 0 ? (
-        <span className="text-xs opacity-80">Checked at {new Date(checkedAt).toLocaleTimeString()}.</span>
+        <span className="text-xs">Checked at {new Date(checkedAt).toLocaleTimeString()}.</span>
       ) : null}
       {save.isError ? <span role="alert" className="text-xs text-[#f85149]">{String(save.error)}</span> : null}
     </span>
