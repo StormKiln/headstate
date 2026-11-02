@@ -26,6 +26,7 @@ ignore = [
   "RUSTSEC-2026-0367",  # unreachable ZIP permission extraction on phone targets
   "RUSTSEC-2026-0368",  # unreachable ZIP symlink extraction on phone targets
   "RUSTSEC-2026-0369",  # unreachable ZIP chmod extraction on phone targets
+  "RUSTSEC-2026-0429",  # unreachable ZIP oversized-symlink abort on phone targets
   "RUSTSEC-2025-0075",  # unic-char-range unmaintained
   "RUSTSEC-2025-0080",  # unic-common unmaintained
   "RUSTSEC-2025-0081",  # unic-char-property unmaintained
