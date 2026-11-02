@@ -52,7 +52,7 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/useDiskInventory", () => ({
   useDiskInventory: () => ({
     status: null, settings: null, error: null, busy: false,
-    save: async () => {}, start: async () => {}, cancel: async () => {},
+    setAdditional: async () => {}, reloadSettings: () => {}, start: async () => {}, cancel: async () => {},
   }),
 }));
 
@@ -914,7 +914,48 @@ describe("ArtifactsPage and roots it could not read", () => {
     state.failedRoots = [{ root: "/Volumes/code", why: "Permission denied (os error 13)" }];
     render(<ArtifactsPage />);
     expect(screen.getByText(/Discovery is incomplete in 1 location/)).toBeTruthy();
-    expect(screen.getByText(/\/Volumes\/code — Permission denied/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(screen.getByText(/Permission denied \(os error 13\) — 1 location/)).toBeTruthy();
+    expect(screen.getByText("/Volumes/code")).toBeTruthy();
+  });
+
+  it("is one collapsed line however many locations, with the count on it", () => {
+    const why = "Discovery depth limit reached; add this folder as a scan root";
+    state.failedRoots = Array.from({ length: 300 }, (_, i) => ({
+      root: `/fixture/projects/p${i % 12}/deep/d${i}`,
+      why,
+    }));
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/Discovery is incomplete in 300 locations/)).toBeTruthy();
+    // The instruction stays visible while collapsed.
+    expect(screen.getByText(/Add a deeper folder in Settings → Repositories/)).toBeTruthy();
+    const toggle = screen.getByRole("button", { name: "Show details" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("/fixture/projects/p0/deep/d0")).toBeNull();
+
+    fireEvent.click(toggle);
+    // Grouped by reason, then project; capped, with the rest COUNTED.
+    expect(screen.getByText(`${why} — 300 locations`)).toBeTruthy();
+    expect(screen.getByText("/fixture/projects/p0")).toBeTruthy();
+    expect(screen.queryByText("/fixture/projects/p9")).toBeNull();
+    expect(screen.getByText("and 7 more projects")).toBeTruthy();
+    expect(screen.getAllByText(/^and \d+ more$/).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("listitem").length).toBeLessThan(50);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all 300 locations" }));
+    expect(screen.getByText("/fixture/projects/p9")).toBeTruthy();
+    expect(screen.getByText("/fixture/projects/p0/deep/d288")).toBeTruthy();
+  });
+
+  it("opens Settings at the repository folders", async () => {
+    const { useSettingsDialog } = await import("@/store/settingsDialog");
+    state.failedRoots = [{ root: "/fixture/projects/p/deep", why: "Permission denied" }];
+    render(<ArtifactsPage />);
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Open repository settings" }));
+    });
+    expect(useSettingsDialog.getState().section).toBe("repositories");
+    act(() => useSettingsDialog.getState().close());
   });
 
   it("keeps showing the artifacts that WERE found", () => {

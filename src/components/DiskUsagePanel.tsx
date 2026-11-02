@@ -1,8 +1,9 @@
 import { useWorktreeDirs } from "../api/hooks";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDiskInventory } from "../api/useDiskInventory";
 import { claudeRevealPath } from "../api/tauri";
 import { IS_MOBILE_BUILD } from "../lib/target";
+import { useSettingsDialog } from "@/store/settingsDialog";
 import { errorMessage } from "@/lib/queryErrorMessage";
 import type { DiskObservation } from "../types/disk";
 function size(value: string | null, unit: "GiB" | "GB"): string {
@@ -52,22 +53,30 @@ export function DiskUsagePanel({ defaultOpen = false }: { defaultOpen?: boolean 
     // `dirs` is `undefined` while unread or unreadable (#1995).
     const { dirs, dirsError, retryDirs } = useWorktreeDirs();
     const dirsReason = errorMessage(dirsError);
-    const { status, settings, error, busy, historyUnreadable, save, start, cancel } = useDiskInventory(open);
+    const { status, settings, error, busy, historyUnreadable, setAdditional, reloadSettings, start, cancel } = useDiskInventory(open);
     const [selected, setSelected] = useState<string | null>(null);
     const [unit, setUnit] = useState<"GiB" | "GB">("GiB");
-    const [draft, setDraft] = useState<string | null>(null);
+    const openSettings = useSettingsDialog(s => s.open);
+    // The external folders are edited in Settings: re-read them when it
+    // closes, so the scope shown here is the one the next scan will use.
+    const settingsOpen = useSettingsDialog(s => s.section !== null);
+    const wasSettingsOpen = useRef(settingsOpen);
+    useEffect(() => {
+        const closed = wasSettingsOpen.current && !settingsOpen;
+        wasSettingsOpen.current = settingsOpen;
+        if (closed && open) reloadSettings();
+    }, [settingsOpen, open, reloadSettings]);
     const [revealError, setRevealError] = useState<string | null>(null);
     const observations = status?.observations ?? [];
     const observation = observations.find(o => o.volume.id === selected) ?? observations[0];
     return <section className="m-4 rounded border border-border p-3"><button type="button" aria-expanded={open} onClick={() => setOpen(v => !v)}>Disk usage</button>{open && <div className="mt-3 space-y-3">
   <p>Measure selected locations and see what remains unexplained. Scans do not remove files.</p>
-  <div className="break-all"><h3>Scan scope</h3><p>Repository folders: {dirsError ? "Unavailable" : dirs === undefined ? "Loading…" : dirs.length ? dirs.join(", ") : "None configured"}. Change these in Settings.</p>{dirsError ? <p role="alert">The saved repository folders could not be read{dirsReason ? `: ${dirsReason}` : ""}. <button type="button" onClick={() => void retryDirs()}>Retry reading folders</button></p> : null}<p>External folders are included only when saved below. Additional locations include developer caches, toolchains, archives and temporary build folders when available; ownership may be unknown.</p><p>This inventory covers all selected folders, regardless of the sidebar filter. Worktree and artifact lists show logical sizes and overlap; do not add their totals to this inventory.</p></div>
+  <div className="break-all"><h3>Scan scope</h3><p>Repository folders: {dirsError ? "Unavailable" : dirs === undefined ? "Loading…" : dirs.length ? dirs.join(", ") : "None configured"}. Change these in Settings.</p>{dirsError ? <p role="alert">The saved repository folders could not be read{dirsReason ? `: ${dirsReason}` : ""}. <button type="button" onClick={() => void retryDirs()}>Retry reading folders</button></p> : null}<p>External folders are included only when saved in Settings → Cleanup. Additional locations include developer caches, toolchains, archives and temporary build folders when available; ownership may be unknown.</p><p>This inventory covers all selected folders, regardless of the sidebar filter. Worktree and artifact lists show logical sizes and overlap; do not add their totals to this inventory.</p></div>
   {error && <p role="alert">Disk measurement unavailable: {error}</p>}{status?.error && <p role="alert">{status.error}</p>}{revealError && <p role="alert">{revealError}</p>}
   {historyUnreadable > 0 && <p role="status">{historyUnreadable === 1 ? "1 saved measurement could not be read and is not shown." : `${historyUnreadable} saved measurements could not be read and are not shown.`}</p>}
-  {!IS_MOBILE_BUILD && <><label className="block">External build and cache folders (one absolute path per line)<textarea value={draft ?? settings?.external_roots.join("\n") ?? ""} onChange={e => setDraft(e.target.value)} disabled={busy || status?.running} className="block w-full rounded border p-2"/></label>
-   <button type="button" disabled={busy || status?.running || !settings} onClick={() => void save({ external_roots: (draft ?? settings?.external_roots.join("\n") ?? "").split("\n").map(p => p.trim()).filter(Boolean), additional_locations: settings?.additional_locations ?? false })}>Save locations</button>{" "}
+  {!IS_MOBILE_BUILD && <><p className="break-all">External build and cache folders: {settings === null ? "Loading…" : settings.external_roots.length ? settings.external_roots.join(", ") : "None"}. <button type="button" className="underline" onClick={() => openSettings("cleanup")}>Change in Settings</button></p>
    <button type="button" disabled={busy || status?.running} onClick={() => void start()}>{status?.resumable ? "Continue disk measurement" : "Measure disk usage"}</button>{" "}<button type="button" disabled={busy || status?.running || !settings} onClick={() => void start(true)}>Scan additional build locations</button>{" "}
-   {settings?.additional_locations && <button type="button" disabled={busy || status?.running} onClick={() => void save({ ...settings, additional_locations: false })}>Exclude additional locations from future scans</button>}
+   {settings?.additional_locations && <button type="button" disabled={busy || status?.running} onClick={() => void setAdditional(false)}>Exclude additional locations from future scans</button>}
    {status?.running && <button type="button" disabled={busy} onClick={() => void cancel()}>Cancel scan</button>}</>}
   {IS_MOBILE_BUILD && <p>Start or stop disk measurements on the desktop.</p>}
   {status?.running && <p role="status">Scanning {status.phase ?? "locations"}: {status.visited} entries checked. {status.remaining ?? 0} queued. {status.current_path}</p>}

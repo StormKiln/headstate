@@ -99,6 +99,31 @@ it("keeps comparable growth and known allocation visible in a partial observatio
  expect(screen.getByRole("button",{name:"Continue disk measurement"})).toBeTruthy();
 });
 
+describe("external folders live in Settings", () => {
+  it("shows the saved folders and points to Settings instead of an edit box", async () => {
+    const { useSettingsDialog } = await import("@/store/settingsDialog");
+    api.diskSettings.mockResolvedValue({ external_roots: ["/fixture/cache"], additional_locations: false });
+    await show();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save locations" })).toBeNull();
+    expect(screen.getByText(/External build and cache folders: \/fixture\/cache\./)).toBeTruthy();
+    act(() => { fireEvent.click(screen.getByRole("button", { name: "Change in Settings" })); });
+    expect(useSettingsDialog.getState().section).toBe("cleanup");
+    // Closing Settings re-reads, so the scope shown is the saved one.
+    api.diskSettings.mockResolvedValue({ external_roots: ["/fixture/other"], additional_locations: false });
+    await act(async () => { useSettingsDialog.getState().close(); });
+    expect(screen.getByText(/External build and cache folders: \/fixture\/other\./)).toBeTruthy();
+  });
+  it("re-reads before scanning additional locations, so a stale list cannot overwrite Settings", async () => {
+    await show();
+    // Saved in Settings after the panel read its copy.
+    api.diskSettings.mockResolvedValue({ external_roots: ["/fixture/new"], additional_locations: false });
+    api.startDiskScan.mockResolvedValue({ run_id: null, running: false, visited: 0, current_path: null, observations: [], error: null });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Scan additional build locations" })); });
+    expect(api.saveDiskSettings).toHaveBeenCalledWith({ external_roots: ["/fixture/new"], additional_locations: true });
+  });
+});
+
 /// #1995: the scan scope's folder setting could not be read. "Unavailable"
 /// alone gave neither the reason nor a way out.
 describe("an unread scan-folder setting (#1995)", () => {

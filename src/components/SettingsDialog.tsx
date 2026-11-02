@@ -20,6 +20,7 @@ import { ClaudeIntegrationsPanel } from "./ClaudeIntegrationsPanel";
 import { JiraSettingsPanel } from "./JiraSettingsPanel";
 import { settingsSections, type SectionId } from "./settingsSections";
 import { GitLabHostPanel } from "./GitLabHostPanel";
+import { DiskLocationsSettings } from "./DiskLocationsSettings";
 import {
   useAutostart,
   useNotifyPrefs,
@@ -933,6 +934,9 @@ export function SettingsDialog({
             anywhere in the UI. Escape is the notable one: it hides the
             whole window to the tray, which is genuinely surprising the
             first time someone presses it to dismiss a menu. */}
+        {/* Desktop only: the phone neither reads nor writes the disk
+            inventory's folders. */}
+        {IS_MOBILE_BUILD ? null : <DiskLocationsSettings />}
             </div>
             {/* Rendered always, hidden with CSS, for the reasons given
                 on the panels above. */}

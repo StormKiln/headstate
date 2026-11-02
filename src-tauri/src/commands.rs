@@ -2059,9 +2059,11 @@ pub async fn scan_artifacts_report(app: AppHandle) -> Result<ArtifactScan, Strin
     .await?;
     // A root that could not be read is NAMED, never silently dropped:
     // an empty list for a configured directory reads as an answer about
-    // it (#846).
-    for f in &failed {
-        log::warn!("artifact scan: could not read {}: {}", f.root, f.why);
+    // it (#846). Every path travels in the result below; the log gets
+    // one summary per scan (count by reason, a few examples), because
+    // one line per path was tens of thousands of lines a day.
+    if let Some(summary) = crate::artifacts::omission_summary(&failed) {
+        log::warn!("{summary}");
     }
     // The failed roots are reported in the return value below; the
     // `artifact-scan-failed-roots` event that also carried them had no

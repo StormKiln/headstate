@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 const setExclusions = vi.hoisted(() => vi.fn((d: string[]) => Promise.resolve(d)));
@@ -42,6 +42,7 @@ const cleanupPrefs = vi.hoisted(() => ({
 
 // Rendered by its own test; it needs a QueryClient this file does not provide.
 vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
+vi.mock("./DiskLocationsSettings", () => ({ DiskLocationsSettings: () => <p>External build and cache folders</p> }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/tauri", () => ({ measurementStatus: () => new Promise(() => {}), exportMeasurements: vi.fn(), revealLog: revealFn }));
 vi.mock("./GitLabHostPanel", () => ({ GitLabHostPanel: () => <button>Save GitLab host</button> }));
@@ -531,6 +532,17 @@ describe("the settings sections", () => {
       "page",
     );
     expect(within(nav).getByRole("button", { name: "General" }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("hosts the external build and cache folders under Cleanup", () => {
+    // Moved off the Artifacts page: this is the box's only host now.
+    render(<SettingsDialog open onOpenChange={() => {}} initialSection="cleanup" />);
+    const box = screen.getByText("External build and cache folders");
+    expect(box.closest(".hidden")).toBeNull();
+    cleanup();
+    render(<SettingsDialog open onOpenChange={() => {}} initialSection="general" />);
+    // Mounted but hidden with the rest of the topic.
+    expect(screen.getByText("External build and cache folders").closest(".hidden")).not.toBeNull();
   });
 
   it("defaults to General", () => {
