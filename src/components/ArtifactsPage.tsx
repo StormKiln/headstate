@@ -12,7 +12,9 @@ import {
   useCachedScan,
   useRemoveArtifacts,
   useVenvs,
+  useWorktreeDirs,
 } from "@/api/hooks";
+import { DiscoveryOmissionsNotice } from "./DiscoveryOmissionsNotice";
 import { useActiveFilters } from "@/store/filters";
 import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
@@ -165,6 +167,9 @@ function ArtifactsFromCache({
   );
 }
 
+/// A stable empty list, so the notice's grouping is not redone every render.
+const NO_DIRS: readonly string[] = [];
+
 export function ArtifactsPage() {
   return <><DiskUsagePanel defaultOpen /><ArtifactInventory /></>;
 }
@@ -201,6 +206,9 @@ function ArtifactInventory() {
   /// Roots the scan could not read, which is a fact about the RESULT
   /// and so outlives the progress figure.
   const failedRoots = useArtifactScanFailures(true);
+  // The scan folders, to group those failures by project. `undefined`
+  // while unread: the notice then groups each path as its own project.
+  const { dirs: scanDirs } = useWorktreeDirs();
   // Read here only to decide the empty state; VenvSection owns the rest.
   const { data: venvList = [], isLoading: venvsLoading, isError: venvsFailed } = useVenvs(true);
   const venvCount = venvList.length;
@@ -371,21 +379,7 @@ function ArtifactInventory() {
   );
   const failedRootsNotice =
     failedRoots && failedRoots.length > 0 ? (
-      <div
-        className="mx-4 mt-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
-        role="status"
-      >
-        <p className="font-semibold">
-          Discovery is incomplete in {failedRoots.length} location{failedRoots.length === 1 ? "" : "s"}. Unlisted output may still use disk space. Add a deeper folder in Settings for a targeted scan.
-        </p>
-        <ul className="mt-1 space-y-0.5">
-          {failedRoots.map((f) => (
-            <li key={f.root} className="break-all text-[#8b949e]">
-              {f.root} — {f.why}
-            </li>
-          ))}
-        </ul>
-      </div>
+      <DiscoveryOmissionsNotice omissions={failedRoots} scanDirs={scanDirs ?? NO_DIRS} />
     ) : null;
 
   const artifactsError =

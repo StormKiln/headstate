@@ -194,6 +194,11 @@ fn walk(
         }
         return;
     }
+    // An installed environment is not walked, and nothing under it is
+    // reported: see [`is_installed_environment`].
+    if is_installed_environment(dir) {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -201,6 +206,12 @@ fn walk(
             return;
         }
     };
+    // Whether the depth limit kept the walk out of any subfolder here.
+    // Reported ONCE, as this directory, rather than once per subfolder:
+    // adding this directory as a scan root recovers all of them, so one
+    // row is the whole instruction. Per-subfolder rows turned one deep
+    // tree into hundreds of lines.
+    let mut beyond_depth = false;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -224,11 +235,10 @@ fn walk(
         // The old walker classified children at MAX_DEPTH, so preserve that
         // boundary while reporting every subtree it could not inspect.
         if depth > MAX_DEPTH {
-            omission(
-                failed,
-                &path,
-                "Discovery depth limit reached; add this folder as a scan root",
-            );
+            // An environment just past the limit is still not a gap.
+            if !is_installed_environment(&path) {
+                beyond_depth = true;
+            }
         } else {
             walk(&path, root, depth + 1, out, failed, remaining, excluded);
         }
@@ -241,6 +251,86 @@ fn walk(
             break;
         }
     }
+    if beyond_depth {
+        omission(failed, dir, DEPTH_LIMIT_REASON);
+    }
+}
+
+/// Why a directory's subfolders were not inspected.
+const DEPTH_LIMIT_REASON: &str = "Discovery depth limit reached; add this folder as a scan root";
+
+/// Whether this directory is an installed package environment rather than
+/// a project tree: a Python virtualenv (`pyvenv.cfg`), a conda environment
+/// (`conda-meta/`), or a package install tree (`site-packages`,
+/// `dist-packages`).
+///
+/// Not walked, and NOTHING beneath it is reported as incomplete discovery.
+/// Build output is what a project's own build writes beside its manifest;
+/// an environment holds installed packages, whose `bin/`, `build/` and
+/// `dist/` folders are package contents, not output a rebuild regenerates.
+/// Walking one produced only noise: every installed package became a
+/// depth-limit row (one environment holds hundreds), and its `bin/` an
+/// unprovable candidate -- thousands of rows on one machine, none of
+/// which a scan root could have turned into an artifact.
+///
+/// This hides no disk use: the disk-usage inventory measures the folder
+/// the environment sits in, and the virtualenv section lists the ones it
+/// manages. A genuinely unscanned project folder is still reported.
+fn is_installed_environment(dir: &Path) -> bool {
+    if dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "site-packages" || n == "dist-packages")
+    {
+        return true;
+    }
+    dir.join("pyvenv.cfg").is_file() || dir.join("conda-meta").is_dir()
+}
+
+/// One log line for a whole scan's omissions, or `None` when there were
+/// none.
+///
+/// One WARN per omission flooded the log -- tens of thousands of lines
+/// over a day of rescans, the same few reasons repeated. The summary keeps
+/// what a reader of the log needs: how many, grouped by reason with the
+/// largest group first, and a few example paths per reason. The full list
+/// travels in the scan result.
+pub fn omission_summary(failed: &[FailedRoot]) -> Option<String> {
+    const EXAMPLES: usize = 3;
+    if failed.is_empty() {
+        return None;
+    }
+    let mut by_reason: Vec<(&str, Vec<&str>)> = Vec::new();
+    for f in failed {
+        match by_reason.iter_mut().find(|(why, _)| *why == f.why) {
+            Some((_, paths)) => paths.push(&f.root),
+            None => by_reason.push((&f.why, vec![&f.root])),
+        }
+    }
+    by_reason.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+    let groups: Vec<String> = by_reason
+        .iter()
+        .map(|(why, paths)| {
+            let shown: Vec<&str> = paths.iter().take(EXAMPLES).copied().collect();
+            let more = paths.len() - shown.len();
+            let tail = if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "{} x \"{why}\" (e.g. {}{tail})",
+                paths.len(),
+                shown.join(", ")
+            )
+        })
+        .collect();
+    Some(format!(
+        "artifact scan: discovery incomplete in {} location{}: {}",
+        failed.len(),
+        if failed.len() == 1 { "" } else { "s" },
+        groups.join("; ")
+    ))
 }
 
 /// Whether a path classifies as an artifact right now.
@@ -1027,16 +1117,126 @@ mod coverage_tests {
         let (found, failed) =
             scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
         assert!(found.is_empty());
+        // Named as the directory whose subfolders went unread, which is
+        // the root to add.
+        let parent = project.parent().unwrap();
         assert!(
             failed
                 .iter()
-                .any(|f| Path::new(&f.root) == project && f.why.contains("depth limit")),
+                .any(|f| Path::new(&f.root) == parent && f.why.contains("depth limit")),
             "{failed:?}"
         );
-        let (found, failed) =
-            scan_streaming(&[project.to_string_lossy().into_owned()], &mut |_| {});
+        let (found, failed) = scan_streaming(&[parent.to_string_lossy().into_owned()], &mut |_| {});
         assert_eq!(found.len(), 1);
         assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn many_subfolders_past_the_depth_limit_are_one_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a/b/c/d/e");
+        for name in ["one", "two", "three", "four"] {
+            fs::create_dir_all(deep.join(name)).unwrap();
+        }
+        let (_, failed) = scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
+        assert_eq!(
+            failed,
+            vec![FailedRoot {
+                root: deep.to_string_lossy().into_owned(),
+                why: DEPTH_LIMIT_REASON.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_inside_an_installed_environment_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        // A virtualenv deep enough that its packages pass the depth
+        // limit, with a `bin/` no manifest can prove.
+        let venv = project.join(".venv");
+        fs::create_dir_all(venv.join("bin")).unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /x").unwrap();
+        for pkg in ["alpha", "beta", "gamma"] {
+            fs::create_dir_all(venv.join("lib/python3/site-packages").join(pkg).join("sub"))
+                .unwrap();
+        }
+        // A conda environment, and a bare install tree outside both.
+        let conda = project.join("env");
+        fs::create_dir_all(conda.join("conda-meta")).unwrap();
+        fs::create_dir_all(conda.join("bin")).unwrap();
+        fs::create_dir_all(project.join("x/y/site-packages/pkg/deeper/still")).unwrap();
+        let (_, failed) = scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    fn a_real_deep_project_folder_beside_an_environment_is_still_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let venv = tmp.path().join("project/.venv");
+        fs::create_dir_all(venv.join("lib/python3/site-packages/pkg/sub")).unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /x").unwrap();
+        let unread = tmp.path().join("project/app/plugins/one/permissions");
+        fs::create_dir_all(unread.join("generated")).unwrap();
+        let (_, failed) = scan_streaming(&[tmp.path().to_string_lossy().into_owned()], &mut |_| {});
+        assert_eq!(
+            failed,
+            vec![FailedRoot {
+                root: unread.to_string_lossy().into_owned(),
+                why: DEPTH_LIMIT_REASON.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_artifact_beside_an_environment_is_still_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]").unwrap();
+        fs::create_dir_all(project.join(".venv/bin")).unwrap();
+        fs::write(project.join(".venv/pyvenv.cfg"), "home = /x").unwrap();
+        let found = super::tests::scan(&[tmp.path().to_string_lossy().into_owned()]);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("target"));
+    }
+
+    fn omitted(root: &str, why: &str) -> FailedRoot {
+        FailedRoot {
+            root: root.into(),
+            why: why.into(),
+        }
+    }
+
+    #[test]
+    fn a_clean_scan_logs_no_summary() {
+        assert_eq!(omission_summary(&[]), None);
+    }
+
+    #[test]
+    fn the_log_summary_counts_by_reason_largest_first_with_capped_examples() {
+        let mut failed: Vec<FailedRoot> = (0..5)
+            .map(|i| omitted(&format!("/fixture/deep{i}"), DEPTH_LIMIT_REASON))
+            .collect();
+        failed.push(omitted("/fixture/locked", "Permission denied"));
+        let line = omission_summary(&failed).unwrap();
+        assert!(
+            line.starts_with("artifact scan: discovery incomplete in 6 locations: 5 x"),
+            "{line}"
+        );
+        assert!(line.contains("/fixture/deep0, /fixture/deep1, /fixture/deep2, and 2 more"));
+        assert!(!line.contains("/fixture/deep3"), "{line}");
+        assert!(line.contains("1 x \"Permission denied\" (e.g. /fixture/locked)"));
+        // Largest group first.
+        assert!(line.find("depth limit").unwrap() < line.find("Permission denied").unwrap());
+        // ONE line, however many paths.
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn a_single_omission_is_singular() {
+        let line = omission_summary(&[omitted("/fixture/x", "Permission denied")]).unwrap();
+        assert!(line.contains("in 1 location:"), "{line}");
     }
 
     #[cfg(unix)]

@@ -68,18 +68,25 @@ export function useDiskInventory(enabled: boolean) {
     finally { setBusy(false); }
   }, []);
 
+  // The folders are edited in Settings now, so the copy this hook read
+  // when the panel opened can be stale. A write of the OTHER half of the
+  // settings re-reads first, or it would put the stale folder list back.
+  const setAdditional = async (additional_locations: boolean) => {
+    const next = { ...(await api.diskSettings()), additional_locations };
+    await api.saveDiskSettings(next);
+    setSettings(next);
+  };
+
   return {
     status, settings, error, busy, historyUnreadable,
-    save: (next: DiskSettings) => perform(async () => {
-      await api.saveDiskSettings(next);
-      setSettings(next);
-    }),
+    /// Re-read the saved settings, after Settings may have changed them.
+    reloadSettings: useCallback(() => {
+      if (IS_MOBILE_BUILD) return;
+      void api.diskSettings().then(setSettings, (e: unknown) => setError(message(e)));
+    }, []),
+    setAdditional: (additional: boolean) => perform(() => setAdditional(additional)),
     start: (additional = false) => perform(async () => {
-      if (additional && settings) {
-        const next = { ...settings, additional_locations: true };
-        await api.saveDiskSettings(next);
-        setSettings(next);
-      }
+      if (additional && settings) await setAdditional(true);
       const next = await api.startDiskScan();
       setStatus(previous => retainMeasurement(next, previous));
       setRefresh(n => n + 1);

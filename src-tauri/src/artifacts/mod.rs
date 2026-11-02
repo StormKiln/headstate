@@ -22,7 +22,7 @@ pub mod model;
 pub mod scan;
 
 pub use model::{Artifact, ArtifactKind};
-pub use scan::scan;
+pub use scan::{omission_summary, scan};
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

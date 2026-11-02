@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 /// and it is the half that changed.
 // Rendered by its own test; it needs a QueryClient this file does not provide.
 vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
+vi.mock("./DiskLocationsSettings", () => ({ DiskLocationsSettings: () => <p>External build and cache folders</p> }));
 vi.mock("@/lib/useIsMobile", () => ({
   useIsMobile: () => true,
   MOBILE_BREAKPOINT: 768,

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const calls = vi.hoisted(() => ({ status: vi.fn(), save: vi.fn() }));
 // Rendered by its own test; it needs a QueryClient this file does not provide.
 vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
+vi.mock("./DiskLocationsSettings", () => ({ DiskLocationsSettings: () => <p>External build and cache folders</p> }));
 vi.mock("../api/transport", () => ({ call: (name: string) => {
   if (name === "measurement_status") return calls.status();
   if (name === "measurement_export") return calls.save();

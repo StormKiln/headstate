@@ -6,6 +6,7 @@ const prefsState: { prefs: unknown } = { prefs: undefined };
 
 // Rendered by its own test; it needs a QueryClient this file does not provide.
 vi.mock("./JiraSettingsPanel", () => ({ JiraSettingsPanel: () => null }));
+vi.mock("./DiskLocationsSettings", () => ({ DiskLocationsSettings: () => <p>External build and cache folders</p> }));
 vi.mock("../api/hooks", () => ({
   // #1154. Undefined renders nothing, which is what these tests assume:
   // a failed probe must not draw "not found" for every tool.
