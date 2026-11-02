@@ -111,28 +111,32 @@ export function SettingsDialog({
   };
 
   const save = () => {
-    const next = value
-      .split("\n")
-      .map((d) => d.trim())
-      .filter(Boolean);
+    const lines = (text: string) => text.split("\n").map((d) => d.trim()).filter(Boolean);
+    const same = (a: string[], b: string[]) => a.length === b.length && a.every((d, i) => d === b[i]);
+    const next = lines(value);
+    // Only a CHANGED field is written. Every other setting saves the moment
+    // it is toggled, so a Save from General used to write back the scan
+    // folders unchanged -- and a write of the roots rescans every one of
+    // them. Never write back folders this dialog did not read (#1995)
+    // either: an untouched box over an unread setting is EMPTY. An edited
+    // box is the user's own answer, read or not.
+    const writeDirs = draft !== null && (dirs === undefined || !same(next, dirs));
+    const nextExclusions = exclusionDraft === null ? null : lines(exclusionDraft);
+    const writeExclusions = nextExclusions !== null && !same(nextExclusions, exclusions);
+    setError(null);
     setSaving(true);
     const saveChanges = async () => {
-      if (exclusionDraft !== null) {
-        const paths = exclusionDraft.split("\n").map((p) => p.trim()).filter(Boolean);
+      if (writeExclusions) {
         // When the roots change too, saving them rescans; rescanning
         // here as well walked every root twice for one Save (#1957).
-        if (draft !== null) await setExclusions(paths, { rescan: false });
-        else await setExclusions(paths);
+        if (writeDirs) await setExclusions(nextExclusions, { rescan: false });
+        else await setExclusions(nextExclusions);
       }
-      // Never write back folders this dialog did not read (#1995). An
-      // untouched box over an unread or unreadable setting is EMPTY, and
-      // saving it -- from any topic's Save -- replaced the user's real
-      // folders with none. An edited box is the user's own answer.
-      if (draft !== null || (exclusionDraft === null && dirs !== undefined)) await setDirs(next);
+      if (writeDirs) await setDirs(next);
     };
     void saveChanges().then(
       () => close(),
-      (e: unknown) => setError(typeof e === "string" ? e : "Could not save"),
+      (e: unknown) => setError(`Settings were not saved: ${errorMessage(e) ?? "the change was refused."}`),
     ).finally(() => setSaving(false));
   };
 
@@ -518,11 +522,6 @@ export function SettingsDialog({
               <button type="button" className="ml-2 underline" onClick={() => void retryExclusions()}>Retry loading exclusions</button>
             </div> : !exclusionsReady && <p className="text-xs text-[#8b949e]">Loading discovery exclusions…</p>}
           </>}
-          {error ? (
-            <p role="alert" className="text-xs text-[#f85149]">
-              {error}
-            </p>
-          ) : null}
         </div>
 
         {/* Half the top-level navigation is irrelevant to a PR-only
@@ -1050,7 +1049,15 @@ export function SettingsDialog({
 
         {/* Outside the scrolling region, so OK and Cancel are always
             reachable however long the list grows. */}
-        <div className="mt-5 flex shrink-0 justify-end gap-2">
+        <div className="mt-5 flex shrink-0 items-center justify-end gap-2">
+          {/* In the footer, not the Repositories panel: Save is offered
+              from every topic, and a failure shown in a hidden panel was
+              a dialog that just stayed open. */}
+          {error ? (
+            <p role="alert" className="mr-auto text-xs text-[#f85149]">
+              {error}
+            </p>
+          ) : null}
           <button
             type="button"
             onClick={close}
@@ -1062,9 +1069,10 @@ export function SettingsDialog({
             <button
               type="button"
               onClick={save} disabled={saving || (exclusionDraft !== null && !exclusionsReady)}
-              className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
+              aria-busy={saving || undefined}
+              className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-[#238636]"
             >
-              Save
+              {saving ? "Saving…" : "Save"}
             </button>
           ) : null}
         </div>
