@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { WorktreeKebab } from "./WorktreeKebab";
 import type { Worktree } from "../types/pr";
@@ -74,5 +74,64 @@ describe("WorktreeKebab and the configured terminal", () => {
     fireEvent.click(screen.getByText("Copy the Claudify command"));
     expect(h.onCopyClaudify).toHaveBeenCalledOnce();
     expect(h.onClaudify).not.toHaveBeenCalled();
+  });
+});
+
+/// The menu was cut off by the list it sits in: it opened `absolute
+/// top-full` inside the row, and the rows' container is
+/// `overflow-hidden`, so on the last rows Remove was clipped out of
+/// reach. jsdom has no layout, so the flip itself cannot be measured
+/// here -- what CAN be asserted is the structural fix: the menu is no
+/// longer a descendant of anything that might clip it.
+describe("WorktreeKebab is not clipped by its container", () => {
+  function renderInClippingList() {
+    const handlers = {
+      onClaudify: vi.fn(),
+      onCopyClaudify: vi.fn(),
+      onForget: vi.fn(),
+      onRemove: vi.fn(),
+      onForce: vi.fn(),
+      onUnlock: vi.fn(),
+    };
+    const onRowClick = vi.fn();
+    render(
+      <div data-testid="list" style={{ overflow: "hidden", height: 24 }}>
+        <div onClick={onRowClick}>
+          <WorktreeKebab worktree={wt} assessed {...handlers} />
+        </div>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /more actions for feature/i }));
+    return { handlers, onRowClick };
+  }
+
+  it("renders the menu outside the overflow container (a portal)", () => {
+    renderInClippingList();
+    const menu = screen.getByRole("menu");
+    expect(screen.getByTestId("list").contains(menu)).toBe(false);
+    expect(document.body.contains(menu)).toBe(true);
+  });
+
+  it("keeps the trigger's menu semantics", () => {
+    renderInClippingList();
+    const trigger = screen.getByRole("button", { name: /more actions for feature/i });
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("still keeps an item click from reaching the row behind the portal", () => {
+    // React bubbles synthetic events along the component tree, not the
+    // DOM, so a portalled item's click would reach the row's own
+    // handler without the wrapper's stopPropagation.
+    const { handlers, onRowClick } = renderInClippingList();
+    fireEvent.click(screen.getByRole("menuitem", { name: /remove worktree/i }));
+    expect(handlers.onForce).toHaveBeenCalledOnce();
+    expect(onRowClick).not.toHaveBeenCalled();
+  });
+
+  it("closes on Escape", async () => {
+    renderInClippingList();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
   });
 });

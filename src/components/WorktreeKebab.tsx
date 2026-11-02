@@ -1,7 +1,13 @@
 import { Bot, MoreHorizontal, RotateCcw, Trash2, Unlock } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import type { Worktree } from "../types/pr";
 import { forceWarning, isSafe, safetyReason } from "../lib/worktrees";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 
 /// Per-row actions for a worktree.
 ///
@@ -72,35 +78,21 @@ export function WorktreeKebab({
   /// age (#775). Only offered on a locked row, and it removes nothing.
   onUnlock: (wt: Worktree) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    const onClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("mousedown", onClick);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onClick);
-    };
-  }, [open]);
-
+  // `data-highlighted` is the menu's keyboard (and pointer) highlight:
+  // focus moves item to item on the arrow keys, so hover alone would
+  // leave a keyboard user with no visible position.
   const item =
-    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
+    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d] data-highlighted:bg-[#21262d]";
   // Same as `item`, but top-aligned: this one carries a second line
   // under its label, and centring would float the icon against the
   // middle of a two-line block.
   const itemStacked =
-    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
+    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d] data-highlighted:bg-[#21262d]";
   // Red, like every other removal affordance on this page. A menu item
   // that deletes a directory must not look like one that copies a
   // string.
   const destructive =
-    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#ff7b72] hover:bg-[#f85149]/10";
+    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#ff7b72] hover:bg-[#f85149]/10 data-highlighted:bg-[#f85149]/10";
 
   // The gate, read here exactly as the primary button reads it (#770).
   //
@@ -171,26 +163,33 @@ export function WorktreeKebab({
     worktree.safety.kind !== "orphaned" && !prunable && !worktree.is_main;
 
   return (
-    <div ref={ref} className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
-      <button
-        type="button"
-        // Falls back to the path for a DETACHED worktree, which has no
-        // branch: the label was "More actions for " with nothing after
-        // it, so a screen reader user could not tell two such rows
-        // apart -- and this menu now removes directories.
-        aria-label={`More actions for ${worktree.branch || worktree.path}`}
-        aria-expanded={open}
-        aria-haspopup="menu"
-        onClick={() => setOpen((o) => !o)}
-        className="rounded p-1 text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
-      >
-        <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-      </button>
+    // The wrapper only stops the click reaching the row. React bubbles
+    // synthetic events through a portal along the COMPONENT tree, so
+    // this still catches clicks on the portalled items below.
+    <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          // Falls back to the path for a DETACHED worktree, which has no
+          // branch: the label was "More actions for " with nothing after
+          // it, so a screen reader user could not tell two such rows
+          // apart -- and this menu now removes directories.
+          aria-label={`More actions for ${worktree.branch || worktree.path}`}
+          className="rounded p-1 text-[#8b949e] hover:bg-[#21262d] hover:text-[#e6edf3]"
+        >
+          <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+        </DropdownMenuTrigger>
 
-      {open ? (
-        <div
-          role="menu"
-          className="absolute right-0 top-full z-20 mt-1 w-56 rounded border border-[#30363d] bg-[#161b22] p-1 shadow-lg"
+        {/* Portalled and collision-aware, which is the fix for the menu
+            being cut off. It used to be `absolute top-full` inside the
+            row, and the list holding the rows is `overflow-hidden`
+            (#818's backstop) -- so on the last rows the menu opened
+            downward past the list's edge and was clipped, Remove
+            included. Rendered at the body it cannot be clipped by any
+            ancestor, and the positioner flips it above the button when
+            there is no room below. */}
+        <DropdownMenuContent
+          align="end"
+          className="w-56 rounded border border-[#30363d] bg-[#161b22] p-1 text-[#e6edf3] shadow-lg ring-0"
         >
           {/* Only once an assessment has been marked. Before that the
               row's own button already IS Claudify, and a menu holding a
@@ -207,25 +206,19 @@ export function WorktreeKebab({
                   the single item it has always been -- the second would
                   be a duplicate of the first. */}
               {terminalConfigured ? (
-                <button
-                  type="button"
-                  role="menuitem"
+                <DropdownMenuItem
                   className={item}
                   onClick={() => {
-                    setOpen(false);
                     onClaudify(worktree);
                   }}
                 >
                   <Bot className="h-3 w-3" aria-hidden="true" />
                   Open the Claudify command
-                </button>
+                </DropdownMenuItem>
               ) : null}
-              <button
-                type="button"
-                role="menuitem"
+              <DropdownMenuItem
                 className={item}
                 onClick={() => {
-                  setOpen(false);
                   // `onCopyClaudify` and not `onClaudify`: with a
                   // terminal configured the latter LAUNCHES, and this
                   // item says "copy".
@@ -234,22 +227,19 @@ export function WorktreeKebab({
               >
                 <Bot className="h-3 w-3" aria-hidden="true" />
                 Copy the Claudify command
-              </button>
+              </DropdownMenuItem>
               {/* Re-LOCKS the force-removal path, so it is the safe
                   direction and needs no confirmation. */}
-              <button
-                type="button"
-                role="menuitem"
+              <DropdownMenuItem
                 className={item}
                 onClick={() => {
-                  setOpen(false);
                   onForget(worktree);
                 }}
               >
                 <RotateCcw className="h-3 w-3" aria-hidden="true" />
                 Forget the assessment
-              </button>
-              <div className="my-1 border-t border-[#30363d]" />
+              </DropdownMenuItem>
+              <DropdownMenuSeparator className="mx-0 my-1 bg-[#30363d]" />
             </>
           ) : null}
 
@@ -278,12 +268,9 @@ export function WorktreeKebab({
               reversible action in the same visual class as the one
               unrecoverable action on the page. */}
           {locked ? (
-            <button
-              type="button"
-              role="menuitem"
+            <DropdownMenuItem
               className={itemStacked}
               onClick={() => {
-                setOpen(false);
                 onUnlock(worktree);
               }}
             >
@@ -298,7 +285,7 @@ export function WorktreeKebab({
                   {safetyReason(worktree.safety)}
                 </span>
               </span>
-            </button>
+            </DropdownMenuItem>
           ) : null}
 
           {/* Removal, on a surface that does not disappear (#770).
@@ -310,12 +297,9 @@ export function WorktreeKebab({
               a considered human judgement reachable, not to re-litigate
               the gate that already refused. */}
           {removable ? (
-            <button
-              type="button"
-              role="menuitem"
+            <DropdownMenuItem
               className={destructive}
               onClick={() => {
-                setOpen(false);
                 if (safe) onRemove(worktree);
                 else onForce(worktree);
               }}
@@ -336,7 +320,7 @@ export function WorktreeKebab({
                   </span>
                 )}
               </span>
-            </button>
+            </DropdownMenuItem>
           ) : null}
 
           {/* Where a prunable row's action actually lives (#793).
@@ -364,8 +348,8 @@ export function WorktreeKebab({
               so it clears this one along with the rest.
             </p>
           ) : null}
-        </div>
-      ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
