@@ -5,6 +5,11 @@ import { PrKebab } from "@/components/PrKebab";
 import { renderWithQuery as render } from "@/test-utils";
 import type { PullRequest } from "@/types/pr";
 
+/// A disabled menu item is `aria-disabled`, not natively `disabled`: the
+/// menu keeps it focusable so its reason (the `title`) stays reachable.
+const isDisabled = (el: Element) => el.getAttribute("aria-disabled") === "true";
+
+
 const act = vi.fn(() => Promise.resolve());
 vi.mock("@/api/hooks", () => ({
   useActOnPr: () => act,
@@ -32,7 +37,7 @@ describe("PrKebab on a stacked row (#1452)", () => {
     render(<PrKebab pr={pr} stackedOn={17} />);
     open();
     const item = screen.getByRole("menuitem", { name: "Add to merge queue" }) as HTMLButtonElement;
-    expect(item.disabled).toBe(true);
+    expect(isDisabled(item)).toBe(true);
     expect(item.title).toBe("stacked on #17 — merge #17 first");
     fireEvent.click(item);
     expect(act).not.toHaveBeenCalled();
@@ -41,7 +46,7 @@ describe("PrKebab on a stacked row (#1452)", () => {
   it("offers it on a row that is not stacked", () => {
     render(<PrKebab pr={pr} />);
     open();
-    expect((screen.getByRole("menuitem", { name: "Add to merge queue" }) as HTMLButtonElement).disabled).toBe(
+    expect(isDisabled(screen.getByRole("menuitem", { name: "Add to merge queue" }))).toBe(
       false,
     );
   });

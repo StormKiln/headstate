@@ -17,6 +17,22 @@ import { toast } from "sonner";
 /// Still an `<a>` with a real `href`: it keeps the accessible role, the
 /// hover affordance, and the ability to copy the address. The click is
 /// intercepted rather than the element replaced.
+/// Open `href` in the user's browser, saying so when it cannot.
+///
+/// The rejection is NOT dropped. It used to be, and that is how the
+/// mobile build shipped with every external link inert: the opener
+/// plugin was in neither the phone's crate nor its capabilities, so each
+/// call rejected and vanished, leaving a tap that did nothing at all --
+/// no navigation, no error, no log. A link that cannot open should say
+/// so. Exported for menu items, which cannot be an `<a>` of their own.
+export function openExternal(href: string): void {
+  void openUrl(href).catch((e: unknown) => {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(`could not open ${href}: ${detail}`);
+    toast.error("Could not open that link", { description: href });
+  });
+}
+
 export function ExternalLink({
   href,
   className,
@@ -50,17 +66,7 @@ export function ExternalLink({
         e.preventDefault();
         e.stopPropagation();
         onClick?.();
-        // The rejection is NOT dropped. It used to be, and that is how
-        // the mobile build shipped with every external link inert: the
-        // opener plugin was in neither the phone's crate nor its
-        // capabilities, so each call rejected and vanished, leaving a
-        // tap that did nothing at all -- no navigation, no error, no
-        // log. A link that cannot open should say so.
-        void openUrl(href).catch((e: unknown) => {
-          const detail = e instanceof Error ? e.message : String(e);
-          console.error(`could not open ${href}: ${detail}`);
-          toast.error("Could not open that link", { description: href });
-        });
+        openExternal(href);
       }}
     >
       {children}
