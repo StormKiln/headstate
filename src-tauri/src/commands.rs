@@ -5929,15 +5929,56 @@ mod corpus_cancel_tests {
         crate::claude::linkscan::reset(&conn, 0).unwrap();
         let registry = std::sync::Mutex::new(PopulationRegistry::default());
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        for _ in 0..4 {
-            populate_live_corpus(
+        let counts = |conn: &rusqlite::Connection| {
+            [
+                "claude_index_ledger",
+                "claude_link_checkpoint",
+                "claude_session_pr",
+            ]
+            .map(|table| {
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+        // Discovery and every lane run on wall-clock slices, so how many
+        // passes acceptance takes depends on the runner. One pass suffices
+        // locally; four left a table empty on a contended Windows runner
+        // (#2097, after #1977), cause unconfirmed. This test is about what
+        // survives the root disappearing, so set up until the source is
+        // actually accepted rather than for a fixed count.
+        let mut accepted = false;
+        let mut last = Vec::new();
+        for pass in 0..32 {
+            let out = populate_live_corpus(
                 &mut conn,
                 Some(&root),
                 &PopulationControl::default(),
                 &registry,
                 &slots,
             );
+            if counts(&conn) == [1, 1, 1] {
+                accepted = true;
+                break;
+            }
+            // Lane errors are logged and swallowed by design, so keep what the
+            // pass reported: a repeat of #2097 then says which lane, and why.
+            last.push(format!(
+                "pass {pass}: rows={:?} index={:?} links={:?} metadata={:?} usage={:?}",
+                counts(&conn),
+                out.index_health,
+                out.links
+                    .map(|l| (l.links_added, l.deferred, l.stopped, l.unreadable.len())),
+                out.metadata.map(|p| p.status),
+                out.usage.map(|p| p.status),
+            ));
         }
+        assert!(
+            accepted,
+            "setup never accepted the source:\n{}",
+            last.join("\n")
+        );
         let epoch: (i64, i64) = conn
             .query_row(
                 "SELECT accepted,staging FROM claude_corpus_epoch",
