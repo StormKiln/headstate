@@ -69,7 +69,7 @@ one-line PR raised the mark -- a failure unrelated to any PR it landed
 on, which in one cycle cost four branches a rebase and meant nothing
 could merge until the mark PR did. Nor could the failure move to the
 `push` run on main or a scheduled job: the desktop release gate waits
-on EVERY check-run attempt on a commit (`wait-for-duplicates`), so one
+on EVERY check-run attempt on a commit (`filter=all`), so one
 red attempt on a main commit burns it for releases, and a scheduled
 run's check-runs attach to main's head. The failure had to leave the
 per-commit checks altogether, not move between them.

@@ -34,129 +34,71 @@ jobs:
   # code fails here instead of shipping.
   #
   # "Every check run" and not "every check name" is the whole point, and
-  # getting it wrong is how this gate was hollow until #883. Read
-  # `wait-for-duplicates` below before changing anything here.
+  # getting it wrong is how this gate was hollow until #883. Every release
+  # tag points at a commit ALSO pushed to `main`, so the commit carries two
+  # suites with identical job names (v5.14.0, 097a1af: 25 check runs, 10
+  # names twice). Collapsing to one run per name let the already-green
+  # `main` suite answer for a tag suite that had not registered yet:
+  # v5.12.0 and v5.11.0 passed only by accident. So nothing is
+  # deduplicated: every attempt of every suite counts (`filter=all`), and
+  # the tag's own push run must exist before the gate can pass.
   #
   # Deliberately a wait rather than duplicating the test steps: one
   # definition of "green" means the release cannot pass a gate that CI
   # would have failed.
   #
-  # `ignore-checks` excludes the PHONE release's jobs. Without it this
-  # waits on every check run attached to the commit, which is a larger
-  # set than CI: a `mobile-v*` tag pointing at the same commit as a `v*`
-  # tag puts mobile-release.yml's jobs on that commit too, and v5.4.0
-  # failed this gate on `ios-release` -- a job that builds no desktop
-  # artifact and whose failure says nothing about whether the desktop is
-  # releasable. The two pipelines are independent by design (see the
-  # header of mobile-release.yml), so neither may hold the other hostage.
+  # ONE exception, and only one: runner capacity. v10.12.2 and v10.12.3
+  # were refused because macOS jobs in the tag's CI run were cancelled
+  # with "The job was not acquired by Runner" -- they never ran a step, so
+  # they said nothing about the code, and the old gate
+  # (lewagon/wait-on-check-action) could not tell that from a real
+  # cancellation. `--rerun-capacity` reruns such an attempt's failed jobs
+  # (bounded) and the rerun must pass on its own. A job that got a
+  # runner, ran a step, or lacks that annotation is never excused; the
+  # rules and their tests are in scripts/wait-release-ci.py.
   #
-  # `ignore-checks` and not `check-name`: the action compares `check-name`
-  # to a check's name with a single `==` (app/services/
-  # github_checks_verifier.rb, `apply_filters`), so it names exactly ONE
-  # check -- a list there matches nothing and fails as "never run".
-  # `ignore-checks` is comma-split, and subtracting is also the safer
-  # direction: a NEW ci.yml job is waited on automatically, where an
-  # allowlist would have silently stopped gating on it.
+  # IGNORE_CHECKS excludes, by name, checks that say nothing about this
+  # build. Subtracting is the safer direction: a NEW ci.yml job is waited
+  # on automatically, where an allowlist would silently stop gating on it.
   #
-  # `publish` names a job in BOTH release workflows, so ignoring it
-  # covers this file's own `publish` too -- which is what we want. That
-  # job is downstream of this gate and reports `skipped` until the gate
-  # clears, and `skipped` is not an allowed conclusion; on v5.4.0 the
-  # gate's final tally already read `publish: completed (skipped)` and
-  # only escaped failing on it because the mobile run's copy was the one
-  # that survived name deduplication. A gate cannot wait on a job that
-  # waits on the gate.
+  # - The PHONE release's jobs: a `mobile-v*` tag on the same commit puts
+  #   mobile-release.yml's jobs here too, and v5.4.0 failed this gate on
+  #   `ios-release`. The two pipelines are independent by design (see the
+  #   header of mobile-release.yml), so neither may hold the other hostage.
+  # - `publish` names a job in BOTH release workflows. Ours is downstream
+  #   of this gate and reports `skipped` until it clears; a gate cannot
+  #   wait on a job that waits on the gate. `gate` is this job itself.
+  # - `ci-maintenance` is operational queue cleanup/timing.
+  # - `cache-budget` is cache-budget.yml's scheduled job (#1505). It
+  #   attaches to `main`'s head, the commit a release tags, and fails on
+  #   CI's cache size -- waiting on it would let a cache size burn a tag.
   #
-  # `ci-maintenance` is operational queue cleanup/timing, never a product gate.
-  # `cache-budget` is cache-budget.yml's scheduled job (#1505). Its check
-  # attaches to `main`'s head commit, the commit a release tags, and it
-  # fails when `main`'s Actions cache outgrows a ceiling -- a statement
-  # about CI's cache, not about this build. Waiting on it would let a
-  # cache size burn a tag.
-  #
-  # Everything not listed here must still conclude `success`, so this
-  # stays as strict as it was for everything CI actually runs.
-  #
-  # `wait-for-duplicates: true` is what makes the claim at the top of
-  # this job TRUE, and without it the gate could be satisfied entirely by
-  # a CI run that never tested the tag (#883). Every release tag points at
-  # a commit that was ALSO pushed to `main`, so the commit carries two
-  # suites with identical job names: v5.14.0 (097a1af) had 25 check runs,
-  # 10 names appearing twice. Read from the pinned action's source
-  # (app/services/github_checks_verifier.rb at 3697690):
-  #
-  #   checks = keep_latest_per_name(checks) unless wait_for_duplicates
-  #   ...
-  #   checks.group_by(&:name).map { |_n, runs| runs.max_by { |r| r.started_at.to_s } }
-  #
-  # so by default each name collapses to ONE run -- and a tag-suite check
-  # that has not registered yet cannot be the max, leaving the already
-  # green `main`-push run to answer for it. The usual backstop does not
-  # apply: `fail_if_requested_check_never_run` returns early unless
-  # `check_name` or `check_regexp` is set (`filters_present?`), and we set
-  # neither, so it is inert here.
-  #
-  # Measured, not hypothetical. On v5.12.0 (7ad496d) the main-push suite
-  # completed at 17:25:35Z, 7.5 minutes before `gate` first polled at
-  # 17:33:08Z, and 9 of 10 names resolved to that stale suite; the gate
-  # was saved only because tag-suite `platform (ubuntu-latest)` had
-  # registered by that same second and still read `in_progress`. v5.11.0
-  # survived for the same accidental reason. Tag a commit whose `main` CI
-  # finished a few minutes earlier and the gate passes in ~15s having
-  # waited for nothing.
-  #
-  # `true` also sets the API's `filter` to `all` rather than `latest`
-  # (`options[:filter] = 'all' if wait_for_duplicates`), but that part is
-  # belt-and-braces rather than the fix: `filter=latest` deduplicates only
-  # WITHIN one check suite, as the action's own comment above
-  # `keep_latest_per_name` says, so our cross-suite duplicates survive it
-  # either way. Measured on 097a1af, which returns the same 25 runs under
-  # `filter=latest` and `filter=all`. The load-bearing half is skipping
-  # `keep_latest_per_name`, which is what actually collapsed the two
-  # suites to one run per name.
-  #
-  # Zero false positives: the two suites are the same jobs on the same
-  # commit, so requiring both green adds no new way to fail -- it only
-  # removes a way to pass without being tested. `ignore-checks` is applied
-  # after the fetch and matches by name, so both suites' copies of
-  # `publish` and the mobile jobs are still dropped.
-  #
-  # NOT `check-regexp` to activate the never-run guard instead: a name
-  # that never reports is the permanently-unmergeable class ci.yml:388-412
-  # warns about.
+  # Everything not listed must conclude `success` (or be an excused
+  # capacity loss that a passing rerun replaced).
   gate:
-    # A healthy Windows CI run took 30m22s (run 36735484073). Wait beyond
-    # the platform job's 45m ceiling, with 15m for runner startup, so a
-    # cold build cannot exhaust the release gate before CI finishes.
-    timeout-minutes: 60
-    # Reads check runs on the tag's commit. `checks: read` is explicit
-    # rather than inherited, so tightening the workflow default above
-    # cannot silently blind the gate.
+    # A healthy Windows CI run took 30m22s (run 36735484073) and macOS
+    # test-rust 43m (run 41710004376). A capacity loss surfaces ~15m into
+    # queueing and the rerun repeats the job, up to three times: 240m is
+    # finite and covers two full rounds with margin.
+    timeout-minutes: 240
+    # `checks: read` and `actions: read` are explicit rather than
+    # inherited, so tightening the workflow default cannot blind the gate.
+    # `actions: write` is only for rerun-failed-jobs on a capacity loss.
     permissions:
       contents: read
       checks: read
-      actions: read
+      actions: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Wait for every CI workflow attempt, including queued duplicates
+      - name: Wait for every CI attempt and check run, rerunning runner-capacity losses
         env:
           GH_TOKEN: ${{ github.token }}
+          IGNORE_CHECKS: ios-release,android-release,reserve,publish,cache-budget,ci-maintenance,gate
         run: >-
           python3 scripts/wait-release-ci.py --repo "$GITHUB_REPOSITORY"
-          --sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --timeout-seconds 3300
-      - name: Wait for CI to pass on this commit
-        uses: lewagon/wait-on-check-action@369769072fe522a3a8a85c03c96af1e5242a1994 # v1.9.1
-        with:
-          ref: ${{ github.sha }}
-          repo-token: ${{ github.token }}
-          running-workflow-name: gate
-          wait-interval: 15
-          allowed-conclusions: success
-          ignore-checks: ios-release,android-release,reserve,publish,cache-budget,ci-maintenance
-          # See the long note above: without this the gate can be answered
-          # by the `main`-push suite and never wait for the tag's own CI.
-          wait-for-duplicates: true
+          --sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --timeout-seconds 14100
+          --rerun-capacity --check-runs --ignore-checks "$IGNORE_CHECKS"
 
   build:
     needs: gate

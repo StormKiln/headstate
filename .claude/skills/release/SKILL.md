@@ -10,8 +10,8 @@ so the in-repo `0.1.0` is correct and needs **no bump commit**.
 
 ## Before tagging: the precondition that matters
 
-The gate sets `wait-for-duplicates: true` (`release.yml`), so it waits on
-**every check-run attempt** on the commit — including superseded ones. A re-run
+The gate (`scripts/wait-release-ci.py`) waits on **every check-run attempt**
+on the commit — including superseded ones. A re-run
 adds a passing attempt but never removes a failed one, so **one failed attempt
 burns that commit for releases permanently.**
 
@@ -21,8 +21,8 @@ The trap: the default check-runs call returns only the latest attempt per job.
 # WRONG -- latest attempt only; showed all-success on a commit the gate refused
 gh api repos/OWNER/REPO/commits/SHA/check-runs
 
-# RIGHT -- what the gate actually sees: every attempt, minus its ignore-checks
-IGN=$(sed -n 's/^ *ignore-checks: *//p' .github/workflows/release.yml)
+# RIGHT -- what the gate actually sees: every attempt, minus its IGNORE_CHECKS
+IGN=$(sed -n 's/^ *IGNORE_CHECKS: *//p' .github/workflows/release.yml)
 gh api "repos/OWNER/REPO/commits/SHA/check-runs?per_page=100&filter=all" \
   -q "[.check_runs[]|select(.name|IN(\"${IGN//,/\",\"}\")|not)|.conclusion]|group_by(.)|map({(.[0]//\"null\"):length})|add"
 ```
@@ -30,7 +30,7 @@ gh api "repos/OWNER/REPO/commits/SHA/check-runs?per_page=100&filter=all" \
 Require `{"success": N}` with no other key. `gh pr checks` has the same blind
 spot and is not sufficient.
 
-The gate drops `ignore-checks` by name, so the count must too. The scheduled
+The gate drops `IGNORE_CHECKS` by name, so the count must too. The scheduled
 `cache-budget` job attaches to `main`'s head and is ignored. Counting it
 flagged `3701ed8` (v10.11.0) as burned when the gate would pass it. A
 `failure` from an ignored job does not burn the commit. Read that list from
@@ -60,21 +60,24 @@ git push origin vX.Y.Z
 so every release gets two independent chances to flake. Check `filter=all`
 again after tagging.
 
-**A runner-capacity cancellation burns the tag too.** v10.12.2's commit had
-24/24 `success` on `main`. Then the tag run's `test-rust` waited 15 minutes for
-a macOS arm64 runner and ended `cancelled`. Its annotation read "The job was
-not acquired by Runner of type hosted even after multiple attempts". The gate
-refused the release, and nothing in the code was wrong. Before pushing a tag,
-look for that annotation on recent runs. If macOS capacity is short, wait for
-it to recover rather than tag into it:
+**A runner-capacity cancellation no longer burns the tag.** v10.12.2 and
+v10.12.3 both had a clean `main` record, then lost macOS jobs in the tag's own
+CI run to "The job was not acquired by Runner of type hosted even after
+multiple attempts". The old gate refused both. The gate now reruns that
+attempt's failed jobs itself (at most three times, `MAX_RERUNS`) and requires
+the rerun to pass. A job that got a runner, ran a step, or lacks that
+annotation is never excused, so a real failure still burns the tag.
+
+So the `filter=all` count above can legitimately show `cancelled` (and
+`lint`'s `failure` reporting it) on a released commit. Before tagging, an
+unexplained non-success is still a burned commit. Read the annotation:
 
 ```bash
-for id in $(gh run list --limit 15 --json databaseId -q '.[].databaseId'); do
-  gh run view "$id" --json jobs -q '.jobs[]|select(.conclusion=="cancelled")|.databaseId'
-done | while read -r j; do
-  gh api "repos/OWNER/REPO/check-runs/$j/annotations" -q '.[].message'
-done | grep -c "not acquired by Runner"   # want 0
+gh api "repos/OWNER/REPO/check-runs/JOB_ID/annotations" -q '.[].message'
 ```
+
+With macOS capacity short, a release can wait hours in `gate` (its
+`timeout-minutes` is 240). That is the gate working, not a hang.
 
 ## A burned tag is not recoverable
 
@@ -141,7 +144,7 @@ collision — `object_pairs_hook` is the real check. And Tauri notarizes the
 **app bundle, not the disk image**, so validating only the DMG is the weaker
 claim.
 
-`allowed-conclusions: success` means `skipped` is not allowed either; that cost
+Only `success` passes, so `skipped` is not allowed either; that cost
 a release at v5.4.0.
 
 ## Mobile

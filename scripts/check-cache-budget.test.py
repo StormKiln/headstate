@@ -204,7 +204,7 @@ checks(
 )
 
 # THE QUOTA, counted over EVERY entry including ones no job class covers.
-# The `setup-ruby` entries that wait-on-check-action leaves on each
+# The `setup-ruby` entries that wait-on-check-action left on each
 # release tag return None from `job_class()`, so no per-class rule sees
 # them -- but GitHub evicts on the quota, which does not care.
 # Constructed so ONLY the quota rule can fire: the unclassified entry sits
