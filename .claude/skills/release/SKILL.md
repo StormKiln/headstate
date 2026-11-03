@@ -60,6 +60,22 @@ git push origin vX.Y.Z
 so every release gets two independent chances to flake. Check `filter=all`
 again after tagging.
 
+**A runner-capacity cancellation burns the tag too.** v10.12.2's commit had
+24/24 `success` on `main`. Then the tag run's `test-rust` waited 15 minutes for
+a macOS arm64 runner and ended `cancelled`. Its annotation read "The job was
+not acquired by Runner of type hosted even after multiple attempts". The gate
+refused the release, and nothing in the code was wrong. Before pushing a tag,
+look for that annotation on recent runs. If macOS capacity is short, wait for
+it to recover rather than tag into it:
+
+```bash
+for id in $(gh run list --limit 15 --json databaseId -q '.[].databaseId'); do
+  gh run view "$id" --json jobs -q '.jobs[]|select(.conclusion=="cancelled")|.databaseId'
+done | while read -r j; do
+  gh api "repos/OWNER/REPO/check-runs/$j/annotations" -q '.[].message'
+done | grep -c "not acquired by Runner"   # want 0
+```
+
 ## A burned tag is not recoverable
 
 Do not re-run the release, delete the tag, or force anything past the gate.
