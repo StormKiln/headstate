@@ -62,6 +62,7 @@ import {
   isDeadLock,
   sortWorktrees,
   WORKTREE_SORT_LABELS,
+  partitionSelection,
   type WorktreeSort,
 } from "../lib/worktrees";
 import { HelpButton } from "./HelpButton";
@@ -1568,6 +1569,9 @@ export function WorktreesPage() {
   const [bulkOpen, setBulkOpen] = useState(false);
   /// The selection-scoped removal dialog (#1140).
   const [selectionOpen, setSelectionOpen] = useState(false);
+  /// The explicit "remove the not-safe ones anyway" in that dialog.
+  /// Cleared every time it opens, so a past answer never carries over.
+  const [selectionAck, setSelectionAck] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
   const removalProgress = useRemovalProgress();
   const removeMany = useRemoveWorktrees();
@@ -2906,7 +2910,10 @@ export function WorktreesPage() {
           <button
             type="button"
             disabled={bulkBusy}
-            onClick={() => setSelectionOpen(true)}
+            onClick={() => {
+              setSelectionAck(false);
+              setSelectionOpen(true);
+            }}
             className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
             Remove {selectedVisible.length} selected
@@ -3497,91 +3504,170 @@ export function WorktreesPage() {
       {selectionOpen ? (
         <Dialog open onOpenChange={(o) => !o && setSelectionOpen(false)}>
           <DialogContent className="max-w-2xl">
-            <DialogTitle>
-              Remove {selectedVisible.length} selected worktree
-              {selectedVisible.length === 1 ? "" : "s"}?
-            </DialogTitle>
-            <ActingOnDesktop />
-            <p className="mt-2 text-sm text-[#8b949e]">
-              {(() => {
-                const total = totalSize(selectedVisible);
-                return total === null
-                  ? "Sizes are still being measured."
-                  : `Reclaims ${formatSize(total)}.`;
-              })()}{" "}
-              Each is re-checked before deletion, so anything that changed since the scan is
-              skipped.
-            </p>
-            {/* THE sentence #1140 requires. A selection narrowed by a
-                filter acts on what is VISIBLE, and a row silently
-                dropped from a batch the user assembled is exactly the
-                surprise the issue is about. Said out loud, with a
-                count, so nothing vanishes quietly. */}
-            {selectedHidden > 0 ? (
-              <p className="mt-2 text-sm text-[#d29922]">
-                {selectedHidden} selected worktree{selectedHidden === 1 ? " is" : "s are"} hidden
-                by the current filters and will NOT be removed.
-              </p>
-            ) : null}
-            {/* Every path, not a count: these are directories on disk. */}
-            <ul className="mt-3 max-h-64 overflow-y-auto font-mono text-xs text-[#8b949e]">
-              {selectedVisible.map((w) => (
-                <li key={w.path} className="py-0.5">
-                  {w.path}
-                </li>
-              ))}
-            </ul>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setSelectionOpen(false)}
-                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const targets = selectedVisible.map((w) => w.path);
-                  setBulkBusy(true);
-                  setSelectionOpen(false);
-                  // Unticked as EACH one goes (#1544), and only the
-                  // paths actually removed, so a refused row stays
-                  // ticked and the user can see what did not go. As it
-                  // goes rather than at the end, because a run that
-                  // fails midway would otherwise leave removed paths
-                  // ticked -- counted as "hidden by the current
-                  // filters" in the next confirmation.
-                  removeMany(selected?.path ?? "", targets, untick).then(
-                    (outcomes) => {
-                      setBulkBusy(false);
-                      const failed = outcomes.filter((o) => o.error !== null);
-                      const ok = outcomes.length - failed.length;
-                      // Never a bare "done": a worktree that went dirty
-                      // since the scan is refused, and hiding that
-                      // would misreport what is still on disk.
-                      if (failed.length === 0) {
-                        toast.success(`Removed ${ok} worktree${ok === 1 ? "" : "s"}`);
-                      } else {
-                        toast.error(
-                          `Removed ${ok}, refused ${failed.length}`,
-                          { description: failed.map((f) => `${f.path}: ${f.error}`).join("\n") },
-                        );
-                      }
-                    },
-                    (e: unknown) => {
-                      setBulkBusy(false);
-                      toast.error("Could not remove the selected worktrees", {
-                        description: errorMessage(e),
-                      });
-                    },
-                  );
-                }}
-                className="rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#ff7b72] hover:bg-[#f85149]/10"
-              >
-                Remove {selectedVisible.length} worktree{selectedVisible.length === 1 ? "" : "s"}
-              </button>
-            </div>
+            {(() => {
+              // Split by what removing each row takes. Before this every
+              // ticked row went through the gated removal, so a selection
+              // of not-safe rows was offered, confirmed, and then refused
+              // row by row with nothing said beforehand.
+              const { safe, forced, blocked } = partitionSelection(selectedVisible);
+              const sending = [...safe, ...forced];
+              const needsAck = forced.length > 0;
+              return (
+                <>
+                  <DialogTitle>
+                    Remove {sending.length} selected worktree
+                    {sending.length === 1 ? "" : "s"}?
+                  </DialogTitle>
+                  <ActingOnDesktop />
+                  <p className="mt-2 text-sm text-[#8b949e]">
+                    {(() => {
+                      const total = totalSize(sending);
+                      return total === null
+                        ? "Sizes are still being measured."
+                        : `Reclaims ${formatSize(total)}.`;
+                    })()}{" "}
+                    Each is re-checked before deletion, so anything that changed since the scan is
+                    skipped.
+                  </p>
+                  {/* THE sentence #1140 requires. A selection narrowed by a
+                      filter acts on what is VISIBLE, and a row silently
+                      dropped from a batch the user assembled is exactly the
+                      surprise the issue is about. */}
+                  {selectedHidden > 0 ? (
+                    <p className="mt-2 text-sm text-[#d29922]">
+                      {selectedHidden} selected worktree{selectedHidden === 1 ? " is" : "s are"} hidden
+                      by the current filters and will NOT be removed.
+                    </p>
+                  ) : null}
+                  {/* Every path, not a count: these are directories on disk. */}
+                  <div className="mt-3 max-h-72 overflow-y-auto">
+                    {safe.length > 0 ? (
+                      <ul className="font-mono text-xs text-[#8b949e]">
+                        {safe.map((w) => (
+                          <li key={w.path} className="py-0.5">
+                            {w.path}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {forced.length > 0 ? (
+                      <>
+                        <p className="mt-3 text-sm font-medium text-[#f85149]">
+                          {forced.length} {forced.length === 1 ? "is" : "are"} not marked safe to
+                          remove
+                        </p>
+                        <ul className="mt-1 text-xs">
+                          {forced.map((w) => (
+                            <li key={w.path} className="py-0.5">
+                              <span className="font-mono text-[#8b949e]">{w.path}</span>
+                              <span className="ml-2 text-[#f85149]">{safetyReason(w.safety)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : null}
+                    {blocked.length > 0 ? (
+                      <>
+                        <p className="mt-3 text-sm font-medium text-[#d29922]">
+                          {blocked.length} will NOT be removed
+                        </p>
+                        <ul className="mt-1 text-xs">
+                          {blocked.map(({ row: w, why }) => (
+                            <li key={w.path} className="py-0.5">
+                              <span className="font-mono text-[#8b949e]">{w.path}</span>
+                              <span className="ml-2 text-[#d29922]">{why}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : null}
+                  </div>
+                  {needsAck ? (
+                    <label className="mt-4 flex items-start gap-2 text-sm text-[#e6edf3]">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={selectionAck}
+                        onChange={(e) => setSelectionAck(e.target.checked)}
+                      />
+                      <span>
+                        Remove the {forced.length} not marked safe anyway. Uncommitted or unpushed
+                        work in them is deleted and cannot be recovered.
+                      </span>
+                    </label>
+                  ) : null}
+                  <div className="mt-5 flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectionOpen(false)}
+                      className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={sending.length === 0 || (needsAck && !selectionAck)}
+                      onClick={() => {
+                        const repoPath = selected?.path ?? "";
+                        const gated = safe.map((w) => w.path);
+                        const past = forced.map((w) => w.path);
+                        setBulkBusy(true);
+                        setSelectionOpen(false);
+                        // Unticked as EACH one goes (#1544), and only the
+                        // paths actually removed, so a refused row stays
+                        // ticked and the user can see what did not go.
+                        void (async () => {
+                          const failed: { path: string; error: string }[] = [];
+                          let ok = 0;
+                          try {
+                            if (gated.length > 0) {
+                              const outcomes = await removeMany(repoPath, gated, untick);
+                              for (const o of outcomes) {
+                                if (o.error === null) ok += 1;
+                                else failed.push({ path: o.path, error: o.error });
+                              }
+                            }
+                            // One at a time, through the same override the
+                            // row's own confirmation uses: it re-checks the
+                            // target is a worktree of this repository and
+                            // still refuses a lock.
+                            for (const path of past) {
+                              try {
+                                await forceRemove(repoPath, path);
+                                untick(path);
+                                ok += 1;
+                              } catch (e: unknown) {
+                                failed.push({ path, error: errorMessage(e) ?? "refused" });
+                              }
+                            }
+                          } catch (e: unknown) {
+                            toast.error("Could not remove the selected worktrees", {
+                              description: errorMessage(e),
+                            });
+                            return;
+                          } finally {
+                            setBulkBusy(false);
+                          }
+                          // Never a bare "done": a worktree that changed
+                          // since the scan is refused, and hiding that
+                          // would misreport what is still on disk.
+                          if (failed.length === 0) {
+                            toast.success(`Removed ${ok} worktree${ok === 1 ? "" : "s"}`);
+                          } else {
+                            toast.error(`Removed ${ok}, refused ${failed.length}`, {
+                              description: failed.map((f) => `${f.path}: ${f.error}`).join("\n"),
+                            });
+                          }
+                        })();
+                      }}
+                      className="rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#ff7b72] hover:bg-[#f85149]/10 disabled:opacity-50"
+                    >
+                      Remove {sending.length} worktree{sending.length === 1 ? "" : "s"}
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
           </DialogContent>
         </Dialog>
       ) : null}
