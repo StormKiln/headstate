@@ -164,8 +164,10 @@ jobs:
     # packaging performs two sequential Apple waits: v9.2.0 reached the DMG
     # wait at roughly 54m after the app notarization was accepted. The
     # existing 30m DMG wait plus verification/upload margin therefore fits
-    # 90m, while 60m canceled it after about 7m (#1742). This remains finite;
-    # unusually long Apple processing can still time out without a retry.
+    # 90m, while 60m canceled it after about 7m (#1742). 120m since the
+    # one-time DMG "Resource busy" rebuild can repeat the ~25m bundle step
+    # before that DMG wait. This remains finite; unusually long Apple
+    # processing can still time out without a retry.
     timeout-minutes: ${{ matrix.timeout-minutes }}
     # Builds and uploads artifacts for `publish` to collect. It creates
     # nothing in the repository, so it does not need write (#886).
@@ -181,7 +183,7 @@ jobs:
           - os: macos-latest
             target: universal-apple-darwin
             bundles: app,dmg
-            timeout-minutes: 90
+            timeout-minutes: 120
           - os: windows-latest
             target: ""
             bundles: nsis
@@ -396,8 +398,24 @@ jobs:
           # rather than passed empty.
           if [ -n "${{ matrix.target }}" ]; then
             # #1915: classify hidden DMG errors; collector discards all raw text.
-            RUST_LOG=tauri_bundler::utils=debug python3 scripts/ci-command.py run release-bundle --release -- \
-              yarn tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+            # v10.9.1 and v10.12.1 both died here on `hdiutil create`
+            # "Resource busy": a transient lock on the runner, after the app
+            # was already notarized. Retry the whole build once for exactly
+            # that classification and nothing else; any other failure, or a
+            # second busy, still fails the release.
+            bundle() {
+              RUST_LOG=tauri_bundler::utils=debug python3 scripts/ci-command.py run "$1" --release -- \
+                yarn tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}" \
+                | tee "$RUNNER_TEMP/$1.out"
+            }
+            if ! bundle release-bundle; then
+              grep -q '^DMG error: operation=create reason=resource-busy$' "$RUNNER_TEMP/release-bundle.out" || exit 1
+              echo "::warning title=DMG retry::hdiutil create reported Resource busy; rebuilding once"
+              # A half-made image would be the first *.dmg the notarize step finds.
+              rm -rf "src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+              sleep 30
+              bundle release-bundle-retry
+            fi
           else
             yarn tauri build --bundles "${{ matrix.bundles }}"
           fi
