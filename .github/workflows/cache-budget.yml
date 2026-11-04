@@ -12,7 +12,7 @@ name: Cache budget
 # run a push starts, so a check on the push would race the very save it
 # means to measure.
 #
-# THIS JOB'S NAME IS IN release.yml's `ignore-checks`. A scheduled run's
+# THIS JOB'S NAME IS IN release.yml's `IGNORE_CHECKS`. A scheduled run's
 # check attaches to `main`'s head commit, and the desktop release gate
 # requires EVERY check run on a tagged commit to be `success` -- so a red
 # budget run on the commit being tagged would burn the tag over a cache

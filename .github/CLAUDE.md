@@ -5,11 +5,17 @@ everywhere, and the `release` skill for cutting a release.
 
 ## The release gate sees every check-run attempt
 
-`release.yml`'s gate sets `wait-for-duplicates: true`, so it waits on **all**
-check-run attempts on the tagged commit, including superseded ones.
+`release.yml`'s gate (`scripts/wait-release-ci.py`) waits on **all** check-run
+attempts on the tagged commit (`filter=all`), including superseded ones.
 
 **One failed attempt burns that commit for releases permanently.** Re-running
 adds a passing attempt; it never removes the failed one.
+
+The one exception is runner capacity: a job cancelled with "The job was not
+acquired by Runner" that never got a runner or ran a step. The gate reruns that
+attempt's failed jobs itself (at most three times) and the rerun must pass.
+Anything else non-success still burns the commit. This exists because v10.12.2
+and v10.12.3 were both burned by macOS runner shortages.
 
 The trap: the default check-runs API returns only the latest attempt per job, so
 a burned commit can look entirely green.
@@ -26,10 +32,10 @@ This burned v5.20.0. `f497c75` still shows `success / failure / success`.
 On a commit already verified on `main` — so every release has two independent
 chances to flake. Check `filter=all` again after tagging.
 
-## `allowed-conclusions: success`
+## Only `success` passes
 
 `skipped` is **not** allowed. That cost a release at v5.4.0, which is why
-`ignore-checks` lists the jobs that legitimately do not run.
+`IGNORE_CHECKS` lists the jobs that legitimately do not run.
 
 ## Versions come from the tag
 

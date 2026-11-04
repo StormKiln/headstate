@@ -63,9 +63,9 @@ tags (v6.0.0, v6.0.1, v7.0.0, v7.1.0, v7.2.0, v7.2.1):
     ZERO rust-cache entries. The recurring leak is already closed at the
     source, and 1.39GB of one-off residue drains on its own clock.
 
-  - What each release still leaves is 10.6MB: a `setup-ruby` bundler
+  - What each release left was 10.6MB: a `setup-ruby` bundler
     cache from `lewagon/wait-on-check-action`, which runs inside the
-    release gate and caches its own Ruby deps. Six tags hold 63.5MB
+    release gate until the gate moved to wait-release-ci.py, and caches its own Ruby deps. Six tags hold 63.5MB
     between them -- 0.6% of the quota.
 
 A deletion loop with a token, able to race a release build still holding
@@ -160,7 +160,7 @@ So the split is now by WHERE, not only by what:
     judging `main` where a ceiling is actually crossed, and fails there.
     That run's check attaches to `main`'s head commit, and the desktop
     release gate reads EVERY check run on a tagged commit -- so its job
-    name is in release.yml's `ignore-checks`. Cache size says nothing
+    name is in release.yml's `IGNORE_CHECKS`. Cache size says nothing
     about whether a build is releasable, and must not burn a tag.
 """
 
@@ -505,7 +505,7 @@ def verdict(entries: list[dict]) -> tuple[list[str], list[str]]:
     # The budget is a ceiling someone chose; the quota is the one GitHub
     # enforces, and eviction obeys the second. An entry outside every
     # budgeted class still occupies the same 10GB: the `setup-ruby`
-    # entries that `lewagon/wait-on-check-action` leaves on each release
+    # entries that `lewagon/wait-on-check-action` left on each release
     # tag are only ~11MB apiece, but `job_class()` returns None for them
     # and nothing was adding them up at all.
     #
